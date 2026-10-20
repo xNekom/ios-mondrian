@@ -137,8 +137,25 @@ instead of the MacOSX one: its user VA is 63.75 GB, the original assertion
 holds as it is, and the platform matches the userland. The sweet port uses
 the MacOSX base, so this is a bigger change than a patch.
 
-**Check:** the kernel builds and the commpage still works (the iOS userland
-reads the time and the kernel version from it).
+**The early boot of the kernel is where the remaining problem is.** With
+4 KiB pages the kernel faults with a prefetch abort on the first
+instruction of `arm_init` (a permission fault with the execute bit clear).
+`tools/qemu-triage.py` says so from a QEMU run:
+
+```
+$ tools/qemu-triage.py /tmp/qemu-out kernel.development.mondrian
+first exception:
+   Taking exception 3 [Prefetch Abort] on CPU 0
+   ESR 0x21 / 0x86000004 -> instruction abort, permission fault, level 1, execute never
+   FAR 0xfffffe0007a6233c
+   symbol _arm_init (+0x0)
+```
+
+The control experiment is the sweet kernel rebuilt with 4 KiB pages
+(branch `exp/sweet-4k`): if it fails the same way, the problem is in XNU
+and not in the port.
+
+**Check:** the kernel reaches `arm_init` and the early console prints.
 
 
 ### 2. The generic half of the sweet series — done
