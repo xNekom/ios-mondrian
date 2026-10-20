@@ -1,0 +1,17 @@
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -159,7 +159,12 @@
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/*
++ * 128GB of zone map VA only fits the 47-bit layout used with 16KB pages.
++ * MONDRIAN has 4KB pages, a 39-bit VA and 112GB of kernel address space,
++ * so it takes the embedded sizes (24GB of VA, 8GB zone map).
++ */
++#if XNU_PLATFORM_MacOSX && !defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
