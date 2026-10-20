@@ -12,6 +12,7 @@
 #include "console.h"
 #include "fdt.h"
 #include "loader.h"
+#include "lz4.h"
 
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
@@ -142,16 +143,43 @@ loader_scan_payload(void)
 /* The end of the shim image: the payload is appended right after it. */
 extern char _end;
 
+/* The appended payload, LZ4 compressed: the build cannot send 15MB over
+ * the USB link of this phone. */
+struct payload_blob {
+	char magic[4];		/* "LZ4P" */
+	uint32_t version;
+	uint64_t raw_size;
+	uint64_t comp_size;
+	uint8_t data[];
+};
+
+static int
+blob_ok(const void *p)
+{
+	const struct payload_blob *b = p;
+
+	return b->magic[0] == 'L' && b->magic[1] == 'Z' && b->magic[2] == '4' &&
+	       b->magic[3] == 'P' && b->version == 1;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
-	/* The payload the build appended to this image. */
-	if (magic_ok((const char *)&_end)) {
-		const struct payload *pp = (const struct payload *)&_end;
-		rd_start = (uint64_t)(uintptr_t)&_end;
-		rd_end = rd_start + payload_size(pp);
-		con_hex("IMAGE", rd_start);
+	/* The payload the build appended to this image, unpacked in place. */
+	if (blob_ok(&_end)) {
+		const struct payload_blob *b = (const struct payload_blob *)&_end;
+		uint64_t scratch = win_base + 0x2000000UL;	/* past the kernel */
+
+		if (!win_size || scratch + b->raw_size > win_base + win_size)
+			return "no room to unpack the payload";
+		long n = lz4_decompress_frame(b->data, b->comp_size,
+					      (uint8_t *)(uintptr_t)scratch, b->raw_size);
+		if (n < 0 || (uint64_t)n != b->raw_size)
+			return "cannot unpack the payload";
+		con_hex2("UNPACK", "n=", (uint32_t)n, "at=", (uint32_t)(scratch >> 32));
+		rd_start = scratch;
+		rd_end = scratch + b->raw_size;
 	} else if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";

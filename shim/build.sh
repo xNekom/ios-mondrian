@@ -51,15 +51,15 @@ else
 fi
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -D$BOARD_DEF ${EXTRA_CFLAGS:-}"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c libc.c; do
+for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c libc.c lz4.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$($READELF -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o | grep -c ABS64 || true)
+abs=$($READELF -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o -o out/shim.elf
+	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 end=$($NM out/shim.elf | awk '$3=="_end"{print $1}')
@@ -69,8 +69,22 @@ truncate -s "$size" out/Image
 # bootloader loads the "kernel" segment raw, with no cpio and no gzip, so
 # this is the one place where the payload survives whatever the ABL does with
 # a ramdisk. The shim finds it right after its own code (at _end).
+#
+# It is compressed with LZ4: the payload is 15MB and the USB link of this
+# phone drops in the middle of a transfer that long (the 5MB image goes
+# through, the 16MB one does not). The shim unpacks it (shim/lz4.c).
 if [ -n "${1:-}" ]; then
-	cat "$1" >> out/Image
+	LZ4=${LZ4:-$(command -v lz4 || echo /opt/homebrew/bin/lz4)}
+	"$LZ4" -BI -9 -f "$1" out/payload.lz4
+	python3 - "$1" out/payload.lz4 out/payload.bin <<-'EOF'
+	import os, struct, sys
+	raw, comp, out = sys.argv[1], sys.argv[2], sys.argv[3]
+	data = open(comp, 'rb').read()
+	with open(out, 'wb') as f:
+	    f.write(b'LZ4P' + struct.pack('<IQQ', 1, os.path.getsize(raw), len(data)))
+	    f.write(data)
+	EOF
+	cat out/payload.bin >> out/Image
 fi
 # Ramdisk: an empty newc cpio (ABL dislikes a zero-size ramdisk on some
 # builds) -> diagnostics.
@@ -97,5 +111,6 @@ else
 fi
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+gcc -O1 -Wall -o out/lz4_test lz4.c lz4_test.c
 echo "shim built for BOARD=$BOARD (header v$BOOT_HEADER)"
 ls -l out/Image out/shim-boot.img

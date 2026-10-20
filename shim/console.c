@@ -126,7 +126,7 @@ void con_bytes(const char *label, const void *p, int n)
 {
 	static const char digits[] = "0123456789abcdef";
 	const unsigned char *b = p;
-	char buf[2];
+	char buf[3];
 	int col = put_str(0, label, YELLOW);
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
 	for (int i = 0; i < n; i++) {
