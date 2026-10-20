@@ -171,10 +171,38 @@ The console alias that patches 0010/0012 install for the world after the
 bootstrap TTBR0 lives at `LOW_GLOBAL_BASE_ADDRESS + 2 MB` for the same
 reason: the device layout has no reserved L1 entry at
 `VM_MIN_KERNEL_ADDRESS`, but `gVirtBase` and the low globals share one,
-and the VM never allocates the low globals region.
+and the VM never allocates the low globals region. The panel is 18 MB,
+so with 2 MB blocks the alias needs nine of them.
 
-**Check:** the kernel passes `arm_init`, prints the `MONDRIAN EARLY`
-stages through `arm_vm_init`, and panics only where it needs hardware.
+**Three more things did not fit in the 39-bit layout**, and each one
+showed up as a panic that named the culprit:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `kmem_range_init: vm_map_locate_space failing for claim kmem_ptr_range` | `ZONE_MAP_VA_SIZE` is 128 GiB on the macOS platform, more than the 112 GiB of kernel VA | patch `0057`: the embedded sizes (24 GiB) |
+| `write_pte_fast: PTE write is unaligned` | `arm_init.c` picks 16 KiB software pages for any device with more than 1 GiB of RAM, while the hardware page is 4 KiB | patch `0058`: `PAGE_SHIFT_CONST = ARM_PGSHIFT` |
+| `Undefined kernel instruction: instr=d51b42a2` (`msr dit, x2`) | the kernel is armv8.5 and saves DIT when it switches context; QEMU's `cortex-a76` is armv8.2 and does not implement it | not a kernel bug: `tools/qemu-ios.py` uses the `max` CPU for the mondrian |
+
+**How these were found without burning a CI run each**: boot the kernel
+in QEMU and read its own state.
+
+```bash
+# boot, keep the framebuffer, the serial log and the QEMU log
+tools/qemu-ios.py payload out --kernel kernel.development.mondrian --board mondrian
+tools/qemu-triage.py out kernel.development.mondrian     # first exception + symbol
+
+# read any kernel variable (physical address of the guest)
+tools/qemu-ios.py payload out --kernel kernel.development.mondrian --board mondrian \
+    --hmp "xp/8gx 0x<pa>"          # pa = VA - link address + phys_base + 0x4000
+
+# read the system registers
+tools/qemu-ios.py payload out --gdb --kernel ... --board mondrian
+lldb -o "gdb-remote 1234" -o "register read -a"
+```
+
+**Check:** the kernel passes `arm_init`, initialises the VM, IOKit, the
+scheduler, the PRNG, libpthread and AMFI, and stops where it needs the
+root device.
 
 
 ### 2. The generic half of the sweet series — done
