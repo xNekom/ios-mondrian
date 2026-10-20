@@ -85,6 +85,20 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
   - With all that, the kernel reaches the end of the kernel init in
     QEMU: IOKit, OSLog, telemetry, the scheduler, BANK, the PRNG,
     libpthread and AMFI all register. The next stop is the root device.
+  - **CI `39491068044` (commit `eb2215f`, patch `0058`): the mondrian
+    kernel boots clean.** `tools/qemu-ios.py` reports `no_panic_observed`
+    and there is not a single exception in the QEMU log. The console
+    shows the kernel banner, the framebuffer at `0xB8000000`
+    (1440x3200) and `MONDRIAN EARLY 20: kprintf startup complete`; the
+    kernel is alive and waiting for the root device, which is the UFS.
+    That is the point where the software part of the port ends and the
+    hardware part begins.
+  - The screen still says `pe_arm_map_interrupt_controller: failed to
+    find the interrupt-controller`: the QEMU ADT does not describe the
+    GIC the way the arm64 platform expert expects. On the phone the
+    facts say `interrupt-controller@17100000` (1 MiB), which is also
+    worth checking against `GICR_PE_SIZE` (0x40000 in the machine
+    config, but 1 MiB for 8 cores suggests 0x20000).
 
 - **Reading the kernel's state out of QEMU** (this is how every one of
   those four bugs was found, in minutes instead of CI runs):
