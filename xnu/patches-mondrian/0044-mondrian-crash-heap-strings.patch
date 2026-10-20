@@ -19,7 +19,7 @@
 +}
 +
 +/*
-+ * MONDRIAN: for an aborting process named in boot-arg sweetscan (comma
++ * MONDRIAN: for an aborting process named in boot-arg mondrianscan (comma
 + * separated, default "backboardd"; "-" = off) print the printable text runs
 + * (>= 24 characters, at least 2 spaces) found in its malloc heap as
 + * "STR text", at most 700 lines. An uncaught NSException's reason string
@@ -36,7 +36,7 @@
 +	int lines = 0;
 +	char last[96] = "";
 +
-+	if (!PE_parse_boot_argn("sweetscan", names, sizeof(names))) {
++	if (!PE_parse_boot_argn("mondrianscan", names, sizeof(names))) {
 +		strlcpy(names, "backboardd", sizeof(names));
 +	}
 +	size_t n = strlen(name), found = 0;

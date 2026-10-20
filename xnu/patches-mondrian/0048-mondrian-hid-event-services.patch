@@ -20605,7 +20605,7 @@
 + *   MondrianHIDTouch    the built-in touch screen (digitizer collections)
 + *
 + * Hardware drivers feed them through the C entry points mondrian_hid_key()
-+ * and mondrian_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
++ * and mondrian_hid_touch(). Boot-arg mondrianhidtest=N (seconds) presses Home
 + * every N seconds, to test the event path without input hardware.
 + */
 +#include <IOKit/IOLib.h>
@@ -20966,7 +20966,7 @@
 +	if (!IOHIDEventService::start(provider)) {
 +		return false;
 +	}
-+	if (PE_parse_boot_argn("sweethidtest", &fTestSecs, sizeof(fTestSecs)) && fTestSecs) {
++	if (PE_parse_boot_argn("mondrianhidtest", &fTestSecs, sizeof(fTestSecs)) && fTestSecs) {
 +		fTest = IOTimerEventSource::timerEventSource(this, &MondrianHIDButtons::testFired);
 +		if (fTest && _hidWorkLoop->addEventSource(fTest) == kIOReturnSuccess) {
 +			fTest->setTimeoutMS(fTestSecs * 1000);

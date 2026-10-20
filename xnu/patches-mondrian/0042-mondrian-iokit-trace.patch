@@ -9,7 +9,7 @@
 +#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
 +/*
 + * MONDRIAN IOKit trace: registry and matching calls made by the processes
-+ * named in boot-arg sweetiolog (comma separated, default "backboardd";
++ * named in boot-arg mondrianiolog (comma separated, default "backboardd";
 + * "-" turns it off) are printed as "IOK name: ...", at most 400 lines per
 + * boot, to find out what a daemon looks for before it gives up.
 + */
@@ -21,7 +21,7 @@
 +mondrian_iolog(char *name, size_t len)
 +{
 +	if (!mondrian_iolog_parsed) {
-+		if (!PE_parse_boot_argn("sweetiolog", mondrian_iolog_names, sizeof(mondrian_iolog_names))) {
++		if (!PE_parse_boot_argn("mondrianiolog", mondrian_iolog_names, sizeof(mondrian_iolog_names))) {
 +			strlcpy(mondrian_iolog_names, "backboardd", sizeof(mondrian_iolog_names));
 +		}
 +		mondrian_iolog_parsed = 1;

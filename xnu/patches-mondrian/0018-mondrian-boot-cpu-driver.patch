@@ -184,7 +184,7 @@ diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 +    "   {"
 +    "     'IOClass'         = MondrianCPU;"
 +    "     'IOProviderClass' = IOPlatformDevice;"
-+    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IONameMatch'     = 'qcom,kryo';"
 +    "     'IOProbeScore'    = 10000:32;"
 +    "   },"
  #endif

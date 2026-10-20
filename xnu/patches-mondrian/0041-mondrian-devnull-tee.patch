@@ -9,9 +9,9 @@
 + * MONDRIAN: daemons started by launchd write stdout/stderr to /dev/null, and
 + * pointing a launchd job at /dev/console stops it from launching at all
 + * (backboardd, v8 image). Instead, what the processes named in boot-arg
-+ * sweetnull (comma separated, default "backboardd,SpringBoard") write to
++ * mondriannull (comma separated, default "backboardd,SpringBoard") write to
 + * /dev/null goes to the console (and so to the persistent log) as
-+ * "|name| text". sweetnull=- turns it off.
++ * "|name| text". mondriannull=- turns it off.
 + */
 +static char mondrian_null_names[128];
 +static int mondrian_null_parsed;
@@ -20,7 +20,7 @@
 +mondrian_null_tee(char *name, size_t len)
 +{
 +	if (!mondrian_null_parsed) {
-+		if (!PE_parse_boot_argn("sweetnull", mondrian_null_names, sizeof(mondrian_null_names))) {
++		if (!PE_parse_boot_argn("mondriannull", mondrian_null_names, sizeof(mondrian_null_names))) {
 +			strlcpy(mondrian_null_names, "backboardd,SpringBoard", sizeof(mondrian_null_names));
 +		}
 +		mondrian_null_parsed = 1;

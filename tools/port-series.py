@@ -41,9 +41,13 @@ RENAMES = [
     (r'sweet-ufs', 'mondrian-ufs'),
     (r'sweet-fbcon', 'mondrian-fbcon'),
     (r'sweetfb_', 'mondrianfb_'),
+    (r'\bsweet(hidtest|iolog|null|scan|fb|touch|keys|usb)\b', r'mondrian\1'),
     (r'sweettouch', 'mondriantouch'),
     (r'sweetkeys', 'mondriankeys'),
     (r'xiaomi,sweet', 'xiaomi,mondrian'),
+    # the CPU compatible string: sweet is a Kryo 470 (Cortex-A76/A55),
+    # mondrian a Kryo 700 (Cortex-X2/A710/A510)
+    (r'qcom,kryo470', 'qcom,kryo'),
     # the description of the board, so that the context lines of the
     # ported patches still match the files they modify
     (r'Redmi Note 10 Pro, SM7150\): MASTER', 'POCO F5 Pro, SM8475): MASTER'),
