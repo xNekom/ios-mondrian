@@ -520,11 +520,14 @@ static void board_memory(uintptr_t dtb)
 		n = fdt_node_regs(dtb, path, regs, 32);
 	else
 		n = 0;
-	if (n <= 0) {
-		/* The device tree did not say: use the board table. */
-		regs[0] = BOARD_MEM_BASE;
-		regs[1] = BOARD_MEM_SIZE;
-		n = 1;
+	if (n > 0) {
+		uintptr_t d;
+		uint32_t l;
+
+		/* Show what the device tree says, so it can be read. */
+		con_str("PATH", path);
+		if (fdt_node_prop(dtb, path, "reg", &d, &l))
+			con_bytes("REG", (const void *)d, 32);
 	}
 
 	for (int i = 0; i < n; i++) {
@@ -542,6 +545,18 @@ static void board_memory(uintptr_t dtb)
 	}
 	if (fb >= 0)
 		best = fb;
+	if (fb < 0) {
+		/*
+		 * No region holds the splash framebuffer, so the device tree
+		 * did not say what we need. The kernel has to get the window
+		 * the board table documents, or the early console cannot write
+		 * to the framebuffer and the kernel dies silently.
+		 */
+		regs[0] = BOARD_MEM_BASE;
+		regs[1] = BOARD_MEM_SIZE;
+		n = 1;
+		best = 0;
+	}
 	if (best < 0) {
 		/* no region of 512 MiB: take the largest one */
 		for (int i = 0; i < n; i++)
@@ -617,7 +632,8 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", BOARD_NAME " shim (" BOARD_SOC ")");
-	con_hex2("WIN", "at=", (uint32_t)(win.base >> 32), "size=", (uint32_t)win.base);
+	con_hex64("WIN", win.base);
+	con_hex64("WSZ", win.size);
 	loader_report_regions();
 	con_skip();
 

@@ -17,6 +17,8 @@ void con_skip(void);
 void con_str(const char *label, const char *s);
 void con_line(const char *s);
 void con_hex(const char *label, uint64_t v);
+/* the same, but the whole 64 bits */
+void con_hex64(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
 /* label, then n bytes of memory as hex */

@@ -106,6 +106,19 @@ void con_hex(const char *label, uint64_t v)
 	con_str(label, buf);
 }
 
+void con_hex64(const char *label, uint64_t v)
+{
+	char buf[19];
+
+	buf[0] = '0';
+	buf[1] = 'x';
+	fmt_hex(buf + 2, v, 16);
+	int col = put_str(0, label, YELLOW);
+	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
+	put_str(col, buf, WHITE);
+	row++;
+}
+
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb)
 {
 	char buf[9];
