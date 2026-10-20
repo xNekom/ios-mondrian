@@ -152,6 +152,48 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
   right. The UFS host is `0x1d84000+0x3000` plus the ICE windows, two
   lanes per direction.
 
+- **2026-10-21: the shim hands the kernel over, and the kernel needs the
+  right window.** The loader went through a chain of failures, each one
+  hiding the next:
+  - The ABL of this phone (Android 13) does not hand the ramdisk over
+    the way the shim expects: it gunzips it and the bytes at the address
+    it publishes are not the payload. The payload now travels **appended
+    to the shim image**, the one segment the bootloader copies raw.
+  - That image is 16MB and the USB link of this phone drops in the
+    middle of a transfer that long, so the payload is **compressed with
+    LZ4** (15.3MB -> 6.7MB) and the shim unpacks it with `shim/lz4.c`,
+    checked against the real payload by `shim/lz4_test.c`. The boot
+    image is 6.9MB and goes through in about a second.
+  - The panic screen erased the console, which is where the facts that
+    explain what the shim was doing were. It now starts below the
+    console, and the loader prints the kernel entry bytes (proof that
+    the copy landed) before it jumps.
+  - **The window of RAM the kernel gets has to be the region that holds
+    the splash framebuffer** (0xb8000000): the early console writes to
+    it through the bootstrap V=P map, which only covers that window. The
+    device tree the bootloader passes did not give a region with the
+    splash, so the shim was copying the kernel to the wrong place and
+    it died silently. It now falls back to the window the board table
+    documents (0x80000000+0x6a000000) when the tree does not say.
+  - The verdict is printed as **words**, not hex: the console is read
+    from a photograph and hex is unreadable when it is blurry.
+  - Two host tests keep this from costing phone cycles:
+    `shim/fdt_live_test.c` replays the device tree parser against the
+    tree captured from the phone, and `shim/loader_test.c` checks where
+    the kernel segments land with the real payload.
+
+- **The phone's memory map, measured** (from `/proc/device-tree` in a
+  recovery, `tools/dtdump.py`): six regions, `0x80000000+0x6a000000`,
+  `0xf4600000+0x0ba00000` (ends exactly at 4G), and four above 4G, the
+  biggest `0x800000000+0x37500000`. Every firmware carve-out of the
+  phone (hyp, mpss, splash at `0xb8000000+0x2b00000`, the modem) is in
+  the low bank, so the kernel goes there and the region above 4G is the
+  alternative. The GIC in the live device tree is `0x17100000+0x10000`
+  (GICD) and `0x17180000+0x200000` (GICR, 8 redistributors, stride
+  `0x40000`): the machine config was right. The UFS host is
+  `0x1d84000+0x3000` plus the ICE windows, two lanes per direction,
+  irq SPI 265.
+
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot
