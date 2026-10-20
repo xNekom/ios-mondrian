@@ -114,6 +114,44 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
     stub on :1234; `lldb -o "gdb-remote 1234" -o "register read -a"`
     shows the system registers (that is how `TCR_EL1` was read).
 
+- **2026-10-21: the shim hands the kernel over to the phone.** The shim
+  is the loader this port inherited from sweet, and it had to be taught
+  what this phone's bootloader does:
+  - With a boot image that carries **no device tree** (header v3) the
+    ABL uses the live tree from `vendor_boot` and leaves
+    `/chosen/linux,initrd-start` pointing at whatever Android had
+    there, so the shim found no payload. It now looks for the payload
+    at the end of its own image (the build appends it there) and, as a
+    fallback, scans the memory regions of the device tree for the
+    signature.
+  - The ABL of this phone (Android 13) does not hand the ramdisk over
+    the way the shim expects (it gunzips it, and the bytes at the
+    address it publishes are not the payload), so the payload does not
+    travel in the ramdisk at all: it is **appended to the shim image**,
+    which is the one segment the bootloader copies raw.
+  - That image is 16MB and the USB link of this phone drops in the
+    middle of a transfer that long (the 5MB image went through every
+    time, the 16MB one failed more often than not), so the payload is
+    **compressed with LZ4** (15.3MB -> 6.7MB) and the shim unpacks it
+    with `shim/lz4.c`, checked against the real payload by
+    `shim/lz4_test.c`. The boot image is now 6.9MB and goes through in
+    about a second.
+  - The shim's panic screen used to erase the console, which is where
+    the facts that explain what it was doing were. It now starts below
+    the console, and the loader prints the first bytes of the kernel
+    entry point (proof that the copy landed) before it jumps.
+- **The phone's memory map, measured** (from `/proc/device-tree` in a
+  recovery, `tools/dtdump.py`): six regions, `0x80000000+0x6a000000`,
+  `0xf4600000+0xba00000` (ends exactly at 4G), and four above 4G, the
+  biggest `0x800000000+0x37500000`. Every firmware carve-out of the
+  phone (hyp, mpss, splash at `0xb8000000+0x2b00000`, the modem) is in
+  the low bank, so the kernel goes above 4G and the board table says so
+  (`phys_base 0x800000000`, `mem_size 0x37500000`). The GIC in the live
+  device tree is `0x17100000+0x10000` (GICD) and `0x17180000+0x200000`
+  (GICR, 8 redistributors, stride `0x40000`): the machine config was
+  right. The UFS host is `0x1d84000+0x3000` plus the ICE windows, two
+  lanes per direction.
+
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot
