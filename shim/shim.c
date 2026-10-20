@@ -136,7 +136,9 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		irq_handler();
 		return;
 	}
-	con_clear(BLUE);
+	/* Keep the console: the facts above explain what the shim was doing. */
+	for (int i = 0; i < 14; i++)
+		con_skip();
 	switch (slot & 3) {
 	case 0: con_str("PANIC", "SYNC"); break;
 	case 1: con_str("PANIC", "IRQ"); break;

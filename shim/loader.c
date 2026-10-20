@@ -174,6 +174,8 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("PHYS", "base=", phys_base, "size=", mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
+	/* What is at the entry point: proof that the copy worked. */
+	con_bytes("KERN", (const void *)(p->entry_va + pa_of_va_base), 16);
 
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > phys_base && rd_start < phys_base + mem_size)
