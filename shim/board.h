@@ -30,6 +30,12 @@
 #define PTIMER_INTID		18
 #define SGI_INTID		1
 
+/* The window of RAM the kernel gets, if the device tree does not say.
+ * It has to be a region that holds the splash framebuffer: the early
+ * console writes to it through the bootstrap V=P map. */
+#define BOARD_MEM_BASE		0x80000000UL
+#define BOARD_MEM_SIZE		0x6a000000UL
+
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */
 #define UFS_BASE		0x01d84000UL
@@ -67,6 +73,11 @@
 #define VTIMER_INTID		19
 #define PTIMER_INTID		18
 #define SGI_INTID		1
+
+/* The window of RAM the kernel gets, if the device tree does not say.
+ * On sweet the device tree always says, so there is no fallback. */
+#define BOARD_MEM_BASE		0
+#define BOARD_MEM_SIZE		0
 
 /* Internal UFS host (ufshc@1d84000, sweet live FDT). */
 #define UFS_BASE		0x01d84000UL

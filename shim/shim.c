@@ -506,14 +506,18 @@ static void board_memory(uintptr_t dtb)
 	int n, best = -1;
 	uint32_t ac = 2, sc = 2;
 
-	if (!dtb || !fdt_find_name(dtb, "memory", path, sizeof(path)))
-		return;
-	/* the cell counts may be overridden by the node */
-	fdt_node_u32(dtb, path, "#address-cells", &ac);
-	fdt_node_u32(dtb, path, "#size-cells", &sc);
-	n = fdt_node_regs_cells(dtb, path, regs, 32, (int)ac, (int)sc);
-	if (n <= 0)
-		return;
+	(void)ac;
+	(void)sc;
+	if (dtb && fdt_find_name(dtb, "memory", path, sizeof(path)))
+		n = fdt_node_regs(dtb, path, regs, 32);
+	else
+		n = 0;
+	if (n <= 0) {
+		/* The device tree did not say: use the board table. */
+		regs[0] = BOARD_MEM_BASE;
+		regs[1] = BOARD_MEM_SIZE;
+		n = 1;
+	}
 
 	for (int i = 0; i < n; i++) {
 		uint64_t base = regs[i * 2], size = regs[i * 2 + 1];

@@ -131,23 +131,6 @@ def dump_dir(root, find=None, prop=None, depth=99):
 
 def build(root):
     """Build a .dtb blob out of a /proc/device-tree style directory."""
-    nodes = []
-
-    def walk(path, rel):
-        names = sorted(n for n in os.listdir(path)
-                       if os.path.isfile(os.path.join(path, n)))
-        props = []
-        for name in names:
-            with open(os.path.join(path, name), 'rb') as f:
-                props.append((name, f.read()))
-        nodes.append((rel, props))
-        for child in sorted(os.listdir(path)):
-            sub = os.path.join(path, child)
-            if os.path.isdir(sub):
-                walk(sub, (rel + '/' + child) if rel else child)
-
-    walk(root, '')
-
     strings = bytearray()
     offsets = {}
 
@@ -161,14 +144,23 @@ def build(root):
         return blob + b'\0' * ((4 - len(blob) % 4) % 4)
 
     struct_block = bytearray()
-    for rel, props in nodes:
+
+    def emit(dirpath, name):
+        """Emit one node and, recursively, its children."""
         struct_block.extend(struct.pack('>I', FDT_BEGIN_NODE))
-        struct_block.extend(align4(rel.encode('utf-8') + b'\0'))
-        for name, data in props:
-            struct_block.extend(struct.pack('>III', FDT_PROP, len(data), stroff(name)))
+        struct_block.extend(align4(name.encode('utf-8') + b'\0'))
+        for prop in sorted(n for n in os.listdir(dirpath)
+                           if os.path.isfile(os.path.join(dirpath, n))):
+            with open(os.path.join(dirpath, prop), 'rb') as f:
+                data = f.read()
+            struct_block.extend(struct.pack('>III', FDT_PROP, len(data), stroff(prop)))
             struct_block.extend(align4(data))
+        for child in sorted(n for n in os.listdir(dirpath)
+                            if os.path.isdir(os.path.join(dirpath, n))):
+            emit(os.path.join(dirpath, child), child)
         struct_block.extend(struct.pack('>I', FDT_END_NODE))
-    struct_block.extend(struct.pack('>I', FDT_END))
+
+    emit(root, '')
 
     rsvmap = struct.pack('>QQ', 0, 0)
     header_len = 40
