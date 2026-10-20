@@ -289,7 +289,7 @@ const char *loader_boot(uintptr_t dtb)
 
 		for (int i = 0; i < n_mem_regs; i++) {
 			uint64_t base = mem_regs[i * 2], size = mem_regs[i * 2 + 1];
-			if (FB_PHYS >= base && FB_PHYS < base + size)
+			if (FB_BASE >= base && FB_BASE < base + size)
 				fb_ok = 1;
 		}
 		if (entry_pa >= phys_base && entry_pa < phys_base + mem_size)
