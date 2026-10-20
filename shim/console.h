@@ -10,6 +10,8 @@
 
 extern volatile uint32_t *con_fb;
 
+/* The console writes nothing until it is pointed at a framebuffer. */
+void con_enable(uintptr_t base, int w, int h);
 void con_clear(uint32_t bg);
 void con_skip(void);
 void con_str(const char *label, const char *s);

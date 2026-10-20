@@ -377,6 +377,46 @@ static void fact(const char *kind, const char *key, const uint64_t *v, int n)
 	con_line(buf);
 }
 
+/* The addresses the shim uses come from the device tree the bootloader
+ * passed, not from the compile time constants: a guessed address could be a
+ * peripheral register. The constants are only a fallback for a board whose
+ * values were measured (sweet).
+ */
+static void board_from_dtb(uintptr_t dtb)
+{
+	static const char *const splash[] = {
+		"cont_splash_region", "sec_boot_screen", "splash",
+	};
+	char path[64];
+	uint64_t regs[8];
+
+	if (!dtb)
+		return;
+
+	/* The framebuffer the bootloader left for the panel. */
+	for (unsigned i = 0; i < sizeof(splash) / sizeof(splash[0]); i++) {
+		if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
+			continue;
+		if (fdt_node_regs(dtb, path, regs, 4) > 0) {
+			con_enable((uintptr_t)regs[0], FB_W, FB_H);
+			con_hex2("FB", "at=", (uint32_t)regs[0], "size=", (uint32_t)regs[1]);
+			goto ufs;
+		}
+	}
+#if !BOARD_FB_FROM_DTB
+	/* sweet: the measured address, the device tree does not name it */
+	con_enable(FB_BASE, FB_W, FB_H);
+	con_hex2("FB", "at=", (uint32_t)FB_BASE, "size=", (uint32_t)FB_SIZE);
+#endif
+ufs:
+	/* The UFS host, if the device tree names it. */
+	if (fdt_find_compatible(dtb, "qcom,ufshc", path, sizeof(path)) &&
+	    fdt_node_regs(dtb, path, regs, 4) > 0) {
+		ufs_set_base((uintptr_t)regs[0]);
+		con_hex2("UFS", "at=", (uint32_t)regs[0], "size=", (uint32_t)regs[1]);
+	}
+}
+
 static void dump_facts(uintptr_t dtb)
 {
 	static const char *const compat[] = {
@@ -405,6 +445,20 @@ static void dump_facts(uintptr_t dtb)
 			uint64_t v[2] = { regs[i * 2], regs[i * 2 + 1] };
 			key[3] = '0' + i;
 			fact("memory", key, v, 2);
+		}
+	}
+	/* The framebuffer the bootloader leaves for the panel: the reserved
+	 * memory region of the splash. */
+	{
+		static const char *const splash[] = {
+			"cont_splash_region", "sec_boot_screen", "splash",
+		};
+		for (unsigned i = 0; i < sizeof(splash) / sizeof(splash[0]); i++) {
+			if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
+				continue;
+			int n = fdt_node_regs(dtb, path, regs, 4);
+			if (n > 0)
+				fact("reg", path, regs, n * 2);
 		}
 	}
 	for (unsigned i = 0; i < sizeof(compat) / sizeof(compat[0]); i++) {
@@ -451,6 +505,9 @@ static uint32_t to_us(uint64_t ticks)
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+	/* Where the framebuffer is comes from the device tree. */
+	board_from_dtb(dtb);
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

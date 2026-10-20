@@ -225,12 +225,16 @@ if __name__ == '__main__':
     ap.add_argument('--qemu', action='store_true', help='QEMU virt addresses')
     ap.add_argument('--highmem', action='store_true', help='use the upper DDR bank')
     ap.add_argument('--facts', help='shim dtb dump to take the memory map from')
+    ap.add_argument('--allow-provisional', action='store_true',
+                    help='build even if the board still has guessed values')
     ap.add_argument('--dump', action='store_true', help='print the tree')
     a = ap.parse_args()
 
     board = boards.get_board(a.board)
     if a.facts:
         board = boards.apply_facts(board, boards.parse_facts(open(a.facts).read()))
+    if not a.allow_provisional:
+        boards.require_measured(board, 'mkadt.py')
     root = build(board, qemu=a.qemu, highmem=a.highmem)
     blob = adt.serialize(root)
     open(a.out, 'wb').write(blob)

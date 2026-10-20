@@ -40,6 +40,7 @@
  * the panel is driven over DSI D-PHY. The address and the geometry have to be
  * read from the device (see the "dtb dump" in the shim). */
 #define FB_BASE			0x9c000000UL
+#define FB_SIZE			0x1700000UL
 #define FB_W			1440
 #define FB_H			3200
 #define FB_STRIDE		(FB_W * 4)
@@ -47,6 +48,10 @@
 #define PAYLOAD_MAGIC		"MONDXNU"
 
 #define NR_CPUS			8
+
+/* The framebuffer address of this board is not measured yet: the shim must
+ * take it from the device tree and must not fall back to the constant. */
+#define BOARD_FB_FROM_DTB	1
 
 #else	/* BOARD_SWEET (default) */
 
@@ -69,6 +74,7 @@
 
 /* reserved-memory cont_splash_region */
 #define FB_BASE			0x9c000000UL
+#define FB_SIZE			0x1700000UL
 #define FB_W			1080
 #define FB_H			2400
 #define FB_STRIDE		(FB_W * 4)
@@ -76,5 +82,10 @@
 #define PAYLOAD_MAGIC		"SWEETXNU"
 
 #define NR_CPUS			8
+
+/* The framebuffer of sweet was measured on the device (the ABL leaves it
+ * at the cont_splash_region), so the constant may be used if the device
+ * tree does not name it. */
+#define BOARD_FB_FROM_DTB	0
 
 #endif	/* BOARD_MONDRIAN */

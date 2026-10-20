@@ -31,8 +31,17 @@
 
 #define BLOCK		4096u
 
-static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(UFS_BASE + off); }
-static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(UFS_BASE + off) = v; }
+/* The UFS host address comes from the device tree when it is there: a
+ * guessed address could be a peripheral register. */
+static uintptr_t ufs_base = UFS_BASE;
+
+void ufs_set_base(uintptr_t base)
+{
+	ufs_base = base;
+}
+
+static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(ufs_base + off); }
+static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(ufs_base + off) = v; }
 
 /* UTP transfer request descriptor (32 bytes). */
 struct utrd {

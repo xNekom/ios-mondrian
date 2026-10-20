@@ -203,8 +203,15 @@ if __name__ == '__main__':
     ap.add_argument('--board', default='sweet', help='sweet | mondrian')
     ap.add_argument('--cmdline', help='kernel boot arguments (default: the board\'s)')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--facts', help='shim dtb dump to take the memory map from')
+    ap.add_argument('--allow-provisional', action='store_true',
+                    help='build even if the board still has guessed values')
     a = ap.parse_args()
     board = boards.get_board(a.board)
+    if a.facts:
+        board = boards.apply_facts(board, boards.parse_facts(open(a.facts).read()))
+    if not a.allow_provisional:
+        boards.require_measured(board, 'mkpayload.py')
     cmdline = a.cmdline if a.cmdline is not None else board.cmdline
     blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk, board)
     open(a.out, 'wb').write(blob)

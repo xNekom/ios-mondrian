@@ -90,6 +90,10 @@ class Board:
     touch: str = ''            # 'goodix-i2c' | 'goodix-spi'
     keys: str = ''             # 'pm6150' | 'pm8008'
     panel: str = ''            # 'lcd-dsc' | 'amoled-dsi'
+    # The fields that are still a guess. An image must not be built from
+    # them: the values have to be read from the phone first (the shim dumps
+    # the live device tree, tools/boards.py reads it back).
+    provisional: frozenset = frozenset()
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +208,11 @@ MONDRIAN = Board(
     touch='goodix-spi',          # Goodix over QUPv3 SE4 SPI, not I2C
     keys='pm8008',               # PM8008 (PMR735A + PM8350B), not the PM6150
     panel='amoled-dsi',
+    # Not measured yet: the memory map of the phone and the framebuffer the
+    # bootloader leaves for a DSI panel. No bootable image may be built from
+    # these.
+    provisional=frozenset({'phys_base', 'mem_size', 'high_phys_base',
+                           'high_mem_size', 'fb', 'fb_size'}),
     # The boot arguments are the ones sweet uses, with the framebuffer
     # arguments renamed for this board. cpus=6 starts the six A710/A510
     # cores and leaves the X2 and the other A710s parked, like sweet leaves
@@ -223,6 +232,35 @@ def get_board(name):
         return BOARDS[name]
     except KeyError:
         raise SystemExit(f'unknown board "{name}"; known: {", ".join(sorted(BOARDS))}')
+
+
+def provisional_fields(board):
+    """The fields of the board that are still a guess, with their values."""
+    return {f: getattr(board, f) for f in sorted(board.provisional)}
+
+
+def is_measured(board):
+    """True when every value of the board comes from the phone."""
+    return not board.provisional
+
+
+def require_measured(board, what):
+    """Stop unless the board was measured on the phone.
+
+    A bootable image is built from the memory map and the framebuffer of the
+    phone. If those are still guesses, the image can write to a register
+    that is not a framebuffer, so the build is refused.
+    """
+    fields = provisional_fields(board)
+    if not fields:
+        return
+    raise SystemExit(
+        f'{what}: the board "{board.name}" is not measured yet.\n'
+        f'  Still a guess: ' +
+        ', '.join(f'{k}={v:#x}' for k, v in fields.items()) + '\n'
+        f'  Read them off the phone first (the shim dumps the live device\n'
+        f'  tree) and put them in tools/boards.py, or pass --allow-provisional\n'
+        f'  if you know what you are doing.')
 
 
 # --------------------------------------------------------------------------
@@ -255,9 +293,11 @@ def apply_facts(board, facts):
     """Return a copy of board with the values from a shim dtb dump applied.
 
     Only the keys the dump actually carries are touched, so a partial dump
-    (say, only the memory node) still works.
+    (say, only the memory node) still works. The fields that the dump
+    measured are no longer provisional.
     """
     b = board
+    done = set()
 
     # Memory banks: "FACT memory reg0 <base> <size>".
     banks = [(v[0], v[1]) for (kind, key), v in facts.items()
@@ -268,6 +308,7 @@ def apply_facts(board, facts):
         high = [x for x in banks if x[0] >= 0x100000000]
         if high:
             b = replace(b, high_phys_base=high[-1][0], high_mem_size=high[-1][1])
+        done |= {'phys_base', 'mem_size', 'high_phys_base', 'high_mem_size'}
 
     for (kind, key), values in facts.items():
         if kind != 'reg' or len(values) < 2:
@@ -275,10 +316,18 @@ def apply_facts(board, facts):
         name = key.rsplit('/', 1)[-1]
         if name.startswith('ufs') and len(values) >= 2:
             b = replace(b, ufs=values[0], ufs_size=values[1])
+            done |= {'ufs', 'ufs_size'}
         elif name in ('intc', 'gic') and len(values) >= 4:
             # GICD, GICD size, GICR, GICR size
             b = replace(b, gicd=values[0], gicd_size=values[1],
                         gicr=values[2], gicr_size=values[3])
+            done |= {'gicd', 'gicd_size', 'gicr', 'gicr_size'}
+        elif 'splash' in name or 'screen' in name:
+            # the framebuffer the bootloader leaves for the panel
+            b = replace(b, fb=values[0], fb_size=values[1])
+            done |= {'fb', 'fb_size'}
+
+    b = replace(b, provisional=frozenset(board.provisional - done))
     return b
 
 

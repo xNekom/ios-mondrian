@@ -33,6 +33,39 @@ of the sweet phone. They are listed in `HARDWARE_PATCHES` of
 `tools/port-series.py` with what each of them needs, and they are the work
 list below.
 
+## Safety: what can and cannot brick the phone
+
+The port must never turn a mistake into a brick. The rules:
+
+| Operation | Risk | Rule |
+| --- | --- | --- |
+| `fastboot boot shim-boot.img` | none | temporary, nothing is written to any partition. A bad image just leaves the phone in fastboot. |
+| `fastboot flash userdata …` | **erases the Android user data** (recoverable by reflashing Android) | only after the user says so. `tools/flash-root.sh` does this and nothing else. |
+| `fastboot flash boot/init_boot/dtbo/vbmeta/abl/tz` | **hard brick** | never. The bootloader chain is not touched, in this fork or upstream. |
+
+Two more rules, because the failure mode that is *not* a brick is still
+bad: writing to a wrong address.
+
+* **The shim takes its addresses from the device tree the bootloader
+  passed**, not from constants. The framebuffer comes from the splash
+  region of the device tree, the UFS host from the `qcom,ufshc` node. If
+  the device tree does not name a framebuffer, the console stays off and
+  the shim writes nothing at all. On sweet the measured constant is only a
+  fallback; on mondrian (`BOARD_FB_FROM_DTB`) there is no fallback.
+* **No image is built from guessed numbers.** `tools/boards.py` marks the
+  fields that are still a guess (`Board.provisional`), and `mkadt.py` and
+  `mkpayload.py` refuse to build for such a board:
+
+  ```
+  $ python3 tools/mkadt.py mondrian.adt --board mondrian --highmem
+  mkadt.py: the board "mondrian" is not measured yet.
+    Still a guess: fb=0x9c000000, fb_size=0x1700000, ...
+  ```
+
+  The values are cleared when a shim dump of the real phone is fed in
+  (`--facts facts.txt`), so the sequence is: boot the shim without a
+  payload, read the screen, fill in the table.
+
 ## The hardware delta
 
 Everything below is taken from the public sources listed at the end; the

@@ -25,6 +25,10 @@ int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max);
 
 /* Path of the first node whose name starts with prefix ("memory" matches
  * "memory@80000000"), or of the first node whose "compatible" property
- * contains the given string. Both return 1 and fill out[] on success. */
+ * contains the given string. Both return 1 and fill out[] on success.
+ * fdt_find_name looks at the children of the root, fdt_find_name_depth at
+ * the nodes of a given depth (2 = a child of the root). */
 int fdt_find_name(uintptr_t fdt, const char *prefix, char *out, int out_len);
+int fdt_find_name_depth(uintptr_t fdt, const char *prefix, char *out, int out_len,
+    int depth);
 int fdt_find_compatible(uintptr_t fdt, const char *compat, char *out, int out_len);

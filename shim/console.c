@@ -1,6 +1,11 @@
 /*
  * Minimal text console on the ABL splash framebuffer. With the MMU off
  * every access is Device memory, so stay aligned (-mstrict-align).
+ *
+ * The framebuffer is not a compile time constant: the shim takes it from
+ * the device tree the bootloader passed, and the console stays off until it
+ * knows one (see con_enable). Writing to a guessed address could hit a
+ * peripheral register, so an unknown framebuffer means no output at all.
  */
 #include "console.h"
 #include "font.h"
@@ -11,15 +16,27 @@
 #define MARGIN		24
 #define LABEL_COLS	8
 
-volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+volatile uint32_t *con_fb;
 static uint32_t con_bg;
 static int row;
+static int con_w = FB_W;
+static int con_h = FB_H;
+
+/* Point the console at the framebuffer the bootloader left. */
+void con_enable(uintptr_t base, int w, int h)
+{
+	con_fb = (volatile uint32_t *)base;
+	con_w = w > 0 ? w : FB_W;
+	con_h = h > 0 ? h : FB_H;
+}
 
 void con_clear(uint32_t bg)
 {
-	for (int y = 0; y < FB_H; y++) {
+	if (!con_fb)
+		return;
+	for (int y = 0; y < con_h; y++) {
 		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
-		for (int x = 0; x < FB_W; x++)
+		for (int x = 0; x < con_w; x++)
 			line[x] = bg;
 	}
 	con_bg = bg;
@@ -32,7 +49,7 @@ static void put_char(int col, char ch, uint32_t fg)
 		ch = '?';
 	const unsigned char *g = font8x16[ch - 0x20];
 	int x0 = MARGIN + col * CH_W, y0 = MARGIN + row * CH_H;
-	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
+	if (x0 + CH_W > con_w || y0 + CH_H > con_h)
 		return;
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
@@ -48,6 +65,8 @@ static void put_char(int col, char ch, uint32_t fg)
 
 static int put_str(int col, const char *s, uint32_t fg)
 {
+	if (!con_fb)
+		return 0;
 	while (*s)
 		put_char(col++, *s++, fg);
 	return col;

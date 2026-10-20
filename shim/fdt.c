@@ -233,6 +233,13 @@ int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max)
 
 int fdt_find_name(uintptr_t fdt, const char *prefix, char *out, int out_len)
 {
+	return fdt_find_name_depth(fdt, prefix, out, out_len, 2);
+}
+
+/* Search a node by name at a given depth (2 = a child of the root). */
+int fdt_find_name_depth(uintptr_t fdt, const char *prefix, char *out, int out_len,
+    int depth_wanted)
+{
 	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
 	uintptr_t p, strings;
 	int found = 0;
@@ -252,8 +259,8 @@ int fdt_find_name(uintptr_t fdt, const char *prefix, char *out, int out_len)
 			w.depth++;
 			path_push(&w, name);
 			p = align4(skip_str(p));
-			if (!found && w.depth == 2) {
-				/* a root level node: compare the name up to '@' */
+			if (!found && w.depth == depth_wanted) {
+				/* compare the name up to '@' */
 				const char *at = name;
 				while (*at && *at != '@')
 					at++;

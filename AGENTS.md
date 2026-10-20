@@ -20,6 +20,13 @@ Pro, SM8475) is the port being done here.
 - The board table lives in `tools/boards.py`; the shim has its own copy in
   `shim/board.h`. Change both together, and prefer reading the live device
   tree (the shim prints it) over guessing a number.
+- **Never flash anything but `userdata`.** `boot`, `init_boot`, `dtbo`,
+  `vbmeta`, `abl` and `tz` are not touched: writing them is a hard brick.
+  `tools/flash-root.sh` flashes the root into `userdata` and asks first.
+- **Never build an image from guessed addresses.** The shim takes the
+  framebuffer and the UFS host from the device tree, and `mkadt.py` /
+  `mkpayload.py` refuse a board whose values are still provisional
+  (`--allow-provisional` is the deliberate way past that).
 - Device bring-up uses temporary `fastboot boot` images. Preserve the Android
   installation and partition backups. The iOS root goes into the existing
   `userdata` partition (no GPT changes). Keep bootloaders, recovery, modem,
