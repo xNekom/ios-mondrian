@@ -82,6 +82,59 @@ def validate_patches(verbose=False):
     return ok
 
 
+def validate_hunk_counts(verbose=False):
+    """Check that every hunk header matches the lines it covers.
+
+    A patch with a wrong count is "corrupt" for git apply, and the CI
+    silently skips such a patch: the build then runs without it.
+    """
+    ok = True
+    hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+
+    def check(hunk, rel):
+        nonlocal ok
+        if hunk is None:
+            return
+        if hunk['ao'] != hunk['oc'] or hunk['an'] != hunk['nc']:
+            print(red(f"[-] {rel}: hunk at line {hunk['ln']} says -{hunk['oc']} +{hunk['nc']} "
+                      f"but covers -{hunk['ao']} +{hunk['an']}"))
+            ok = False
+
+    for patch_dir in PATCH_DIRS:
+        full = os.path.join(REPO_ROOT, patch_dir)
+        if not os.path.isdir(full):
+            continue
+        for path in sorted(glob.glob(os.path.join(full, '*.patch'))):
+            rel = os.path.relpath(path, REPO_ROOT)
+            with open(path, 'r', errors='ignore') as f:
+                lines = f.read().split('\n')
+            hunk = None
+            for ln, line in enumerate(lines, 1):
+                m = hunk_re.match(line)
+                if m:
+                    check(hunk, rel)
+                    hunk = {'ln': ln, 'oc': int(m.group(2) or 1), 'nc': int(m.group(4) or 1),
+                            'ao': 0, 'an': 0}
+                    continue
+                if hunk is None:
+                    continue
+                if line.startswith('diff --git'):
+                    check(hunk, rel)
+                    hunk = None
+                    continue
+                if line.startswith('+') and not line.startswith('+++'):
+                    hunk['an'] += 1
+                elif line.startswith('-') and not line.startswith('---'):
+                    hunk['ao'] += 1
+                elif line.startswith(' '):
+                    hunk['ao'] += 1
+                    hunk['an'] += 1
+            check(hunk, rel)
+    if ok:
+        print(green("[✓] Validated the hunk headers of every patch"))
+    return ok
+
+
 def validate_python_scripts(verbose=False):
     tools_dir = os.path.join(REPO_ROOT, 'tools')
     py_files = sorted(glob.glob(os.path.join(tools_dir, '*.py')))
@@ -139,10 +192,11 @@ def main():
 
     print(bold("=== Running ios-mondrian Repository Validation ==="))
     ok_patches = validate_patches(a.verbose)
+    ok_hunks = validate_hunk_counts(a.verbose)
     ok_python = validate_python_scripts(a.verbose)
     ok_shell = validate_shell_scripts(a.verbose)
 
-    if ok_patches and ok_python and ok_shell:
+    if ok_patches and ok_hunks and ok_python and ok_shell:
         print(bold(green("\nAll repository integrity checks PASSED successfully!")))
         return 0
     else:

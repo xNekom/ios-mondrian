@@ -209,7 +209,7 @@ index 8226b8c..c7d274f 100644
  	VMAPPLE.h \
 -	BCM2837.h
 +	BCM2837.h \
-	MONDRIAN.h
++	MONDRIAN.h
  
  
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
@@ -218,7 +218,7 @@ new file mode 100644
 index 0000000..a044ad0
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/MONDRIAN.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,87 @@
 +/*
 + * Board config for the POCO F5 Pro / Redmi K60 ("mondrian", Qualcomm
 + * SM8475 / Snapdragon 8+ Gen 1): Cortex-X2 + 3 x Cortex-A710 + 4 x
