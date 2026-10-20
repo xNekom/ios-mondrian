@@ -248,7 +248,7 @@ index 0000000..a044ad0
 +#define NO_MONITOR                1
 +#define NO_ECORE                  1
 +
-+#define MONDRIAN                  1
++#define MONDRIAN                     1
 +
 +#define ARM_ARCH_TIMER
 +#define __ARM_ARCH__              8

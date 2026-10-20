@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""Port a patch from the sweet series to the mondrian series.
+"""Port the sweet patch series to the mondrian series.
 
-  tools/port-series.py 0004-sweet-machine-config.patch
-  tools/port-series.py --all
+  tools/port-series.py --all          # port everything that is not hardware
+  tools/port-series.py 0016 0017      # port single patches
+  tools/port-series.py --all --dry-run
 
 The mechanical part of the port is the board identifiers: the sweet series
 guards its code with SWEET and calls its files, drivers and boot arguments
 sweet_*.  On mondrian they become MONDRIAN and mondrian_*.  This script does
-that renaming and leaves the parts that depend on the hardware alone, but
-marks them so they are not missed.
+that renaming.
 
-It does not check that the result applies: the patch has to be tried with
-git apply against the patched xnu tree, or with a CI run.
+The patches that talk to the hardware of the sweet phone are not ported: a
+renamed copy would compile and then not work, because SM8475 has a UFS 3.1
+host, an AMOLED panel on DSI D-PHY, a Goodix touch on SPI and a PM8008
+instead of the PM6150.  They are listed in HARDWARE_PATCHES with what each
+of them needs; docs/MONDIAN_PORT.md has the details.
+
+The result is checked with tools/apply-series.py, which applies the series
+to an xnu tree in seconds.
 """
 import argparse
 import os
@@ -30,7 +36,6 @@ RENAMES = [
     (r'_PEXPERT_ARM64_SWEET_H', '_PEXPERT_ARM64_MONDRIAN_H'),
     (r'pexpert/arm64/SWEET\.h', 'pexpert/arm64/MONDRIAN.h'),
     (r'\bdefined\s*\(SWEET\)', 'defined(MONDRIAN)'),
-    (r'\bdefined\s*\(SWEET\)\b', 'defined(MONDRIAN)'),
     (r'\bSweetPlatformExpert\b', 'MondrianPlatformExpert'),
     (r'sweet_ufs', 'mondrian_ufs'),
     (r'sweet-ufs', 'mondrian-ufs'),
@@ -39,82 +44,320 @@ RENAMES = [
     (r'sweettouch', 'mondriantouch'),
     (r'sweetkeys', 'mondriankeys'),
     (r'xiaomi,sweet', 'xiaomi,mondrian'),
+    # the description of the board, so that the context lines of the
+    # ported patches still match the files they modify
+    (r'Redmi Note 10 Pro, SM7150\): MASTER', 'POCO F5 Pro, SM8475): MASTER'),
+    (r'Redmi Note 10 Pro bootstrap console', 'POCO F5 Pro bootstrap console'),
+    (r'Redmi Note 10 Pro', 'POCO F5 Pro'),
+    (r'Snapdragon 732G\): Kryo 470 = Cortex-A76 \+ Cortex-A55, ARMv8\.2, no PAC\.',
+     'Snapdragon 8+ Gen 1): Cortex-X2 + Cortex-A710 + Cortex-A510, ARMv9.0, no PAC.'),
+    (r'Kryo 470: Cortex-A76 \+ Cortex-A55', 'Cortex-X2 + Cortex-A710 + Cortex-A510'),
+    (r'Kryo 470', 'Kryo 700'),
+    (r'Cortex-A76/A55', 'Cortex-X2/A710/A510'),
+    (r'\b16K pages\b', '4K pages'),
+    # the board specific identifiers: SWEET_SMP_MAX_CPUS, SWEET_FB_*,
+    # SWEET_LOG_*, sweet_ufs.c, sweet_keys.c, ...
+    (r'\bSWEET_([A-Z0-9_]+)\b', r'MONDRIAN_\1'),
+    (r'\bsweet_([a-z0-9_]+)\b', r'mondrian_\1'),
+    # the file names: SweetCPU.cpp, SweetPlatformExpert.cpp, SWEET.h
+    (r'\bSweet([A-Z]\w*)', r'Mondrian\1'),
+    (r'\bSWEET\.h\b', 'MONDRIAN.h'),
     (r'\bSWEET\b', 'MONDRIAN'),
     (r'\bsweet\b', 'mondrian'),
     (r'\bSweet\b', 'Mondrian'),
 ]
 
-# Hints that the hunk talks to the hardware and has to be looked at by hand.
-HARDWARE_HINTS = {
-    'ufs': 'the UFS host is a UFS 3.1 controller on SM8475, not the UFSHCI 2.1 '
-            'sweet drives: the UTRD is 16 dwords and the PRDT is 64 bit',
-    'goodix': 'the touch is a Goodix on QUPv3 SPI (0x990000), not on I2C',
-    'geni': 'the QUPv3 wrapper is at 0x9c0000 with the SE4 at 0x990000',
-    'spmi': 'the PMIC is a PM8008 (PMR735A + PM8350B), not a PM6150',
-    'rpmh': 'the regulator votes are for the PM8008 rails, not the PM6150 LDO11',
-    'dsi': 'the panel is an AMOLED on DSI D-PHY, not an LCD in DSC video mode',
-    'framebuffer': 'the ABL framebuffer of a DSI panel is not the cont_splash_region',
-    '0x9c000000': 'the framebuffer address of mondrian has to be measured',
-    '0x17a00000': 'the GIC of SM8475 is at 0x17100000 (GICD) and 0x17180000 (GICR)',
-    '0x1d84000': 'the UFS host is still at 0x1d84000, but it is a different IP',
-    '16k': 'mondrian runs with 4 KiB pages: __ARM_16K_PG__ must not be defined',
-    '0x4000': '4 KiB pages change the page table geometry (L2 block = 2 MB)',
+# Patches that talk to the hardware of the sweet phone.
+HARDWARE_PATCHES = {
+    '0028': 'UFS root device: sweet drives a UFSHCI 2.1 host, mondrian a UFS 3.1 one',
+    '0029': 'UFS: unsealed root volume, needs the UFS 3.1 driver',
+    '0030': 'UFS writes, needs the UFS 3.1 driver',
+    '0031': 'UFS: read/write root, needs the UFS 3.1 driver',
+    '0034': 'UFS DMA above 4G, needs the UFS 3.1 driver',
+    '0046': 'IOSurface and IOMobileFramebuffer: the panel is an AMOLED on DSI',
+    '0047': 'the persistent console log writes to the end of the userdata partition: UFS',
+    '0054': 'the process sampler reads the UFS root and the framebuffer',
+    '0055': 'the AKS state sampler extends the process sampler',
+    '0056': 'throttled panel copy: same',
+    '0060': 'keys over SPMI and touch over I2C: mondrian has a PM8008 and SPI',
+    '0061': 'the display size: the framebuffer of the panel is not there yet',
+    '0062': 'RPMh vote for the touch rail and the battery: the rails differ',
+    '0063': 'GENI I2C FIFO and the Goodix GT9896: mondrian is Goodix on SPI',
+    '0067': 'the console mute is a display thing',
+    '0068': 'the IOSurface lookup: needs the IOSurface patch',
+    '0069': 'UFS: batched log flushes',
+    '0071': 'the touch edge events need the display mapping of the panel',
+    '0072': 'USB probe: the SM8475 DWC3 needs its own configuration',
+    '0073': 'USB device',
+    '0074': 'USB VBUS override',
+    '0075': 'USB ECM',
+    '0076': 'USB receive path',
+    '0077': 'USB live log',
+    '0079': 'display power: the panel is an AMOLED on DSI',
+    '0081': 'USB link state',
+}
+
+# Ported by hand, not copied.
+HAND_WRITTEN = {
+    '0004': 'the machine config (xnu/patches-mondrian/0001)',
+    '0006': 'the master config (xnu/patches-mondrian/0002)',
+}
+
+# Patches of which only some files are ported: the rest needs the hardware
+# of the sweet phone, but these parts are generic.
+PARTIAL = {
+    '0046': ['iokit/Kernel/arm/SweetPlatformExpert.cpp'],
 }
 
 
+def fix_hunk_counts(text):
+    """Recompute the counts of the hunk headers.
+
+    Filtering a patch can cut a hunk short (the context lines after the
+    change belong to the group), and a hunk with a wrong count is
+    "corrupt" for git apply.
+    """
+    trailing = text.endswith('\n')
+    lines = text.split('\n')
+    if trailing:
+        # the empty string after the last newline is not a context line
+        lines = lines[:-1]
+    out = []
+    group = []          # the lines of the current file group
+
+    for line in lines:
+        if line.startswith('diff --git') or line.startswith('--- '):
+            if group:
+                out.extend(fix_group(group))
+                group = []
+        group.append(line)
+    if group:
+        out.extend(fix_group(group))
+    result = '\n'.join(out)
+    return result + '\n' if trailing else result
+
+
+def fix_group(group):
+    """The lines of one file group, with the hunk headers corrected."""
+    out = []
+    i = 0
+    while i < len(group):
+        line = group[i]
+        m = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$', line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        ao = an = 0
+        j = i + 1
+        while j < len(group):
+            l = group[j]
+            if l.startswith('@@') or l.startswith('diff --git') or l.startswith('--- '):
+                break
+            if l.startswith('+'):
+                an += 1
+            elif l.startswith('-'):
+                ao += 1
+            elif l.startswith(' '):
+                ao += 1
+                an += 1
+            else:
+                # an empty line is a context line whose space was stripped
+                ao += 1
+                an += 1
+            j += 1
+        out.append(f'@@ -{m.group(1)},{ao} +{m.group(3)},{an} @@{m.group(5)}')
+        out.extend(group[i + 1:j])
+        i = j
+    return out
+
+
+# Context lines that a ported patch carries but that do not exist in the
+# mondrian tree: the file or the entry comes from a hardware patch that is
+# not ported yet. The lines are dropped and the hunk counts are fixed.
+DROP_LINES = {
+    '0058': [
+        # the display files are added by the display patch, which is not ported
+        'iokit/Kernel/arm/SweetSurface.cpp',
+        'iokit/Kernel/arm/SweetFramebuffer.cpp',
+        # the context after the display entry of the kernel config table
+        '#endif',
+        "'IOClass'         = IOPanicPlatform;",
+    ],
+}
+
+# Context blocks of a ported patch that have to point at something else: the
+# entry they name is added by a hardware patch that is not ported yet.
+CONTEXT_BLOCKS = {
+    '0058': [
+        # the HID entries go after the platform expert entry, not after the
+        # display one (the display patch is not ported yet)
+        (['    "     \'IOProviderClass\' = IOPlatformDevice;"',
+          '    "     \'IONameMatch\'     = \'sweet,display\';"',
+          '    "   },"'],
+         ['    "     \'IONameMatch\'     = \'xiaomi,sweet\';"',
+          '    "     \'IOProbeScore\'    = 10000:32;"',
+          '    "   },"']),
+    ],
+    '0059': [
+        # the platform expert ends with the /arm-io nubs (the generic part of
+        # the display patch), so the context is one line shorter
+        (["\t}", "}", ""], ["}", ""]),
+    ],
+}
+
+def substitute_blocks(text, blocks):
+    """Replace a sequence of context lines with another sequence.
+
+    The blocks hold the content of the lines, without the diff prefix.
+    """
+    lines = text.split('\n')
+    for old, new in blocks:
+        for i in range(len(lines) - len(old) + 1):
+            if all(lines[i + k] == ' ' + o for k, o in enumerate(old)):
+                lines[i:i + len(old)] = [' ' + n for n in new]
+                break
+    return '\n'.join(lines)
+
+
+def substitute(text, rules):
+    """Replace the substrings of the context lines."""
+    out = []
+    for line in text.split('\n'):
+        for old, new in rules:
+            if old in line:
+                line = line.replace(old, new)
+        out.append(line)
+    return '\n'.join(out)
+
+
+def drop_lines(text, patterns):
+    """Remove the context lines that match one of the patterns."""
+    out = []
+    for line in text.split('\n'):
+        if line.startswith(' ') and any(p in line for p in patterns):
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+def split_groups(text):
+    """Split a patch into its per-file groups.
+
+    A group starts at a 'diff --git' line or, in the patches that have no
+    such header, at a '--- ' line.
+    """
+    groups = []
+    cur = []
+    for line in text.split('\n'):
+        if line.startswith('diff --git') or line.startswith('--- '):
+            if cur:
+                groups.append('\n'.join(cur))
+            cur = [line]
+        elif cur:
+            cur.append(line)
+    if cur:
+        groups.append('\n'.join(cur))
+    return groups
+
+
+def filter_groups(text, patterns):
+    """Keep only the file groups whose path matches one of the patterns."""
+    groups = split_groups(text)
+    kept = []
+    for g in groups:
+        header = g.split('\n', 1)[0]
+        if any(p in header for p in patterns):
+            kept.append(g)
+    return '\n'.join(kept)
+
+
 def port_text(text):
-    """Apply the board renames, return (new text, list of hardware notes)."""
-    notes = []
+    """Apply the board renames."""
     for pat, rep in RENAMES:
         text = re.sub(pat, rep, text)
-    low = text.lower()
-    for needle, note in HARDWARE_HINTS.items():
-        if needle in low and note not in notes:
-            notes.append(note)
-    return text, notes
+    return text
 
 
-def port_file(path):
-    with open(path, 'r', errors='surrogateescape') as f:
-        text = f.read()
-    new, notes = port_text(text)
-    return new, notes
-
-
-def out_name(name):
-    return re.sub(r'\bsweet\b', 'mondrian', name.replace('-sweet-', '-mondrian-'))
+def out_name(name, number):
+    """The name of the ported patch: the number of the mondrian series."""
+    stem = re.sub(r'^\d{4}-', '', name)
+    stem = re.sub(r'\bsweet\b', 'mondrian', stem)
+    return f'{number:04d}-{stem}'
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('patch', nargs='*', help='patch file name (in xnu/patches/)')
+    ap.add_argument('patch', nargs='*', help='patch number or name (in xnu/patches/)')
     ap.add_argument('--all', action='store_true', help='port every patch of the series')
     ap.add_argument('--out', default=MONDRIAN_SERIES, help='output directory')
+    ap.add_argument('--start', type=int, default=3, help='first number of the output series')
     ap.add_argument('--dry-run', action='store_true', help='only report')
     a = ap.parse_args()
 
+    all_patches = sorted(n for n in os.listdir(SWEET_SERIES) if n.endswith('.patch'))
+    wanted = []
     if a.all:
-        names = sorted(n for n in os.listdir(SWEET_SERIES) if n.endswith('.patch'))
+        wanted = [n for n in all_patches
+                  if n[:4] not in HARDWARE_PATCHES and n[:4] not in HAND_WRITTEN]
     else:
-        names = a.patch
-    if not names:
+        for p in a.patch:
+            match = [n for n in all_patches if n.startswith(p) or n[:4] == p]
+            if not match:
+                print(f'-- {p}: no such patch', file=sys.stderr)
+                continue
+            wanted += match
+    if not wanted:
         ap.error('nothing to do: give a patch name or --all')
 
     os.makedirs(a.out, exist_ok=True)
-    for name in names:
-        src = os.path.join(SWEET_SERIES, name)
-        if not os.path.exists(src):
-            print(f'-- {name}: not in the sweet series', file=sys.stderr)
+    # remove the files of a previous run, but keep the hand written ones
+    for f in sorted(os.listdir(a.out)):
+        if not (f.endswith('.patch') or f.endswith('.sh')):
             continue
-        text, notes = port_file(src)
-        dst = os.path.join(a.out, out_name(name))
+        if f.startswith('0001-') or f.startswith('0002-'):
+            continue
+        os.remove(os.path.join(a.out, f))
+    number = a.start
+    for name in wanted:
+        num = name[:4]
+        if num in HAND_WRITTEN:
+            print(f'-- {name}: ported by hand ({HAND_WRITTEN[num]})')
+            continue
+        if num in HARDWARE_PATCHES:
+            print(f'-- {name}: hardware, not ported: {HARDWARE_PATCHES[num]}')
+            continue
+        with open(os.path.join(SWEET_SERIES, name), 'r', errors='surrogateescape') as f:
+            text = f.read()
+        if num in PARTIAL:
+            text = filter_groups(text, PARTIAL[num])
+            text = fix_hunk_counts(text)
+            print(f'   (only the generic part: {", ".join(PARTIAL[num])})')
+        if num in CONTEXT_BLOCKS:
+            text = substitute_blocks(text, CONTEXT_BLOCKS[num])
+            text = fix_hunk_counts(text)
+        if num in DROP_LINES:
+            text = drop_lines(text, DROP_LINES[num])
+            text = fix_hunk_counts(text)
+            print('   (context lines of the not yet ported hardware dropped)')
+        text = port_text(text)
+        dst = os.path.join(a.out, out_name(name, number))
         if not a.dry_run:
             with open(dst, 'w', errors='surrogateescape') as f:
-                f.write(text)
+                f.write(text if text.endswith('\n') else text + '\n')
         print(f'-- {name} -> {os.path.relpath(dst, REPO_ROOT)}')
-        for n in notes:
-            print(f'   hardware: {n}')
+        # the staging script of a patch keeps its number
+        for extra in sorted(os.listdir(SWEET_SERIES)):
+            if extra.startswith(num + '-') and extra.endswith('.sh'):
+                with open(os.path.join(SWEET_SERIES, extra), 'r', errors='surrogateescape') as f:
+                    sh_text = port_text(f.read())
+                sh_dst = os.path.join(a.out, out_name(extra, number))
+                if not a.dry_run:
+                    with open(sh_dst, 'w', errors='surrogateescape') as f:
+                        f.write(sh_text)
+                print(f'   {extra} -> {os.path.relpath(sh_dst, REPO_ROOT)}')
+        number += 1
 
 
 if __name__ == '__main__':

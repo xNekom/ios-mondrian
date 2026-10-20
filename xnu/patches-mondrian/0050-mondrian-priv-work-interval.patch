@@ -1,0 +1,57 @@
+--- a/bsd/kern/mondrian_amfi.c
++++ b/bsd/kern/mondrian_amfi.c
+@@ -29,6 +29,7 @@
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
++#include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+@@ -308,8 +309,46 @@
+ 	.mpo_vnode_check_signature = mondrian_amfi_vnode_check_signature,
+ };
+ 
++/*
++ * Privileges for non-root processes come from MAC policies (priv_check_cred
++ * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
++ * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
++ * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
++ * Grant that one; log the first denial of each other privilege per process.
++ */
++#define MONDRIAN_PRIV_LOG_MAX      64
++static struct {
++	int  priv;
++	char name[20];
++} mondrian_priv_logged[MONDRIAN_PRIV_LOG_MAX];
++static int mondrian_priv_logged_count;
++
++static int
++mondrian_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++{
++	if (priv == PRIV_WORK_INTERVAL) {
++		return 0;
++	}
++	char name[20];
++	proc_selfname(name, sizeof(name));
++	for (int i = 0; i < mondrian_priv_logged_count; i++) {
++		if (mondrian_priv_logged[i].priv == priv &&
++		    strncmp(mondrian_priv_logged[i].name, name, sizeof(name)) == 0) {
++			return EPERM;
++		}
++	}
++	if (mondrian_priv_logged_count < MONDRIAN_PRIV_LOG_MAX) {
++		mondrian_priv_logged[mondrian_priv_logged_count].priv = priv;
++		strlcpy(mondrian_priv_logged[mondrian_priv_logged_count].name, name, sizeof(name));
++		mondrian_priv_logged_count++;
++		printf("MONDRIAN Sandbox: %s privilege %d denied\n", name, priv);
++	}
++	return EPERM;
++}
++
+ static const struct mac_policy_ops mondrian_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = mondrian_sandbox_syscall,
++	.mpo_priv_grant = mondrian_sandbox_priv_grant,
+ };
+ 
+ static struct mac_policy_conf mondrian_sandbox_mac_conf = {
