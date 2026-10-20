@@ -141,7 +141,7 @@ loader_scan_payload(void)
 }
 
 /* The end of the shim image: the payload is appended right after it. */
-extern char _end;
+extern char _end[];	/* the payload follows it: the compiler cannot know */
 
 /* The appended payload, LZ4 compressed: the build cannot send 15MB over
  * the USB link of this phone. The header is read as bytes because the
@@ -175,8 +175,8 @@ const char *loader_boot(uintptr_t dtb)
 	uint64_t rd_start, rd_end;
 
 	/* The payload the build appended to this image, unpacked in place. */
-	if (blob_ok((const uint8_t *)&_end)) {
-		const uint8_t *b = (const uint8_t *)&_end;
+	if (blob_ok((const uint8_t *)&_end[0])) {
+		const uint8_t *b = (const uint8_t *)&_end[0];
 		uint64_t raw = blob_u64(b + BLOB_RAW);
 		uint64_t comp = blob_u64(b + BLOB_COMP);
 		uint64_t scratch = win_base + 0x2000000UL;	/* past the kernel */
