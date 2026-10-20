@@ -144,22 +144,30 @@ loader_scan_payload(void)
 extern char _end;
 
 /* The appended payload, LZ4 compressed: the build cannot send 15MB over
- * the USB link of this phone. */
-struct payload_blob {
-	char magic[4];		/* "LZ4P" */
-	uint32_t version;
-	uint64_t raw_size;
-	uint64_t comp_size;
-	uint8_t data[];
-};
+ * the USB link of this phone. The header is read as bytes because the
+ * compiler does not know that the payload follows _end.
+ *
+ *   0  "LZ4P"      4  version   8  raw size   16  compressed size   24 data
+ */
+#define BLOB_RAW	8
+#define BLOB_COMP	16
+#define BLOB_DATA	24
+
+static uint64_t
+blob_u64(const uint8_t *p)
+{
+	uint64_t v = 0;
+
+	for (int i = 7; i >= 0; i--)
+		v = (v << 8) | p[i];
+	return v;
+}
 
 static int
-blob_ok(const void *p)
+blob_ok(const uint8_t *p)
 {
-	const struct payload_blob *b = p;
-
-	return b->magic[0] == 'L' && b->magic[1] == 'Z' && b->magic[2] == '4' &&
-	       b->magic[3] == 'P' && b->version == 1;
+	return p[0] == 'L' && p[1] == 'Z' && p[2] == '4' && p[3] == 'P' &&
+	       blob_u64(p + 4) == 1;
 }
 
 const char *loader_boot(uintptr_t dtb)
@@ -167,19 +175,21 @@ const char *loader_boot(uintptr_t dtb)
 	uint64_t rd_start, rd_end;
 
 	/* The payload the build appended to this image, unpacked in place. */
-	if (blob_ok(&_end)) {
-		const struct payload_blob *b = (const struct payload_blob *)&_end;
+	if (blob_ok((const uint8_t *)&_end)) {
+		const uint8_t *b = (const uint8_t *)&_end;
+		uint64_t raw = blob_u64(b + BLOB_RAW);
+		uint64_t comp = blob_u64(b + BLOB_COMP);
 		uint64_t scratch = win_base + 0x2000000UL;	/* past the kernel */
 
-		if (!win_size || scratch + b->raw_size > win_base + win_size)
+		if (!win_size || scratch + raw > win_base + win_size)
 			return "no room to unpack the payload";
-		long n = lz4_decompress_frame(b->data, b->comp_size,
-					      (uint8_t *)(uintptr_t)scratch, b->raw_size);
-		if (n < 0 || (uint64_t)n != b->raw_size)
+		long n = lz4_decompress_frame(b + BLOB_DATA, comp,
+					      (uint8_t *)(uintptr_t)scratch, raw);
+		if (n < 0 || (uint64_t)n != raw)
 			return "cannot unpack the payload";
 		con_hex2("UNPACK", "n=", (uint32_t)n, "at=", (uint32_t)(scratch >> 32));
 		rd_start = scratch;
-		rd_end = scratch + b->raw_size;
+		rd_end = scratch + raw;
 	} else if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
