@@ -279,6 +279,27 @@ const char *loader_boot(uintptr_t dtb)
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
+
+	/*
+	 * A verdict in words: the console is read from a photograph, so the
+	 * numbers are hard to make out but short words are not.
+	 */
+	{
+		int fb_ok = 0, jmp_ok = 0, kern_ok = 0;
+
+		for (int i = 0; i < n_mem_regs; i++) {
+			uint64_t base = mem_regs[i * 2], size = mem_regs[i * 2 + 1];
+			if (FB_PHYS >= base && FB_PHYS < base + size)
+				fb_ok = 1;
+		}
+		if (entry_pa >= phys_base && entry_pa < phys_base + mem_size)
+			jmp_ok = 1;
+		const uint32_t *k = (const uint32_t *)entry_pa;
+		kern_ok = (k[0] | k[1] | k[2] | k[3]) != 0;
+		con_str("VERDICT", fb_ok ? "fb-inside" : "FB-OUTSIDE");
+		con_str("VERDICT", jmp_ok ? "jump-inside" : "JUMP-OUTSIDE");
+		con_str("VERDICT", kern_ok ? "kernel-copied" : "KERN-EMPTY");
+	}
 	con_str("XNU", "jumping (fbcon clears screen)");
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
