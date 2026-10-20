@@ -247,6 +247,12 @@ const char *loader_boot(uintptr_t dtb)
 	if (rd_end > kern_pa && rd_start < kern_pa + 0x100000)
 		return "ramdisk overlaps kernel memory";
 
+	/* What we are about to copy, and from where. */
+	con_bytes("PAY", (const void *)rd_start, 16);
+	for (uint32_t i = 0; i < p->nsegs; i++)
+		con_hex2("SEG", "dst=", (uint32_t)((p->segs[i].vmaddr + pa_of_va_base) >> 32),
+			 "off=", (uint32_t)(p->segs[i].file_off >> 32));
+
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
