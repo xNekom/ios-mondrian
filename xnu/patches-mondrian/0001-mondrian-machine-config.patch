@@ -31,6 +31,28 @@ index 8460893..9a748ea 100644
  
  endif
  
+@@ -336,9 +336,21 @@ endif
+ # Use ARM_LARGE_MEMORY config for all MacOSX targets.
+ ifneq ($(filter $(PLATFORM),MacOSX),)
+ LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+ endif
+ 
++# MONDRIAN keeps 4 KiB pages, so TCR_EL1_BOOT selects the 39-bit VA layout
++# (T0SZ = T1SZ = 25) and TTBR1 only covers 0xFFFFFF8000000000 upwards. Every
++# macOS-style kernel address (0xFFFFFE...) - link address, low globals, pmap
++# heap - is outside that window, and the large memory layout needs the 47-bit
++# VA, so MONDRIAN uses the device addresses instead. Without this the kernel
++# cannot even fetch its own text: the first instruction of arm_init aborts.
++ifeq ($(CURRENT_MACHINE_CONFIG),MONDRIAN)
++LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
++ARM64_PLKSEG_ADDR  =0xfffffff004004000
++ARM64_LINK_ADDR    =0xfffffff007004000
++endif
++
+ 
+ CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
 diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
 index 133b07f..e01c124 100644
 --- a/osfmk/arm64/proc_reg.h
