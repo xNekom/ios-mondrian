@@ -16,6 +16,9 @@ import boards  # noqa: E402
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+# The window of the QEMU "virt" machine: its RAM starts at 0x40000000, so the
+# kernel goes there whatever the board says.
+QEMU_PHYS_BASE, QEMU_MEM_SIZE = 0xb0000000, 0x4d000000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -56,6 +59,8 @@ def build(board, seed=None, qemu=False, highmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-ios.py)."""
     phys_base, mem_size = ((board.high_phys_base, board.high_mem_size) if highmem
                            else (board.phys_base, board.mem_size))
+    if qemu:
+        phys_base, mem_size = QEMU_PHYS_BASE, QEMU_MEM_SIZE
     gicd, gicr, timebase = ((QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu
                             else (board.gicd, board.gicr, board.timebase))
     seed = seed if seed is not None else os.urandom(64)

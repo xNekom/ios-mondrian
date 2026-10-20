@@ -247,6 +247,47 @@ def substitute(text, rules):
     return '\n'.join(out)
 
 
+# Hunks that have to be rewritten, not just renamed.
+#
+# The early console maps the splash framebuffer in the bootstrap tables. The
+# sweet code put the entry in the FIRST V=P L2 table, which is the table of
+# the L1 entry of the RAM. With 4 KiB pages an L1 entry covers 1 GiB, so the
+# framebuffer is in an L1 entry of its own and its L2 table is a different
+# one: the sweet code would have written the framebuffer over the mapping of
+# the RAM. Look the L2 table up in the L1 table instead.
+REPLACEMENTS = {
+    '0010': [(
+        "+\tand\t\tx12, x10, #(ARM_TT_L2_INDEX_MASK)\n"
+        "+\tlsr\t\tx12, x12, #(ARM_TT_L2_SHIFT)\n"
+        "+\tadd\t\tx13, x25, #(2 * PGBYTES)\n"
+        "+\tstr\t\tx11, [x13, x12, lsl #TTE_SHIFT]",
+        "+\t/*\n"
+        "+\t * The L2 table of this GiB: with 4 KiB pages an L1 entry covers\n"
+        "+\t * 1 GiB, so the framebuffer is not in the L1 entry of the RAM and\n"
+        "+\t * its L2 table is not the first one. The V=P bootstrap mapping is\n"
+        "+\t * VA=PA, so the physical address of the L2 table is its virtual\n"
+        "+\t * address.\n"
+        "+\t */\n"
+        "+\tand\t\tx12, x10, #(ARM_TT_L1_INDEX_MASK)\n"
+        "+\tlsr\t\tx12, x12, #(ARM_TT_L1_SHIFT)\n"
+        "+\tldr\t\tx14, [x25, x12, lsl #TTE_SHIFT]\n"
+        "+\tand\t\tx13, x14, #(ARM_TTE_TABLE_MASK)\n"
+        "+\tand\t\tx12, x10, #(ARM_TT_L2_INDEX_MASK)\n"
+        "+\tlsr\t\tx12, x12, #(ARM_TT_L2_SHIFT)\n"
+        "+\tstr\t\tx11, [x13, x12, lsl #TTE_SHIFT]"),
+    ],
+}
+
+
+def apply_replacements(text, replacements):
+    """Replace the hunks that the renaming is not enough for."""
+    for old, new in replacements:
+        if old not in text:
+            raise SystemExit('port-series: the hunk to replace was not found:\n' + old)
+        text = text.replace(old, new)
+    return text
+
+
 def drop_lines(text, patterns):
     """Remove the context lines that match one of the patterns."""
     out = []
@@ -361,6 +402,9 @@ def main():
             print(f'   (only the generic part: {", ".join(PARTIAL[num])})')
         if num in CONTEXT_BLOCKS:
             text = substitute_blocks(text, CONTEXT_BLOCKS[num])
+            text = fix_hunk_counts(text)
+        if num in REPLACEMENTS:
+            text = apply_replacements(text, REPLACEMENTS[num])
             text = fix_hunk_counts(text)
         if num in DROP_LINES:
             text = drop_lines(text, DROP_LINES[num])
