@@ -510,16 +510,22 @@ static struct mem_window win;
 static void board_memory(uintptr_t dtb)
 {
 	char path[64];
-	uint64_t regs[64];
+	uint64_t regs[32];		/* 16 regions, like the facts dump */
 	int n, best = -1, fb = -1;
 	uint32_t ac = 2, sc = 2;
 
 	(void)ac;
 	(void)sc;
+	/* The same call the facts dump uses: it reads the regions right. */
 	if (dtb && fdt_find_name(dtb, "memory", path, sizeof(path)))
-		n = fdt_node_regs(dtb, path, regs, 32);
+		n = fdt_node_regs(dtb, path, regs, 16);
 	else
 		n = 0;
+	if (n > 0) {
+		con_str("PATH", path);
+		con_hex64("R0", regs[0]);
+		con_hex64("S0", regs[1]);
+	}
 	if (n > 0) {
 		uintptr_t d;
 		uint32_t l;
