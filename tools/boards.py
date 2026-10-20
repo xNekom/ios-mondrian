@@ -169,13 +169,16 @@ MONDRIAN = Board(
     # bootloader passes, read from /proc/device-tree in a recovery. The
     # /memory node has six regions: 0x80000000+0x6a000000, then a hole, then
     # 0xf4600000+0x0ba00000 (which ends exactly at 4G), and four regions above
-    # 4G. The kernel gets the first one (the low bank) and the largest region
-    # above 4G is the high memory. The ddr_size property says 12GB: the
-    # bootloader only describes the part of the RAM the kernel may use.
-    phys_base=0x800000000,
-    mem_size=0x37500000,
-    alt_phys_base=0x80000000,
-    alt_mem_size=0x6a000000,
+    # 4G. The kernel gets the first one: it is the region that holds the
+    # splash framebuffer (0xb8000000), and the early console writes to it
+    # through the bootstrap V=P map, which only covers the window the kernel
+    # is given. The largest region above 4G is the alternative. The ddr_size
+    # property says 12GB: the bootloader only describes the part of the RAM
+    # the kernel may use.
+    phys_base=0x80000000,
+    mem_size=0x6a000000,
+    alt_phys_base=0x800000000,
+    alt_mem_size=0x37500000,
     soc_base=0x01000000,
     # GICD/GICR: cape.dtsi and the mainline sm8450.dtsi agree, and the live
     # device tree confirms it: interrupt-controller@17100000 has
