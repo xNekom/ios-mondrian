@@ -1,29 +1,34 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1825,6 +1825,45 @@
+@@ -1825,6 +1825,55 @@
  #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
  #endif
  
 +#if defined(MONDRIAN)
 +/*
-+ * A 2MB framebuffer alias that survives the bootstrap TTBR0 teardown.
-+ * The low globals own the first L2 block of their own L1 entry; the block
-+ * above it is inside the reserved low-globals region, so the VM never
-+ * allocates it, and the L1 table exists because gVirtBase sits in the same
++ * A framebuffer alias that survives the bootstrap TTBR0 teardown.
++ * The low globals own the first L2 block of their own L1 entry; the blocks
++ * above it are inside the reserved low-globals region, so the VM never
++ * allocates them, and the L1 table exists because gVirtBase sits in the same
 + * 1GB entry. If any of that is not true the console is disabled instead:
 + * writing through a dead mapping would fault.
++ * The panel is 1440x3200x4 = 18MB, so with 4KB pages the alias needs one
++ * 2MB block per 2MB of framebuffer, not the single block 16KB pages used.
 + */
 +#define MONDRIAN_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
++#define MONDRIAN_EARLY_FB_SIZE (1440ULL * 3200ULL * 4ULL)
++#define MONDRIAN_EARLY_FB_BLOCKS ((MONDRIAN_EARLY_FB_SIZE + ARM_TT_L2_SIZE - 1) / ARM_TT_L2_SIZE)
 +
 +static boolean_t
 +mondrian_early_map_final(void)
 +{
 +	const vm_map_address_t va = MONDRIAN_EARLY_FB_VA;
 +	tt_entry_t l1;
-+	tt_entry_t *l2, *slot;
++	tt_entry_t *l2;
++	vm_map_address_t i;
 +
-+	if ((va + ARM_TT_L2_SIZE) > gVirtBase) {
++	if ((va + (MONDRIAN_EARLY_FB_BLOCKS * ARM_TT_L2_SIZE)) > gVirtBase) {
 +		return FALSE;
 +	}
 +	l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
@@ -31,14 +36,19 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 +		return FALSE;
 +	}
 +	l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
-+	slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
-+	if (*slot != ARM_TTE_EMPTY) {
-+		return FALSE;
++	for (i = 0; i < MONDRIAN_EARLY_FB_BLOCKS; i++) {
++		tt_entry_t *slot = &l2[((va + (i * ARM_TT_L2_SIZE)) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		if (*slot != ARM_TTE_EMPTY) {
++			return FALSE;
++		}
 +	}
-+	*slot = 0xb8000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
-+	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
-+	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
-+	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	for (i = 0; i < MONDRIAN_EARLY_FB_BLOCKS; i++) {
++		tt_entry_t *slot = &l2[((va + (i * ARM_TT_L2_SIZE)) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++		*slot = (0xb8000000ULL + (i * ARM_TT_L2_SIZE)) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	}
 +	__asm__ volatile("dsb ishst" ::: "memory");
 +	return TRUE;
 +}
