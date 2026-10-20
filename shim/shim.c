@@ -475,6 +475,59 @@ static void dump_facts(uintptr_t dtb)
 	con_skip();
 }
 
+/*
+ * The memory map of the phone, from the live device tree, and the window the
+ * kernel gets.
+ *
+ * The device tree the bootloader passes is the truth about the RAM of this
+ * phone, so the shim uses it instead of a number baked into the image: the
+ * kernel is copied to the window chosen here and the boot arguments say so.
+ */
+struct mem_window {
+	uint64_t base, size;
+};
+
+static struct mem_window win;
+
+static void board_memory(uintptr_t dtb)
+{
+	char path[64];
+	uint64_t regs[64];
+	uint64_t total = 0;
+	int n, best = -1;
+	uint32_t ac = 2, sc = 2;
+
+	if (!dtb || !fdt_find_name(dtb, "memory", path, sizeof(path)))
+		return;
+	/* the cell counts may be overridden by the node */
+	fdt_node_u32(dtb, path, "#address-cells", &ac);
+	fdt_node_u32(dtb, path, "#size-cells", &sc);
+	n = fdt_node_regs_cells(dtb, path, regs, 32, (int)ac, (int)sc);
+	if (n <= 0)
+		return;
+
+	for (int i = 0; i < n; i++) {
+		uint64_t base = regs[i * 2], size = regs[i * 2 + 1];
+		con_hex2("MEM", "at=", (uint32_t)(base >> 32), "size=", (uint32_t)base);
+		total += size;
+		/* the highest region that can host the kernel */
+		if (size >= 0x20000000UL && (best < 0 || base > regs[best * 2]))
+			best = i;
+	}
+	if (best < 0) {
+		/* no region of 512 MiB: take the largest one */
+		for (int i = 0; i < n; i++)
+			if (best < 0 || regs[i * 2 + 1] > regs[best * 2 + 1])
+				best = i;
+	}
+	if (best < 0)
+		return;
+	win.base = regs[best * 2];
+	win.size = regs[best * 2 + 1];
+	con_hex2("WIN", "at=", (uint32_t)(win.base >> 32), "size=", (uint32_t)win.base);
+	con_hex("TOT", total);
+}
+
 /* ---- main ---- */
 
 static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
@@ -511,6 +564,11 @@ void shim_main(uint64_t dtb)
 
 	/* Where the framebuffer is comes from the device tree. */
 	board_from_dtb(dtb);
+	/* And so does the memory map: the kernel gets the window the
+	 * bootloader reports, not the one the image was built for. */
+	board_memory(dtb);
+	if (win.size)
+		loader_set_window(win.base, win.size);
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

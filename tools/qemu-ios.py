@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot a SWEETXNU or MONDXNU payload (tools/mkpayload.py) in QEMU's virt board.
+"""Boot a SWEETXNU or MONDRIAN payload (tools/mkpayload.py) in QEMU's virt board.
 
   qemu-ios.py PAYLOAD OUTDIR [--secs N] [--gdb] [--live-serial]
 
@@ -77,8 +77,8 @@ def check_kernel_tools(kernel_path):
 def build_image(payload):
     """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
-    assert magic in (b'SWEETXNU', b'MONDXNU') and ver == 1, \
-        'not a SWEETXNU/MONDXNU v1 payload'
+    assert magic in (b'SWEETXNU', b'MONDRIAN') and ver == 1, \
+        'not a SWEETXNU/MONDRIAN v1 payload'
     virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
         struct.unpack_from('<7Q', payload, 0x10)
     cmdline = payload[0x48:0x48 + BOOT_LINE_LENGTH]
@@ -211,7 +211,7 @@ def stream_serial_file(serial_path, file_pos, out_stream=sys.stdout):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Boot a SWEETXNU or MONDXNU payload in QEMU's virt board.",
+        description="Boot a SWEETXNU or MONDRIAN payload in QEMU's virt board.",
         epilog="Examples:\n"
                "  qemu-ios.py payload.bin out/\n"
                "  qemu-ios.py payload.bin out/ --live-serial\n"

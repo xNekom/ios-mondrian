@@ -20,8 +20,10 @@ int fdt_node_prop(uintptr_t fdt, const char *path, const char *prop,
     uintptr_t *data, uint32_t *len);
 
 /* Decode a "reg" property into address/size pairs, using the address and
- * size cells of the root. Returns the number of pairs. */
+ * size cells of the node (or of the root). Returns the number of pairs. */
 int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max);
+int fdt_node_regs_cells(uintptr_t fdt, const char *path, uint64_t *out, int max,
+    int ac, int sc);
 
 /* Path of the first node whose name starts with prefix ("memory" matches
  * "memory@80000000"), or of the first node whose "compatible" property

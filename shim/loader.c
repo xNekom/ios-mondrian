@@ -75,6 +75,17 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+/* The window of RAM the kernel gets. The device tree of the phone is the
+ * truth about it; the payload header only knows what the image was built
+ * for. */
+static uint64_t win_base, win_size;
+
+void loader_set_window(uint64_t base, uint64_t size)
+{
+	win_base = base;
+	win_size = size;
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 const char *loader_boot(uintptr_t dtb)
@@ -92,13 +103,19 @@ const char *loader_boot(uintptr_t dtb)
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
-	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
+	uint64_t phys_base = p->phys_base, mem_size = p->mem_size;
+
+	/* The window the bootloader reported wins over the payload header. */
+	if (win_size)
+		phys_base = win_base, mem_size = win_size;
+
+	uint64_t pa_of_va_base = phys_base - p->virt_base;	/* pa = va + this */
+	con_hex2("PHYS", "base=", phys_base, "size=", mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
+	if (rd_end > phys_base && rd_start < phys_base + mem_size)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
@@ -121,8 +138,8 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Revision = 2;
 	ba->Version = 2;
 	ba->virtBase = p->virt_base;
-	ba->physBase = p->phys_base;
-	ba->memSize = p->mem_size;
+	ba->physBase = phys_base;
+	ba->memSize = mem_size;
 	ba->topOfKernelData = top;
 	ba->Video.v_baseAddr = FB_BASE;
 	ba->Video.v_display = 1;
@@ -134,7 +151,7 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
-	ba->memSizeActual = p->mem_size;
+	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;

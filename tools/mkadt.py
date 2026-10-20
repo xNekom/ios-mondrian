@@ -233,7 +233,8 @@ if __name__ == '__main__':
     board = boards.get_board(a.board)
     if a.facts:
         board = boards.apply_facts(board, boards.parse_facts(open(a.facts).read()))
-    if not a.allow_provisional:
+    if not a.allow_provisional and not a.qemu:
+        # the QEMU memory is synthetic, the phone's is not
         boards.require_measured(board, 'mkadt.py')
     root = build(board, qemu=a.qemu, highmem=a.highmem)
     blob = adt.serialize(root)

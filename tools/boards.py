@@ -163,7 +163,7 @@ MONDRIAN = Board(
     arch='armv9.0',
     machine_config='MONDRIAN',
     dt_prefix='mondrian',
-    payload_magic=b'MONDXNU',
+    payload_magic=b'MONDRIAN',
     page_size=4096,              # PAGE_SIZE=4096 in build.config.msm.mondrian
     # TODO(mondrian): the low bank carries the bootloader, the modem and the
     # other firmware carve-outs (cape-reserved-memory.dtsi), so the kernel

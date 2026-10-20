@@ -202,33 +202,43 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out)
 	return fdt_node_u64(fdt, "/chosen", prop, out);
 }
 
-int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max)
+int fdt_node_regs_cells(uintptr_t fdt, const char *path, uint64_t *out, int max,
+    int ac, int sc)
 {
 	uintptr_t data;
 	uint32_t len;
-	uint32_t ac = 2, sc = 1;
 	int cells, n = 0;
 
 	if (!fdt_node_prop(fdt, path, "reg", &data, &len))
 		return 0;
-	if (!fdt_node_u32(fdt, "/", "#address-cells", &ac))
-		ac = 2;
-	if (!fdt_node_u32(fdt, "/", "#size-cells", &sc))
-		sc = 1;
 	if (ac == 0 || ac > 2 || sc == 0 || sc > 2)
 		return 0;
 	cells = ac + sc;
 	for (uint32_t off = 0; off + cells * 4 <= len && n < max; off += cells * 4) {
 		uint64_t base = 0, size = 0;
-		for (uint32_t c = 0; c < ac; c++)
+		for (int c = 0; c < ac; c++)
 			base = (base << 32) | be32(data + off + c * 4);
-		for (uint32_t c = 0; c < sc; c++)
+		for (int c = 0; c < sc; c++)
 			size = (size << 32) | be32(data + off + ac * 4 + c * 4);
 		out[n * 2] = base;
 		out[n * 2 + 1] = size;
 		n++;
 	}
 	return n;
+}
+
+int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max)
+{
+	uint32_t ac = 2, sc = 1;
+
+	/* The node may override the cells of the root. */
+	if (!fdt_node_u32(fdt, path, "#address-cells", &ac) &&
+	    !fdt_node_u32(fdt, "/", "#address-cells", &ac))
+		ac = 2;
+	if (!fdt_node_u32(fdt, path, "#size-cells", &sc) &&
+	    !fdt_node_u32(fdt, "/", "#size-cells", &sc))
+		sc = 1;
+	return fdt_node_regs_cells(fdt, path, out, max, (int)ac, (int)sc);
 }
 
 int fdt_find_name(uintptr_t fdt, const char *prefix, char *out, int out_len)

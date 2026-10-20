@@ -44,7 +44,7 @@
 #define FB_H			3200
 #define FB_STRIDE		(FB_W * 4)
 
-#define PAYLOAD_MAGIC		"MONDXNU"
+#define PAYLOAD_MAGIC		"MONDRIAN"
 
 #define NR_CPUS			8
 
