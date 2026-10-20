@@ -1,6 +1,6 @@
 #!/bin/sh
 # Host side of the phone's USB Ethernet (kernel sweetusb=2, patches 0075-0077).
-#   tools/sweet-usbnet.sh [LOGFILE]
+#   tools/ios-usbnet.sh [LOGFILE]
 # Waits for the phone's CDC-ECM interface (host MAC 02:00:5e:77:ee:01),
 # gives it 192.168.7.1/24 (the phone is 192.168.7.2), then prints the live
 # kernel console the phone streams to UDP port 5140 (and appends it to

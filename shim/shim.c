@@ -7,7 +7,9 @@
  * Any unexpected exception paints a blue panic screen.
  */
 #include <stdint.h>
+#include "board.h"
 #include "console.h"
+#include "fdt.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
@@ -16,10 +18,6 @@
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
-#define GICR_SIZE		0x100000UL
-#define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
 #define GICR_WAKER		0x14
 #define GICR_SGI		0x10000
@@ -30,9 +28,7 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
-#define SGI_INTID		1
+/* VTIMER_INTID, PTIMER_INTID and SGI_INTID come from board.h */
 
 #define PSCI_VERSION		0x84000000UL
 #define PSCI_CPU_SUSPEND	0xc4000001UL
@@ -44,8 +40,6 @@
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
-
-#define NR_CPUS			8
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -340,6 +334,90 @@ static void test_gic(void)
 	isb();
 }
 
+/* ---- device tree facts ---- */
+
+/*
+ * Print the facts of the live device tree in a machine readable form:
+ *
+ *   FACT memory reg0 0x100000000 0x7fc00000
+ *   FACT reg /soc/intc 0x17100000 0x10000 0x17180000 0x200000
+ *
+ * tools/boards.py parses these (parse_facts) to fill in the board table, so
+ * a new phone can be described from what the bootloader says instead of from
+ * guesswork.
+ */
+static void fact(const char *kind, const char *key, const uint64_t *v, int n)
+{
+	static const char hex[] = "0123456789abcdef";
+	char buf[192];
+	int i = 0;
+
+	for (const char *s = "FACT "; *s; s++)
+		buf[i++] = *s;
+	for (const char *s = kind; *s && i < 32; s++)
+		buf[i++] = *s;
+	buf[i++] = ' ';
+	for (const char *s = key; *s && i < 64; s++)
+		buf[i++] = *s;
+	for (int j = 0; j < n && i < 170; j++) {
+		buf[i++] = ' ';
+		buf[i++] = '0';
+		buf[i++] = 'x';
+		uint64_t x = v[j];
+		int started = 0;
+		for (int k = 60; k >= 0; k -= 4) {
+			int d = (int)((x >> k) & 0xf);
+			if (d || started || k == 0) {
+				buf[i++] = hex[d];
+				started = 1;
+			}
+		}
+	}
+	buf[i] = 0;
+	con_line(buf);
+}
+
+static void dump_facts(uintptr_t dtb)
+{
+	static const char *const compat[] = {
+		"qcom,ufshc",		/* the internal UFS host */
+		"arm,gic-v3",		/* GICD and GICR */
+		"qcom,spmi",		/* the PMIC bus */
+		"qcom,geni-se-qup",	/* the QUPv3 wrapper (I2C, SPI) */
+		"qcom,dsi-display",	/* the panel */
+		"qcom,mdss",		/* the display subsystem */
+		"qcom,pmic-glink",	/* the PMIC */
+	};
+	char path[64];
+	uint64_t regs[32];
+
+	con_str("SHIM", "board " BOARD_NAME " (" BOARD_SOC ")");
+	con_skip();
+	if (!dtb) {
+		con_str("DTB", "no device tree");
+		return;
+	}
+
+	if (fdt_find_name(dtb, "memory", path, sizeof(path))) {
+		int n = fdt_node_regs(dtb, path, regs, 16);
+		for (int i = 0; i < n; i++) {
+			char key[8] = "reg0";
+			uint64_t v[2] = { regs[i * 2], regs[i * 2 + 1] };
+			key[3] = '0' + i;
+			fact("memory", key, v, 2);
+		}
+	}
+	for (unsigned i = 0; i < sizeof(compat) / sizeof(compat[0]); i++) {
+		int n;
+		if (!fdt_find_compatible(dtb, compat[i], path, sizeof(path)))
+			continue;
+		n = fdt_node_regs(dtb, path, regs, 8);
+		if (n > 0)
+			fact("reg", path, regs, n * 2);
+	}
+	con_skip();
+}
+
 /* ---- main ---- */
 
 static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
@@ -377,7 +455,12 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", BOARD_NAME " shim (" BOARD_SOC ")");
+	con_skip();
+
+	/* What the bootloader says about this phone. Always print it: it is the
+	 * cheapest way to check the board table against the device. */
+	dump_facts(dtb);
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

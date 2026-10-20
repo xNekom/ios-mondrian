@@ -1,10 +1,21 @@
 #!/bin/bash
 # Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
+#
+#   BOARD=sweet|mondrian shim/build.sh [PAYLOAD]
+#
+# The board selects the MMIO constants in shim/board.h and the magic of the
+# payload the shim accepts. The same values live in tools/boards.py.
 set -euo pipefail
 cd "$(dirname "$0")"
+BOARD=${BOARD:-sweet}
+case "$BOARD" in
+	sweet)		BOARD_DEF=BOARD_SWEET ;;
+	mondrian)	BOARD_DEF=BOARD_MONDRIAN ;;
+	*)		echo "error: unknown BOARD '$BOARD' (sweet or mondrian)" >&2; exit 1 ;;
+esac
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -D$BOARD_DEF"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -33,4 +44,5 @@ mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+echo "shim built for BOARD=$BOARD"
 ls -l out/Image out/shim-boot.img

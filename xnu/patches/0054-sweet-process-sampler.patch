@@ -138,7 +138,7 @@
 + * and for each of its threads, the user pc/lr/sp and a frame-pointer
 + * backtrace as "SMP name[pid] tN pc ... lr ... bt ..." (header line with the
 + * shared region slide and the main binary's mach header, to symbolicate
-+ * with tools/sweet-crash.py). A thread blocked in a syscall shows the
++ * with tools/ios-crash.py). A thread blocked in a syscall shows the
 + * syscall stub in pc and its caller in lr/bt.
 + *
 + * First sample 90 s after start, then every 120 s, 10 samples at most.

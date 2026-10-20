@@ -3,6 +3,9 @@ name: xnu
 on:
   workflow_dispatch:
     inputs:
+      board:
+        description: Board to build (sweet = Redmi Note 10 Pro, mondrian = POCO F5 Pro)
+        default: sweet
       macos_version:
         description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
         default: "13.5"
@@ -10,15 +13,16 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG
-        default: SWEET
+        description: "xnu MACHINE_CONFIG (default: the one of the board)"
+        default: ""
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    branches: [main, mondrian]
     paths:
       - "xnu/patches/**"
+      - "xnu/patches-mondrian/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -30,7 +34,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  BOARD: ${{ inputs.board || 'sweet' }}
 
 jobs:
   build:
@@ -41,14 +45,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Select the board
+        run: |
+          case "$BOARD" in
+            sweet)    SERIES=xnu/patches;          MACHINE=SWEET ;;
+            mondrian) SERIES=xnu/patches-mondrian; MACHINE=MONDRIAN ;;
+            *) echo "error: unknown board '$BOARD'" >&2; exit 1 ;;
+          esac
+          if [ -n "${{ inputs.machine_config }}" ]; then
+            MACHINE="${{ inputs.machine_config }}"
+          fi
+          echo "SERIES=$SERIES" >> "$GITHUB_ENV"
+          echo "MACHINE=$MACHINE" >> "$GITHUB_ENV"
+          echo "building $BOARD with $SERIES (MACHINE_CONFIG=$MACHINE)"
+          ls "$SERIES"
+
       - name: Fetch build script
         run: |
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          cp "$SERIES"/*.patch "$SERIES"/*.sh dxb/patches/
+          # libfirehose_kernel is built arm64e-only; our kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
@@ -70,6 +89,7 @@ jobs:
       - name: Build
         working-directory: dxb
         env:
+          MACHINE_CONFIG: ${{ env.MACHINE }}
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
@@ -92,7 +112,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree-${{ env.BOARD }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -119,6 +139,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: xnu-kernel-${{ env.BOARD }}
           path: out/
           if-no-files-found: warn

@@ -30,6 +30,7 @@ import argparse, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
+import boards  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
@@ -140,16 +141,18 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, board=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
     segs = [s for s in m['segs'] if s['vmsize']]
     text = m['segs'][0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
-    # virt_base: 32MB (16K-granule L2 block) below the mach header, so start.s's
-    # block mapping that starts at the header's block begins exactly at phys_base.
-    virt_base = text['vmaddr'] & ~(0x2000000 - 1)
+    # virt_base: one L2 block (ARM_TT_L2_SIZE, which depends on the page
+    # size) below the mach header, so start.s's block mapping that starts at
+    # the header's block begins exactly at phys_base.
+    l2 = board.tt_l2_size if board else 0x2000000
+    virt_base = text['vmaddr'] & ~(l2 - 1)
     kernel_end = max(s['vmaddr'] + s['vmsize'] for s in segs)
     kernel_end = (kernel_end + PAGE - 1) & ~(PAGE - 1)
 
@@ -180,7 +183,8 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     out += adt_blob
     out += b'\0' * (-len(out) & 0xf)
 
-    struct.pack_into('<8sII', out, 0, b'SWEETXNU', 1, len(pieces))
+    struct.pack_into('<8sII', out, 0, board.payload_magic if board else b'SWEETXNU',
+                     1, len(pieces))
     struct.pack_into('<7Q', out, 0x10, virt_base, m['entry'], adt_off, len(adt_blob), kernel_end,
                      PHYS_BASE, MEM_SIZE)
     cl = cmdline.encode()[:BOOT_LINE_LENGTH - 1]
@@ -196,10 +200,13 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
-    ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
+    ap.add_argument('--board', default='sweet', help='sweet | mondrian')
+    ap.add_argument('--cmdline', help='kernel boot arguments (default: the board\'s)')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    board = boards.get_board(a.board)
+    cmdline = a.cmdline if a.cmdline is not None else board.cmdline
+    blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk, board)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

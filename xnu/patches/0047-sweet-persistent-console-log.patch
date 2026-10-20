@@ -35,7 +35,7 @@
 + *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
 + *   | u64 flush sequence
 + * ring offset of byte n = n % ring size. Read it from a recovery with
-+ * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
++ * tools/ios-log-pull.sh. Disabled with boot-arg sweetlog=0.
 + */
 +#define SWEET_LOG_SIZE          (4u << 20)
 +#define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)

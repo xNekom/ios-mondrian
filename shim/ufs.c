@@ -10,10 +10,9 @@
  * Register layout and descriptor formats: JEDEC UFSHCI (JESD223).
  */
 #include <stdint.h>
+#include "board.h"
 #include "console.h"
 #include "ufs.h"
-
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08

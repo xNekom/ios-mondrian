@@ -6,7 +6,7 @@ This document explains how to test the patched Apple XNU kernel for the Redmi No
 
 ## 1. Overview
 
-`tools/qemu-sweet.py` emulates the bare-metal boot shim loader on your host system:
+`tools/qemu-ios.py` emulates the bare-metal boot shim loader on your host system:
 - It configures `qemu-system-aarch64` on the `virt` board with `gic-version=3` and CPU `cortex-a76` (matching the Kryo 470 Gold cores' `ID_AA64MMFR0` architecture).
 - It covers the physical memory layout (framebuffer at `0x9c000000`, kernel base at `0xb0000000`).
 - It extracts the visual 1080×2400 framebuffer into `fb.png`, captures registers into `regs.txt`, and logs exception interrupts into `qemu.log`.
@@ -19,7 +19,7 @@ This document explains how to test the patched Apple XNU kernel for the Redmi No
 Verify your environment using the built-in check:
 
 ```sh
-python3 tools/qemu-sweet.py --check-env
+python3 tools/qemu-ios.py --check-env
 ```
 
 If dependencies are missing, install them:
@@ -62,19 +62,19 @@ If dependencies are missing, install them:
 
 ### Basic Run (20 Seconds Smoke Test)
 ```sh
-python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run --secs 20
+python3 tools/qemu-ios.py /tmp/payload-qemu.bin /tmp/qemu_run --secs 20
 ```
 
 ### Live Console Streaming
 Stream serial kernel printf output live to your terminal:
 ```sh
-python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run --live-serial
+python3 tools/qemu-ios.py /tmp/payload-qemu.bin /tmp/qemu_run --live-serial
 ```
 
 ### Automated CI / Regression Check (Fail on Panic)
 Exit with status code `2` if a panic occurred or `3` if blank/undecodable:
 ```sh
-python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run \
+python3 tools/qemu-ios.py /tmp/payload-qemu.bin /tmp/qemu_run \
     --kernel xnu/out/kernel.development.sweet \
     --fail-on-panic
 ```
@@ -82,7 +82,7 @@ python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run \
 ### Interactive GDB Debugging
 Start the machine halted with a GDB stub on port 1234:
 ```sh
-python3 tools/qemu-sweet.py /tmp/payload-qemu.bin /tmp/qemu_run --gdb
+python3 tools/qemu-ios.py /tmp/payload-qemu.bin /tmp/qemu_run --gdb
 ```
 In another terminal:
 ```sh

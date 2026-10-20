@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo ios-root-tweaks.py MOUNTED_ROOT
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).

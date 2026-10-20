@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Wrap tools/sweet-init.S into a static, ad-hoc signed arm64 Mach-O executable.
+"""Wrap tools/ios-init.S into a static, ad-hoc signed arm64 Mach-O executable.
 
-  mkinit.py OBJECT OUT [ENTITLEMENTS.plist]   (OBJECT: clang -target arm64-apple-ios16.0 -c sweet-init.S)
+  mkinit.py OBJECT OUT [ENTITLEMENTS.plist]   (OBJECT: clang -target arm64-apple-ios16.0 -c ios-init.S)
 
 No available linker produces static iOS executables on Linux, and the program
 is a single position-independent __text section, so the executable is laid

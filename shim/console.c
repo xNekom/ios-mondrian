@@ -73,6 +73,13 @@ void con_str(const char *label, const char *s)
 	row++;
 }
 
+/* A raw line, for machine readable output (the dtb dump). */
+void con_line(const char *s)
+{
+	put_str(0, s, WHITE);
+	row++;
+}
+
 void con_hex(const char *label, uint64_t v)
 {
 	char buf[17];

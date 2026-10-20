@@ -53,7 +53,7 @@
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
 @@ -10,7 +10,7 @@
-  * with tools/sweet-crash.py). A thread blocked in a syscall shows the
+  * with tools/ios-crash.py). A thread blocked in a syscall shows the
   * syscall stub in pc and its caller in lr/bt.
   *
 - * First sample 90 s after start, then every 120 s, 10 samples at most.

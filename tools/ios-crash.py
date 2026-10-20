@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Symbolicate SWEET console crash reports (patch 0043) typed in from a photo.
 
-  sweet-crash.py CACHE ROOT [REPORT.txt]       (report on stdin if omitted)
+  ios-crash.py CACHE ROOT [REPORT.txt]       (report on stdin if omitted)
 
 CACHE is the dyld_shared_cache_arm64 (in a writable directory: ipsw keeps a
 symbol cache next to it), ROOT the mounted iOS root image. Lines look like
