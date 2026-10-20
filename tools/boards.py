@@ -165,16 +165,22 @@ MONDRIAN = Board(
     dt_prefix='mondrian',
     payload_magic=b'MONDRIAN',
     page_size=4096,              # PAGE_SIZE=4096 in build.config.msm.mondrian
-    # TODO(mondrian): the low bank carries the bootloader, the modem and the
-    # other firmware carve-outs (cape-reserved-memory.dtsi), so the kernel
-    # must live above 4G. The size is a placeholder until the live device
-    # tree is read (see apply_facts and docs/MONDIAN_PORT.md).
-    phys_base=0x00000000,
-    mem_size=0x80000000,
-    high_phys_base=0x100000000,
-    high_mem_size=0xe8000000,     # TODO(mondrian): measure on the device
+    # Measured on the phone (2026-10-20): the live device tree that the
+    # bootloader passes, read from /proc/device-tree in a recovery. The
+    # /memory node has six regions: 0x80000000+0x6a000000, then a hole, then
+    # 0xf4600000+0x0ba00000 (which ends exactly at 4G), and four regions above
+    # 4G. The kernel gets the first one (the low bank) and the largest region
+    # above 4G is the high memory. The ddr_size property says 12GB: the
+    # bootloader only describes the part of the RAM the kernel may use.
+    phys_base=0x80000000,
+    mem_size=0x6a000000,
+    high_phys_base=0x800000000,
+    high_mem_size=0x37500000,
     soc_base=0x01000000,
-    # GICD/GICR: cape.dtsi and the mainline sm8450.dtsi agree.
+    # GICD/GICR: cape.dtsi and the mainline sm8450.dtsi agree, and the live
+    # device tree confirms it: interrupt-controller@17100000 has
+    # reg = <0x17100000 0x10000> (GICD) and <0x17180000 0x200000> (GICR),
+    # redistributor-stride = 0x40000, one redistributor region.
     gicd=0x17100000,
     gicd_size=0x10000,
     gicr=0x17180000,
@@ -182,14 +188,17 @@ MONDRIAN = Board(
     gicr_pe_size=0x40000,
     # The splash the ABL leaves for the display: cont_splash_region at
     # 0xB8000000, 0x2b00000 (43 MiB). Source: the SM8450 display dtsi
-    # (cape-sde-display.dtsi, splash_region), not measured on the phone yet;
-    # the shim prefers the value of the live device tree.
+    # (cape-sde-display.dtsi, splash_region); the shim prefers the value of
+    # the live device tree.
     fb=0xb8000000,
     fb_size=0x2b00000,
     fb_w=1440,
     fb_h=3200,
     # UFS host: ufshc@1d84000 (mainline sm8450.dtsi). Same window as sweet,
-    # but a UFS 3.1 controller, not the UFSHCI 2.1 sweet drives.
+    # but a UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. The live
+    # device tree agrees: ufshc@1d84000 with reg 0x1d84000+0x3000 (ufs_mem),
+    # 0x1d88000+0x8000 (ufs_ice) and 0x1d90000+0x9000 (ufs_ice_hwkms),
+    # two lanes per direction, irq SPI 265.
     ufs=0x01d84000,
     ufs_size=0x3000,
     timebase=19200000,
@@ -208,10 +217,9 @@ MONDRIAN = Board(
     touch='goodix-spi',          # Goodix over QUPv3 SE4 SPI, not I2C
     keys='pm8008',               # PM8008 (PMR735A + PM8350B), not the PM6150
     panel='amoled-dsi',
-    # Not measured yet: the memory map of the phone. No bootable image may be
-    # built from these.
-    provisional=frozenset({'phys_base', 'mem_size', 'high_phys_base',
-                           'high_mem_size'}),
+    # Nothing is provisional any more: every value above was read from the
+    # phone itself.
+    provisional=frozenset(),
     # The boot arguments are the ones sweet uses, with the framebuffer
     # arguments renamed for this board. cpus=6 starts the six A710/A510
     # cores and leaves the X2 and the other A710s parked, like sweet leaves
@@ -304,23 +312,31 @@ def apply_facts(board, facts):
     if banks:
         banks.sort()
         b = replace(b, phys_base=banks[0][0], mem_size=banks[0][1])
+        # The RAM above 4GB: the biggest of those regions, not the last one.
         high = [x for x in banks if x[0] >= 0x100000000]
         if high:
-            b = replace(b, high_phys_base=high[-1][0], high_mem_size=high[-1][1])
+            biggest = max(high, key=lambda x: x[1])
+            b = replace(b, high_phys_base=biggest[0], high_mem_size=biggest[1])
         done |= {'phys_base', 'mem_size', 'high_phys_base', 'high_mem_size'}
 
     for (kind, key), values in facts.items():
         if kind != 'reg' or len(values) < 2:
             continue
         name = key.rsplit('/', 1)[-1]
+        base = name.split('@')[0]
         if name.startswith('ufs') and len(values) >= 2:
             b = replace(b, ufs=values[0], ufs_size=values[1])
             done |= {'ufs', 'ufs_size'}
-        elif name in ('intc', 'gic') and len(values) >= 4:
-            # GICD, GICD size, GICR, GICR size
-            b = replace(b, gicd=values[0], gicd_size=values[1],
-                        gicr=values[2], gicr_size=values[3])
-            done |= {'gicd', 'gicd_size', 'gicr', 'gicr_size'}
+        elif base in ('intc', 'gic', 'interrupt-controller') and len(values) >= 2:
+            # The device tree describes the GIC (GICD plus the redistributor
+            # window) with a single reg. The GICR sits 512KB above the GICD on
+            # this SoC, and the redistributor stride follows from the size.
+            gicd, gicd_size = values[0], values[1]
+            b = replace(b, gicd=gicd, gicd_size=gicd_size)
+            done |= {'gicd', 'gicd_size'}
+            if len(values) >= 4:
+                b = replace(b, gicr=values[2], gicr_size=values[3])
+                done |= {'gicr', 'gicr_size'}
         elif 'splash' in name or 'screen' in name:
             # the framebuffer the bootloader leaves for the panel
             b = replace(b, fb=values[0], fb_size=values[1])
