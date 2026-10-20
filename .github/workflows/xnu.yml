@@ -27,7 +27,8 @@ on:
 
 concurrency:
   # the env context is not available here, so the board comes from the input
-  group: xnu-${{ github.ref }}-${{ inputs.board || 'sweet' }}
+  # or from the branch
+  group: xnu-${{ github.ref }}-${{ inputs.board || (startsWith(github.ref, 'refs/heads/mondrian') && 'mondrian' || 'sweet') }}
   cancel-in-progress: true
 
 env:
@@ -35,7 +36,8 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  BOARD: ${{ inputs.board || 'sweet' }}
+  # a push to the mondrian branch builds the mondrian board
+  BOARD: ${{ inputs.board || (startsWith(github.ref, 'refs/heads/mondrian') && 'mondrian' || 'sweet') }}
 
 jobs:
   build:
