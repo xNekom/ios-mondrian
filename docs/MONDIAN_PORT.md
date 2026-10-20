@@ -137,25 +137,44 @@ instead of the MacOSX one: its user VA is 63.75 GB, the original assertion
 holds as it is, and the platform matches the userland. The sweet port uses
 the MacOSX base, so this is a bigger change than a patch.
 
-**The early boot of the kernel is where the remaining problem is.** With
-4 KiB pages the kernel faults with a prefetch abort on the first
-instruction of `arm_init` (a permission fault with the execute bit clear).
-`tools/qemu-triage.py` says so from a QEMU run:
+**The early boot was the remaining problem, and it was the address
+layout.** With 4 KiB pages the kernel faulted on the first instruction of
+`arm_init` (`ESR 0x21 / 0x86000004`, a level 1 translation fault) even
+though the bootstrap page tables were correct:
 
-```
-$ tools/qemu-triage.py /tmp/qemu-out kernel.development.mondrian
-first exception:
-   Taking exception 3 [Prefetch Abort] on CPU 0
-   ESR 0x21 / 0x86000004 -> instruction abort, permission fault, level 1, execute never
-   FAR 0xfffffe0007a6233c
-   symbol _arm_init (+0x0)
-```
+| | 16 KiB (sweet) | 4 KiB (mondrian) |
+| --- | --- | --- |
+| `TCR_EL1_BOOT` | T0SZ = T1SZ = 17, 47-bit VA | T0SZ = T1SZ = 25, 39-bit VA |
+| TTBR1 window starts at | `0xFFFF800000000000` | `0xFFFFFF8000000000` |
+| kernel link address | `0xFFFFFE0007004000` (inside) | the same address (outside) |
 
-The control experiment is the sweet kernel rebuilt with 4 KiB pages
-(branch `exp/sweet-4k`): if it fails the same way, the problem is in XNU
-and not in the port.
+The build runs with `PLATFORM=MacOSX`, so `makedefs/MakeInc.def` picks
+`ARM64_LINK_ADDR = 0xFFFFFE0007004000`, low globals at
+`0xFFFFFE0000000000` and `-DARM_LARGE_MEMORY=1`. That whole layout only
+fits in a 47-bit VA: with 4 KiB pages the kernel address is in the hole
+between the TTBR0 and TTBR1 windows, so the MMU never walks its tables.
+Patch `xnu/patches-mondrian/0001` now gives MONDRIAN the device layout
+(`ARM64_LINK_ADDR 0xFFFFFFF007004000`, `-UARM_LARGE_MEMORY`).
 
-**Check:** the kernel reaches `arm_init` and the early console prints.
+Measured with the QEMU gdb stub (`--gdb`, stop on the exception vector,
+read the system registers): `TTBR0_EL1 0xb0176000`, `TTBR1_EL1
+0xb0177000`, `TCR_EL1 0x22a5192519` (4 KiB granules, 39-bit VA),
+`SCTLR_EL1` M = 1 - and the tables populated exactly where expected. The
+tables were right; the address was not in any window.
+
+The earlier "sweet 4 KiB" control (`exp/sweet-4k`) does **not** contradict
+this: its `TCR_EL1_BOOT` is still `0x226511a511` (T0SZ = T1SZ = 17,
+TG0 = TG1 = 16 KiB), so it was a 16 KiB kernel with a 47-bit VA. The
+mondrian build is the first real 4 KiB kernel in the tree.
+
+The console alias that patches 0010/0012 install for the world after the
+bootstrap TTBR0 lives at `LOW_GLOBAL_BASE_ADDRESS + 2 MB` for the same
+reason: the device layout has no reserved L1 entry at
+`VM_MIN_KERNEL_ADDRESS`, but `gVirtBase` and the low globals share one,
+and the VM never allocates the low globals region.
+
+**Check:** the kernel passes `arm_init`, prints the `MONDRIAN EARLY`
+stages through `arm_vm_init`, and panics only where it needs hardware.
 
 
 ### 2. The generic half of the sweet series — done

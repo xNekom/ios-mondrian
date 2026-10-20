@@ -237,7 +237,8 @@ def main():
     ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds (default: 20)')
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
-    ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
+    ap.add_argument('--cpu', help="QEMU CPU model (default: cortex-a76 for sweet, max for mondrian: "
+                                  "the mondrian kernel is armv8.5 and uses MSR DIT, which cortex-a76 does not implement)")
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
@@ -245,6 +246,11 @@ def main():
     ap.add_argument('--board', default='sweet', help='sweet | mondrian (the framebuffer to decode)')
     a = ap.parse_args()
     set_board(a.board)
+    if a.cpu is None:
+        # The mondrian kernel is built for armv8.5 and uses MSR DIT when it
+        # switches context; cortex-a76 (armv8.2) does not implement that
+        # register, so the sweet board keeps its model and mondrian gets max.
+        a.cpu = 'max' if a.board == 'mondrian' else 'cortex-a76'
 
     if a.check_env:
         ok = check_qemu_dependency(a.cpu)

@@ -42,6 +42,41 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
     so `tools/mkpayload.py` rounds the kernel's virtual base down to 2 MB
     (`board.tt_l2_size`) and the shim's MMU uses the board's granule
     (`BOARD_PG_SHIFT`).
+- **2026-10-20: the dead `arm_init` fetch explained and fixed** (commit
+  `bac4cbe`). The mondrian kernel stopped at the first instruction of
+  `_arm_init` (`ESR 0x21 / 0x86000004`, instruction abort, translation fault
+  level 1) while the sweet kernel booted. Controls that ruled things out:
+  the sweet kernel with the mondrian ADT boots; the mondrian kernel with the
+  sweet ADT still faults; the mondrian kernel with the early console
+  disabled still faults (CI `39476685118`). So it was the kernel build, not
+  the device tree and not the console.
+  - QEMU, stopped on the exception vector through the gdb stub
+    (`tools/qemu-ios.py ... --gdb`, then
+    `lldb -o "gdb-remote 1234" -o "register read -a"`): `TTBR0_EL1
+    0xb0176000`, `TTBR1_EL1 0xb0177000` - both tables correctly populated
+    (`bootstrap_pagetables` at PA 0xb0176000; the KVA root entry 0 ->
+    0xb017a003; the `arm_init` block 0xb0a00601), `SCTLR_EL1` M=1 - but
+    `TCR_EL1 0x22a5192519` = **T0SZ = T1SZ = 25, TG0 = TG1 = 4 KiB, a 39-bit
+    VA**.
+  - With a 39-bit VA, TTBR1 only translates `0xFFFFFF8000000000` upwards.
+    The kernel is linked at `0xFFFFFE0007004000`, in the hole between the
+    TTBR0 and TTBR1 windows, so the MMU can never fetch it. The tables the
+    bootstrap builds are fine; they are simply outside the window.
+  - `TCR_EL1_BOOT` is `osfmk/arm64/proc_reg.h`. The address comes from
+    `ARM64_LINK_ADDR` in `makedefs/MakeInc.def`, which the build sets to the
+    macOS value (`0xFFFFFE0007004000`, `ARM_LARGE_MEMORY=1`) because it runs
+    with `PLATFORM=MacOSX`. The large memory layout also puts low globals at
+    `0xFFFFFE0000000000` and the pmap heap in the same window, so it needs
+    the 47-bit VA and cannot work with 4 KiB/39-bit at all.
+  - Fix in `xnu/patches-mondrian/0001`: for
+    `CURRENT_MACHINE_CONFIG = MONDRIAN` use the device addresses
+    (`ARM64_LINK_ADDR 0xfffffff007004000`,
+    `ARM64_PLKSEG_ADDR 0xfffffff004004000`) and `-UARM_LARGE_MEMORY`.
+  - **The earlier "sweet 4 KiB" control was not a 4 KiB kernel**: its
+    `TCR_EL1_BOOT` is still `0x226511a511` (T0SZ = T1SZ = 17, TG0 = TG1 =
+    16 KiB), so it proved nothing about 4 KiB. The mondrian build is the
+    first real 4 KiB kernel in this tree.
+
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot
@@ -116,11 +151,13 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
      volume up key is a plain PM8350 GPIO.
   6. The USB stack: the SM8475 DWC3 needs its own configuration.
 
-- **Next concrete action:** run the CI for the mondrian board
-  (`gh workflow run xnu.yml -f board=mondrian`) and check that the XNU
-  machine config patch applies and the kernel builds with
-  `MACHINE_CONFIG=MONDRIAN`. Then port the generic series with
-  `tools/port-series.py` and build a kernel that reaches the early console.
+- **Next concrete action:** CI run `39480177767` (commit `bac4cbe`) rebuilds
+  the kernel with the device link address. Run it in QEMU
+  (`tools/qemu-ios.py <payload> <out> --kernel ... --board mondrian`) and
+  triage the first exception with `tools/qemu-triage.py`. Success looks like:
+  past `arm_init`, through `arm_vm_init`, to the point where it needs the
+  hardware (root device / UFS) instead of dying in the bootstrap. Then the
+  UFS 3.1 root driver is the work (item 2 of the list above).
 
 - **Facts that were checked against sources (not guesses):**
   - 4 KiB pages: `PAGE_SIZE=4096` in `build.config.msm.mondrian` of
