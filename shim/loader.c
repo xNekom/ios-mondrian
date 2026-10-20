@@ -184,9 +184,6 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("PHYS", "base=", phys_base, "size=", mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
-	/* What is at the entry point: proof that the copy worked. */
-	con_bytes("KERN", (const void *)(p->entry_va + pa_of_va_base), 16);
-
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > phys_base && rd_start < phys_base + mem_size)
 		return "ramdisk overlaps kernel memory";
@@ -199,6 +196,8 @@ const char *loader_boot(uintptr_t dtb)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
+	/* What is at the entry point now: proof that the copy worked. */
+	con_bytes("KERN", (const void *)(p->entry_va + pa_of_va_base), 16);
 
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
