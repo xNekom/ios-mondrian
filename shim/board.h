@@ -34,13 +34,12 @@
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */
 #define UFS_BASE		0x01d84000UL
 
-/* TODO(mondrian): the ABL leaves no simple framebuffer behind on a DSI
- * panel. sweet's LCD kept one at 0x9c000000 (cont_splash_region); on SM8475
- * the display subsystem is MDSS (0x0ae00000) with the DPU at 0x0ae01000 and
- * the panel is driven over DSI D-PHY. The address and the geometry have to be
- * read from the device (see the "dtb dump" in the shim). */
-#define FB_BASE			0x9c000000UL
-#define FB_SIZE			0x1700000UL
+/* The splash the ABL leaves for the DSI panel: cont_splash_region at
+ * 0xB8000000, 0x2b00000 (43 MiB). Source: the SM8450 display dtsi
+ * (cape-sde-display.dtsi, splash_region). The shim prefers the value of the
+ * live device tree; this is the documented fallback. */
+#define FB_BASE			0xb8000000UL
+#define FB_SIZE			0x2b00000UL
 #define FB_W			1440
 #define FB_H			3200
 #define FB_STRIDE		(FB_W * 4)
@@ -49,9 +48,9 @@
 
 #define NR_CPUS			8
 
-/* The framebuffer address of this board is not measured yet: the shim must
- * take it from the device tree and must not fall back to the constant. */
-#define BOARD_FB_FROM_DTB	1
+/* The framebuffer of the board is a documented value of the platform, but
+ * the device tree is always preferred when it names it. */
+#define BOARD_FB_FROM_DTB	0
 
 #else	/* BOARD_SWEET (default) */
 

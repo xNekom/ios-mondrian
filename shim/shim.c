@@ -384,8 +384,11 @@ static void fact(const char *kind, const char *key, const uint64_t *v, int n)
  */
 static void board_from_dtb(uintptr_t dtb)
 {
-	static const char *const splash[] = {
-		"cont_splash_region", "sec_boot_screen", "splash",
+	/* A 2D array, not an array of pointers: the shim is linked at 0 and
+	 * loaded wherever ABL puts it, so any absolute address in .rodata
+	 * would be wrong (and the build refuses absolute relocations). */
+	static const char splash[][24] = {
+		"cont_splash_region", "sec_boot_screen", "splash", "",
 	};
 	char path[64];
 	uint64_t regs[8];
@@ -394,7 +397,7 @@ static void board_from_dtb(uintptr_t dtb)
 		return;
 
 	/* The framebuffer the bootloader left for the panel. */
-	for (unsigned i = 0; i < sizeof(splash) / sizeof(splash[0]); i++) {
+	for (unsigned i = 0; splash[i][0]; i++) {
 		if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
 			continue;
 		if (fdt_node_regs(dtb, path, regs, 4) > 0) {
@@ -419,7 +422,8 @@ ufs:
 
 static void dump_facts(uintptr_t dtb)
 {
-	static const char *const compat[] = {
+	/* A 2D array, not an array of pointers: see board_from_dtb(). */
+	static const char compat[][24] = {
 		"qcom,ufshc",		/* the internal UFS host */
 		"arm,gic-v3",		/* GICD and GICR */
 		"qcom,spmi",		/* the PMIC bus */
@@ -427,6 +431,7 @@ static void dump_facts(uintptr_t dtb)
 		"qcom,dsi-display",	/* the panel */
 		"qcom,mdss",		/* the display subsystem */
 		"qcom,pmic-glink",	/* the PMIC */
+		"",
 	};
 	char path[64];
 	uint64_t regs[32];
@@ -447,21 +452,19 @@ static void dump_facts(uintptr_t dtb)
 			fact("memory", key, v, 2);
 		}
 	}
-	/* The framebuffer the bootloader leaves for the panel: the reserved
+	/* The framebuffer the bootloader left for the panel: the reserved
 	 * memory region of the splash. */
-	{
-		static const char *const splash[] = {
-			"cont_splash_region", "sec_boot_screen", "splash",
-		};
-		for (unsigned i = 0; i < sizeof(splash) / sizeof(splash[0]); i++) {
-			if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
-				continue;
-			int n = fdt_node_regs(dtb, path, regs, 4);
-			if (n > 0)
-				fact("reg", path, regs, n * 2);
-		}
+	static const char splash[][24] = {
+		"cont_splash_region", "sec_boot_screen", "splash", "",
+	};
+	for (unsigned i = 0; splash[i][0]; i++) {
+		if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
+			continue;
+		int n = fdt_node_regs(dtb, path, regs, 4);
+		if (n > 0)
+			fact("reg", path, regs, n * 2);
 	}
-	for (unsigned i = 0; i < sizeof(compat) / sizeof(compat[0]); i++) {
+	for (unsigned i = 0; compat[i][0]; i++) {
 		int n;
 		if (!fdt_find_compatible(dtb, compat[i], path, sizeof(path)))
 			continue;
@@ -523,12 +526,17 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/* No payload: probe the internal UFS while the MMU is still off.
+	 * SHIM_NO_UFS leaves the controller alone: the first boot of a new
+	 * board only reads the device tree and draws on the splash. */
+#ifndef SHIM_NO_UFS
 	stage = "ufs";
 	test_ufs();
 	con_skip();
-	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
+#else
+	con_str("UFS", "probe skipped (SHIM_NO_UFS)");
+#endif
 	delay_ms(180000);
 	reset(20);
 

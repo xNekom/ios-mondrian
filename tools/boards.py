@@ -180,12 +180,12 @@ MONDRIAN = Board(
     gicr=0x17180000,
     gicr_size=0x200000,          # 8 redistributors, stride 0x40000
     gicr_pe_size=0x40000,
-    # TODO(mondrian): the ABL splash of a DSI panel. sweet's LCD left its
-    # framebuffer at 0x9c000000; on SM8475 the display subsystem is MDSS
-    # (0x0ae00000) with a DPU (0x0ae01000) and the panel is driven over
-    # DSI D-PHY, so the address has to be read from the device.
-    fb=0x9c000000,
-    fb_size=0x1700000,
+    # The splash the ABL leaves for the display: cont_splash_region at
+    # 0xB8000000, 0x2b00000 (43 MiB). Source: the SM8450 display dtsi
+    # (cape-sde-display.dtsi, splash_region), not measured on the phone yet;
+    # the shim prefers the value of the live device tree.
+    fb=0xb8000000,
+    fb_size=0x2b00000,
     fb_w=1440,
     fb_h=3200,
     # UFS host: ufshc@1d84000 (mainline sm8450.dtsi). Same window as sweet,
@@ -208,11 +208,10 @@ MONDRIAN = Board(
     touch='goodix-spi',          # Goodix over QUPv3 SE4 SPI, not I2C
     keys='pm8008',               # PM8008 (PMR735A + PM8350B), not the PM6150
     panel='amoled-dsi',
-    # Not measured yet: the memory map of the phone and the framebuffer the
-    # bootloader leaves for a DSI panel. No bootable image may be built from
-    # these.
+    # Not measured yet: the memory map of the phone. No bootable image may be
+    # built from these.
     provisional=frozenset({'phys_base', 'mem_size', 'high_phys_base',
-                           'high_mem_size', 'fb', 'fb_size'}),
+                           'high_mem_size'}),
     # The boot arguments are the ones sweet uses, with the framebuffer
     # arguments renamed for this board. cpus=6 starts the six A710/A510
     # cores and leaves the X2 and the other A710s parked, like sweet leaves
