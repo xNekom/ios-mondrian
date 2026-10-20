@@ -502,7 +502,6 @@ static void board_memory(uintptr_t dtb)
 {
 	char path[64];
 	uint64_t regs[64];
-	uint64_t total = 0;
 	int n, best = -1, fb = -1;
 	uint32_t ac = 2, sc = 2;
 
@@ -521,7 +520,6 @@ static void board_memory(uintptr_t dtb)
 
 	for (int i = 0; i < n; i++) {
 		uint64_t base = regs[i * 2], size = regs[i * 2 + 1];
-		total += size;
 		/*
 		 * The region that holds the splash framebuffer is the one the
 		 * kernel has to get: the early console writes to it through the
