@@ -101,6 +101,20 @@ void loader_set_regions(const uint64_t *regs, int n)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* How much of the ramdisk the payload takes. */
+static uint64_t
+payload_size(const struct payload *p)
+{
+	uint64_t end = p->adt_off + p->adt_size;
+
+	for (uint32_t i = 0; i < p->nsegs; i++) {
+		uint64_t e = p->segs[i].file_off + p->segs[i].file_size;
+		if (e > end)
+			end = e;
+	}
+	return end;
+}
+
 /*
  * The bootloader does not always tell us where it put the ramdisk: it
  * publishes the address in the device tree, and only when the image carries
@@ -125,25 +139,20 @@ loader_scan_payload(void)
 	return 0;
 }
 
-/* How much of the ramdisk the payload takes. */
-static uint64_t
-payload_size(const struct payload *p)
-{
-	uint64_t end = p->adt_off + p->adt_size;
-
-	for (uint32_t i = 0; i < p->nsegs; i++) {
-		uint64_t e = p->segs[i].file_off + p->segs[i].file_size;
-		if (e > end)
-			end = e;
-	}
-	return end;
-}
+/* The end of the shim image: the payload is appended right after it. */
+extern char _end;
 
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+	/* The payload the build appended to this image. */
+	if (magic_ok((const char *)&_end)) {
+		const struct payload *pp = (const struct payload *)&_end;
+		rd_start = (uint64_t)(uintptr_t)&_end;
+		rd_end = rd_start + payload_size(pp);
+		con_hex("IMAGE", rd_start);
+	} else if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);

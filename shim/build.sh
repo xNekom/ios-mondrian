@@ -65,14 +65,16 @@ $OBJCOPY -O binary out/shim.elf out/Image
 end=$($NM out/shim.elf | awk '$3=="_end"{print $1}')
 size=$((16#$end))
 truncate -s "$size" out/Image
-# Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
-# newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
-# The payload goes in gzipped: the ABL of this phone (Android 13) gunzips the
-# ramdisk into its own buffer and drops the ramdisk when it is not gzip, so a
-# raw payload never reaches the shim. The shim sees the decompressed bytes.
+# The xnu payload (tools/mkpayload.py) is appended to the shim image: the
+# bootloader loads the "kernel" segment raw, with no cpio and no gzip, so
+# this is the one place where the payload survives whatever the ABL does with
+# a ramdisk. The shim finds it right after its own code (at _end).
 if [ -n "${1:-}" ]; then
-	gzip -9 -c "$1" > out/ramdisk.bin
-else
+	cat "$1" >> out/Image
+fi
+# Ramdisk: an empty newc cpio (ABL dislikes a zero-size ramdisk on some
+# builds) -> diagnostics.
+if true; then
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 dtb_arg=()
