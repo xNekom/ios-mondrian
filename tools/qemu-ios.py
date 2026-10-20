@@ -22,8 +22,21 @@ An undecodable or blank screen returns 3 with --fail-on-panic.
 """
 import argparse, json, os, shutil, socket, struct, subprocess, sys, time, zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import boards  # noqa: E402
+
+# The framebuffer of the board: the early console draws there, and it is
+# what the tool decodes.
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
+
+
+def set_board(name):
+    """Use the framebuffer and the geometry of the board."""
+    global FB_BASE, FB_W, FB_H, FB_STRIDE
+    b = boards.get_board(name)
+    FB_BASE, FB_W, FB_H = b.fb, b.fb_w, b.fb_h
+    FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
 BOOT_LINE_LENGTH = 608
@@ -229,7 +242,9 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
+    ap.add_argument('--board', default='sweet', help='sweet | mondrian (the framebuffer to decode)')
     a = ap.parse_args()
+    set_board(a.board)
 
     if a.check_env:
         ok = check_qemu_dependency(a.cpu)
