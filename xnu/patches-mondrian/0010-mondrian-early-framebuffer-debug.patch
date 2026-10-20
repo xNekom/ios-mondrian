@@ -259,7 +259,7 @@ index 0000000..8f4c808
 +		return;
 +	}
 +	early_panicking = 1;
-+	mondrian_early_string("\nSWEET EARLY PANIC: ");
++	mondrian_early_string("\nMONDRIAN EARLY PANIC: ");
 +	va_list copy;
 +	va_copy(copy, *args);
 +	_doprnt(fmt, &copy, mondrian_early_putc, 16);
