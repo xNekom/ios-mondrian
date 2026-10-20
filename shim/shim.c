@@ -400,18 +400,25 @@ static void board_from_dtb(uintptr_t dtb)
 	for (unsigned i = 0; splash[i][0]; i++) {
 		if (!fdt_find_name_depth(dtb, splash[i], path, sizeof(path), 3))
 			continue;
-		if (fdt_node_regs(dtb, path, regs, 4) > 0) {
-			con_enable((uintptr_t)regs[0], FB_W, FB_H);
-			con_hex2("FB", "at=", (uint32_t)regs[0], "size=", (uint32_t)regs[1]);
-			goto ufs;
-		}
-	}
-#if !BOARD_FB_FROM_DTB
-	/* sweet: the measured address, the device tree does not name it */
-	con_enable(FB_BASE, FB_W, FB_H);
-	con_hex2("FB", "at=", (uint32_t)FB_BASE, "size=", (uint32_t)FB_SIZE);
+		if (fdt_node_regs(dtb, path, regs, 4) <= 0)
+			continue;
+		/* Say where it is before moving the console there: the address
+		 * of the device tree is not always the one the panel shows. */
+		con_hex2("FB", "at=", (uint32_t)regs[0], "size=", (uint32_t)regs[1]);
+#if BOARD_FB_FROM_DTB
+		con_enable((uintptr_t)regs[0], FB_W, FB_H);
 #endif
-ufs:
+		return;
+	}
+}
+
+static void board_ufs(uintptr_t dtb)
+{
+	char path[64];
+	uint64_t regs[8];
+
+	if (!dtb)
+		return;
 	/* The UFS host, if the device tree names it. */
 	if (fdt_find_compatible(dtb, "qcom,ufshc", path, sizeof(path)) &&
 	    fdt_node_regs(dtb, path, regs, 4) > 0) {
@@ -562,11 +569,26 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+	/* The console first, on the address the board documents: if anything
+	 * goes wrong while reading the device tree, the screen still shows
+	 * where it stopped. */
+	con_enable(FB_BASE, FB_W, FB_H);
+	con_str("S1", "console on");
+	con_hex("DTB", dtb);
+	con_skip();
+	stage = "fdt";
+
 	/* Where the framebuffer is comes from the device tree. */
 	board_from_dtb(dtb);
+	board_ufs(dtb);
+	con_str("S2", "framebuffer");
+	con_skip();
 	/* And so does the memory map: the kernel gets the window the
 	 * bootloader reports, not the one the image was built for. */
+	stage = "mem";
 	board_memory(dtb);
+	con_str("S3", "memory");
+	con_skip();
 	if (win.size)
 		loader_set_window(win.base, win.size);
 

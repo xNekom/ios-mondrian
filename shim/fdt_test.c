@@ -203,6 +203,17 @@ int main(void)
 	check(fdt_node_u32(dtb, "/soc/intc", "#nothing", &v) == 0,
 	      "fdt_node_u32 missing property");
 
+	/* The memory node: the cells come from the node (or from the root). */
+	{
+		uint64_t regs[8];
+		int n = fdt_node_regs(dtb, "/memory@80000000", regs, 4);
+		check(n == 1 && regs[0] == 0x80000000 && regs[1] == 0x40000000,
+		      "fdt_node_regs memory");
+		n = fdt_node_regs(dtb, "/soc/ufs_mem", regs, 4);
+		check(n == 1 && regs[0] == 0x01d84000 && regs[1] == 0x3000,
+		      "fdt_node_regs ufs_mem");
+	}
+
 	printf("%s\n", failures ? "FAILED" : "all checks passed");
 	return failures ? 1 : 0;
 }
