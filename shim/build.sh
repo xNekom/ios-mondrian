@@ -67,8 +67,11 @@ size=$((16#$end))
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
+# The payload goes in gzipped: the ABL of this phone (Android 13) gunzips the
+# ramdisk into its own buffer and drops the ramdisk when it is not gzip, so a
+# raw payload never reaches the shim. The shim sees the decompressed bytes.
 if [ -n "${1:-}" ]; then
-	cp "$1" out/ramdisk.bin
+	gzip -9 -c "$1" > out/ramdisk.bin
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi

@@ -116,6 +116,7 @@ loader_scan_payload(void)
 
 	for (int i = 0; i < n_mem_regs; i++) {
 		uint64_t base = mem_regs[i * 2], size = mem_regs[i * 2 + 1];
+		con_hex2("SCAN", "at=", (uint32_t)(base >> 32), "size=", (uint32_t)base);
 		for (uint64_t a = base; a + 64 <= base + size; a += 64) {
 			if (*(volatile uint64_t *)a == want)
 				return (uintptr_t)a;
