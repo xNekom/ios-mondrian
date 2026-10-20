@@ -309,6 +309,7 @@ const char *loader_boot(uintptr_t dtb)
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+	shim_set_stage("xnu");
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";
 }

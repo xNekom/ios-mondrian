@@ -89,7 +89,11 @@ vectors:
 	vent 15
 
 exc_common:
-	sub	sp, sp, #(30 * 8)
+	/*
+	 * The frame holds x0-x28 and, at the end, the x29/x30 that the
+	 * vector stashed below the original stack pointer.
+	 */
+	sub	sp, sp, #(34 * 8)
 	stp	x0, x1, [sp, #0]
 	stp	x2, x3, [sp, #16]
 	stp	x4, x5, [sp, #32]
@@ -105,6 +109,8 @@ exc_common:
 	stp	x24, x25, [sp, #192]
 	stp	x26, x27, [sp, #208]
 	str	x28, [sp, #224]
+	ldp	x2, x3, [sp, #256]		/* the stashed x29/x30 */
+	stp	x2, x3, [sp, #240]
 	mov	x0, x29
 	mov	x1, sp
 	bl	exc_handler

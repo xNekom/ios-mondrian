@@ -53,6 +53,12 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
+
+/* The loader tells us what it is doing, so the panic names the step. */
+void shim_set_stage(const char *s)
+{
+	stage = s;
+}
 static volatile uint64_t sec_mpidr[NR_CPUS];
 static volatile uint64_t sec_probe[4];	/* CPU1 redistributor write test */
 static volatile uint32_t irq_count, irq_other, irq_last;
@@ -153,7 +159,10 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("SPSR", rsr("spsr_el1"));
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
-	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
+	con_hex("X2", regs[2]);
+	con_hex("X3", regs[3]);
+	con_hex("X29", regs[29]);
+	con_hex("X30", regs[30]);
 	reset(40);
 }
 
