@@ -45,6 +45,18 @@ RENAMES = [
     (r'sweettouch', 'mondriantouch'),
     (r'sweetkeys', 'mondriankeys'),
     (r'xiaomi,sweet', 'xiaomi,mondrian'),
+    # the early console draws on the splash of the board: the address and the
+    # geometry of the panel. On the SM8475 the cont_splash_region is at
+    # 0xb8000000 and the panel is 1440x3200 (stride 5760). Writing to the
+    # sweet address would hit the firmware area of the SM8475.
+    (r'0x9c000000', '0xb8000000'),
+    (r'\bEARLY_WIDTH 1080u\b', 'EARLY_WIDTH 1440u'),
+    (r'\bEARLY_HEIGHT 2400u\b', 'EARLY_HEIGHT 3200u'),
+    (r'\bEARLY_STRIDE \(4320u / 4\)', 'EARLY_STRIDE (5760u / 4)'),
+    (r'\b4320\b', '5760'),
+    # the last row the early console writes on: the sweet screen is 2400
+    # pixels high, the mondrian one 3200
+    (r'\b2368\b', '3168'),
     # the CPU compatible string: sweet is a Kryo 470 (Cortex-A76/A55),
     # mondrian a Kryo 700 (Cortex-X2/A710/A510)
     (r'qcom,kryo470', 'qcom,kryo'),
