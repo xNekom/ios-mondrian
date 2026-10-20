@@ -14,3 +14,6 @@ void loader_set_window(uint64_t base, uint64_t size);
 /* The memory regions of the phone (base/size pairs), to look for the
  * payload when the bootloader does not say where it put it. */
 void loader_set_regions(const uint64_t *regs, int n);
+
+/* Print the memory regions the shim knows about. */
+void loader_report_regions(void);

@@ -100,6 +100,14 @@ void loader_set_regions(const uint64_t *regs, int n)
 	n_mem_regs = n;
 }
 
+/* The memory regions, so the console can show what the shim picked. */
+void loader_report_regions(void)
+{
+	for (int i = 0; i < n_mem_regs; i++)
+		con_hex2("MEM", "at=", (uint32_t)(mem_regs[i * 2] >> 32),
+			 "size=", (uint32_t)mem_regs[i * 2]);
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 /* How much of the ramdisk the payload takes. */

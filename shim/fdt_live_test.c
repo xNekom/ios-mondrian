@@ -77,6 +77,41 @@ int main(int argc, char **argv)
 		printf("ufshc: NOT FOUND\n");
 	}
 
+
+	/* The same decision board_memory() makes, so we can see it here. */
+	{
+		uint64_t wregs[64];
+		char wpath[64];
+		int n = 0, best = -1, fb = -1;
+		uint64_t FB_BASE = 0xb8000000UL;
+
+		if (fdt_find_name((uintptr_t)dtb, "memory", wpath, sizeof(wpath)))
+			n = fdt_node_regs((uintptr_t)dtb, wpath, wregs, 32);
+		if (n <= 0) {
+			wregs[0] = 0x80000000UL;
+			wregs[1] = 0x6a000000UL;
+			n = 1;
+			printf("  (fallback to the board table)\n");
+		}
+		for (int i = 0; i < n; i++) {
+			uint64_t base = wregs[i * 2], size = wregs[i * 2 + 1];
+			printf("  region %d: %016lx + %016lx\n", i, base, size);
+			if (FB_BASE >= base && FB_BASE < base + size)
+				fb = i;
+			if (size >= 0x20000000UL && (best < 0 || base > wregs[best * 2]))
+				best = i;
+		}
+		if (fb >= 0)
+			best = fb;
+		uint64_t phys_base = best >= 0 ? wregs[best * 2] : 0;
+		uint64_t mem_size = best >= 0 ? wregs[best * 2 + 1] : 0;
+		printf("  window: %016lx + %016lx\n", phys_base, mem_size);
+		printf("  verdict: %s\n", phys_base == 0x80000000UL ? "window-low-bank" :
+			(phys_base == 0x800000000UL ? "window-above-4g" : "window-other"));
+		printf("  fb: %s\n", (FB_BASE >= phys_base && FB_BASE < phys_base + mem_size) ?
+			"fb-inside" : "FB-OUTSIDE");
+	}
+
 	uint64_t start = 0, end = 0;
 	printf("chosen/linux,initrd-start: %s\n",
 	       fdt_chosen_u64((uintptr_t)dtb, "linux,initrd-start", &start) ? "yes" : "no");

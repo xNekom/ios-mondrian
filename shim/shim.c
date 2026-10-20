@@ -503,7 +503,7 @@ static void board_memory(uintptr_t dtb)
 	char path[64];
 	uint64_t regs[64];
 	uint64_t total = 0;
-	int n, best = -1;
+	int n, best = -1, fb = -1;
 	uint32_t ac = 2, sc = 2;
 
 	(void)ac;
@@ -521,13 +521,20 @@ static void board_memory(uintptr_t dtb)
 
 	for (int i = 0; i < n; i++) {
 		uint64_t base = regs[i * 2], size = regs[i * 2 + 1];
-		con_hex2("MEM", "at=", (uint32_t)(base >> 32), "size=", (uint32_t)base);
 		total += size;
-		/* The loader looks for the payload in these regions. */
+		/*
+		 * The region that holds the splash framebuffer is the one the
+		 * kernel has to get: the early console writes to it through the
+		 * bootstrap V=P map, which only covers this window.
+		 */
+		if (FB_BASE >= base && FB_BASE < base + size)
+			fb = i;
 		/* the highest region that can host the kernel */
 		if (size >= 0x20000000UL && (best < 0 || base > regs[best * 2]))
 			best = i;
 	}
+	if (fb >= 0)
+		best = fb;
 	if (best < 0) {
 		/* no region of 512 MiB: take the largest one */
 		for (int i = 0; i < n; i++)
@@ -539,9 +546,8 @@ static void board_memory(uintptr_t dtb)
 	loader_set_regions(regs, n);
 	win.base = regs[best * 2];
 	win.size = regs[best * 2 + 1];
-	con_hex2("WIN", "at=", (uint32_t)(win.base >> 32), "size=", (uint32_t)win.base);
-	con_hex("TOT", total);
 }
+
 
 /* ---- main ---- */
 
@@ -604,6 +610,8 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", BOARD_NAME " shim (" BOARD_SOC ")");
+	con_hex2("WIN", "at=", (uint32_t)(win.base >> 32), "size=", (uint32_t)win.base);
+	loader_report_regions();
 	con_skip();
 
 	/* What the bootloader says about this phone. Always print it: it is the
