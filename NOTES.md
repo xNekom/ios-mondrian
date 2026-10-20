@@ -11,6 +11,33 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
 - The fork is `xNekom/ios-mondrian`, branch `mondrian` of
   `dipa-studio/ios-sweet`. The upstream `main` is untouched.
+- **The mondrian kernel BUILDS.** CI run `39457133108` (commit `c51b7f9`,
+  "the commpage with 4 KiB pages") succeeded and produced
+  `kernel.development.mondrian` (16,671,128 bytes,
+  SHA256 `c1a215d5f5bf7186f8e24537a300c5343456b7a86cc0c365c2fc00a73c625ea0`).
+  The series is 56 patches and applies cleanly to a fresh xnu-8796.141.3.
+- **What the build proved** (checked on the artifact):
+  - the kernel is a plain **arm64** Mach-O (not arm64e) and the whole
+    16 MB binary has **not a single PAC instruction** (`pacias`, `autia`,
+    `pacib`, `retaa`, `retab`): the SM8475 has no pointer authentication
+    and the kernel does not try to use it;
+  - the board identifiers are in the binary: `MondrianPlatformExpert`,
+    `MondrianHIDButtons`, `MondrianHIDTouch`, `MondrianCPU`,
+    `IONameMatch = 'xiaomi,mondrian'`, `MONDRIAN AMFI`, `MONDRIAN AKS`;
+  - the commpage needed a fix for 4 KiB pages (see below).
+- **The 4 KiB page tax (the real work of this port):**
+  - XNU only checks the commpage nesting for 16 KiB pages. With 4 KiB pages
+    it asserts that the commpage is above the maximum user VA
+    (`osfmk/arm/pmap/pmap.c`, the `ARM_PGSHIFT == 12` branch), which cannot
+    hold: the MacOSX platform gives the user a 140 TiB VA and the commpage
+    has to stay mappable by the userland. Patch
+    `xnu/patches-mondrian/0056` replaces the check with one that holds
+    (the commpage and its 1 GiB nesting region share an L1 entry, and that
+    region is reserved in every user space).
+  - the page table geometry follows: an L2 block is 2 MB instead of 32 MB,
+    so `tools/mkpayload.py` rounds the kernel's virtual base down to 2 MB
+    (`board.tt_l2_size`) and the shim's MMU uses the board's granule
+    (`BOARD_PG_SHIFT`).
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot

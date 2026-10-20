@@ -107,8 +107,39 @@ ARMv9.0 is binary compatible with the ARMv8.5 baseline, so the kernel is
 compiled for armv8.5-a and runs on the X2. XNU 8796 has no LPA2, so it uses
 39-bit virtual addresses, which ARMv9 still allows.
 
+**The build works** (CI run `39457133108`): the artifact is a plain arm64
+Mach-O with not a single PAC instruction, and the board identifiers are in
+it (`MondrianPlatformExpert`, `IONameMatch = 'xiaomi,mondrian'`, ...).
+
 **Check:** `gh workflow run xnu.yml -R xNekom/ios-mondrian -f board=mondrian`
 must produce `kernel.development.mondrian`.
+
+#### 1.1 The 4 KiB page tax
+
+This is the part of the port that is not a rename. With 4 KiB pages:
+
+| What | 16 KiB (sweet) | 4 KiB (mondrian) |
+| --- | --- | --- |
+| L1 entry covers | 64 GB | 1 GB |
+| L2 block covers | 32 MB | 2 MB |
+| the physmap needs | 1 L1 entry for 4 GB of RAM | 4-5 L1 entries |
+| the commpage check | not compiled | asserts the commpage is above the user VA |
+
+The commpage assertion (`osfmk/arm/pmap/pmap.c`, the `ARM_PGSHIFT == 12`
+branch) cannot hold on this board: the MacOSX platform gives the user a
+140 TiB VA, and the commpage has to stay mappable by the userland. Patch
+`xnu/patches-mondrian/0056` replaces it with the check that does hold: the
+commpage and its 1 GiB nesting region (which is reserved in every user
+address space) share an L1 entry.
+
+The alternative, cleaner in principle, is to build the **iPhoneOS** platform
+instead of the MacOSX one: its user VA is 63.75 GB, the original assertion
+holds as it is, and the platform matches the userland. The sweet port uses
+the MacOSX base, so this is a bigger change than a patch.
+
+**Check:** the kernel builds and the commpage still works (the iOS userland
+reads the time and the kernel version from it).
+
 
 ### 2. The generic half of the sweet series — done
 
