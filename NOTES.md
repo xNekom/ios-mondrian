@@ -35,13 +35,39 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
     and A510 have no pointer authentication, so plain arm64 like sweet),
     **4 KiB pages** (no `__ARM_16K_PG__`), GICv3 with the Group 1 interrupt
     path and eight redistributors of 256 KiB.
+  - `xnu/patches-mondrian/0002-mondrian-master-config.patch`:
+    `config/MASTER.arm64.mondrian` (the open source arm64 assembly and
+    pmap, no kpc). Without it the build fails in pmap.h with a duplicate
+    member.
+  - `xnu/patches-mondrian/0003-0055`: the generic half of the sweet series
+    is ported (RAM disk root, AMFI, HFS+, BearSSL, console, crash log, HID,
+    SMP, identity). **55/55 patches apply** to a fresh xnu-8796.141.3 tree.
   - `tools/port-series.py`: ports a patch of the sweet series to the mondrian
-    series (renames the board identifiers) and flags the hunks that talk to
-    the hardware.
+    series (renames the board identifiers, drops the context lines that name
+    something a not yet ported hardware patch adds) and lists the hardware
+    patches it skips.
+  - `tools/apply-series.py`: applies a series to an xnu tree in seconds and
+    reports what does not apply. This is the local loop: no CI run needed to
+    iterate the port.
+  - `tools/validate-repo.py` also checks the hunk headers of every patch: a
+    patch with a wrong count is "corrupt" for git apply and the CI skips it
+    silently. (The first mondrian patch had exactly that bug.)
   - The CI has a `board` input and stages `xnu/patches/` or
     `xnu/patches-mondrian/`.
   - The board independent tools were renamed (`tools/sweet-*.py` ->
     `tools/ios-*.py`, `tools/qemu-sweet.py` -> `tools/qemu-ios.py`).
+
+- **The local loop (no CI):**
+  ```
+  git clone --depth 1 --branch xnu-8796.141.3 \
+      https://github.com/apple-oss-distributions/xnu.git /tmp/xnu8796
+  tools/apply-series.py /tmp/xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
+  ```
+  It runs the staging scripts (the *.sh files that fetch Apple's open source
+  libpthread, HFS and BearSSL) and then the patches, and reports each
+  failure. 55/55 apply. The *compile* still needs the CI: xnu-8796 needs
+  Xcode 15 (the iig of Xcode 16+ emits an IORPC ABI it does not have) and
+  the KDK 13.5, which the runner has.
 
 - **NOT done yet (the work list, in order):**
   1. The generic half of the sweet series in the mondrian series (mockfs,

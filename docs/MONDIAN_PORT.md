@@ -20,7 +20,18 @@ already in place, what has to change, and where the numbers come from.
 | `shim/board.h`, `shim/build.sh BOARD=` | the bare-metal shim for either board |
 | `shim/fdt.c` | a device tree parser, so the board table can be filled in from the live device |
 | `xnu/patches-mondrian/0001` | the XNU machine config for SM8475 (ARMv9.0, 4 KiB pages, GICv3) |
+| `xnu/patches-mondrian/0002` | the master config of the board (`config/MASTER.arm64.mondrian`) |
+| `xnu/patches-mondrian/0003-0055` | the generic half of the sweet series, ported (RAM disk root, AMFI, HFS+, BearSSL, console, crash log, HID, SMP, identity) |
 | `tools/port-series.py` | ports a patch of the sweet series to the mondrian series and flags the hardware parts |
+| `tools/apply-series.py` | applies a series to an xnu tree in seconds and reports what does not apply |
+
+The ported series applies cleanly: `tools/apply-series.py` reports
+**55/55** against a fresh xnu-8796.141.3 tree.
+
+The patches that are **not** ported are the ones that talk to the hardware
+of the sweet phone. They are listed in `HARDWARE_PATCHES` of
+`tools/port-series.py` with what each of them needs, and they are the work
+list below.
 
 ## The hardware delta
 
@@ -66,14 +77,14 @@ compiled for armv8.5-a and runs on the X2. XNU 8796 has no LPA2, so it uses
 **Check:** `gh workflow run xnu.yml -R xNekom/ios-mondrian -f board=mondrian`
 must produce `kernel.development.mondrian`.
 
-### 2. The generic half of the sweet series
+### 2. The generic half of the sweet series — done
 
-Everything in `xnu/patches/` that does not talk to the hardware can be taken
-over as it is: the RAM disk root (0021-0024), AMFI (0025, 0035, 0036), the
-HFS+ root (0026), BearSSL (0020, 0027, 0032, 0033), the console and the
-crash log (0010, 0012, 0043-0047), the entitlement and bindfs work
-(0035-0038), the process sampler (0054, 0055) and the USB stack
-(0072-0077, 0081).
+Everything in `xnu/patches/` that does not talk to the hardware is ported
+to `xnu/patches-mondrian/`: the RAM disk root (0021-0024), AMFI (0025,
+0035, 0036), the HFS+ root (0026), BearSSL (0020, 0027, 0032, 0033), the
+console and the crash log (0010, 0012, 0043-0047), the entitlement and
+bindfs work (0035-0038), the HID services (0058), the iPhone identity
+(0059), the SMP (0065, 0078) and the net trace (0080).
 
 `tools/port-series.py` does the renaming (`SWEET` -> `MONDRIAN`,
 `sweet_ufs.c` -> `mondrian_ufs.c`, the `sweetfb_*` boot arguments ->
@@ -81,7 +92,7 @@ crash log (0010, 0012, 0043-0047), the entitlement and bindfs work
 `SweetPlatformExpert` -> `MondrianPlatformExpert`, the `IONameMatch`
 `xiaomi,sweet` -> `xiaomi,mondrian`).
 
-Two things need attention beyond the renaming:
+Two things needed attention beyond the renaming:
 
 * **Page size.** The `__ARM_16K_PG__` define disappears, so XNU runs with
   `PAGE_SHIFT` 12. The physmap fix of 0011 is written in terms of
@@ -90,6 +101,14 @@ Two things need attention beyond the renaming:
 * **The kernel's L2 block mapping** is 2 MB instead of 32 MB, so
   `tools/mkpayload.py` rounds the kernel's virtual base down to 2 MB
   (it does, through `board.tt_l2_size`).
+
+`tools/apply-series.py` checks the result against a real xnu tree:
+
+```
+git clone --depth 1 --branch xnu-8796.141.3 \
+    https://github.com/apple-oss-distributions/xnu.git xnu8796
+tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
+```
 
 ### 3. The UFS 3.1 root device
 
