@@ -86,7 +86,57 @@ void loader_set_window(uint64_t base, uint64_t size)
 	win_size = size;
 }
 
+/* The memory regions of the phone, from the device tree. */
+static uint64_t mem_regs[64];
+static int n_mem_regs;
+
+void loader_set_regions(const uint64_t *regs, int n)
+{
+	if (n > 32)
+		n = 32;
+	for (int i = 0; i < n * 2; i++)
+		mem_regs[i] = regs[i];
+	n_mem_regs = n;
+}
+
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
+
+/*
+ * The bootloader does not always tell us where it put the ramdisk: it
+ * publishes the address in the device tree, and only when the image carries
+ * a tree for it to patch. Look for the payload ourselves.
+ */
+static uintptr_t
+loader_scan_payload(void)
+{
+	uint64_t want = 0;
+
+	for (int k = 0; k < 8; k++)
+		want |= (uint64_t)(unsigned char)PAYLOAD_MAGIC[k] << (8 * k);
+
+	for (int i = 0; i < n_mem_regs; i++) {
+		uint64_t base = mem_regs[i * 2], size = mem_regs[i * 2 + 1];
+		for (uint64_t a = base; a + 64 <= base + size; a += 64) {
+			if (*(volatile uint64_t *)a == want)
+				return (uintptr_t)a;
+		}
+	}
+	return 0;
+}
+
+/* How much of the ramdisk the payload takes. */
+static uint64_t
+payload_size(const struct payload *p)
+{
+	uint64_t end = p->adt_off + p->adt_size;
+
+	for (uint32_t i = 0; i < p->nsegs; i++) {
+		uint64_t e = p->segs[i].file_off + p->segs[i].file_size;
+		if (e > end)
+			end = e;
+	}
+	return end;
+}
 
 const char *loader_boot(uintptr_t dtb)
 {
@@ -98,8 +148,19 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
 	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
-		return "no payload (" PAYLOAD_MAGIC ")";
+	if (!magic_ok(p->magic)) {
+		/* Not there: show what is, and go looking for the payload. */
+		con_bytes("RD", (const void *)rd_start, 32);
+		uintptr_t found = loader_scan_payload();
+		if (!found)
+			return "no payload (" PAYLOAD_MAGIC ")";
+		con_hex("FOUND", found);
+		rd_start = found;
+		p = (const struct payload *)rd_start;
+		if (!magic_ok(p->magic))
+			return "no payload (" PAYLOAD_MAGIC ")";
+		rd_end = rd_start + payload_size(p);
+	}
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 

@@ -23,11 +23,21 @@ case "$BOARD" in
 		;;
 	mondrian)
 		BOARD_DEF=BOARD_MONDRIAN
-		BOOT_HEADER=3
-		DTB=
+		# With a device tree in the image the bootloader patches its
+		# /chosen (linux,initrd-start and -end), which is how the shim
+		# finds the payload. Without one it uses the live tree from
+		# vendor_boot and those pointers stay stale, so the payload is
+		# not found. DTB= points at a tree captured from the phone
+		# (tools/dtdump.py --build) to embed.
+		DTB=${DTB:-}
 		;;
 	*) echo "error: unknown BOARD '$BOARD' (sweet or mondrian)" >&2; exit 1 ;;
 esac
+if [ -n "$DTB" ]; then
+	BOOT_HEADER=2
+else
+	BOOT_HEADER=3
+fi
 CROSS=${CROSS:-aarch64-linux-gnu-}
 CC=${CROSS}gcc
 OBJCOPY=${CROSS}objcopy

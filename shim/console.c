@@ -121,3 +121,24 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+void con_bytes(const char *label, const void *p, int n)
+{
+	static const char digits[] = "0123456789abcdef";
+	const unsigned char *b = p;
+	char buf[2];
+	int col = put_str(0, label, YELLOW);
+	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
+	for (int i = 0; i < n; i++) {
+		if (i && !(i & 3)) {
+			buf[0] = ' ';
+			buf[1] = 0;
+			col = put_str(col, buf, WHITE);
+		}
+		buf[0] = digits[b[i] >> 4];
+		buf[1] = digits[b[i] & 15];
+		buf[2] = 0;
+		col = put_str(col, buf, WHITE);
+	}
+	row++;
+}

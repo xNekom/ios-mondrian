@@ -58,8 +58,8 @@ class Board:
     # upper one, which is what both boards use on the phone.
     phys_base: int
     mem_size: int
-    high_phys_base: int
-    high_mem_size: int
+    alt_phys_base: int      # the other window (mkadt.py --alt-mem)
+    alt_mem_size: int
 
     soc_base: int              # base of the /arm-io range
     gicd: int
@@ -114,8 +114,8 @@ SWEET = Board(
     # The live FDT memory node is <0x80000000 2G>, <0x1_00000000 0xfcc00000>;
     # every fixed reserved-memory carve-out is in the low bank and the dynamic
     # pools are limited below 4G.
-    high_phys_base=0x100000000,
-    high_mem_size=0xfcc00000,
+    alt_phys_base=0x100000000,
+    alt_mem_size=0xfcc00000,
     soc_base=0x01000000,
     gicd=0x17a00000,
     gicd_size=0x10000,
@@ -172,10 +172,10 @@ MONDRIAN = Board(
     # 4G. The kernel gets the first one (the low bank) and the largest region
     # above 4G is the high memory. The ddr_size property says 12GB: the
     # bootloader only describes the part of the RAM the kernel may use.
-    phys_base=0x80000000,
-    mem_size=0x6a000000,
-    high_phys_base=0x800000000,
-    high_mem_size=0x37500000,
+    phys_base=0x800000000,
+    mem_size=0x37500000,
+    alt_phys_base=0x80000000,
+    alt_mem_size=0x6a000000,
     soc_base=0x01000000,
     # GICD/GICR: cape.dtsi and the mainline sm8450.dtsi agree, and the live
     # device tree confirms it: interrupt-controller@17100000 has
@@ -311,13 +311,17 @@ def apply_facts(board, facts):
              if kind == 'memory' and key.startswith('reg') and len(v) >= 2]
     if banks:
         banks.sort()
-        b = replace(b, phys_base=banks[0][0], mem_size=banks[0][1])
-        # The RAM above 4GB: the biggest of those regions, not the last one.
-        high = [x for x in banks if x[0] >= 0x100000000]
-        if high:
-            biggest = max(high, key=lambda x: x[1])
-            b = replace(b, high_phys_base=biggest[0], high_mem_size=biggest[1])
-        done |= {'phys_base', 'mem_size', 'high_phys_base', 'high_mem_size'}
+        # The shim gives the kernel the highest region of at least 512MB (the
+        # low bank of this phone carries the bootloader, the modem and the
+        # firmware carve-outs), so the image has to be built for that one.
+        big = [x for x in banks if x[1] >= 0x20000000]
+        best = max(big, key=lambda x: x[0]) if big else max(banks, key=lambda x: x[1])
+        b = replace(b, phys_base=best[0], mem_size=best[1])
+        rest = [x for x in banks if x != best]
+        if rest:
+            alt = max(rest, key=lambda x: x[1])
+            b = replace(b, alt_phys_base=alt[0], alt_mem_size=alt[1])
+        done |= {'phys_base', 'mem_size', 'alt_phys_base', 'alt_mem_size'}
 
     for (kind, key), values in facts.items():
         if kind != 'reg' or len(values) < 2:
@@ -351,6 +355,6 @@ if __name__ == '__main__':
     for b in BOARDS.values():
         print(f'{b.name:9} {b.soc:8} {b.arch:8} page={b.page_size} '
               f'gicd={b.gicd:#x} ufs={b.ufs:#x} fb={b.fb:#x} '
-              f'ram={b.high_phys_base:#x}+{b.high_mem_size:#x}')
+              f'alt={b.alt_phys_base:#x}+{b.alt_mem_size:#x}')
     if len(sys.argv) > 1:
         print(parse_facts(open(sys.argv[1]).read()))

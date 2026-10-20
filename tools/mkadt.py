@@ -5,7 +5,7 @@ Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the board description in tools/boards.py, which in turn is
 taken from the live device tree of the phone.
 
-Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--board NAME]
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--altmem] [--board NAME]
 """
 import hashlib, os, struct, sys
 
@@ -55,9 +55,9 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(board, seed=None, qemu=False, highmem=False):
+def build(board, seed=None, qemu=False, altmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-ios.py)."""
-    phys_base, mem_size = ((board.high_phys_base, board.high_mem_size) if highmem
+    phys_base, mem_size = ((board.alt_phys_base, board.alt_mem_size) if altmem
                            else (board.phys_base, board.mem_size))
     if qemu:
         phys_base, mem_size = QEMU_PHYS_BASE, QEMU_MEM_SIZE
@@ -228,7 +228,7 @@ if __name__ == '__main__':
     ap.add_argument('out')
     ap.add_argument('--board', default='sweet', help='sweet | mondrian')
     ap.add_argument('--qemu', action='store_true', help='QEMU virt addresses')
-    ap.add_argument('--highmem', action='store_true', help='use the upper DDR bank')
+    ap.add_argument('--altmem', action='store_true', help='use the upper DDR bank')
     ap.add_argument('--facts', help='shim dtb dump to take the memory map from')
     ap.add_argument('--allow-provisional', action='store_true',
                     help='build even if the board still has guessed values')
@@ -241,7 +241,7 @@ if __name__ == '__main__':
     if not a.allow_provisional and not a.qemu:
         # the QEMU memory is synthetic, the phone's is not
         boards.require_measured(board, 'mkadt.py')
-    root = build(board, qemu=a.qemu, highmem=a.highmem)
+    root = build(board, qemu=a.qemu, altmem=a.altmem)
     blob = adt.serialize(root)
     open(a.out, 'wb').write(blob)
     if a.dump:

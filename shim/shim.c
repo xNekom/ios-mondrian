@@ -517,6 +517,7 @@ static void board_memory(uintptr_t dtb)
 		uint64_t base = regs[i * 2], size = regs[i * 2 + 1];
 		con_hex2("MEM", "at=", (uint32_t)(base >> 32), "size=", (uint32_t)base);
 		total += size;
+		/* The loader looks for the payload in these regions. */
 		/* the highest region that can host the kernel */
 		if (size >= 0x20000000UL && (best < 0 || base > regs[best * 2]))
 			best = i;
@@ -529,6 +530,7 @@ static void board_memory(uintptr_t dtb)
 	}
 	if (best < 0)
 		return;
+	loader_set_regions(regs, n);
 	win.base = regs[best * 2];
 	win.size = regs[best * 2 + 1];
 	con_hex2("WIN", "at=", (uint32_t)(win.base >> 32), "size=", (uint32_t)win.base);

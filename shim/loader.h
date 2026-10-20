@@ -10,3 +10,7 @@ const char *loader_boot(uintptr_t dtb);
 
 /* The window of RAM the kernel gets: base and size, 0 if not set. */
 void loader_set_window(uint64_t base, uint64_t size);
+
+/* The memory regions of the phone (base/size pairs), to look for the
+ * payload when the bootloader does not say where it put it. */
+void loader_set_regions(const uint64_t *regs, int n);

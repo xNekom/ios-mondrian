@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Dump a flattened device tree (DTB) as readable text.
+"""Read and write a device tree: dump it, or build a .dtb from a directory.
 
 Used to read the *live* device tree of a phone (pulled from /proc/device-tree
 in a recovery) instead of trusting a device tree source that may not be the
-one the bootloader passes.
+one the bootloader passes, and to put that tree back into a boot image so the
+bootloader patches /chosen/linux,initrd-* in it.
 
     tools/dtdump.py mondrian.dtb                 # the whole tree
     tools/dtdump.py mondrian.dtb --find ufs      # only the matching nodes
     tools/dtdump.py mondrian.dtb --prop reg      # only this property
+    tools/dtdump.py --build /tmp/mondrian-dt out.dtb   # directory -> .dtb
 """
 
 import argparse
+import os
 import struct
 import sys
 
@@ -19,6 +22,7 @@ FDT_END_NODE = 0x2
 FDT_PROP = 0x3
 FDT_NOP = 0x4
 FDT_END = 0x9
+FDT_MAGIC = 0xD00DFEED
 
 
 def _align4(n):
@@ -125,16 +129,83 @@ def dump_dir(root, find=None, prop=None, depth=99):
             print(f'    {name} = {value}')
 
 
+def build(root):
+    """Build a .dtb blob out of a /proc/device-tree style directory."""
+    nodes = []
+
+    def walk(path, rel):
+        names = sorted(n for n in os.listdir(path)
+                       if os.path.isfile(os.path.join(path, n)))
+        props = []
+        for name in names:
+            with open(os.path.join(path, name), 'rb') as f:
+                props.append((name, f.read()))
+        nodes.append((rel, props))
+        for child in sorted(os.listdir(path)):
+            sub = os.path.join(path, child)
+            if os.path.isdir(sub):
+                walk(sub, (rel + '/' + child) if rel else child)
+
+    walk(root, '')
+
+    strings = bytearray()
+    offsets = {}
+
+    def stroff(name):
+        if name not in offsets:
+            offsets[name] = len(strings)
+            strings.extend(name.encode('utf-8') + b'\0')
+        return offsets[name]
+
+    def align4(blob):
+        return blob + b'\0' * ((4 - len(blob) % 4) % 4)
+
+    struct_block = bytearray()
+    for rel, props in nodes:
+        struct_block.extend(struct.pack('>I', FDT_BEGIN_NODE))
+        struct_block.extend(align4(rel.encode('utf-8') + b'\0'))
+        for name, data in props:
+            struct_block.extend(struct.pack('>III', FDT_PROP, len(data), stroff(name)))
+            struct_block.extend(align4(data))
+        struct_block.extend(struct.pack('>I', FDT_END_NODE))
+    struct_block.extend(struct.pack('>I', FDT_END))
+
+    rsvmap = struct.pack('>QQ', 0, 0)
+    header_len = 40
+    off_rsvmap = header_len
+    off_struct = off_rsvmap + len(rsvmap)
+    off_strings = off_struct + len(struct_block)
+    total = off_strings + len(strings)
+
+    header = struct.pack('>IIIIIIIIII', FDT_MAGIC, total, off_struct, off_strings,
+                          off_rsvmap, 17, 16, 0, len(strings), len(struct_block))
+    return header + rsvmap + bytes(struct_block) + bytes(strings)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('dtb', help='the .dtb file or a /proc/device-tree directory')
+    ap.add_argument('dtb', nargs='?', help='the .dtb file or a /proc/device-tree directory')
+    ap.add_argument('--build', metavar='DIR', help='build a .dtb from a directory')
+    ap.add_argument('--out', help='output file for --build')
     ap.add_argument('--find', help='only nodes whose path contains this text')
     ap.add_argument('--prop', help='only this property')
     ap.add_argument('--depth', type=int, default=99, help='max depth to print')
     args = ap.parse_args()
 
-    import os
+    if args.build:
+        blob = build(args.build)
+        if args.out:
+            with open(args.out, 'wb') as f:
+                f.write(blob)
+            print(f'{args.out}: {len(blob)} bytes')
+        else:
+            sys.stdout.buffer.write(blob)
+        return 0
+
+    if not args.dtb:
+        ap.error('a .dtb file, a directory or --build is required')
+
     if os.path.isdir(args.dtb):
         try:
             dump_dir(args.dtb, args.find, args.prop, args.depth)
