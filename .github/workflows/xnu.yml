@@ -26,7 +26,8 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  # the env context is not available here, so the board comes from the input
+  group: xnu-${{ github.ref }}-${{ inputs.board || 'sweet' }}
   cancel-in-progress: true
 
 env:
@@ -66,7 +67,9 @@ jobs:
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp "$SERIES"/*.patch "$SERIES"/*.sh dxb/patches/
+          cp "$SERIES"/*.patch dxb/patches/
+          # the staging scripts are only in the sweet series
+          cp "$SERIES"/*.sh dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; our kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
@@ -121,6 +124,9 @@ jobs:
         run: |
           mkdir -p out/kdk-libs
           for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            # no KDK installed: the glob stays literal, and a file name with
+            # a '*' breaks the artifact upload
+            [ -e "$lib" ] || continue
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
