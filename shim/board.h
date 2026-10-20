@@ -89,3 +89,14 @@
 #define BOARD_FB_FROM_DTB	0
 
 #endif	/* BOARD_MONDRIAN */
+
+/*
+ * The page size the kernel of this board uses. The shim's MMU has to use
+ * the same granule: sweet runs the kernel with 16 KiB pages, mondrian with
+ * 4 KiB ones (PAGE_SIZE=4096 in build.config.msm.mondrian).
+ */
+#if defined(BOARD_MONDRIAN)
+#define BOARD_PG_SHIFT		12
+#else
+#define BOARD_PG_SHIFT		14
+#endif

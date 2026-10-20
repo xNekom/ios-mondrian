@@ -1,23 +1,28 @@
 /*
- * Milestone 3: EL1 stage-1 MMU with the 16K granule XNU uses.
+ * Milestone 3: EL1 stage-1 MMU with the granule XNU uses.
  *
- * T0SZ=28 gives a 36-bit VA whose walk starts at level 2: one 16K table of
- * 2048 x 32MB blocks covers 64GB, identity mapped (VA == PA).
+ * T0SZ=28 gives a 36-bit VA whose walk starts at level 2: one table of
+ * 2048 blocks covers 64GB, identity mapped (VA == PA).
  *
  * Qualcomm XPUs fault on speculative reads of protected carve-outs (TZ,
  * hyp, modem...), so nothing is mapped cacheable except our own image:
  *   - default: Device-nGnRnE, execute-never (same as MMU off)
- *   - the 32MB block(s) holding the image get an L3 table: image pages are
+ *   - the block(s) holding the image get an L3 table: image pages are
  *     Normal write-back, the rest of the block stays Device
  *   - the splash framebuffer block is Normal non-cacheable (write-combining)
+ *
+ * The granule is the one of the board (shim/board.h): 16 KiB for sweet,
+ * 4 KiB for mondrian. With 16 KiB a level 2 block covers 32MB, with 4 KiB
+ * it covers 8MB.
  */
 #include <stdint.h>
+#include "board.h"
 #include "mmu.h"
 
-#define PG_SHIFT	14
-#define PG_SIZE		(1UL << PG_SHIFT)		/* 16K */
-#define BLK_SHIFT	25
-#define BLK_SIZE	(1UL << BLK_SHIFT)		/* 32MB level-2 block */
+#define PG_SHIFT	BOARD_PG_SHIFT
+#define PG_SIZE		(1UL << PG_SHIFT)
+#define BLK_SHIFT	(PG_SHIFT + 11)		/* 2048 entries of one granule */
+#define BLK_SIZE	(1UL << BLK_SHIFT)
 #define NENT		2048
 
 #define ATTR_DEV	0	/* MAIR attr0 = 0x00 Device-nGnRnE */
@@ -39,9 +44,16 @@
 #define WB_FLAGS	(D_ATTR(ATTR_WB) | D_SH_INNER | D_AF | D_UXN)
 #define NC_FLAGS	(D_ATTR(ATTR_NC) | D_SH_OUTER | D_AF | D_PXN | D_UXN)
 
-/* TCR: T0SZ=28, IRGN0/ORGN0=WBWA, SH0=inner, TG0=16K, EPD1, TG1=16K, IPS=36 bit */
+/* TCR: T0SZ=28, IRGN0/ORGN0=WBWA, SH0=inner, TG0/TG1=the board's granule,
+ * IPS=36 bit. TG0: 0b10 = 16 KiB, 0b00 = 4 KiB. TG1: 0b01 = 16 KiB, 0b00 =
+ * 4 KiB. */
+#if PG_SHIFT == 14
 #define TCR_VAL		(28UL | (1UL << 8) | (1UL << 10) | (3UL << 12) | (2UL << 14) | \
 			 (28UL << 16) | (1UL << 23) | (1UL << 30) | (1UL << 32))
+#else
+#define TCR_VAL		(28UL | (1UL << 8) | (1UL << 10) | (3UL << 12) | \
+			 (28UL << 16) | (1UL << 30) | (1UL << 32))
+#endif
 
 #define SCTLR_M		(1UL << 0)
 #define SCTLR_A		(1UL << 1)
