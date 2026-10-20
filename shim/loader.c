@@ -229,8 +229,14 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("PHYS", "base=", phys_base, "size=", mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
-	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > phys_base && rd_start < phys_base + mem_size)
+	/*
+	 * The payload must not overlap where the kernel goes. Compare with
+	 * the kernel image, not with the whole window: the window is the
+	 * 885MB region the device tree describes, and the unpacked payload
+	 * lives in it, past the kernel image.
+	 */
+	uint64_t kern_pa = p->kernel_end + pa_of_va_base;
+	if (rd_end > kern_pa && rd_start < kern_pa + 0x100000)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {
