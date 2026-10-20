@@ -163,11 +163,18 @@ blob_u64(const uint8_t *p)
 	return v;
 }
 
+static uint32_t
+blob_u32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 static int
 blob_ok(const uint8_t *p)
 {
 	return p[0] == 'L' && p[1] == 'Z' && p[2] == '4' && p[3] == 'P' &&
-	       blob_u64(p + 4) == 1;
+	       blob_u32(p + 4) == 1;
 }
 
 const char *loader_boot(uintptr_t dtb)
