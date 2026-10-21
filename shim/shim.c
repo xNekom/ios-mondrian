@@ -618,6 +618,7 @@ void shim_main(uint64_t dtb)
 	 * goes wrong while reading the device tree, the screen still shows
 	 * where it stopped. */
 	con_enable(FB_BASE, FB_W, FB_H);
+	con_clear(RED);		/* what is on the screen is from this run */
 	con_str("S1", "console on");
 	con_hex("DTB", dtb);
 	con_skip();
@@ -639,7 +640,6 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(RED);
 	con_str("SHIM", BOARD_NAME " shim (" BOARD_SOC ")");
 	con_hex64("WIN", win.base);
 	con_hex64("WSZ", win.size);
