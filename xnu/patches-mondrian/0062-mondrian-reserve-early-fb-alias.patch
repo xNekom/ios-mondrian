@@ -1,0 +1,30 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index fc2096f..73d0cfc 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2537,6 +2537,25 @@ pmap_virtual_region(
+ 		low_global_vr_size = 0x800000;
+ 	}
+ 
++#if defined(MONDRIAN)
++	/*
++	 * arm_vm_init() aliases the 1440x3200x4 panel (18432000 bytes, nine
++	 * 2MB blocks) at LOW_GLOBAL_BASE_ADDRESS + 2MB so that the bootstrap
++	 * console survives the TTBR0 teardown. With 4KB pages the low-globals
++	 * reservation above is a single L2 block (8MB), so everything past
++	 * LOW_GLOBAL_BASE_ADDRESS + 8MB would stay inside kernel_map's first
++	 * free hole, and the alias blocks at LOW_GLOBAL_BASE_ADDRESS + 8MB
++	 * through + 20MB would look allocatable. A kmem claim landing there
++	 * (zone metadata, ipc_kernel_map, ...) makes pmap_enter() reach
++	 * pmap_ttne() with a block at L2 and panic:
++	 *   pmap_tte: Attempt to demote L2 block, tte=0x...0605,
++	 *   target_level=3, addr=0xfffffff000802000
++	 * Reserve the whole alias region instead; the VM then starts
++	 * allocating at LOW_GLOBAL_BASE_ADDRESS + 32MB, past the last block.
++	 */
++	low_global_vr_size = 0x2000000;
++#endif /* MONDRIAN */
++
+ 	if (((gVirtBase & low_global_vr_mask) != LOW_GLOBAL_BASE_ADDRESS) && (region_select == 2)) {
+ 		*startp = LOW_GLOBAL_BASE_ADDRESS;
+ 		*size = low_global_vr_size;

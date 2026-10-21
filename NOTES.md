@@ -12,8 +12,12 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 **The kernel boots on the phone** (2026-10-21). The ABL loads the shim, the
 shim reads the live device tree, unpacks the payload, copies the kernel and
 jumps; the kernel's own console comes up on the splash framebuffer
-(`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
-then it panics with an undefined instruction. The next step is the panic.
+(`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`).
+Two phone-only panics have been fixed since: the physical-timer write
+(`0061`, see "Undefined kernel instruction" below) and the framebuffer alias
+overlapping the kernel heap (`0062`, see "the pmap panic" below).
+**Next: boot the `0062` kernel on the phone** - it should get past
+`kmem_range_init` and die at the UFS root, which is what the host does.
 
 ### The window of RAM (the thing that was wrong three times)
 
@@ -342,6 +346,72 @@ fatal instruction in the middle of it.
 
 Note for the next sysreg surprise: `git grep CNTP_` finds only this write and
 one comment; `CNTV_*`, `CNTKCTL_EL1` and `DAIF` are all accepted by QHEE.
+
+### The pmap panic: the framebuffer alias was eating the kernel heap
+
+With `0061` the phone reaches the claim table printed by `kmem_range_init()`
+and then panics:
+
+```
+panic(cpu 0 caller 0xfffffff0073ff5c8): pmap_tte: Attempt to demote L2 block,
+  tte=0x60000...0605, pmap=0xfffffff007ba9728, target_level=3,
+  addr=0xfffffff000802000 @pmap_pt_geometry.h:548
+```
+
+`addr` is `LOW_GLOBAL_BASE_ADDRESS + 0x802000`, i.e. 8 MiB + 8 KiB: the first
+8 KiB of kernel_map's low hole. `tte` is a *write-combining* 2 MB block
+(`ATTRINDX 1` -> the `...605`), and the only code in this tree that creates
+WCOMB blocks is `0012-mondrian-keep-debug-console-after-ttbr0.patch`:
+`mondrian_early_map_final()` aliases the panel at
+`LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE` (2 MiB) as nine 2 MB blocks
+(1440x3200x4 = 18,432,000 bytes -> `VA 0xfffffff000200000 .. 0xfffffff001400000`,
+`PA 0xb8000000 ..`).
+
+Measured on the host (the tables are deterministic, they are built
+unconditionally in `arm_vm_init`):
+
+```
+(qemu) xp /12gx 0xb1086000          # L1[448] -> this L2, PA 0xb... random
+b1086000: 0x18000000b108d003 0x00600000b8000605   <- 2 MiB block, VA +0 MiB
+b1086010: 0x00600000b8200605 0x00600000b8400605
+b1086020: 0x00600000b8600605 0x00600000b8800605
+b1086030: 0x00600000b8a00605 0x00600000b8c00605
+b1086040: 0x00600000b8e00605 0x00600000b9000605   <- nine blocks, 18 MB
+b1086050: 0x0 0x0
+```
+
+The bug is the **reservation**. `pmap_virtual_region()` reserves the low
+globals as one L2 block - 8 MB with 4 KiB pages, 32 MB with 16 KiB pages
+(`pmap.c`, `low_global_vr_size`). With 16 KiB pages the whole 18 MB alias
+sat inside that one block; with 4 KiB pages only `VA +0 .. +8 MiB` is
+reserved, so blocks 4..9 (`VA +8 .. +20 MiB`) are *inside kernel_map's first
+free hole* and the VM happily allocates there. The first kmem claim
+(`zone_meta` / `ipc_kernel_map`, whichever the scramble puts lowest) then
+`pmap_enter()`s 4 KiB pages over a 2 MB block, and `pmap_ttne()` panics
+under `MACH_ASSERT`.
+
+`0062-mondrian-reserve-early-fb-alias.patch` fixes it by reserving 32 MB of
+low globals on MONDRIAN, so `kernel_map`'s first allocatable VA is
+`LOW_GLOBAL_BASE_ADDRESS + 32 MiB`, past the last alias block. Nothing else
+needs to move: the alias stays where the console expects it.
+
+How to see the same thing on the host (`--hmp` output lands in `regs.txt`):
+
+```
+python3 tools/qemu-ios.py /private/tmp/q15/p.bin /private/tmp/qX \
+    --board mondrian --secs 0.9 --kernel /private/tmp/mk14/kernel.development.mondrian \
+    --hmp "xp /12gx 0xb1086000"
+```
+
+The blocks are there from 0.2 s and still there at 2.2 s. The decoded
+framebuffer (`fb.txt`) is not evidence either way: `_fbcon_base` is already
+non-zero at 0.9 s (the WCOMB `ml_io_map` mapping in `io_submap`,
+`0xfffffff04f8xxxxx`, with `io_range = 0xfffffff4b9a1c000` in that boot), so
+the text printed during the claim stage may come from either console.
+
+Note for the next time a claim address looks impossible: `pmap_ttne()` only
+panics with `MACH_ASSERT`; a release kernel would instead return a null PTE
+and die somewhere else.
 
 ### What else was tried (and ruled out)
 

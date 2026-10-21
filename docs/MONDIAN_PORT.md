@@ -276,9 +276,15 @@ mondrian build is the first real 4 KiB kernel in the tree.
 The console alias that patches 0010/0012 install for the world after the
 bootstrap TTBR0 lives at `LOW_GLOBAL_BASE_ADDRESS + 2 MB` for the same
 reason: the device layout has no reserved L1 entry at
-`VM_MIN_KERNEL_ADDRESS`, but `gVirtBase` and the low globals share one,
-and the VM never allocates the low globals region. The panel is 18 MB,
-so with 2 MB blocks the alias needs nine of them.
+`VM_MIN_KERNEL_ADDRESS`, but `gVirtBase` and the low globals share one.
+The panel is 18 MB, so with 2 MB blocks the alias needs nine of them -
+which is more than the low-globals *reservation* covers: it is sized as one
+L2 block (8 MB with 4 KiB pages, 32 MB with 16 KiB pages), so with 4 KiB
+pages blocks 4..9 landed in kernel_map's first free hole and the first kmem
+claim panicked in `pmap_ttne()` ("Attempt to demote L2 block", `0062`
+extends the reservation to 32 MB). The VM must never hand out a VA that a
+boot-time block mapping owns; that invariant is the thing to check first
+when a `pmap_enter()` panics this way.
 
 **Three more things did not fit in the 39-bit layout**, and each one
 showed up as a panic that named the culprit:
