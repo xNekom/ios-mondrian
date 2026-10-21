@@ -30,6 +30,8 @@
 #define HCS_UCRDY	(1u << 3)
 
 #define BLOCK		4096u
+/* The PRDT byte count field is 16 bits in UFS 3.x: 64 KiB per descriptor. */
+#define PRDT_CHUNK	(64u << 10)
 
 /* The UFS host address comes from the device tree when it is there: a
  * guessed address could be a peripheral register. */
@@ -40,10 +42,24 @@ void ufs_set_base(uintptr_t base)
 	ufs_base = base;
 }
 
+/*
+ * The address a device has to use to reach our memory. The image is linked
+ * at 0 and ABL loads it at 0xA8000000, so the link address is not the
+ * physical one.
+ */
+static inline uintptr_t phys_of(const void *p)
+{
+	return (uintptr_t)p + shim_base;
+}
+
 static inline uint32_t ufs_rd(uint32_t off) { return *(volatile uint32_t *)(ufs_base + off); }
 static inline void ufs_wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(ufs_base + off) = v; }
 
-/* UTP transfer request descriptor (32 bytes). */
+/*
+ * UTP transfer request descriptor, UFS 3.x: 16 dwords (64 bytes). UFS 2.x
+ * used 8 dwords; 3.x adds the task tag, which the host and the device both
+ * require, plus the racing buffer fields.
+ */
 struct utrd {
 	uint32_t dw0;		/* [31:28] CT, [26:25] DD, [24] I */
 	uint32_t dw1;
@@ -53,6 +69,10 @@ struct utrd {
 	uint32_t ucdbau;
 	uint32_t resp;		/* [31:16] response UPIU offset, [15:0] length (DWORDs) */
 	uint32_t prdt;		/* [31:16] PRDT offset, [15:0] entries (DWORDs/entries) */
+	uint32_t task_tag;	/* the task tag, UFS 3.x */
+	uint32_t rblen;		/* the racing buffer's length */
+	uint32_t rbaddr_lo, rbaddr_hi;
+	uint32_t dw12, dw13, dw14, dw15;
 };
 
 /* UTP command descriptor: command UPIU, response UPIU, PRDT. */
@@ -110,17 +130,18 @@ static uint32_t scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, void *bu
 	for (unsigned i = 0; i < cdb_len; i++)
 		ucd.cmd[16 + i] = cdb[i];
 
-	uintptr_t ucd_pa = (uintptr_t)&ucd;
+	uintptr_t ucd_pa = phys_of(&ucd);
 	utrl[0].dw0 = (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24);	/* UFS storage, dev->host */
 	utrl[0].dw2 = 0x0f;			/* OCS: invalid until the host updates it */
 	utrl[0].ucdba = (uint32_t)ucd_pa;
 	utrl[0].ucdbau = (uint32_t)(ucd_pa >> 32);
 	utrl[0].resp = (512u / 4) << 16 | (512u / 4);
+	utrl[0].task_tag = ucd.cmd[3];
 	if (len) {
-		uintptr_t buf_pa = (uintptr_t)buf;
+		uintptr_t buf_pa = phys_of(buf);
 		ucd.prdt[0].addr_lo = (uint32_t)buf_pa;
 		ucd.prdt[0].addr_hi = (uint32_t)(buf_pa >> 32);
-		ucd.prdt[0].dbc = len - 1;
+		ucd.prdt[0].dbc = len - 1;		/* the count is 16 bits in 3.x */
 		utrl[0].prdt = (1024u / 4) << 16 | 1;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");
@@ -221,7 +242,7 @@ void test_ufs(void)
 
 	/* Take over the transfer request list: stop, point at ours, run. */
 	ufs_wr(REG_UTRLRSR, 0);
-	uintptr_t list = (uintptr_t)utrl;
+	uintptr_t list = phys_of(utrl);
 	ufs_wr(REG_UTRLBA, (uint32_t)list);
 	ufs_wr(REG_UTRLBAU, (uint32_t)(list >> 32));
 	ufs_wr(REG_UTRLRSR, 1);

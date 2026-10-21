@@ -34,7 +34,17 @@ _start:
 	b.hs	2f
 	str	xzr, [x1], #8
 	b	1b
-2:	mov	x0, x19
+2:	/*
+	 * The runtime base of this image. ABL loads it wherever it wants (it
+	 * puts it at 0xA8000000), and the image is linked at 0, so anything
+	 * that hands an address to a device (DMA) has to add this.
+	 */
+	adrp	x0, _head
+	add	x0, x0, #:lo12:_head
+	adrp	x1, shim_base
+	add	x1, x1, #:lo12:shim_base
+	str	x0, [x1]
+	mov	x0, x19
 	bl	shim_main
 3:	wfe
 	b	3b

@@ -110,3 +110,6 @@
 #else
 #define BOARD_PG_SHIFT		14
 #endif
+
+/* The runtime base of the shim image (see start.S). */
+extern uint64_t shim_base;

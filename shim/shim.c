@@ -647,21 +647,25 @@ void shim_main(uint64_t dtb)
 	 * cheapest way to check the board table against the device. */
 	dump_facts(dtb);
 	con_skip();
-	const char *why = loader_boot(dtb);
-	con_str("LOADER", why);
-	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off.
-	 * SHIM_NO_UFS leaves the controller alone: the first boot of a new
-	 * board only reads the device tree and draws on the splash. */
+	/*
+	 * Probe the internal UFS while the MMU is still off, before the
+	 * kernel takes over: it says what the host controller is (version,
+	 * the LUN size, the partitions) and the read-only commands do not
+	 * touch the data. SHIM_NO_UFS leaves the controller alone.
+	 */
 #ifndef SHIM_NO_UFS
 	stage = "ufs";
 	test_ufs();
 	con_skip();
-	con_str("UFS", "probe done, reset in ~3 min");
 #else
 	con_str("UFS", "probe skipped (SHIM_NO_UFS)");
+	con_skip();
 #endif
+
+	const char *why = loader_boot(dtb);
+	con_str("LOADER", why);
+	con_skip();
 	delay_ms(180000);
 	reset(20);
 
