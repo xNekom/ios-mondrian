@@ -1,0 +1,22 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -493,7 +493,18 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
+-#define DEBUG_BSDINIT 0
++/*
++ * MONDRIAN: print the "bsd_init: calling ..." trail. On the phone the boot
++ * stops somewhere between the BSD copyright (the first thing bsd_init
++ * prints) and IOFindBSDRoot, with nothing in between, so the last line on
++ * the screen is the only way to know which call hangs. The console does not
++ * scroll, which makes the last line exactly the useful one.
++ */
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++#define DEBUG_BSDINIT 1
++#else
++#define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)

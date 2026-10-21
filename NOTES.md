@@ -51,6 +51,35 @@ three rails (`vdd-hba`, `vcc`, `vccq`). The live UFS device-tree node says
 = 2`, `phys = <phy 0xa7>`; the rails are its `vdd-hba-supply` (phandle 0x2e),
 `vcc-supply` (0x2fc) and `vccq-supply` (0x2fd).
 
+### 2026-10-21 22:30: the stop is NOT the UFS driver (`0063` finds where it is)
+
+Two facts, both from the phone:
+
+1. **The console does not scroll.** The user cannot move it, so whatever is
+   on the last line is all the evidence a boot gives. Plan every diagnostic
+   around that: the last line printed must be the answer (hence the
+   `mondrian_ufs_why()` in the panic, and hence this trail).
+2. **Booting from `boot_b` (so the ABL leaves UFS powered, see "The ABL,
+   measured") changes nothing**: the screen still stops at the BSD
+   copyright, which `bsd_init()` prints as its *first* line, long before
+   `IOFindBSDRoot` and the UFS driver. So the hang is inside `bsd_init`,
+   between the banner and the root lookup - the UFS power question is not
+   what is blocking the boot right now.
+
+`bsd_init` already has a `bsd_init_kprintf("calling ...")` trail, compiled
+out by `#define DEBUG_BSDINIT 0`. Patch `0063` turns it on for mondrian, so
+the last line on the screen names the call that hung (`calling vfsinit`,
+`calling inittodr`, `calling skywalk_init`, ...).
+
+Boot procedure that writes (approved by the user 2026-10-21): the phone's
+active slot is **`_b`** and its boot partition held TWRP. Originals saved in
+`~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
+(sha256 `39a24660...` / `7a7bdbd2...`, 192 MiB each, read with `adb
+exec-out dd` from TWRP). New images go to `boot_b` with
+`fastboot flash boot_b /tmp/boot-mondrian.img` (the ABL then loads them from
+UFS, which is what keeps UFS powered); restore with
+`fastboot flash boot_b ~/mondrian-backups/boot_b-orig.img`.
+
 ### The window of RAM (the thing that was wrong three times)
 
 **The window the kernel gets has three hard requirements**, and the
