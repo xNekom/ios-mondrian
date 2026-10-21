@@ -395,13 +395,43 @@ low globals on MONDRIAN, so `kernel_map`'s first allocatable VA is
 `LOW_GLOBAL_BASE_ADDRESS + 32 MiB`, past the last alias block. Nothing else
 needs to move: the alias stays where the console expects it.
 
-How to see the same thing on the host (`--hmp` output lands in `regs.txt`):
+**Measured with `0062`** (`xnu-kernel-mondrian` from run `39652592771`): the
+lowest kmem claim is now `0xfffffff002001000`, i.e. `LOW_GLOBAL_BASE_ADDRESS
++ 32 MiB + 4 KiB`, and every other claim follows it:
 
 ```
-python3 tools/qemu-ios.py /private/tmp/q15/p.bin /private/tmp/qX \
-    --board mondrian --secs 0.9 --kernel /private/tmp/mk14/kernel.development.mondrian \
+bufferhdr            : 0xfffffff002001000 - 0xfffffff0022f9000 (3040K)
+kmem_ptr_range_meta  : 0xfffffff0021c4000 - 0xfffffff0021ef000 (172K)
+ipc_kernel_map       : 0xfffffff0020f5000 - 0xfffffff0060f5000 (64M)
+```
+
+The same boot reaches `IOFindBSDRoot` (UFS root missing) with no demote panic.
+
+How to see the page tables on the host (`--hmp` output lands in `regs.txt`):
+
+```
+python3 tools/qemu-ios.py /private/tmp/q62/p.bin /private/tmp/qX \
+    --board mondrian --secs 0.9 --kernel /tmp/mk62/kernel.development.mondrian \
     --hmp "xp /12gx 0xb1086000"
 ```
+
+**`--kernel` does not change what boots.** It only feeds `llvm-nm` so
+`qemu-ios.py` can decode the framebuffer text. The kernel comes from the
+payload, so a new kernel needs a rebuilt payload first, or every "verification"
+silently boots the old one:
+
+```
+python3 tools/mkpayload.py /tmp/mk62/kernel.development.mondrian \
+    /private/tmp/q15/m.adt /private/tmp/q62/p.bin --board mondrian \
+    --cmdline "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam \
+    -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 \
+    wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 \
+    mondrianfb_noconsole=1 mondrianfb_hz=30"
+```
+
+Then read the claim list at 1.15-1.25 s: the console wraps, so the first
+claims are only on screen for a moment (the address column is what matters,
+the claim order is shuffled).
 
 The blocks are there from 0.2 s and still there at 2.2 s. The decoded
 framebuffer (`fb.txt`) is not evidence either way: `_fbcon_base` is already
