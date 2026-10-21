@@ -49,7 +49,10 @@ if command -v mkbootimg >/dev/null; then
 else
 	MKBOOTIMG="python3 ../tools/mkbootimg.py"
 fi
+# SMALL_SHIM=1 builds the loader without the bring-up diagnostics: it only
+# places the kernel, the device tree and the boot arguments, and jumps.
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -D$BOARD_DEF ${EXTRA_CFLAGS:-}"
+[ -n "${SMALL_SHIM:-}" ] && CFLAGS="$CFLAGS -DSMALL_SHIM -DSHIM_NO_UFS"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c libc.c lz4.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o

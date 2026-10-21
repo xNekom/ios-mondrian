@@ -641,15 +641,19 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_str("SHIM", BOARD_NAME " shim (" BOARD_SOC ")");
+#ifndef SMALL_SHIM
 	con_hex64("WIN", win.base);
 	con_hex64("WSZ", win.size);
 	loader_report_regions();
 	con_skip();
+#endif
 
+#ifndef SMALL_SHIM
 	/* What the bootloader says about this phone. Always print it: it is the
 	 * cheapest way to check the board table against the device. */
 	dump_facts(dtb);
 	con_skip();
+#endif
 
 	/*
 	 * Probe the internal UFS while the MMU is still off, before the
@@ -657,11 +661,11 @@ void shim_main(uint64_t dtb)
 	 * the LUN size, the partitions) and the read-only commands do not
 	 * touch the data. SHIM_NO_UFS leaves the controller alone.
 	 */
-#ifndef SHIM_NO_UFS
+#if !defined(SHIM_NO_UFS) && !defined(SMALL_SHIM)
 	stage = "ufs";
 	test_ufs();
 	con_skip();
-#else
+#elif defined(SHIM_NO_UFS)
 	con_str("UFS", "probe skipped (SHIM_NO_UFS)");
 	con_skip();
 #endif
