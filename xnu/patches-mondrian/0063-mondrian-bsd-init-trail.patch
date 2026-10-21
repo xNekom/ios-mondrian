@@ -20,3 +20,22 @@
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+@@ -499,9 +510,18 @@
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	kprintf("MONDRIAN bsd_init: entered\n");
++#endif
+ 	throttle_init();
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	kprintf("MONDRIAN bsd_init: past throttle_init\n");
++#endif
+ 	printf(copyright);
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	kprintf("MONDRIAN bsd_init: past the banner\n");
++#endif
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
+ 	dev_kmem_init();

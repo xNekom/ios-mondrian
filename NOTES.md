@@ -71,6 +71,37 @@ out by `#define DEBUG_BSDINIT 0`. Patch `0063` turns it on for mondrian, so
 the last line on the screen names the call that hung (`calling vfsinit`,
 `calling inittodr`, `calling skywalk_init`, ...).
 
+### 2026-10-21 23:20: `0063` prints nothing, and the banner is the last line
+
+`0063` was built (CI `39673392243`, `d5618a32...`), made into
+`/tmp/boot-mondrian.img` (`0534333d...`) and **flashed to `boot_b`**; the
+phone rebooted from it. The photo of that boot ends at
+
+    Copyright (c) 1982, 1986, 1989, 1991, 1993
+    The Regents of the University of California.  All rights reserved.
+
+with **no `bsd_init: calling ...` line at all** - not the first one. That
+matters, because the trail is compiled in (35 `bsd_init: calling` strings in
+the payload, 47 `bsd_init: ` in the kernel) and the first thing it prints is
+`calling dev_kmem_init`, on the statement *after* `printf(copyright)`. So
+the kernel never gets past the banner, or it gets past it with a console
+that no longer draws.
+
+Two details narrow it down:
+
+- the banner is the first **BSD `printf`** of the boot (`bsd/kern/subr_prf.c`
+  `vprintf`: `log_putc` plus `console_write_char`), while everything before
+  it - and the whole `0063` trail - is the *osfmk* `kprintf` path;
+- after the banner the screen is exactly full (the ring reached the last
+  row), so the console is at its one interesting cursor position.
+
+`0063` now also prints, with `kprintf`, `MONDRIAN bsd_init: entered`,
+`... past throttle_init` and `... past the banner`: with those three the
+next boot says whether the CPU reaches `bsd_init` at all and whether the
+banner's `printf` is what kills the console. If *nothing* new appears, the
+console dies earlier and the next step is a beacon painted from the timer
+interrupt (proves CPU and display alive, and prints the interrupted PC).
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
@@ -79,6 +110,25 @@ exec-out dd` from TWRP). New images go to `boot_b` with
 `fastboot flash boot_b /tmp/boot-mondrian.img` (the ABL then loads them from
 UFS, which is what keeps UFS powered); restore with
 `fastboot flash boot_b ~/mondrian-backups/boot_b-orig.img`.
+
+### 2026-10-21 23:05: the console blanks instead of wrapping (`0005`)
+
+The framebuffer console used to wrap: `fbcon_newline()` did
+`fbcon_row = (fbcon_row + 1) % fbcon_rows`, so once the screen filled, new
+text overwrote the top and **the newest line was somewhere in the middle**,
+with older lines still below it. On a phone whose console cannot be scrolled
+that is unusable: a photo of "the end" is not the end. `fbcon_newline()` now
+clears the whole screen and restarts at row 0 when the cursor leaves the
+last row, so after any boot the **last non-blank line is the newest output**
+and everything below it is blank. No scrolling and no per-line cost (the
+alternatives - a pixel scroll or a character ring - cost 3.2 M pixel writes
+per line on a 1440x3200 screen).
+
+CI run `39675771678` (commit `9a08d3f`, pushed 2026-10-21 21:04 UTC) was
+still queued at 23:10 local, so its artifact was not downloaded yet; the
+kernel on disk was `/tmp/mk64` (run `39673392243`, the `0063` trail, built
+at 23:05). `boot_b` held the image flashed at 22:30 (the `0063`-less
+mk63 kernel), the phone was in **fastboot** and nothing was running.
 
 ### The window of RAM (the thing that was wrong three times)
 
