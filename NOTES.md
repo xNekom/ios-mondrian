@@ -23,10 +23,33 @@ scheduler bands, `MONDRIAN GIC: virtual timer INTID 19`, `MONDRIAN HID:
 buttons registered`, `calling mpo_policy_init`, and then the BSD copyright -
 i.e. it is past `kmem_range_init` (where it used to die) and where the host
 also ends up: the UFS root. Nothing about `pmap_tte` on screen.
-**Next: power up UFS** (`mondrian_ufs.c`: clocks + `vcc`/`vccq`/`vdd-hba`)
-so `rd=ufsroot0` stops panicking, then the log ring so the console stops
-being photos. The image was `/tmp/boot-mondrian.img` (kernel from CI run
+The image was `/tmp/boot-mondrian.img` (kernel from CI run
 `39652592771`, `ecf08e7a...`), booted with `fastboot boot` (writes nothing).
+
+**Then the UFS root turned out to have a bug of its own, and it is the one
+that matters:** `mondrian_ufs.c` looked up the device-tree node
+`/sweet-ufs` (the name on sweet, copied with the driver) but `mkadt.py`
+builds the node as `/<dt_prefix>-ufs` = **`/mondrian-ufs`**. The probe
+therefore returned `ENXIO` before it ever read a single UFS register, and
+`IOFindBSDRoot` panicked with `ufsroot0 unavailable: 6`. So the phone has
+never actually asked the host whether it was left running - the "power up
+UFS" item below may not even be needed. Fixed, and the panic now carries the
+detail (`mondrian_ufs_why()`): a photo of the last lines says whether it is
+`host not ready: hce 0x.. hcs 0x..` (needs clocks/PHY/regulators), `LUN 0
+has no GPT`, `no GPT partition named "userdata"`, or a SCSI failure with its
+OCS/UPIU/status. Ground truth from TWRP: `userdata` is **`/dev/block/sda37`
+on LUN 0**, GPT name `userdata`, 234,465,260 KiB - so LUN 0 is right and the
+partition name still matches the driver default.
+
+**Next: boot the fixed driver** and read the last lines. If the panic says
+`host not ready`, then (and only then) the power-up work is real: GCC
+`ufs_phy_gdsc` at `0x87004`, the branch clocks at `0x87018` (AXI), `0x87020`
+(AHB), `0x87064` (UNIPRO), `0x8706c` (ICE), `0x870a4` (PHY_AUX), `0x870d4`
+(AGGRE), the block reset at `0x87000`, the QMP PHY at `0x1d87000` and the
+three rails (`vdd-hba`, `vcc`, `vccq`). The live UFS device-tree node says
+`reg = 0x1d84000+0x3000`, `interrupts = GIC SPI 0x109`, `lanes-per-direction
+= 2`, `phys = <phy 0xa7>`; the rails are its `vdd-hba-supply` (phandle 0x2e),
+`vcc-supply` (0x2fc) and `vccq-supply` (0x2fd).
 
 ### The window of RAM (the thing that was wrong three times)
 
