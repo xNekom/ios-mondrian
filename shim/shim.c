@@ -441,7 +441,7 @@ static void board_ufs(uintptr_t dtb)
 	}
 }
 
-static void dump_facts(uintptr_t dtb)
+static void __attribute__((unused)) dump_facts(uintptr_t dtb)
 {
 	/* A 2D array, not an array of pointers: see board_from_dtb(). */
 	static const char compat[][24] = {
