@@ -102,6 +102,57 @@ banner's `printf` is what kills the console. If *nothing* new appears, the
 console dies earlier and the next step is a beacon painted from the timer
 interrupt (proves CPU and display alive, and prints the interrupted PC).
 
+### 2026-10-22 00:05: the trail works, and the console dies **mid-line**
+
+New kernel (`0063` + `0005`, CI `39681009955`, `d5618a32...` -> image
+`b88ffe46...`, flashed to `boot_b` and rebooted). The photo shows the trail:
+
+    MONDRIAN bsd_init: past the banner
+    bsd_init: calling kauth_init
+    bsd_init: calling process_name
+    bsd_init: calling get_bsdthread_info
+    bsd_init: calling kmem_suballoc
+    bsd_init: calling bsd_buffer
+    bsd_init: calling bsd_buffer headers and 4872 cluster IO buffer headers
+    using 5648 buffer headers
+    bsd_init: calling IOKitInitializeTime
+    bsd_init: calling 1/1 CPUs initialized, SGI1 verified
+    MONDRIAN CPU:                       <-- and here the screen stops
+
+So `bsd_init` gets well past the banner (the earlier boot stopped *at* the
+banner), and the last line is **half a line**: the console died in the middle
+of `IOLog("MONDRIAN CPU: boot CPU %u registered, ...")`. Two things follow:
+
+- the freeze is **not** a fixed point in `bsd_init`: the previous boot (same
+  kernel, older console) stopped at the banner, this one at the IOLog, and
+  the only differences are the console and two extra `kprintf`s. It is
+  **timing dependent**;
+- the console dies **while writing**, not while a call is blocked, and no
+  panic text follows. That fits a fault in the framebuffer write: the
+  exception handler's own panic message goes through the same broken write,
+  so it never reaches the screen either.
+
+The console write goes through `console_write()`
+(`osfmk/console/serial_console.c`): it copies into a **ring buffer** and
+drains it to the hardware; if the ring cannot be drained the writer spins in
+`console_ring_reserve_space()`. So a dead framebuffer mapping freezes the
+screen with whatever the drain last managed to draw - exactly what the photo
+shows.
+
+The framebuffer console mapped the splash with `ml_io_map_wcomb()` (a
+page-table mapping in `kernel_map`), which can be torn down under the
+console. The kernel already has a **reserved alias** of the same physical
+framebuffer (`0012` + `0062`): a kernel VA in the low globals that the VM
+never reuses, so it cannot die. `0064`/`0065` switch the console to it and
+add two more diagnostics:
+
+- the console leaves the bottom two rows alone and the **beacon** paints
+  them from the timer interrupt (`IRQ <count> PC <pc>`): if it advances, the
+  CPU is alive and the PC says where it is; if it stops, the CPU is stuck;
+- the **panic copy** through the alias keeps working after the console took
+  over (`mondrian_early_panic` used to be disabled with the early console),
+  so a panic is visible even if the console is what died.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`

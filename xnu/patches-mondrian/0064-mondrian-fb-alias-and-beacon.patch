@@ -1,0 +1,193 @@
+diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -22,11 +22,23 @@
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+ 
++/*
++ * The last two text rows belong to the beacon (see mondrian_early_beacon):
++ * the console must not draw there, or the beacon and the console would fight
++ * over the same pixels.
++ */
++#define EARLY_HUD_ROW0 (EARLY_ROWS - MONDRIAN_FB_HUD_ROWS)
++
+ extern unsigned char iso_font[256 * 16];
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++/* The panic copy keeps drawing after the console took over: it is the only
++ * way to see a panic if the console itself is what died. */
++static unsigned int early_forced;
++/* The kernel VA alias of the framebuffer, 0 while the bootstrap VA=PA is live. */
++static uint64_t early_fb_va;
+ 
+ static void
+ mondrian_early_clear_row(void)
+@@ -42,7 +54,7 @@
+ void
+ mondrian_early_putc(char c)
+ {
+-	if (early_disabled) {
++	if (early_disabled && !early_forced) {
+ 		return;
+ 	}
+ 	if (!early_started) {
+@@ -112,10 +124,15 @@
+ void
+ mondrian_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	if (early_panicking || early_fb_va == 0) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	early_forced = 1;
++	/* Start at the bottom of the screen: the console's newest lines are
++	 * there, and a panic is the last thing that will be said. */
++	early_row = EARLY_HUD_ROW0;
++	early_col = 0;
+ 	mondrian_early_string("\nMONDRIAN EARLY PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+@@ -130,11 +147,105 @@
+ {
+ 	mondrian_early_mark(8, "leaving bootstrap TTBR0");
+ 	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb_va = base;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/*
++ * The kernel VA of the framebuffer alias, or 0 if there is none. The alias
++ * lives in the reserved low globals, so the VM never reuses it and it stays
++ * mapped for the whole boot: the framebuffer console uses it instead of a
++ * page-table mapping that can be torn down under it.
++ */
++uint64_t
++mondrian_early_fb_va(void)
++{
++	return early_fb_va;
++}
++
++/*
++ * The beacon: painted from the timer interrupt, into the two bottom rows the
++ * console does not use. It answers two questions the phone cannot answer
++ * otherwise: is the CPU still taking interrupts, and what was it doing? A
++ * beacon that stops advancing means the CPU is stuck; the PC it shows says
++ * where. No locks, no allocation: this runs in interrupt context.
++ */
++static void
++hud_clear(unsigned int row)
++{
++	for (unsigned int y = row * EARLY_CELL_H; y < (row + 1) * EARLY_CELL_H; y++) {
++		volatile uint32_t *line = EARLY_FB + y * EARLY_STRIDE;
++		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++			line[x] = 0xff202020u;
++		}
++	}
++}
++
++static void
++hud_putc(unsigned int row, unsigned int col, char c)
++{
++	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
++	for (unsigned int gy = 0; gy < 16; gy++) {
++		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
++			volatile uint32_t *line = EARLY_FB +
++			    (row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
++			    col * EARLY_CELL_W;
++			for (unsigned int gx = 0; gx < 8; gx++) {
++				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff202020u;
++				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
++					line[gx * EARLY_SCALE + sx] = pixel;
++				}
++			}
++		}
++	}
++}
++
++static unsigned int
++hud_hex(char *buf, unsigned int n, uint64_t v, unsigned int digits)
++{
++	static const char hexd[] = "0123456789abcdef";
++	for (unsigned int i = 0; i < digits; i++) {
++		buf[n + i] = hexd[(v >> ((digits - 1 - i) * 4)) & 0xf];
++	}
++	return n + digits;
++}
++
+ void
++mondrian_early_beacon(uint64_t pc, uint64_t count)
++{
++	if (early_fb_va == 0) {
++		return;
++	}
++	char line1[48], line2[48];
++	unsigned int n = 0;
++
++	line1[n++] = 'I'; line1[n++] = 'R'; line1[n++] = 'Q'; line1[n++] = ' ';
++	n = hud_hex(line1, n, count, 6);
++	line1[n++] = ' '; line1[n++] = 'P'; line1[n++] = 'C'; line1[n++] = ' ';
++	n = hud_hex(line1, n, pc >> 32, 8);
++	line1[n++] = ' ';
++	n = hud_hex(line1, n, pc & 0xffffffffu, 8);
++	line1[n] = '\0';
++
++	n = 0;
++	line2[n++] = 'B'; line2[n++] = 'E'; line2[n++] = 'A'; line2[n++] = 'C';
++	line2[n++] = 'O'; line2[n++] = 'N'; line2[n++] = ' ';
++	n = hud_hex(line2, n, count >> 32, 8);
++	line2[n] = '\0';
++
++	hud_clear(EARLY_HUD_ROW0);
++	hud_clear(EARLY_HUD_ROW0 + 1);
++	for (unsigned int i = 0; i < n; i++) {
++		hud_putc(EARLY_HUD_ROW0, i, line1[i]);
++	}
++	for (unsigned int i = 0; line2[i] != '\0'; i++) {
++		hud_putc(EARLY_HUD_ROW0 + 1, i, line2[i]);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++void
+ mondrian_early_disable(void)
+ {
+ 	early_disabled = 1;
+diff --git a/osfmk/arm64/mondrian_early.h b/osfmk/arm64/mondrian_early.h
+--- a/osfmk/arm64/mondrian_early.h
++++ b/osfmk/arm64/mondrian_early.h
+@@ -6,12 +6,17 @@
+ #include <stdarg.h>
+ #include <stdint.h>
+ 
++/* The bottom rows of the framebuffer belong to the beacon, not the console. */
++#define MONDRIAN_FB_HUD_ROWS 2u
++
+ #if defined(MONDRIAN)
+ void mondrian_early_mark(unsigned int stage, const char *label);
+ void mondrian_early_putc(char c);
+ void mondrian_early_panic(const char *fmt, va_list *args);
+ void mondrian_early_relocate(uint64_t base);
+ void mondrian_early_disable(void);
++uint64_t mondrian_early_fb_va(void);
++void mondrian_early_beacon(uint64_t pc, uint64_t count);
+ #else
+ static inline void mondrian_early_mark(unsigned int stage, const char *label)
+ {
+@@ -19,6 +24,12 @@
+ 	(void)label;
+ }
+ static inline void mondrian_early_disable(void) {}
++static inline uint64_t mondrian_early_fb_va(void) { return 0; }
++static inline void mondrian_early_beacon(uint64_t pc, uint64_t count)
++{
++	(void)pc;
++	(void)count;
++}
+ #endif
+ 
+ #endif

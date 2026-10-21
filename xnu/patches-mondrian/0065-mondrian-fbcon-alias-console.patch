@@ -1,0 +1,78 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -742,7 +742,8 @@
+ static void
+ fbcon_clear_screen(void)
+ {
+-	for (uint32_t y = 0; y < fbcon_height; y++) {
++	uint32_t rows = fbcon_rows * 16 * FBCON_SCALE;
++	for (uint32_t y = 0; y < rows; y++) {
+ 		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+ 		for (uint32_t x = 0; x < fbcon_width; x++) {
+ 			line[x] = FBCON_BG;
+@@ -767,7 +768,11 @@
+ fbcon_init(void)
+ {
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
++	/* The bottom rows belong to the beacon (mondrian_early_beacon). */
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
++	if (fbcon_rows > MONDRIAN_FB_HUD_ROWS) {
++		fbcon_rows -= MONDRIAN_FB_HUD_ROWS;
++	}
+ 	fbcon_col = fbcon_row = 0;
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+@@ -857,7 +862,16 @@
+ 		return;
+ 	}
+ 	mondrian_early_mark(17, "fbcon config read; mapping");
+-	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	/*
++	 * The reserved kernel alias of the framebuffer, not a page-table
++	 * mapping: the alias lives in the low globals the VM never reuses, so
++	 * it cannot be torn down under the console while the kernel runs. The
++	 * PE's own mapping (ml_io_map_wcomb) is only the fallback.
++	 */
++	fbcon_base = (volatile uint32_t *)mondrian_early_fb_va();
++	if (fbcon_base == NULL) {
++		fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	}
+ 	mondrian_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&mondrian_fbcon_serial_functions);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -38,6 +38,7 @@
+ #include <arm64/machine_machdep.h>
+ #include <arm64/monotonic.h>
+ #include <arm64/instructions.h>
++#include <arm64/mondrian_early.h>
+ 
+ #include <kern/debug.h>
+ #include <kern/restartable.h>
+@@ -1861,6 +1862,7 @@
+ 	 * mondrian: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++	static uint64_t mondrian_irq_count;
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
+@@ -1871,6 +1873,15 @@
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		/*
++		 * The beacon: painted from the timer interrupt into the two
++		 * bottom rows the console does not use. If it keeps advancing
++		 * the CPU is alive and the screen is alive, and the PC it shows
++		 * is where the CPU was; if it stops, the CPU is stuck.
++		 */
++		if ((++mondrian_irq_count & 0x3f) == 0) {
++			mondrian_early_beacon(get_saved_state_pc(state), mondrian_irq_count);
++		}
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
