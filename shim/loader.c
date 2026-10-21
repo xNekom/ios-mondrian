@@ -67,6 +67,10 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
+/* The memory regions of the phone, from the device tree. */
+static uint64_t mem_regs[64];
+static int n_mem_regs;
+
 /* Wipe the window the kernel is going to get.
  *
  * The real bootloader hands the kernel memory it has scrubbed, and the
@@ -75,28 +79,39 @@ static void zero64(uintptr_t dst, uint64_t n)
  * live memory, and the kernel read a stale pointer out of it and jumped
  * to it ("Undefined kernel instruction", pc inside its own heap).
  *
- * The framebuffer is left alone so the console stays on the screen, and
- * so is the firmware's own memory: it is not a hole, it belongs to the
- * secure world, and scribbling on it makes the phone reset. */
+ * Only the parts of the window that the device tree says are memory are
+ * wiped: this phone's RAM has a hole (0xea000000..0xf4600000) and writing
+ * there faults. The framebuffer is left alone so the console stays on the
+ * screen, and so is the firmware's own memory: it is not a hole, it
+ * belongs to the secure world, and scribbling on it makes the phone reset.
+ */
 static void wipe_window(uint64_t base, uint64_t size)
 {
 	const uint64_t chunk = 0x10000;	/* 64 KiB at a time */
-	uint64_t start = base, end = base + size;
+	uint64_t end = base + size;
 
 	con_hex2("WIPE", "from=", (uint32_t)base, "to=", (uint32_t)end);
-	for (uint64_t a = start; a < end; a += chunk) {
-		uint64_t b = a + chunk;
-		if (b > end)
-			b = end;
-		int skip = 0;
-		if (FB_BASE < b && FB_BASE + FB_SIZE > a)
-			skip = 1;			/* the console */
-		for (int i = 0; !skip && i < BOARD_RESERVED_N; i++)
-			if (board_reserved[i][0] < b &&
-			    board_reserved[i][0] + board_reserved[i][1] > a)
-				skip = 1;		/* the secure world */
-		if (!skip)
-			zero64(a, b - a);
+	for (int i = 0; i < n_mem_regs; i++) {
+		uint64_t rb = mem_regs[i * 2], rs = mem_regs[i * 2 + 1];
+		uint64_t a = rb > base ? rb : base;
+		uint64_t b = (rb + rs) < end ? (rb + rs) : end;
+
+		if (a >= b)
+			continue;
+		for (uint64_t p = a; p < b; p += chunk) {
+			uint64_t q = p + chunk;
+			if (q > b)
+				q = b;
+			int skip = 0;
+			if (FB_BASE < q && FB_BASE + FB_SIZE > p)
+				skip = 1;			/* the console */
+			for (int k = 0; !skip && k < BOARD_RESERVED_N; k++)
+				if (board_reserved[k][0] < q &&
+				    board_reserved[k][0] + board_reserved[k][1] > p)
+					skip = 1;		/* the secure world */
+			if (!skip)
+				zero64(p, q - p);
+		}
 	}
 	con_str("WIPE", "done");
 }
@@ -120,10 +135,6 @@ void loader_set_window(uint64_t base, uint64_t size)
 	win_base = base;
 	win_size = size;
 }
-
-/* The memory regions of the phone, from the device tree. */
-static uint64_t mem_regs[64];
-static int n_mem_regs;
 
 void loader_set_regions(const uint64_t *regs, int n)
 {

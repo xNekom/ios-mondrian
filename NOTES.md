@@ -106,48 +106,75 @@ before trusting it.
   (19), the same as the sweet.
 - `ro.boot.bootdevice` is `1d84000.ufshc`, the same UFS host as the sweet.
 
-### The kernel panics after its console (solved 2026-10-21)
+### The kernel panics after its console (the RCpc instructions)
 
 With the right window the kernel brings its console up on the phone
 (`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
-then it panicked:
+then it panics:
 
-    panic(cpu 0 caller 0xfffffff007a405b8): Undefined kernel instruction:
+    panic(cpu 0 caller 0xfffffff007a485b8): Undefined kernel instruction:
     pc=0xffffffff0074b58c40 instr=0x51be220  (sleh.c:951)
 
 Reading that line:
 
 - The format is `panic("Undefined kernel instruction: pc=%p instr=%x", ...)`
-  (`osfmk/arm64/sleh.c`, `handle_uncategorized()`), and **`%p` hides the top
-  byte** of a kernel address (it prints the address with the top byte
-  replaced by `0xff`). The real pc is `0xfffffff074b58c40`, which is
-  **outside the kernel image** (`__TEXT_EXEC` ends at 0xfffffff007aa8000).
-  Do not chase the address as if it were code: it is in the physmap, i.e.
-  physical memory mapped 1:1.
+  (`osfmk/arm64/sleh.c`, `handle_uncategorized()`).
 - The instruction word `0x051be220` has `op0 = 0b0010`, a **reserved**
-  encoding: the CPU really did execute garbage. The kernel jumped through a
-  corrupted pointer.
-- The console line is 80 characters wide, so the pc is split across two
-  lines ("...pc=0xffffffff0074b58c4" + "0 instr=..."). Photograph the whole
-  screen, not the tail.
+  encoding: the CPU really did execute garbage.
+- The pc is a kernel-style address above the kernel image (which ends at
+  0xffffffff007c74000). It is the same in every boot, whatever the window
+  and the seed are, so it is not the slide and not the window.
 
-The cause was the **window ending inside the phone's RAM hole**: the
-kernel's first heap pages come from the end of the window, and there the
-writes went nowhere. With the window ending in the second bank
-(`0xb0000000+0x46000000`) the kernel's heap starts in real RAM.
+**The cause: the kernel was built for the wrong CPU.** It was compiled with
+`-march=armv8.5-a+crypto`, and that puts **226 RCpc instructions**
+(`ldapr`, `ldar`, ARMv8.3) in it. The SM8475's cores are Cortex-A78:
+ARMv8.2 with LSE, **no RCpc and no pointer authentication**. QEMU runs
+`-cpu max`, which implements every optional feature, so the host booted
+clean and the phone raised an undefined instruction. The build now uses
+`-mcpu=cortex-a78` (patch 0001).
 
-Two dead ends, kept so they are not tried again:
+The same mistake is the one the *topaz* port (Redmi Note 12 4G, SM6225) ran
+into: its patch 0081 builds with `-mcpu=cortex-a53`, turns PAN off and
+emulates the iOS userland's LSE/LDAPR in `handle_uncategorized`, because
+the iOS 16 userland still has LSE atomics and `ldapr` in it. We will need
+that emulation too, but only for the userland: the kernel's own RCpc
+instructions go away with the right `-mcpu`.
+
+### The topaz fork is worth reading
+
+`MakrSas/ios-topaz` is another port of this one to a Qualcomm phone
+(Redmi Note 12 4G, SM6225) that **boots all the way to the iOS home
+screen**. Its README lists the walls it hit, and two of them are ours:
+
+- *"XNU hangs after initCPU (no SGI / timer interrupt): the shim prepares
+  the GIC for all the cores before the jump: GICD groups, redistributor
+  wake, SGIs/PPIs in Group 1"*. Our shim already does this (`test_gic()`,
+  and the secondaries' redistributors in `secondary_main()`), which is why
+  the phone's kernel gets as far as the console.
+- *"The cores are ARMv8.0: no LSE atomics, no RCpc (ldapr), no PAN"*. That
+  is the one that bit us.
+- Its virtual timer is also **INTID 19 at 19.2 MHz**, the same numbers the
+  mondrian's live device tree gives ✓.
+
+Its `shim/shim.c` and `xnu/patches/` are worth reading before writing our
+own driver patches.
+
+### What else was tried (and ruled out)
 
 - Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.
   XNU's dynamic memory is a *virtual* range whose pages come from the free
   list, and the range crossed 4 GB into a hole the device tree does not
   describe as RAM, so the shim itself faulted (`PANIC SYNC`, `STAGE
-  loader`). The wipe was removed.
+  loader`).
+- The shim now **wipes the window** before the kernel starts (the real
+  bootloader scrubs the memory it hands over; the sweet's window is DRAM
+  that Android never touched, so it is zero already, but this phone's
+  window is Android's live memory). It did not change the panic, so the
+  stale data was not the cause — but it is what a real bootloader does, so
+  it stays.
 - The kernel is built with `-march=armv8.5-a+crypto` and QEMU runs `-cpu
   max`, which implements every optional feature; the SM8475 cores do not.
-  That is still worth keeping in mind, but it is **not** what this panic
-  was: the executed word was a reserved encoding (garbage), not an
-  optional instruction.
+  That was the cause (see above).
 
 ### Getting the phone to do things
 

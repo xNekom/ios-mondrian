@@ -190,9 +190,8 @@ MONDRIAN = Board(
     # hypervisor is at 0x80000000+0x600000; the kernel image written over it
     # kills the secure world and the phone resets instead of booting).
     #
-    # The window is 0xb0000000+0x3a000000, so it ends at 0xea000000, the
-    # first byte of the hole between the phone's two RAM banks. The live
-    # device tree says the RAM is
+    # The window is 0xb0000000+0x46000000, so it ends at 0xf6000000, inside
+    # the phone's *second* RAM bank. The live device tree says the RAM is
     #   0x80000000+0x6a000000  and  0xf4600000+0xba00000
     # so 0xea000000..0xf4600000 is a hole: not RAM at all. The kernel's
     # dynamic memory starts at the *end* of the window (static_memory_end =
@@ -206,12 +205,11 @@ MONDRIAN = Board(
     # 0xf6000000, in the second bank) is just as bad: the zone map still
     # covers the hole, and the kernel reads a pointer from it.
     #
-    # Below 0x3a000000 the physmap no longer fits next to the kernel's own
-    # image and the boot dies in pmap_map_bd (measured on the host). This is
-    # the smallest size that boots, so the window cannot be shortened to
-    # stay below the first no-map carve-out (qheebsp_reserved_region at
-    # 0xe0000000): the ~2 MB of firmware memory inside the window have to
-    # be declared reserved in the device tree instead.
+    # The size has a floor: below 0x3a000000 the physmap no longer fits next
+    # to the kernel's own image and the boot dies in pmap_map_bd (measured on
+    # the host, and on the phone with the new kernel: it asked for more room
+    # than the old window had). At 0x46000000 the host boots with every
+    # slide tried, and the end of the window is in real RAM.
     #
     # The base is the only one that boots, measured on the host with the same
     # kernel (tools/qemu-ios.py): the low bank and the hole after the splash
@@ -219,7 +217,7 @@ MONDRIAN = Board(
     # even exists. That bisection was made with a random seed, so it is not
     # trustworthy: redo it with the seed pinned below.
     phys_base=0xb0000000,
-    mem_size=0x3a000000,
+    mem_size=0x46000000,
     # Pinned: the physmap slide comes from this seed, and with a random one
     # the boot is a coin flip (one run in three dies in pmap_map_bd). This
     # one is known to work with the window above (checked on the host).
