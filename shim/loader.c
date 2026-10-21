@@ -15,8 +15,6 @@
 #include "lz4.h"
 
 #define BOOT_LINE_LENGTH	608
-/* How much memory above the window is wiped before the kernel starts. */
-#define ZERO_ABOVE_WINDOW	(256UL << 20)
 #define PAGE_16K		0x4000UL
 
 struct payload_seg {
@@ -315,24 +313,6 @@ const char *loader_boot(uintptr_t dtb)
 		con_str("VERDICT", kern_ok ? "kernel-copied" : "KERN-EMPTY");
 	}
 #endif
-	/*
-	 * The memory the kernel takes as its heap starts right above the
-	 * window (XNU's arm_vm_init puts static_memory_end at
-	 * gPhysBase + memSize). On a phone that memory still holds whatever
-	 * Android left there, and the kernel reads it before it writes it:
-	 * a stale pointer sends it to a data address and it dies with an
-	 * undefined instruction. In QEMU the RAM is zeroed, which is why
-	 * the same kernel boots there. So wipe it here.
-	 */
-	{
-		uintptr_t start = phys_base + mem_size;
-		uintptr_t end = start + ZERO_ABOVE_WINDOW;
-
-		for (uintptr_t a = start; a < end; a += 4096)
-			zero64(a, 4096);
-		con_hex2("ZERO", "from=", start, "to=", end);
-	}
-
 	con_str("XNU", "jumping (fbcon clears screen)");
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */

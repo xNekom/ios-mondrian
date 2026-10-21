@@ -89,6 +89,89 @@ values that still have to be read from the device are marked **TODO**.
 
 Sources: see [References](#references).
 
+## The window of RAM (2026-10-21, measured)
+
+The window is the block of physical memory the kernel gets: it decides
+where the kernel image is written, what the kernel's physical aperture
+looks like, and what the framebuffer console can reach. Two rules, both
+learned the hard way:
+
+1. **It has to contain the splash framebuffer** (0xb8000000 on this phone).
+   The kernel's framebuffer console is mapped VA=PA inside the window; with
+   the framebuffer outside, the kernel dies before it prints anything.
+2. **It has to start above the firmware's own memory** at the bottom of the
+   bank. The hypervisor is at 0x80000000+0x600000
+   (`/reserved-memory/hyp_region`) and the kernel image is written to the
+   start of the window: overwriting the hypervisor kills the secure world
+   and the phone **resets** instead of booting.
+
+The sweet's window satisfies both, so the mondrian uses the same one:
+
+    phys_base = 0xb0000000
+    mem_size  = 0x4d000000
+
+It is also the only one that boots. Measured on the host with the same
+kernel (`tools/qemu-ios.py`; the window is chosen with the
+`QEMU_PHYS_BASE`/`QEMU_MEM_SIZE` environment variables, so no phone is
+needed to try a window):
+
+| window | result |
+| --- | --- |
+| `0xb0000000 + 0x4d000000` | **boots clean** |
+| `0xbab00000 + 0x25500000` | panic in `pmap_map_bd` |
+| `0xb8000000 + 0x4d000000` | data abort before the console |
+| `0x80000000 + 0x25500000` | panic in `pmap_map_bd` |
+| `0xb0000000 + 0x25500000` | panic in `pmap_map_bd` |
+| `0xb0000000 + 0x6a000000` | panic in `pmap_map_bd` |
+
+XNU's arm64 PE builds the physical aperture from `gPhysBase`/`gPhysSize`
+(`osfmk/arm64/arm_vm_init.c`, `arm_vm_physmap_init()`); a window that does
+not fit that shape leaves the kernel without a usable map.
+
+**Do not use the biggest free hole.** `0xbab00000 + 597 MB` is clear of
+every carve-out, but the framebuffer falls outside it.
+
+The board table (`tools/boards.py`) and the shim (`shim/board.h`) hold the
+window; the shim checks the live device tree agrees that it is inside a
+memory region and says so on the screen.
+
+### The memory of this phone (from the live device tree)
+
+| what | value |
+| --- | --- |
+| `/memory` | `0x80000000+0x6a000000`, `0xf4600000+0xba00000`, four above 32 GB |
+| usable RAM per the bootloader | 1.85 GB (`ddr_size` says 12) |
+| `/reserved-memory` | 38 carve-outs: hypervisor 0x80000000+0x600000, AOP, SMEM, modem 0x8bc00000+0x13200000, splash 0xb8000000+0x2b00000, tags, QTEe |
+| biggest hole | `0xbab00000 + 597 MB` (does not boot: no framebuffer) |
+| framebuffer | 0xb8000000, 1440x3200, stride 5760 |
+| GIC | GICD 0x17100000+0x10000, GICR 0x17180000+0x200000, redistributor stride 0x40000 |
+| virtual timer | INTID 19 (no `virtual-timer-intid` in the tree) |
+| UFS host | 0x1d84000 (`ro.boot.bootdevice` = `1d84000.ufshc`) |
+
+## Getting the phone to do things
+
+| what | how |
+| --- | --- |
+| run the kernel | the phone in fastboot (power + volume down), then `tools/phone-boot.sh` |
+| write an image to the boot partition | `tools/phone-deploy.sh push` + `install` (asks first) |
+| a root shell | `adb pair <ip>:<port> <code>` (Android wireless debugging) + `adb root`; the build is `userdebug` |
+| recover from a boot loop | recovery (power + volume up), then `dd if=/dev/block/by-name/boot_a of=/dev/block/by-name/boot_b bs=4M` |
+
+`fastboot boot` writes no partition, so the phone keeps its Android
+installation; the original boot image is also kept at
+`/tmp/boot-orig-b.img` (sha1
+`89a1b3dfced4a6e4312925641daf51133a70f6ff`) and on the phone at
+`/data/local/tmp/boot-orig_b.img`.
+
+**The kernel panics after its console comes up** (`Undefined kernel
+instruction: pc=0xfffffff00740c4f`), and the same kernel boots clean in
+QEMU with the same window. That is the open item. A first guess (stale RAM,
+wiping the memory above the window) was wrong: XNU's dynamic memory is a
+virtual range whose pages come from the free list, and the wipe crossed
+4 GB into a hole the device tree does not describe, so the shim faulted.
+The wipe was removed; the full panic is the next thing to read (the console
+scrolls, so a photograph has to cover the whole screen).
+
 ## The work list
 
 Ordered so that every step is testable on its own. The first four steps need

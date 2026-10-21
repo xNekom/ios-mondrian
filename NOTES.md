@@ -7,6 +7,140 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-21: the kernel runs on the phone. Read this before touching the window
+
+**The kernel boots on the phone** (2026-10-21). The ABL loads the shim, the
+shim reads the live device tree, unpacks the payload, copies the kernel and
+jumps; the kernel's own console comes up on the splash framebuffer
+(`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
+then it panics with an undefined instruction. The next step is the panic.
+
+### The window of RAM (the thing that was wrong twice)
+
+**The window the kernel gets has two hard requirements**, and the sweet's
+window satisfies both, so the mondrian uses the same one:
+
+- it must **contain the splash framebuffer** (0xb8000000 on this phone): the
+  kernel's framebuffer console is mapped VA=PA inside the window, and
+  without it the kernel dies before it can print anything;
+- it must **start above the firmware's own memory** at the bottom of the
+  bank: the hypervisor lives at 0x80000000+0x600000
+  (`/reserved-memory/hyp_region`), and the kernel image is written to the
+  start of the window. Writing over the hypervisor kills the secure world
+  and the **phone resets** instead of booting. That was the first failure:
+  the shim had picked the whole low bank (0x80000000+0x6a000000) because
+  that is the region that holds the framebuffer.
+
+**The window is `0xb0000000 + 0x4d000000`** (the sweet's), and it is the
+only one that boots. Measured on the host with the same kernel
+(`tools/qemu-ios.py`, the window is chosen with the `QEMU_PHYS_BASE` and
+`QEMU_MEM_SIZE` environment variables, so this costs nothing on the phone):
+
+| window | result |
+|---|---|
+| `0xb0000000 + 0x4d000000` (the sweet's) | **boots clean** |
+| `0xbab00000 + 0x25500000` (the hole after the splash) | panic in `pmap_map_bd` |
+| `0xb8000000 + 0x4d000000` | data abort before the console |
+| `0x80000000 + 0x25500000` (the low bank) | panic in `pmap_map_bd` |
+| `0xb0000000 + 0x25500000` | panic in `pmap_map_bd` |
+| `0xb0000000 + 0x6a000000` | panic in `pmap_map_bd` |
+
+XNU's arm64 PE builds the physical aperture from `gPhysBase`/`gPhysSize`
+(`osfmk/arm64/arm_vm_init.c`, `arm_vm_physmap_init()`), so a window that
+does not fit that shape leaves the kernel without a usable map: it dies in
+`pmap_map_bd` or, earlier, in a data abort whose faulting address is a
+null pointer plus a small offset.
+
+**Do not use the biggest free hole** (`0xbab00000 + 597 MB`): it is clear of
+the carve-outs, but the framebuffer falls outside it and the kernel never
+reaches its console.
+
+### The memory of this phone (measured, live device tree)
+
+- `/memory` has six regions: `0x80000000+0x6a000000`, `0xf4600000+0xba00000`
+  and four above 32 GB. The bootloader only describes 1.85 GB of usable RAM
+  even though `ddr_size` says 12.
+- `/reserved-memory` has **38 carve-outs**: the hypervisor at
+  0x80000000+0x600000, the AOP, the SMEM, the modem firmware at
+  0x8bc00000+0x13200000, the splash at 0xb8000000+0x2b00000, the tags, the
+  QTEe. The biggest hole is `0xbab00000 + 597 MB`.
+- The framebuffer is at 0xb8000000, 1440x3200, stride 5760.
+- The GIC is `interrupt-controller@17100000` (GICD 0x17100000+0x10000, GICR
+  0x17180000+0x200000, redistributor stride 0x40000). The live tree has **no**
+  `virtual-timer-intid` property, so the kernel uses the Qualcomm numbering
+  (19), the same as the sweet.
+- `ro.boot.bootdevice` is `1d84000.ufshc`, the same UFS host as the sweet.
+
+### The kernel panics after its console (open)
+
+With the right window the kernel brings its console up on the phone
+(`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
+then panics:
+
+    panic(cpu 0 caller 0xfffffff007a6e588): Undefined kernel instruction:
+    pc=0xfffffff00740c4f instr=0x51be228  (sleh.c:951)
+
+The same kernel boots clean in QEMU with the same window, so this is the
+next thing to chase. Notes on what was tried:
+
+- The first guess was stale RAM (QEMU's RAM is zeroed, the phone's is not),
+  so the shim wiped 256 MB above the window before jumping. That was wrong
+  twice: XNU's dynamic memory is a *virtual* range whose pages come from the
+  free list (not "the memory right above the window"), and the range crossed
+  4 GB into a hole the device tree does not describe as RAM, so the shim
+  itself faulted (`PANIC SYNC`, `STAGE loader`). The wipe was removed.
+- The pc is not 4-byte aligned and lands in `__TEXT_EXEC` near
+  `_ml_nofault_copy`; the printed instruction word does not decode as a
+  valid AArch64 instruction, which is what a jump through a corrupted
+  pointer looks like. The next step is to read the full panic (the console
+  scrolls: photograph the whole screen) and check the caller and the
+  instruction word before assuming a stale pointer.
+- The kernel is built with `-march=armv8.5-a+crypto`. QEMU runs `-cpu max`,
+  which implements every optional feature; the SM8475 cores do not. If the
+  fault turns out to be an optional instruction/system register, the fix is
+  in the machine flags, not in the window.
+
+### Getting the phone to do things
+
+- **fastboot over USB works** (the cable was the problem, not the port):
+  43 MB/s, `max-download-size` 768 MB, `fastboot boot` of a 7 MB image takes
+  0.3 s. The ABL's fastboot USB stack still hangs from time to time, so
+  every command runs with a time limit.
+- **adb over Wi-Fi works**: the Android "wireless debugging" pairing
+  (`adb pair <ip>:<port> <code>`) and then `adb root` (the build is
+  `userdebug`), which gives a root shell over the network.
+- The phone is **A/B**: `boot_a` is `/dev/block/sde14`, `boot_b` is
+  `/dev/block/sde43`, the active slot is `_b`.
+- **One command to run the kernel** (the phone has to be in fastboot, power
+  + volume down):
+
+      tools/phone-boot.sh
+
+  It builds the image if it is missing and boots it with `fastboot boot`,
+  which writes no partition at all.
+- `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path for
+  the cases where the image has to be written to the boot partition.
+- **The original boot image** is at `/tmp/boot-orig-b.img` on the Mac (sha1
+  `89a1b3dfced4a6e4312925641daf51133a70f6ff`) and at
+  `/data/local/tmp/boot-orig_b.img` on the phone. `boot_a` still has the
+  stock Android image.
+- **If the phone is stuck in a loop**: boot the recovery (power + volume
+  up) and copy the good slot over the bad one, no USB needed:
+
+      dd if=/dev/block/by-name/boot_a of=/dev/block/by-name/boot_b bs=4M
+
+### The ABL, measured
+
+- It loads the boot image at **0xA8000000** (the shim is linked at 0 and
+  adds the runtime base to every address it hands to a device).
+- It loads the **hypervisor at 0x80000000** and starts it. Overwriting that
+  memory resets the phone.
+- It passes the Android boot arguments in `/chosen/bootargs`; XNU needs its
+  own, which is what the shim builds.
+- It leaves the **UFS powered** when it boots the phone the normal way, and
+  powers it down when it enters fastboot. That is why booting the image
+  from the partition is better than `fastboot boot` for the root device.
+
 **STATE at 2026-10-20 (fork created, no phone yet):**
 
 - The fork is `xNekom/ios-mondrian`, branch `mondrian` of
