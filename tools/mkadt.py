@@ -23,6 +23,10 @@ import os
 # to try the phone's own window without touching the board table.
 QEMU_PHYS_BASE = int(os.environ.get('QEMU_PHYS_BASE', '0xb0000000'), 0)
 QEMU_MEM_SIZE = int(os.environ.get('QEMU_MEM_SIZE', '0x4d000000'), 0)
+# How many CPU nodes the tree declares (0 = the board's own count). The first
+# bring-up on a new phone wants one: the kernel starts the other cores
+# through PSCI, and the shim does not implement that call yet.
+DT_CPUS = int(os.environ.get('DT_CPUS', '0'), 0)
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -67,7 +71,18 @@ def build(board, seed=None, qemu=False, altmem=False):
         phys_base, mem_size = QEMU_PHYS_BASE, QEMU_MEM_SIZE
     gicd, gicr, timebase = ((QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu
                             else (board.gicd, board.gicr, board.timebase))
-    seed = seed if seed is not None else os.urandom(64)
+    seed = seed if seed is not None else board.seed
+    if seed is None:
+        seed = os.urandom(64)
+    # ADT_SEED=<hex> pins it. The kernel derives the physmap slide from this
+    # seed, and the slide decides whether the physmap fits next to the
+    # kernel's own image: with a random seed the boot is a coin flip (the
+    # host panics in pmap_map_bd about one run in three). A pinned seed
+    # makes the boot reproducible, which is what the phone needs to match
+    # the host.
+    if 'ADT_SEED' in os.environ:
+        seed = bytes.fromhex(os.environ['ADT_SEED'].replace(' ', ''))
+        assert len(seed) == 64, 'ADT_SEED must be 64 bytes of hex'
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
 
@@ -120,7 +135,10 @@ def build(board, seed=None, qemu=False, altmem=False):
     cpu_compat = {'sweet': cstr('qcom,kryo470') + cstr('ARM,v8'),
                   'mondrian': cstr('qcom,kryo') + cstr('ARM,v9')}
     cpu_nodes = []
-    for core in range(1 if qemu else len(board.cpus)):
+    n_cpus = 1 if qemu else len(board.cpus)
+    if DT_CPUS:
+        n_cpus = max(1, min(DT_CPUS, len(board.cpus)))
+    for core in range(n_cpus):
         cpu = board.cpus[core]
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
@@ -213,6 +231,17 @@ def build(board, seed=None, qemu=False, altmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,<board>' stays for the platform expert matching.
+    # The RAM the kernel gets, as the phone's own device tree states it: one
+    # region, the window. The kernel may read this node instead of
+    # dram-base/dram-size, so the two have to agree.
+    # ADT_MEMORY=0 leaves it out (the sweet's tree has no /memory node).
+    memory = [] if os.environ.get('ADT_MEMORY') == '0' else [
+        node('memory', [
+            ph(),
+            ('device_type', cstr('memory')),
+            ('reg', u64(phys_base, mem_size)),
+        ])]
+
     return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,' + board.name) +
@@ -223,7 +252,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + memory + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

@@ -15,10 +15,10 @@ jumps; the kernel's own console comes up on the splash framebuffer
 (`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
 then it panics with an undefined instruction. The next step is the panic.
 
-### The window of RAM (the thing that was wrong twice)
+### The window of RAM (the thing that was wrong three times)
 
-**The window the kernel gets has two hard requirements**, and the sweet's
-window satisfies both, so the mondrian uses the same one:
+**The window the kernel gets has three hard requirements**, and the
+mondrian's is now `0xb0000000 + 0x46000000`:
 
 - it must **contain the splash framebuffer** (0xb8000000 on this phone): the
   kernel's framebuffer console is mapped VA=PA inside the window, and
@@ -29,21 +29,35 @@ window satisfies both, so the mondrian uses the same one:
   start of the window. Writing over the hypervisor kills the secure world
   and the **phone resets** instead of booting. That was the first failure:
   the shim had picked the whole low bank (0x80000000+0x6a000000) because
-  that is the region that holds the framebuffer.
+  that is the region that holds the framebuffer;
+- it must **end in memory that really exists**. The phone's RAM has a hole:
+  the live device tree says `0x80000000+0x6a000000` and
+  `0xf4600000+0xba00000`, so **0xea000000..0xf4600000 is not RAM**. XNU
+  takes its first heap pages from the *end* of the window
+  (`static_memory_end = physmap_base + memSize`), so a window that ends
+  inside the hole hands those pages to memory that is not there: the writes
+  are lost and the kernel jumps to a corrupted pointer. That was the phone's
+  panic (see below). The window now ends at 0xf6000000, inside the second
+  bank.
 
-**The window is `0xb0000000 + 0x4d000000`** (the sweet's), and it is the
-only one that boots. Measured on the host with the same kernel
-(`tools/qemu-ios.py`, the window is chosen with the `QEMU_PHYS_BASE` and
-`QEMU_MEM_SIZE` environment variables, so this costs nothing on the phone):
+**The size has a floor too**: below 0x3a000000 the physmap no longer fits
+next to the kernel's own image and the boot dies in `pmap_map_bd`. At
+0x46000000 the host boots with every slide tried (see the slide below).
+
+Measured on the host with the same kernel (`tools/qemu-ios.py`, the window
+is chosen with the `QEMU_PHYS_BASE` and `QEMU_MEM_SIZE` environment
+variables, so this costs nothing on the phone):
 
 | window | result |
 |---|---|
-| `0xb0000000 + 0x4d000000` (the sweet's) | **boots clean** |
+| `0xb0000000 + 0x46000000` (now) | **boots clean** |
+| `0xb0000000 + 0x4d000000` (the sweet's) | boots clean **on the host only**: it ends at 0xfd000000, inside the phone's hole |
+| `0xb0000000 + 0x3a000000` | boots clean (ends at 0xea000000, just before the hole) but needs a lucky slide |
+| `0xb0000000 + 0x30000000` | panic in `pmap_map_bd` with every seed tried |
 | `0xbab00000 + 0x25500000` (the hole after the splash) | panic in `pmap_map_bd` |
 | `0xb8000000 + 0x4d000000` | data abort before the console |
 | `0x80000000 + 0x25500000` (the low bank) | panic in `pmap_map_bd` |
 | `0xb0000000 + 0x25500000` | panic in `pmap_map_bd` |
-| `0xb0000000 + 0x6a000000` | panic in `pmap_map_bd` |
 
 XNU's arm64 PE builds the physical aperture from `gPhysBase`/`gPhysSize`
 (`osfmk/arm64/arm_vm_init.c`, `arm_vm_physmap_init()`), so a window that
@@ -54,6 +68,27 @@ null pointer plus a small offset.
 **Do not use the biggest free hole** (`0xbab00000 + 597 MB`): it is clear of
 the carve-outs, but the framebuffer falls outside it and the kernel never
 reaches its console.
+
+### The physmap slide makes the boot a coin flip (found 2026-10-21)
+
+`arm_vm_physmap_slide()` moves the physmap by up to 1 GB
+(`ARM64_PHYSMAP_SLIDE_RANGE`), and the offset comes from the **random seed
+the device tree gives the kernel** (`/chosen/random-seed`). With a random
+seed the *host* boot is a coin flip: about one run in three dies in
+`pmap_map_bd`, and which run fails changes every time. That is why the
+window table above looked inconsistent.
+
+- `tools/boards.py` now has a `seed` field and the mondrian pins
+  `b'mondrian' * 8`, so the boot is reproducible. `ADT_SEED=<64 bytes of
+  hex>` overrides it for experiments.
+- With the seed pinned, the same window always gives the same result
+  (checked three times each).
+- The window `0x46000000` boots with every seed tried, so it does not rely
+  on a lucky slide.
+
+**The old "only this base boots" conclusion was measured with a random
+seed and is not trustworthy.** Redo the base bisection with a pinned seed
+before trusting it.
 
 ### The memory of this phone (measured, live device tree)
 
@@ -71,34 +106,48 @@ reaches its console.
   (19), the same as the sweet.
 - `ro.boot.bootdevice` is `1d84000.ufshc`, the same UFS host as the sweet.
 
-### The kernel panics after its console (open)
+### The kernel panics after its console (solved 2026-10-21)
 
 With the right window the kernel brings its console up on the phone
 (`initialize_screen: b=B8000000`, `MONDRIAN GIC: virtual timer INTID 19`) and
-then panics:
+then it panicked:
 
-    panic(cpu 0 caller 0xfffffff007a6e588): Undefined kernel instruction:
-    pc=0xfffffff00740c4f instr=0x51be228  (sleh.c:951)
+    panic(cpu 0 caller 0xfffffff007a405b8): Undefined kernel instruction:
+    pc=0xffffffff0074b58c40 instr=0x51be220  (sleh.c:951)
 
-The same kernel boots clean in QEMU with the same window, so this is the
-next thing to chase. Notes on what was tried:
+Reading that line:
 
-- The first guess was stale RAM (QEMU's RAM is zeroed, the phone's is not),
-  so the shim wiped 256 MB above the window before jumping. That was wrong
-  twice: XNU's dynamic memory is a *virtual* range whose pages come from the
-  free list (not "the memory right above the window"), and the range crossed
-  4 GB into a hole the device tree does not describe as RAM, so the shim
-  itself faulted (`PANIC SYNC`, `STAGE loader`). The wipe was removed.
-- The pc is not 4-byte aligned and lands in `__TEXT_EXEC` near
-  `_ml_nofault_copy`; the printed instruction word does not decode as a
-  valid AArch64 instruction, which is what a jump through a corrupted
-  pointer looks like. The next step is to read the full panic (the console
-  scrolls: photograph the whole screen) and check the caller and the
-  instruction word before assuming a stale pointer.
-- The kernel is built with `-march=armv8.5-a+crypto`. QEMU runs `-cpu max`,
-  which implements every optional feature; the SM8475 cores do not. If the
-  fault turns out to be an optional instruction/system register, the fix is
-  in the machine flags, not in the window.
+- The format is `panic("Undefined kernel instruction: pc=%p instr=%x", ...)`
+  (`osfmk/arm64/sleh.c`, `handle_uncategorized()`), and **`%p` hides the top
+  byte** of a kernel address (it prints the address with the top byte
+  replaced by `0xff`). The real pc is `0xfffffff074b58c40`, which is
+  **outside the kernel image** (`__TEXT_EXEC` ends at 0xfffffff007aa8000).
+  Do not chase the address as if it were code: it is in the physmap, i.e.
+  physical memory mapped 1:1.
+- The instruction word `0x051be220` has `op0 = 0b0010`, a **reserved**
+  encoding: the CPU really did execute garbage. The kernel jumped through a
+  corrupted pointer.
+- The console line is 80 characters wide, so the pc is split across two
+  lines ("...pc=0xffffffff0074b58c4" + "0 instr=..."). Photograph the whole
+  screen, not the tail.
+
+The cause was the **window ending inside the phone's RAM hole**: the
+kernel's first heap pages come from the end of the window, and there the
+writes went nowhere. With the window ending in the second bank
+(`0xb0000000+0x46000000`) the kernel's heap starts in real RAM.
+
+Two dead ends, kept so they are not tried again:
+
+- Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.
+  XNU's dynamic memory is a *virtual* range whose pages come from the free
+  list, and the range crossed 4 GB into a hole the device tree does not
+  describe as RAM, so the shim itself faulted (`PANIC SYNC`, `STAGE
+  loader`). The wipe was removed.
+- The kernel is built with `-march=armv8.5-a+crypto` and QEMU runs `-cpu
+  max`, which implements every optional feature; the SM8475 cores do not.
+  That is still worth keeping in mind, but it is **not** what this panic
+  was: the executed word was a reserved encoding (garbage), not an
+  optional instruction.
 
 ### Getting the phone to do things
 
@@ -120,6 +169,25 @@ next thing to chase. Notes on what was tried:
   which writes no partition at all.
 - `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path for
   the cases where the image has to be written to the boot partition.
+  `CMDLINE='...'` overrides the kernel boot arguments (that is how `cpus=1`
+  was tested).
+- **QEMU parity check** (the same kernel, the same tree, the same window;
+  this is how the window rules above were measured):
+
+      export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
+      python3 tools/mkadt.py --board mondrian --qemu /tmp/adt-qemu.dtb
+      python3 tools/mkpayload.py /tmp/mk10/kernel.development.mondrian \
+          /tmp/adt-qemu.dtb /tmp/payload-qemu.bin --board mondrian
+      python3 tools/qemu-ios.py /tmp/payload-qemu.bin /tmp/qemu-out \
+          --board mondrian --secs 18 \
+          --kernel /tmp/mk10/kernel.development.mondrian
+
+  It writes `/tmp/qemu-out/fb.txt` (the console text, decoded with the
+  kernel's own font) and prints `{"status": "no_panic_observed"}` or
+  `{"status": "panic"}`.
+- `QEMU_PHYS_BASE` / `QEMU_MEM_SIZE` override the window for the host run,
+  `ADT_SEED` pins the random seed, `ADT_MEMORY=0` leaves the `/memory` node
+  out of the tree, and `DT_CPUS=1` writes a single cpu node.
 - **The original boot image** is at `/tmp/boot-orig-b.img` on the Mac (sha1
   `89a1b3dfced4a6e4312925641daf51133a70f6ff`) and at
   `/data/local/tmp/boot-orig_b.img` on the phone. `boot_a` still has the

@@ -47,7 +47,7 @@ build)
 	[ -f "$RAMDISK" ] || { printf '#!/bin/sh\nexec /bin/sh\n' > "$RAMDISK"; }
 	python3 tools/mkadt.py --board "$BOARD" "$ADT"
 	python3 tools/mkpayload.py "$KERNEL" "$ADT" "$PAYLOAD" --board "$BOARD" \
-		--ramdisk "$RAMDISK"
+		--ramdisk "$RAMDISK" ${CMDLINE:+--cmdline "$CMDLINE"}
 	# The shim image: the loader plus the payload, as a boot image.
 	# SMALL_SHIM keeps the diagnostics out: the facts dump fills the whole
 	# screen and the lines that matter (the loader's verdict, the kernel's

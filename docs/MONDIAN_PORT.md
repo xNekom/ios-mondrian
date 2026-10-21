@@ -93,7 +93,7 @@ Sources: see [References](#references).
 
 The window is the block of physical memory the kernel gets: it decides
 where the kernel image is written, what the kernel's physical aperture
-looks like, and what the framebuffer console can reach. Two rules, both
+looks like, and what the framebuffer console can reach. Three rules, all
 learned the hard way:
 
 1. **It has to contain the splash framebuffer** (0xb8000000 on this phone).
@@ -104,29 +104,52 @@ learned the hard way:
    (`/reserved-memory/hyp_region`) and the kernel image is written to the
    start of the window: overwriting the hypervisor kills the secure world
    and the phone **resets** instead of booting.
+3. **It has to end in memory that exists.** This phone's RAM has a hole:
+   the live tree says `0x80000000+0x6a000000` and `0xf4600000+0xba00000`,
+   so **0xea000000..0xf4600000 is not RAM**. XNU takes its first heap pages
+   from the *end* of the window (`static_memory_end = physmap_base +
+   memSize`), so a window that ends inside the hole gives the first heap
+   pages to memory that is not there: the writes are lost and the kernel
+   jumps to a corrupted pointer. That was the phone's panic
+   ("Undefined kernel instruction", pc inside the physmap).
 
-The sweet's window satisfies both, so the mondrian uses the same one:
+So the mondrian's window is:
 
     phys_base = 0xb0000000
-    mem_size  = 0x4d000000
+    mem_size  = 0x46000000        # ends at 0xf6000000, in the second bank
 
-It is also the only one that boots. Measured on the host with the same
-kernel (`tools/qemu-ios.py`; the window is chosen with the
-`QEMU_PHYS_BASE`/`QEMU_MEM_SIZE` environment variables, so no phone is
-needed to try a window):
+There is also a **floor**: below 0x3a000000 the physmap no longer fits next
+to the kernel's own image and the boot dies in `pmap_map_bd`. At
+0x46000000 the host boots with every slide tried.
+
+Measured on the host with the same kernel (`tools/qemu-ios.py`; the window
+is chosen with the `QEMU_PHYS_BASE`/`QEMU_MEM_SIZE` environment variables,
+so no phone is needed to try a window):
 
 | window | result |
 | --- | --- |
-| `0xb0000000 + 0x4d000000` | **boots clean** |
+| `0xb0000000 + 0x46000000` | **boots clean** |
+| `0xb0000000 + 0x4d000000` (the sweet's) | boots clean **on the host only**: it ends at 0xfd000000, inside the phone's hole |
+| `0xb0000000 + 0x3a000000` | boots clean (ends just before the hole) but needs a lucky slide |
+| `0xb0000000 + 0x30000000` | panic in `pmap_map_bd` with every seed tried |
 | `0xbab00000 + 0x25500000` | panic in `pmap_map_bd` |
 | `0xb8000000 + 0x4d000000` | data abort before the console |
 | `0x80000000 + 0x25500000` | panic in `pmap_map_bd` |
 | `0xb0000000 + 0x25500000` | panic in `pmap_map_bd` |
-| `0xb0000000 + 0x6a000000` | panic in `pmap_map_bd` |
 
 XNU's arm64 PE builds the physical aperture from `gPhysBase`/`gPhysSize`
 (`osfmk/arm64/arm_vm_init.c`, `arm_vm_physmap_init()`); a window that does
 not fit that shape leaves the kernel without a usable map.
+
+**The physmap slide makes the boot a coin flip.** `arm_vm_physmap_slide()`
+moves the physmap by up to 1 GB, and the offset comes from the random seed
+the device tree hands the kernel (`/chosen/random-seed`). With a random
+seed about one host boot in three dies in `pmap_map_bd`, and which one
+changes every time. The mondrian therefore pins the seed
+(`tools/boards.py`, field `seed`; `ADT_SEED=<hex>` overrides it), and the
+table above was measured with a pinned seed. **The earlier "only this base
+boots" conclusion was measured with a random seed and is not trustworthy:
+redo the base bisection with a pinned seed.**
 
 **Do not use the biggest free hole.** `0xbab00000 + 597 MB` is clear of
 every carve-out, but the framebuffer falls outside it.

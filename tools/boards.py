@@ -94,6 +94,12 @@ class Board:
     # them: the values have to be read from the phone first (the shim dumps
     # the live device tree, tools/boards.py reads it back).
     provisional: frozenset = frozenset()
+    # The seed the device tree gives the kernel (64 bytes). The kernel
+    # derives the physmap slide from it, and the slide decides whether the
+    # physmap fits next to the kernel's own image: with a random seed the
+    # mondrian boot is a coin flip (one run in three dies in pmap_map_bd).
+    # None means random (the sweet's window is big enough for any slide).
+    seed: bytes | None = None
 
 
 # --------------------------------------------------------------------------
@@ -179,14 +185,41 @@ MONDRIAN = Board(
     # above the firmware's own memory at the bottom of the bank (the
     # hypervisor is at 0x80000000+0x600000; the kernel image written over it
     # kills the secure world and the phone resets instead of booting).
-    # 0xb0000000+0x4d000000 ends at 0xfd000000, inside the bank.
     #
-    # It is also the only window that boots, measured on the host with the
-    # same kernel (tools/qemu-ios.py): the low bank and the hole after the
-    # splash both panic in pmap_map_bd, and any other base dies before the
-    # console even exists.
+    # The window is 0xb0000000+0x3a000000, so it ends at 0xea000000, the
+    # first byte of the hole between the phone's two RAM banks. The live
+    # device tree says the RAM is
+    #   0x80000000+0x6a000000  and  0xf4600000+0xba00000
+    # so 0xea000000..0xf4600000 is a hole: not RAM at all. The kernel's
+    # dynamic memory starts at the *end* of the window (static_memory_end =
+    # physmap_base + memSize), so a window that ends inside the hole hands
+    # the first heap pages to memory that does not exist: the writes are
+    # lost and the kernel jumps to a corrupted pointer. That was the
+    # phone's panic ("Undefined kernel instruction", pc inside the physmap,
+    # the same every time: a page in the hole read back as a pointer).
+    #
+    # A window that *contains* the hole (0xb0000000+0x46000000 ends at
+    # 0xf6000000, in the second bank) is just as bad: the zone map still
+    # covers the hole, and the kernel reads a pointer from it.
+    #
+    # Below 0x3a000000 the physmap no longer fits next to the kernel's own
+    # image and the boot dies in pmap_map_bd (measured on the host). This is
+    # the smallest size that boots, so the window cannot be shortened to
+    # stay below the first no-map carve-out (qheebsp_reserved_region at
+    # 0xe0000000): the ~2 MB of firmware memory inside the window have to
+    # be declared reserved in the device tree instead.
+    #
+    # The base is the only one that boots, measured on the host with the same
+    # kernel (tools/qemu-ios.py): the low bank and the hole after the splash
+    # both panic in pmap_map_bd, and any other base dies before the console
+    # even exists. That bisection was made with a random seed, so it is not
+    # trustworthy: redo it with the seed pinned below.
     phys_base=0xb0000000,
-    mem_size=0x4d000000,
+    mem_size=0x3a000000,
+    # Pinned: the physmap slide comes from this seed, and with a random one
+    # the boot is a coin flip (one run in three dies in pmap_map_bd). This
+    # one is known to work with the window above (checked on the host).
+    seed=b'\x11' * 64,
     alt_phys_base=0x800000000,
     alt_mem_size=0x37500000,
     soc_base=0x01000000,
@@ -234,10 +267,11 @@ MONDRIAN = Board(
     # phone itself.
     provisional=frozenset(),
     # The boot arguments are the ones sweet uses, with the framebuffer
-    # arguments renamed for this board. cpus=6 starts the six A710/A510
-    # cores and leaves the X2 and the other A710s parked, like sweet leaves
-    # the two A76s parked.
-    cmdline=('debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress '
+    # arguments renamed for this board.
+    # cpus=1: the kernel starts the other cores through PSCI, and the shim
+    # does not implement that call yet, so the first bring-up wants a single
+    # core (what the QEMU run does too, its tree has one cpu node).
+    cmdline=('debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=30'),

@@ -35,9 +35,17 @@
  * firmware's own memory at the bottom of the bank (the hypervisor is at
  * 0x80000000; the kernel image written over it resets the phone).
  * The device tree confirms that the window is inside a memory region; the
- * shim prints both so a mismatch is visible on the screen. */
+ * shim prints both so a mismatch is visible on the screen.
+ *
+ * It ends at 0xea000000 because the phone's RAM has a hole: the live device
+ * tree says 0x80000000+0x6a000000 and 0xf4600000+0xba00000, so everything
+ * between 0xea000000 and 0xf4600000 is not RAM. The kernel takes its first
+ * heap pages from the end of the window, and on this phone that end used to
+ * be inside the hole: the writes were lost and the kernel jumped to a
+ * corrupted pointer (see NOTES.md). It cannot be smaller either: below
+ * 0x3a000000 the physmap no longer fits and the boot dies in pmap_map_bd. */
 #define BOARD_MEM_BASE		0xb0000000UL
-#define BOARD_MEM_SIZE		0x4d000000UL
+#define BOARD_MEM_SIZE		0x3a000000UL
 
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */
