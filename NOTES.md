@@ -159,6 +159,50 @@ screen**. Its README lists the walls it hit, and two of them are ours:
 Its `shim/shim.c` and `xnu/patches/` are worth reading before writing our
 own driver patches.
 
+### The other ports (2026-10-21): four repositories worth reading
+
+Read after the panic above was diagnosed, and one of them **solved it**.
+
+- **`UniXNU/UniXNU`** (via `palazik/ios-dodge`) — iOS *and* macOS on
+  non-Apple arm64, on **xnu-8796.141.3** with **4 KiB pages**, the same tree
+  and the same page size as ours. `patches/xnu/native-4k-bootstrap-capacity.patch`
+  (BSD-2-Clause-Patent) is the fix for the `pmap_map_bd` panic and is now
+  merged into our `0001`: with 4 KiB pages an L2 table covers **1 GiB**, so a
+  mapping that straddles a 1 GiB boundary needs one more bootstrap L2 page
+  than the four `start.s` invalidates; that page was never invalidated and
+  the mapping it described was silently wrong. Their `native-4k-user-abi.patch`
+  is **for later**: XNU hardcodes 16K in four places that decide what
+  userspace sees (VM map entry alignment, commpage, …), and
+  `PAGE_SHIFT_CONST` picks 16K whenever `memSize > 1GB`, which our 1.1 GiB
+  window is. It changes what iOS sees, so it stays out until userland runs.
+- **`palazik/ios-dodge`** (OnePlus 13, SM8750) — a full patch series against
+  the same xnu, each one a small lesson. The ones we want after the kernel
+  boots: `0029` **local TLB flush**, `0034` **timer quiesce** (stop CNTV
+  before the handover and *do not touch `CNTP_CTL_EL0`*, which EL1 may not
+  own — our shim does touch it in `test_gic()` and at handover), `0008`
+  **physmap alignment padding**, `0025` **framebuffer block descriptor
+  alignment**, `0028` **early exception vectors**, `0037` exception with the
+  MMU off. Its GIC is v3 dist `0x16000000` / redist `0x16080000` stride
+  `0x40000`, 19.2 MHz, **virtual timer INTID 27** — a newer SoC generation
+  than ours, which is 19.
+- **`mytiantian001/iPadOS-nabu`** (Xiaomi Pad 5, SM8150) — same CPU
+  generation as ours (ARMv8.2), so the walls match: **`cpus=1` is their
+  default** because the 8-core loopattach race resets the phone, and they
+  keep a **4 MiB persistent ring at the end of `userdata`, readable from
+  TWRP** — that is how we get the kernel console **from the terminal**
+  instead of a photo, and it does not need the USB stack. Their notes are
+  also where the "logs survive a reset" property is spelled out.
+- **`Gsjsjzhznsz/ios-raphael`** (Redmi K20 Pro, SM8150) — reaches the iOS
+  lock screen. Two facts to remember: a **CPU `compatible` mismatch**
+  (`kryo470` in the device tree vs the real `kryo485`) hung the bootstrap,
+  so our ADT's CPU node matters; and `sweetscale=0`, DSI DCS brightness,
+  SPMI serialisation and a **DWC31 USB hang** are the same classes of bug we
+  will meet on the display and USB patches.
+- **`MRHRTZ/ios-emulator`** (iOS userland under QEMU) — not a port, but it
+  has the **not-affiliated-with-Apple notice** we now carry at the top of
+  `README.md`, and the same split we use: patched XNU, real iOS userland,
+  Apple firmware downloaded separately and never in the repository.
+
 ### What else was tried (and ruled out)
 
 - Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.

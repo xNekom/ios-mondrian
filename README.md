@@ -17,6 +17,17 @@ DSI D-PHY, a Goodix touch on SPI and a PM8008.
 > stubbed, and Apple's security model is mostly switched off. It installs into
 > the `userdata` partition and so **erases Android's user data**.
 
+> [!IMPORTANT]
+> **This project is not affiliated with Apple.** It is an independent
+> educational and research effort, not affiliated with, endorsed by,
+> sponsored by or developed in cooperation with Apple Inc. Apple, iPhone,
+> iOS, iPadOS, macOS and XNU are trademarks of Apple Inc. No Apple firmware,
+> IPSW, filesystem image or other Apple copyrighted material is distributed
+> here: you download and prepare those yourself, from Apple, under whatever
+> terms apply to you. Only Apple's open-source releases (xnu, IOHIDFamily,
+> libpthread, hfs) are used as source, under their own licences.
+> Third-party components keep their own licences.
+
 ## Status
 
 | | sweet (upstream) | mondrian (this fork) |
