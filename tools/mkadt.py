@@ -23,6 +23,13 @@ import os
 # to try the phone's own window without touching the board table.
 QEMU_PHYS_BASE = int(os.environ.get('QEMU_PHYS_BASE', '0xb0000000'), 0)
 QEMU_MEM_SIZE = int(os.environ.get('QEMU_MEM_SIZE', '0x4d000000'), 0)
+# Panic log buffer, carved from the TOP of the dram range and exposed to XNU
+# as /pram + /chosen/embedded-panic-log-size. Without it pe_init.c's
+# check_for_panic_log() leaves gPanicBase == 0, debug_log_init() fails twice
+# ("debug_log_init: Error!! gPanicBase is still not initialized") and the
+# kernel hangs right after "kdp_core zlib memory" -- reproduced on QEMU here
+# and independently on ios-fajita upstream (commit 1664d63).
+PANIC_LOG_SIZE = 0x100000
 # How many CPU nodes the tree declares (0 = the board's own count). The first
 # bring-up on a new phone wants one: the kernel starts the other cores
 # through PSCI, and the shim does not implement that call yet.
@@ -69,6 +76,9 @@ def build(board, seed=None, qemu=False, altmem=False):
                            else (board.phys_base, board.mem_size))
     if qemu:
         phys_base, mem_size = QEMU_PHYS_BASE, QEMU_MEM_SIZE
+    # Carve the panic log off the top so the kernel never allocates over it.
+    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
+    mem_size -= PANIC_LOG_SIZE
     gicd, gicr, timebase = ((QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu
                             else (board.gicd, board.gicr, board.timebase))
     seed = seed if seed is not None else board.seed
@@ -92,6 +102,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
+        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
         ('firmware-version', cstr(board.name + '-shim')),
         ('system-firmware-version', cstr(board.name + '-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
@@ -285,6 +296,10 @@ def build(board, seed=None, qemu=False, altmem=False):
             ('no-map', b''),
         ])])]
 
+    # Panic log region. reg = <phys size>; it sits just above the dram-size
+    # we expose, so XNU maps it but never allocates into it.
+    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
+
     return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,' + board.name) +
@@ -295,7 +310,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + memory + reserved + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

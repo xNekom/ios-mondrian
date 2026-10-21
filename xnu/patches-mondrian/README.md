@@ -19,6 +19,7 @@ The CI picks the series with the `board` input of `.github/workflows/xnu.yml`:
 | 0001 | `mondrian-machine-config` | **done**: the XNU board config for SM8475 (ARMv9.0, 4 KiB pages, GICv3 with eight redistributors, no PAC) |
 | 0002 | `mondrian-master-config` | **done**: `config/MASTER.arm64.mondrian`, the open source arm64 assembly and pmap, no kpc |
 | 0003-0055 | the generic half of the sweet series | **done**: RAM disk root, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
+| 0060 | `mondrian-4k-bootstrap-va-zone` | **done**: pre-map enough bootstrap VA for the 4 KiB `vm_page` array, so `pmap_startup()` does not block on the free list it is about to build |
 
 The series applies cleanly to a fresh xnu-8796.141.3 tree:
 

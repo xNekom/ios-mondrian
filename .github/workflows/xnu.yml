@@ -97,7 +97,22 @@ jobs:
           MACHINE_CONFIG: ${{ env.MACHINE }}
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          # dxb logs "Skipping patch .../patches/00NN-..." for a patch that
+          # does not apply and then builds anyway; the step below turns that
+          # into a failure instead of a kernel that is silently missing a
+          # change (0010, the early framebuffer, was lost that way).
+          set -o pipefail
+          bash build.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: No skipped patches
+        if: always()
+        run: |
+          if grep -E 'Skipping patch .*/patches/[0-9]{4}-' "$RUNNER_TEMP/build.log"; then
+            echo "::error::a patch did not apply; the kernel is missing it"
+            exit 1
+          fi
+          echo "all patches applied"
 
       - name: Package build tree for local compiles
         if: always()

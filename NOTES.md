@@ -222,6 +222,43 @@ Two traps it catches:
 - A patch that touches a *staged* file (`bsd/mondrian_hfs/...`,
   `libkern/...bearssl`) only applies after its `00NN-stage-*.sh` ran.
 
+### The forks (2026-10-21): what is worth taking
+
+242 forks of `dipa-studio/ios-sweet`. Most are untouched copies; the ones
+with real work, and what we took or want from them:
+
+- **upstream `main` (not a fork)**: `1664d63 mkadt: emit a panic log region`
+  (`/pram` + `/chosen/embedded-panic-log-size`). Without it
+  `check_for_panic_log()` leaves `gPanicBase == 0`, `debug_log_init()`
+  fails twice and the kernel hangs after `kdp_core zlib memory`. **Taken**
+  into `tools/mkadt.py`: the top 1 MiB of the dram range becomes `/pram`.
+  Confirmed on QEMU: with it the two `gPanicBase is still not initialized`
+  lines are gone and the panic backtrace prints.
+- **`Log1nYT/ios-sweet` (venus, Mi 11, SM8350)**: 23 patches past the sweet
+  series, the closest thing to our hardware list: `0083` DWC3/QSCRATCH
+  probe with the *lahaina* GCC clock-gate offsets (and the note that the
+  sdmmagpie offsets external-abort), `0085` FTS SPI touch on a QUP,
+  `0093/0094` PMIC keys, `0104` real battery over SPMI, `0103` keep the
+  display on, `0110` mount the root HFS+ volume with its journal even if
+  fsck rewrote the header, `0084` echo the tail of the previous boot's log
+  into the console at start-up (ring in the last blocks of `userdata`).
+  All SM8350-specific but the *structure* is what we need for UFS/touch/
+  keys/USB; the `sweet_log_echo` idea is also the cheapest answer to
+  "read the console from the terminal" once UFS works.
+- **`Olegu621/ios-sweet` (peridot, POCO F5, SM7475)**: same CPU IP as
+  SM8475 (X2 + A710 + A510) but only two extra patches (`0083` early panic
+  trace, `0084` two FB L2 blocks); they still use 16 KiB pages. Useful as a
+  reference for SM7475/SM8475 GIC and CPU-driver facts, nothing else.
+- **`blahajcoding/ios-lemonadep` (OnePlus 9 Pro, SM8350)**: a real board
+  port in one patch (`0082-lemonadep-board`), still `__ARM_16K_PG__`.
+- **`MeowTechOpenSource/ios-beryllium` (POCO F1, SDM845)**: CPU `compatible`
+  trick to reuse the platform CPU driver, and "limit the early console
+  mapping to the visible framebuffer" (same class as our `0010`).
+- **`xNekom/ios-mondrian`** is ours.
+
+Nobody else runs 4 KiB pages, so the `pmap_startup()` stall above and the
+`pmap_map_bd` panic are ours alone — no fork has a fix to copy.
+
 ### The stall after "MONDRIAN EARLY 20" (4 KiB bootstrap VA)
 
 Once the extra bootstrap L2 page was in (`0001`, from UniXNU), the
@@ -254,6 +291,12 @@ grow past the window: measured on QEMU the steal started at +38 MiB and
 256 MiB segment only when `!__ARM_16K_PG__`, so the window becomes ~150 MiB
 for a 1.1 GiB board. It costs one 4 KiB page per 2 MiB pre-mapped, i.e. ~75
 pages, out of the ~1230 `pt_desc_t` the bootstrap pool has.
+
+With it (CI `39634059470`, kernel `695b0efb…`) QEMU boots past
+`vm_page_bootstrap` and `bsd_autoconf`, runs the DLIL/Skywalk self-tests and
+only panics where it should: `IOFindBSDRoot: MONDRIAN UFS root ufsroot0
+unavailable` (there is no `/sweet-ufs` node in the QEMU tree). That is the
+first time the mondrian kernel reaches BSD in the host.
 
 ### What else was tried (and ruled out)
 
