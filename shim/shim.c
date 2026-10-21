@@ -575,6 +575,28 @@ static void board_memory(uintptr_t dtb)
 	if (best < 0)
 		return;
 	loader_set_regions(regs, n);
+
+	/*
+	 * The window of the board table wins: it is the one that holds the
+	 * framebuffer and starts above the firmware's memory, and it is the
+	 * one the kernel boots with. The device tree has to agree that it
+	 * is inside a memory region; if it does not, say so on the screen.
+	 */
+	if (BOARD_MEM_BASE && BOARD_MEM_SIZE) {
+		int inside = 0;
+		for (int i = 0; i < n; i++) {
+			uint64_t base = regs[i * 2], size = regs[i * 2 + 1];
+			if (BOARD_MEM_BASE >= base &&
+			    BOARD_MEM_BASE + BOARD_MEM_SIZE <= base + size)
+				inside = 1;
+		}
+		win.base = BOARD_MEM_BASE;
+		win.size = BOARD_MEM_SIZE;
+		con_str("WINDOW", inside ? "board table, inside the dt memory" :
+			"board table, NOT inside the dt memory!");
+		return;
+	}
+
 	win.base = regs[best * 2];
 	win.size = regs[best * 2 + 1];
 	/*

@@ -18,7 +18,11 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 # The window of the QEMU "virt" machine: its RAM starts at 0x40000000, so the
 # kernel goes there whatever the board says.
-QEMU_PHYS_BASE, QEMU_MEM_SIZE = 0xb0000000, 0x4d000000
+import os
+# The window the kernel gets in the QEMU run; the environment overrides it
+# to try the phone's own window without touching the board table.
+QEMU_PHYS_BASE = int(os.environ.get('QEMU_PHYS_BASE', '0xb0000000'), 0)
+QEMU_MEM_SIZE = int(os.environ.get('QEMU_MEM_SIZE', '0x4d000000'), 0)
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 

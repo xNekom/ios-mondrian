@@ -174,16 +174,19 @@ MONDRIAN = Board(
     # phone really has (the ddr_size property says 12GB, but the bootloader
     # only describes the part the kernel may use).
     #
-    # The window is not the whole region: the firmware keeps the low
-    # addresses of the bank for itself (/reserved-memory: the hypervisor at
-    # 0x80000000, the AOP, the SMEM, the modem, the splash...) and the kernel
-    # image written over the hypervisor kills the secure world, which resets
-    # the phone instead of booting it. So the kernel goes to the biggest hole
-    # of the region, which starts right after the splash: 0xbab00000, 597 MB.
-    # The framebuffer is mapped apart by the early console patch, so it does
-    # not have to be inside the window.
-    phys_base=0xbab00000,
-    mem_size=0x25500000,
+    # The window is the same one the sweet uses, and for the same reasons: it
+    # has to contain the splash framebuffer (0xb8000000), and it has to start
+    # above the firmware's own memory at the bottom of the bank (the
+    # hypervisor is at 0x80000000+0x600000; the kernel image written over it
+    # kills the secure world and the phone resets instead of booting).
+    # 0xb0000000+0x4d000000 ends at 0xfd000000, inside the bank.
+    #
+    # It is also the only window that boots, measured on the host with the
+    # same kernel (tools/qemu-ios.py): the low bank and the hole after the
+    # splash both panic in pmap_map_bd, and any other base dies before the
+    # console even exists.
+    phys_base=0xb0000000,
+    mem_size=0x4d000000,
     alt_phys_base=0x800000000,
     alt_mem_size=0x37500000,
     soc_base=0x01000000,

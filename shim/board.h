@@ -30,14 +30,14 @@
 #define PTIMER_INTID		18
 #define SGI_INTID		1
 
-/* The window of RAM the kernel gets, if the device tree does not say.
- * It is a hole inside the region that holds the splash framebuffer: the
- * low addresses of that region belong to the firmware (the hypervisor is
- * at 0x80000000) and the kernel image written over it resets the phone.
- * The framebuffer itself is mapped apart by the early console patch, so
- * it does not have to be inside the window. */
-#define BOARD_MEM_BASE		0xbab00000UL
-#define BOARD_MEM_SIZE		0x25500000UL
+/* The window of RAM the kernel gets. It is the same window the sweet uses:
+ * it holds the splash framebuffer (0xb8000000) and it starts above the
+ * firmware's own memory at the bottom of the bank (the hypervisor is at
+ * 0x80000000; the kernel image written over it resets the phone).
+ * The device tree confirms that the window is inside a memory region; the
+ * shim prints both so a mismatch is visible on the screen. */
+#define BOARD_MEM_BASE		0xb0000000UL
+#define BOARD_MEM_SIZE		0x4d000000UL
 
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */
