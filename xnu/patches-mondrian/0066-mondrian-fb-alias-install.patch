@@ -1,0 +1,85 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1855,7 +1855,13 @@
+ 	if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
+ 		return FALSE;
+ 	}
+-	l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	/*
++	 * The bootstrap aperture is still the live mapping here, so the page
++	 * tables are reachable by their physical address. phystokv() is not:
++	 * it returns a physmap address, and the physmap is only mapped once
++	 * TTBR1 points at the final table.
++	 */
++	l2 = (tt_entry_t *)(l1 & ARM_TTE_TABLE_MASK);
+ 	for (i = 0; i < MONDRIAN_EARLY_FB_BLOCKS; i++) {
+ 		tt_entry_t *slot = &l2[((va + (i * ARM_TT_L2_SIZE)) & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 		if (*slot != ARM_TTE_EMPTY) {
+@@ -2202,13 +2208,21 @@
+ 
+ 	arm_set_user_tbi();
+ 
++	arm_vm_physmap_init(args);
+ #if defined(MONDRIAN)
+-	/* phystokv() must still refer to the bootstrap aperture here. */
++	/*
++	 * The alias needs the final TTBR1 tables, and they only exist once
++	 * the physmap is in: the kernel image (gVirtBase) shares the L1
++	 * entry with the low globals, and that entry is created by
++	 * arm_vm_physmap_init(). The bootstrap aperture is still live here,
++	 * so the tables can be read by their physical address.
++	 */
+ 	if (!mondrian_early_map_final()) {
+ 		mondrian_early_disable();
++	} else {
++		mondrian_early_set_fb_va(MONDRIAN_EARLY_FB_VA);
+ 	}
+ #endif
+-	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
+ 	ml_enable_monitor();
+diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -147,10 +147,18 @@
+ mondrian_early_relocate(uint64_t base)
+ {
+ 	mondrian_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
+-	early_fb_va = base;
++	if (early_fb_va != 0) {
++		early_fb = (volatile uint32_t *)(uintptr_t)base;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_early_mark(9, "kernel framebuffer VA live");
++}
++
++/* The alias is in place: from now on the framebuffer is at this VA. */
++void
++mondrian_early_set_fb_va(uint64_t va)
++{
++	early_fb_va = va;
+ }
+ 
+ /*
+diff --git a/osfmk/arm64/mondrian_early.h b/osfmk/arm64/mondrian_early.h
+--- a/osfmk/arm64/mondrian_early.h
++++ b/osfmk/arm64/mondrian_early.h
+@@ -16,6 +16,7 @@
+ void mondrian_early_relocate(uint64_t base);
+ void mondrian_early_disable(void);
+ uint64_t mondrian_early_fb_va(void);
++void mondrian_early_set_fb_va(uint64_t va);
+ void mondrian_early_beacon(uint64_t pc, uint64_t count);
+ #else
+ static inline void mondrian_early_mark(unsigned int stage, const char *label)
+@@ -25,6 +26,7 @@
+ }
+ static inline void mondrian_early_disable(void) {}
+ static inline uint64_t mondrian_early_fb_va(void) { return 0; }
++static inline void mondrian_early_set_fb_va(uint64_t va) { (void)va; }
+ static inline void mondrian_early_beacon(uint64_t pc, uint64_t count)
+ {
+ 	(void)pc;

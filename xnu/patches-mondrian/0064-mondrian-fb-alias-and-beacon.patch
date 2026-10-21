@@ -1,16 +1,17 @@
 diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 --- a/osfmk/arm64/mondrian_early.c
 +++ b/osfmk/arm64/mondrian_early.c
-@@ -22,11 +22,23 @@
+@@ -22,11 +22,24 @@
  #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
  #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
  
 +/*
 + * The last two text rows belong to the beacon (see mondrian_early_beacon):
 + * the console must not draw there, or the beacon and the console would fight
-+ * over the same pixels.
++ * over the same pixels. The console keeps rows 0..97 (fbcon_rows), the
++ * beacon takes 98 and 99.
 + */
-+#define EARLY_HUD_ROW0 (EARLY_ROWS - MONDRIAN_FB_HUD_ROWS)
++#define EARLY_HUD_ROW0 (EARLY_ROWS - 1)
 +
  extern unsigned char iso_font[256 * 16];
  
@@ -25,7 +26,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  
  static void
  mondrian_early_clear_row(void)
-@@ -42,7 +54,7 @@
+@@ -42,7 +55,7 @@
  void
  mondrian_early_putc(char c)
  {
@@ -34,7 +35,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  		return;
  	}
  	if (!early_started) {
-@@ -112,10 +124,15 @@
+@@ -112,10 +125,15 @@
  void
  mondrian_early_panic(const char *fmt, va_list *args)
  {
@@ -51,7 +52,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  	mondrian_early_string("\nMONDRIAN EARLY PANIC: ");
  	va_list copy;
  	va_copy(copy, *args);
-@@ -130,11 +147,105 @@
+@@ -130,11 +148,105 @@
  {
  	mondrian_early_mark(8, "leaving bootstrap TTBR0");
  	early_fb = (volatile uint32_t *)(uintptr_t)base;
