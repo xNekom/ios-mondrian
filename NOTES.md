@@ -16,8 +16,17 @@ jumps; the kernel's own console comes up on the splash framebuffer
 Two phone-only panics have been fixed since: the physical-timer write
 (`0061`, see "Undefined kernel instruction" below) and the framebuffer alias
 overlapping the kernel heap (`0062`, see "the pmap panic" below).
-**Next: boot the `0062` kernel on the phone** - it should get past
-`kmem_range_init` and die at the UFS root, which is what the host does.
+**`0062` booted on the phone on 2026-10-21 20:40 and the pmap panic is
+gone.** The screen (photos, read line by line) shows the zone map, `kmem
+subsystem is initialized`, the gLocks, the file queues, the UGM streams, the
+scheduler bands, `MONDRIAN GIC: virtual timer INTID 19`, `MONDRIAN HID:
+buttons registered`, `calling mpo_policy_init`, and then the BSD copyright -
+i.e. it is past `kmem_range_init` (where it used to die) and where the host
+also ends up: the UFS root. Nothing about `pmap_tte` on screen.
+**Next: power up UFS** (`mondrian_ufs.c`: clocks + `vcc`/`vccq`/`vdd-hba`)
+so `rd=ufsroot0` stops panicking, then the log ring so the console stops
+being photos. The image was `/tmp/boot-mondrian.img` (kernel from CI run
+`39652592771`, `ecf08e7a...`), booted with `fastboot boot` (writes nothing).
 
 ### The window of RAM (the thing that was wrong three times)
 
@@ -442,6 +451,42 @@ the text printed during the claim stage may come from either console.
 Note for the next time a claim address looks impossible: `pmap_ttne()` only
 panics with `MACH_ASSERT`; a release kernel would instead return a null PTE
 and die somewhere else.
+
+### On the phone: `0062` gets past `kmem_range_init` (2026-10-21 20:40)
+
+The kernel from CI run `39652592771` was built into a phone image
+(`KERNEL=/tmp/mk62/kernel.development.mondrian bash tools/phone-deploy.sh
+build`, image `/tmp/boot-mondrian.img`) and booted with
+`tools/phone-cycle.sh` (`fastboot boot`: nothing is written). The screen shows,
+in order:
+
+```
+Zone map: 61 maps, 12 entries and 115 holes left
+VM bootstrap ... 16384 zones
+kmem subsystem is initialized
+Long gLocks configured: ...
+File queue configured: 16 chunks ...
+UGM stream configured: 6 streams ...
+Scheduler: Default of tasks once per 1 second
+...
+MONDRIAN GIC: virtual timer INTID 19
+MONDRIAN HID: buttons registered ...
+calling mpo_policy_init: (built-in for security)
+Security policy: Trust caches unavailable (target/trust)
+Copyright (c) 1982, 1986, 1989, 1993
+	The Regents of the University of California.  All rights reserved.
+```
+
+No `pmap_tte`, no `demote`. The zone-map/`kmem subsystem is initialized`
+lines come *after* `kmem_range_init`, which is exactly where the old kernel
+died, and the BSD banner is where the host also stops: the missing UFS root.
+So the phone and the host now agree step for step, which is the state worth
+keeping - a divergence on the phone is a real device bug, not a port bug.
+
+The phone did not come back to fastboot by itself within the 240 s the script
+waits (the panic screen stays up); it came back to recovery when the user
+restarted it. Plan for that when asking for a photo: the useful shot is the
+**last ten lines**, everything above has usually wrapped away already.
 
 ### What else was tried (and ruled out)
 
