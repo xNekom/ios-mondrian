@@ -194,6 +194,35 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
   `0x1d84000+0x3000` plus the ICE windows, two lanes per direction,
   irq SPI 265.
 
+- **The UFS 3.1 root device is written** (patch `0059`, CI `39572896412`):
+  the sweet's driver ported with the UFS 3.x descriptors (the transfer
+  request descriptor is 16 dwords with the task tag, the PRDT byte count
+  field is 16 bits, so 64 KiB per descriptor) and the UPIU's fourth byte
+  carries the task tag. It compiles and is in the kernel
+  (`_mondrian_ufs_init`).
+  - The ABL leaves the UFS powered only while it boots from it, so
+    entered through fastboot the host is not reachable: the driver still
+    has to bring the clocks and the three supplies (vcc, vccq, vdd-hba,
+    all on the PM8008) up from the device tree. Booting the phone the
+    normal way (the bootloader boots our image) avoids that work
+    entirely, because the UFS is still powered then.
+- **The bootloader's fastboot USB is the flaky part, not the cable**:
+  adb over a recovery (OrangeFox or TWRP, the Linux USB stack) moves
+  35 MB/s without a single error, while the ABL's fastboot drops the
+  transfer of anything bigger than a few hundred kilobytes
+  (`usb_read failed with status e00002ed`, even on a `getvar`). So the
+  deploy path is now `tools/phone-deploy.sh`: the image goes over adb
+  and the recovery writes it to the boot partition, and the phone then
+  boots it the normal way (no fastboot transfer at all). The original
+  boot image is kept in the phone so the Android installation can go
+  back.
+- **The shim has a small build**: `SMALL_SHIM=1` leaves out the facts
+  dump, the UFS probe and the verdicts, so the loader is only the
+  kernel, the device tree, the boot arguments and the jump. What cannot
+  go away is the shim itself: the bootloader hands a kernel the Android
+  boot arguments, and XNU needs its own (physBase, memSize,
+  deviceTreeP) plus the ADT.
+
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot
