@@ -301,6 +301,48 @@ only panics where it should: `IOFindBSDRoot: MONDRIAN UFS root ufsroot0
 unavailable` (there is no `/sweet-ufs` node in the QEMU tree). That is the
 first time the mondrian kernel reaches BSD in the host.
 
+### On the phone: "Undefined kernel instruction" at `fiq_context_init+0x14`
+
+With `0060` the phone got past the GIC setup (the previous runs died earlier,
+in `pmap_map_bd` while `ml_io_map`ping the GIC) and then panicked right after
+`MONDRIAN GIC: virtual timer INTID 19`, with the panic line wrapping on the
+screen:
+
+```
+panic(cpu 0 caller 0xfffffff007a993d4): Undefined kernel instruction:
+  pc=0xfffffff007424a14 instr=d51be228 @sleh.c:951
+```
+
+Reading the wrapped line out of the photo is what cost the time: the pc is
+`0xfffffff007424a14`, not the `…b742a4` the first reading suggested, and:
+
+```
+fffffff007424a00 <_fiq_context_init>:
+  mrs  x8, DAIF
+  tbz  w8, #7, +0x1c            ; the "interrupts still disabled" assert
+  mov  w8, #1
+  msr  CNTV_CTL_EL0, x8         ; accepted
+  mov  w8, #2
+  msr  CNTP_CTL_EL0, x8         ; <-- the panic, instr=d51be228
+  ret
+```
+
+So the faulting instruction is `_enable_virtual_timer()`'s "disable the
+physical timer as a precaution" write. QHEE, the hypervisor this phone runs
+under, does not trap an EL1 access to the physical timer for the guest to
+emulate: it reports it as an **undefined instruction** (EC 0, not the
+EC 0x18 a trapped system register would give). XNU runs off the virtual
+timer, so `0061-mondrian-no-physical-timer.patch` simply skips that write
+when `MONDRIAN` is defined. QEMU's virt machine has no hypervisor and never
+reproduced it.
+
+That also explains why the panic path itself nested: the panic handler was
+already running on a CPU whose FIQ/timer context had just been set up with a
+fatal instruction in the middle of it.
+
+Note for the next sysreg surprise: `git grep CNTP_` finds only this write and
+one comment; `CNTV_*`, `CNTKCTL_EL1` and `DAIF` are all accepted by QHEE.
+
 ### What else was tried (and ruled out)
 
 - Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.

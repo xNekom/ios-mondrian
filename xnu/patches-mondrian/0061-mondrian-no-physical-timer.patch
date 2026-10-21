@@ -1,0 +1,25 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2242,9 +2242,21 @@ _enable_virtual_timer(void)
+ static void
+ _enable_virtual_timer(void)
+ {
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ 
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
++#if defined(MONDRIAN)
++	/*
++	 * The Qualcomm hypervisor (QHEE) on this phone reports an EL1 access
++	 * to the physical timer as an undefined instruction instead of
++	 * trapping it: with the write below the boot CPU died with
++	 *   Undefined kernel instruction: pc=fiq_context_init+0x14
++	 *   instr=d51be228 (msr CNTP_CTL_EL0, x8)
++	 * while the CNTV_CTL_EL0 write just above is accepted. XNU runs off
++	 * the virtual timer, so leave the physical one alone.
++	 */
++#else
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
+ 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
++#endif
+ }

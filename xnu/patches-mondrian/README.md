@@ -20,6 +20,7 @@ The CI picks the series with the `board` input of `.github/workflows/xnu.yml`:
 | 0002 | `mondrian-master-config` | **done**: `config/MASTER.arm64.mondrian`, the open source arm64 assembly and pmap, no kpc |
 | 0003-0055 | the generic half of the sweet series | **done**: RAM disk root, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
 | 0060 | `mondrian-4k-bootstrap-va-zone` | **done**: pre-map enough bootstrap VA for the 4 KiB `vm_page` array, so `pmap_startup()` does not block on the free list it is about to build |
+| 0061 | `mondrian-no-physical-timer` | **done**: drop the `CNTP_CTL_EL0` write; QHEE reports an EL1 access to the physical timer as an undefined instruction |
 
 The series applies cleanly to a fresh xnu-8796.141.3 tree:
 
