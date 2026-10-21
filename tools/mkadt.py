@@ -231,16 +231,59 @@ def build(board, seed=None, qemu=False, altmem=False):
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,<board>' stays for the platform expert matching.
-    # The RAM the kernel gets, as the phone's own device tree states it: one
-    # region, the window. The kernel may read this node instead of
-    # dram-base/dram-size, so the two have to agree.
-    # ADT_MEMORY=0 leaves it out (the sweet's tree has no /memory node).
-    memory = [] if os.environ.get('ADT_MEMORY') == '0' else [
+    # The RAM the kernel gets, as the phone's own device tree states it.
+    # XNU reads this node (checked on the host: a /memory that describes
+    # less memory than the window makes the kernel fail), but it ignores
+    # /reserved-memory.
+    # ADT_MEMORY=0 leaves the node out (the sweet's tree has no /memory).
+    # ADT_MEM_SIZE=<hex> makes the node describe less memory than the
+    # window, to see whether the kernel reads this node at all.
+    # ADT_MEM_RESERVED=1 leaves the firmware's regions out of it. XNU dies
+    # in pmap_map_bd with the gaps that makes, so it is off by default.
+    adt_mem_size = int(os.environ.get('ADT_MEM_SIZE', '0'), 0) or mem_size
+    regions = []
+    if adt_mem_size:
+        regions = [(phys_base, adt_mem_size)]
+        if os.environ.get('ADT_MEM_RESERVED') == '1':
+            left = list(regions)
+            for rb, rs in board.reserved:
+                rest = []
+                for b, s in left:
+                    if rb >= b + s or rb + rs <= b:
+                        rest.append((b, s))
+                        continue
+                    if b < rb:
+                        rest.append((b, rb - b))
+                    if rb + rs < b + s:
+                        rest.append((rb + rs, b + s - (rb + rs)))
+                left = rest
+            regions = left
+    # The node is off by default: XNU dies in pmap_map_bd when the tree
+    # describes the window and the seed's slide does not fit that shape
+    # (the host reference has to boot), and the sweet's tree has none
+    # either. The kernel gets the window from the boot arguments.
+    memory = [] if os.environ.get('ADT_MEMORY', '0') == '0' else [
         node('memory', [
             ph(),
             ('device_type', cstr('memory')),
-            ('reg', u64(phys_base, mem_size)),
+            ('reg', b''.join(u64(b, s) for b, s in regions)),
         ])]
+
+    # Firmware memory the kernel must not touch. The phone's device tree
+    # marks 38 regions no-map; the ones inside the window are copied here.
+    # ADT_RESERVED=all reserves the whole window (a test: if the kernel
+    # cannot map its own image any more, it read this node).
+    reserved = []
+    if os.environ.get('ADT_RESERVED') == 'all':
+        reserved = [node('reserved-memory', [
+            ph(),
+            ('#address-cells', u32(2)),
+            ('#size-cells', u32(2)),
+        ], [node('test-reserved', [
+            ph(),
+            ('reg', u64(phys_base, mem_size)),
+            ('no-map', b''),
+        ])])]
 
     return node('device-tree', [
         ph(),
@@ -252,7 +295,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + memory + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + memory + reserved + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

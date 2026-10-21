@@ -100,6 +100,10 @@ class Board:
     # mondrian boot is a coin flip (one run in three dies in pmap_map_bd).
     # None means random (the sweet's window is big enough for any slide).
     seed: bytes | None = None
+    # Firmware memory inside the window, from the live device tree's
+    # /reserved-memory (the ones marked no-map). The kernel must not
+    # allocate it, so the tree says the memory is what is left.
+    reserved: tuple = ()
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +224,24 @@ MONDRIAN = Board(
     # the boot is a coin flip (one run in three dies in pmap_map_bd). This
     # one is known to work with the window above (checked on the host).
     seed=b'\x11' * 64,
+    # The firmware memory inside the window, from the live device tree's
+    # /reserved-memory (the ones marked no-map). They are not holes: the
+    # memory is there, but it belongs to the secure world, so the kernel
+    # must not use it. XNU reads the tree's /memory node (checked on the
+    # host: a /memory that describes less memory makes the kernel fail),
+    # but it ignores /reserved-memory, so the regions are left out of
+    # /memory instead.
+    reserved=(
+        (0xe0000000, 0x00600000),     # qheebsp_reserved_region
+        (0xe0600000, 0x00400000),     # cpusys_vm_region
+        (0xe0a00000, 0x00100000),     # hyp_reserved_region
+        (0xe55f3000, 0x00009000),     # trust_ui_vm_qrtr
+        (0xe55fc000, 0x00004000),     # trust_ui_vm_vblk0_ring
+        (0xe5600000, 0x00100000),     # trust_ui_vm_swiotlb
+        (0xe8800000, 0x00100000),     # tz_stat_region
+        (0xe8900000, 0x01200000),     # tags_region
+        (0xe9b00000, 0x00500000),     # qtee_region
+    ),
     alt_phys_base=0x800000000,
     alt_mem_size=0x37500000,
     soc_base=0x01000000,

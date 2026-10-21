@@ -29,18 +29,25 @@ done
 
 command -v fastboot >/dev/null || { echo "falta fastboot" >&2; exit 1; }
 
+# The phone's serial in fastboot. It is also how the phone is told apart
+# from the other devices on the network: adb over wifi reaches every phone
+# in the house, so adb is only ever used with an explicit serial.
+PHONE_SERIAL=${PHONE_SERIAL:-7e63c267}
+
 phone_fastboot() {
-	fastboot devices 2>/dev/null | grep -q 'fastboot'
+	fastboot devices 2>/dev/null | grep -q "^${PHONE_SERIAL}[[:space:]]"
 }
 
 phone_android() {
-	adb devices 2>/dev/null | grep -q 'device$'
+	# The mondrian's adb name over wifi (the mDNS name carries the serial).
+	local dev="adb-${PHONE_SERIAL}-HV6ZYc._adb-tls-connect._tcp"
+	adb devices 2>/dev/null | grep -q "^${dev}[[:space:]].*device$"
 }
 
 if [ "$WAIT_ONLY" = 0 ]; then
 	[ -f "$IMAGE" ] || { echo "no hay imagen en $IMAGE" >&2; exit 1; }
 	echo "== arrancando $IMAGE (fastboot boot, no escribe nada)"
-	( fastboot boot "$IMAGE" > /tmp/fb-boot.txt 2>&1 ) &
+	( fastboot -s "$PHONE_SERIAL" boot "$IMAGE" > /tmp/fb-boot.txt 2>&1 ) &
 	pid=$!
 	for _ in $(seq 1 45); do
 		sleep 1
@@ -59,7 +66,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 	fi
 	if phone_android; then
 		echo "== el movil volvio a Android: pidiendo el bootloader"
-		adb reboot bootloader >/dev/null 2>&1
+		local dev="adb-${PHONE_SERIAL}-HV6ZYc._adb-tls-connect._tcp"
+		adb -s "$dev" reboot bootloader >/dev/null 2>&1
 		sleep 10
 		continue
 	fi

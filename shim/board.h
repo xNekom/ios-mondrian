@@ -69,6 +69,34 @@
  * the device tree is always preferred when it names it. */
 #define BOARD_FB_FROM_DTB	0
 
+/*
+ * The window has to be wiped before the kernel starts.
+ *
+ * The real bootloader hands the kernel memory it has scrubbed, and the
+ * kernel counts on it: the sweet's window is DRAM that Android never
+ * touched, so it is already zero. This phone's window is Android's live
+ * memory, full of leftovers, and the kernel read a stale pointer out of it
+ * and jumped to it ("Undefined kernel instruction", pc inside its own heap).
+ *
+ * The firmware's own regions are skipped: they are not holes, but they
+ * belong to the secure world (the tags, the QTEe, the trusted UI) and
+ * scribbling on them makes the phone reset. The framebuffer is skipped
+ * too, so the console stays on the screen.
+ */
+#define BOARD_WIPE		1
+#define BOARD_RESERVED_N	9
+static const uint64_t board_reserved[BOARD_RESERVED_N][2] = {
+	{ 0xe0000000UL, 0x00600000UL },	/* qheebsp_reserved_region */
+	{ 0xe0600000UL, 0x00400000UL },	/* cpusys_vm_region */
+	{ 0xe0a00000UL, 0x00100000UL },	/* hyp_reserved_region */
+	{ 0xe55f3000UL, 0x00009000UL },	/* trust_ui_vm_qrtr */
+	{ 0xe55fc000UL, 0x00004000UL },	/* trust_ui_vm_vblk0_ring */
+	{ 0xe5600000UL, 0x00100000UL },	/* trust_ui_vm_swiotlb */
+	{ 0xe8800000UL, 0x00100000UL },	/* tz_stat_region */
+	{ 0xe8900000UL, 0x01200000UL },	/* tags_region */
+	{ 0xe9b00000UL, 0x00500000UL },	/* qtee_region */
+};
+
 #else	/* BOARD_SWEET (default) */
 
 /* Redmi Note 10 Pro ("sweet", Qualcomm SM7150 / Snapdragon 732G).
@@ -108,6 +136,16 @@
  * at the cont_splash_region), so the constant may be used if the device
  * tree does not name it. */
 #define BOARD_FB_FROM_DTB	0
+
+/* Sweet's window is DRAM that Android never used, so it is already zero
+ * and there is nothing to wipe (and 4 GB of wiping would take a while). */
+#define BOARD_WIPE		0
+#define BOARD_RESERVED_N	0
+#if BOARD_RESERVED_N
+static const uint64_t board_reserved[BOARD_RESERVED_N][2] = { { 0, 0 } };
+#else
+static const uint64_t board_reserved[1][2] = { { 0, 0 } };
+#endif
 
 #endif	/* BOARD_MONDRIAN */
 

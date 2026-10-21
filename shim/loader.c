@@ -67,6 +67,40 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
+/* Wipe the window the kernel is going to get.
+ *
+ * The real bootloader hands the kernel memory it has scrubbed, and the
+ * kernel counts on it: on sweet the window is DRAM that Android never
+ * touched, so it is zero already. On this phone the window is Android's
+ * live memory, and the kernel read a stale pointer out of it and jumped
+ * to it ("Undefined kernel instruction", pc inside its own heap).
+ *
+ * The framebuffer is left alone so the console stays on the screen, and
+ * so is the firmware's own memory: it is not a hole, it belongs to the
+ * secure world, and scribbling on it makes the phone reset. */
+static void wipe_window(uint64_t base, uint64_t size)
+{
+	const uint64_t chunk = 0x10000;	/* 64 KiB at a time */
+	uint64_t start = base, end = base + size;
+
+	con_hex2("WIPE", "from=", (uint32_t)base, "to=", (uint32_t)end);
+	for (uint64_t a = start; a < end; a += chunk) {
+		uint64_t b = a + chunk;
+		if (b > end)
+			b = end;
+		int skip = 0;
+		if (FB_BASE < b && FB_BASE + FB_SIZE > a)
+			skip = 1;			/* the console */
+		for (int i = 0; !skip && i < BOARD_RESERVED_N; i++)
+			if (board_reserved[i][0] < b &&
+			    board_reserved[i][0] + board_reserved[i][1] > a)
+				skip = 1;		/* the secure world */
+		if (!skip)
+			zero64(a, b - a);
+	}
+	con_str("WIPE", "done");
+}
+
 static int magic_ok(const char *m)
 {
 	static const char want[] = PAYLOAD_MAGIC;
@@ -188,6 +222,15 @@ blob_ok(const uint8_t *p)
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+
+#if BOARD_WIPE
+	/*
+	 * Before anything is placed in the window: the kernel expects it to
+	 * be scrubbed.
+	 */
+	if (win_base && win_size)
+		wipe_window(win_base, win_size);
+#endif
 
 	/* The payload the build appended to this image, unpacked in place. */
 	if (blob_ok((const uint8_t *)&_end[0])) {
