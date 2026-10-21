@@ -120,7 +120,7 @@ exc_common:
 	stp	x26, x27, [sp, #208]
 	str	x28, [sp, #224]
 	ldp	x2, x3, [sp, #256]		/* the stashed x29/x30 */
-	stp	x2, x3, [sp, #240]
+	stp	x2, x3, [sp, #232]		/* the frame's slots 29 and 30 */
 	mov	x0, x29
 	mov	x1, sp
 	bl	exc_handler
