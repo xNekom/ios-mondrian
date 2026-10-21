@@ -1,8 +1,8 @@
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 997a4ab..db26bbe 100644
+index 997a4ab..772d03e 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -697,6 +697,148 @@ register_serial_functions(struct pe_serial_functions *fns)
+@@ -697,6 +697,170 @@ register_serial_functions(struct pe_serial_functions *fns)
  	gPESF = fns;
  }
  
@@ -15,8 +15,14 @@ index 997a4ab..db26bbe 100644
 + *   reg    = <phys size>       absolute physical address, not arm-io relative
 + *   width, height              pixels
 + *   stride                     bytes per line, 32bpp
-+ * Lines wrap back to the top instead of scrolling; the line after the cursor
-+ * is kept blank so the newest output is easy to find.
++ * The newest output is always the last line drawn. A phone console cannot be
++ * scrolled, so a photo only ever showed the first screenful and never the
++ * panic: the cursor used to wrap back to the top and overwrite the oldest
++ * line. Scrolling the pixels instead would cost a full-screen move (4.6M
++ * stores at 1440x3200) for every single line, which is seconds of stalls over
++ * a boot, so the screen is blanked once when the cursor leaves the last row
++ * and drawing restarts at the top: one blank per screenful, and nothing stale
++ * ever sits below the cursor.
 + */
 +
 +extern unsigned char iso_font[256 * 16];
@@ -40,13 +46,29 @@ index 997a4ab..db26bbe 100644
 +	}
 +}
 +
++/* Blank the whole text area; the next glyph goes to the top row. */
++static void
++fbcon_clear_screen(void)
++{
++	for (uint32_t y = 0; y < fbcon_height; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++}
++
 +static void
 +fbcon_newline(void)
 +{
 +	fbcon_col = 0;
-+	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	if (fbcon_row + 1 >= fbcon_rows) {
++		fbcon_clear_screen();
++		fbcon_row = 0;
++	} else {
++		fbcon_row++;
++	}
 +	fbcon_clear_row(fbcon_row);
-+	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
 +}
 +
 +static void
@@ -151,7 +173,7 @@ index 997a4ab..db26bbe 100644
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -777,6 +919,8 @@ serial_init(void)
+@@ -777,6 +941,8 @@ serial_init(void)
  
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  
