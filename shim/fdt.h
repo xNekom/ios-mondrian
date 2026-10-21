@@ -25,6 +25,21 @@ int fdt_node_regs(uintptr_t fdt, const char *path, uint64_t *out, int max);
 int fdt_node_regs_cells(uintptr_t fdt, const char *path, uint64_t *out, int max,
     int ac, int sc);
 
+/*
+ * The carve-outs of /reserved-memory: the addresses the firmware keeps for
+ * itself (the hypervisor, the modem, the framebuffer...). Returns the
+ * number of base/size pairs written to out[].
+ */
+int fdt_reserved_regions(uintptr_t fdt, uint64_t *out, int max);
+
+/*
+ * The biggest hole inside a memory region once the carve-outs of
+ * /reserved-memory are taken out of it. Returns 1 and fills hole_base and
+ * hole_size when there is one.
+ */
+int fdt_biggest_hole(uintptr_t fdt, uint64_t base, uint64_t size,
+		uint64_t *hole_base, uint64_t *hole_size);
+
 /* Path of the first node whose name starts with prefix ("memory" matches
  * "memory@80000000"), or of the first node whose "compatible" property
  * contains the given string. Both return 1 and fill out[] on success.

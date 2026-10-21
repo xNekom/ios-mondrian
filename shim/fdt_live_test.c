@@ -112,6 +112,21 @@ int main(int argc, char **argv)
 			"fb-inside" : "FB-OUTSIDE");
 	}
 
+	/* The carve-outs of the firmware and the hole the kernel goes to. */
+	{
+		uint64_t res[128];
+		int n = fdt_reserved_regions((uintptr_t)dtb, res, 64);
+		printf("reserved-memory: %d carve-outs\n", n);
+		for (int i = 0; i < n && i < 8; i++)
+			printf("    %016lx + %016lx\n", res[i * 2], res[i * 2 + 1]);
+		uint64_t hb = 0, hs = 0;
+		if (fdt_biggest_hole((uintptr_t)dtb, 0x80000000UL, 0x6a000000UL, &hb, &hs))
+			printf("  hole in the low bank: %016lx + %016lx (%.1f MB)\n",
+			       hb, hs, hs / 1048576.0);
+		else
+			printf("  no hole found\n");
+	}
+
 	uint64_t start = 0, end = 0;
 	printf("chosen/linux,initrd-start: %s\n",
 	       fdt_chosen_u64((uintptr_t)dtb, "linux,initrd-start", &start) ? "yes" : "no");

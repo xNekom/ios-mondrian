@@ -308,6 +308,116 @@ int fdt_find_name_depth(uintptr_t fdt, const char *prefix, char *out, int out_le
 	}
 }
 
+/*
+ * The carve-outs of /reserved-memory. The nodes are children of
+ * /reserved-memory, so their addresses use the cells of that node (2 and 2),
+ * not the ones of the root.
+ */
+int fdt_reserved_regions(uintptr_t fdt, uint64_t *out, int max)
+{
+	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
+	uintptr_t p, strings;
+	int n = 0;
+
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	p = fdt + be32(fdt + 8);
+	strings = fdt + be32(fdt + 12);
+	w.strings = strings;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			w.depth++;
+			path_push(&w, name);
+			p = align4(skip_str(p));
+			/* a direct child of /reserved-memory */
+			if (w.depth == 3 && w.path[1] == 'r' &&
+			    n + 2 <= max) {
+				uint64_t v[2];
+				if (fdt_node_regs_cells(fdt, w.path, v, 1,
+				    2, 2) == 1 && v[1]) {
+					out[n * 2] = v[0];
+					out[n * 2 + 1] = v[1];
+					n++;
+				}
+			}
+			break;
+		}
+		case FDT_END_NODE:
+			path_pop(&w);
+			w.depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p);
+			uintptr_t val = p + 8;
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return n;
+		}
+	}
+}
+
+/*
+ * The biggest hole inside a memory region, once the firmware's carve-outs
+ * are taken out of it.
+ *
+ * The window of the kernel has to avoid them: on this phone the low bank
+ * starts with the hypervisor (0x80000000), and the kernel image written
+ * over it makes the secure world die, which resets the phone instead of
+ * booting it. The hole after the last carve-out is where the kernel goes.
+ */
+int fdt_biggest_hole(uintptr_t fdt, uint64_t base, uint64_t size,
+		uint64_t *hole_base, uint64_t *hole_size)
+{
+	uint64_t res[128];
+	int n;
+	uint64_t cur = base, end = base + size;
+
+	*hole_base = base;
+	*hole_size = 0;
+	if (!fdt)
+		return 0;
+	n = fdt_reserved_regions(fdt, res, 64);
+	/* sort by base (insertion; there are few of them) */
+	for (int i = 1; i < n; i++) {
+		uint64_t b = res[i * 2], s = res[i * 2 + 1];
+		int j = i - 1;
+		while (j >= 0 && res[j * 2] > b) {
+			res[(j + 1) * 2] = res[j * 2];
+			res[(j + 1) * 2 + 1] = res[j * 2 + 1];
+			j--;
+		}
+		res[(j + 1) * 2] = b;
+		res[(j + 1) * 2 + 1] = s;
+	}
+	for (int i = 0; i < n; i++) {
+		uint64_t b = res[i * 2], s = res[i * 2 + 1];
+		if (s == 0 || b >= end)
+			continue;
+		if (b < base)
+			b = base;
+		if (b > cur && b - cur > *hole_size) {
+			*hole_base = cur;
+			*hole_size = b - cur;
+		}
+		if (b + s > cur)
+			cur = b + s;
+	}
+	if (cur < end && end - cur > *hole_size) {
+		*hole_base = cur;
+		*hole_size = end - cur;
+	}
+	return *hole_size > 0;
+}
+
 int fdt_find_compatible(uintptr_t fdt, const char *compat, char *out, int out_len)
 {
 	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };

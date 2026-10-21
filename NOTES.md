@@ -223,6 +223,62 @@ half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
   boot arguments, and XNU needs its own (physBase, memSize,
   deviceTreeP) plus the ADT.
 
+## 2026-10-21: the shim runs on the phone, and the window was wrong
+
+**The shim works on the phone** (2026-10-21): written to `boot_b` (the active
+slot) with adb over Wi-Fi, the ABL loads it, it reads the live device tree,
+unpacks the payload and prints everything on the splash framebuffer. The
+screen showed the facts dump, so the loader, the console, the FDT parser and
+the LZ4 unpacker all work on the real phone.
+
+**But the kernel never ran**: the screen showed the loader's output up to
+the segment list and nothing else, and the phone rebooted in a loop.
+
+- **Cause**: the window was the whole low bank (0x80000000+0x6a000000), and
+  the kernel image is written to the start of that window. The low bank
+  starts with the firmware's own memory: the hypervisor is at
+  0x80000000+0x600000 (`/reserved-memory/hyp_region`), then the AOP, the
+  SMEM, the modem firmware. Writing the kernel over the hypervisor kills
+  the secure world, and the phone resets instead of booting. That is why
+  there was no kernel output at all: the reset happened during the copy of
+  the segments, before the jump.
+- **The criterion was wrong**: the sweet does *not* use the lowest region.
+  It uses 0xb0000000+0x4d000000, chosen because it is above the carve-outs
+  of its phone (NOTES.md, "must therefore lie below the kernel"). The
+  mondrian had taken the lowest region because that is the one with the
+  splash framebuffer, and the sweet's early console patch maps the
+  framebuffer apart anyway (patch 0012 maps it at a fixed VA), so the
+  framebuffer does not have to be inside the window.
+- **Fix**: the shim now reads `/reserved-memory` from the live device tree
+  (`fdt_reserved_regions()`, `fdt_biggest_hole()`) and gives the kernel the
+  biggest hole of the region instead of the whole region. On this phone
+  that hole is **0xbab00000 + 0x25500000 (597 MB)**, right after the splash,
+  clear of the hypervisor, the AOP, the SMEM and the modem. The board table
+  and the ADT use the same window. The host test against the phone's own
+  device tree finds the same hole (`shim/fdt_live_test.c`).
+- The same change reproduces the sweet's window exactly, which is a good
+  sign that the criterion is now the right one.
+
+**The deploy path is adb over Wi-Fi**: the phone's USB port does not
+enumerate on this Mac (nothing at all shows up on the USB bus, not even
+other devices), but the Android "wireless debugging" pairing works:
+`adb pair <ip>:<port> <code>`, then `adb root` (the build is `userdebug`),
+which gives shell and root over the network. The image goes with `adb push`
+and the recovery writes it with `dd` to the active slot
+(`tools/phone-deploy.sh`).
+
+**Backups**: the original boot image is at `/data/local/tmp/boot-orig_b.img`
+on the phone and at `/tmp/boot-orig-b.img` on the Mac
+(sha1 89a1b3dfced4a6e4312925641daf51133a70f6ff). The other slot (`boot_a`)
+still has the stock Android image.
+
+**If the phone is stuck in the shim loop**: boot the recovery (power +
+volume up) and, in its terminal, copy the good slot over the bad one:
+
+    dd if=/dev/block/by-name/boot_a of=/dev/block/by-name/boot_b bs=4M
+
+That needs no USB at all.
+
 - **Done in this fork:**
   - `tools/boards.py`: the board table (sweet and mondrian) with the MMIO
     windows, the memory map, the CPU topology, the page size and the boot

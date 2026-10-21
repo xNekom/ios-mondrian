@@ -169,14 +169,21 @@ MONDRIAN = Board(
     # bootloader passes, read from /proc/device-tree in a recovery. The
     # /memory node has six regions: 0x80000000+0x6a000000, then a hole, then
     # 0xf4600000+0x0ba00000 (which ends exactly at 4G), and four regions above
-    # 4G. The kernel gets the first one: it is the region that holds the
-    # splash framebuffer (0xb8000000), and the early console writes to it
-    # through the bootstrap V=P map, which only covers the window the kernel
-    # is given. The largest region above 4G is the alternative. The ddr_size
-    # property says 12GB: the bootloader only describes the part of the RAM
-    # the kernel may use.
-    phys_base=0x80000000,
-    mem_size=0x6a000000,
+    # 4G. The kernel gets a window inside the first one: that is the region
+    # that holds the splash framebuffer (0xb8000000) and the only one the
+    # phone really has (the ddr_size property says 12GB, but the bootloader
+    # only describes the part the kernel may use).
+    #
+    # The window is not the whole region: the firmware keeps the low
+    # addresses of the bank for itself (/reserved-memory: the hypervisor at
+    # 0x80000000, the AOP, the SMEM, the modem, the splash...) and the kernel
+    # image written over the hypervisor kills the secure world, which resets
+    # the phone instead of booting it. So the kernel goes to the biggest hole
+    # of the region, which starts right after the splash: 0xbab00000, 597 MB.
+    # The framebuffer is mapped apart by the early console patch, so it does
+    # not have to be inside the window.
+    phys_base=0xbab00000,
+    mem_size=0x25500000,
     alt_phys_base=0x800000000,
     alt_mem_size=0x37500000,
     soc_base=0x01000000,

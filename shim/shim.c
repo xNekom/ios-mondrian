@@ -577,6 +577,19 @@ static void board_memory(uintptr_t dtb)
 	loader_set_regions(regs, n);
 	win.base = regs[best * 2];
 	win.size = regs[best * 2 + 1];
+	/*
+	 * Inside that region, the kernel gets the biggest hole: the low
+	 * addresses of the bank belong to the firmware, and the kernel
+	 * image written over them resets the phone.
+	 */
+	if (dtb) {
+		uint64_t hb, hs;
+		if (fdt_biggest_hole(dtb, win.base, win.size, &hb, &hs) &&
+		    hs >= 0x2000000UL) {
+			win.base = hb;
+			win.size = hs;
+		}
+	}
 }
 
 

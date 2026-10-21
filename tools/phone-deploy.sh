@@ -26,7 +26,11 @@ PAYLOAD=${PAYLOAD:-/tmp/payload-phone.bin}
 IMAGE=${IMAGE:-/tmp/boot-mondrian.img}
 RAMDISK=${RAMDISK:-/tmp/phone-ramdisk}
 REMOTE=/data/local/tmp/boot-mondrian.img
-BLOCK=/dev/block/by-name/boot
+
+# The phone is A/B: the active slot decides which boot partition is written.
+slot() {
+	adb shell getprop ro.boot.slot_suffix 2>/dev/null | tr -d '\r\n'
+}
 
 need() {
 	command -v "$1" >/dev/null || { echo "falta $1" >&2; exit 1; }
@@ -45,8 +49,11 @@ build)
 	python3 tools/mkpayload.py "$KERNEL" "$ADT" "$PAYLOAD" --board "$BOARD" \
 		--ramdisk "$RAMDISK"
 	# The shim image: the loader plus the payload, as a boot image.
+	# SMALL_SHIM keeps the diagnostics out: the facts dump fills the whole
+	# screen and the lines that matter (the loader's verdict, the kernel's
+	# early console) scroll away.
 	(cd shim && BOARD=$BOARD CROSS=${CROSS:-aarch64-elf-} \
-		EXTRA_CFLAGS="-DSHIM_NO_UFS" ./build.sh "$PAYLOAD")
+		SMALL_SHIM=1 ./build.sh "$PAYLOAD")
 	cp shim/out/shim-boot.img "$IMAGE"
 	ls -l "$IMAGE" "$PAYLOAD"
 	;;
@@ -59,10 +66,12 @@ push)
 install)
 	need adb
 	adb wait-for-device
+	BLOCK=/dev/block/by-name/boot$(slot)
+	ORIG=/data/local/tmp/boot-orig$(slot).img
 	# The original goes first: the boot partition is the Android one.
-	if ! adb shell "ls /data/local/tmp/boot-orig.img" >/dev/null 2>&1; then
+	if ! adb shell "ls $ORIG" >/dev/null 2>&1; then
 		echo "guardando la imagen original de $BLOCK"
-		adb shell "dd if=$BLOCK of=/data/local/tmp/boot-orig.img bs=4M"
+		adb shell "dd if=$BLOCK of=$ORIG bs=4M"
 	fi
 	adb shell "dd if=$REMOTE of=$BLOCK bs=4M conv=fsync"
 	adb shell "sync"
@@ -71,8 +80,9 @@ install)
 backup)
 	need adb
 	adb wait-for-device
-	adb shell "dd if=$BLOCK of=/data/local/tmp/boot-orig.img bs=4M"
-	adb shell "ls -l /data/local/tmp/boot-orig.img"
+	BLOCK=/dev/block/by-name/boot$(slot)
+	adb shell "dd if=$BLOCK of=/data/local/tmp/boot-orig$(slot).img bs=4M"
+	adb shell "ls -l /data/local/tmp/boot-orig$(slot).img"
 	;;
 reboot)
 	adb reboot
