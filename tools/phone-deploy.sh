@@ -20,10 +20,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BOARD=mondrian
-KERNEL=${KERNEL:-/tmp/mk10/kernel.development.mondrian}
+KERNEL=${KERNEL:-}
 ADT=${ADT:-/tmp/adt-mondrian.dtb}
 PAYLOAD=${PAYLOAD:-/tmp/payload-phone.bin}
 IMAGE=${IMAGE:-/tmp/boot-mondrian.img}
+RAMDISK=${RAMDISK:-/tmp/phone-ramdisk}
 REMOTE=/data/local/tmp/boot-mondrian.img
 BLOCK=/dev/block/by-name/boot
 
@@ -34,10 +35,15 @@ need() {
 case "${1:-}" in
 build)
 	need adb
-	[ -f "$KERNEL" ] || { echo "falta el kernel en $KERNEL" >&2; exit 1; }
+	if [ -z "$KERNEL" ]; then
+		# The newest kernel the CI produced.
+		KERNEL=$(ls -t /tmp/mk*/kernel.development.mondrian 2>/dev/null | head -1)
+	fi
+	[ -f "$KERNEL" ] || { echo "no hay kernel; baja el artefacto del CI" >&2; exit 1; }
+	[ -f "$RAMDISK" ] || { printf '#!/bin/sh\nexec /bin/sh\n' > "$RAMDISK"; }
 	python3 tools/mkadt.py --board "$BOARD" "$ADT"
 	python3 tools/mkpayload.py "$KERNEL" "$ADT" "$PAYLOAD" --board "$BOARD" \
-		--ramdisk /tmp/qemutest/init
+		--ramdisk "$RAMDISK"
 	# The shim image: the loader plus the payload, as a boot image.
 	(cd shim && BOARD=$BOARD CROSS=${CROSS:-aarch64-elf-} \
 		EXTRA_CFLAGS="-DSHIM_NO_UFS" ./build.sh "$PAYLOAD")
