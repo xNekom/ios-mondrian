@@ -233,7 +233,10 @@ with real work, and what we took or want from them:
   fails twice and the kernel hangs after `kdp_core zlib memory`. **Taken**
   into `tools/mkadt.py`: the top 1 MiB of the dram range becomes `/pram`.
   Confirmed on QEMU: with it the two `gPanicBase is still not initialized`
-  lines are gone and the panic backtrace prints.
+  lines are gone and the panic backtrace prints. Caveat: the shim's
+  `memSize` is still the whole window, so the top MiB is *also* in the VM's
+  free range; iBoot would have reserved it. Harmless for a panic record,
+  but it is the next thing to tighten if the log ever comes out garbled.
 - **`Log1nYT/ios-sweet` (venus, Mi 11, SM8350)**: 23 patches past the sweet
   series, the closest thing to our hardware list: `0083` DWC3/QSCRATCH
   probe with the *lahaina* GCC clock-gate offsets (and the note that the
