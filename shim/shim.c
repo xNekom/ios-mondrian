@@ -54,6 +54,9 @@ extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 
+/* The runtime base of this image (set in start.S). */
+uint64_t shim_base;
+
 /* The loader tells us what it is doing, so the panic names the step. */
 void shim_set_stage(const char *s)
 {
