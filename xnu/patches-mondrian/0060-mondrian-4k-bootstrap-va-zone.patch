@@ -1,0 +1,25 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2257,6 +2257,20 @@
+ 	mem_segments = (mem_size + 0x0FFFFFFF) >> 28;
+ 
+ 	va_l1 = dynamic_memory_begin;
+ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
++#if !__ARM_16K_PG__
++	/*
++	 * With 4 KiB native pages the bootstrap steals that happen before
++	 * vm_page_bootstrap() builds the free list are several times larger:
++	 * the vm_page array, the page hash buckets and the early kalloc and
++	 * zone arenas all scale with the page count, which is four times
++	 * higher than with 16 KiB pages. If pmap_steal_memory() walks past
++	 * this statically mapped window, pmap_expand() has to get a page table
++	 * page from the VM free list, which is still empty because
++	 * pmap_startup() is exactly what fills it, and the boot CPU spins in
++	 * vm_page_wait() forever.
++	 */
++	va_l1_end += ((mem_segments * 16) << 20);
++#endif
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+ 	va_l1_end = (va_l1_end + 0x00000000007FFFFFULL) & 0xFFFFFFFFFF800000ULL;
+ 

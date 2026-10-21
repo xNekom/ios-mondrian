@@ -222,6 +222,39 @@ Two traps it catches:
 - A patch that touches a *staged* file (`bsd/mondrian_hfs/...`,
   `libkern/...bearssl`) only applies after its `00NN-stage-*.sh` ran.
 
+### The stall after "MONDRIAN EARLY 20" (4 KiB bootstrap VA)
+
+Once the extra bootstrap L2 page was in (`0001`, from UniXNU), the
+`pmap_map_bd` panic went away in QEMU and the kernel stopped right after
+stage 20 with no message and no panic. It was not a lock: the frame-pointer
+walk (see the QEMU dump trick below) gave
+
+```
+vm_page_wait <- vm_page_grab_options <- pmap_pages_alloc_zeroed
+  <- pmap_expand <- pmap_enter_options_internal <- pmap_enter
+  <- pmap_steal_memory_internal <- pmap_startup <- vm_page_bootstrap
+```
+
+`pmap_startup()` is what *fills* the VM free list, and it first steals the
+`vm_page` array through `pmap_steal_freeable_memory()`, which maps the new
+KVA with `pmap_enter()`. `pmap_enter()` may need to expand a table, and
+`pmap_expand()` -> `pmap_tt_allocate()` asks the VM free list for the table
+page. That list is still empty (we measured `vm_page_free_count == 0`), so
+`vm_page_wait()` blocks with no thread left to wake it: an eternal spin.
+
+Normally this never happens because `arm_vm_init()` pre-maps, down to L3,
+a window `dynamic_memory_begin` .. `+ (2 + 10 * segments) MiB + FB`, and
+every bootstrap steal lives inside it. That estimate is tuned for 16 KiB
+pages. With 4 KiB pages the page count is four times higher, so the
+`vm_page` array, the page hash buckets and the early kalloc/zone arenas
+grow past the window: measured on QEMU the steal started at +38 MiB and
+`virtual_space_start` reached +84 MiB while the window ended at +70 MiB.
+
+`0060-mondrian-4k-bootstrap-va-zone.patch` adds 16 MiB of headroom per
+256 MiB segment only when `!__ARM_16K_PG__`, so the window becomes ~150 MiB
+for a 1.1 GiB board. It costs one 4 KiB page per 2 MiB pre-mapped, i.e. ~75
+pages, out of the ~1230 `pt_desc_t` the bootstrap pool has.
+
 ### What else was tried (and ruled out)
 
 - Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.
