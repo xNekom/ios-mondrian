@@ -115,8 +115,8 @@ index ccbb188..777aca4 100644
 +
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
- 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff@@ -609,3 +628,20 @@ Lkernelcache_base_found:
-@@ -609,3 +628,20 @@ Lkernelcache_base_found:
+ 	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
+@@ -609,4 +628,21 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -137,6 +137,7 @@ index ccbb188..777aca4 100644
 +	str		x11, [x13, x12, lsl #TTE_SHIFT]
 +#endif
 +
+ 	b Lbootstrap_tables_ready
 diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 new file mode 100644
 index 0000000..8f4c808

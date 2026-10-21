@@ -203,6 +203,25 @@ Read after the panic above was diagnosed, and one of them **solved it**.
   `README.md`, and the same split we use: patched XNU, real iOS userland,
   Apple firmware downloaded separately and never in the repository.
 
+### Checking the patches locally (ten seconds, not ten minutes)
+
+`tools/check-patches.sh` applies a series to a pristine xnu-8796.141.3 in
+`research/` (cached, not in git) with the same `git apply` the CI uses, and
+stages the `.sh` sources first, like `dxb` does. It matters because the CI
+**skips** a patch that does not apply and still reports success: on
+2026-10-21 `0010` (the early framebuffer) was skipped that way and the
+kernel it produced quietly had no console.
+
+Two traps it catches:
+
+- `git apply` **fails a hunk that ends with added lines and no trailing
+  context**. A hunk must end on an unchanged line. Trimming the trailing
+  context of `0010`'s second hunk (to let `0001` insert the UniXNU label
+  there) is what broke it; it now anchors on `b Lbootstrap_tables_ready`,
+  the line `0001` inserts, so `0010` depends on `0001` for that context.
+- A patch that touches a *staged* file (`bsd/mondrian_hfs/...`,
+  `libkern/...bearssl`) only applies after its `00NN-stage-*.sh` ran.
+
 ### What else was tried (and ruled out)
 
 - Wiping 256 MB above the window before the jump ("stale RAM"): wrong twice.
