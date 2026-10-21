@@ -3,6 +3,9 @@
 #
 #   tools/phone-boot.sh              # build the image and boot it
 #   tools/phone-boot.sh <image>      # boot an image that is already built
+#   tools/phone-boot.sh --wait       # boot it and wait for the phone to come
+#                                    # back (it panics and the bootloader
+#                                    # reboots it; see phone-cycle.sh)
 #
 # The phone has to be in fastboot (power + volume down). Nothing is
 # flashed: fastboot boot loads the image in RAM and runs it, so the boot
@@ -14,7 +17,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE=${1:-/tmp/boot-mondrian.img}
+WAIT=0
+if [ "${1:-}" = "--wait" ]; then
+	WAIT=1
+	shift
+	IMAGE=${1:-/tmp/boot-mondrian.img}
+fi
 command -v fastboot >/dev/null || { echo "falta fastboot" >&2; exit 1; }
+
+if [ "$WAIT" = 1 ]; then
+	exec bash tools/phone-cycle.sh "$IMAGE"
+fi
 
 if [ ! -f "$IMAGE" ]; then
 	echo "== no hay imagen en $IMAGE: se construye"
