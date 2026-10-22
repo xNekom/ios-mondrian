@@ -137,7 +137,7 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -73,7 +73,24 @@
+@@ -73,7 +73,26 @@
  	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
  }
  
@@ -151,8 +151,10 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	if (!gicd_base) {
 +		return;
 +	}
++	vm_offset_t pe = find_gicr_pe_base();
++	uint32_t igroupr = *(volatile uint32_t *)(pe + GICR_IGROUPR0);
 +	kprintf("MONDRIAN GIC: vtimer %u GICR_IGROUPR0=%x GICD_IGROUPR=%x GICD_CTLR=%x timer_pending=%d\n",
-+	    mondrian_vtimer_intid, gicr_read32(GICR_IGROUPR0),
++	    mondrian_vtimer_intid, igroupr,
 +	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
 +	    ml_get_timer_pending());
 +#endif
