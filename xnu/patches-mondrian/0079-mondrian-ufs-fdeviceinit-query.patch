@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -258,23 +258,134 @@
+ 		uint8_t sense_ascq = ucd->resp[47];
+ 		printf("MONDRIAN UFS: sense len %u key 0x%x asc 0x%x ascq 0x%x\n",
+ 		    sense_len, sense_key, sense_asc, sense_ascq);
+-		/*
+-		 * The target explicitly asks for START STOP UNIT before it
+-		 * becomes ready: NOT READY / 04 / 02. This is a power-state
+-		 * command only; it does not write media. Let the probe perform
+-		 * that one narrowly-scoped command, then poll TEST UNIT READY.
+-		 */
++		/* The target asks for the standard UFS fDeviceInit sequence. */
+ 		if (cdb[0] == 0x00 && ocs == 0 && ucd->resp[0] == 0x21 &&
+ 		    sense_key == 0x02 && sense_asc == 0x04 && sense_ascq == 0x02) {
+-			UFS_WHY("unit requires START STOP (sense 2/04/02)");
++			UFS_WHY("unit requires fDeviceInit (sense 2/04/02)");
+ 			return EAGAIN;
+ 		}
+ 		printf("MONDRIAN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		UFS_WHY("scsi 0x%02x: ocs 0x%x upiu 0x%x response 0x%x status 0x%x sense %x/%x/%x",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], sense_key, sense_asc, sense_ascq);
++		return EIO;
++	}
++	return 0;
++}
++
++/* NOP OUT/IN verifies the UTP layer before the device-management queries. */
++static int
++ufs_nop_out(void)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x00;                  /* NOP OUT UPIU */
++	ucd->cmd[3] = ++su.tag;
++	utrd->dw0 = (1u << 28);             /* UFS command, no data */
++	utrd->dw2 = 0x0f;
++	utrd->task_tag = ucd->cmd[3];
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	printf("MONDRIAN UFS: NOP OUT sent\n");
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			UFS_WHY("NOP OUT timeout");
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x20) {
++		printf("MONDRIAN UFS: NOP IN failed ocs 0x%x upiu 0x%x\n", ocs, ucd->resp[0]);
++		UFS_WHY("NOP OUT: ocs %x upiu %x", ocs, ucd->resp[0]);
++		return EIO;
++	}
++	printf("MONDRIAN UFS: NOP IN received\n");
++	return 0;
++}
++
++/* UFS device-management QUERY FLAG, used for fDeviceInit before SCSI I/O. */
++static int
++ufs_query_flag(uint8_t opcode, bool *value)
++{
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
++	uint8_t function;
++
++	if (opcode == 0x06) {                 /* SET FLAG */
++		function = 0x81;                 /* standard write request */
++	} else if (opcode == 0x05 && value != NULL) { /* READ FLAG */
++		function = 0x01;                 /* standard read request */
++	} else {
++		return EINVAL;
++	}
++
++	bzero(utrd, sizeof(*utrd));
++	bzero(ucd, sizeof(*ucd));
++	ucd->cmd[0] = 0x16;                 /* QUERY REQUEST UPIU */
++	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[5] = function;
++	ucd->cmd[12] = opcode;
++	ucd->cmd[13] = 0x01;                /* QUERY_FLAG_IDN_FDEVICEINIT */
++	utrd->dw0 = (1u << 28);             /* UFS command, no data */
++	utrd->dw2 = 0x0f;
++	utrd->task_tag = ucd->cmd[3];
++	utrd->ucdba = (uint32_t)ucd_pa;
++	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
++	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++	__builtin_arm_dsb(0xf);
++
++	ufs_wr(REG_UTRLDBR, 1);
++	printf("MONDRIAN UFS: query opcode 0x%x fDeviceInit sent\n", opcode);
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (ufs_rd(REG_UTRLDBR) & 1) {
++		if (mach_absolute_time() > deadline) {
++			ufs_wr(REG_UTRLCLR, ~1u);
++			UFS_WHY("query fDeviceInit timeout");
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++	dma_sync(DMA_UTRL, sizeof(*utrd));
++	dma_sync(DMA_UCD, sizeof(*ucd));
++
++	uint32_t ocs = utrd->dw2 & 0xff;
++	if (ocs || ucd->resp[0] != 0x36 || ucd->resp[6] != 0) {
++		printf("MONDRIAN UFS: query failed ocs 0x%x upiu 0x%x response 0x%x result 0x%x\n",
++		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[19]);
++		UFS_WHY("query fDeviceInit: ocs %x upiu %x response %x result %x",
++		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[19]);
+ 		return EIO;
+ 	}
++	if (value != NULL) {
++		*value = (ucd->resp[23] & 1) != 0;
++		printf("MONDRIAN UFS: fDeviceInit is %u\n", *value);
++	}
+ 	return 0;
+ }
+ 
+@@ -679,24 +790,37 @@
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+-		/* The host clock was off, and the target requires an explicit start. */
++		/*
++		 * Linux's UFSHCD sequence is: link startup, NOP OUT, then set
++		 * fDeviceInit and wait for the device to clear it before any
++		 * SCSI command. This host was switched off by the bootloader;
++		 * its first TUR now explicitly returns sense 2/04/02, so perform
++		 * that standard device-management sequence here.
++		*/
+ 		error = ufs_scsi(tur, sizeof(tur), 0);
+ 		if (error == EAGAIN) {
+-			static const uint8_t start_unit[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
+-			printf("MONDRIAN UFS: device requires START STOP UNIT; starting\n");
+-			error = ufs_scsi(start_unit, sizeof(start_unit), 0);
++			bool initializing = false;
++			error = ufs_nop_out();
+ 			if (!error) {
++				printf("MONDRIAN UFS: completing fDeviceInit\n");
++				error = ufs_query_flag(0x06, NULL); /* SET_FLAG */
++			}
++			if (!error) {
+ 				for (int i = 0; i < 20; i++) {
+ 					delay(500000); /* half a second */
+-					error = ufs_scsi(tur, sizeof(tur), 0);
+-					if (error != EAGAIN) {
++					error = ufs_query_flag(0x05, &initializing); /* READ_FLAG */
++					if (error || !initializing) {
+ 						break;
+ 					}
+-					printf("MONDRIAN UFS: device still initializing (%d/20)\n", i + 1);
++					if ((i & 1) == 1) {
++						printf("MONDRIAN UFS: fDeviceInit still set (%d/20)\n", i + 1);
++					}
+ 				}
+-				if (error == EAGAIN) {
+-					UFS_WHY("unit still not ready after START STOP (sense 2/04/02)");
++				if (!error && initializing) {
++					UFS_WHY("fDeviceInit remained set after 10 seconds");
+ 					error = ETIMEDOUT;
++				} else if (!error) {
++					error = ufs_scsi(tur, sizeof(tur), 0);
+ 				}
+ 			}
+ 		}

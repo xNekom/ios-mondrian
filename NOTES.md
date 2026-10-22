@@ -342,11 +342,16 @@ response UPIU. The remaining response is from the **UFS device**, not the
 controller: response code `1` (TARGET FAILURE), SCSI status `2` (CHECK
 CONDITION), with sense length `18`, key `0x2` (NOT READY), ASC `0x04`,
 ASCQ `0x02` ("initializing command required" / "START UNIT required").
-This is not unit attention and not an invalid descriptor. `0078` sends the
-SCSI `START STOP UNIT` command with START=1 and no eject/data bits, then
-polls TEST UNIT READY for up to 10 seconds. This changes the device's power
-state only; it does not write any storage blocks. If it becomes ready, GPT
-reading continues; otherwise the final panic retains the sense details.
+This is not unit attention and not an invalid descriptor. `0078` tried the
+SCSI `START STOP UNIT` command with START=1; the target rejected it with
+sense `05/24/00` (ILLEGAL REQUEST / invalid field in CDB), so that command
+is not supported in this device's initialization state. The Linux UFSHCD
+source shows the correct protocol sequence after link startup: NOP OUT,
+QUERY `SET_FLAG fDeviceInit`, then poll QUERY `READ_FLAG fDeviceInit` until
+the device clears it (`ufshcd_complete_dev_init()` in `drivers/ufs/core/ufshcd.c`).
+`0079` implements NOP OUT followed by the set/read query exchanges, and polls
+for up to 10 seconds before retrying TEST UNIT READY. The queries initialize
+the device; they do not write user storage blocks.
 
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
