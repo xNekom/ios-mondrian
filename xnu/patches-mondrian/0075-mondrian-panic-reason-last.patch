@@ -1,0 +1,60 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1063,6 +1063,22 @@
+ 	va_end(panic_str_args);
+ }
+ #endif /* defined (__x86_64__) */
++
++#if defined(MONDRIAN)
++/* The reason of the panic, kept so that it can be printed again at the end
++ * (see panic_trap_to_debugger): the console cannot be scrolled. */
++static char mondrian_panic_reason[256];
++static unsigned int mondrian_panic_len;
++
++static void
++mondrian_panic_putc(char c)
++{
++	if (mondrian_panic_len < sizeof(mondrian_panic_reason) - 1) {
++		mondrian_panic_reason[mondrian_panic_len++] = c;
++		mondrian_panic_reason[mondrian_panic_len] = '\0';
++	}
++}
++#endif
+ 
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wmissing-noreturn"
+@@ -1075,6 +1091,20 @@
+ #if defined(MONDRIAN)
+ 	/* No CPU/thread/debugger state is required for this first panic copy. */
+ 	mondrian_early_panic(panic_format_str, panic_args);
++	/*
++	 * The phone's console cannot be scrolled and a panic is longer than
++	 * the screen, so the first line - the reason - is gone by the time
++	 * the panic ends. Keep a copy and print it again at the end, so the
++	 * last thing on the screen is why the kernel died.
++	 */
++	{
++		va_list copy;
++
++		va_copy(copy, *panic_args);
++		mondrian_panic_len = 0;
++		_doprnt(panic_format_str, copy, mondrian_panic_putc, 16);
++		va_end(copy);
++	}
+ #endif
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1460,6 +1490,12 @@
+ 	}
+ 
+ 	paniclog_append_noflush("\nPlease go to https://panic.apple.com to report this panic\n");
++#if defined(MONDRIAN)
++	/* The last line on the screen: why the kernel died. */
++	if (mondrian_panic_len != 0) {
++		printf("MONDRIAN PANIC: %s\n", mondrian_panic_reason);
++	}
++#endif
+ 	panic_spin_forever();
+ }
+ 
