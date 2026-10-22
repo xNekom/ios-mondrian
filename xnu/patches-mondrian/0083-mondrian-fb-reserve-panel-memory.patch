@@ -1,103 +1,22 @@
 xnu 0083: keep the panel's memory out of the page allocator
 
 The ABL leaves the continuous-splash buffer mapped and the display
-hardware keeps scanning it out of RAM: the kernel console draws into it
-now, and the userland framebuffer driver will do the same. The boot
-arguments describe the whole window as free RAM, so the page allocator
-would eventually hand those pages out and the screen would turn into
-whatever the kernel stored there. The PE records the region from the ADT
-while it maps the console, and pmap_next_page() steps over it.
+hardware keeps scanning it out of RAM: the kernel console draws into it,
+and the userland framebuffer driver will do the same. The boot arguments
+describe the whole window as free RAM, so the page allocator would
+eventually hand those pages out and the screen would turn into whatever
+the kernel stored there. The PE records the region from the ADT while it
+maps the console; pmap_startup() initialises those page frames like any
+other and does not release them, so they never join the free list.
 
-diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
---- a/osfmk/arm/pmap/pmap.c
-+++ b/osfmk/arm/pmap/pmap.c
-@@ -2602,7 +2602,39 @@
- 
- /**
-  * Prepare bad ram pages to be skipped.
-+ */
-+
-+#if defined(MONDRIAN)
-+/*
-+ * The phone's panel is scanned out of the ABL's continuous-splash buffer by
-+ * the display hardware, and the kernel draws into it (the framebuffer
-+ * console now, IOMobileFramebuffer later). Nothing in the boot arguments
-+ * says that, so the whole window arrives as RAM: once allocations reach the
-+ * buffer the screen would turn into whatever the kernel stored there. The
-+ * PE recorded the region from the ADT (pe_serial.c); skip it here.
-+ *
-+ * Both ends are page aligned, so the hole is a whole number of pages.
-  */
-+extern uint64_t mondrian_fb_reserved_start(void);
-+extern uint64_t mondrian_fb_reserved_end(void);
-+
-+static pmap_paddr_t
-+mondrian_ram_skipped(
-+	pmap_paddr_t first,
-+	pmap_paddr_t end)
-+{
-+	pmap_paddr_t fb_start = (pmap_paddr_t)mondrian_fb_reserved_start();
-+	pmap_paddr_t fb_end = (pmap_paddr_t)mondrian_fb_reserved_end();
-+	pmap_paddr_t lo, hi;
-+
-+	if ((fb_start >= fb_end) || (fb_end <= first) || (fb_start >= end)) {
-+		return 0;
-+	}
-+	lo = (fb_start > first) ? fb_start : first;
-+	hi = (fb_end < end) ? fb_end : end;
-+	return (hi > lo) ? (hi - lo) : 0;
-+}
-+#endif /* MONDRIAN */
- 
- /*
-  * Initialize the count of available pages. No lock needed here,
-@@ -2618,6 +2650,9 @@
- 	assert(first == (first & ~PAGE_MASK));
- 	assert(end == (end & ~PAGE_MASK));
- 	avail_page_count = atop(end - first);
-+#if defined(MONDRIAN)
-+	avail_page_count -= atop(mondrian_ram_skipped(first, end));
-+#endif /* MONDRIAN */
- 
- 	need_ram_ranges_init = false;
- }
-@@ -2639,7 +2674,12 @@
- 	if (need_ram_ranges_init) {
- 		initialize_ram_ranges();
- 	}
--	return (unsigned int)atop(avail_end - first_avail);
-+	return (unsigned int)atop(avail_end - first_avail) -
-+#if defined(MONDRIAN)
-+	    (unsigned int)atop(mondrian_ram_skipped(first_avail, avail_end));
-+#else
-+	    0;
-+#endif /* MONDRIAN */
- }
- 
- 
-@@ -2662,6 +2702,22 @@
- 
- 
- 	if (first_avail != avail_end) {
-+#if defined(MONDRIAN)
-+		/*
-+		 * Step over the panel's memory instead of handing it out. The
-+		 * page count above already left it out, so nothing else has to
-+		 * change; the walk simply continues above the hole.
-+		 */
-+		pmap_paddr_t fb_end = (pmap_paddr_t)mondrian_fb_reserved_end();
-+		if ((first_avail >= (pmap_paddr_t)mondrian_fb_reserved_start()) &&
-+		    (first_avail < fb_end)) {
-+			first_avail = (fb_end < avail_end) ? fb_end : avail_end;
-+			if (first_avail == avail_end) {
-+				assert(avail_page_count == 0);
-+				return FALSE;
-+			}
-+		}
-+#endif /* MONDRIAN */
- 		*pnum = (ppnum_t)atop(first_avail);
- 		first_avail += PAGE_SIZE;
- 		assert(avail_page_count > 0);
+The first version skipped the window inside pmap_next_page(), and that
+panicked at vm_resident.c:2627 (`Assertion failed: ppnum ==
+VM_PAGE_GET_PHYS_PAGE(m)`) right after "kprintf startup complete": on
+arm64 a page's physical address comes from its index in vm_pages, so a
+hole in the walk shifts every page after it. Keeping the walk intact and
+withholding the pages from the free queues costs nothing and makes the
+reservation permanent.
+
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
@@ -108,7 +27,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 +/*
 + * The physical extent of the panel's memory, as the ADT states it. The MDP
 + * scans that region out of RAM by itself, so it is not free memory: the
-+ * page allocator has to skip it (see pmap_next_page()). Zero until
++ * page allocator must not release it (see pmap_startup()). Zero until
 + * fbcon_probe() has read the node.
 + */
 +static uint64_t fbcon_phys_base, fbcon_phys_end;
@@ -156,3 +75,66 @@ diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
  kern_return_t serial_irq_action(serial_device_t device);
  bool serial_irq_filter(serial_device_t device);
  
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -1394,6 +1394,31 @@
+ #endif
+ 
+ void vm_page_release_startup(vm_page_t mem);
++
++#if defined(MONDRIAN)
++/*
++ * The panel's memory is described as RAM but the display hardware keeps
++ * scanning it, so it must never reach the free list. "Never free" is not the
++ * same as "skip": on arm64 a page's physical address is derived from its
++ * index in vm_pages, so pmap_next_page() has to keep handing the region out
++ * in order. The pages are initialised like any other and simply not released
++ * to the free queues; they stay wired, which is what the display needs, and
++ * the rest of the array keeps its index/address arithmetic.
++ */
++extern uint64_t mondrian_fb_reserved_start(void);
++extern uint64_t mondrian_fb_reserved_end(void);
++
++static boolean_t
++mondrian_page_is_screen(vm_page_t mem)
++{
++	uint64_t start = mondrian_fb_reserved_start();
++	uint64_t end = mondrian_fb_reserved_end();
++	uint64_t phys = (uint64_t)VM_PAGE_GET_PHYS_PAGE(mem) << PAGE_SHIFT;
++
++	return (start < end) && (phys >= start) && (phys < end);
++}
++#endif /* MONDRIAN */
++
+ void
+ pmap_startup(
+ 	vm_offset_t     *startp,
+@@ -1569,6 +1594,9 @@
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
++		}
++		if (mondrian_page_is_screen(&vm_pages[i])) {
++			continue;
+ 		}
+ 		if (vm_himemory_mode) {
+ 			vm_page_release_startup(&vm_pages[i]);
+@@ -1579,11 +1607,17 @@
+ 	if (!vm_himemory_mode) {
+ 		do {
+ 			if (!VMP_ERROR_GET(&vm_pages[--i])) {               /* skip retired pages */
++				if (mondrian_page_is_screen(&vm_pages[i])) {
++					continue;
++				}
+ 				vm_page_release_startup(&vm_pages[i]);
+ 			}
+ 		} while (i != 0);
+ 	}
+ 
++	printf("MONDRIAN VM: %llu panel pages kept off the free list\n",
++	    (unsigned long long)((mondrian_fb_reserved_end() -
++	    mondrian_fb_reserved_start()) >> PAGE_SHIFT));
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 	printf("pmap_startup() init/release time: %lld microsec\n", (now_ns - start_ns) / NSEC_PER_USEC);
+ 	printf("pmap_startup() delayed init/release of %d pages\n", vm_delayed_count);
