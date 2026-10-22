@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -56,6 +56,8 @@
+ #define REG_UTRLDBR     0x58
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
++#define REG_UTRLCNR     0x64
++#define REG_UTRIACR     0x4c
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -228,6 +230,26 @@
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	printf("MONDRIAN UFS: scsi 0x%02x answered ocs 0x%x upiu 0x%x\n", cdb[0], ocs, ucd->resp[0]);
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		/*
++		 * What the host says about the request, and what it did with
++		 * it: the outcome code, the response UPIU, and the request
++		 * descriptor as the host left it. A descriptor that still holds
++		 * the 0xf we wrote means the host never looked at it (a list it
++		 * does not read, or the multi-queue mode, where the transfer
++		 * request list does not exist).
++		 */
++		printf("MONDRIAN UFS: host: hce 0x%x hcs 0x%x is 0x%x cnr 0x%x iacr 0x%x\n",
++		    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_IS), ufs_rd(REG_UTRLCNR),
++		    ufs_rd(REG_UTRIACR));
++		printf("MONDRIAN UFS: host: list %x:%x rsr 0x%x dbr 0x%x\n",
++		    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLRSR),
++		    ufs_rd(REG_UTRLDBR));
++		printf("MONDRIAN UFS: utrd %08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    utrd->dw0, utrd->dw1, utrd->dw2, utrd->dw3, utrd->ucdba, utrd->ucdbau,
++		    utrd->resp, utrd->prdt);
++		printf("MONDRIAN UFS: upiu %02x %02x %02x %02x resp %02x %02x %02x %02x\n",
++		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3],
++		    ucd->resp[0], ucd->resp[1], ucd->resp[6], ucd->resp[7]);
+ 		printf("MONDRIAN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		UFS_WHY("scsi 0x%02x: ocs 0x%x upiu 0x%x response 0x%x status 0x%x",
