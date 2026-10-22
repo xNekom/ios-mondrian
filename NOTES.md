@@ -225,6 +225,53 @@ If the `CNTV_CTL_EL1` write is trapped by QHEE the boot dies with an
 in 0061) and that is visible on the screen; then the wait has to be
 removed another way (a platform that fakes an IORTC service).
 
+### 2026-10-22 09:10: past `IOKitInitializeTime`, and the UFS driver is the next wall
+
+With `0069` (no RTC wait, and the EL1 view of the timer control enabled)
+the boot goes a long way: `vfsinit`, the kernel threads, the network
+interfaces, `bsd_autoconf`, `net_init_run`, and then
+
+    bsd_init: calling device_add_rd0 (01000000/12000000) at FFFFFFFF80087C000 ...
+
+which is the **root device**: the UFS driver is being probed. It never says
+anything, and the trail of `0070` says where it stops:
+
+    MONDRIAN UFS: probe start
+    MONDRIAN UFS: regs mapped at fffffffbacd3c0
+    <nothing more>
+
+so it is stuck in `kmem_alloc_contig()`: the 1 MiB physically contiguous
+allocation for the descriptors and the bounce buffer never comes back.
+`0071` prints what one page costs and how many pages are free, to tell a
+size problem from "no contiguous memory at all".
+
+**Reference found (2026-10-22):** `oosexgang/hackios-xnu-kernel` runs the
+same XNU (8796) on a Snapdragon phone (POCO X5 Pro, redwood) and has a
+**UFSHCI driver for the same host at the same address**
+(`ufshc@1d84000`, `ufs_mem` ✓ - ours too). Theirs works; ours does not
+(yet). What it shows:
+
+- the request descriptor's first word is `CTS | DD` and **nothing else**:
+  no bit 24 (our driver set it; Linux sets it neither);
+- the transfer list has to be **stopped and waited for** before its base
+  is changed (ours changed it right away);
+- they allocate the descriptors in memory the loader owns and the data
+  buffers with `kmem_alloc_contig()` of 256 KiB each, and they *prove* that
+  the controller is reading their list before ringing a doorbell (ours
+  checks the base and the run bit, which is close);
+- their `osfmk/arm64/gic_v3_irq.c` is a generic GICv3 driver (Group 1 IRQs,
+  the EL1 virtual timer PPI routed to `rtclock_intr()`) - the same shape as
+  our `sleh_irq` branch, and a good reference for the GIC setup;
+- their phone boots with *their* loader, not with the ABL, so there is no
+  hypervisor between the kernel and the timer: the QHEE problem of the
+  timer interrupt (the EL1 view of `CNTV_CTL_EL0`) is ours alone.
+
+Their alternative to a kernel UFS driver: the loader keeps Qualcomm's own
+UFS driver resident and serves blocks to the kernel through a shared page
+(`bsd/dev/redwood_ufs.c`). That is a way out if the in-kernel UFSHCI
+driver does not come up: our shim could stay resident and serve the
+blocks the same way.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
