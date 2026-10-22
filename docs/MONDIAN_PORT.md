@@ -413,6 +413,12 @@ IOSurface, and presents by copying the enabled layers into it. Only the
 geometry changed (1440x3200 at 526 ppi, not 1080x2400 at 395). It is
 untested on hardware and lives on its own branch until the root mounts.
 
+Sweet's two follow-ups on that file are **not** ported yet and have to be
+rebased on `MondrianFramebuffer.cpp` when they are needed: `0056` (present
+at most once every few vsyncs) and `0079` (`RequestPowerChange`: fade the
+panel to black when backboardd asks for display off, which is what the
+power button and auto-lock use).
+
 **Check:** the iOS home screen appears on the phone.
 
 **Fallback, only if the scanout dies:** an MDSS driver — the
