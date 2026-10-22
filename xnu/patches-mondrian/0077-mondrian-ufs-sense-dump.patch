@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -252,10 +252,16 @@
+ 		printf("MONDRIAN UFS: upiu %02x %02x %02x %02x resp %02x %02x %02x %02x\n",
+ 		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3],
+ 		    ucd->resp[0], ucd->resp[1], ucd->resp[6], ucd->resp[7]);
++		uint32_t sense_len = ((uint32_t)ucd->resp[32] << 8) | ucd->resp[33];
++		uint8_t sense_key = ucd->resp[36] & 0x0f;
++		uint8_t sense_asc = ucd->resp[46];
++		uint8_t sense_ascq = ucd->resp[47];
++		printf("MONDRIAN UFS: sense len %u key 0x%x asc 0x%x ascq 0x%x\n",
++		    sense_len, sense_key, sense_asc, sense_ascq);
+ 		printf("MONDRIAN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+-		UFS_WHY("scsi 0x%02x: ocs 0x%x upiu 0x%x response 0x%x status 0x%x",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		UFS_WHY("scsi 0x%02x: ocs 0x%x upiu 0x%x response 0x%x status 0x%x sense %x/%x/%x",
++		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7], sense_key, sense_asc, sense_ascq);
+ 		return EIO;
+ 	}
+ 	return 0;
