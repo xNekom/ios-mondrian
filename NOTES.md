@@ -7,6 +7,40 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-22 19:15: VM init passes, `device_add_rd0` again, and the UFS probe runs
+
+The 0083 fix works. The 17:52 boot (local kernel, sha256 `e20b4515…`) went
+through `pmap_startup()`, through all of `bsd_init()` and into the disk:
+
+    bsd_init: calling setconf
+    Added memory device md0/rd0 (01000000/12000000) at FFFFFFFF008090000 for 000000000004000
+    MONDRIAN UFS: probe start
+    Unclassified kernel abort (fault_code=0x10)
+
+So the framebuffer reservation no longer breaks the page array, and the boot
+is back to (and past) the point 0082 reached. The abort is a **translation
+fault** and `atos` against the local kernel puts its pc inside
+`pe_mondrian_gic_dump` (`pe_fiq.c:88`) -- the first thing the UFS probe did.
+
+**Root cause (0087).** `pe_init_fiq()` runs long before `STARTUP_SUB_KMEM`, and
+`io_map()` (`osfmk/arm/io_map.c:101`) then takes the virtual address out of
+`virtual_space_start` and maps it with `pmap_map_bd()`: a *bootstrap* mapping.
+Once the VM owns that address space, the GIC is mapped nowhere, and the first
+read of `GICR_IGROUPR0` is the fault above. Anything else mapped through
+`ml_io_map()` before `STARTUP_SUB_KMEM` has the same problem -- the early
+framebuffer survives only because 0062 keeps a reserved low-global alias for
+it.
+
+Fix: remember GICD/GICR physical bases and sizes while the device tree is
+readable, and map them again through `ml_io_map()` in
+`pe_mondrian_gic_dump()` (idempotent, so later GIC configuration also lands on
+real addresses). Series applies `86/86`; the image built from the local kernel
+(`4363fa85…`) was flashed to `boot_b` at 19:17.
+
+**The local build is now the fast path** (see the 17:15 entry): `make` ->
+`KERNEL=… bash tools/phone-deploy.sh build` -> flash, about five minutes with
+no CI queue.
+
 ## 2026-10-22 17:15: the 16:05 and 16:30 photos are 0083's panic, not 0086's UFS
 
 **What the photo proves.** The 16:30 photo (run 39793414594's kernel,
