@@ -1,0 +1,51 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -857,22 +857,32 @@
+ mondrian_fbcon_beacon(uint64_t pc, uint64_t count)
+ {
+ 	static const char hexd[] = "0123456789abcdef";
+-	char line[48];
++	char line[80];
+ 	unsigned int n = 0;
+ 	uint32_t row;
+ 
+ 	if (fbcon_base == NULL || fbcon_rows < 8) {
+ 		return;
+ 	}
+-	row = (fbcon_row + 24) % fbcon_rows;
++	/* A fixed row: the beacon stays where it is, so a photo shows it
++	 * updating in place instead of leaving copies behind. */
++	row = fbcon_rows / 2;
+ 
+ 	line[n++] = 'I'; line[n++] = 'R'; line[n++] = 'Q'; line[n++] = ' ';
+ 	for (int i = 5; i >= 0; i--) {
+ 		line[n++] = hexd[(count >> (i * 4)) & 0xf];
+ 	}
+ 	line[n++] = ' '; line[n++] = 'P'; line[n++] = 'C'; line[n++] = ' ';
+-	for (int i = 7; i >= 0; i--) {
++	for (int i = 15; i >= 0; i--) {
+ 		line[n++] = hexd[(pc >> (i * 4)) & 0xf];
++	}
++	line[n++] = ' '; line[n++] = 'F'; line[n++] = 'B'; line[n++] = ' ';
++	for (int i = 15; i >= 0; i--) {
++		line[n++] = hexd[(((uint64_t)fbcon_base) >> (i * 4)) & 0xf];
++	}
++	line[n++] = ' '; line[n++] = 'A'; line[n++] = 'L'; line[n++] = ' ';
++	for (int i = 15; i >= 0; i--) {
++		line[n++] = hexd[(mondrian_early_fb_va() >> (i * 4)) & 0xf];
+ 	}
+ 	line[n] = '\0';
+ 	fbcon_draw_text(row, line);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1879,7 +1879,7 @@
+ 		 * the screen is alive, and the PC it shows is where the CPU
+ 		 * was; if it stops, the CPU is stuck.
+ 		 */
+-		if ((++mondrian_irq_count & 0x3f) == 0) {
++		if ((++mondrian_irq_count & 0x3) == 0) {
+ 			mondrian_fbcon_beacon(get_saved_state_pc(state), mondrian_irq_count);
+ 		}
+ 		rtclock_intr(TRUE);
