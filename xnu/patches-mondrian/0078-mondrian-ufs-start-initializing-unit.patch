@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -258,6 +258,17 @@
+ 		uint8_t sense_ascq = ucd->resp[47];
+ 		printf("MONDRIAN UFS: sense len %u key 0x%x asc 0x%x ascq 0x%x\n",
+ 		    sense_len, sense_key, sense_asc, sense_ascq);
++		/*
++		 * The target explicitly asks for START STOP UNIT before it
++		 * becomes ready: NOT READY / 04 / 02. This is a power-state
++		 * command only; it does not write media. Let the probe perform
++		 * that one narrowly-scoped command, then poll TEST UNIT READY.
++		 */
++		if (cdb[0] == 0x00 && ocs == 0 && ucd->resp[0] == 0x21 &&
++		    sense_key == 0x02 && sense_asc == 0x04 && sense_ascq == 0x02) {
++			UFS_WHY("unit requires START STOP (sense 2/04/02)");
++			return EAGAIN;
++		}
+ 		printf("MONDRIAN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		UFS_WHY("scsi 0x%02x: ocs 0x%x upiu 0x%x response 0x%x status 0x%x sense %x/%x/%x",
+@@ -668,8 +679,26 @@
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0)); i++) {
++		/* The host clock was off, and the target requires an explicit start. */
++		error = ufs_scsi(tur, sizeof(tur), 0);
++		if (error == EAGAIN) {
++			static const uint8_t start_unit[6] = { 0x1b, 0, 0, 0, 0x01, 0 };
++			printf("MONDRIAN UFS: device requires START STOP UNIT; starting\n");
++			error = ufs_scsi(start_unit, sizeof(start_unit), 0);
++			if (!error) {
++				for (int i = 0; i < 20; i++) {
++					delay(500000); /* half a second */
++					error = ufs_scsi(tur, sizeof(tur), 0);
++					if (error != EAGAIN) {
++						break;
++					}
++					printf("MONDRIAN UFS: device still initializing (%d/20)\n", i + 1);
++				}
++				if (error == EAGAIN) {
++					UFS_WHY("unit still not ready after START STOP (sense 2/04/02)");
++					error = ETIMEDOUT;
++				}
++			}
+ 		}
+ 	}
+ 	if (!error) {

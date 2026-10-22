@@ -327,7 +327,7 @@ clock came up.
 console blanks the screen when it is full and a panic is longer than the
 screen: without it the last line is only the URL.
 
-### 2026-10-22 11:25: the GCC clock works; the target reports CHECK CONDITION
+### 2026-10-22 12:35: the GCC clock works; the target requires START UNIT
 
 With `0076` (CI `39751846288`), the photo confirms that enabling GCC branch
 `0x870` brought the host up:
@@ -338,13 +338,15 @@ With `0076` (CI `39751846288`), the photo confirms that enabling GCC branch
     host: list 0:b2362000 rsr 0x1 dbr 0x0
 
 The host now sees our UTRD, completes the command, and returns a valid
-response UPIU. The remaining error is from the **UFS device**, not the
-controller: UPIU response code `1` (TARGET FAILURE), SCSI status `2` (CHECK
-CONDITION). The probe currently retries TEST UNIT READY three times, but
-does not issue REQUEST SENSE, so the reason (likely unit attention, but not
-yet observed) is still unknown. `0077` prints the response's sense length,
-key, ASC and ASCQ and includes them in the final panic reason. Do not assume
-unit attention until those bytes are read.
+response UPIU. The remaining response is from the **UFS device**, not the
+controller: response code `1` (TARGET FAILURE), SCSI status `2` (CHECK
+CONDITION), with sense length `18`, key `0x2` (NOT READY), ASC `0x04`,
+ASCQ `0x02` ("initializing command required" / "START UNIT required").
+This is not unit attention and not an invalid descriptor. `0078` sends the
+SCSI `START STOP UNIT` command with START=1 and no eject/data bits, then
+polls TEST UNIT READY for up to 10 seconds. This changes the device's power
+state only; it does not write any storage blocks. If it becomes ready, GPT
+reading continues; otherwise the final panic retains the sense details.
 
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
