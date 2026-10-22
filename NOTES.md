@@ -272,6 +272,34 @@ UFS driver resident and serves blocks to the kernel through a shared page
 driver does not come up: our shim could stay resident and serve the
 blocks the same way.
 
+### 2026-10-22 10:00: the root device is reached, and the UFS host is switched off
+
+The kernel now boots all the way to the root lookup and panics there with
+the UFS reason (the trail is on the screen, and it says):
+
+    MONDRIAN UFS: asking for 147456 bytes of contiguous memory
+    MONDRIAN UFS: dma at ffffffff87000000
+    MONDRIAN UFS: dma pa 0xb2362000
+    MONDRIAN UFS: hce 0x0 hcs 0x0            <-- the host is off
+    MONDRIAN UFS: list stopped, run 0
+    MONDRIAN UFS: scsi 0x00 sent, waiting
+    MONDRIAN UFS: scsi 0x00 answered ocs 0x0 upiu 0x0
+    MONDRIAN UFS: probe failed: 5 (scsi 0x00: ocs 0x0 upiu 0x0 response 0x0 status 0x0)
+
+Two things settled:
+
+- the contiguous allocation **does** come back (128 KiB, 36 pages: the
+  1 MiB request of the sweet driver is 256 pages with 4 KiB pages and the
+  zone map's runs are shorter than that, so it scans for ever);
+- the host controller is **disabled**: `HCE` reads 0 and `HCS` reads 0, so
+  there is no device and the command goes nowhere (the doorbell clears
+  itself at once). The sweet driver never has to enable the host, because
+  its bootloader leaves it on; Qualcomm's ABL had the storage only while it
+  needed it and switched the host off. `0074` writes `HCE = 1` (which is
+  what starts the UniPro link) and waits for the device to show up in
+  `HCS`. If the host's clock had been gated too, the write goes nowhere
+  and `HCE` reads 0 again - that is the next thing to see.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
