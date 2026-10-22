@@ -342,29 +342,30 @@ response UPIU. The remaining response is from the **UFS device**, not the
 controller: response code `1` (TARGET FAILURE), SCSI status `2` (CHECK
 CONDITION), with sense length `18`, key `0x2` (NOT READY), ASC `0x04`,
 ASCQ `0x02` ("initializing command required" / "START UNIT required").
-This is not unit attention and not an invalid descriptor. `0078` tried the
-SCSI `START STOP UNIT` command with START=1; the target rejected it with
-sense `05/24/00` (ILLEGAL REQUEST / invalid field in CDB), so that command
-is not supported in this device's initialization state. The Linux UFSHCD
-source shows the correct protocol sequence after link startup: NOP OUT,
-QUERY `SET_FLAG fDeviceInit`, then poll QUERY `READ_FLAG fDeviceInit` until
-the device clears it (`ufshcd_complete_dev_init()` in `drivers/ufs/core/ufshcd.c`).
-`0079` implements NOP OUT followed by the set/read query exchanges, and polls
-for up to 10 seconds before retrying TEST UNIT READY. The queries initialize
-the device; they do not write user storage blocks.
+This is not unit attention and not an invalid UTRD. `0078` tried START STOP
+on LUN 0 with START=1; the target rejected it with sense `05/24/00`
+(ILLEGAL REQUEST / invalid field in CDB). UniXNU's working NativeUfs driver
+on the related SM8550 records the actual state it saw: NOP OUT succeeds,
+`fDeviceInit=0`, `bCurrentPowerMode=0x33` (UFS-PowerDown), and each LU is
+NOT READY. Its wake sequence is READ ATTRIBUTE `bCurrentPowerMode` (opcode
+`0x03`, IDN `0x02`), then START STOP UNIT with power condition ACTIVE (`CDB
+byte 4 = 0x10`) directed to the UFS Device well-known LUN `0xd0`, wait 50 ms,
+then poll TUR on LUN 0. It explicitly does **not** restart the link or reset
+the controller when adopting the firmware state. `0082` follows that
+observed sequence; this is stronger evidence than our previous generic
+fDeviceInit guess. The UniXNU observation is on SM8550, so the next phone
+boot still has to confirm the same power-mode value and wake response on
+SM8475.
 
-The device-management QUERY uses the UPIU LUN `0x7f`: Linux issues these
-through its pseudo-SCSI device (`lun = U64_MAX`), and
-`ufshcd_scsi_to_upiu_lun()` maps that pseudo-LUN to `0x7f`. The first 0079
-query used LUN 0; `0080` corrects it and prints the exact query header and
-response if the device still rejects it.
-
-The 0080 phone photo confirms NOP OUT/IN succeeds, but SET_FLAG still gets a
-QUERY_RSP (`0x36`) with response `0xff` (general failure), even after the
-LUN correction. Linux's initialization sequence also sends UIC
-`DME_LINK_STARTUP` *before* NOP OUT / fDeviceInit. The driver had not sent
-that UIC command, so `0081` adds it and records the UIC result and HCS before
-retrying the device-management sequence.
+The 0080 photo confirms NOP OUT/IN succeeds, but SET_FLAG still gets a
+QUERY_RSP (`0x36`) with response `0xff` (general failure). The 0080 LUN
+`0x7f` was based on Linux's pseudo-SCSI device mapping; UniXNU's query helper
+leaves the query LUN at 0, so `0082` returns the power-mode query to LUN 0.
+Linux's full fresh-start path includes UIC `DME_LINK_STARTUP`, but the
+controller already answers NOP OUT and SCSI on this phone, and UniXNU's
+tested adoption path does not restart the firmware-established link. `0082`
+therefore drops the speculative UIC restart and tests the documented
+low-power wake command.
 
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
