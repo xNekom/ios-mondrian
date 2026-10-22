@@ -1,0 +1,102 @@
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -819,8 +819,65 @@
+ fbcon_receive_ready(void)
+ {
+ 	return 0;
++}
++
++/* Draw a string at a given row, without touching the console's cursor. */
++static void
++fbcon_draw_text(uint32_t row, const char *s)
++{
++	uint32_t col = 0;
++
++	fbcon_clear_row(row);
++	for (; *s != '\0' && col < fbcon_cols; s++, col++) {
++		const unsigned char *glyph = iso_font + (unsigned char)*s * 16;
++		uint32_t x0 = col * 8 * FBCON_SCALE, y0 = row * 16 * FBCON_SCALE;
++		for (uint32_t gy = 0; gy < 16; gy++) {
++			for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++				volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++				for (uint32_t gx = 0; gx < 8; gx++) {
++					uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++					for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++						line[gx * FBCON_SCALE + sx] = px;
++					}
++				}
++			}
++		}
++	}
+ }
+ 
++/*
++ * The beacon: painted from the timer interrupt, a few rows ahead of the
++ * console's cursor (the console will overwrite it when it gets there). It
++ * answers what a frozen screen cannot: is the CPU still taking interrupts,
++ * and what was it doing when they arrived? A beacon that stops advancing
++ * means the CPU is stuck; the PC it shows says where. No locks, no
++ * allocation: this runs in interrupt context.
++ */
++void
++mondrian_fbcon_beacon(uint64_t pc, uint64_t count)
++{
++	static const char hexd[] = "0123456789abcdef";
++	char line[48];
++	unsigned int n = 0;
++	uint32_t row;
++
++	if (fbcon_base == NULL || fbcon_rows < 8) {
++		return;
++	}
++	row = (fbcon_row + 24) % fbcon_rows;
++
++	line[n++] = 'I'; line[n++] = 'R'; line[n++] = 'Q'; line[n++] = ' ';
++	for (int i = 5; i >= 0; i--) {
++		line[n++] = hexd[(count >> (i * 4)) & 0xf];
++	}
++	line[n++] = ' '; line[n++] = 'P'; line[n++] = 'C'; line[n++] = ' ';
++	for (int i = 7; i >= 0; i--) {
++		line[n++] = hexd[(pc >> (i * 4)) & 0xf];
++	}
++	line[n] = '\0';
++	fbcon_draw_text(row, line);
++}
++
+ static uint8_t
+ fbcon_receive_data(void)
+ {
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -55,6 +55,7 @@
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
++void mondrian_fbcon_beacon(uint64_t pc, uint64_t count);
+ kern_return_t serial_irq_action(serial_device_t device);
+ bool serial_irq_filter(serial_device_t device);
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1874,13 +1874,13 @@
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		/*
+-		 * The beacon: painted from the timer interrupt into the two
+-		 * bottom rows the console does not use. If it keeps advancing
+-		 * the CPU is alive and the screen is alive, and the PC it shows
+-		 * is where the CPU was; if it stops, the CPU is stuck.
++		 * The beacon: painted from the timer interrupt, ahead of the
++		 * console's cursor. If it keeps advancing the CPU is alive and
++		 * the screen is alive, and the PC it shows is where the CPU
++		 * was; if it stops, the CPU is stuck.
+ 		 */
+ 		if ((++mondrian_irq_count & 0x3f) == 0) {
+-			mondrian_early_beacon(get_saved_state_pc(state), mondrian_irq_count);
++			mondrian_fbcon_beacon(get_saved_state_pc(state), mondrian_irq_count);
+ 		}
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();

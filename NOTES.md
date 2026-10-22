@@ -153,6 +153,31 @@ add two more diagnostics:
   over (`mondrian_early_panic` used to be disabled with the early console),
   so a panic is visible even if the console is what died.
 
+### 2026-10-22 07:30: the alias still does not exist; the beacon moves into the console
+
+The kernel with `0064`/`0065`/`0066` (CI `39687189369`) boots **exactly** as
+before: the screen ends at `MONDRIAN CPU: 1/1 CPUs initialized, SGI1 verified`
+and **no beacon appears**. So the alias was still not installed: the console
+kept the PE's `ml_io_map_wcomb()` mapping and the beacon, which drew through
+the alias, had nothing to draw on.
+
+Where the alias is installed is now known: `arm_vm_init()` sets up the low
+globals' L2 table *before* the physmap exists, and the alias needs the L1
+entry that `arm_vm_physmap_init()` creates (the kernel image and the low
+globals share the 1GB entry `0xfffffff000000000`). The order in `0066` is
+right (after the physmap), but the L2 table is reached through
+`phystokv()`, which returns an *aperture* address that is not mapped until
+TTBR1 points at the final table - so the check reads garbage and gives up.
+`0066` reads the table by its physical address instead (the bootstrap
+aperture is still VA=PA at that point).
+
+Even so, the beacon stayed invisible, so `0067` paints it **from inside the
+console** (`mondrian_fbcon_beacon()` in `pe_serial.c`, using the mapping the
+console itself uses, a few rows *ahead* of the console cursor so the console
+cannot hide it). The timer interrupt calls it every 64 interrupts with the
+interrupted PC: if it advances, the CPU is alive and the PC says where; if
+it stops, the CPU is stuck.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
