@@ -1,0 +1,58 @@
+xnu 0084: paint colour bars where the console never draws
+
+The panel's byte order and stride are only checkable from a photo. Four
+bars (red, green, blue, white) fill the rows the console keeps free at
+the bottom, drawn with a zero top byte so their presence also says
+whether the panel honours alpha.
+
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -783,7 +783,39 @@
+ 	fbcon_clear_row(fbcon_row);
+ }
+ 
++/*
++ * Colour and geometry self-test, painted once when the console starts.
++ *
++ * A photo of the phone is the only way to know what the panel really shows,
++ * and the two rows the console keeps free at the bottom are the only place
++ * the text never overwrites. Four bars, left to right: red, green, blue,
++ * white. They are written with a zero top byte, so if they appear at all
++ * the panel ignores alpha; if the order is not red-green-blue-white, the
++ * byte order in the ADT is wrong; if a bar is missing or starts short, the
++ * width or the stride is wrong. All of that has to be known before the
++ * userland framebuffer driver starts writing pixels.
++ */
+ static void
++fbcon_paint_colour_bars(void)
++{
++	static const uint32_t bars[4] = {
++		0x00ff0000u,            /* red */
++		0x0000ff00u,            /* green */
++		0x000000ffu,            /* blue */
++		0x00ffffffu             /* white */
++	};
++	uint32_t y0 = fbcon_rows * 16 * FBCON_SCALE;
++
++	for (uint32_t y = y0; y < fbcon_height; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = bars[(uint64_t)x * 4 / fbcon_width];
++		}
++	}
++	__builtin_arm_dsb(0xf);
++}
++
++static void
+ fbcon_init(void)
+ {
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+@@ -796,6 +828,7 @@
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
++	fbcon_paint_colour_bars();
+ }
+ 
+ static unsigned int

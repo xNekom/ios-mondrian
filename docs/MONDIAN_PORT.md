@@ -376,18 +376,53 @@ prints the same "userdata on LUN 0" line as on sweet.
 
 Sweet's panel is an LCD in DSC video mode: the bootloader leaves a
 framebuffer at 0x9c000000 and the kernel copies the rendered image into it
-(0046, 0056, 0079). Mondrian's panel is an AMOLED behind a DSI D-PHY: the
-image has to be sent to the DSI controller (MDSS 0x0ae00000, DPU 0x0ae01000)
-as command mode packets, with the panel's own timing.
+(0046, 0056, 0079). Imported from the live device tree of mondrian:
+`cont_splash_region` at **0xB8000000, 0x2B00000 (43 MiB)**, and the console
+has been drawing into it since the first phone boot
+(`initialize_screen: b=B8000000`), at 1440x3200, stride 5760.
 
-**TODO:** find out what the ABL leaves behind. On some Qualcomm devices the
-bootloader draws the splash into a "sec boot screen" region; the address and
-its geometry have to be read from the device. The shim prints the device
-tree of the phone, which is where to look.
+That is the same situation as the sweet, and it is the important finding:
+mondrian's panel is AMOLED behind a DSI D-PHY in command mode with DSC, but
+the ABL has already brought the whole pipe up (DSI, DSC, MDP scanout) and
+the display hardware keeps scanning the reserved buffer out of RAM on its
+own. Nothing in XNU touches the DISP clocks or the DSI controller, so the
+scanout survives the kernel: a photo taken minutes into a boot shows the
+current text, not a frozen splash. A linear framebuffer therefore exists on
+this phone too, which is what the userland framebuffer driver needs, and the
+MDSS/DSI driver is **not** on the critical path for the lockscreen.
 
-Until then, the early console (0010, 0012) is the only way to see the kernel.
+What has to be true for that to keep working:
+
+* The buffer must never be handed out as free RAM. The boot arguments
+  describe the whole window as memory, so `pmap_next_page()` is taught to
+  step over the region (`0083`); the PE reads the extent from the ADT.
+* The byte order and the stride have to be known before userland writes
+  pixels. `0084` paints four bars (red, green, blue, white) in the two rows
+  the console leaves free at the bottom of the screen: one photo then says
+  whether the packing is XRGB or XBGR, whether alpha is honoured, and
+  whether the width is the whole panel.
+* The screen must not go idle. Idle power collapse is a feature of the
+  display driver, which is not loaded here; the ABL does not enable it,
+  so the scanout is expected to persist. If the panel ever stops (blank or
+  frozen after a while), that is the signal to write the DSI driver.
+
+`0085` is sweet's IOSurface + IOMobileFramebuffer pair ported to this
+board: `AppleCLCD` matches `/arm-io/disp0` (`compatible = mondrian,display`,
+already in the ADT from `mkadt.py`), publishes the panel memory as an
+IOSurface, and presents by copying the enabled layers into it. Only the
+geometry changed (1440x3200 at 526 ppi, not 1080x2400 at 395). It is
+untested on hardware and lives on its own branch until the root mounts.
 
 **Check:** the iOS home screen appears on the phone.
+
+**Fallback, only if the scanout dies:** an MDSS driver — the
+`qcom,mdss_mdp@ae00000` node (0x0AE00000 + 0x84000, VBIF at 0x0AEB0000,
+regDMA at 0x0AEAC000), the panel `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`
+(`msm_drm.dsi_display0` in the boot arguments), and the gamma/LUT and DSC
+tables from the vendor tree. The DSI and DSI-PHY nodes are not in the live
+DTB the ABL passes (it is trimmed), so their registers would have to come
+from the `mondrian-s-oss` device tree. Weeks of work; it is not needed if
+the splash keeps running.
 
 ### 5. The touch
 

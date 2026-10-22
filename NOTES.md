@@ -7,6 +7,47 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-22 15:30: the display is not a driver problem (0083/0084, 0085)
+
+**Finding, from the live device tree and from the phone itself:** the ABL
+leaves `cont_splash_region` at **0xB8000000, size 0x2B00000** and the
+display hardware (MDP -> DSC -> DSI -> AMOLED panel in command mode) keeps
+scanning that buffer out of RAM after we jump to XNU. The kernel console
+has been drawing into it on every boot since 2026-10-21 and the text is
+current minutes later, so mondrian effectively has the **same linear
+framebuffer sweet has**, at 1440x3200, stride 5760, just in a 43 MiB
+reserved window instead of sweet's 0x9C000000. The MDSS/DSI driver that
+`docs/MONDIAN_PORT.md` used to list as weeks of work is therefore **not** on
+the path to the lockscreen; it is only the fallback if the scanout ever
+stops.
+
+Three consequences, and the patches that follow from them:
+
+* `0083` — the buffer must not be free RAM. The boot arguments describe the
+  whole window as memory, so `pmap_next_page()` now steps over the region
+  the PE read from the ADT (`mondrian-fbcon` reg). Without this the page
+  allocator eventually reaches 0xB8000000 and the screen becomes whatever
+  the kernel stores there. Untested on the phone yet.
+* `0084` — colour self-test. Four bars (red, green, blue, white) are painted
+  in the two rows the console keeps free at the bottom, with a zero top
+  byte. From one photo: XRGB vs XBGR, whether alpha is honoured, and whether
+  1440 is really the live width. Do this before the userland driver writes
+  pixels.
+* `0085` — sweet's IOSurface + IOMobileFramebuffer pair, ported:
+  `AppleCLCD` matches `/arm-io/disp0` (`compatible = mondrian,display`,
+  already emitted by `mkadt.py`), publishes the panel memory as an
+  IOSurface and presents by copying the enabled layers into it. Geometry
+  1440x3200 @ 526 ppi. It needs the platform expert to publish the
+  `/arm-io` children (the hunk from sweet 0046), which `0085` also does.
+  **On branch `display`, not on `mondrian`, until the UFS root mounts** —
+  it is 1400 lines of untested code and must not be able to break the UFS
+  iteration.
+
+Status of the UFS blocker is unchanged: `0082` (wake the LU through the
+device WLUN 0xD0 with START STOP ACTIVE, per UniXNU's observed SM8550
+sequence) is the run to watch; `0081`'s job was `cancelled` by the
+concurrency group when 0082 was pushed, not a build failure.
+
 ## 2026-10-21: the kernel runs on the phone. Read this before touching the window
 
 **The kernel boots on the phone** (2026-10-21). The ABL loads the shim, the

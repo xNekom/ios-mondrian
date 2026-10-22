@@ -1,0 +1,158 @@
+xnu 0083: keep the panel's memory out of the page allocator
+
+The ABL leaves the continuous-splash buffer mapped and the display
+hardware keeps scanning it out of RAM: the kernel console draws into it
+now, and the userland framebuffer driver will do the same. The boot
+arguments describe the whole window as free RAM, so the page allocator
+would eventually hand those pages out and the screen would turn into
+whatever the kernel stored there. The PE records the region from the ADT
+while it maps the console, and pmap_next_page() steps over it.
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2602,7 +2602,39 @@
+ 
+ /**
+  * Prepare bad ram pages to be skipped.
++ */
++
++#if defined(MONDRIAN)
++/*
++ * The phone's panel is scanned out of the ABL's continuous-splash buffer by
++ * the display hardware, and the kernel draws into it (the framebuffer
++ * console now, IOMobileFramebuffer later). Nothing in the boot arguments
++ * says that, so the whole window arrives as RAM: once allocations reach the
++ * buffer the screen would turn into whatever the kernel stored there. The
++ * PE recorded the region from the ADT (pe_serial.c); skip it here.
++ *
++ * Both ends are page aligned, so the hole is a whole number of pages.
+  */
++extern uint64_t mondrian_fb_reserved_start(void);
++extern uint64_t mondrian_fb_reserved_end(void);
++
++static pmap_paddr_t
++mondrian_ram_skipped(
++	pmap_paddr_t first,
++	pmap_paddr_t end)
++{
++	pmap_paddr_t fb_start = (pmap_paddr_t)mondrian_fb_reserved_start();
++	pmap_paddr_t fb_end = (pmap_paddr_t)mondrian_fb_reserved_end();
++	pmap_paddr_t lo, hi;
++
++	if ((fb_start >= fb_end) || (fb_end <= first) || (fb_start >= end)) {
++		return 0;
++	}
++	lo = (fb_start > first) ? fb_start : first;
++	hi = (fb_end < end) ? fb_end : end;
++	return (hi > lo) ? (hi - lo) : 0;
++}
++#endif /* MONDRIAN */
+ 
+ /*
+  * Initialize the count of available pages. No lock needed here,
+@@ -2618,6 +2650,9 @@
+ 	assert(first == (first & ~PAGE_MASK));
+ 	assert(end == (end & ~PAGE_MASK));
+ 	avail_page_count = atop(end - first);
++#if defined(MONDRIAN)
++	avail_page_count -= atop(mondrian_ram_skipped(first, end));
++#endif /* MONDRIAN */
+ 
+ 	need_ram_ranges_init = false;
+ }
+@@ -2639,7 +2674,12 @@
+ 	if (need_ram_ranges_init) {
+ 		initialize_ram_ranges();
+ 	}
+-	return (unsigned int)atop(avail_end - first_avail);
++	return (unsigned int)atop(avail_end - first_avail) -
++#if defined(MONDRIAN)
++	    (unsigned int)atop(mondrian_ram_skipped(first_avail, avail_end));
++#else
++	    0;
++#endif /* MONDRIAN */
+ }
+ 
+ 
+@@ -2662,6 +2702,22 @@
+ 
+ 
+ 	if (first_avail != avail_end) {
++#if defined(MONDRIAN)
++		/*
++		 * Step over the panel's memory instead of handing it out. The
++		 * page count above already left it out, so nothing else has to
++		 * change; the walk simply continues above the hole.
++		 */
++		pmap_paddr_t fb_end = (pmap_paddr_t)mondrian_fb_reserved_end();
++		if ((first_avail >= (pmap_paddr_t)mondrian_fb_reserved_start()) &&
++		    (first_avail < fb_end)) {
++			first_avail = (fb_end < avail_end) ? fb_end : avail_end;
++			if (first_avail == avail_end) {
++				assert(avail_page_count == 0);
++				return FALSE;
++			}
++		}
++#endif /* MONDRIAN */
+ 		*pnum = (ppnum_t)atop(first_avail);
+ 		first_avail += PAGE_SIZE;
+ 		assert(avail_page_count > 0);
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -726,6 +726,25 @@
+ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++/*
++ * The physical extent of the panel's memory, as the ADT states it. The MDP
++ * scans that region out of RAM by itself, so it is not free memory: the
++ * page allocator has to skip it (see pmap_next_page()). Zero until
++ * fbcon_probe() has read the node.
++ */
++static uint64_t fbcon_phys_base, fbcon_phys_end;
++
++uint64_t
++mondrian_fb_reserved_start(void)
++{
++	return fbcon_phys_base;
++}
++
++uint64_t
++mondrian_fb_reserved_end(void)
++{
++	return fbcon_phys_end;
++}
+ 
+ static void
+ fbcon_clear_row(uint32_t row)
+@@ -930,6 +949,15 @@
+ 	}
+ 	mondrian_early_mark(17, "fbcon config read; mapping");
+ 	/*
++	 * The panel memory is reserved from here on: arm_init() has already
++	 * read this node when the page allocator starts counting pages
++	 * (vm_page_bootstrap), so the whole region is skipped there instead of
++	 * being handed to the VM as free RAM.
++	 */
++	fbcon_phys_base = reg[0];
++	fbcon_phys_end = reg[0] + reg[1];
++	mondrian_early_mark(19, "panel memory is not RAM");
++	/*
+ 	 * The reserved kernel alias of the framebuffer, not a page-table
+ 	 * mapping: the alias lives in the low globals the VM never reuses, so
+ 	 * it cannot be torn down under the console while the kernel runs. The
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -56,6 +56,9 @@
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+ void mondrian_fbcon_beacon(uint64_t pc, uint64_t count);
++/* The panel's memory, which the page allocator must not hand out. */
++uint64_t mondrian_fb_reserved_start(void);
++uint64_t mondrian_fb_reserved_end(void);
+ kern_return_t serial_irq_action(serial_device_t device);
+ bool serial_irq_filter(serial_device_t device);
+ 
