@@ -327,6 +327,25 @@ clock came up.
 console blanks the screen when it is full and a panic is longer than the
 screen: without it the last line is only the URL.
 
+### 2026-10-22 11:25: the GCC clock works; the target reports CHECK CONDITION
+
+With `0076` (CI `39751846288`), the photo confirms that enabling GCC branch
+`0x870` brought the host up:
+
+    hce 0x1 hcs 0x10f cap 0x1587031f ver 0x300
+    scsi 0x00 answered ocs 0x0 upiu 0x21
+    host: hce 0x1 hcs 0x10f is 0x0 cnr 0x1 iacr 0x0
+    host: list 0:b2362000 rsr 0x1 dbr 0x0
+
+The host now sees our UTRD, completes the command, and returns a valid
+response UPIU. The remaining error is from the **UFS device**, not the
+controller: UPIU response code `1` (TARGET FAILURE), SCSI status `2` (CHECK
+CONDITION). The probe currently retries TEST UNIT READY three times, but
+does not issue REQUEST SENSE, so the reason (likely unit attention, but not
+yet observed) is still unknown. `0077` prints the response's sense length,
+key, ASC and ASCQ and includes them in the final panic reason. Do not assume
+unit attention until those bytes are read.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
