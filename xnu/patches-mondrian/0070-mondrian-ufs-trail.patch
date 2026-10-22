@@ -1,0 +1,164 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -42,6 +42,10 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* pexpert/arm/pe_fiq.c and osfmk/arm64/sleh.c: what the interrupts and the
++ * GIC actually look like on this phone. */
++extern void pe_mondrian_gic_dump(void);
++extern void mondrian_irq_dump(void);
+ 
+ #define REG_IS          0x20
+ #define REG_IE          0x24
+@@ -192,6 +196,7 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
++	printf("MONDRIAN UFS: scsi 0x%02x sent, waiting\n", cdb[0]);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -213,6 +218,7 @@
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	printf("MONDRIAN UFS: scsi 0x%02x answered ocs 0x%x upiu 0x%x\n", cdb[0], ocs, ucd->resp[0]);
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("MONDRIAN UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+@@ -243,9 +249,11 @@
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
++	printf("MONDRIAN UFS: GPT header read, error %d\n", error);
+ 	if (error) {
+ 		return error;
+ 	}
++	printf("MONDRIAN UFS: GPT signature %.8s\n", (const char *)b);
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+ 		printf("MONDRIAN UFS: LUN %u has no GPT\n", su.lun);
+ 		UFS_WHY("LUN %u has no GPT", su.lun);
+@@ -299,6 +307,7 @@
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
++	printf("MONDRIAN UFS: hce 0x%x hcs 0x%x\n", hce, hcs);
+ 	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
+ 		printf("MONDRIAN UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		UFS_WHY("host not ready: hce 0x%x hcs 0x%x", hce, hcs);
+@@ -502,6 +511,9 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
++	printf("MONDRIAN UFS: probe start\n");
++	pe_mondrian_gic_dump();
++	mondrian_irq_dump();
+ 	if (SecureDTLookupEntry(NULL, "/mondrian-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+@@ -509,21 +521,26 @@
+ 		UFS_WHY("no /mondrian-ufs node in the ADT");
+ 		return ENXIO;
+ 	}
++	printf("MONDRIAN UFS: node at %llx size %u\n", (uint64_t)reg[0], size);
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	printf("MONDRIAN UFS: regs mapped at %llx\n", (uint64_t)su.regs);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("MONDRIAN UFS: no contiguous DMA memory\n");
+ 		return ENOMEM;
+ 	}
++	printf("MONDRIAN UFS: dma at %llx\n", (uint64_t)su.dma);
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
+ 	if (!pn) {
++		printf("MONDRIAN UFS: no physical address for the DMA memory\n");
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
++	printf("MONDRIAN UFS: dma pa 0x%llx, taking over the host\n", (uint64_t)su.dma_pa);
+ 
+ 	lck_mtx_lock(&mondrian_ufs_lock);
+ 	error = ufs_take_over_host();
+@@ -538,6 +555,7 @@
+ 	}
+ 	lck_mtx_unlock(&mondrian_ufs_lock);
+ 	if (error) {
++		printf("MONDRIAN UFS: probe failed: %d (%s)\n", error, ufs_why);
+ 		return error;
+ 	}
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1846,6 +1846,28 @@
+ 
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
++}
++
++#if defined(MONDRIAN)
++/* The INTIDs that actually arrive, so that a late print can say whether
++ * the timer ever interrupted. */
++static uint32_t mondrian_intids[8];
++static unsigned int mondrian_intid_n;
++#endif
++
++/*
++ * The INTIDs that arrived, printed late (the UFS probe calls this): with
++ * the timer in there, the timer interrupt works; without it, the timer is
++ * not reaching the CPU at all.
++ */
++void
++mondrian_irq_dump(void)
++{
++#if defined(MONDRIAN)
++	for (unsigned int i = 0; i < 8; i++) {
++		kprintf("MONDRIAN IRQ: %u intid %u\n", i, mondrian_intids[(mondrian_intid_n + i) % 8]);
++	}
++#endif
+ }
+ 
+ void
+@@ -1866,6 +1888,8 @@
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
++	mondrian_intids[mondrian_intid_n++ % 8] = intid;
++
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -73,7 +73,24 @@
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++/* What the GIC really looks like from the non-secure side, and whether the
++ * timer has fired. Printed by the UFS probe, which is late enough in the
++ * boot for the screen to still show it. */
+ void
++pe_mondrian_gic_dump(void)
++{
++#if defined(MONDRIAN)
++	if (!gicd_base) {
++		return;
++	}
++	kprintf("MONDRIAN GIC: vtimer %u GICR_IGROUPR0=%x GICD_IGROUPR=%x GICD_CTLR=%x timer_pending=%d\n",
++	    mondrian_vtimer_intid, gicr_read32(GICR_IGROUPR0),
++	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
++	    ml_get_timer_pending());
++#endif
++}
++
++void
+ pe_init_fiq()
+ {
+ 	int error;
