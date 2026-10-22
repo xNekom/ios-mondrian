@@ -1,0 +1,67 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,7 +78,7 @@
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2274,6 +2274,18 @@
+ 
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
+ #if defined(MONDRIAN)
++	/*
++	 * The virtual timer interrupt has to be unmasked for EL1 explicitly.
++	 * On sweet the kernel gets the timer from the bootloader with no
++	 * hypervisor in between and CNTV_CTL_EL0.ENABLE is enough; on this
++	 * phone the hypervisor (QHEE) only delivers the timer interrupt to
++	 * the guest once the guest has unmasked it for EL1. Until it does,
++	 * no timeout ever expires: the boot then waits forever in
++	 * IOKitInitializeTime() for the RTC that this phone does not have.
++	 */
++	uint64_t cntvctl1 = CNTV_CTL_EL1_ENABLE | CNTV_CTL_EL1_EL1IRQEN;
++
++	__builtin_arm_wsr64("CNTV_CTL_EL1", cntvctl1);
+ 	/*
+ 	 * The Qualcomm hypervisor (QHEE) on this phone reports an EL1 access
+ 	 * to the physical timer as an undefined instruction instead of
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -1970,6 +1970,10 @@
+ #define CNTV_CTL_EL0_ISTATUS     (0x1 << 2)           /* (read only): whether interrupt asserted */
+ #define CNTV_CTL_EL0_IMASKED     (0x1 << 1)           /* 1: interrupt masked */
+ #define CNTV_CTL_EL0_ENABLE      (0x1 << 0)           /* 1: virtual timer enabled */
++
++#define CNTV_CTL_EL1_ISTATUS     (0x1 << 2)           /* (read only): whether interrupt asserted */
++#define CNTV_CTL_EL1_EL1IRQEN    (0x1 << 1)           /* 1: timer interrupt enabled to EL1 */
++#define CNTV_CTL_EL1_ENABLE      (0x1 << 0)           /* 1: virtual timer enabled */
+ 
+ #define CNTP_CTL_EL0_ISTATUS     CNTV_CTL_EL0_ISTATUS
+ #define CNTP_CTL_EL0_IMASKED     CNTV_CTL_EL0_IMASKED
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -176,6 +176,15 @@
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << mondrian_vtimer_intid) | (1U << MONDRIAN_IPI_SGI));
++	/*
++	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
++	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
++	 * set below), so a timer left in Group 0 never interrupts. Print the
++	 * registers to see what the hypervisor really did with the write.
++	 */
++	kprintf("MONDRIAN GIC: vtimer %u GICR_IGROUPR0=%x GICD_IGROUPR=%x GICD_CTLR=%x\n",
++	    mondrian_vtimer_intid, gicr_read32(GICR_IGROUPR0),
++	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR));
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
