@@ -386,6 +386,14 @@ It is the first thing to port once the partition reads, because from the
 moment userland starts, a panic there is only visible through it — the phone
 console cannot scroll and the USB stack is not up.
 
+**Known debt in the GPT reader.** `ufs_find_partition()` bounds the entry
+table with `nent * esz > BOUNCE_SIZE`, but the product is 32-bit: a corrupt
+table with `nent` a multiple of 2^25 makes it wrap to a small number, the
+check passes, the read asks for zero blocks and the loop then walks `nent`
+entries past the bounce buffer — a fault that would look like a UFS failure.
+Guard with `nent > BOUNCE_SIZE / esz` *before* multiplying, in the same patch
+that enables writes (when a corrupted table stops being hypothetical).
+
 ### 4. The display
 
 Sweet's panel is an LCD in DSC video mode: the bootloader leaves a
