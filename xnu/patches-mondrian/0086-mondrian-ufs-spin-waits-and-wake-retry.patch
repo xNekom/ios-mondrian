@@ -1,0 +1,335 @@
+xnu 0086: waits that do not need the clock, and both UFS wake attempts
+
+0082 froze the boot on its first SCSI command: the wait loop used
+mach_absolute_time() and delay(), the first place in the boot that does,
+and this board's timebase is exactly what has never been shown to work
+(the timer interrupt has never been seen). Every wait in the driver now
+counts CPU spins, and a one-off calibration prints how many counter ticks
+two million spins take, so the boot says whether the counter moves.
+
+The wake sequence is also made harmless: START STOP UNIT on the device
+WLUN 0xD0 is sent and its completion is waited for only briefly (a device
+that does not answer must not hang the boot), then TEST UNIT READY is
+retried, and if the unit stays asleep the wake is tried again on LUN 0.
+It also prints what 0082 never printed: the power mode and fDeviceInit
+before the wake, the sense of the first TEST UNIT READY, and the state of
+every command that never completes (HCS, IS, doorbell, UTRD), so one boot
+answers where the truth is.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -79,6 +79,73 @@
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ 
+ /*
++ * Waits here count CPU spins, not nanoseconds. This board's timebase is not
++ * trusted yet: the timer interrupt has never been seen, and 0082 froze the
++ * boot at its first SCSI command printing "scsi 0x1b sent, waiting", which
++ * is exactly the first place that called mach_absolute_time() and delay().
++ * Whatever is wrong with the clock, a spin-counted wait still finishes, and
++ * the calibration below says whether the counter ticks at all.
++ */
++static uint64_t ufs_spins_per_ms = 20000;       /* fallback: ~20MHz spin */
++
++static void
++ufs_calibrate_spins(void)
++{
++	const unsigned long n = 2000000;
++	uint32_t freq = gPEClockFrequencyInfo.timebase_frequency_hz;
++	uint64_t t0 = mach_absolute_time();
++	uint64_t t1, ticks, elapsed_ms;
++
++	for (unsigned long i = 0; i < n; i++) {
++		__builtin_arm_yield();
++	}
++	t1 = mach_absolute_time();
++	ticks = t1 - t0;
++	printf("MONDRIAN UFS: clock: %llu ticks for %lu spins, timebase %u Hz\n",
++	    ticks, n, freq);
++	if (ticks != 0 && freq > 1000) {
++		elapsed_ms = ticks * 1000ull / freq;
++		if (elapsed_ms == 0) {
++			elapsed_ms = 1;
++		}
++		ufs_spins_per_ms = n / elapsed_ms;
++		if (ufs_spins_per_ms == 0) {
++			ufs_spins_per_ms = 1;
++		}
++		printf("MONDRIAN UFS: clock: %llu spins per millisecond\n",
++		    ufs_spins_per_ms);
++	} else {
++		printf("MONDRIAN UFS: clock: the counter does not tick (or has no"
++		    " frequency); waits stay spin-counted\n");
++	}
++}
++
++static void
++ufs_spin_ms(unsigned int ms)
++{
++	uint64_t n = ufs_spins_per_ms * (ms ? ms : 1);
++
++	for (uint64_t i = 0; i < n; i++) {
++		__builtin_arm_yield();
++	}
++}
++
++/* Wait for slot 0's doorbell bit to clear, i.e. for the host to finish. */
++static int
++ufs_wait_done(unsigned int ms)
++{
++	uint64_t n = ufs_spins_per_ms * (ms ? ms : 1);
++
++	while (n-- > 0) {
++		if (!(ufs_rd(REG_UTRLDBR) & 1)) {
++			return 1;
++		}
++		__builtin_arm_yield();
++	}
++	return 0;
++}
++
++/*
+  * UFS 3.x transfer request descriptor: 16 dwords (64 bytes). UFS 2.1 used
+  * 8 dwords; 3.x adds the task tag, which the host and the device both
+  * require, plus the racing buffer fields.
+@@ -208,17 +275,23 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+-	printf("MONDRIAN UFS: scsi 0x%02x sent, waiting\n", cdb[0]);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		if (mach_absolute_time() > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("MONDRIAN UFS: command 0x%02x timed out\n", cdb[0]);
+-			return ETIMEDOUT;
+-		}
+-		delay(1);
++	printf("MONDRIAN UFS: scsi 0x%02x on LUN 0x%02x sent, waiting\n", cdb[0], lun);
++	if (!ufs_wait_done(500)) {
++		/*
++		 * The host never finished the request. Print what it did with
++		 * it: the doorbell, the status, and the descriptor as the host
++		 * left it (0xf in dw2 means the host never even looked at it).
++		 */
++		printf("MONDRIAN UFS: scsi 0x%02x never completed: hcs 0x%x is 0x%x"
++		    " dbr 0x%x\n", cdb[0], ufs_rd(REG_HCS), ufs_rd(REG_IS),
++		    ufs_rd(REG_UTRLDBR));
++		printf("MONDRIAN UFS: utrd %08x %08x %08x %08x cnr %x\n",
++		    utrd->dw0, utrd->dw1, utrd->dw2, utrd->dw3, ufs_rd(REG_UTRLCNR));
++		printf("MONDRIAN UFS: upiu %02x %02x %02x %02x\n",
++		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3]);
++		ufs_wr(REG_UTRLCLR, ~1u);
++		UFS_WHY("scsi 0x%02x on LUN 0x%02x never completed", cdb[0], lun);
++		return ETIMEDOUT;
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+@@ -298,16 +371,10 @@
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	printf("MONDRIAN UFS: NOP OUT sent\n");
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		if (mach_absolute_time() > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			UFS_WHY("NOP OUT timeout");
+-			return ETIMEDOUT;
+-		}
+-		delay(1);
++	if (!ufs_wait_done(500)) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++		UFS_WHY("NOP OUT timeout");
++		return ETIMEDOUT;
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+@@ -323,14 +390,17 @@
+ 	return 0;
+ }
+ 
+-/* UFS device-management QUERY READ ATTRIBUTE. */
++/*
++ * UFS device-management QUERY READ: an attribute (opcode 0x03) or a flag
++ * (0x05). Both put the value in the same place of the response UPIU.
++ */
+ static int
+-ufs_query_read_attr(uint8_t idn, uint32_t *value)
++ufs_query_read(uint8_t opcode, uint8_t idn, const char *what, uint32_t *value)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD;
+-	const uint8_t opcode = 0x03;          /* READ ATTRIBUTE */
++
+ 	if (value == NULL) {
+ 		return EINVAL;
+ 	}
+@@ -353,17 +423,11 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+-	printf("MONDRIAN UFS: query READ ATTRIBUTE idn 0x%x sent\n", idn);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
+-		if (mach_absolute_time() > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
+-			UFS_WHY("query READ ATTRIBUTE timeout");
+-			return ETIMEDOUT;
+-		}
+-		delay(1);
++	printf("MONDRIAN UFS: query %s (op 0x%x idn 0x%x) sent\n", what, opcode, idn);
++	if (!ufs_wait_done(500)) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++		UFS_WHY("query %s timeout", what);
++		return ETIMEDOUT;
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+@@ -375,16 +439,16 @@
+ 		printf("MONDRIAN UFS: query req %02x %02x %02x %02x func %02x op/idn %02x/%02x\n",
+ 		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3], ucd->cmd[5],
+ 		    ucd->cmd[12], ucd->cmd[13]);
+-		printf("MONDRIAN UFS: query failed ocs 0x%x upiu 0x%x response 0x%x rsp op/idn %02x/%02x\n",
+-		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[12], ucd->resp[13]);
+-		UFS_WHY("query READ ATTRIBUTE %x: ocs %x upiu %x response %x rsp %x/%x",
+-		    idn,
+-		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[12], ucd->resp[13]);
++		printf("MONDRIAN UFS: query %s failed ocs 0x%x upiu 0x%x response 0x%x"
++		    " rsp op/idn %02x/%02x\n", what, ocs, ucd->resp[0], ucd->resp[6],
++		    ucd->resp[12], ucd->resp[13]);
++		UFS_WHY("query %s: ocs %x upiu %x response %x rsp %x/%x",
++		    what, ocs, ucd->resp[0], ucd->resp[6], ucd->resp[12], ucd->resp[13]);
+ 		return EIO;
+ 	}
+ 	*value = ((uint32_t)ucd->resp[20] << 24) | ((uint32_t)ucd->resp[21] << 16) |
+ 	    ((uint32_t)ucd->resp[22] << 8) | ucd->resp[23];
+-	printf("MONDRIAN UFS: bCurrentPowerMode 0x%x\n", *value);
++	printf("MONDRIAN UFS: %s 0x%x\n", what, *value);
+ 	return 0;
+ }
+ 
+@@ -533,7 +597,7 @@
+ 			if ((hce & 1) && (hcs & HCS_DP)) {
+ 				break;
+ 			}
+-			delay(1);
++			__builtin_arm_yield();
+ 		}
+ 		printf("MONDRIAN UFS: after enabling: hce 0x%x hcs 0x%x\n", hce, hcs);
+ 	}
+@@ -789,37 +853,82 @@
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+-		uint32_t power = 0;
+-		/* The firmware leaves the UFS LU in PowerDown on this platform. */
++		static const uint8_t start_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++		uint32_t power = 0, flag = 0;
++		int tur_error;
++
++		ufs_calibrate_spins();
+ 		error = ufs_nop_out();
+ 		if (!error) {
+-			error = ufs_query_read_attr(0x02, &power); /* bCurrentPowerMode */
++			error = ufs_query_read(0x03, 0x02, "bCurrentPowerMode", &power);
+ 		}
+-		if (!error && (power & 0xff) != 0x11) {       /* UFS_ACTIVE_PWR_MODE */
+-			static const uint8_t start_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+-			printf("MONDRIAN UFS: power mode 0x%x; START STOP ACTIVE on WLUN 0xd0\n",
+-			    power & 0xff);
+-			error = ufs_scsi(0xd0, start_active, sizeof(start_active), 0);
+-			if (!error) {
+-				delay(50000);                 /* allow the UFS device to wake */
+-			}
++		if (!error) {
++			/* 0 means the device already ran its own initialization; 1
++			 * means it wants a SET FLAG, which this driver has never
++			 * managed to send in a form the device accepted. */
++			(void)ufs_query_read(0x05, 0x01, "fDeviceInit", &flag);
+ 		}
+ 		if (!error) {
+-			error = ETIMEDOUT;
+-			for (int i = 0; i < 20; i++) {
+-				int tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
+-				if (!tur_error) {
+-					error = 0;
+-					break;
+-				}
+-				if (tur_error != EAGAIN) {
+-					error = tur_error;
+-					break;
+-				}
+-				delay(10000);                /* 10 ms, as in the native UFS bring-up */
++			/*
++			 * What the LU says about itself before anything is sent
++			 * to it: the sense here is the baseline the retries below
++			 * are compared against, and 0082 never printed it.
++			 */
++			tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
++			printf("MONDRIAN UFS: before any wake: TUR %d, power 0x%x,"
++			    " fDeviceInit 0x%x\n", tur_error, power & 0xff, flag & 1);
++			if (tur_error == 0) {
++				error = 0;
++			} else {
++				/*
++				 * The firmware leaves the UFS device in PowerDown on
++				 * this platform (bCurrentPowerMode 0x33). The native
++				 * bring-up for this SoC wakes it with START STOP UNIT,
++				 * power condition active, addressed to the device
++				 * well-known LUN 0xD0. The device does not always
++				 * answer that command: 0082 waited for a completion
++				 * for ever, which is why a wake that never completes
++				 * is not fatal here. The wake is tried twice -- on the
++				 * device WLUN and then on LUN 0 itself -- and TEST
++				 * UNIT READY decides, not the wake command.
++				 */
++				for (unsigned int round = 0; round < 2; round++) {
++					uint8_t wake_lun = (round == 0) ? 0xd0 : (uint8_t)su.lun;
++					int wake = ufs_scsi(wake_lun, start_active,
++					    sizeof(start_active), 0);
++
++					printf("MONDRIAN UFS: START STOP ACTIVE on LUN 0x%02x: %d\n",
++					    wake_lun, wake);
++					error = ETIMEDOUT;
++					for (int i = 0; i < 20; i++) {
++						tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
++						if (!tur_error) {
++							error = 0;
++							break;
++						}
++						if (tur_error != EAGAIN && tur_error != ETIMEDOUT) {
++							error = tur_error;
++							break;
++						}
++						ufs_spin_ms(25);
++					}
++					if (!error) {
++						printf("MONDRIAN UFS: LUN %u answered after the"
++						    " wake on 0x%02x\n", su.lun, wake_lun);
++						break;
++					}
++					printf("MONDRIAN UFS: LUN %u still not ready after the"
++					    " wake on 0x%02x\n", su.lun, wake_lun);
++				}
+ 			}
+-			if (error == ETIMEDOUT) {
+-				UFS_WHY("LUN %u stayed PowerDown after START STOP ACTIVE", su.lun);
++			if (!error) {
++				(void)ufs_query_read(0x03, 0x02, "bCurrentPowerMode", &power);
++				(void)ufs_query_read(0x05, 0x01, "fDeviceInit", &flag);
++				printf("MONDRIAN UFS: after the wake: power 0x%x"
++				    " fDeviceInit 0x%x\n", power & 0xff, flag & 1);
++			} else {
++				UFS_WHY("LUN %u stayed PowerDown after both wake attempts",
++				    su.lun);
+ 			}
+ 		}
+ 	}
