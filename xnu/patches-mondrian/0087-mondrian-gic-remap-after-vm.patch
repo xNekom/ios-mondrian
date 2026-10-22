@@ -1,0 +1,117 @@
+xnu 0087: keep the GIC reachable after the VM takes over
+
+pe_init_fiq() runs long before STARTUP_SUB_KMEM, so io_map() -- and
+therefore ml_io_map() -- hands it a virtual address carved out of the
+bootstrap space and maps it with pmap_map_bd() (osfmk/arm/io_map.c:101).
+When the VM starts, that address belongs to kernel_map: the GIC is no
+longer mapped anywhere, and the first access after that is a translation
+fault (fault_code 0x10).
+
+That is the panic that stopped the boot right after "MONDRIAN UFS: probe
+start": the probe's first action was the GIC dump, and pe_mondrian_gic_dump()
+reads GICR_IGROUPR0. The abort even names it --
+pc 0xfffffff007a27090 is inside pe_mondrian_gic_dump (pe_fiq.c:88).
+
+Keep the physical base and size of GICD and GICR from the device tree
+while they are readable, and map the GIC again through ml_io_map() once
+the VM is up. pe_mondrian_gic_dump() does that before touching anything,
+so the dump is safe wherever it is called from, and later GIC
+configuration (enabling the timer PPI, for instance) no longer writes to
+addresses that are not the GIC.
+
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -26,6 +26,22 @@
+ static vm_offset_t gicr_base;
+ static vm_offset_t gicr_size;
+ 
++#if defined(MONDRIAN)
++/*
++ * The physical extent of the GIC, recorded while pe_init_fiq() runs. It has
++ * to be recorded because the mapping made there does not survive: io_map()
++ * is called before STARTUP_SUB_KMEM, so it carves the virtual address out of
++ * the bootstrap space (pmap_map_bd) and advances virtual_space_start; once
++ * the VM owns that space, every access to the GIC is a translation fault
++ * (fault_code 0x10), which is what the UFS probe hit the first time it
++ * dumped the GIC. pe_mondrian_gic_remap() maps it again, for real.
++ */
++static vm_offset_t mondrian_gicd_phys;
++static vm_offset_t mondrian_gicr_phys;
++static vm_offset_t mondrian_gicd_size;
++static vm_offset_t mondrian_gicr_size;
++#endif
++
+ static uint32_t
+ _gic_read32(vm_offset_t addr)
+ {
+@@ -76,10 +92,33 @@
+ /* What the GIC really looks like from the non-secure side, and whether the
+  * timer has fired. Printed by the UFS probe, which is late enough in the
+  * boot for the screen to still show it. */
++#if defined(MONDRIAN)
++/*
++ * Put the GIC back in the kernel's address space. Called after the VM is up
++ * (the mapping pe_init_fiq() made was only a bootstrap one); see the comment
++ * on mondrian_gicd_phys. Safe to call more than once: each call replaces the
++ * previous mapping, so later configuration goes to real memory.
++ */
+ void
++pe_mondrian_gic_remap(void)
++{
++	if (!mondrian_gicd_phys || !mondrian_gicr_phys) {
++		return;
++	}
++	gicd_base = ml_io_map(mondrian_gicd_phys, mondrian_gicd_size);
++	if (!gicd_base) {
++		panic("%s: cannot remap GICD region", __func__);
++	}
++	gicr_base = ml_io_map(mondrian_gicr_phys, mondrian_gicr_size);
++	if (!gicr_base) {
++		panic("%s: cannot remap GICR region", __func__);
++	}
++}
++
++void
+ pe_mondrian_gic_dump(void)
+ {
+-#if defined(MONDRIAN)
++	pe_mondrian_gic_remap();
+ 	if (!gicd_base) {
+ 		return;
+ 	}
+@@ -89,8 +128,13 @@
+ 	    mondrian_vtimer_intid, igroupr,
+ 	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
+ 	    ml_get_timer_pending());
+-#endif
+ }
++#else
++void
++pe_mondrian_gic_dump(void)
++{
++}
++#endif
+ 
+ void
+ pe_init_fiq()
+@@ -145,6 +189,19 @@
+ 		uint64_t const gicr_base_prop = ((uint64_t const *) prop)[2];
+ 		uint64_t const gicr_size_prop = ((uint64_t const *) prop)[3];
+ 
++#if defined(MONDRIAN)
++		/*
++		 * Remember where they are: the mapping below only lasts until the
++		 * VM takes over the bootstrap address space (see the comment on
++		 * these statics), and pe_mondrian_gic_remap() needs the physical
++		 * addresses to map them again.
++		 */
++		mondrian_gicd_phys = soc_base_phys + gicd_base_prop;
++		mondrian_gicr_phys = soc_base_phys + gicr_base_prop;
++		mondrian_gicd_size = gicd_size_prop;
++		mondrian_gicr_size = gicr_size_prop;
++#endif
++
+ 		// Find GICD base address
+ 		gicd_base = ml_io_map(soc_base_phys + gicd_base_prop, gicd_size_prop);
+ 
