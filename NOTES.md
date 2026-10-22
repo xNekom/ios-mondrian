@@ -7,6 +7,92 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-22 17:15: the 16:05 and 16:30 photos are 0083's panic, not 0086's UFS
+
+**What the photo proves.** The 16:30 photo (run 39793414594's kernel,
+`ffe3e10c…`) is the **head** of a boot, about fourteen lines, not a tail: the
+screen is otherwise empty below `MONDRIAN EARLY 20: kprintf startup complete`
+and the colour bars sit in their dedicated rows. The two lines at the top are
+`mondrian_early_panic()`, which starts at the bottom row, prints `\n` (which
+wraps it to row 0) and only then the reason, so they overwrite the first two
+lines of the *same* boot. The reason:
+
+    MONDRIAN EARLY PANIC: vm_resident.c:2627 Assertion failed:
+    ppnum == VM_PAGE_GET_PHYS_PAGE(m)
+
+That is the assert inside the `VM_PAGE_SET_PHYS_PAGE()` macro
+(`osfmk/vm/vm_page.h:431`), expanded at `vm_page_init()`'s call
+(`vm_resident.c:2627`).
+
+**Cause, proven by reading the code.** arm64 does not store a page's physical
+address in the page: `VM_PAGE_GET_PHYS_PAGE()` computes it from the page's
+**index** in `vm_pages` plus `vm_first_phys_ppnum`
+(`vm_page.h:421-429`), because the array is handed a linear run of frames by
+`pmap_startup()`. 0083 made `pmap_next_page()` step over the panel's window
+(0xB8000000, 43 MiB), so every frame above the hole sat one hole's worth of
+indices away from its address and the assert fired as soon as the walk
+crossed it. The stage is after `kprintf` (VM init is `STARTUP_SUB_PMAP_STEAL`,
+after `STARTUP_SUB_KPRINTF`), which is exactly where the log stops. 0082, with
+no 0083, booted to `device_add_rd0`. **0086 was never the problem and has
+never run on hardware.**
+
+**Fix, in `170c09a`.** `pmap.c` is back to stock; the reservation moved into
+`pmap_startup()`: the panel's frames are initialised like every other one and
+then *not* released to the free queues (`mondrian_page_is_screen()`), so they
+stay wired, never join a free list and the index/address arithmetic is
+untouched. One printf reports how many pages were kept. Series applies
+`85/85`; CI run **39794567870** (#73) is building it.
+
+**The local full build cannot replace CI yet.** `dxb` + Xcode 27 + KDK (no
+sudo: `pkgutil --expand-full` twice, `KDKROOT=` override) gets through mig,
+ctf, firehose, installhdrs and most of IOKit, then dies on the iig-generated
+DriverKit stubs: `error: no member named 'kernelContent' in 'IORPC'`
+(`DriverKit/OSObject.iig.cpp`, `OSAction.iig.cpp`). Xcode 27's `iig` does not
+match 8796's IOKit headers; the workflow pins Xcode 15.0.1 for exactly this.
+Workaround that gets past it: copy the 17 `*.iig.cpp` and `*.h` from the
+`xnu-buildtree-mondrian` artifact into
+`build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/iokit/DEVELOPMENT/DriverKit/`
+(note the extra `DEVELOPMENT` component: the stubs are generated per kernel
+config, and `iokit/DriverKit/` is a different, unused copy), make sure they are
+newer than the `.iig` sources, then run the kernel make directly:
+
+    cd $WORK/xnu && make install -j8 VERBOSE=YES \
+      CTFCONVERT=$WORK/fakeroot/usr/local/bin/ctfconvert \
+      CTFMERGE=$WORK/fakeroot/usr/local/bin/ctfmerge \
+      CTFDUMP=$WORK/fakeroot/usr/local/bin/ctfdump \
+      SDKROOT=macosx TARGET_CONFIGS="DEVELOPMENT ARM64 MONDRIAN" CONCISE=0 \
+      BUILD_WERROR=0 BUILD_LTO=0 SRCROOT=$WORK/xnu OBJROOT=$WORK/build/xnu.obj \
+      SYMROOT=$WORK/build/xnu.sym DSTROOT=$WORK/fakeroot \
+      FAKEROOT_DIR=$WORK/fakeroot KDKROOT=/private/tmp/kdk/root/KDK_13.5_22G74.kdk \
+      TIGHTBEAMC=tightbeamc-not-supported RC_DARWIN_KERNEL_VERSION=22.6.0 \
+      KERNEL_BUILDS_IN_PARALLEL=1
+
+The `platform/` headers never needed the SDK: `installhdrs` installs them from
+xnu's own `EXTERNAL_HEADERS`, and the workflow's `sdk-kernel-platform/` copy
+in the artifact is empty because of a silent `|| true`.
+
+**The local build now produces a kernel (2026-10-22 17:50).** With the stubs in
+the right directory the tree compiles and links
+`build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/kernel.development.mondrian`
+(16,434,768 bytes, `Darwin Kernel Version 22.6.0: Thu Oct 22 17:50:41 CEST
+2026; pedrojuuu:…`). The `make` still exits 2, and that is expected: the only
+failure is `config_all`'s symbol-set *validation*
+(`SETUP/kextsymboltool … -output /dev/null` reporting `wild:` IOKit C++
+symbols), which `build.sh` already wraps in `|| true`; the linked kernel is
+written before it. So this is a viable fast path: `make` → `KERNEL=… bash
+tools/phone-deploy.sh build` → flash, with no CI round trip. Only `.iig`
+regeneration would need Xcode 15 (impossible here without an Apple ID: no
+`xcodes`, no session).
+
+**First boot of the local kernel** (`/tmp/boot-mondrian.img` sha256
+`e20b4515f7f91a806f4176fb4978d830cbaff223aa5eb446bfa86ff600345f56`, flashed to
+`boot_b` at 17:52). Expected if 0083 is right: `MONDRIAN VM: N panel pages
+kept off the free list`, then `pmap_startup() init/release time`, then the
+first UFS lines from 0086 (`MONDRIAN UFS: …`, `clock: N ticks for 2000000
+spins`, `summary: …`). If instead the screen still stops at `MONDRIAN EARLY
+20: kprintf startup complete`, the panic is not the hole and the next suspect
+is `vm_page_init`'s packed-pointer offset.
+
 ## 2026-10-22 16:05: 0086 froze on the clock, and the agent got project skills
 
 **What the 0082 boot photo proved.** `NOP OUT/IN` and `QUERY READ ATTRIBUTE`
