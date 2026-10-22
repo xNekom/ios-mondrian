@@ -13,39 +13,30 @@ diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -2274,6 +2274,18 @@
- 
- 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
- #if defined(MONDRIAN)
+@@ -2270,7 +2270,23 @@
+ static void
+ _enable_virtual_timer(void)
+ {
++#if defined(MONDRIAN)
 +	/*
 +	 * The virtual timer interrupt has to be unmasked for EL1 explicitly.
 +	 * On sweet the kernel gets the timer from the bootloader with no
-+	 * hypervisor in between and CNTV_CTL_EL0.ENABLE is enough; on this
-+	 * phone the hypervisor (QHEE) only delivers the timer interrupt to
-+	 * the guest once the guest has unmasked it for EL1. Until it does,
-+	 * no timeout ever expires: the boot then waits forever in
-+	 * IOKitInitializeTime() for the RTC that this phone does not have.
++	 * hypervisor in between, and there the EL0 view of CNTV_CTL_EL0 is
++	 * all there is: bit 1 is IMASKED there, and XNU leaves it clear, so
++	 * the interrupt goes out. This phone has the hypervisor (QHEE) in
++	 * between, and with EL2 present the same encoding is the EL1 view,
++	 * where bit 1 is EL1IRQEN instead: with XNU's value the timer
++	 * interrupt is never enabled to EL1, so no timeout ever expires (the
++	 * boot then waits forever in IOKitInitializeTime() for an RTC that
++	 * this phone does not have).
 +	 */
-+	uint64_t cntvctl1 = CNTV_CTL_EL1_ENABLE | CNTV_CTL_EL1_EL1IRQEN;
-+
-+	__builtin_arm_wsr64("CNTV_CTL_EL1", cntvctl1);
- 	/*
- 	 * The Qualcomm hypervisor (QHEE) on this phone reports an EL1 access
- 	 * to the physical timer as an undefined instruction instead of
-diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
---- a/osfmk/arm64/proc_reg.h
-+++ b/osfmk/arm64/proc_reg.h
-@@ -1970,6 +1970,10 @@
- #define CNTV_CTL_EL0_ISTATUS     (0x1 << 2)           /* (read only): whether interrupt asserted */
- #define CNTV_CTL_EL0_IMASKED     (0x1 << 1)           /* 1: interrupt masked */
- #define CNTV_CTL_EL0_ENABLE      (0x1 << 0)           /* 1: virtual timer enabled */
-+
-+#define CNTV_CTL_EL1_ISTATUS     (0x1 << 2)           /* (read only): whether interrupt asserted */
-+#define CNTV_CTL_EL1_EL1IRQEN    (0x1 << 1)           /* 1: timer interrupt enabled to EL1 */
-+#define CNTV_CTL_EL1_ENABLE      (0x1 << 0)           /* 1: virtual timer enabled */
++	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE | (1 << 1); /* EL1IRQEN with EL2 present */
++#else
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
++#endif
  
- #define CNTP_CTL_EL0_ISTATUS     CNTV_CTL_EL0_ISTATUS
- #define CNTP_CTL_EL0_IMASKED     CNTV_CTL_EL0_IMASKED
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
+ #if defined(MONDRIAN)
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
