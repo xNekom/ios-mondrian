@@ -19,7 +19,7 @@ answers where the truth is.
 diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 --- a/bsd/dev/mondrian_ufs.c
 +++ b/bsd/dev/mondrian_ufs.c
-@@ -79,6 +79,73 @@
+@@ -79,6 +79,77 @@
  #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
  
  /*
@@ -31,6 +31,10 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 + * the calibration below says whether the counter ticks at all.
 + */
 +static uint64_t ufs_spins_per_ms = 20000;       /* fallback: ~20MHz spin */
++
++/* The register accessors are defined further down, next to the mapping. */
++static inline uint32_t ufs_rd(uint32_t off);
++static inline void ufs_wr(uint32_t off, uint32_t v);
 +
 +static void
 +ufs_calibrate_spins(void)
@@ -93,7 +97,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
   * UFS 3.x transfer request descriptor: 16 dwords (64 bytes). UFS 2.1 used
   * 8 dwords; 3.x adds the task tag, which the host and the device both
   * require, plus the racing buffer fields.
-@@ -208,17 +275,23 @@
+@@ -208,17 +279,23 @@
  	__builtin_arm_dsb(0xf);
  
  	ufs_wr(REG_UTRLDBR, 1);
@@ -128,7 +132,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
-@@ -298,16 +371,10 @@
+@@ -298,16 +375,10 @@
  
  	ufs_wr(REG_UTRLDBR, 1);
  	printf("MONDRIAN UFS: NOP OUT sent\n");
@@ -149,7 +153,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
-@@ -323,14 +390,17 @@
+@@ -323,14 +394,17 @@
  	return 0;
  }
  
@@ -170,7 +174,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	if (value == NULL) {
  		return EINVAL;
  	}
-@@ -353,17 +423,11 @@
+@@ -353,17 +427,11 @@
  	__builtin_arm_dsb(0xf);
  
  	ufs_wr(REG_UTRLDBR, 1);
@@ -193,7 +197,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
-@@ -375,16 +439,16 @@
+@@ -375,16 +443,16 @@
  		printf("MONDRIAN UFS: query req %02x %02x %02x %02x func %02x op/idn %02x/%02x\n",
  		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3], ucd->cmd[5],
  		    ucd->cmd[12], ucd->cmd[13]);
@@ -216,7 +220,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	return 0;
  }
  
-@@ -533,7 +597,7 @@
+@@ -533,7 +601,7 @@
  			if ((hce & 1) && (hcs & HCS_DP)) {
  				break;
  			}
@@ -225,7 +229,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  		}
  		printf("MONDRIAN UFS: after enabling: hce 0x%x hcs 0x%x\n", hce, hcs);
  	}
-@@ -789,37 +853,82 @@
+@@ -789,37 +857,82 @@
  	error = ufs_take_over_host();
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
