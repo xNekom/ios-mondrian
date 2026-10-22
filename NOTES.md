@@ -7,6 +7,69 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-22 23:45: **the UFS stack works end to end** -- the root device reads
+
+Boot with the instrumented local kernel (`f1b682db…`, 23:31): the GIC remap
+(0087) works, the probe gets through the whole UFS bring-up, and the kernel
+reads the GPT and finds `userdata`:
+
+    MONDRIAN GIC: ... (dump prints its registers again; no abort)
+    MONDRIAN IRQ: 7 intid 1                       <- an interrupt arrived
+    MONDRIAN UFS: node at 1d84000 size 16
+    MONDRIAN UFS: regs mapped at ffffffff5ff00c000
+    MONDRIAN UFS: one page: 0
+    MONDRIAN UFS: asking for 147456 bytes of contiguous memory
+    MONDRIAN UFS: dma at ffffffff5f9204000
+    MONDRIAN UFS: dma pa 0xb2304000, taking over the host
+    MONDRIAN UFS: hce 0x1 hcs 0x10f cap 0x1587031f ver 0x300
+    MONDRIAN UFS: list stopped, run 0
+    MONDRIAN UFS: clock: 34573 ticks for 2000000 spins, timebase 19200000 Hz
+    MONDRIAN UFS: clock: 2000000 spins per millisecond
+    MONDRIAN UFS: NOP OUT sent / NOP IN received
+    MONDRIAN UFS: bCurrentPowerMode 0x33          (PowerDown)
+    MONDRIAN UFS: fDeviceInit 0x0
+    MONDRIAN UFS: LUN 0 still not ready (2/04/02)
+    MONDRIAN UFS: before any wake: TUR 35, power 0x33, fDeviceInit 0x0
+    MONDRIAN UFS: scsi 0x1b on LUN 0xd0 sent, waiting
+    MONDRIAN UFS: START STOP ACTIVE on LUN 0xd0: 0
+    MONDRIAN UFS: LUN 0 answered after the wake on 0xd0
+    MONDRIAN UFS: bCurrentPowerMode 0x11          (Active)
+    MONDRIAN UFS: summary: LUN 0 ready, power 0x11, fDeviceInit 0x0
+    MONDRIAN UFS: scsi 0x28 on LUN 0x00 sent, waiting
+    MONDRIAN UFS: GPT header read, error 0
+    MONDRIAN UFS: GPT signature EFI PART
+    MONDRIAN UFS: "userdata" on LUN 0: first block 0x2f8a00, 228969 MiB, read-only
+    BSD root: ufsroot0, major 2, minor 0
+    bsd_init: vfs_mountroot
+    hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : fc1c
+    hfs_mount: hfs_mountfs returned error=22 for device unknown-dev
+    cannot mount root, errno = 19
+    bsd_init: calling setconf
+    (the second vfs_mountroot() hangs here; "mount(2) failed" below it is stale
+     framebuffer text -- that string is not in the kernel)
+
+**What this proves.** The LU wake is real (`0x33` -> `0x11` with the CDB
+`1b 00 00 00 10 00` on WLUN `0xd0`), READ(10) works, the GPT parses, the
+partition walk names the partition, and the block device reaches HFS. The
+only thing missing is that `userdata` still holds the **Android** data: the
+HFS+ volume header signature is `0xfc1c`, not `H+`.
+
+**Next: put an iOS root in `userdata`.** `userdata` is the only partition
+this project may write; `tools/flash-root.sh <root>.simg` does it (it asks
+first; it refuses anything else). The root image lives on the sweet machine
+(`/run/media/dipa/android/ios-sweet-ipsw/ios16-root-20H392-v15.simg`, 12 GB,
+built by `tools/mkiosroot.sh`), **not on this Mac**, and this Mac has ~15 GiB
+free, so getting it here is the logistics step. A 64 MB HFS+ test image
+(`printf 'H+' …`/`newfs_hfs` plus one file) would prove the mount for
+almost nothing before spending a 12 GB flash; then flash v15 for the real
+userland.
+
+**Correction to the entry below**: `fault_code=0x10` is **`FSC_SYNC_EXT_ABORT`**
+(`osfmk/arm64/proc_reg.h:1783`), a bus abort, *not* a translation fault. The
+mapping `ml_io_map()` made before `STARTUP_SUB_KMEM` is not reachable once the
+VM owns that address space, and reading the GIC through it aborts on the bus
+(not a page-table walk failure).
+
 ## 2026-10-22 19:15: VM init passes, `device_add_rd0` again, and the UFS probe runs
 
 The 0083 fix works. The 17:52 boot (local kernel, sha256 `e20b4515…`) went

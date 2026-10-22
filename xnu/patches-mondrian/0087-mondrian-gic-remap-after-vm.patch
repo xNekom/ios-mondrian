@@ -3,21 +3,21 @@ xnu 0087: keep the GIC reachable after the VM takes over
 pe_init_fiq() runs long before STARTUP_SUB_KMEM, so io_map() -- and
 therefore ml_io_map() -- hands it a virtual address carved out of the
 bootstrap space and maps it with pmap_map_bd() (osfmk/arm/io_map.c:101).
-When the VM starts, that address belongs to kernel_map: the GIC is no
-longer mapped anywhere, and the first access after that is a translation
-fault (fault_code 0x10).
+When the VM starts, that address belongs to kernel_map and the GIC is no
+longer reachable there: the first access after that aborts.
 
-That is the panic that stopped the boot right after "MONDRIAN UFS: probe
-start": the probe's first action was the GIC dump, and pe_mondrian_gic_dump()
-reads GICR_IGROUPR0. The abort even names it --
-pc 0xfffffff007a27090 is inside pe_mondrian_gic_dump (pe_fiq.c:88).
+That is the abort that stopped the boot right after "MONDRIAN UFS: probe
+start": the probe's first action is the GIC dump, and pe_mondrian_gic_dump()
+reads GICR_IGROUPR0. The abort names it -- pc 0xfffffff007a27110 is inside
+pe_mondrian_gic_dump. Its fault_code is 0x10, which is FSC_SYNC_EXT_ABORT
+(osfmk/arm64/proc_reg.h:1783), not a translation fault: the access no longer
+reaches the GIC and the bus aborts it.
 
-Keep the physical base and size of GICD and GICR from the device tree
-while they are readable, and map the GIC again through ml_io_map() once
-the VM is up. pe_mondrian_gic_dump() does that before touching anything,
-so the dump is safe wherever it is called from, and later GIC
-configuration (enabling the timer PPI, for instance) no longer writes to
-addresses that are not the GIC.
+Keep the physical base and size of GICD and GICR from the device tree while
+it is readable, and map the GIC again through ml_io_map() once the VM is up.
+pe_mondrian_gic_dump() does that before touching a register and prints the
+two mappings, so later GIC configuration (enabling the timer PPI, for
+instance) also lands on real addresses.
 
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
@@ -45,7 +45,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  static uint32_t
  _gic_read32(vm_offset_t addr)
  {
-@@ -76,10 +92,33 @@
+@@ -76,10 +92,38 @@
  /* What the GIC really looks like from the non-secure side, and whether the
   * timer has fired. Printed by the UFS probe, which is late enough in the
   * boot for the screen to still show it. */
@@ -56,7 +56,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 + * on mondrian_gicd_phys. Safe to call more than once: each call replaces the
 + * previous mapping, so later configuration goes to real memory.
 + */
- void
++void
 +pe_mondrian_gic_remap(void)
 +{
 +	if (!mondrian_gicd_phys || !mondrian_gicr_phys) {
@@ -70,9 +70,14 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	if (!gicr_base) {
 +		panic("%s: cannot remap GICR region", __func__);
 +	}
++	printf("MONDRIAN GIC: gicd %llx+%llx -> %llx, gicr %llx+%llx -> %llx\n",
++	    (unsigned long long)mondrian_gicd_phys, (unsigned long long)mondrian_gicd_size,
++	    (unsigned long long)gicd_base,
++	    (unsigned long long)mondrian_gicr_phys, (unsigned long long)mondrian_gicr_size,
++	    (unsigned long long)gicr_base);
 +}
 +
-+void
+ void
  pe_mondrian_gic_dump(void)
  {
 -#if defined(MONDRIAN)
@@ -80,7 +85,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	if (!gicd_base) {
  		return;
  	}
-@@ -89,8 +128,13 @@
+@@ -89,8 +133,13 @@
  	    mondrian_vtimer_intid, igroupr,
  	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
  	    ml_get_timer_pending());
@@ -95,7 +100,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  
  void
  pe_init_fiq()
-@@ -145,6 +189,19 @@
+@@ -145,6 +194,19 @@
  		uint64_t const gicr_base_prop = ((uint64_t const *) prop)[2];
  		uint64_t const gicr_size_prop = ((uint64_t const *) prop)[3];
  
