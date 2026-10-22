@@ -178,6 +178,53 @@ cannot hide it). The timer interrupt calls it every 64 interrupts with the
 interrupted PC: if it advances, the CPU is alive and the PC says where; if
 it stops, the CPU is stuck.
 
+### 2026-10-22 08:00: the boot is not stuck, it is waiting 30 s for an RTC that never comes
+
+The screen always ends at the same place:
+
+    bsd_init: calling IOKitInitializeTime
+    MONDRIAN CPU: 1/1 CPUs initialized, SGI1 verified
+
+and the screen does not move again, not even minutes later. That last line
+is the *other* thread (the CPU bring-up one, patch 0051) talking while the
+main thread is inside `IOKitInitializeTime()`
+(`iokit/Kernel/IOStartIOKit.cpp`):
+
+```c
+	t.tv_sec = 30;
+	t.tv_nsec = 0;
+// RTC is not present on this target
+#ifndef BCM2837
+	IOService::waitForService(
+		IOService::resourceMatching("IORTC"), &t );
+#endif
+```
+
+The wait is for an `IORTC` service that this phone does not have, and the
+30 s timeout **never expires**: no timeout works on the phone. That also
+explains the beacon (0067/0068), which never appeared: it is painted from
+the virtual timer interrupt, and that interrupt never arrives.
+
+Why the timer interrupt does not arrive: XNU's arm64 code only writes
+`CNTV_CTL_EL0` (the *EL0* view) and arms the timeout with
+`CNTV_TVAL_EL0` (`ml_set_decrementer()` in `machine_routines.c`). On sweet
+that is enough, because the kernel gets the timer from the bootloader with
+no hypervisor in between. On this phone the hypervisor (QHEE) sits in
+between and only delivers the timer interrupt to the guest once the guest
+has unmasked it *for EL1* (`CNTV_CTL_EL1.EL1IRQEN`), which nothing in the
+tree ever does. So `0069`:
+
+- writes `CNTV_CTL_EL1 = ENABLE | EL1IRQEN` in `_enable_virtual_timer()`;
+- skips the `IORTC` wait on mondrian, like the Raspberry Pi does;
+- prints the GIC group registers (`GICR_IGROUPR0`, `GICD_IGROUPR`,
+  `GICD_CTLR`), because a PPI left in Group 0 belongs to TrustZone and is
+  never forwarded to this CPU.
+
+If the `CNTV_CTL_EL1` write is trapped by QHEE the boot dies with an
+"Undefined kernel instruction" (the same thing the physical timer write did
+in 0061) and that is visible on the screen; then the wait has to be
+removed another way (a platform that fakes an IORTC service).
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
