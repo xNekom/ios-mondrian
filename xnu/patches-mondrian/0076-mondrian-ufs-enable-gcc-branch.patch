@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -47,6 +47,8 @@
+ extern void pe_mondrian_gic_dump(void);
+ extern void mondrian_irq_dump(void);
+ 
++#define REG_CAP          0x00
++#define REG_VER          0x08
+ #define REG_IS          0x20
+ #define REG_IE          0x24
+ #define REG_HCS         0x30
+@@ -332,12 +334,61 @@
+ 		UFS_WHY("no GPT partition named \"%s\"", want);
+ 	return ENOENT;
+ }
++
++/* The global clock controller and the branch that clocks the UFS host. */
++static vm_offset_t gcc_base;
++static uint32_t gcc_branch;
++
++static void
++ufs_enable_clock(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	uintptr_t const *prop = NULL;
++	unsigned int size = 0;
++	uint32_t branch = 0, value = 0;
+ 
++	if (SecureDTLookupEntry(NULL, "/mondrian-gcc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("MONDRIAN UFS: no /mondrian-gcc node in the device tree\n");
++		return;
++	}
++	if (SecureDTGetProperty(node, "ufs-branch", (void const **)&prop, &size) == kSuccess && size == 4) {
++		branch = *(uint32_t const *)prop;
++	}
++	gcc_base = ml_io_map(reg[0], 0x1000);
++	if (gcc_base == 0) {
++		printf("MONDRIAN UFS: cannot map the clock controller\n");
++		return;
++	}
++	gcc_branch = branch;
++	/*
++	 * The bootloader had the storage only while it needed it and left the
++	 * host's clock off: every register of the host reads as zero. The
++	 * branch's command register (the first one of the branch) enables it.
++	 */
++	value = *(volatile uint32_t *)(gcc_base + (branch * 0x100));
++	printf("MONDRIAN UFS: gcc %llx branch %u cmd %x\n", (uint64_t)gcc_base, branch, value);
++	*(volatile uint32_t *)(gcc_base + (branch * 0x100)) = 1;
++	value = *(volatile uint32_t *)(gcc_base + (branch * 0x100));
++	printf("MONDRIAN UFS: gcc branch %u cmd is now %x\n", branch, value);
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	printf("MONDRIAN UFS: hce 0x%x hcs 0x%x\n", hce, hcs);
++	printf("MONDRIAN UFS: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x\n", hce, hcs,
++	    ufs_rd(REG_CAP), ufs_rd(REG_VER));
++	if (hce == 0 && hcs == 0) {
++		/* Nothing responds: the host's clock is off. */
++		ufs_enable_clock();
++		hce = ufs_rd(REG_HCE);
++		hcs = ufs_rd(REG_HCS);
++		printf("MONDRIAN UFS: after the clock: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x\n", hce, hcs,
++		    ufs_rd(REG_CAP), ufs_rd(REG_VER));
++	}
+ 	if (!(hce & 1)) {
+ 		/*
+ 		 * The bootloader had the storage for as long as it needed it

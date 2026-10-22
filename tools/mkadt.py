@@ -221,6 +221,17 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('reg', u64(board.ufs, board.ufs_size)),
     ])
 
+    # The global clock controller: the UFS host's clock is a branch of it,
+    # and the bootloader leaves that branch off (the host's registers read
+    # as zero). The branch number is in the property, so the driver does not
+    # have to know it.
+    gcc = node(board.dt_prefix + '-gcc', [
+        ph(),
+        ('compatible', cstr('qcom,gcc')),
+        ('reg', u64(board.gcc, 0x1000)),
+        ('ufs-branch', u32(board.ufs_gcc_branch)),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -310,7 +321,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs, gcc]))
 
 
 if __name__ == '__main__':

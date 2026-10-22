@@ -75,6 +75,8 @@ class Board:
 
     ufs: int                   # UFS host controller
     ufs_size: int
+    gcc: int                   # global clock controller (the UFS branch lives here)
+    ufs_gcc_branch: int        # the GCC branch that clocks the UFS host
 
     timebase: int              # architected timer frequency
     vtimer_intid: int          # GIC INTID of the virtual timer
@@ -140,6 +142,10 @@ SWEET = Board(
     # Internal UFS host (ufshc@1d84000, sweet live FDT), UFSHCI 2.1
     ufs=0x01d84000,
     ufs_size=0x3000,
+    # Qualcomm's global clock controller (every one of these SoCs has it
+    # here; the live FDT of the mondrian says clock-controller@100000).
+    gcc=0x100000,
+    ufs_gcc_branch=0x870,
     timebase=19200000,
     vtimer_intid=19,
     ipi_sgi=1,
@@ -267,6 +273,11 @@ MONDRIAN = Board(
     # two lanes per direction, irq SPI 265.
     ufs=0x01d84000,
     ufs_size=0x3000,
+    # The live FDT: soc/clock-controller@100000 (the GCC). The UFS host's
+    # clock is the branch 0x870 of it (the AXI, AHB, UniPro, ICE, PHY_AUX
+    # and aggregate branches all hang off it).
+    gcc=0x100000,
+    ufs_gcc_branch=0x870,
     timebase=19200000,
     vtimer_intid=19,             # Qualcomm's PPI numbering, as on sweet
     ipi_sgi=1,
