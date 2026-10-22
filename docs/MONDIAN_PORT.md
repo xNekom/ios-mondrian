@@ -372,6 +372,20 @@ version.
 **Check:** `rd=ufsroot0` mounts the `userdata` partition and the kernel
 prints the same "userdata on LUN 0" line as on sweet.
 
+The driver is read-only (`mondrian_ufs_write()` returns `EROFS`) and the
+disk commands it issues — TEST UNIT READY, NOP, QUERY, START STOP UNIT —
+do not touch the medium, so nothing here can damage the table. That changes
+only when writes are enabled to mount a read/write root; `tools/backup-gpt.sh`
+records both copies of the GPT (fastboot's view of the partitions, and the
+raw primary/backup headers through adb) before that step.
+
+Sweet's persistent console log (`0047`: a 4 MiB ring at the end of
+`userdata`, header `SWEETLOG`, read back from a recovery with
+`tools/ios-log-pull.sh`) is not ported yet because it needs that write path.
+It is the first thing to port once the partition reads, because from the
+moment userland starts, a panic there is only visible through it — the phone
+console cannot scroll and the USB stack is not up.
+
 ### 4. The display
 
 Sweet's panel is an LCD in DSC video mode: the bootloader leaves a
