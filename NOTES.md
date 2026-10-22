@@ -21,7 +21,10 @@ million spins, then spins per millisecond) that answers the question from the
 next photo, and treats a wake that never completes as non-fatal: it dumps
 `hcs/is/dbr` + the UTRD, clears the doorbell, retries `TEST UNIT READY`, then
 tries the wake again on LUN 0. It also prints the baseline TUR sense and
-`fDeviceInit` before any wake, none of which 0082 printed.
+`fDeviceInit` before any wake, none of which 0082 printed. The last line is a
+summary (spins/ms, NOP liveness, power mode, `fDeviceInit`) printed *after*
+the retries on purpose: the console blanks once per screenful, so a line
+printed early is gone by the time the photo is taken.
 
 **Build hiccup.** The first 0086 push failed to compile (`ufs_rd` used before
 its definition); the forward declarations are in, the patch re-applies

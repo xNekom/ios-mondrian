@@ -19,10 +19,12 @@ answers where the truth is.
 diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 --- a/bsd/dev/mondrian_ufs.c
 +++ b/bsd/dev/mondrian_ufs.c
-@@ -79,6 +79,77 @@
+@@ -77,6 +77,77 @@
+ #define PRDT_CHUNK      (64u << 10)             /* PRDT byte count field: 16 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
  #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
- 
- /*
++
++/*
 + * Waits here count CPU spins, not nanoseconds. This board's timebase is not
 + * trusted yet: the timer interrupt has never been seen, and 0082 froze the
 + * boot at its first SCSI command printing "scsi 0x1b sent, waiting", which
@@ -92,11 +94,9 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +	}
 +	return 0;
 +}
-+
-+/*
+ 
+ /*
   * UFS 3.x transfer request descriptor: 16 dwords (64 bytes). UFS 2.1 used
-  * 8 dwords; 3.x adds the task tag, which the host and the device both
-  * require, plus the racing buffer fields.
 @@ -208,17 +279,23 @@
  	__builtin_arm_dsb(0xf);
  
@@ -132,7 +132,29 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
-@@ -298,16 +375,10 @@
+@@ -230,7 +307,6 @@
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+-	printf("MONDRIAN UFS: scsi 0x%02x answered ocs 0x%x upiu 0x%x\n", cdb[0], ocs, ucd->resp[0]);
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		uint32_t sense_len = ((uint32_t)ucd->resp[32] << 8) | ucd->resp[33];
+ 		uint8_t sense_key = ucd->resp[36] & 0x0f;
+@@ -239,10 +315,12 @@
+ 		/* This is the expected wake-up response while the LU is PowerDown. */
+ 		if (cdb[0] == 0x00 && ocs == 0 && ucd->resp[0] == 0x21 &&
+ 		    sense_key == 0x02 && sense_asc == 0x04 && sense_ascq == 0x02) {
+-			printf("MONDRIAN UFS: LUN %u not ready (sense 2/04/02)\n", lun);
++			printf("MONDRIAN UFS: LUN %u still not ready (2/04/02)\n", lun);
+ 			UFS_WHY("LUN %u PowerDown: sense 2/04/02", lun);
+ 			return EAGAIN;
+ 		}
++		printf("MONDRIAN UFS: scsi 0x%02x answered ocs 0x%x upiu 0x%x\n",
++		    cdb[0], ocs, ucd->resp[0]);
+ 		/*
+ 		 * What the host says about the request, and what it did with
+ 		 * it: the outcome code, the response UPIU, and the request
+@@ -298,16 +376,10 @@
  
  	ufs_wr(REG_UTRLDBR, 1);
  	printf("MONDRIAN UFS: NOP OUT sent\n");
@@ -153,7 +175,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
-@@ -323,14 +394,17 @@
+@@ -323,14 +395,17 @@
  	return 0;
  }
  
@@ -174,7 +196,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	if (value == NULL) {
  		return EINVAL;
  	}
-@@ -353,17 +427,11 @@
+@@ -353,17 +428,11 @@
  	__builtin_arm_dsb(0xf);
  
  	ufs_wr(REG_UTRLDBR, 1);
@@ -197,7 +219,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	}
  	__builtin_arm_dsb(0xf);
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
-@@ -375,16 +443,16 @@
+@@ -375,16 +444,16 @@
  		printf("MONDRIAN UFS: query req %02x %02x %02x %02x func %02x op/idn %02x/%02x\n",
  		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3], ucd->cmd[5],
  		    ucd->cmd[12], ucd->cmd[13]);
@@ -220,7 +242,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	return 0;
  }
  
-@@ -533,7 +601,7 @@
+@@ -533,7 +602,7 @@
  			if ((hce & 1) && (hcs & HCS_DP)) {
  				break;
  			}
@@ -229,7 +251,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  		}
  		printf("MONDRIAN UFS: after enabling: hce 0x%x hcs 0x%x\n", hce, hcs);
  	}
-@@ -789,37 +857,82 @@
+@@ -789,37 +858,102 @@
  	error = ufs_take_over_host();
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
@@ -303,7 +325,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +					printf("MONDRIAN UFS: START STOP ACTIVE on LUN 0x%02x: %d\n",
 +					    wake_lun, wake);
 +					error = ETIMEDOUT;
-+					for (int i = 0; i < 20; i++) {
++					for (int i = 0; i < 8; i++) {
 +						tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
 +						if (!tur_error) {
 +							error = 0;
@@ -313,7 +335,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +							error = tur_error;
 +							break;
 +						}
-+						ufs_spin_ms(25);
++						ufs_spin_ms(60);
 +					}
 +					if (!error) {
 +						printf("MONDRIAN UFS: LUN %u answered after the"
@@ -326,12 +348,32 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  			}
 -			if (error == ETIMEDOUT) {
 -				UFS_WHY("LUN %u stayed PowerDown after START STOP ACTIVE", su.lun);
++			/*
++			 * The summary is printed last on purpose: the console
++			 * blanks once per screenful, so the early lines are
++			 * already gone when the photo is taken. The clock is
++			 * repeated here because it is the line that decides
++			 * whether the timebase is alive at all.
++			 */
 +			if (!error) {
 +				(void)ufs_query_read(0x03, 0x02, "bCurrentPowerMode", &power);
 +				(void)ufs_query_read(0x05, 0x01, "fDeviceInit", &flag);
-+				printf("MONDRIAN UFS: after the wake: power 0x%x"
-+				    " fDeviceInit 0x%x\n", power & 0xff, flag & 1);
++				printf("MONDRIAN UFS: summary: %llu spins/ms, LUN %u"
++				    " ready, power 0x%x, fDeviceInit 0x%x\n",
++				    ufs_spins_per_ms, su.lun, power & 0xff, flag & 1);
 +			} else {
++				/*
++				 * The LU does not answer. Is the transport still
++				 * alive? A NOP that completes says yes, and then
++				 * the next fix is the device's power state, not
++				 * the link or the host.
++				 */
++				int nop = ufs_nop_out();
++				(void)ufs_query_read(0x03, 0x02, "bCurrentPowerMode", &power);
++				(void)ufs_query_read(0x05, 0x01, "fDeviceInit", &flag);
++				printf("MONDRIAN UFS: summary: %llu spins/ms, NOP IN %d,"
++				    " power 0x%x, fDeviceInit 0x%x, LUN %u still asleep\n",
++				    ufs_spins_per_ms, nop, power & 0xff, flag & 1, su.lun);
 +				UFS_WHY("LUN %u stayed PowerDown after both wake attempts",
 +				    su.lun);
  			}
