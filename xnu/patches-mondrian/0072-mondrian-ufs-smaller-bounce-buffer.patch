@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -61,7 +61,15 @@
+ #define HCS_UTRLRDY     (1u << 1)
+ 
+ #define UFS_BLOCK       4096u
+-#define BOUNCE_SIZE     (1u << 20)
++/*
++ * The bounce buffer has to be physically contiguous, and the zone map hands
++ * out short runs: the sweet driver asks for 1 MiB and gets it (16 KiB
++ * pages, 66 of them), but with 4 KiB pages that is 256 pages in a row and
++ * the runs here are shorter, so the request never comes back and the boot
++ * waits in kmem_alloc_contig() for ever. 128 KiB is 32 pages, which the
++ * zone map does have.
++ */
++#define BOUNCE_SIZE     (128u << 10)
+ #define PRDT_CHUNK      (64u << 10)             /* PRDT byte count field: 16 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+@@ -538,6 +546,7 @@
+ 		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+ 		printf("MONDRIAN UFS: one page: %d\n", kr);
+ 	}
++	printf("MONDRIAN UFS: asking for %u bytes of contiguous memory\n", (unsigned int)DMA_SIZE);
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("MONDRIAN UFS: no contiguous DMA memory\n");
