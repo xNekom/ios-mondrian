@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -338,7 +338,28 @@
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+ 	printf("MONDRIAN UFS: hce 0x%x hcs 0x%x\n", hce, hcs);
+-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
++	if (!(hce & 1)) {
++		/*
++		 * The bootloader had the storage for as long as it needed it
++		 * and left the host controller disabled (HCE 0); the sweet
++		 * driver never has to enable it, because its bootloader
++		 * leaves the host on. Writing HCE starts the UniPro link, and
++		 * the device shows up in HCS. If the host's clock had been
++		 * gated as well, the write goes nowhere and HCE reads 0 again.
++		 */
++		printf("MONDRIAN UFS: enabling the host controller\n");
++		ufs_wr(REG_HCE, 1);
++		for (int i = 0; i < 100000; i++) {
++			hce = ufs_rd(REG_HCE);
++			hcs = ufs_rd(REG_HCS);
++			if ((hce & 1) && (hcs & HCS_DP)) {
++				break;
++			}
++			delay(1);
++		}
++		printf("MONDRIAN UFS: after enabling: hce 0x%x hcs 0x%x\n", hce, hcs);
++	}
++	if (!(hce & 1) || !(hcs & HCS_DP)) {
+ 		printf("MONDRIAN UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		UFS_WHY("host not ready: hce 0x%x hcs 0x%x", hce, hcs);
+ 		return ENXIO;
+@@ -362,8 +383,9 @@
+ 	ufs_wr(REG_UTRLRSR, 1);
+ 	/* Never ring a doorbell unless the host uses our list. */
+ 	if (ufs_rd(REG_UTRLBA) != (uint32_t)list || ufs_rd(REG_UTRLBAU) != (uint32_t)(list >> 32) ||
+-	    !(ufs_rd(REG_UTRLRSR) & 1)) {
+-		printf("MONDRIAN UFS: host did not take our request list\n");
++	    !(ufs_rd(REG_UTRLRSR) & 1) || !(ufs_rd(REG_HCS) & HCS_UTRLRDY)) {
++		printf("MONDRIAN UFS: host did not take our request list (hcs 0x%x rsr 0x%x)\n",
++		    ufs_rd(REG_HCS), ufs_rd(REG_UTRLRSR));
+ 		UFS_WHY("host did not take our request list");
+ 		return EIO;
+ 	}
