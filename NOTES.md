@@ -300,6 +300,33 @@ Two things settled:
   `HCS`. If the host's clock had been gated too, the write goes nowhere
   and `HCE` reads 0 again - that is the next thing to see.
 
+### 2026-10-22 11:00: the host UFS reads as zero everywhere: its clock is off
+
+The UFS driver now talks to the host and says everything about it:
+
+    MONDRIAN UFS: hce 0x0 hcs 0x0 cap 0x0 ver 0x0     <- nothing responds
+    MONDRIAN UFS: enabling the host controller
+    MONDRIAN UFS: after enabling: hce 0x0 hcs 0x0     <- the write goes nowhere
+    MONDRIAN UFS: host: list 0:0 rsr 0x0 dbr 0x0      <- every register reads 0
+
+Every register of the host reads zero and a write to `HCE` does not stick:
+the bootloader had the storage only while it needed it and left the host's
+**clock** off (the sweet driver never has to enable the host, because its
+bootloader leaves it on). The clock controller is the one the live device
+tree calls `clock-controller@100000` (the GCC), and the UFS host's clock
+is its branch `0x870` (the AXI, AHB, UniPro, ICE, PHY_AUX and aggregate
+branches all hang off it: `BCR 0x87000`, `GDSCR 0x87004`, `AXI 0x87018`,
+`AHB 0x87020`, `UNIPRO 0x87064`, `ICE 0x8706c`, `PHY_AUX 0x870a4`,
+`AGGRE 0x870d4`). `0076` adds the node to the ADT (the board table carries
+the GCC's address and the branch number) and the driver enables the branch
+before touching the host, printing `CAP` and `VER` before and after: those
+two are read-only and non-zero for a live host, so they say whether the
+clock came up.
+
+`0075` keeps the panic's reason and prints it again at the end, because the
+console blanks the screen when it is full and a panic is longer than the
+screen: without it the last line is only the URL.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
