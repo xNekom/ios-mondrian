@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -342,6 +342,7 @@
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 	ucd->cmd[0] = 0x16;                 /* QUERY REQUEST UPIU */
++	ucd->cmd[2] = 0x7f;                 /* Linux pseudo-SCSI LUN (U64_MAX) maps here */
+ 	ucd->cmd[3] = ++su.tag;
+ 	ucd->cmd[5] = function;
+ 	ucd->cmd[12] = opcode;
+@@ -376,10 +377,13 @@
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x36 || ucd->resp[6] != 0) {
+-		printf("MONDRIAN UFS: query failed ocs 0x%x upiu 0x%x response 0x%x result 0x%x\n",
+-		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[19]);
+-		UFS_WHY("query fDeviceInit: ocs %x upiu %x response %x result %x",
+-		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[19]);
++		printf("MONDRIAN UFS: query req %02x %02x %02x %02x func %02x op/idn %02x/%02x\n",
++		    ucd->cmd[0], ucd->cmd[1], ucd->cmd[2], ucd->cmd[3], ucd->cmd[5],
++		    ucd->cmd[12], ucd->cmd[13]);
++		printf("MONDRIAN UFS: query failed ocs 0x%x upiu 0x%x response 0x%x rsp op/idn %02x/%02x\n",
++		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[12], ucd->resp[13]);
++		UFS_WHY("query fDeviceInit: ocs %x upiu %x response %x rsp %x/%x",
++		    ocs, ucd->resp[0], ucd->resp[6], ucd->resp[12], ucd->resp[13]);
+ 		return EIO;
+ 	}
+ 	if (value != NULL) {

@@ -353,6 +353,12 @@ the device clears it (`ufshcd_complete_dev_init()` in `drivers/ufs/core/ufshcd.c
 for up to 10 seconds before retrying TEST UNIT READY. The queries initialize
 the device; they do not write user storage blocks.
 
+The device-management QUERY uses the UPIU LUN `0x7f`: Linux issues these
+through its pseudo-SCSI device (`lun = U64_MAX`), and
+`ufshcd_scsi_to_upiu_lun()` maps that pseudo-LUN to `0x7f`. The first 0079
+query used LUN 0; `0080` corrects it and prints the exact query header and
+response if the device still rejects it.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`
