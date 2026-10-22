@@ -7,6 +7,36 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-22 16:05: 0086 froze on the clock, and the agent got project skills
+
+**What the 0082 boot photo proved.** `NOP OUT/IN` and `QUERY READ ATTRIBUTE`
+complete (`bCurrentPowerMode 0x33`, PowerDown), then the screen stops at
+`scsi 0x1b sent, waiting` and never prints a timeout. That wait loop was the
+**first place in the whole boot to call `mach_absolute_time()` / `delay(1)`**,
+and the timer interrupt has still never been seen on this board. Observation:
+the boot hangs there. Inference (not proved): the timebase does not advance,
+either frozen or unusable at EL1. `0086` therefore replaces every wait in
+`mondrian_ufs.c` with spin counts, prints a calibration line (ticks per two
+million spins, then spins per millisecond) that answers the question from the
+next photo, and treats a wake that never completes as non-fatal: it dumps
+`hcs/is/dbr` + the UTRD, clears the doorbell, retries `TEST UNIT READY`, then
+tries the wake again on LUN 0. It also prints the baseline TUR sense and
+`fDeviceInit` before any wake, none of which 0082 printed.
+
+**Build hiccup.** The first 0086 push failed to compile (`ufs_rd` used before
+its definition); the forward declarations are in, the patch re-applies
+(`85/85`), and run **39792570620** (`mondrian`) is the kernel to flash.
+Separately, run 39789013790 was a **real** compile failure (not
+concurrency), and 39786545938 (`display`, 0085) **succeeded**: the
+framebuffer driver compiles but stays untested until the root mounts.
+
+**OpenCode is now equipped for this project.** Five project skills in
+`.opencode/skills/` (versioned, advertised automatically): console-photo
+triage, arm64 board porting, the patch stack + CI, Qualcomm device trees, and
+the mondrian UFS work. They encode the traps that have actually cost time
+(CI skips a non-applying patch and still goes green; a cancelled job reports
+as `failure`; DT `interrupts` are SPI-32; 256 contiguous pages never return).
+
 ## 2026-10-22 15:30: the display is not a driver problem (0083/0084, 0085)
 
 **Finding, from the live device tree and from the phone itself:** the ABL
