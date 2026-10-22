@@ -359,6 +359,13 @@ through its pseudo-SCSI device (`lun = U64_MAX`), and
 query used LUN 0; `0080` corrects it and prints the exact query header and
 response if the device still rejects it.
 
+The 0080 phone photo confirms NOP OUT/IN succeeds, but SET_FLAG still gets a
+QUERY_RSP (`0x36`) with response `0xff` (general failure), even after the
+LUN correction. Linux's initialization sequence also sends UIC
+`DME_LINK_STARTUP` *before* NOP OUT / fDeviceInit. The driver had not sent
+that UIC command, so `0081` adds it and records the UIC result and HCS before
+retrying the device-management sequence.
+
 Boot procedure that writes (approved by the user 2026-10-21): the phone's
 active slot is **`_b`** and its boot partition held TWRP. Originals saved in
 `~/mondrian-backups/boot_a-orig.img` and `boot_b-orig.img`

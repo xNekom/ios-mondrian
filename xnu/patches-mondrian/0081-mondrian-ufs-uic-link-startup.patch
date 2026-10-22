@@ -1,0 +1,84 @@
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -60,6 +60,10 @@
+ #define REG_UTRLRSR     0x60
+ #define REG_UTRLCNR     0x64
+ #define REG_UTRIACR     0x4c
++#define REG_UICCMD      0x90
++#define REG_UICARG1     0x94
++#define REG_UICARG2     0x98
++#define REG_UICARG3     0x9c
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -505,6 +509,56 @@
+ 	*(volatile uint32_t *)(gcc_base + (branch * 0x100)) = 1;
+ 	value = *(volatile uint32_t *)(gcc_base + (branch * 0x100));
+ 	printf("MONDRIAN UFS: gcc branch %u cmd is now %x\n", branch, value);
++}
++
++/* Start the UniPro/M-PHY link as UFSHCD does before NOP and QUERY traffic. */
++static int
++ufs_link_startup(void)
++{
++	uint32_t hcs = 0, is = 0, result = 0;
++	unsigned int i;
++
++	for (i = 0; i < 1000000; i++) {
++		hcs = ufs_rd(REG_HCS);
++		if (hcs & (1u << 3)) {             /* UIC command ready */
++			break;
++		}
++		delay(1);
++	}
++	if (!(hcs & (1u << 3))) {
++		printf("MONDRIAN UFS: UIC command not ready, HCS 0x%x\n", hcs);
++		UFS_WHY("UIC command not ready: HCS %x", hcs);
++		return ETIMEDOUT;
++	}
++
++	ufs_wr(REG_IS, 1u << 10);             /* clear stale UIC command completion */
++	ufs_wr(REG_UICARG1, 0);
++	ufs_wr(REG_UICARG2, 0);
++	ufs_wr(REG_UICARG3, 0);
++	__builtin_arm_dsb(0xf);
++	ufs_wr(REG_UICCMD, 0x16);             /* UIC_CMD_DME_LINK_STARTUP */
++	for (i = 0; i < 5000000; i++) {
++		is = ufs_rd(REG_IS);
++		if (is & (1u << 10)) {             /* UIC_COMMAND_COMPL */
++			break;
++		}
++		delay(1);
++	}
++	if (!(is & (1u << 10))) {
++		printf("MONDRIAN UFS: DME_LINK_STARTUP timed out HCS 0x%x IS 0x%x\n",
++		    ufs_rd(REG_HCS), is);
++		UFS_WHY("DME_LINK_STARTUP timeout: HCS %x IS %x", ufs_rd(REG_HCS), is);
++		return ETIMEDOUT;
++	}
++	result = ufs_rd(REG_UICARG2) & 0xff;
++	ufs_wr(REG_IS, 1u << 10);
++	printf("MONDRIAN UFS: DME_LINK_STARTUP result 0x%x HCS 0x%x\n",
++	    result, ufs_rd(REG_HCS));
++	if (result != 0) {
++		UFS_WHY("DME_LINK_STARTUP result %x", result);
++		return EIO;
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -552,7 +606,11 @@
+ 		UFS_WHY("requests outstanding from the bootloader");
+ 		return EBUSY;
+ 	}
+-	ufs_wr(REG_IE, 0);                      /* polled operation */
++	ufs_wr(REG_IE, 0);                      /* all completions are polled */
++	int error = ufs_link_startup();
++	if (error) {
++		return error;
++	}
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+ 	ufs_wr(REG_UTRLRSR, 0);
+ 	/* The list must be stopped before its base is changed. */
