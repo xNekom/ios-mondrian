@@ -1,23 +1,26 @@
 /*
  * SPMI master-side observer reads for the boot menu keys.
  *
- * The tree of the phone (the 2026-10-23 spmi@c42d000 dump) decides
- * everything here:
- *   - the arbiter: node by compatible "qcom,spmi-pmic-arb"; its five
- *     regions bind by reg-names: cnfg, core, ... obsrvr.
- *   - the power-on block: the /__symbols__ entry containing "pon_hlos@"
- *     (qcom,pmk8350@0/pon_hlos@1300: periph 0x13, sid 0).
- *   - the volume key: /soc/gpio_keys/vol_up's "gpios" = <phandle index
- *     flag>; the phandle resolves through the tree to the gpio block
- *     (qcom,pm8350@1/pinctrl@8800: periph 0x88, sid 1) and the index is
- *     the second cell.
+ * The live tree decides every number: the arbiter node by compatible
+ * "qcom,spmi-pmic-arb" with its five regions bound by reg-names (cnfg,
+ * core, chnls, obsrvr, intr); the power-on block through the /__symbols__
+ * entry containing "pon_hlos@"; the volume key through
+ * /soc/gpio_keys/vol_up's "gpios" = <phandle index flag>, with the
+ * phandle resolved to the PMIC's pinctrl node.
  *
- * The only constants left (not of the phone) are the peripheral layout
- * rules: a status register sits at +0x10 of its own SPMI peripheral, and
- * the observer command is EXT_READL = (bit27) | (addr << 4), status at
- * +0x08 (bit 0 done, bits 1..3 error), data at +0x18 (the protocol the
- * timer's keys patch already proved on sweet). Every loop is bounded.
- * Nothing in this module ever writes the PMIC configuration.
+ * One structural fact does not come from the tree: a QC PMIC gpio is its
+ * own SPMI peripheral, the block starting at the pinctrl node's reg
+ * address and the pins following at +0x100 each, so the eight pages
+ * after the base are scanned and the first ones that exist are used. The
+ * peripheral status register sits at +0x10 (real-time status), which is
+ * where the timer's proven keys patch (sweet) reads KPDPWR/RESIN.
+ *
+ * The protocol is EXT_READL, one byte: command (1<<27)|(addr<<4) written
+ * to the observer slot, status at +0x08 (bit 0 done, bits 1..3 error),
+ * data at +0x18. Every loop is bounded; nothing here writes the PMIC
+ * configuration, and a version that is not the v5 one is recorded and
+ * tried anyway -- the reads are read-only and bounded, so the worst case
+ * is "no keys", never a dead shim.
  */
 #include <stdint.h>
 #include "console.h"
@@ -31,11 +34,10 @@ typedef volatile uint32_t *sp_reg;
 
 static sp_reg sp_core, sp_cnfg, sp_obs;
 static uint16_t ap_pon = NO_APID, ap_gpio = NO_APID;
-static int sp_why;
-
 static uint16_t ap_gpio_pages[8];
+static uint32_t sp_version;
 static unsigned char pon_prev = 0xff, gpio_prev[8];
-static int sp_ok;
+static int sp_ok, sp_why;
 
 static uint32_t
 be32at(uintptr_t p)
@@ -138,14 +140,17 @@ sp_read(uint16_t apid, uint16_t off, unsigned char *out)
 
 /*
  * "/soc/qcom,spmi@c42d000/qcom,pm8350@1/pinctrl@8800" ->
- *   ppid (1 << 8) | 0x88:  the pmic node is the parent segment ("...@1");
- *   the peripheral id is the high byte of the node's own reg (0x8800).
+ *   ppid (1 << 8) | 0x88:  the pmic node is the parent segment, its '@'
+ *   carries the sid; the peripheral id is the high byte of the node's own
+ *   reg (0x8800 -> 0x88).
  */
 static uint16_t
 sp_ppid_of(uintptr_t fdt, const char *path)
 {
 	int n = str_len(path);
 	int last = -1, prev = -1;
+	uintptr_t rp;
+	uint32_t rl;
 	unsigned sid;
 	int srok = 0, k;
 
@@ -163,7 +168,6 @@ sp_ppid_of(uintptr_t fdt, const char *path)
 		}
 	if (k < 0)
 		return NO_APID;
-	/* the digits right after the parent's '@' */
 	for (int m = prev + 1; m < last; m++)
 		if (path[m] == '@') {
 			sid = sp_atoi(path + m + 1, &srok);
@@ -171,9 +175,6 @@ sp_ppid_of(uintptr_t fdt, const char *path)
 		}
 	if (!srok)
 		return NO_APID;
-	uintptr_t rp;
-	uint32_t rl;
-
 	if (!fdt_node_prop(fdt, path, "reg", &rp, &rl) || rl < 4)
 		return NO_APID;
 	uint16_t per = (uint16_t)(be32at(rp) >> 8);
@@ -191,20 +192,18 @@ spmi_init(uintptr_t fdt)
 	uint32_t len, acc = 0;
 	uint64_t regs[10];
 	char names[5][8];
-	uint32_t count, version;
-	int o = 0, named = 0;
+	uint32_t count;
+	int o = 0, named = 0, found = 0;
 	const char *s;
 	char tmp[8];
+	uint16_t gpio_ppid;
 
 	sp_ok = 0;
+	sp_why = 0;
 	if (!fdt || !fdt_find_compatible(fdt, "qcom,spmi-pmic-arb",
-	    path, sizeof(path))) {
-		con_str("SPMI", "no arbiter in the tree");
-		sp_why = 1;
-		return;
-	}
+	    path, sizeof(path)))
+		return;	/* 1: no arbiter */
 	if (!fdt_node_prop(fdt, path, "reg-names", &data, &len)) {
-		con_str("SPMI", "no reg-names");
 		sp_why = 2;
 		return;
 	}
@@ -224,7 +223,6 @@ spmi_init(uintptr_t fdt)
 	 * its own five reg pairs are one address and one size cell each.
 	 */
 	if (named != 5 || fdt_node_regs_cells(fdt, path, regs, 5, 1, 1) < 5) {
-		con_str("SPMI", "five regions expected");
 		sp_why = 3;
 		return;
 	}
@@ -237,81 +235,68 @@ spmi_init(uintptr_t fdt)
 			sp_cnfg = (sp_reg)(uintptr_t)regs[i * 2];
 	}
 	if (!sp_core || !sp_cnfg || !sp_obs) {
-		con_str("SPMI", "regions missing");
 		sp_why = 4;
 		return;
 	}
-	version = sp_rd(sp_core, 0);
+	sp_version = sp_rd(sp_core, 0);
 	count = sp_rd(sp_core, 4) & 0x7ffu;
-	if (version < 0x50000000u || version >= 0x70000000u ||
-	    count == 0 || count > 512) {
-		con_hex64("SPMI version-gate", version);
+	/* A count the map cannot hold means this is not the arbiter the
+	 * protocol knows; the version itself is only recorded. */
+	if (count == 0 || count > 512) {
 		sp_why = 5;
 		return;
 	}
+	/* the PON: the tree's power-on block */
 	if (!fdt_symbols_for(fdt, "pon_hlos@", path, sizeof(path))) {
-		con_str("SPMI", "no pon_hlos");
 		sp_why = 6;
 		return;
 	}
 	ap_pon = sp_ppid_of(fdt, path);
 	if (ap_pon == NO_APID) {
-		con_str("SPMI", "pon ppid refused");
 		sp_why = 7;
 		return;
 	}
 	ap_pon = sp_find_apid(ap_pon, count);
 	if (ap_pon == NO_APID) {
-		con_str("SPMI", "pon apid refused");
 		sp_why = 8;
 		return;
 	}
-	/* the gpio block behind /soc/gpio_keys/vol_up */
+	/* the gpio block: what /soc/gpio_keys/vol_up points at */
 	if (!fdt_node_prop(fdt, "/soc/gpio_keys/vol_up", "gpios", &data,
 	    &len) || len < 8) {
-		con_str("SPMI", "no vol_up gpios");
 		sp_why = 9;
 		return;
 	}
 	if (!fdt_find_phandle(fdt, be32at(data), path, sizeof(path))) {
-		con_str("SPMI", "no phandle of vol_up");
 		sp_why = 12;
 		return;
 	}
-	ap_gpio = sp_ppid_of(fdt, path);
-	if (ap_gpio == NO_APID) {
-		con_str("SPMI", "gpio ppid refused");
+	gpio_ppid = sp_ppid_of(fdt, path);
+	if (gpio_ppid == NO_APID) {
 		sp_why = 10;
 		return;
 	}
-	ap_gpio = sp_find_apid(ap_gpio, count);
-	if (ap_gpio == NO_APID) {
-		con_str("SPMI", "gpio apid refused");
+	/* a gpio is its own peripheral page: scan the block's eight pages */
+	for (int i = 0; i < 8; i++) {
+		ap_gpio_pages[i] = sp_find_apid(
+		    (uint16_t)((gpio_ppid & 0xff00u) + (gpio_ppid & 0xffu) + i),
+		    count);
+		if (ap_gpio_pages[i] != NO_APID) {
+			found = 1;
+			gpio_prev[i] = 0;
+			if (ap_gpio == NO_APID)
+				ap_gpio = ap_gpio_pages[i];
+		}
+	}
+	if (!found) {
 		sp_why = 11;
 		return;
 	}
-	/*
-	 * The gpio block's page 0x88 is the first gpio; the following
-	 * pages (0x89..) exist on this PMIC up to its pin count. Probe
-	 * them: a pin that does not exist simply has no APID, and reads
-	 * are bounded.
-	 */
-	for (int i = 0; i < 8; i++) {
-		uint16_t ppid = (uint16_t)((ap_gpio & 0xff00u) |
-		    (0x88u + (unsigned)i));
-
-		ap_gpio_pages[i] = sp_find_apid(ppid, count);
-		if (ap_gpio_pages[i] == NO_APID)
-			ap_gpio_pages[i] = (i == 0) ? ap_gpio : NO_APID;
-	}
 	sp_ok = 1;
-	/* the state the edges are taken against */
 	(void)sp_read(ap_pon, 0x10u, &pon_prev);
-	for (int i = 0; i < 8; i++) {
-		gpio_prev[i] = 0;
+	for (int i = 0; i < 8; i++)
 		if (ap_gpio_pages[i] != NO_APID)
 			(void)sp_read(ap_gpio_pages[i], 0x10u, &gpio_prev[i]);
-	}
 	o = 0;
 	hexd(buf + o, pon_prev);
 	o += 2;
@@ -319,27 +304,31 @@ spmi_init(uintptr_t fdt)
 	hexd(buf + o, gpio_prev[0]);
 	o += 2;
 	buf[o++] = ' ';
-	hexd(buf + o, (unsigned char)(ap_pon >> 8));
-	o += 2;
 	buf[o++] = ' ';
-	hexd(buf + o, (unsigned char)(ap_gpio >> 8));
+	hexd(buf + o, (unsigned char)(gpio_ppid >> 8));
 	o += 2;
 	buf[o] = 0;
-	con_str("SPMI", buf);
+	con_str("SPMI ok", buf);
 }
 
 int
 spmi_ready(void)
 {
-	return sp_ok && ap_pon != NO_APID && ap_gpio != NO_APID;
+	return sp_ok && ap_pon != NO_APID;
 }
 
-/*
- * One byte of the PON's status and one of the gpio's; the changed bytes
- * go out for the menu's key lines. Returns the edges:
- *   1 the PON byte moved (the power key lives there)
- *   2 the gpio byte moved (the volume lives there)
- */
+int
+spmi_why(void)
+{
+	return sp_why;
+}
+
+uint32_t
+spmi_version(void)
+{
+	return sp_version;
+}
+
 int
 spmi_poll(unsigned char *pon, unsigned char *gpio, int *page)
 {
@@ -373,15 +362,4 @@ spmi_poll(unsigned char *pon, unsigned char *gpio, int *page)
 	}
 	*pon = pon_prev;
 	return rc;
-}
-
-int
-spmi_why(void)
-{
-	/* The menu prints it as a number: a string table would need
-	 * absolute pointers (see the if-chain note). 1 no arbiter,
-	 * 2 no reg-names, 3 regions, 4 regions missing, 5 version gate,
-	 * 6 no pon, 7 pon ppid, 8 pon apid, 9 no gpios, 10 gpio ppid,
-	 * 11 gpio apid, 12 vol_up phandle. */
-	return sp_why;
 }

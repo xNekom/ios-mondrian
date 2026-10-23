@@ -240,54 +240,55 @@ m_screen(int sel)
 	m_center(140, title, M_SCALE_TITLE, M_WHITE);
 	/* Two cards centered as a pair: 60 + 600 + 120 + 600 + 60. The
 	 * logos share a slab of three times the fruit's height. */
-	m_card(60, m_apple, m_apple_W, m_apple_H, 3, m_apple_H * 3,
+	m_card(60, m_apple, m_apple_W, m_apple_H, 1, m_apple_H,
 	    items[0], notes[0], sel == 0);
-	m_card(780, m_android, m_android_W, m_android_H, 3, m_apple_H * 3,
+	m_card(780, m_android, m_android_W, m_android_H, 1, m_apple_H,
 	    items[1], notes[1], sel == 1);
 }
 
-/* One line of key state at the bottom, for the next photograph. */
+/* The key state at the bottom, in readable size: bytes when the probe
+ * works, the refusal code and the arbiter version when it does not. */
 static void
 m_keys_line(unsigned char pon, unsigned char gpio, int ready)
 {
 	static const char hex[] = "0123456789abcdef";
+	static const char pre[] = "keys ";
+	static const char sp[] = "spmi code ";
+	static const char ver[] = " ver ";
 	char buf[40];
+	int o = 0;
 
-	buf[0] = 'k';
-	buf[1] = 'e';
-	buf[2] = 'y';
-	buf[3] = 's';
-	buf[4] = ' ';
-	buf[5] = ready ? 'o' : 'o';
-	buf[6] = ready ? 'n' : 'f';
-	buf[7] = ready ? ' ' : 'f';
-	buf[8] = ready ? 'p' : ' ';
-	buf[9] = ready ? 'o' : ' ';
-	buf[10] = ready ? 'n' : ' ';
-	buf[11] = ready ? '=' : ' ';
-	buf[12] = ready ? hex[pon >> 4] : ' ';
-	buf[13] = ready ? hex[pon & 15] : ' ';
-	buf[14] = ' ';
-	buf[15] = ready ? 'g' : ' ';
-	buf[16] = ready ? '=' : ' ';
-	buf[17] = ready ? hex[gpio >> 4] : ' ';
-	buf[18] = ready ? hex[gpio & 15] : ' ';
-	buf[19] = 0;
-	m_rect(0, 3000, FB_W, 32, M_BG);
-	m_str(24, 3000, buf, 2, M_WHITE);
-	if (!ready) {
-		static const char tag[] = "spmi code ";
-		char nb[8];
-		int w = spmi_why(), n = 0;
+	for (int i = 0; pre[i]; i++)
+		buf[o++] = pre[i];
+	if (ready) {
+		buf[o++] = 'p';
+		buf[o++] = 'o';
+		buf[o++] = 'n';
+		buf[o++] = '=';
+		buf[o++] = hex[pon >> 4];
+		buf[o++] = hex[pon & 15];
+		buf[o++] = ' ';
+		buf[o++] = 'g';
+		buf[o++] = '=';
+		buf[o++] = hex[gpio >> 4];
+		buf[o++] = hex[gpio & 15];
+	} else {
+		uint32_t v = spmi_version();
+		int c = spmi_why();
 
-		if (w >= 10)
-			nb[n++] = (char)('0' + w / 10);
-		nb[n++] = (char)('0' + w % 10);
-		nb[n] = 0;
-		m_rect(0, 3020, FB_W, 32, M_BG);
-		m_str(24, 3020, tag, 2, M_WHITE);
-		m_str(24 + 10 * 8 * 2, 3020, nb, 2, M_WHITE);
+		for (int i = 0; sp[i]; i++)
+			buf[o++] = sp[i];
+		if (c >= 10)
+			buf[o++] = (char)('0' + c / 10);
+		buf[o++] = (char)('0' + c % 10);
+		for (int i = 0; ver[i]; i++)
+			buf[o++] = ver[i];
+		for (int s = 28; s >= 0; s -= 4)
+			buf[o++] = hex[(v >> s) & 15];
 	}
+	buf[o] = 0;
+	m_rect(0, 2990, FB_W, 34, M_BG);
+	m_str(24, 2995, buf, 2, M_WHITE);
 }
 
 int

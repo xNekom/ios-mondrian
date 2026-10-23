@@ -32,3 +32,6 @@ int spmi_ready(void);
 
 /* Why the init refused, as a code for the menu line (0 = it did not). */
 int spmi_why(void);
+
+/* The arbiter version word as read (for the diagnostic line). */
+uint32_t spmi_version(void);

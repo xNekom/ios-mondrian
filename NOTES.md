@@ -68,6 +68,39 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 18:00: native-resolution logos, and a second real SPMI bug (the early ppid refusal)
+
+**The photo showed a ragged fruit because it was 90x104 at blit x3** (the
+rasterizer's low resolution, not the path). The logos are now rasterized
+at native blit size and painted 1:1: **Apple 245x284**, **Android
+242x139** (same vector sources, same pipeline; `tools/gen-menu-logos.py`
+→ `shim/menu_logos.h`, `m_card(..., scale = 1, slab = m_apple_H)`), so
+the silhouette is the corporate one pixel for pixel. The palette of the
+17:55 entry is unchanged (white everywhere, only the robot green).
+
+**Second SPMI bug.** The 17:55 probe still refused because it required
+the single ppid `(sid << 8) | 0x88` to exist before scanning the gpio
+pages: a PMIC gpio is its own peripheral page, so if page 0x88 does not
+exist (or the map spells it differently) the probe gave up before
+looking at 0x89..0x8f. Now the pages are scanned from the pinctrl
+node's own reg address and the probe succeeds with the first page that
+the APID map knows. The v5 version gate no longer refuses: the version
+word is recorded and printed, the reads are read-only and bounded, and
+the worst case stays "no keys, countdown only".
+
+**The refusal is now self-describing on screen** (scale 2, bottom line):
+`keys pon=XX g=XX` when it works, `spmi code N ver XXXXXXXX` when it
+does not: 1 no arbiter, 2 reg-names, 3 regions, 4 missing, 5 count,
+6 no pon, 7 pon ppid, 8 pon apid, 9 no gpios, 10 gpio ppid,
+11 gpio apid, 12 vol_up phandle. One photo of that line names the
+remaining defect exactly.
+
+**Image ready:** `/tmp/boot-mondrian-menu4.img` (`89c6ae11…`, 7.68 MB)
+= menu v0.4 (native logos + robust probe) + the GIC-fixed kernel; the
+`boot_b` write follows the same 5-step protocol once the phone is in
+fastboot (it is frozen at the VFS_ROOT panic after the persistent boot
+of v0.3).
+
 ## 2026-10-23 17:55: the photo named two real bugs; menu v0.3 flashed to boot_b
 
 **Bug 1 (why the keys never worked): the SPMI `reg` was parsed with the
