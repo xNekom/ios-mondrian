@@ -7,6 +7,57 @@ K60** (`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). The sweet half
 below is the upstream reference implementation and still works; the mondrian
 half is what is being built. The plan is in `docs/MONDIAN_PORT.md`.
 
+## 2026-10-23 16:10: the reboot of 0087 in TYPER-only, and the boot menu v0 of the shim
+
+**The panic of the 06:43 boot** was ours: `pe_mondrian_gic_dump()` reading
+`GICR_IGROUPR0` (SGI page, phys `0x17180000+0x10080`) after the VM was up.
+The same read worked at 23:31 and aborted at 06:43, so it is intermittent,
+not address-related: the TYPER read (first redistributor page) has never
+aborted. The dump is diagnostics only, so now it reads nothing beyond
+TYPER. **0087 in the repo was regenerated so that it produces that same
+version**: the tree was patched over the pristine cache (stages +
+0001..0086, and the old 0087), the function was corrected with the
+one from the local file, and the final patch is a `diff stateA..Y3`
+between commits -- never hunks by hand, which is what failed three
+times. `tools/check-patches.sh` reports **86/86** and the file that the
+patch generates is *identical* to the one at
+`/private/tmp/dxblocal/xnu/pexpert/arm/pe_fiq.c`. The local kernel with
+this change (sha256 `a3715411…`) is compiled and inside the boot image
+below; the leftover `GICR_IGROUPR0=` string in the binary is the one
+from `pe_init_fiq()`, which is the one that never aborted.
+
+**The boot menu (dual boot, phase v0)** is now in the shim:
+`shim/menu.c` + `shim/menu.h`, called from `shim_main()` just before
+`loader_boot()`. It draws a band over the diagnostic console (title,
+iOS, Android "not wired yet", countdown 5 s) and boots iOS as before: at
+present it changes NOTHING of the boot behind it. Notes: the band sits over
+the bottom quarter of the fb (y0 = FB_H - 412); it
+compiles in BOTH configurations (complete and `SMALL_SHIM=1`, which is
+the deploy) and `build.sh` rejects absolute relocations as before. v0 =
+drawing only; the Android option does nothing yet (v2 must first write
+`misc`), and the keys of v3 have sources to be measured: the power key in
+the PMIC PON across SPMI and (at least) one of the volumes in the PM8350
+per `qcom/xiaomi-sm8475-common.dtsi`. The shim's `reset()` already does
+`PSCI_SYSTEM_RESET` + `PSHOLD` + restart reason in `IMEM` -- that is the
+reboot the dual-boot shall later reuse (*observation: it is the same
+hardware that resets the phone when something hangs*).
+
+**The image to flash at boot_b** (built on this Mac):
+`/tmp/boot-mondrian-menu0.img` (sha256 `7064ac6e6f16…`, 7.6 MB) =
+`SMALL_SHIM` shim + boot menu v0 + kernel `a3715411…`, with the cmdline
+from `boards.py` (the same as the ones of the boots that already work;
+`phone-deploy.sh` with neither `CMDLINE` nor `ADT` changed). The flow
+that worked at 00:18: `adb push` + `dd` at `boot_b` (keep slot b active)
+→ restart → photo.
+
+**This boot must show, in order:** the menu band with a 5→1 countdown →
+`LOADER ok` (or the verdict of the loader) → the early XNU console →
+`MONDRIAN GIC: ... gicr ... -> ..., gicr ... -> ...` (remap, WITHOUT the
+panic) → the UFS render (`NOP`, queries, GPT `EFI PART`, `userdata` in
+`0x2f8a00`) → `BSD root: ufsroot0` → **`hfs: mounted iOSRoot`** (the 64 MB
+test image already in `userdata`) and after that the launchd error (it is
+expected that it dies; what this proves is the reading of `userdata`).
+
 ## 2026-10-22 23:45: **the UFS stack works end to end** -- the root device reads
 
 Boot with the instrumented local kernel (`f1b682db…`, 23:31): the GIC remap

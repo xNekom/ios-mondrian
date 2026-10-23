@@ -12,6 +12,7 @@
 #include "fdt.h"
 #include "mmu.h"
 #include "loader.h"
+#include "menu.h"
 #include "ufs.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -704,6 +705,19 @@ void shim_main(uint64_t dtb)
 	con_str("UFS", "probe skipped (SHIM_NO_UFS)");
 	con_skip();
 #endif
+
+	/*
+	 * The boot menu, v0: it draws the band and counts five seconds down
+	 * to the default (iOS). There is no input yet: the keys are polled
+	 * in a later version, and their sources (PON over SPMI for the
+	 * power key, maybe a TLMM gpio for one of the volumes) have to come
+	 * out of the stock device tree first. Everything behind the menu is
+	 * unchanged: the loader boots the kernel the build appended, so a
+	 * menu bug costs a band with a wrong line of text at most.
+	 */
+	stage = "menu";
+	menu_show();
+	con_skip();
 
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

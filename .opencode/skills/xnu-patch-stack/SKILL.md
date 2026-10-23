@@ -58,6 +58,22 @@ state, then regenerate every patch that moved. `tools/apply-series.py` and
 across to the mondrian series and is the right tool when porting `0030`
 (writes) or `0047` (persistent log).
 
+Regenerating an existing patch (the 2026-10-23 way, when the staged tree is
+gone): the pristine cache is `research/xnu-src-8796` (committed, resettable
+with `git checkout -- .`). Copy it, run the stage scripts and the series
+without the patch being regenerated, `commit` that as *stateA*, apply the
+fix (copy the function from the working file you have), `commit` as *B*, and
+the patch is `git diff stateA..B -- <file>` -- never hunks counted by hand,
+which was what failed three times for 0087. Two more traps paid for that
+day: base the diff on the **series** (before the patch), not on
+"series + the old version of the same patch" -- corrections to lines the
+patch itself ADDS turn into edits of preimages that do not exist yet, and
+the checker fails with "does not apply"; and
+`/private/tmp/dxblocal/xnu` can look clean while the kernel binaries still
+contain all the patches (the objects were compiled while the tree was
+patched): verify `git log -1` and `git status` before trusting that tree as
+a source.
+
 ## CI
 
 ```sh

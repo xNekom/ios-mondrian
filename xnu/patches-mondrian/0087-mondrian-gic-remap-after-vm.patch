@@ -19,10 +19,64 @@ pe_mondrian_gic_dump() does that before touching a register and prints the
 two mappings, so later GIC configuration (enabling the timer PPI, for
 instance) also lands on real addresses.
 
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
+Once the remap was in, the same read came back once more (the 06:43 boot
+of 2026-10-23): GICR_IGROUPR0 lives in the redistributor's SGI page, and
+that read is the one the phone intermittently refuses with
+FSC_SYNC_EXT_ABORT (far = gicr + 0x10080), while the identical access
+during pe_init_fiq() has never failed (the 23:31 boot read it fine). The
+dump is diagnostics only, so it now reads nothing past the first
+redistributor page: GICR_TYPER has never aborted and it proves the
+mapping is live. The remap itself is unchanged.
+
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -26,6 +26,22 @@
+@@ -26,6 +26,23 @@ static vm_offset_t gicd_base;
  static vm_offset_t gicr_base;
  static vm_offset_t gicr_size;
  
@@ -32,9 +86,10 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 + * to be recorded because the mapping made there does not survive: io_map()
 + * is called before STARTUP_SUB_KMEM, so it carves the virtual address out of
 + * the bootstrap space (pmap_map_bd) and advances virtual_space_start; once
-+ * the VM owns that space, every access to the GIC is a translation fault
-+ * (fault_code 0x10), which is what the UFS probe hit the first time it
-+ * dumped the GIC. pe_mondrian_gic_remap() maps it again, for real.
++ * the VM owns that space, an access to the GIC aborts on the bus
++ * (FSC_SYNC_EXT_ABORT, fault_code 0x10), which is what the UFS probe hit
++ * the first time it dumped the GIC. pe_mondrian_gic_remap() maps it again,
++ * for real.
 + */
 +static vm_offset_t mondrian_gicd_phys;
 +static vm_offset_t mondrian_gicr_phys;
@@ -45,7 +100,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  static uint32_t
  _gic_read32(vm_offset_t addr)
  {
-@@ -76,10 +92,38 @@
+@@ -76,21 +93,62 @@ find_gicr_pe_base()
  /* What the GIC really looks like from the non-secure side, and whether the
   * timer has fired. Printed by the UFS probe, which is late enough in the
   * boot for the screen to still show it. */
@@ -85,9 +140,24 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	if (!gicd_base) {
  		return;
  	}
-@@ -89,8 +133,13 @@
- 	    mondrian_vtimer_intid, igroupr,
- 	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
+-	vm_offset_t pe = find_gicr_pe_base();
+-	uint32_t igroupr = *(volatile uint32_t *)(pe + GICR_IGROUPR0);
+-	kprintf("MONDRIAN GIC: vtimer %u GICR_IGROUPR0=%x GICD_IGROUPR=%x GICD_CTLR=%x timer_pending=%d\n",
+-	    mondrian_vtimer_intid, igroupr,
+-	    gicd_read32(0x80 + ((mondrian_vtimer_intid / 32) * 4)), gicd_read32(GICD_CTLR),
++	/*
++	 * Read only the first redistributor page. GICR_IGROUPR0 lives in the
++	 * SGI page (GICR base + 0x10080) and reading it *after* the VM is up
++	 * has aborted on the bus in some boots (FSC_SYNC_EXT_ABORT, far =
++	 * gicr + 0x10080) even though the same access works during
++	 * pe_init_fiq(); this dump runs from the UFS probe, late enough that
++	 * the phone has already been through several power transitions.
++	 * TYPER is enough to tell that the mapping is live -- which is what
++	 * the remap above is for -- and it has never faulted.
++	 */
++	uint64_t typer = *(volatile uint64_t *)(gicr_base + GICR_TYPER);
++	kprintf("MONDRIAN GIC: vtimer %u gicr typer=%llx timer_pending=%d\n",
++	    mondrian_vtimer_intid, (unsigned long long)typer,
  	    ml_get_timer_pending());
 -#endif
  }
@@ -100,7 +170,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  
  void
  pe_init_fiq()
-@@ -145,6 +194,19 @@
+@@ -145,6 +203,19 @@ pe_init_fiq()
  		uint64_t const gicr_base_prop = ((uint64_t const *) prop)[2];
  		uint64_t const gicr_size_prop = ((uint64_t const *) prop)[3];
  

@@ -527,6 +527,26 @@ wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=30
 `cpus=6` starts the boot CPU (the X2) and the first five cores. On mondrian
 that is the X2, the three A710s and two A510s; `cpus=8` is the full set.
 
+## Dual boot (Android on slot a, iOS on slot b)
+
+The goal: at power on the phone offers iOS and Android; the volume keys
+navigate and the power key confirms. The ABL of Xiaomi is untouchable (see
+the safety section), so the selector lives where this project already
+controls the boot: the shim (slot b) and, when a choice has to leave a
+trace the ABL would read, the kernel's own UFS driver.
+
+| Phase | What it does | State |
+| --- | --- | --- |
+| v0 | the shim draws a band at the bottom of the framebuffer and counts 5 s down to iOS (`shim/menu.c`; the choice has no keys yet) | built; pending its first on-device photo |
+| v1 | reboot from inside: the shim already has `PSCI_SYSTEM_RESET` + `PSHOLD 0x0c264000` and the restart reason at 0x146aa65c; in the kernel the reset has to be the WDT (a "MACH Reboot" hangs today) | planned; validate the reset first |
+| v2 | switching the A/B slot: the kernel's UFS stack (end to end: GPT + `userdata`) writes the 4 KiB `misc` BCB of AOSP and resets; unproven with this ABL is whether it honors what `misc` says (the proverb test is `fastboot getvar current-slot`) | planned; design note: `shim/ufs.c` is read-only SCSI, a WRITE(10) fits in ~40 lines, so the shim may be able to do the whole switch alone |
+| v3 | the keys: the power key is not a TLMM gpio, it comes out of the PMIC's PON block over SPMI; at least one volume key is on the PM8350 per `qcom/xiaomi-sm8475-common.dtsi`. Poll, no interrupts: the ABL does not configure anything for this | read the stock dtsi first |
+| v4 | remember the last choice (boot args or a byte of the payload), timeouts | later |
+
+`boot_a` stays untouched at all times: the Android installation keeps its
+boot image where it was, and `fastboot boot` (Power+VolDown) is still the
+rescue path of a boot that went wrong.
+
 ## References
 
 * `MiCode/kernel_devicetree`, branch `mondrian-s-oss`
