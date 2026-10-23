@@ -30,21 +30,22 @@
 #define PTIMER_INTID		18
 #define SGI_INTID		1
 
-/* The window of RAM the kernel gets. It is the same window the sweet uses:
- * it holds the splash framebuffer (0xb8000000) and it starts above the
- * firmware's own memory at the bottom of the bank (the hypervisor is at
- * 0x80000000; the kernel image written over it resets the phone).
- * The device tree confirms that the window is inside a memory region; the
+/* The window of RAM the kernel gets. It holds the splash framebuffer
+ * (0xb8000000) and starts above the firmware's own memory at the bottom of
+ * the bank (the hypervisor is at 0x80000000; the kernel image written over
+ * it resets the phone).
+ *
+ * It ends at 0xe0000000, the first firmware carve-out (qheebsp_reserved_region).
+ * The live device tree says the RAM runs are 0x80000000+0x6a000000 and
+ * 0xf4600000+0xba00000 and marks the islands below 0xea000000 no-map, so a
+ * window that reaches past 0xe0000000 hands the VM pages that the AP cannot
+ * touch: the first access is a synchronous external abort, minutes into the
+ * boot. The device tree confirms the window is inside a memory region; the
  * shim prints both so a mismatch is visible on the screen.
  *
- * It ends at 0xf6000000, inside the phone's second RAM bank: the live
- * device tree says 0x80000000+0x6a000000 and 0xf4600000+0xba00000, so
- * everything between 0xea000000 and 0xf4600000 is a hole and is not RAM.
- * The wipe below only touches what the device tree says is memory.
- * The window cannot be much smaller either: below 0x3a000000 the physmap
- * no longer fits and the boot dies in pmap_map_bd. */
+ * The wipe below only touches what the device tree says is memory. */
 #define BOARD_MEM_BASE		0xb0000000UL
-#define BOARD_MEM_SIZE		0x46000000UL
+#define BOARD_MEM_SIZE		0x30000000UL
 
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */

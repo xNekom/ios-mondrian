@@ -106,12 +106,10 @@ Two rules cover the other failure mode, writing to the wrong place:
 
 ## The window of RAM
 
-The kernel gets `phys_base = 0xb0000000`, `mem_size = 0x46000000`. The rules
-behind those two numbers are in `NOTES.md` ("The window of RAM"): it must
-contain the splash framebuffer, start above the firmware's own memory (the
-hypervisor resets the phone when overwritten) and end in memory that exists
-(0xea000000..0xf4600000 is a hole, and XNU takes its first heap pages from the
-end of the window). The floor is 0x3a000000, and the physmap slide comes from
+The kernel gets `phys_base = 0xb0000000`, `mem_size = 0x30000000`: 768 MiB of
+real memory that ends exactly at the first firmware carve-out. The four rules
+behind those numbers (and the abort that the previous 1.12 GiB window caused)
+are in `NOTES.md` ("The window of RAM"). The physmap slide comes from
 `/chosen/random-seed`, so the seed is pinned in `tools/boards.py`.
 
 | what | value |

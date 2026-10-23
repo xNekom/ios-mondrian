@@ -34,28 +34,22 @@ Verified on the phone:
   build is flashed to `boot_b`.
 - **iOS userland runs.** With the real root in `userdata`, `FSIOC_KERNEL_ROOTAUTH`
   fails with `error 25` (ENOTTY: HFS has no such ioctl) and `0089` continues;
-  `/sbin/launchd` then starts as pid 1, libignition registers the dyld shared
-  cache, and launchd runs its first boot task (`mount-phase-1`, exec `mount`).
-- **The root is read-only.** The UFS block device has no write path yet, so
-  launchd's `mount_hfs` fails to remount `/` ("Read-only file system"), and
-  the Data volume and `/private/preboot/<uuid>` lookups fail: the flattened
-  HFS root has neither.
+  `/sbin/launchd` starts as pid 1, libignition registers the dyld shared
+  cache, and launchd runs its boot tasks. It gets as far as `backboardd`
+  loading its HID plugins and opening `MondrianHIDTouch`.
+- **The root is read-write.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the
+  write half of the block device; `DKIOCISWRITABLE` had to say so too, or HFS
+  keeps `HFS_WRITEABLE_MEDIA` off and never writes at all.
 - **Recovery path.** `boot_a` keeps the stock Android image and `fastboot
   boot` writes nothing: experiments are volatile unless the image is installed.
 
 Current blocker, in order:
 
-1. **UFS writes.** SCSI WRITE(10) and SYNCHRONIZE CACHE on the root device,
-   plus the write half of the block device, so launchd can mount `/`
-   read-write. Everything after this point (logging, `/private/var`, the
-   persistent console log) needs it.
-2. **Volume layout.** launchd expects a Data volume and
-   `/private/preboot/<uuid>`; a flattened HFS root has one volume and a
-   `private/preboot/Cryptexes` directory. Either the root image grows those
-   paths (cheap: symlink or copy) or launchd keeps failing those steps.
-3. **Then:** the display presentation (`0085`), touch and USB.
-
-Next concrete actions:
+1. **Volume layout.** launchd expects a Data volume and
+   `/private/preboot/<hash>/usr/standalone/firmware`; the flattened HFS root
+   has one volume and a `private/preboot/Cryptexes` directory, so those boot
+   steps fail (they do not stop launchd). Grow the paths in the root image.
+2. **Then:** the display presentation (`0085`), touch and USB.
 
 ```sh
 tools/build-kernel-local.sh                        # -> /tmp/kernel.development.mondrian
@@ -65,13 +59,6 @@ tools/mkpayload.py /tmp/kernel.development.mondrian shim/out/mondrian.adt \
 BOARD=mondrian shim/build.sh shim/out/payload.bin  # -> shim/out/shim-boot.img
 tools/phone-boot.sh                                # volatile; phone in fastboot
 ```
-
-The cloud build (`gh workflow run xnu.yml -f board=mondrian`) is the same
-series and stays as the reproducible reference.
-
-A definitive write to `boot_b` follows the graded protocol of
-`docs/MONDIAN_PORT.md` (volatile proof first, `fastboot getvar current-slot`,
-verified backup, write, read back).
 
 ## Building and booting
 
@@ -128,9 +115,8 @@ This device has **no `init_boot`**.
 
 ## Traps already paid for
 
-**The window of RAM.** `phys_base = 0xb0000000`, `mem_size = 0x46000000` (ends
-at `0xf6000000`, in the second bank). Three rules, each learned by a reset or
-a panic:
+**The window of RAM.** `phys_base = 0xb0000000`, `mem_size = 0x30000000`
+(ends at `0xe0000000`). Four rules, each learned by a reset or a panic:
 
 - it must contain the splash framebuffer, because the early console maps
   `VA=PA` inside the window;
@@ -139,10 +125,21 @@ a panic:
   `0x80000000+0x600000` resets the phone;
 - it must end in memory that exists: XNU takes its first heap pages from the
   *end* of the window, and a window ending in the hole hands them to nothing
-  (`Undefined kernel instruction`, pc inside the physmap).
+  (`Undefined kernel instruction`, pc inside the physmap);
+- it must not **contain** a carve-out or a hole in the middle: the VM hands
+  out pages across the whole window, and the first access to a page it took
+  from `0xe0000000`+ is a synchronous external abort (`Kernel data abort`,
+  `far` inside the physmap of `qheebsp_reserved_region`). The previous 1.12
+  GiB window had `0xe0000000..0xea000000` (the first bank's firmware islands)
+  and `0xea000000..0xf4600000` (the gap between the banks) in the middle;
+  launchd ran for minutes before an allocation landed there.
 
-The floor is `0x3a000000`: below that the physmap no longer fits next to the
-kernel image and the boot dies in `pmap_map_bd`. The **physmap slide** comes
+`0x30000000` is the largest window that ends at the first carve-out. Smaller
+is not safe either: the bootstrap VA window is sized from `mem_size` in
+256 MiB segments (`arm_vm_init.c`), and the early page tables run out below
+768 MiB.
+
+The **physmap slide** comes
 from `/chosen/random-seed`, so a random seed makes the boot a coin flip
 (about one host boot in three dies); `boards.py` pins the seed and `ADT_SEED`
 overrides it. Do not use the biggest free hole (`0xbab00000+597 MB`): the

@@ -191,45 +191,36 @@ MONDRIAN = Board(
     # bootloader passes, read from /proc/device-tree in a recovery. The
     # /memory node has six regions: 0x80000000+0x6a000000, then a hole, then
     # 0xf4600000+0x0ba00000 (which ends exactly at 4G), and four regions above
-    # 4G. The kernel gets a window inside the first one: that is the region
-    # that holds the splash framebuffer (0xb8000000) and the only one the
-    # phone really has (the ddr_size property says 12GB, but the bootloader
-    # only describes the part the kernel may use).
+    # 4G. The kernel gets a window inside the first one.
     #
-    # The window is the same one the sweet uses, and for the same reasons: it
-    # has to contain the splash framebuffer (0xb8000000), and it has to start
-    # above the firmware's own memory at the bottom of the bank (the
-    # hypervisor is at 0x80000000+0x600000; the kernel image written over it
-    # kills the secure world and the phone resets instead of booting).
+    # The window has to satisfy four rules, each learned by a reset or a
+    # panic:
     #
-    # The window is 0xb0000000+0x46000000, so it ends at 0xf6000000, inside
-    # the phone's *second* RAM bank. The live device tree says the RAM is
-    #   0x80000000+0x6a000000  and  0xf4600000+0xba00000
-    # so 0xea000000..0xf4600000 is a hole: not RAM at all. The kernel's
-    # dynamic memory starts at the *end* of the window (static_memory_end =
-    # physmap_base + memSize), so a window that ends inside the hole hands
-    # the first heap pages to memory that does not exist: the writes are
-    # lost and the kernel jumps to a corrupted pointer. That was the
-    # phone's panic ("Undefined kernel instruction", pc inside the physmap,
-    # the same every time: a page in the hole read back as a pointer).
+    # - it must contain the splash framebuffer, because the early console maps
+    #   VA=PA inside the window;
+    # - it must start above the firmware's own memory: the kernel image is
+    #   written to the start of the window, and overwriting the hypervisor at
+    #   0x80000000+0x600000 resets the phone;
+    # - it must end in memory that exists: XNU takes its first heap pages from
+    #   the *end* of the window, and a window ending in the hole hands them to
+    #   nothing (`Undefined kernel instruction`, pc inside the physmap);
+    # - it must not *contain* a carve-out or a hole in the middle. The VM
+    #   hands out pages across the whole window, so the first access to a page
+    #   the allocator took from 0xe0000000+ is a synchronous external abort
+    #   (`Kernel data abort`, far inside the physmap of the carve-out): the
+    #   first bank's firmware islands and the gap between the banks were both
+    #   inside the old 1.12 GiB window.
     #
-    # A window that *contains* the hole (0xb0000000+0x46000000 ends at
-    # 0xf6000000, in the second bank) is just as bad: the zone map still
-    # covers the hole, and the kernel reads a pointer from it.
+    # 0xb0000000+0x30000000 ends exactly at the first carve-out
+    # (qheebsp_reserved_region) and contains no other. 768 MiB of real memory
+    # beats 1.12 GiB of which 360 MiB could never be used. The panel's own
+    # pages are kept off the free list separately (mondrian_page_is_screen).
     #
-    # The size has a floor: below 0x3a000000 the physmap no longer fits next
-    # to the kernel's own image and the boot dies in pmap_map_bd (measured on
-    # the host, and on the phone with the new kernel: it asked for more room
-    # than the old window had). At 0x46000000 the host boots with every
-    # slide tried, and the end of the window is in real RAM.
-    #
-    # The base is the only one that boots, measured on the host with the same
-    # kernel (tools/qemu-ios.py): the low bank and the hole after the splash
-    # both panic in pmap_map_bd, and any other base dies before the console
-    # even exists. That bisection was made with a random seed, so it is not
-    # trustworthy: redo it with the seed pinned below.
+    # Keep the size at or above 0x30000000: the bootstrap VA window scales
+    # with the number of 256 MiB segments (two plus ten per segment,
+    # arm_vm_init.c) and a smaller window leaves the early page tables short.
     phys_base=0xb0000000,
-    mem_size=0x46000000,
+    mem_size=0x30000000,
     # Pinned: the physmap slide comes from this seed, and with a random one
     # the boot is a coin flip (one run in three dies in pmap_map_bd). This
     # one is known to work with the window above (checked on the host).
