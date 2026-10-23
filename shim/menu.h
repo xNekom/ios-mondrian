@@ -1,10 +1,11 @@
 #pragma once
 
 /*
- * The boot menu of the shim. v0 draws a band and counts down to the
- * default (iOS); the volume and power keys are polled in a later version,
- * once their sources (PMIC PON over SPMI, maybe a TLMM gpio for one of the
- * volumes) have been read out of the stock device tree.
+ * The boot menu of the shim. v0.1 draws a full-screen selector with
+ * logos and counts down to the default (iOS); the volume and power keys
+ * are polled in a later version, once their sources (PMIC PON over SPMI,
+ * maybe a TLMM gpio for one of the volumes) have been read out of the
+ * stock device tree.
  */
 
 /* The countdown, in seconds. */
