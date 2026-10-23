@@ -13,7 +13,6 @@
 #include "mmu.h"
 #include "loader.h"
 #include "menu.h"
-#include "spmi.h"
 #include "ufs.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -718,23 +717,16 @@ void shim_main(uint64_t dtb)
 	 * menu bug costs a wrong screen at most.
 	 */
 	stage = "menu";
-	menu_show();
+	int choice = menu_show(dtb);
 	con_skip();
 
 	/*
-	 * The SPMI probe (read-only EXT_READL of the PON and the gpio
-	 * status): its regions and the peripherals come out of the live
-	 * tree; the print is what maps the keys. Before the loader, so a
-	 * dead arbiter only costs a line, never the boot.
+	 * The keyboard is inside the menu now (spmi_init there): the
+	 * selection is not used to switch anything yet -- Android arms
+	 * the misc BCB in v2 -- so the boot behind it stays iOS while
+	 * the pick is recorded on the console for the photographs.
 	 */
-	stage = "spmi";
-	spmi_init(dtb);
-	{
-		unsigned char pon = 0, gpio = 0;
-
-		spmi_poll(&pon, &gpio);
-	}
-	con_skip();
+	con_hex("MENU choice", (uint64_t)choice);
 
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

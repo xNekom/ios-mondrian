@@ -30,6 +30,7 @@
 #include "font.h"
 #include "menu.h"
 #include "menu_logos.h"
+#include "spmi.h"
 
 #define M_BG		0xff10101aU	/* the page */
 #define M_CARD		0xff191922U	/* an unselected card */
@@ -232,8 +233,9 @@ m_card(int cx, const unsigned char *bits, int bw, int bh, int scale,
 	m_in(cx, M_CARD_W, M_CARD_Y + M_NOTE_Y, note, M_SCALE_NOTE, M_DIM);
 }
 
-int
-menu_show(void)
+/* The title and the two cards: everything a selection change repaints. */
+static void
+m_screen(int sel)
 {
 	static const char title[] = BOARD_NAME " boot menu";
 	static const char items[][8] = { "iOS", "Android" };
@@ -241,47 +243,131 @@ menu_show(void)
 		"the root image lives in userdata",
 		"not wired yet (v2: misc write)",
 	};
-	static const char leaving[] = "LEAVES AS IT IS: starting iOS";
-	static const char cd_head[] = "starting iOS in ";
-	char cd_line[20];
-	int sel = MENU_DEFAULT;
-	int cd_y = 2700;
 
-	if (!con_fb)
-		return sel;
-
-	/* The whole screen: the diagnostic console above is gone; the
-	 * loader's verdicts, printed after this returns, come back over
-	 * the same background. */
 	m_rect(0, 0, FB_W, FB_H, M_BG);
 	m_center(140, title, M_SCALE_TITLE, M_FG);
-
 	/* Two cards centered as a pair: 60 + 600 + 120 + 600 + 60. The
 	 * logos share a slab of three times the fruit's height. */
 	m_card(60, m_apple, m_apple_W, m_apple_H, 3, m_apple_H * 3,
 	    items[0], notes[0], sel == 0);
 	m_card(780, m_android, m_android_W, m_android_H, 3, m_apple_H * 3,
 	    items[1], notes[1], sel == 1);
+}
 
-	/* The countdown. Each second rewrites only its own row; the rest
-	 * of the screen keeps what it has, so a photograph cannot come
-	 * out mid-clear. */
-	for (int n = MENU_SECONDS; n > 0; n--) {
-		char *p = cd_line;
-		const char *q = cd_head;
+/* One line of key state at the bottom, for the next photograph. */
+static void
+m_keys_line(unsigned char pon, unsigned char gpio, int ready)
+{
+	static const char hex[] = "0123456789abcdef";
+	char buf[40];
 
-		while (*q)
-			*p++ = *q++;
-		*p++ = (char)('0' + n);
-		*p++ = 's';
-		*p = 0;
-		m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
-		m_center(cd_y, cd_line, M_SCALE_CD, M_CD);
-		m_wait_ms(1000);
+	buf[0] = 'k';
+	buf[1] = 'e';
+	buf[2] = 'y';
+	buf[3] = 's';
+	buf[4] = ':';
+	buf[5] = ' ';
+	buf[6] = ready ? 'p' : 'o';
+	buf[7] = ready ? 'o' : 'f';
+	buf[8] = ready ? 'n' : 'f';
+	buf[9] = ' ';
+	buf[10] = hex[pon >> 4];
+	buf[11] = hex[pon & 15];
+	buf[12] = ' ';
+	buf[13] = 'g';
+	buf[14] = 'p';
+	buf[15] = 'i';
+	buf[16] = 'o';
+	buf[17] = ' ';
+	buf[18] = hex[gpio >> 4];
+	buf[19] = hex[gpio & 15];
+	buf[20] = 0;
+	m_rect(0, 3030, FB_W, 20, M_BG);
+	m_str(24, 3030, buf, 1, M_DIM);
+}
+
+int
+menu_show(uintptr_t fdt)
+{
+	static const char leaving[] = "LEAVES IT AS IT IS: starting iOS";
+	static const char cd_head[] = "starting iOS in ";
+	char cd_line[20];
+	int sel = MENU_DEFAULT;
+	int cd_y = 2700;
+	int ready;
+	unsigned char pon = 0, gpio = 0, last_pon = 0, last_gpio = 0;
+	int shown = -1;
+	int elapsed = 0;
+
+	if (!con_fb)
+		return sel;
+
+	/*
+	 * The keys. shim/spmi.c takes the arbiter regions and the two
+	 * peripherals out of the live tree; a failed probe leaves the
+	 * countdown as the only path, so the menu never depends on the
+	 * keys to produce a boot.
+	 */
+	spmi_init(fdt);
+	ready = spmi_ready();
+	if (ready)
+		(void)spmi_poll(&pon, &gpio);
+	last_pon = pon;
+	last_gpio = gpio;
+
+	m_screen(sel);
+	m_keys_line(pon, gpio, ready);
+
+	/* One second of countdown, polled at 50 ms: an ascending edge of
+	 * any PON bit other than bit 0 moves the selection, an ascending
+	 * bit 0 of the PON (KPDPWR) confirms. Rising edges keep a press
+	 * from cycling twice (press then release). */
+	while (elapsed < MENU_SECONDS * 1000) {
+		m_wait_ms(50);
+		elapsed += 50;
+
+		if (ready) {
+			unsigned char p = 0, g = 0;
+
+			(void)spmi_poll(&p, &g);
+			if ((p & 1) && !(last_pon & 1)) {
+				/* the power key: confirm what is selected */
+				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
+				    M_BG);
+				m_center(cd_y, leaving, M_SCALE_CD, M_FG);
+				return sel;
+			}
+			if ((p & ~last_pon) || (g & ~last_gpio)) {
+				sel = 1 - sel;
+				m_screen(sel);
+			}
+			last_pon = p;
+			last_gpio = g;
+			pon = p;
+			gpio = g;
+			m_keys_line(pon, gpio, ready);
+		}
+
+		int left = MENU_SECONDS - elapsed / 1000;
+
+		if (left < 0)
+			left = 0;
+		if (left != shown) {
+			char *cp = cd_line;
+			const char *q = cd_head;
+
+			shown = left;
+			while (*q)
+				*cp++ = *q++;
+			*cp++ = (char)('0' + (left > 9 ? 9 : left));
+			*cp++ = 's';
+			*cp = 0;
+			m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
+			m_center(cd_y, cd_line, M_SCALE_CD, M_CD);
+		}
 	}
 	m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
 	m_center(cd_y, leaving, M_SCALE_CD, M_FG);
 
-	/* v0.1 has no input: the countdown always lands on the default. */
 	return sel;
 }

@@ -5,9 +5,10 @@ Both silhouettes come from public vector sources and are rasterized here
 into one-bit arrays with a small parser -> flatten -> even-odd pipeline.
 No binary assets: the bitmaps are generated C arrays.
 
-    Apple    Bootstrap Icons "apple" (MIT license; attribution kept in
-             the generated header)
-             github.com/twbs/icons, viewBox 0 0 16 16
+    Apple    the corporate silhouette (Wikimedia Commons
+             "Apple_logo_black.svg", 814x1000, kept in the generated
+             header with its trademark note; the file is hosted there
+             as ineligible-for-copyright, the mark is Apple's)
     Android  Google Material Design Icons "android" (Apache 2.0)
              The icon is already just the head: dome, antennae, eyes.
              github.com/google/material-design-icons, viewBox 0 0 24 24
@@ -25,15 +26,15 @@ import os
 import re
 
 APPLE_D = (
-    "M11.182.008C11.148-.03 9.923.023 8.857 1.18c-1.066 1.156-.902 2.482-.878"
-    "2.516s1.52.087 2.475-1.258.762-2.391.728-2.43m3.314 11.733c-.048-.096"
-    "-2.325-1.234-2.113-3.422s1.675-2.789 1.698-2.854-.597-.79-1.254-1.157"
-    "a3.7 3.7 0 0 0-1.563-.434c-.108-.003-.483-.095-1.254.116-.508.139-1.653"
-    ".589-1.968.607-.316.018-1.256-.522-2.267-.665-.647-.125-1.333.131-1.824"
-    ".328-.49.196-1.422.754-2.074 2.237-.652 1.482-.311 3.83-.067 4.56s.625"
-    "1.924 1.273 2.796c.576.984 1.34 1.667 1.659 1.899s1.219.386 1.843.067"
-    "c.502-.308 1.408-.485 1.766-.472.357.013 1.061.154 1.782.539.571.197"
-    "1.111.115 1.652-.105.541-.221 1.324-1.059 2.238-2.758q.52-1.185.473-1.282"
+    "M788.1 340.9c-5.8 4.5-108.2 62.2-108.2 190.5 0 148.4 130.3 200.9"
+    "134.2 202.2-.6 3.2-20.7 71.9-68.7 141.9-42.8 61.6-87.5 123.1-155.5"
+    "123.1s-85.5-39.5-164-39.5c-76.5 0-103.7 40.8-165.9 40.8s-105.6-57"
+    "-155.5-127C46.7 790.7 0 663 0 541.8c0-194.4 126.4-297.5 250.8-297.5"
+    "66.1 0 121.2 43.4 162.7 43.4 39.5 0 101.1-46 176.3-46 28.5 0 130.9"
+    "2.6 198.3 99.2zm-234-181.5c31.1-36.9 53.1-88.1 53.1-139.3 0-7.1-.6"
+    "-14.3-1.9-20.1-50.6 1.9-110.8 33.7-147.1 75.8-28.5 32.4-55.1 83.6"
+    "-55.1 135.5 0 7.8 1.3 15.6 1.9 18.1 3.2.6 8.4 1.3 13.6 1.3 45.4 0 "
+    "102.5-30.4 135.5-71.3z"
 )
 
 ANDROID_D = (
@@ -308,13 +309,14 @@ def pack(name, g):
 
 
 def main():
-    apple = rasterize(APPLE_D, 6)        # 16 * 6 = 96 px wide
+    apple = rasterize(APPLE_D, 0.11)     # the 814x1000 corporate path
     andro = rasterize(ANDROID_D, 5.5)    # 24 * 5.5 = 132 px wide
     out = (
         "/*\n"
         " * The logos of the boot menu, rasterized by\n"
         " * tools/gen-menu-logos.py from public vector sources:\n"
-        " *   Apple:   Bootstrap Icons \"apple\" (MIT license)\n"
+        " *   Apple:   Wikimedia Commons \"Apple_logo_black.svg\"\n"
+        " *            (814x1000; the mark is a trademark of Apple Inc.)\n"
         " *   Android: Google Material Icons \"android\" (Apache 2.0)\n"
         " * One bit per pixel, MSB first per row. Do not edit the bit maps\n"
         " * by hand; change the generator and run it.\n"

@@ -1,11 +1,13 @@
 #pragma once
+#include <stdint.h>
 
 /*
- * The boot menu of the shim. v0.1 draws a full-screen selector with
- * logos and counts down to the default (iOS); the volume and power keys
- * are polled in a later version, once their sources (PMIC PON over SPMI,
- * maybe a TLMM gpio for one of the volumes) have been read out of the
- * stock device tree.
+ * The boot menu of the shim. v0.2 draws the full-screen selector with
+ * the two logo cards and counts down to the default (iOS); the keys are
+ * polled through shim/spmi.c (PON + PM8350 gpio, addresses from the live
+ * tree): a rising edge moves the selection, the PON's power bit
+ * confirms. Both the running boot (the legal timeout) and the failure
+ * mode (spmi off -> countdown only) end on a defined choice.
  */
 
 /* The countdown, in seconds. */
@@ -15,9 +17,10 @@
 #define MENU_DEFAULT	0
 
 /*
- * Draw the selector and run the countdown; the return value is the index
- * of the choice. Without a framebuffer (con_enable() not called, or a
- * board the tree did not give us the splash of) it draws nothing and
- * returns the default at once, so the boot behind it is unchanged.
+ * Draw the selector, poll the keys and run the countdown; the return
+ * value is the index of the choice. Without a framebuffer (con_enable()
+ * not called, or a board the tree did not give us the splash of) it
+ * draws nothing and returns the default at once, so the boot behind it
+ * is unchanged.
  */
-int menu_show(void);
+int menu_show(uintptr_t fdt);
