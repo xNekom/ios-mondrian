@@ -68,6 +68,17 @@ install)
 	adb wait-for-device
 	BLOCK=/dev/block/by-name/boot$(slot)
 	ORIG=/data/local/tmp/boot-orig$(slot).img
+	# boot_a keeps the stock Android image; the shim boots from slot b and
+	# nothing here is allowed to break that escape hatch. To break this
+	# rule on purpose (there is no known need), set BOOT_A=1 and have a
+	# verified copy of boot_a at backup/boot_a-original.img (sha256
+	# 39a24660fe9c2ebbf3f074b783a240c0d86eaa42fc241b04394706e00bdadb74).
+	if [ "$(slot)" = "a" ]; then
+		if [ "${BOOT_A:-0}" != 1 ]; then
+			echo "rechazado: escribiria boot_a (el Android de escape). BOOT_A=1 lo permite a despropósito." >&2
+			exit 1
+		fi
+	fi
 	# The original goes first: the boot partition is the Android one.
 	if ! adb shell "ls $ORIG" >/dev/null 2>&1; then
 		echo "guardando la imagen original de $BLOCK"
@@ -81,8 +92,15 @@ backup)
 	need adb
 	adb wait-for-device
 	BLOCK=/dev/block/by-name/boot$(slot)
+	# Keep it on the phone too (the recovery trick of NOTES.md reads it
+	# without USB), but the durable copy comes off the phone: /data is
+	# the partition this port rewrites and already lost the earlier
+	# copies once.
 	adb shell "dd if=$BLOCK of=/data/local/tmp/boot-orig$(slot).img bs=4M"
 	adb shell "ls -l /data/local/tmp/boot-orig$(slot).img"
+	DEST="backup/boot$(slot)-$(date +%Y%m%d-%H%M).img"
+	adb pull /data/local/tmp/boot-orig$(slot).img "$DEST"
+	shasum -a 256 "$DEST" | tee -a backup/SHA256SUMS
 	;;
 reboot)
 	adb reboot

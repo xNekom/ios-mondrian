@@ -35,16 +35,58 @@ list below.
 
 ## Safety: what can and cannot brick the phone
 
-The port must never turn a mistake into a brick. The rules:
+The phone's boot chain is Qualcomm firmware below the Android images:
+`xbl` → `xbl_config` → `abl` → `tz`/`hyp`/`uefisecapp`/modem. An image in
+that chain cannot be repaired by the OS or by fastboot — on this device
+the only way back is EDL with an authorized Xiaomi account — so it stays
+out of bounds permanently. Everything the port writes lives above that
+chain, where the stock fastboot ROM can restore any image.
 
-| Operation | Risk | Rule |
+### Partition policy
+
+Written — the allow-list; everything else is off:
+
+| Partition | Role | Extra rule |
 | --- | --- | --- |
-| `fastboot boot shim-boot.img` | none | temporary, nothing is written to any partition. A bad image just leaves the phone in fastboot. |
-| `fastboot flash userdata …` | **erases the Android user data** (recoverable by reflashing Android) | only after the user says so. `tools/flash-root.sh` does this and nothing else. |
-| `fastboot flash boot/init_boot/dtbo/vbmeta/abl/tz` | **hard brick** | never. The bootloader chain is not touched, in this fork or upstream. |
+| `boot_b` | the shim slot | the routine target of the port |
+| `boot_a` | stock Android, the escape hatch | deploy tooling refuses it (`phone-deploy.sh install` needs `BOOT_A=1`); a verified backup precedes any write |
+| `vendor_boot` | the shim reads its live device tree out of it | dump verified by SHA256 first |
+| `misc` | the A/B boot-control block; dual boot v2 writes it from the kernel | wrong content only selects the wrong slot; `fastboot --set-active` fixes it without flashing anything |
+| `init_boot`, `recovery` | untouched so far | the same safeguards whenever a write is actually needed |
+| `userdata` | the iOS root | erasing Android user data here is acceptable and recoverable; `tools/flash-root.sh` writes it and asks first |
 
-Two more rules, because the failure mode that is *not* a brick is still
-bad: writing to a wrong address.
+Repeated volatile `fastboot boot` runs — including every failure and every
+panic — touch no partition at all, and a slot switch (`fastboot
+--set-active a`) only marks state; neither is part of the write count.
+
+Never written — the deny-list, an irreversible brick:
+
+`xbl`, `xbl_config`, `abl`, `tz`, `hyp`, `uefi*`/`uefisecapp`, `modem*`,
+`persist`, and every other low-level image the stock ROM ships. Nothing in
+this port needs them, and the dual-boot plan runs entirely inside the
+allow-list: the menu is in the shim, the slot switch is a `misc` write.
+
+Read-only as well, because nothing needs them and a bad copy can break
+verified boot or device-tree delivery: `vbmeta`, `dtbo`.
+
+### A definitive write, in graded steps
+
+1. **Volatile proof first.** `fastboot boot` the same image. It writes no
+   partition; a bad image leaves the phone in fastboot and nothing worse.
+2. **Name the target.** `fastboot getvar current-slot`; the write pins to
+   that `boot_<slot>`, `boot_a` never by accident.
+3. **Verified originals.** Dump the target partition, pull it to
+   `backup/`, record it in `SHA256SUMS`, and check the sum before writing.
+   (The on-phone copy sits in `/data/local/tmp` and dies with the next
+   `userdata` wipe; the copy on the workstation is the durable one.)
+4. **Write, read back, then commit to booting from it.** Verify the
+   flashed partition by hash, reboot once, confirm the slot the next boot
+   came from.
+5. **Keep the disaster baseline.** The complete stock fastboot ROM of this
+   exact model restores every allow-list partition; keep it on disk before
+   the first definitive write.
+
+Two rules cover the other failure mode — writing to the wrong place:
 
 * **The shim takes its addresses from the device tree the bootloader
   passed**, not from constants. The framebuffer comes from the splash

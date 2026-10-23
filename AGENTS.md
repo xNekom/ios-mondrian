@@ -10,7 +10,7 @@ Pro, SM8475) is the port being done here.
 - `docs/MONDIAN_PORT.md` is the work list for the port: the hardware delta
   between the two phones, what is already done and what each remaining
   subsystem needs. Keep it in sync with the code.
-- The user switches agents frequently. Update the active handoff in
+- Work moves between sessions. Update the active handoff in
   `NOTES.md` after each milestone and before stopping. Record commits, CI run
   IDs, exact build/boot results and unfinished work. Distinguish observations
   from guesses.
@@ -20,9 +20,22 @@ Pro, SM8475) is the port being done here.
 - The board table lives in `tools/boards.py`; the shim has its own copy in
   `shim/board.h`. Change both together, and prefer reading the live device
   tree (the shim prints it) over guessing a number.
-- **Never flash anything but `userdata`.** `boot`, `init_boot`, `dtbo`,
-  `vbmeta`, `abl` and `tz` are not touched: writing them is a hard brick.
-  `tools/flash-root.sh` flashes the root into `userdata` and asks first.
+- **Hardware safety outranks persistence (policy, 2026-10-23).** The
+  firmware-level partition set (`xbl`, `xbl_config`, `abl`, `tz`, `hyp`,
+  `modem*`, `persist`, `uefi*`/`uefisecapp` and every other low-level
+  image the stock ROM ships) is never written: a cooked image there
+  bricks the boot chain irreversibly. Writable storage is the high-level
+  set only — `boot_<slot>` (the shim boots from slot b; `boot_a` keeps
+  the stock Android escape hatch and the deploy tooling refuses it),
+  `vendor_boot` (only with a verified dump first: the shim reads its
+  live device tree), `init_boot`/`recovery` if present, and `userdata`
+  (the iOS root; wiping Android data there is acceptable and
+  recoverable). Every definitive write needs the graded safeguards: a
+  proven `fastboot boot` of the same image, `fastboot getvar
+  current-slot` to name the target, and verified originals in `backup/`
+  (`SHA256SUMS`). The stock fastboot ROM is the disaster-recovery
+  baseline. `tools/flash-root.sh` (userdata) still asks before every
+  flash.
 - **Never build an image from guessed addresses.** The shim takes the
   framebuffer and the UFS host from the device tree, and `mkadt.py` /
   `mkpayload.py` refuse a board whose values are still provisional
