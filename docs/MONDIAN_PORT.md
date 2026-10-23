@@ -579,7 +579,8 @@ trace the ABL would read, the kernel's own UFS driver.
 
 | Phase | What it does | State |
 | --- | --- | --- |
-| v0 | the shim draws a band at the bottom of the framebuffer and counts 5 s down to iOS (`shim/menu.c`; the choice has no keys yet) | built; pending its first on-device photo |
+| v0 | the shim draws a band at the bottom of the framebuffer and counts 5 s down to iOS (`shim/menu.c`; the choice has no keys yet) | first on-device photo pending |
+| v0.1 | the menu becomes a full-screen selector: page background, one card per choice with a generated one-bit logo (`shim/menu_logos.h`, made by `tools/gen-menu-logos.py`) and the countdown; still no keys | built (`7d65c89`), volatile boot done, photo pending |
 | v1 | reboot from inside: the shim already has `PSCI_SYSTEM_RESET` + `PSHOLD 0x0c264000` and the restart reason at 0x146aa65c; in the kernel the reset has to be the WDT (a "MACH Reboot" hangs today) | planned; validate the reset first |
 | v2 | switching the A/B slot: the kernel's UFS stack (end to end: GPT + `userdata`) writes the 4 KiB `misc` BCB of AOSP and resets; unproven with this ABL is whether it honors what `misc` says (the proverb test is `fastboot getvar current-slot`) | planned; design note: `shim/ufs.c` is read-only SCSI, a WRITE(10) fits in ~40 lines, so the shim may be able to do the whole switch alone |
 | v3 | the keys: the power key is not a TLMM gpio, it comes out of the PMIC's PON block over SPMI; at least one volume key is on the PM8350 per `qcom/xiaomi-sm8475-common.dtsi`. Poll, no interrupts: the ABL does not configure anything for this | read the stock dtsi first |
