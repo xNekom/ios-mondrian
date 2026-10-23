@@ -142,14 +142,13 @@ authentication) and uses 39-bit virtual addresses, which ARMv9 still allows.
 
 ## Remaining work
 
-### 1. The iOS root (current blocker)
+### 1. The iOS root
 
-Reads work end to end (UFS → GPT → `userdata` → HFS). What is missing is the
-root vnode: `hfs: mounted iOSRoot` is followed by
-`bsd_init: cannot find root vnode`. `0088` prints the errno so the next photo
-names it; the current `userdata` holds a 64 MB test image, and the plain H+
-twin versus the HFSX original separates "catalog cannot answer" from "read
-fails".
+Reads work end to end (UFS → GPT → `userdata` → HFS). Mount, root vnode and
+`VFS_ROOT` succeed on the 64 MB HFSX test image; the sealed-root check was
+what panicked (`rootvp not authenticated after mounting`, `0088`/`0089`).
+What is missing is the real root: a 12 GB iOS 16 image built with
+`tools/mkiosroot.sh`, and then userland.
 
 The persistent console log (sweet `0047`: a 4 MiB ring at the end of
 `userdata`) is not ported because it needs the write path. Port it right after

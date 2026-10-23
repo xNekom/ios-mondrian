@@ -1,0 +1,38 @@
+xnu 0089: accept an unsealed root volume on mondrian
+
+With the HFSX test image the mount now succeeds and VFS_ROOT returns a
+root vnode; the next check is the sealed-root one. bsd_init() calls
+FSIOC_KERNEL_ROOTAUTH on the root vnode and panics with "rootvp not
+authenticated after mounting" when it fails (measured 2026-10-23). That
+check assumes an Image4 chain of trust; mondrian boots an unsigned
+kernel with no AMFI and an HFS root built by tools/mkiosroot.sh, so the
+ioctl always fails.
+
+Print the failure and continue, the way the sweet series does in its
+0029. This is the bring-up behaviour, not a security model: once the
+image is sealed or APFS with a trust cache, the panic comes back.
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -957,9 +957,22 @@
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++			/*
++			 * MONDRIAN has no chain of trust to extend: the kernel it
++			 * boots is unsigned and there is no Image4/AMFI, and its HFS
++			 * root cannot be a sealed volume. Report it instead of
++			 * panicking; the bring-up root is unsealed by design.
++			 */
+ 			if (autherr) {
++				printf("MONDRAN: root volume is not authenticated "
++				    "(error %d); continuing unsealed\n", autherr);
++			}
++#else
++			if (autherr) {
+ 				panic("rootvp not authenticated after mounting");
+ 			}
++#endif
+ 		}
+ 	}
+ 

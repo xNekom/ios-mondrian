@@ -22,7 +22,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
 | `0070`–`0082`, `0086` | the UFS 3.1 root device and its wake sequence |
 | `0083`–`0084` | panel memory kept off the free list, colour-bar self-test |
-| `0087`–`0088` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic |
+| `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 
 `0085` (the IOSurface + IOMobileFramebuffer pair) lives on branch `display` and
 is merged once the root mounts. Each patch's symptom and the trap behind it are

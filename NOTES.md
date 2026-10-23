@@ -28,20 +28,21 @@ Verified on the phone:
 - **Boot menu** in the shim: two cards with logos, 5 s countdown, and working
   SPMI keys (power confirms, volume moves the selection). The current menu
   build is flashed to `boot_b`.
+- **Root volume.** With the HFSX test image on `userdata`: GPT, mount and
+  `VFS_ROOT` all succeed, and the only thing that stopped the boot was the
+  sealed-root check (`rootvp not authenticated after mounting`). The HFSX
+  reader is not the defect; patch `0089` reports the failure and continues.
 - **Recovery path.** `boot_a` keeps the stock Android image and
   `fastboot boot` writes nothing, so every experiment is volatile unless the
   image is explicitly installed.
 
 Current blocker, in order:
 
-1. **`hfs: mounted iOSRoot` is followed by `bsd_init: cannot find root vnode`.**
-   `hfs_root()` resolves CNID 2 through the catalog, so the error separates a
-   reader defect (HFSX compare path) from a read failure. Patch `0088` prints
-   `bsd_init: VFS_ROOT failed, error %d, rootdev %s` before the panic, so one
-   photo names it. Cheapest discriminator first: `userdata` currently holds a
-   64 MB **HFSX** (case-sensitive, journaled) test image; flash the plain
-   **H+** twin with the same catalog and the same boot. If `VFS_ROOT` passes,
-   the HFSX path is the defect; if it does not, the errno does.
+1. **Root authentication.** `bsd_init` calls `FSIOC_KERNEL_ROOTAUTH` on the
+   root vnode and panics when it fails; an unsigned kernel with an HFS root
+   built by `tools/mkiosroot.sh` can never answer it. `0089` prints
+   `MONDRAN: root volume is not authenticated (error N); continuing unsealed`
+   and falls through. This is bring-up behaviour, not a security model.
 2. **The real iOS root is not on this Mac.** The 12 GB v15 image was built on
    another machine; it has to be copied here (or rebuilt with
    `tools/mkiosroot.sh`) before `userdata` gets the real root.
