@@ -18,6 +18,10 @@
 # keybagd reads with /defaults/no-effaceable-storage (tools/mkadt.py).
 set -euo pipefail
 
+# macOS has everything these images need natively (hdiutil/newfs_hfs); the
+# Darwin path lives next door because it shares no command with the Linux one.
+[[ $(uname -s) == Darwin ]] && exec "$(dirname "$0")/mkiosroot-darwin.sh" "$@"
+
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }

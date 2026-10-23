@@ -300,8 +300,9 @@ m_keys_line(unsigned char pon, unsigned char gpio, int ready,
 	static const char pre[] = "keys ";
 	static const char sp[] = "spmi code ";
 	static const char ver[] = " ver ";
-	char buf[40];
+	char buf[48];
 	int o = 0;
+	uint64_t mmfr0;
 
 	for (int i = 0; pre[i]; i++)
 		buf[o++] = pre[i];
@@ -331,6 +332,18 @@ m_keys_line(unsigned char pon, unsigned char gpio, int ready,
 		for (int s = 28; s >= 0; s -= 4)
 			buf[o++] = hex[(v >> s) & 15];
 	}
+	/* the CPU's granule support (ID_AA64MMFR0_EL1, TGran16 at 23:20):
+	 * iOS userland and its dyld cache are built for 16 KiB pages, so a 0
+	 * here means the 4 KiB kernel has to cope with 16 KiB code hashes. */
+	__asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
+	buf[o++] = ' ';
+	buf[o++] = 't';
+	buf[o++] = 'g';
+	buf[o++] = '1';
+	buf[o++] = '6';
+	buf[o++] = '=';
+	buf[o++] = (char)('0' + ((mmfr0 >> 20) & 0xf));
+
 	/* the two costs, in microseconds: "t=123d=456" */
 	buf[o++] = ' ';
 	buf[o++] = 't';

@@ -8,24 +8,27 @@ whose first node read fails) surfaces as the same "cannot find root
 vnode" panic, with no error number: the errno is what tells the path
 apart.
 
-Keep the return value of VFS_ROOT and print it, with the root device,
-before the panic. The next boot then says ENOENT (2: the catalog has no
-such CNID), EIO (5: the catalog read failed) or EINVAL, which is the
-difference between the HFSX comparison path and the UFS read path.
+Keep the return value of VFS_ROOT in a local of its own (the `err` of
+the mountroot loop does not live in this scope) and print it, with the
+root device, before the panic. The next boot then says ENOENT (2: the
+catalog has no such CNID), EIO (5: the catalog read failed) or EINVAL,
+which is the difference between the HFSX comparison path and the UFS
+read path.
 
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index f7b45bd..3f74173 100644
+index f7b45bd..f8e830e 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -925,7 +925,10 @@ bsd_init(void)
+@@ -925,7 +925,11 @@ bsd_init(void)
  
  	bsd_init_kprintf("calling VFS_ROOT\n");
  	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
 -	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
-+	if ((err = VFS_ROOT(mountlist.tqh_first, &init_rootvnode,
-+	    vfs_context_kernel())) != 0) {
++	int rooterr = VFS_ROOT(mountlist.tqh_first, &init_rootvnode,
++	    vfs_context_kernel());
++	if (rooterr != 0) {
 +		printf("bsd_init: VFS_ROOT failed, error %d, rootdev %s\n",
-+		    err, rootdevice);
++		    rooterr, rootdevice);
  		panic("bsd_init: cannot find root vnode: %s", PE_boot_args());
  	}
  	(void)vnode_ref(init_rootvnode);
