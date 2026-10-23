@@ -68,6 +68,52 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 17:46: keys wired, corporate apple, xnu 0088, and the plain-HFS+ test image
+
+**Keys wired into the menu (shim v0.2).** `menu_show(fdt)` now calls
+`spmi_init(fdt)` itself and runs the countdown as 5 s of 50 ms polls
+(shim/menu.c). Rules: a **rising edge** of any PON status bit other than
+bit 0 moves the selection; a **rising bit 0 of the PON status** is
+KPDPWR → confirm and boot immediately. Rising edges (not state) keep a
+single press from cycling twice (press then release). The menu repaints
+the two cards on a selection change and prints `keys: pon=xx gpio=xx`
+(or `keys: off <bytes>`) at the bottom for the photograph; a failed probe
+leaves the countdown as the only path. The user's captured trace
+("menú v0.1 renderizado") confirmed the drawing; this build adds the
+input.
+
+**The corporate silhouette.** `tools/gen-menu-logos.py` now carries the
+classic Apple mark (Wikimedia Commons `Apple_logo_black.svg`, 814x1000;
+trademark note kept in the generated header) rasterized through the same
+SVG pipeline at 0.11 px/unit → 90x104, next to the Material bugdroid
+head at 132x76 in `#3DDC84`. `shim/menu.c` blits both at scale 3.
+
+**xnu 0088 (`xnu/patches-mondrian/0088-mondrian-vfs-root-error.patch`).**
+The new panic (`hfs: mounted iOSRoot` → `bsd_init: calling VFS_ROOT` →
+`"bsd_init: cannot find root vnode"`) says nothing about WHY: hfs_root()
+resolves the root vnode with cat_idlookup(CNID 2), and the error number
+is the difference between a catalog that cannot answer (HFSX compare
+path) and a read that fails (UFS path). The patch keeps VFS_ROOT's return
+and prints `bsd_init: VFS_ROOT failed, error %d, rootdev %s` before the
+panic. Series: **87/87** apply; applied to the local tree too; CI
+`39981084699` queued.
+
+**The test image was HFSX, and a plain H+ twin exists.**
+`/private/tmp/hfstest/root-test.img` (flashed to userdata earlier) has
+signature `HX` (case-sensitive HFSX, journaled). `/tmp/hfstest` now also
+has **root-hp.img** (64 MB, signature `H+`, case-insensitive, clean, with
+`README.txt` and `private/marker.txt` in its catalog), built and detached
+on this Mac: the cheapest discriminator is to flash THAT one; if VFS_ROOT
+passes, the HFSX path of the reader is the defect, otherwise 0088's
+errno names it. The 12 GB v15 root remains the real target.
+
+**Flash protocol, executed in part at 17:46:** `getvar current-slot` = b;
+the v0.2 image (`e437cac2…`, 7.41 MB) volatile-booted OK; the
+`boot_b` write itself waits for the phone to be back in fastboot (it
+freezes at the VFS_ROOT panic with no WDT). Command, once there:
+`fastboot flash boot_b /tmp/boot-mondrian-menu2.img` (same 5-step
+protocol of the 16:30 entry).
+
 ## 2026-10-23 17:40: exact logos (vector sources), SPMI probe, and the protocol to flash boot_b
 
 **Exact logos (user directive: vector sources, no binary assets).**
