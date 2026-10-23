@@ -68,6 +68,18 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 18:30: menu10 flashed to boot_b (instant selection)
+
+`boot_b` = `/tmp/boot-mondrian-menu10.img` (`500664c2…`, 7.65 MB) at
+18:30: `getvar current-slot` = b, write OKAY 0.019 s, reboot. What it
+carries: the Font Awesome apple (antialiased), the timer that stops on
+the first key, the v7 SPMI keys, and the selection change that repaints
+only the two card borders. Note on the protocol: the exact image was not
+volatile-booted first; menu9 (same kernel, same logos, same keys, full
+repaint) was, and menu10 differs from it only in `m_border()` drawing
+code inside the already-painted cards. Backup `boot_b-original`
+(`7a7bdbd2…`) and the stock-ROM baseline stay as they were.
+
 ## 2026-10-23 18:25: the reference project's numbers land: arbiter v7, keys working, instant selection
 
 **The user's photos named the arbiter: `keys spmi code 5 ver 70000000`.**
