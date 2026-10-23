@@ -53,9 +53,9 @@
 #define M_CARD_H	900
 #define M_CARD_Y	420
 #define M_CARD_GAP	120
-#define M_LOGO_Y	90		/* logo offset inside the card */
-#define M_LABEL_Y	470		/* label offset inside the card */
-#define M_NOTE_Y	600		/* note offset inside the card */
+#define M_LOGO_Y	80		/* logo offset inside the card */
+#define M_LABEL_Y	500		/* label offset inside the card */
+#define M_NOTE_Y	620		/* note offset inside the card */
 
 /* A filled rectangle. */
 static void
@@ -332,16 +332,16 @@ menu_show(uintptr_t fdt)
 			unsigned char p = 0, g = 0;
 			int e = spmi_poll(&p, &g, &page);
 
-			/* spmi.c reports RISING bits only: bit 0 of the PON
-			 * is KPDPWR (the power key: confirm); any other
-			 * rising bit moves the selection (the volume). */
-			if ((e & SPMI_PON_ANY) && (g & 1)) {
+			/* The HackiOS key map: KPDPWR (PON bit 7) confirms;
+			 * RESIN (bit 6) and the gpio level going low move
+			 * the selection. */
+			if (e & SPMI_KEY_POWER) {
 				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
 				    M_BG);
 				m_center(cd_y, leaving, M_SCALE_CD, M_WHITE);
 				return sel;
 			}
-			if (e) {
+			if (e & (SPMI_KEY_VOLUP | SPMI_KEY_VOLDOWN)) {
 				sel = 1 - sel;
 				m_screen(sel);
 			}

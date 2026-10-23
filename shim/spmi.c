@@ -1,26 +1,24 @@
 /*
- * SPMI master-side observer reads for the boot menu keys.
+ * SPMI master-side observer reads for the boot menu keys, with the shield
+ * of the numbers the live tree gives and the key map the HackiOS reference
+ * driver documents for the same PMIC family (bsd/dev/redwood_buttons.c):
  *
- * The live tree decides every number: the arbiter node by compatible
- * "qcom,spmi-pmic-arb" with its five regions bound by reg-names (cnfg,
- * core, chnls, obsrvr, intr); the power-on block through the /__symbols__
- * entry containing "pon_hlos@"; the volume key through
- * /soc/gpio_keys/vol_up's "gpios" = <phandle index flag>, with the
- * phandle resolved to the PMIC's pinctrl node.
+ *   power        KPDPWR_N of the PON block (bit 7 of its real-time status)
+ *   volume down  RESIN_N of the same block (bit 6)
+ *   volume up    GPIO6 of the PMIC (level bit 0 of its page, pulled up:
+ *                the key pulls it LOW)
  *
- * One structural fact does not come from the tree: a QC PMIC gpio is its
- * own SPMI peripheral, the block starting at the pinctrl node's reg
- * address and the pins following at +0x100 each, so the eight pages
- * after the base are scanned and the first ones that exist are used. The
- * peripheral status register sits at +0x10 (real-time status), which is
- * where the timer's proven keys patch (sweet) reads KPDPWR/RESIN.
+ * The tree decides the addresses: the arbiter by compatible
+ * "qcom,spmi-pmic-arb" (five regions by reg-names); the PON by the first
+ * node whose compatible contains "pon"; the gpio block by resolving
+ * /soc/gpio_keys/vol_up's phandle. A PMIC gpio is its own peripheral page
+ * at the block's reg address + 0x100 per pin, so gpio 6 is reg + 5 * 0x100;
+ * the status of a peripheral is its register 0x10.
  *
- * The protocol is EXT_READL, one byte: command (1<<27)|(addr<<4) written
- * to the observer slot, status at +0x08 (bit 0 done, bits 1..3 error),
- * data at +0x18. Every loop is bounded; nothing here writes the PMIC
- * configuration, and a version that is not the v5 one is recorded and
- * tried anyway -- the reads are read-only and bounded, so the worst case
- * is "no keys", never a dead shim.
+ * The transfer protocol is the arbiter's version 5: EXT_READL, one byte,
+ * command (1<<27) | (reg<<4), status at +0x08 (bit 0 done, bits 1..3
+ * error), data at +0x18, observer window base + 0x80 per channel. Every
+ * loop is bounded; nothing writes the PMIC configuration.
  */
 #include <stdint.h>
 #include "console.h"
@@ -31,12 +29,20 @@ typedef volatile uint32_t *sp_reg;
 
 #define OBS_PER_APID	0x80u
 #define NO_APID		0xffffu
+#define REG_RT_STATUS	0x10u	/* the inputs as they are now */
+#define PON_KPDPWR	0x80u
+#define PON_RESIN	0x40u
+#define GPIO_LEVEL	0x01u	/* 0 while the key is held */
 
 static sp_reg sp_core, sp_cnfg, sp_obs;
+/* v5 and v7 place the three tables differently (Linux spmi-pmic-arb.c):
+ *            observer stride  APID map in core  owner in cnfg
+ *   v5       0x80 per apid    0x900 + 4n        0x700 + 4n
+ *   v7       0x20 per apid    0x2000 + 4n       4n  (per-bus numbering) */
+static uint32_t sp_obs_stride = 0x20, sp_map_off = 0x2000, sp_owner_off = 0;
 static uint16_t ap_pon = NO_APID, ap_gpio = NO_APID;
-static uint16_t ap_gpio_pages[8];
 static uint32_t sp_version;
-static unsigned char pon_prev = 0xff, gpio_prev[8];
+static unsigned char pon_prev = 0xff, gpio_prev = 0xff;
 static int sp_ok, sp_why;
 
 static uint32_t
@@ -104,11 +110,11 @@ sp_find_apid(uint16_t ppid, uint32_t count)
 	uint16_t found = NO_APID;
 
 	for (uint32_t i = 0; i < count; ++i) {
-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+		uint32_t map = sp_rd(sp_core, sp_map_off + 4u * i);
 
 		if (map == 0 || ((map >> 8) & 0xfffu) != ppid)
 			continue;
-		uint32_t owner = sp_rd(sp_cnfg, 0x700u + 4u * i) & 7u;
+		uint32_t owner = sp_rd(sp_cnfg, sp_owner_off + 4u * i) & 7u;
 		if (found == NO_APID || owner == 0)
 			found = (uint16_t)i;
 	}
@@ -120,12 +126,12 @@ sp_read(uint16_t apid, uint16_t off, unsigned char *out)
 {
 	if (apid == NO_APID || !sp_ok)
 		return 0;
-	uintptr_t q = (uintptr_t)sp_obs + (uintptr_t)apid * OBS_PER_APID;
+	uintptr_t q = (uintptr_t)sp_obs + (uintptr_t)apid * sp_obs_stride;
 	uint32_t cmd = (1u << 27) | ((off & 0xffu) << 4);
 
 	*(volatile uint32_t *)q = cmd;
 	__asm__ volatile("dsb osh" ::: "memory");
-	for (unsigned i = 0; i < 1000; ++i) {
+	for (unsigned i = 0; i < 2000; ++i) {
 		uint32_t st = sp_rd((sp_reg)q, 0x08u);
 
 		if (st & 1u) {
@@ -138,12 +144,7 @@ sp_read(uint16_t apid, uint16_t off, unsigned char *out)
 	return 0;
 }
 
-/*
- * "/soc/qcom,spmi@c42d000/qcom,pm8350@1/pinctrl@8800" ->
- *   ppid (1 << 8) | 0x88:  the pmic node is the parent segment, its '@'
- *   carries the sid; the peripheral id is the high byte of the node's own
- *   reg (0x8800 -> 0x88).
- */
+/* "…/qcom,pm8350@1/pinctrl@8800" -> (1 << 8) | (reg >> 8). */
 static uint16_t
 sp_ppid_of(uintptr_t fdt, const char *path)
 {
@@ -184,6 +185,18 @@ sp_ppid_of(uintptr_t fdt, const char *path)
 	return (uint16_t)(sid << 8 | per);
 }
 
+/* What kind of peripheral is there: 2 bytes at 0x04 (type, subtype). */
+static int
+sp_identify(uint16_t apid, unsigned char type, unsigned char sub_lo,
+    unsigned char sub_hi)
+{
+	unsigned char t = 0, s = 0;
+
+	if (!sp_read(apid, 0x04u, &t) || !sp_read(apid, 0x05u, &s))
+		return 0;
+	return t == type && s >= sub_lo && s <= sub_hi;
+}
+
 void
 spmi_init(uintptr_t fdt)
 {
@@ -193,10 +206,11 @@ spmi_init(uintptr_t fdt)
 	uint64_t regs[10];
 	char names[5][8];
 	uint32_t count;
-	int o = 0, named = 0, found = 0;
+	int o = 0, named = 0;
 	const char *s;
 	char tmp[8];
-	uint16_t gpio_ppid;
+	uint16_t gpio_ppid, ppid;
+	uint32_t idx = 0;
 
 	sp_ok = 0;
 	sp_why = 0;
@@ -239,34 +253,56 @@ spmi_init(uintptr_t fdt)
 		return;
 	}
 	sp_version = sp_rd(sp_core, 0);
-	count = sp_rd(sp_core, 4) & 0x7ffu;
-	/* A count the map cannot hold means this is not the arbiter the
-	 * protocol knows; the version itself is only recorded. */
-	if (count == 0 || count > 512) {
+	/*
+	 * The layout of the tables follows the arbiter's version: this
+	 * phone reports 0x70000000 (v7: observer 0x20 per channel, the
+	 * APID map at core+0x2000, the owner table at cnfg+4n). Older
+	 * systems report 0x5xxxxxxx (the layout the timer's driver uses).
+	 */
+	if (sp_version >= 0x70000000u) {
+		sp_obs_stride = 0x20;
+		sp_map_off = 0x2000;
+		sp_owner_off = 0;
+	} else if (sp_version >= 0x50000000u) {
+		sp_obs_stride = 0x80;
+		sp_map_off = 0x900;
+		sp_owner_off = 0x700;
+	} else {
 		sp_why = 5;
 		return;
 	}
-	/* the PON: the tree's power-on block */
-	if (!fdt_symbols_for(fdt, "pon_hlos@", path, sizeof(path))) {
+	count = sp_rd(sp_core, 4) & 0x7ffu;
+	if (count == 0 || count > 1024) {
+		sp_why = 5;
+		return;
+	}
+	/*
+	 * The PON. Its node has no /__symbols__ label on this tree, so it
+	 * is found by compatible ("qcom,pm8998-pon"); the symbols entry
+	 * stays as a second chance.
+	 */
+	if (!fdt_find_compatible_part(fdt, "pon", path, sizeof(path)) &&
+	    !fdt_symbols_for(fdt, "pon_hlos@", path, sizeof(path))) {
 		sp_why = 6;
 		return;
 	}
-	ap_pon = sp_ppid_of(fdt, path);
-	if (ap_pon == NO_APID) {
+	ppid = sp_ppid_of(fdt, path);
+	if (ppid == NO_APID) {
 		sp_why = 7;
 		return;
 	}
-	ap_pon = sp_find_apid(ap_pon, count);
+	ap_pon = sp_find_apid(ppid, count);
 	if (ap_pon == NO_APID) {
 		sp_why = 8;
 		return;
 	}
 	/* the gpio block: what /soc/gpio_keys/vol_up points at */
 	if (!fdt_node_prop(fdt, "/soc/gpio_keys/vol_up", "gpios", &data,
-	    &len) || len < 8) {
+	    &len) || len < 12) {
 		sp_why = 9;
 		return;
 	}
+	idx = be32at(data + 4);		/* the pin inside the block (1-based) */
 	if (!fdt_find_phandle(fdt, be32at(data), path, sizeof(path))) {
 		sp_why = 12;
 		return;
@@ -276,36 +312,41 @@ spmi_init(uintptr_t fdt)
 		sp_why = 10;
 		return;
 	}
-	/* a gpio is its own peripheral page: scan the block's eight pages */
-	for (int i = 0; i < 8; i++) {
-		ap_gpio_pages[i] = sp_find_apid(
-		    (uint16_t)((gpio_ppid & 0xff00u) + (gpio_ppid & 0xffu) + i),
-		    count);
-		if (ap_gpio_pages[i] != NO_APID) {
-			found = 1;
-			gpio_prev[i] = 0;
-			if (ap_gpio == NO_APID)
-				ap_gpio = ap_gpio_pages[i];
-		}
+	/* a pin is its own peripheral page: the block's base + (pin - 1) */
+	if (idx == 0 || idx > 8)
+		idx = 1;
+	ap_gpio = sp_find_apid((uint16_t)(gpio_ppid + idx - 1), count);
+	if (ap_gpio == NO_APID) {
+		/* the pin map of this PMIC may number them otherwise: look
+		 * at the block's pages until one answers */
+		for (unsigned i = 0; i < 8 && ap_gpio == NO_APID; i++)
+			ap_gpio = sp_find_apid(
+			    (uint16_t)(gpio_ppid + i), count);
 	}
-	if (!found) {
+	if (ap_gpio == NO_APID) {
 		sp_why = 11;
 		return;
 	}
 	sp_ok = 1;
-	(void)sp_read(ap_pon, 0x10u, &pon_prev);
-	for (int i = 0; i < 8; i++)
-		if (ap_gpio_pages[i] != NO_APID)
-			(void)sp_read(ap_gpio_pages[i], 0x10u, &gpio_prev[i]);
+	/* the keys are read whatever the identify says (reads only); a
+	 * mismatch is said in the log so the line explains itself */
+	if (!sp_identify(ap_pon, 0x01, 0x09, 0x09))
+		sp_why = 13;
+	else {
+		unsigned char g[2];
+
+		if (!sp_read(ap_gpio, 0x04u, &g[0]) ||
+		    !sp_read(ap_gpio, 0x05u, &g[1]) ||
+		    g[0] != 0x10 || g[1] < 0x10 || g[1] > 0x13)
+			sp_why = 14;
+	}
+	(void)sp_read(ap_pon, REG_RT_STATUS, &pon_prev);
+	(void)sp_read(ap_gpio, REG_RT_STATUS, &gpio_prev);
 	o = 0;
 	hexd(buf + o, pon_prev);
 	o += 2;
 	buf[o++] = ' ';
-	hexd(buf + o, gpio_prev[0]);
-	o += 2;
-	buf[o++] = ' ';
-	buf[o++] = ' ';
-	hexd(buf + o, (unsigned char)(gpio_ppid >> 8));
+	hexd(buf + o, gpio_prev);
 	o += 2;
 	buf[o] = 0;
 	con_str("SPMI ok", buf);
@@ -314,7 +355,7 @@ spmi_init(uintptr_t fdt)
 int
 spmi_ready(void)
 {
-	return sp_ok && ap_pon != NO_APID;
+	return sp_ok && ap_pon != NO_APID && ap_gpio != NO_APID;
 }
 
 int
@@ -329,37 +370,35 @@ spmi_version(void)
 	return sp_version;
 }
 
+/*
+ * The three keys, by their edges (the map of the HackiOS reference): the
+ * PON's status has KPDPWR in bit 7 and RESIN in bit 6, both set while the
+ * key is held; the gpio's level bit 0 is 0 while the key is held (the pin
+ * is pulled up). A press is the bit going down for the PON and the level
+ * going LOW for the gpio, so each press reports once.
+ */
 int
 spmi_poll(unsigned char *pon, unsigned char *gpio, int *page)
 {
-	unsigned char v = pon_prev;
+	unsigned char p = pon_prev, g = gpio_prev;
 	int rc = 0;
 
+	(void)page;
 	if (!spmi_ready())
 		return 0;
-	/* a rising bit is a press; a falling one is a release and is only
-	 * recorded, so one press cannot cycle twice */
-	if (sp_read(ap_pon, 0x10u, &v)) {
-		if (v & ~pon_prev) {
-			rc |= SPMI_PON_ANY;
-			*gpio = v & ~pon_prev;	/* the bits that rose */
-		}
-		pon_prev = v;
+	if (sp_read(ap_pon, REG_RT_STATUS, &p)) {
+		if ((p & PON_KPDPWR) && !(pon_prev & PON_KPDPWR))
+			rc |= SPMI_KEY_POWER;
+		if ((p & PON_RESIN) && !(pon_prev & PON_RESIN))
+			rc |= SPMI_KEY_VOLDOWN;
+		pon_prev = p;
 	}
-	for (int i = 0; i < 8; i++) {
-		unsigned char g = gpio_prev[i];
-
-		if (ap_gpio_pages[i] == NO_APID)
-			continue;
-		if (sp_read(ap_gpio_pages[i], 0x10u, &g)) {
-			if (g & ~gpio_prev[i]) {
-				rc |= SPMI_GPIO_ANY;
-				*gpio = g;
-				*page = i;
-			}
-			gpio_prev[i] = g;
-		}
+	if (sp_read(ap_gpio, REG_RT_STATUS, &g)) {
+		if (!(g & GPIO_LEVEL) && (gpio_prev & GPIO_LEVEL))
+			rc |= SPMI_KEY_VOLUP;
+		gpio_prev = g;
 	}
 	*pon = pon_prev;
+	*gpio = gpio_prev;
 	return rc;
 }

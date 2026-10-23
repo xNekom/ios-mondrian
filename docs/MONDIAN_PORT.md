@@ -571,6 +571,11 @@ that is the X2, the three A710s and two A510s; `cpus=8` is the full set.
 
 ## Dual boot (Android on slot a, iOS on slot b)
 
+The menu as it renders (white on the dark page, the Android head in its
+green, the selection as the ring) is kept in `docs/menu-preview.png`;
+`tools/gen-menu-logos.py` rasterizes both silhouettes from vector sources
+into `shim/menu_logos.h`.
+
 The goal: at power on the phone offers iOS and Android; the volume keys
 navigate and the power key confirms. The ABL of Xiaomi is untouchable (see
 the safety section), so the selector lives where this project already

@@ -23,8 +23,9 @@ void spmi_init(uintptr_t fdt);
  * The current PON byte, the gpio byte that rose and its page index are
  * copied out for the menu's screen line.
  */
-#define SPMI_PON_ANY	1
-#define SPMI_GPIO_ANY	2
+#define SPMI_KEY_POWER		0x1	/* KPDPWR (PON bit 7) went down */
+#define SPMI_KEY_VOLDOWN	0x2	/* RESIN (PON bit 6) went down */
+#define SPMI_KEY_VOLUP		0x4	/* GPIO6 pulled low (its level fell) */
 int spmi_poll(unsigned char *pon, unsigned char *gpio, int *page);
 
 /* 1 when the init found and gated the regions */

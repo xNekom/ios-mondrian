@@ -309,8 +309,8 @@ def pack(name, g):
 
 
 def main():
-    apple = rasterize(APPLE_D, 0.30)     # the 814x1000 corporate path, native 1x blit
-    andro = rasterize(ANDROID_D, 11)     # 24 * 11 = 264 px wide, native 1x blit
+    apple = rasterize(APPLE_D, 0.40)     # the 814x1000 corporate path, native 1x blit
+    andro = rasterize(ANDROID_D, 14)     # 24 * 14 = 336 px wide, native 1x blit
     out = (
         "/*\n"
         " * The logos of the boot menu, rasterized by\n"

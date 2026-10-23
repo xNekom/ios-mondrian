@@ -442,6 +442,87 @@ fdt_find_phandle(uintptr_t fdt, uint32_t want, char *out, int out_len)
 }
 
 /*
+ * A compatible string containing needle (any of the list's strings), the
+ * node path in out[]. The PON nodes carry no /__symbols__ label on this
+ * phone's tree, but every one of them has "pon" in its compatible
+ * ("qcom,pm8998-pon" here), so this finds it without a per-phone string.
+ */
+int fdt_find_compatible_part(uintptr_t fdt, const char *needle, char *out,
+    int out_len)
+{
+	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
+	uintptr_t p, strings;
+	int found = 0, nl = 0;
+
+	while (needle[nl])
+		nl++;
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	p = fdt + be32(fdt + 8);
+	strings = fdt + be32(fdt + 12);
+	w.strings = strings;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			w.depth++;
+			path_push(&w, name);
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			path_pop(&w);
+			w.depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+
+			if (!found && streq((const char *)(strings + nameoff),
+			    "compatible")) {
+				uint32_t off = 0;
+
+				while (off < len && !found) {
+					const char *s = (const char *)(val + off);
+					int sl = 0;
+
+					while (s[sl] && off + sl < len)
+						sl++;
+					for (int at = 0; at + nl <= sl; at++) {
+						int m = 0;
+
+						while (m < nl && s[at + m] ==
+						    needle[m])
+							m++;
+						if (m == nl) {
+							int n = 0;
+							const char *q = w.path;
+
+							while (*q && n < out_len - 1)
+								out[n++] = *q++;
+							out[n] = 0;
+							found = 1;
+							break;
+						}
+					}
+					off += sl + 1;
+				}
+			}
+			p = align4(val + len);
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return found;
+		}
+	}
+}
+
+/*
  * The carve-outs of /reserved-memory. The nodes are children of
  * /reserved-memory, so their addresses use the cells of that node (2 and 2),
  * not the ones of the root.

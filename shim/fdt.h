@@ -54,3 +54,5 @@ int fdt_find_compatible(uintptr_t fdt, const char *compat, char *out, int out_le
 int fdt_symbols_for(uintptr_t fdt, const char *needle, char *out, int out_len);
 /* The node path whose "phandle" is the given handle. */
 int fdt_find_phandle(uintptr_t fdt, uint32_t want, char *out, int out_len);
+/* First node with a compatible string containing needle. */
+int fdt_find_compatible_part(uintptr_t fdt, const char *needle, char *out, int out_len);
