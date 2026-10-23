@@ -30,8 +30,8 @@ Verified on the phone:
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
 - **Boot menu** in the shim: two cards with logos, 5 s countdown, and working
-  SPMI keys (power confirms, volume moves the selection). The current menu
-  build is flashed to `boot_b`.
+  SPMI keys (power confirms, volume moves the selection). `boot_b` carries the
+  current shim and payload; `fastboot boot` is only for tests.
 - **iOS userland runs.** With the real root in `userdata`, `FSIOC_KERNEL_ROOTAUTH`
   fails with `error 25` (ENOTTY: HFS has no such ioctl) and `0089` continues;
   `/sbin/launchd` starts as pid 1, libignition registers the dyld shared
