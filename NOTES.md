@@ -19,6 +19,10 @@ Verified on the phone:
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   kernel console draws into the splash framebuffer the ABL leaves at
   **0xB8000000** (1440x3200, stride 5760).
+- **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1` (the
+  shim prints it as `tg16`), so the shim, the payload and the kernel all run
+  the granule iOS is built for: `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2
+  blocks and the generic Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
   scheduler, PRNG, libpthread and AMFI into `bsd_init`. The GIC is remapped
   after the VM takes over, and the virtual timer (INTID 19) delivers.
@@ -28,26 +32,28 @@ Verified on the phone:
 - **Boot menu** in the shim: two cards with logos, 5 s countdown, and working
   SPMI keys (power confirms, volume moves the selection). The current menu
   build is flashed to `boot_b`.
-- **Root volume and userland handoff.** With the HFSX test image on
-  `userdata`: GPT, mount and `VFS_ROOT` succeed, `FSIOC_KERNEL_ROOTAUTH` fails
-  with `error 25` (ENOTTY: HFS has no such ioctl, so it can never pass),
-  `0089` reports it and continues, and `bsd_init` runs to
-  `load_init_program: attempting to load /sbin/launchd`. The kernel side of
-  the root is done; what panics now is that the test image has no init.
-- **Recovery path.** `boot_a` keeps the stock Android image and
-  `fastboot boot` writes nothing, so every experiment is volatile unless the
-  image is explicitly installed.
+- **iOS userland runs.** With the real root in `userdata`, `FSIOC_KERNEL_ROOTAUTH`
+  fails with `error 25` (ENOTTY: HFS has no such ioctl) and `0089` continues;
+  `/sbin/launchd` then starts as pid 1, libignition registers the dyld shared
+  cache, and launchd runs its first boot task (`mount-phase-1`, exec `mount`).
+- **The root is read-only.** The UFS block device has no write path yet, so
+  launchd's `mount_hfs` fails to remount `/` ("Read-only file system"), and
+  the Data volume and `/private/preboot/<uuid>` lookups fail: the flattened
+  HFS root has neither.
+- **Recovery path.** `boot_a` keeps the stock Android image and `fastboot
+  boot` writes nothing: experiments are volatile unless the image is installed.
 
 Current blocker, in order:
 
-1. **The real iOS root is not on this Mac.** The 12 GB v15 image was built on
-   another machine; it has to be copied here (or rebuilt with
-   `tools/mkiosroot.sh`) into `userdata` before `/sbin/launchd` exists. The
-   test image also lacks `/dev`, which is why `devfs_kernel_mount` returns
-   `ENOENT`; a real root has it.
-2. **After launchd:** the persistent console log (needs the UFS write path),
-   the display presentation, touch and USB. The root mounts read-only today,
-   which is enough to start the boot but not for `/private/var`.
+1. **UFS writes.** SCSI WRITE(10) and SYNCHRONIZE CACHE on the root device,
+   plus the write half of the block device, so launchd can mount `/`
+   read-write. Everything after this point (logging, `/private/var`, the
+   persistent console log) needs it.
+2. **Volume layout.** launchd expects a Data volume and
+   `/private/preboot/<uuid>`; a flattened HFS root has one volume and a
+   `private/preboot/Cryptexes` directory. Either the root image grows those
+   paths (cheap: symlink or copy) or launchd keeps failing those steps.
+3. **Then:** the display presentation (`0085`), touch and USB.
 
 Next concrete actions:
 
@@ -61,8 +67,7 @@ tools/phone-boot.sh                                # volatile; phone in fastboot
 ```
 
 The cloud build (`gh workflow run xnu.yml -f board=mondrian`) is the same
-series and stays as the reproducible reference; the local script is the loop
-to use while iterating.
+series and stays as the reproducible reference.
 
 A definitive write to `boot_b` follows the graded protocol of
 `docs/MONDIAN_PORT.md` (volatile proof first, `fastboot getvar current-slot`,
@@ -143,16 +148,19 @@ from `/chosen/random-seed`, so a random seed makes the boot a coin flip
 overrides it. Do not use the biggest free hole (`0xbab00000+597 MB`): the
 framebuffer falls outside it.
 
-**The 4 KiB page tax.** Each of these was a separate panic:
+**Page size: 16 KiB, and the three pieces must agree.** `ID_AA64MMFR0_EL1`
+reports `TGran16=1` (measured 2026-10-23; the menu prints it as `tg16`), so
+mondrian runs the granule iOS is built for. These are the failures that cost
+time:
 
-| symptom | cause | patch |
+| symptom | cause | where |
 | --- | --- | --- |
-| fault on the first instruction of `arm_init` (`ESR 0x21 / 0x86000004`) | the macOS layout puts the kernel at `0xFFFFFE0007004000`, which needs a 47-bit VA; 4 KiB pages give 39 | `0001` (`ARM64_LINK_ADDR 0xFFFFFFF007004000`, `-UARM_LARGE_MEMORY`) |
-| commpage assert | the `ARM_PGSHIFT == 12` branch asserts what the macOS user VA cannot satisfy | `0056` |
-| `kmem_range_init: vm_map_locate_space failing for claim kmem_ptr_range` | `ZONE_MAP_VA_SIZE` is 128 GiB, more than the 112 GiB of kernel VA | `0057` (24 GiB) |
-| `write_pte_fast: PTE write is unaligned` | `arm_init.c` picks 16 KiB software pages whenever RAM > 1 GiB | `0058` (`PAGE_SHIFT_CONST = ARM_PGSHIFT`) |
-| stall after `MONDRIAN EARLY 20` with `vm_page_free_count == 0` | the bootstrap VA window is sized for 16 KiB pages, so `pmap_expand()` waits for a free list that `pmap_startup()` is still building | `0060` (+16 MiB per 256 MiB segment) |
-| `pmap_tte: Attempt to demote L2 block` | the framebuffer alias needs nine 2 MiB blocks but the low-globals reservation is one L2 block (8 MiB with 4 KiB pages) | `0062` (reserve 32 MiB) |
+| `disallowing unsupported code signature page shift: 14`, then launchd cannot load `libSystem` | the dyld cache's code directory is 16 KiB; a 4 KiB kernel refuses it (and would panic on a non-16 KiB-aligned hash offset) | `0001` (`__ARM_16K_PG__`), `tools/boards.py` |
+| `LOADER ramdisk overlaps kernel memory` | `virt_base` must sit one L2 block (32 MiB) below the text, so the kernel image reaches past a fixed 32 MiB scratch offset and the ramdisk copy overwrites the payload it reads from | `shim/loader.c` (unpack at the top of the window) |
+| no console at all after the shim | the granule is `BOARD_PG_SHIFT`: TCR TG0/TG1, 2048-entry tables, 32 MiB blocks | `shim/board.h`, `shim/mmu.c` |
+
+The 4 KiB era left `0056` (commpage), `0057` (zone map VA) and `0062` (32 MiB
+low-globals reservation) in the series; they still apply and are harmless.
 
 **Instructions the platform does not have.** The kernel was once built with
 `-march=armv8.5-a+crypto`, which emits 226 RCpc `ldapr`s; this board's cores do
@@ -184,9 +192,10 @@ Stepping `pmap_next_page()` over the hole instead breaks the invariant that a
 page's physical address is derived from its *index* in `vm_pages`
 (`ppnum == VM_PAGE_GET_PHYS_PAGE(m)` assert in `vm_page_init`).
 
-**Contiguous memory comes in small runs.** `kmem_alloc_contig(1 MiB)` never
-returns with 4 KiB pages (256 pages); 128 KiB (36 pages) does. Size
-descriptors and bounce buffers to what the zone map can actually give.
+**Contiguous memory comes in small runs.** With 4 KiB pages
+`kmem_alloc_contig(1 MiB)` never returned (256 pages); 128 KiB (36 pages)
+did. Size descriptors and bounce buffers to what the zone map can give — the
+UFS host asks for 144 KiB (nine 16 KiB pages) and gets it.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels

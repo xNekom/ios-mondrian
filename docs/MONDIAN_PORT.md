@@ -3,8 +3,8 @@
 `sweet` is a Redmi Note 10 Pro: Snapdragon 732G (SM7150), ARMv8.2, 16 KiB
 pages, an LCD in DSC video mode, a Goodix touch on I²C and a PM6150.
 `mondrian` is a POCO F5 Pro (the global Redmi K60): Snapdragon 8+ Gen 1
-(SM8475), ARMv9.0, 4 KiB pages, an AMOLED on DSI D-PHY, a Goodix touch on SPI
-and a PM8008.
+(SM8475), ARMv9.0, an AMOLED on DSI D-PHY, a Goodix touch on SPI and a
+PM8008.
 
 Same idea (stock iOS 16 userland on a patched XNU), different silicon. This
 document is the work list: what is in place, what each remaining subsystem
@@ -16,7 +16,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | | sweet (SM7150) | mondrian (SM8475) |
 | --- | --- | --- |
 | CPU | 2x Cortex-A76 + 6x Cortex-A55, ARMv8.2 | 1x Cortex-X2 + 3x Cortex-A710 + 4x Cortex-A510, ARMv9.0 |
-| Page size | 16 KiB (`__ARM_16K_PG__`) | **4 KiB** (`PAGE_SIZE=4096` in `build.config.msm.mondrian`) |
+| Page size | 16 KiB (`__ARM_16K_PG__`) | 16 KiB: `TGran16=1` measured, iOS userland needs it |
 | Page tables | L2 block = 32 MB | L2 block = 2 MB (`ARM_4K_TT_L2_SIZE`) |
 | Pointer auth | none | none (compile plain arm64, like sweet) |
 | GICD | 0x17a00000 | **0x17100000** |
@@ -39,7 +39,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | `shim/board.h`, `shim/build.sh BOARD=` | the shim for either board; `fdt.c` parses the live device tree so the table can be filled from the device |
 | `xnu/patches-mondrian/0001`–`0002` | the XNU machine config for SM8475 and `config/MASTER.arm64.mondrian` |
 | `xnu/patches-mondrian/0003`–`0055` | the generic half of the sweet series, ported (RAM disk root, AMFI, HFS+, BearSSL, console, crash log, HID, SMP, iPhone identity) |
-| `xnu/patches-mondrian/0056`–`0062` | the 4 KiB page work (commpage, zone map VA, software page size, bootstrap VA, no physical timer, framebuffer alias) and the first UFS root device (`0059`) |
+| `xnu/patches-mondrian/0056`–`0062` | page-size work (commpage, zone map VA, bootstrap VA, no physical timer, framebuffer alias) and the first UFS root device (`0059`); `0058` is gone with the 4 KiB software page size |
 | `xnu/patches-mondrian/0063`–`0082`, `0086` | the boot diagnostics and the UFS 3.1 root device |
 | `xnu/patches-mondrian/0083`–`0084`, `0087`, `0088` | panel memory reservation, colour-bar self-test, GIC remap after the VM, VFS_ROOT errno |
 | `tools/apply-series.py`, `tools/check-patches.sh` | apply a series to a fresh xnu tree in seconds and report what does not apply |
@@ -127,30 +127,30 @@ end of the window). The floor is 0x3a000000, and the physmap slide comes from
 The board table and the shim hold the window; the shim checks the live device
 tree agrees that it is inside a memory region and prints that on the screen.
 
-## The 4 KiB work
+## Page size
 
-The board runs 4 KiB pages, which is the part of the port that is not a
-rename: page table geometry, the commpage check, the zone map, the bootstrap VA
-window, the software page size and the framebuffer alias all assume 16 KiB
-somewhere. Each fix and its symptom are tabulated in `NOTES.md`; the invariant
-worth remembering is that the VM must never hand out a VA owned by a boot-time
-block mapping (`pmap_enter()` then panics in `pmap_ttne()`).
+The port started on 4 KiB pages because the stock kernel is built with
+`PAGE_SIZE=4096`, and that cost a handful of panics (the table in `NOTES.md`
+has them). It was the wrong default: iOS userland, its dyld shared cache and
+the code signatures on it are built for 16 KiB, and the SoC implements the
+granule (`ID_AA64MMFR0_EL1.TGran16 = 1`, measured 2026-10-23). The shim, the
+payload and the kernel now all run 16 KiB, which removes those workarounds
+and lets launchd register the shared cache.
 
 ARMv9.0 is binary compatible with the ARMv8.5 baseline, so the kernel builds
 for `armv8.5-a` with plain `arm64` (the X2/A710/A510 have no pointer
-authentication) and uses 39-bit virtual addresses, which ARMv9 still allows.
+authentication).
 
 ## Remaining work
 
 ### 1. The iOS root
 
-Reads work end to end (UFS → GPT → `userdata` → HFS). Mount, root vnode,
-`VFS_ROOT` and `bsd_init` succeed on the 64 MB HFSX test image; the
-sealed-root check returns `ENOTTY` on HFS and `0089` continues past it, so the
-boot reaches `load_init_program: attempting to load /sbin/launchd`. What is
-missing is that init: the real root is a 12 GB iOS 16 image built with
-`tools/mkiosroot.sh` (the test image also has no `/dev`, hence
-`devfs_kernel_mount: kernel_mount failed: 2`).
+Reads work end to end (UFS → GPT → `userdata` → HFS), and with the real
+iOS 16 root built by `tools/mkiosroot.sh` on `userdata` the boot reaches
+launchd: pid 1 runs libignition, registers the dyld shared cache and starts
+its boot tasks. Two things stop it: the root is read-only (the block device
+has no write path) and launchd expects a Data volume and
+`/private/preboot/<uuid>`, which a flattened HFS root does not have.
 
 The persistent console log (sweet `0047`: a 4 MiB ring at the end of
 `userdata`) is not ported because it needs the write path. Port it right after

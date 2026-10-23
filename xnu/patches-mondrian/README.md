@@ -16,17 +16,16 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 
 | Patch | What |
 | --- | --- |
-| `0001`–`0002` | the machine config for SM8475 (ARMv9.0, 4 KiB pages, GICv3 with eight redistributors, no PAC) and `config/MASTER.arm64.mondrian` |
+| `0001`–`0002` | the machine config for SM8475 (ARMv9.0, 16 KiB pages, GICv3 with eight redistributors, no PAC) and `config/MASTER.arm64.mondrian` |
 | `0003`–`0055` | the generic half of the sweet series: RAM disk root, mockfs, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
-| `0056`–`0062` | the 4 KiB page work (commpage, zone map VA, software page size, bootstrap VA zone, no physical timer write, framebuffer alias reservation); `0059` is the first UFS 3.1 root device |
+| `0056`–`0062` | the page-size work (commpage, zone map VA, bootstrap VA zone, no physical timer write, framebuffer alias reservation) and the first UFS 3.1 root device (`0059`); `0058` went away with the 4 KiB software page size |
 | `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
 | `0070`–`0082`, `0086` | the UFS 3.1 root device and its wake sequence |
 | `0083`–`0084` | panel memory kept off the free list, colour-bar self-test |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 
-`0085` (the IOSurface + IOMobileFramebuffer pair) lives on branch `display` and
-is merged once the root mounts. Each patch's symptom and the trap behind it are
-in `NOTES.md`.
+`0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
+the trap behind it are in `NOTES.md`.
 
 ## Applying it
 
