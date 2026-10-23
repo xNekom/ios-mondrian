@@ -27,7 +27,10 @@ Sources for the mondrian numbers:
       qcom/xiaomi-sm8475-common.dtsi  volume-up key on the PM8350
       qcom/waipio-qupv3.dtsi          QUPv3 wrapper and SE addresses
   MiCode/Xiaomi_Kernel_OpenSource @ mondrian-s-oss
-      build.config.msm.mondrian      PAGE_SIZE=4096 (4 KiB pages, not 16 KiB)
+      build.config.msm.mondrian      PAGE_SIZE=4096, but the SoC reports
+                                     TGran16=1 (ID_AA64MMFR0_EL1, read by
+                                     the shim): the port uses 16 KiB pages
+                                     like iOS
   mainline Linux qcom/sm8450.dtsi    UFS host, MDSS/DPU, GIC redistributors
 """
 from dataclasses import dataclass, replace
@@ -180,7 +183,10 @@ MONDRIAN = Board(
     machine_config='MONDRIAN',
     dt_prefix='mondrian',
     payload_magic=b'MONDRIAN',
-    page_size=4096,              # PAGE_SIZE=4096 in build.config.msm.mondrian
+    # 16 KiB, as iOS: the dyld cache's code signature is 16 KiB page hashes
+    # and a 4 KiB kernel cannot validate it (cs_validate_hash panics on an
+    # offset that is not 16 KiB aligned). The SoC supports the granule.
+    page_size=16384,
     # Measured on the phone (2026-10-20): the live device tree that the
     # bootloader passes, read from /proc/device-tree in a recovery. The
     # /memory node has six regions: 0x80000000+0x6a000000, then a hole, then
@@ -281,9 +287,9 @@ MONDRIAN = Board(
     timebase=19200000,
     vtimer_intid=19,             # Qualcomm's PPI numbering, as on sweet
     ipi_sgi=1,
-    # 4 KiB pages: XNU maps the kernel with 2 MB L2 block entries
-    # (ARM_4K_TT_L2_SIZE).
-    tt_l2_size=0x200000,
+    # 16 KiB pages: XNU maps the kernel with 32 MB L2 block entries
+    # (ARM_16K_TT_L2_SIZE).
+    tt_l2_size=0x2000000,
     cpus=tuple(
         Cpu(aff1=i, cluster=0 if i < 4 else (1 if i < 7 else 2),
             freq=3000000000 if i == 0 else (2500000000 if i < 4 else 1800000000),

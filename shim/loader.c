@@ -248,9 +248,18 @@ const char *loader_boot(uintptr_t dtb)
 		const uint8_t *b = (const uint8_t *)&_end[0];
 		uint64_t raw = blob_u64(b + BLOB_RAW);
 		uint64_t comp = blob_u64(b + BLOB_COMP);
-		uint64_t scratch = win_base + 0x2000000UL;	/* past the kernel */
+		/*
+		 * Unpack at the top of the window, not at a fixed offset past
+		 * the kernel: the kernel image spans one L2 block below its
+		 * link address, which is 32 MiB with the 16 KiB pages this
+		 * board runs, and the image then reaches past a 32 MiB offset
+		 * (the ramdisk copy used to overwrite the payload it was
+		 * reading from). The window is the free DDR region, so its top
+		 * is as good as any other and nothing else lives there.
+		 */
+		uint64_t scratch = (win_base + win_size - raw) & ~0xFFFUL;
 
-		if (!win_size || scratch + raw > win_base + win_size)
+		if (!win_size || scratch < win_base)
 			return "no room to unpack the payload";
 		long n = lz4_decompress_frame(b + BLOB_DATA, comp,
 					      (uint8_t *)(uintptr_t)scratch, raw);

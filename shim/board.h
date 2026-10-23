@@ -150,14 +150,12 @@ static const uint64_t board_reserved[1][2] = { { 0, 0 } };
 
 /*
  * The page size the kernel of this board uses. The shim's MMU has to use
- * the same granule: sweet runs the kernel with 16 KiB pages, mondrian with
- * 4 KiB ones (PAGE_SIZE=4096 in build.config.msm.mondrian).
+ * the same granule, because the kernel starts on the tables it builds.
+ * Both boards run 16 KiB: SM8475 reports TGran16=1 in ID_AA64MMFR0_EL1
+ * (measured 2026-10-23) and the iOS userland, its dyld cache and the code
+ * signatures are built for 16 KiB pages.
  */
-#if defined(BOARD_MONDRIAN)
-#define BOARD_PG_SHIFT		12
-#else
 #define BOARD_PG_SHIFT		14
-#endif
 
 /* The runtime base of the shim image (see start.S). */
 extern uint64_t shim_base;

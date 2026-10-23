@@ -1,14 +1,22 @@
-The bootstrap page table capacity is taken from UniXNU
+MONDRIAN runs with the 16 KiB translation granule: the SoC reports
+TGran16=1 in ID_AA64MMFR0_EL1 (the shim prints it), and iOS userland,
+its dyld shared cache and the code signatures on it are built for 16 KiB
+pages (a 4 KiB kernel refuses the cache's code directory: "disallowing
+unsupported code signature page shift: 14"). So __ARM_16K_PG__ is set,
+ARM_PGSHIFT is 14, an L2 block covers 32 MB and the kernel uses the
+generic Apple VA layout and link address instead of the 4 KiB device
+layout this board originally carried.
+
+The bootstrap page table capacity guard is taken from UniXNU
 (github.com/UniXNU/UniXNU, patches/xnu/native-4k-bootstrap-capacity.patch,
-BSD-2-Clause-Patent): with 4 KiB pages an L2 table covers 1 GiB, so a
-window that straddles a 1 GiB boundary needs one more bootstrap L2 page
-than the four start.s invalidates. That page was never invalidated, it
-held whatever was in memory, and the mapping it described was silently
-wrong: the kernel died in pmap_map_bd because its own page tables did
-not cover the address it wanted to map.
+BSD-2-Clause-Patent): start.s invalidated only the first four pages of
+the reserved pool, and the fifth (or later) page could hold stale memory,
+so the mapping it described was silently wrong and the kernel died in
+pmap_map_bd. The guard counts the pool with BOOTSTRAP_TABLE_BYTES and
+scales by ARM_PGBYTES, so it holds for either granule.
 
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
-index 8460893..9a748ea 100644
+index 5bd6f23dd..cafe96823 100644
 --- a/makedefs/MakeInc.def
 +++ b/makedefs/MakeInc.def
 @@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
@@ -40,30 +48,28 @@ index 8460893..9a748ea 100644
  
  endif
  
-@@ -336,9 +336,21 @@ endif
- # Use ARM_LARGE_MEMORY config for all MacOSX targets.
- ifneq ($(filter $(PLATFORM),MacOSX),)
- LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
- ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+@@ -334,7 +338,6 @@ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
  ARM64_LINK_ADDR    =0xfffffe0007004000
  endif
  
-+# MONDRIAN keeps 4 KiB pages, so TCR_EL1_BOOT selects the 39-bit VA layout
-+# (T0SZ = T1SZ = 25) and TTBR1 only covers 0xFFFFFF8000000000 upwards. Every
-+# macOS-style kernel address (0xFFFFFE...) - link address, low globals, pmap
-+# heap - is outside that window, and the large memory layout needs the 47-bit
-+# VA, so MONDRIAN uses the device addresses instead. Without this the kernel
-+# cannot even fetch its own text: the first instruction of arm_init aborts.
-+ifeq ($(CURRENT_MACHINE_CONFIG),MONDRIAN)
-+LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY
-+ARM64_PLKSEG_ADDR  =0xfffffff004004000
-+ARM64_LINK_ADDR    =0xfffffff007004000
-+endif
-+
- 
+-
  CFLAGS_ARM64	= -Darm64 -DARM64 -D__ARM64__ -DLP64 -DPAGE_SIZE_FIXED -DVM_KERNEL_LINK_ADDRESS=$(ARM64_LINK_ADDR) \
+ 			$(LARGE_MEMORY_DEFINE) -momit-leaf-frame-pointer -fno-strict-aliasing -D__API__=v4 -mkernel
+ 
+diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
+index 19eb82333..9597da706 100644
+--- a/osfmk/arm64/genassym.c
++++ b/osfmk/arm64/genassym.c
+@@ -249,6 +249,7 @@ main(int     argc,
+ 
+ 
+ 	DECLARE("PGBYTES", ARM_PGBYTES);
++	DECLARE("BOOTSTRAP_TABLE_BYTES", BOOTSTRAP_TABLE_SIZE);
+ 	DECLARE("PGSHIFT", ARM_PGSHIFT);
+ 
+ 	DECLARE("VM_MIN_KERNEL_ADDRESS", VM_MIN_KERNEL_ADDRESS);
 diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
-index 133b07f..e01c124 100644
+index 133b07fd6..901879cec 100644
 --- a/osfmk/arm64/proc_reg.h
 +++ b/osfmk/arm64/proc_reg.h
 @@ -213,6 +213,14 @@
@@ -82,7 +88,7 @@ index 133b07f..e01c124 100644
  
  /* I-Cache. */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index c40c6ea..9888608 100644
+index c40c6eac4..8e4ef5465 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -145,10 +151,10 @@ index c40c6ea..9888608 100644
  	entropy_collect();
  
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e5336e5..f8d0d2e 100644
+index e5336e5a1..f5f20aecc 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -426,6 +426,10 @@
+@@ -422,6 +422,10 @@ start_cpu:
  
  	/* allocate an L2 table */
  3:	add	$4, $4, PGBYTES
@@ -159,7 +165,7 @@ index e5336e5..f8d0d2e 100644
  
  	/* create_l1_table_entry(virt_base, L1 table, L2 table, scratch1, scratch2, scratch3) */
  	create_l1_table_entry	$0, $3, $4, $6, $7, $8
-@@ -528,8 +532,8 @@
+@@ -524,8 +528,8 @@ LEXT(start_first_cpu)
  	// Invalidate all entries in the bootstrap page tables
  	mov		x0, #(ARM_TTE_EMPTY)				// Load invalid entry template
  	mov		x1, x25								// Start at V=P pagetable root
@@ -170,7 +176,7 @@ index e5336e5..f8d0d2e 100644
  
  Linvalidate_bootstrap:							// do {
  	str		x0, [x1], #(1 << TTE_SHIFT)			//   Invalidate and advance
-@@ -613,6 +617,12 @@
+@@ -609,6 +613,12 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -183,7 +189,7 @@ index e5336e5..f8d0d2e 100644
  	/* Ensure TTEs are visible */
  	dsb		ish
  
-@@ -745,11 +745,11 @@ common_start:
+@@ -745,11 +755,11 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
  
@@ -198,7 +204,7 @@ index e5336e5..f8d0d2e 100644
  #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
  	/* Watchtower
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 3ad743f..4ec6989 100644
+index 3ad743fc3..2dc71020f 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -141,11 +141,25 @@ pe_init_fiq()
@@ -265,23 +271,9 @@ index 3ad743f..4ec6989 100644
  }
  #else
  void
-diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
-index 8226b8c..c7d274f 100644
---- a/pexpert/pexpert/arm64/Makefile
-+++ b/pexpert/pexpert/arm64/Makefile
-@@ -17,7 +17,8 @@ PRIVATE_KERNELFILES = \
- 	boot.h \
- 	H13.h \
- 	VMAPPLE.h \
--	BCM2837.h
-+	BCM2837.h \
-+	MONDRIAN.h
- 
- 
- # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/MONDRIAN.h b/pexpert/pexpert/arm64/MONDRIAN.h
 new file mode 100644
-index 0000000..a044ad0
+index 000000000..b6f4d864b
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/MONDRIAN.h
 @@ -0,0 +1,87 @@
@@ -298,10 +290,10 @@ index 0000000..a044ad0
 + *
 + * Two things differ from the sweet (SM7150) board this was ported from:
 + *
-+ *  - The bootloader uses 4 KiB pages (PAGE_SIZE=4096 in
-+ *    build.config.msm.mondrian), so __ARM_16K_PG__ stays undefined and XNU
-+ *    runs with PAGE_SHIFT 12. That also changes the geometry of the page
-+ *    tables: an L2 block covers 2 MB instead of 32 MB.
++ *  - The SoC supports the 16 KiB translation granule (TGran16=1 in
++ *    ID_AA64MMFR0_EL1) and iOS userland, its dyld cache and the code
++ *    signatures assume 16 KiB pages, so XNU runs with PAGE_SHIFT 14 and an
++ *    L2 block covers 32 MB, as on sweet.
 + *
 + *  - The GIC has eight redistributors with a 256 KiB stride
 + *    (redistributor-stride = <0x0 0x40000> in cape.dtsi), not two with
@@ -325,7 +317,7 @@ index 0000000..a044ad0
 +#define __ARM_ENABLE_SWAP__       1
 +#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
 +#define __ARM_PAN_AVAILABLE__     1
-+/* No __ARM_16K_PG__: the bootloader runs with 4 KiB pages. */
++#define __ARM_16K_PG__            1
 +
 +#define HAS_GIC_V3                1
 +
@@ -372,8 +364,22 @@ index 0000000..a044ad0
 +/* End of GICv3 register definitions */
 +
 +#endif /* ! _PEXPERT_ARM64_MONDRIAN_H */
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index 8226b8cd2..a69bee4ac 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -17,7 +17,8 @@ PRIVATE_KERNELFILES = \
+ 	boot.h \
+ 	H13.h \
+ 	VMAPPLE.h \
+-	BCM2837.h
++	BCM2837.h \
++	MONDRIAN.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
-index 9454534..88e524a 100644
+index 945453413..db3aad9bb 100644
 --- a/pexpert/pexpert/arm64/board_config.h
 +++ b/pexpert/pexpert/arm64/board_config.h
 @@ -97,6 +97,17 @@
@@ -394,29 +400,3 @@ index 9454534..88e524a 100644
  #ifdef ARM64_BOARD_CONFIG_VMAPPLE
  #include <pexpert/arm64/VMAPPLE.h>
  
-diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
---- a/osfmk/arm/pmap/pmap.h
-+++ b/osfmk/arm/pmap/pmap.h
-@@ -115,6 +115,11 @@
-  * Upper limit on how many pages can be consumed by bootstrap page tables
-  */
- #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
-+#elif defined(MONDRIAN) || (!defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__)
-+/* Native 4 KiB: two roots plus up to seven L2 pages per 6 GiB mapping.
-+ * The physical and virtual bases may each straddle an extra 1 GiB region.
-+ */
-+#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
- #else /* defined(ARM_LARGE_MEMORY) */
- #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
- #endif /* defined(ARM_LARGE_MEMORY) */
-diff --git a/osfmk/arm64/genassym.c b/osfmk/arm64/genassym.c
---- a/osfmk/arm64/genassym.c
-+++ b/osfmk/arm64/genassym.c
-@@ -270,6 +270,7 @@
- 
- 
- 	DECLARE("PGBYTES", ARM_PGBYTES);
-+	DECLARE("BOOTSTRAP_TABLE_BYTES", BOOTSTRAP_TABLE_SIZE);
- 	DECLARE("PGSHIFT", ARM_PGSHIFT);
- 
- 	DECLARE("VM_MIN_KERNEL_ADDRESS", VM_MIN_KERNEL_ADDRESS);
