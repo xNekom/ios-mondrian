@@ -1,11 +1,11 @@
 # The mondrian patch series
 
-This is the XNU patch series for the **POCO F5 Pro / Redmi K60**
-(`mondrian`, Qualcomm SM8475 / Snapdragon 8+ Gen 1). It is a parallel series
-to `xnu/patches/`, which stays the (working) `sweet` series: the two boards
-are different SoCs and the patches are not interchangeable.
+The XNU patch series for the **POCO F5 Pro / Redmi K60** (`mondrian`, Qualcomm
+SM8475 / Snapdragon 8+ Gen 1). It is parallel to `xnu/patches/`, which stays the
+working `sweet` series: different SoCs, and the patches are not
+interchangeable.
 
-The CI picks the series with the `board` input of `.github/workflows/xnu.yml`:
+The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 
 | board | series | machine config |
 | --- | --- | --- |
@@ -14,15 +14,21 @@ The CI picks the series with the `board` input of `.github/workflows/xnu.yml`:
 
 ## What is in here
 
-| # | Patch | State |
-| --- | --- | --- |
-| 0001 | `mondrian-machine-config` | **done**: the XNU board config for SM8475 (ARMv9.0, 4 KiB pages, GICv3 with eight redistributors, no PAC) |
-| 0002 | `mondrian-master-config` | **done**: `config/MASTER.arm64.mondrian`, the open source arm64 assembly and pmap, no kpc |
-| 0003-0055 | the generic half of the sweet series | **done**: RAM disk root, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
-| 0060 | `mondrian-4k-bootstrap-va-zone` | **done**: pre-map enough bootstrap VA for the 4 KiB `vm_page` array, so `pmap_startup()` does not block on the free list it is about to build |
-| 0061 | `mondrian-no-physical-timer` | **done**: drop the `CNTP_CTL_EL0` write; QHEE reports an EL1 access to the physical timer as an undefined instruction |
+| Patch | What |
+| --- | --- |
+| `0001`–`0002` | the machine config for SM8475 (ARMv9.0, 4 KiB pages, GICv3 with eight redistributors, no PAC) and `config/MASTER.arm64.mondrian` |
+| `0003`–`0055` | the generic half of the sweet series: RAM disk root, mockfs, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
+| `0056`–`0062` | the 4 KiB page work (commpage, zone map VA, software page size, bootstrap VA zone, no physical timer write, framebuffer alias reservation); `0059` is the first UFS 3.1 root device |
+| `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
+| `0070`–`0082`, `0086` | the UFS 3.1 root device and its wake sequence |
+| `0083`–`0084` | panel memory kept off the free list, colour-bar self-test |
+| `0087`–`0088` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic |
 
-The series applies cleanly to a fresh xnu-8796.141.3 tree:
+`0085` (the IOSurface + IOMobileFramebuffer pair) lives on branch `display` and
+is merged once the root mounts. Each patch's symptom and the trap behind it are
+in `NOTES.md`.
+
+## Applying it
 
 ```
 git clone --depth 1 --branch xnu-8796.141.3 \
@@ -30,19 +36,33 @@ git clone --depth 1 --branch xnu-8796.141.3 \
 tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 ```
 
+The CI **skips** a patch that does not apply and still reports success, so run
+the command above (or `tools/check-patches.sh`) before pushing. It reports
+87/87 for the current series. Two traps it catches: `git apply` rejects a hunk
+that ends with added lines and no trailing context, and a patch touching a
+staged source (HFS, BearSSL, libpthread) only applies after its staging script
+ran.
+
+`tools/validate-repo.py` is stricter than `git apply`, and three of its
+findings on this series are known and harmless: the numbering gap at `0085`
+(the patch is on branch `display`), the prose preamble of `0087` (its diff
+starts further down, which `git apply` accepts) and a hunk count in `0060`. All
+87 patches apply with `git apply` and build in CI as they are.
+
 ## What is still missing
 
-The patches that talk to the hardware of the sweet phone. They are listed
-in `HARDWARE_PATCHES` of `tools/port-series.py` with what each of them
-needs, and `docs/MONDIAN_PORT.md` has the details:
+The patches that talk to the sweet phone's hardware. They are listed in
+`HARDWARE_PATCHES` of `tools/port-series.py`; `docs/MONDIAN_PORT.md` has the
+work items:
 
-* the UFS 3.1 root device (the blocker for booting iOS),
-* the display (an AMOLED on DSI D-PHY),
+* writes for the UFS root device (reads work; the persistent console log needs
+  the same write path),
+* the display presentation driver (`0085`),
 * the touch (a Goodix on QUPv3 SPI),
-* the keys (the PM8008),
-* the USB stack (the SM8470 DWC3).
+* the kernel-side keys and the dual-boot slot switch,
+* the USB stack (the SM8475 DWC3).
 
-`tools/port-series.py` does the mechanical part of the port: it takes a
-patch from the sweet series, renames the board identifiers, drops the
-context lines that name something a not yet ported hardware patch adds, and
-tells you which hunks still need hardware work.
+`tools/port-series.py` does the mechanical part of a port: it takes a patch from
+the sweet series, renames the board identifiers, drops the context lines that
+name something a not-yet-ported patch adds, and lists the hunks that need
+hardware work.
