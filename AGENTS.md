@@ -8,10 +8,6 @@ Pro, SM8475) is the port being done here.
   traps that already cost time. `docs/MONDIAN_PORT.md` is the work list (the
   hardware delta, what is done, what each remaining subsystem needs). Keep both
   in sync with the code.
-- Work moves between sessions: update the state section of `NOTES.md` after
-  each milestone and before stopping. Say what was tried, what the exact
-  build/boot result was, and what is unfinished. Distinguish observations from
-  guesses, and write dates, not times.
 - Commit completed changes. Kernel builds go through GitHub Actions (`gh
   workflow run xnu.yml -f board=mondrian`); `tools/apply-series.py` and
   `tools/check-patches.sh` validate a series locally in seconds, and the CI
@@ -48,3 +44,40 @@ Pro, SM8475) is the port being done here.
   that have already cost time (console-photo triage, arm64 board porting, the
   patch stack + CI, Qualcomm device trees, mondrian UFS). Update the relevant
   one when a new trap is paid for; load it before re-deriving it.
+
+## Documentation rules (hard requirements)
+
+The `.md` files are for the next developer, not for the session that wrote
+them. A fact that only mattered while debugging is not documentation.
+
+- **Edit in place, never append.** `NOTES.md` has no changelog: rewrite its
+  state section when the state changes, and delete what it replaces. A new
+  dated entry is only justified if the date itself carries meaning (a policy
+  decision, the first boot of a subsystem). When in doubt, fold the fact into
+  the existing section.
+- **Dates only, never times.** Write `2026-10-23`; never add the hour of the
+  day, never append a wall-clock time or a timezone (`UTC`, `CEST`, "local").
+  Durations are fine ("about four minutes").
+- **No session ephemera.** No CI run ids, workflow job numbers, image or kernel
+  hashes, byte sizes, `/tmp` paths, `adb`/`fastboot` transcripts, "photo
+  pending", "waiting for the user", to-do notes to yourself, or narration of
+  what you tried and discarded. If a number is needed to reproduce something,
+  it belongs in `tools/` (board table, constants) and the doc points there.
+  A commit hash is allowed only when it is the sole pointer to a piece of work
+  that is not in the tree (e.g. a branch's tip).
+- **Every paragraph must answer "what do I do with this?"** Keep: measured
+  hardware values, invariants that break silently, symptoms paired with their
+  cause and fix, the commands a newcomer needs, pointers to the source of a
+  number. Drop: reasoning that only justifies a decision already made, dead
+  ends without a reusable lesson, and anything duplicated from another doc.
+- **One home per fact.** Hardware facts and traps in `NOTES.md`, work items and
+  the hardware delta in `docs/MONDIAN_PORT.md`, procedures and layout in
+  `README.md`, per-patch state in `xnu/patches-mondrian/README.md`, the
+  emulator in `docs/QEMU_TESTING.md`. Cross-link instead of repeating; if two
+  files disagree, fix the wrong one rather than adding a third statement.
+- **Length budgets.** `NOTES.md` ≤ 350 lines, `docs/MONDIAN_PORT.md` ≤ 300,
+  `README.md` ≤ 250, `docs/QEMU_TESTING.md` ≤ 90, each `README.md` under
+  `xnu/` ≤ 80. Do not grow a file to record a change: if new text would exceed
+  the budget, delete or merge something old in the same edit.
+- **Write for the reader, in English, in the present tense.** Observations and
+  guesses are labelled (`measured`, `expected`, `TODO`), not woven into prose.
