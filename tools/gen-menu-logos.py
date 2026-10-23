@@ -5,10 +5,9 @@ Both silhouettes come from public vector sources and are rasterized here
 into one-bit arrays with a small parser -> flatten -> even-odd pipeline.
 No binary assets: the bitmaps are generated C arrays.
 
-    Apple    the corporate silhouette (Wikimedia Commons
-             "Apple_logo_black.svg", 814x1000, kept in the generated
-             header with its trademark note; the file is hosted there
-             as ineligible-for-copyright, the mark is Apple's)
+    Apple    Font Awesome Free 6.7.2 "apple" (brand icon, CC BY 4.0;
+             the mark is Apple's). The silhouette that matches the
+             phone's reference: full leaf, smooth bottom.
     Android  Google Material Design Icons "android" (Apache 2.0)
              The icon is already just the head: dome, antennae, eyes.
              github.com/google/material-design-icons, viewBox 0 0 24 24
@@ -26,15 +25,13 @@ import os
 import re
 
 APPLE_D = (
-    "M788.1 340.9c-5.8 4.5-108.2 62.2-108.2 190.5 0 148.4 130.3 200.9"
-    "134.2 202.2-.6 3.2-20.7 71.9-68.7 141.9-42.8 61.6-87.5 123.1-155.5"
-    "123.1s-85.5-39.5-164-39.5c-76.5 0-103.7 40.8-165.9 40.8s-105.6-57"
-    "-155.5-127C46.7 790.7 0 663 0 541.8c0-194.4 126.4-297.5 250.8-297.5"
-    "66.1 0 121.2 43.4 162.7 43.4 39.5 0 101.1-46 176.3-46 28.5 0 130.9"
-    "2.6 198.3 99.2zm-234-181.5c31.1-36.9 53.1-88.1 53.1-139.3 0-7.1-.6"
-    "-14.3-1.9-20.1-50.6 1.9-110.8 33.7-147.1 75.8-28.5 32.4-55.1 83.6"
-    "-55.1 135.5 0 7.8 1.3 15.6 1.9 18.1 3.2.6 8.4 1.3 13.6 1.3 45.4 0 "
-    "102.5-30.4 135.5-71.3z"
+    "M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-"
+    "35.5-2.8-74.3 20.7-88.5 20.7-15 0-49.4-19.7-76.4-19.7C63.3 141.2 4 184"
+    ".8 4 273.5q0 39.3 14.4 81.2c12.8 36.7 59 126.7 107.2 125.2 25.2-.6 43-"
+    "17.9 75.8-17.9 31.8 0 48.3 17.9 76.4 17.9 48.6-.7 90.4-82.5 102.6-119."
+    "3-65.2-30.7-61.7-90-61.7-91.9zm-56.6-164.2c27.3-32.4 24.8-61.9 24-72.5"
+    "-24.1 1.4-52 16.4-67.9 34.9-17.5 19.8-27.8 44.3-25.6 71.9 26.1 2 49.9-"
+    "11.4 69.5-34.3z"
 )
 
 ANDROID_D = (
@@ -220,9 +217,9 @@ def subpaths(d):
 
 
 class Grid:
-    def __init__(self, w, h, sup=2):
+    def __init__(self, w, h, sup=4):
         self.w, self.h, self.sup = w, h, sup
-        self.px = [[0] * w for _ in range(h)]
+        self.px = [[0] * w for _ in range(h)]   # coverage: 0 .. sup*sup
 
 
 def fill(g, polys):
@@ -257,8 +254,7 @@ def fill(g, polys):
                     if x1 <= x + 0.5 < x2:
                         hit[x] += 1
         for x in range(g.w):
-            if hit[x] * 2 >= sup:
-                g.px[y][x] = 1
+            g.px[y][x] = hit[x]      # samples inside: the coverage
 
 
 def crop(g, margin=1):
@@ -269,7 +265,7 @@ def crop(g, margin=1):
     y1 = min(g.h, max(p[0] for p in pts) + margin + 1)
     x0 = max(0, min(p[1] for p in pts) - margin)
     x1 = min(g.w, max(p[1] for p in pts) + margin + 1)
-    out = Grid(x1 - x0, y1 - y0)
+    out = Grid(x1 - x0, y1 - y0, g.sup)   # the coverage scale must survive
     out.px = [row[x0:x1] for row in g.px[y0:y1]]
     return out
 
@@ -291,32 +287,32 @@ def rasterize(d, px_per_unit, padding=1, sup=2):
 
 
 def pack(name, g):
+    """4-bit coverage, high nibble = the even pixel (antialiasing)."""
+    full = float(g.sup)   # one sample per row of the supersampling
     rows = []
     for y in range(g.h):
-        cells = g.px[y]
-        pad = (8 - g.w % 8) % 8
-        row = cells + [0] * pad
         b = []
-        for i in range(0, g.w + pad, 8):
-            byte = 0
-            for bit in range(8):
-                byte = (byte << 1) | row[i + bit]
-            b.append("0x%02x" % byte)
+        for x in range(0, g.w, 2):
+            hi = min(15, int(round(g.px[y][x] * 15.0 / full)))
+            lo = min(15, int(round(g.px[y][x + 1] * 15.0 / full))) \
+                if x + 1 < g.w else 0
+            b.append("0x%02x" % ((hi << 4) | lo))
         rows.append("\t" + ", ".join(b) + ",")
+    stride = (g.w + 1) // 2
     return ("static const unsigned char %s[%d * %d] = {\n%s\n};\n"
             "#define %s_W %d\n#define %s_H %d\n"
-            % (name, g.w, g.h, "\n".join(rows), name, g.w, name, g.h))
+            % (name, stride, g.h, "\n".join(rows), name, g.w, name, g.h))
 
 
 def main():
-    apple = rasterize(APPLE_D, 0.40)     # the 814x1000 corporate path, native 1x blit
+    apple = rasterize(APPLE_D, 0.70)     # the 384x512 Font Awesome path, native 1x blit
     andro = rasterize(ANDROID_D, 14)     # 24 * 14 = 336 px wide, native 1x blit
     out = (
         "/*\n"
         " * The logos of the boot menu, rasterized by\n"
         " * tools/gen-menu-logos.py from public vector sources:\n"
-        " *   Apple:   Wikimedia Commons \"Apple_logo_black.svg\"\n"
-        " *            (814x1000; the mark is a trademark of Apple Inc.)\n"
+        " *   Apple:   Font Awesome Free 6.7.2 \"apple\" (CC BY 4.0;\n"
+        " *            the mark is a trademark of Apple Inc.)\n"
         " *   Android: Google Material Icons \"android\" (Apache 2.0)\n"
         " * One bit per pixel, MSB first per row. Do not edit the bit maps\n"
         " * by hand; change the generator and run it.\n"

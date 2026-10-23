@@ -150,32 +150,44 @@ m_in(int cx, int cw, int y, const char *s, int scale, uint32_t fg)
 	m_str(x, y, s, scale, fg);
 }
 
-/* A one-bit bitmap, scaled; both colors are painted (the logo is opaque). */
+/* Blend fg over bg with an alpha 0..255. */
+static uint32_t
+m_mix(uint32_t bg, uint32_t fg, int a)
+{
+	int br = (int)(bg >> 16 & 255), bgc = (int)(bg >> 8 & 255),
+	    bb = (int)(bg & 255);
+	int fr = (int)(fg >> 16 & 255), fgc = (int)(fg >> 8 & 255),
+	    fb = (int)(fg & 255);
+	int r = br + (fr - br) * a / 255;
+	int g = bgc + (fgc - bgc) * a / 255;
+	int b = bb + (fb - bb) * a / 255;
+
+	return 0xff000000U | (uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b;
+}
+
+/*
+ * A logo: 4-bit coverage per pixel (two pixels per byte, high nibble the
+ * even one), blended over the card. That is what keeps the outline of the
+ * fruit smooth instead of a staircase.
+ */
 static void
-m_blit(int x, int y, const unsigned char *bits, int w, int h, int scale,
+m_blit(int x, int y, const unsigned char *cov, int w, int h,
     uint32_t fg, uint32_t bg)
 {
-	int stride = (w + 7) / 8;
+	int stride = (w + 1) / 2;
 
 	if (!con_fb)
 		return;
 	for (int gy = 0; gy < h; gy++)
 		for (int gx = 0; gx < w; gx++) {
-			uint32_t c = (bits[stride * gy + (gx >> 3)] &
-			    (0x80 >> (gx & 7))) ? fg : bg;
+			unsigned char byte = cov[stride * gy + (gx >> 1)];
+			int a = (gx & 1) ? (int)(byte & 15) : (int)(byte >> 4);
+			int px = x + gx, py = y + gy;
 
-			for (int sy = 0; sy < scale; sy++) {
-				int py = y + gy * scale + sy;
-				int px = x + gx * scale;
-
-				if (py >= FB_H || px >= FB_W)
-					continue;
-				volatile uint32_t *p = con_fb +
-				    (uint64_t)py * (FB_STRIDE / 4) + px;
-				for (int sx = 0; sx < scale && px + sx < FB_W;
-				    sx++)
-					p[sx] = c;
-			}
+			if (px >= FB_W || py >= FB_H)
+				continue;
+			con_fb[(uint64_t)py * (FB_STRIDE / 4) + px] =
+			    m_mix(bg, fg, a * 17);
 		}
 }
 
@@ -199,22 +211,36 @@ m_wait_ms(int ms)
 		;
 }
 
+/*
+ * The border of a card, alone: that is all a selection change repaints,
+ * so the switch is instant instead of a full-screen redraw.
+ */
+static void
+m_border(int cx, int sel)
+{
+	if (sel)
+		m_ring(cx, M_CARD_Y, M_CARD_W, M_CARD_H, 8, M_HI_BG);
+	else {
+		m_ring(cx, M_CARD_Y, M_CARD_W, M_CARD_H, 8, M_CARD);
+		m_ring(cx, M_CARD_Y, M_CARD_W, M_CARD_H, 3, M_CARD_LINE);
+	}
+}
+
 /* One choice: card, logo, label, note; the selected one gets the accent. */
 static void
 m_card(int cx, const unsigned char *bits, int bw, int bh, int scale,
     int slab_h, const char *label, const char *note, int sel)
 {
-	int lw = bw * scale, lh = bh * scale, my;
+	int lw = bw, lh = bh, my;
+
+	(void)scale;
 
 	m_rect(cx, M_CARD_Y, M_CARD_W, M_CARD_H, M_CARD);
-	if (sel)
-		m_ring(cx, M_CARD_Y, M_CARD_W, M_CARD_H, 8, M_HI_BG);
-	else
-		m_ring(cx, M_CARD_Y, M_CARD_W, M_CARD_H, 3, M_CARD_LINE);
+	m_border(cx, sel);
 
 	/* The logo, vertically centered on the tallest logo's slab. */
 	my = M_CARD_Y + M_LOGO_Y + (slab_h - lh) / 2;
-	m_blit(cx + (M_CARD_W - lw) / 2, my, bits, bw, bh, scale,
+	m_blit(cx + (M_CARD_W - lw) / 2, my, bits, bw, bh,
 	    bits == m_apple ? M_APPLE : M_DROID, M_CARD);
 
 	/* The label: white on both cards; the accent ring is the mark. */
@@ -301,7 +327,7 @@ menu_show(uintptr_t fdt)
 	int cd_y = 2700;
 	int ready;
 	unsigned char pon = 0, gpio = 0;
-	int page = 0, shown = -1, elapsed = 0;
+	int page = 0, shown = -1, elapsed = 0, user_active = 0;
 
 	if (!con_fb)
 		return sel;
@@ -320,21 +346,25 @@ menu_show(uintptr_t fdt)
 	m_screen(sel);
 	m_keys_line(pon, gpio, ready);
 
-	/* One second of countdown, polled at 50 ms: an ascending edge of
-	 * any PON bit other than bit 0 moves the selection, an ascending
-	 * bit 0 of the PON (KPDPWR) confirms. Rising edges keep a press
-	 * from cycling twice (press then release). */
-	while (elapsed < MENU_SECONDS * 1000) {
+	/*
+	 * The countdown, polled at 50 ms. Any key press STOPS it: the menu
+	 * then waits for the power key to start the selected system. The
+	 * keys are the HackiOS map: KPDPWR (PON bit 7) confirms, RESIN
+	 * (bit 6, volume down) and the gpio level going low (volume up)
+	 * move the selection. A press is an edge, so it reports once.
+	 */
+	for (;;) {
 		m_wait_ms(50);
-		elapsed += 50;
+		if (!user_active) {
+			elapsed += 50;
+			if (elapsed >= MENU_SECONDS * 1000)
+				break;
+		}
 
 		if (ready) {
 			unsigned char p = 0, g = 0;
 			int e = spmi_poll(&p, &g, &page);
 
-			/* The HackiOS key map: KPDPWR (PON bit 7) confirms;
-			 * RESIN (bit 6) and the gpio level going low move
-			 * the selection. */
 			if (e & SPMI_KEY_POWER) {
 				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
 				    M_BG);
@@ -342,30 +372,48 @@ menu_show(uintptr_t fdt)
 				return sel;
 			}
 			if (e & (SPMI_KEY_VOLUP | SPMI_KEY_VOLDOWN)) {
+				int old = sel;
+
+				user_active = 1;
 				sel = 1 - sel;
-				m_screen(sel);
+				/* two borders, not the whole screen: the
+				 * change lands at once, without a flash */
+				m_border(old == 0 ? 60 : 780, 0);
+				m_border(sel == 0 ? 60 : 780, 1);
 			}
 			pon = p;
 			gpio = g;
 			m_keys_line(pon, gpio, ready);
 		}
 
-		int left = MENU_SECONDS - elapsed / 1000;
+		if (user_active) {
+			/* the countdown is stopped: ask for the confirm */
+			if (shown != -2) {
+				shown = -2;
+				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
+				    M_BG);
+				m_center(cd_y, "press power to start",
+				    M_SCALE_CD, M_WHITE);
+			}
+		} else {
+			int left = MENU_SECONDS - elapsed / 1000;
 
-		if (left < 0)
-			left = 0;
-		if (left != shown) {
-			char *cp = cd_line;
-			const char *q = cd_head;
+			if (left < 0)
+				left = 0;
+			if (left != shown) {
+				char *cp = cd_line;
+				const char *q = cd_head;
 
-			shown = left;
-			while (*q)
-				*cp++ = *q++;
-			*cp++ = (char)('0' + (left > 9 ? 9 : left));
-			*cp++ = 's';
-			*cp = 0;
-			m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
-			m_center(cd_y, cd_line, M_SCALE_CD, M_WHITE);
+				shown = left;
+				while (*q)
+					*cp++ = *q++;
+				*cp++ = (char)('0' + (left > 9 ? 9 : left));
+				*cp++ = 's';
+				*cp = 0;
+				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
+				    M_BG);
+				m_center(cd_y, cd_line, M_SCALE_CD, M_WHITE);
+			}
 		}
 	}
 	m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);

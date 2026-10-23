@@ -68,6 +68,38 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 18:25: the reference project's numbers land: arbiter v7, keys working, instant selection
+
+**The user's photos named the arbiter: `keys spmi code 5 ver 70000000`.**
+The SPMI arbiter of this phone is **version 7** (0x70000000), not the v5
+the timer's driver and HackiOS implement. Linux supports v7
+(`drivers/spmi/spmi-pmic-arb.c`, PMIC_ARB_VERSION_V7_MIN): the observer
+channel stride is **0x20 per channel**, the APID map lives at
+**core+0x2000+4n**, and the owner table at **cnfg+4n** (per-bus
+numbering). `shim/spmi.c` now selects the table layout from the version
+word; the v5 layout stays for other targets.
+
+**The key map came from oosexgang/hackios-xnu-kernel**
+(`xnu/files/bsd/dev/redwood_buttons.c`), the closest reference project
+(XNU 8796 on a POCO, APFS root on flash, real keys): power is
+**KPDPWR = bit 7** of the PON's real-time status, **volume down = RESIN
+= bit 6** (which explains why the live tree has no vol_down gpio node),
+and **volume up = GPIO6, its own peripheral page 0x8d, level bit 0, held
+LOW**. The same file also confirms the PON node has no `__symbols__`
+label on these trees: it is found by the compatible string containing
+"pon" (new `fdt_find_compatible_part`). Keys now work on the phone.
+
+**Timer:** the first key press stops the countdown and the menu waits
+for power ("press power to start"); a selection change repaints only the
+two card borders (`m_border`), not the full screen, so the switch is
+immediate instead of a black flash with a half-drawn logo.
+
+**Logo:** the reference silhouette was not the Wikimedia path (its lower
+right reads as a "leg"); it is the Font Awesome "apple" brand glyph
+(CC BY 4.0), whose leaf and bottom match the phone's reference, and the
+logos are painted with **4-bit coverage blended over the card**
+(antialiased) at native size: apple 263x314, Android 308x177.
+
 ## 2026-10-23 18:00: native-resolution logos, and a second real SPMI bug (the early ppid refusal)
 
 **The photo showed a ragged fruit because it was 90x104 at blit x3** (the
