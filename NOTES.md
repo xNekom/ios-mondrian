@@ -198,6 +198,15 @@ image drops on the fastboot USB link, so the payload is LZ4-compressed
 the UFS powered when it boots the normal way and powers it down in fastboot;
 either way the kernel now brings the host up itself (`0074`–`0076`).
 
+**fastboot serves 768 MiB per download and cannot split a raw image.** The
+bootloader reports `max-download-size: 805306368`, and fastboot's answer to a
+bigger raw file is to resparse it, which wants to read the partition back:
+it fails at once with `fastboot: error: Failed reading from userdata` (the
+name in the message is the partition, not a file). Flash an Android sparse
+image instead (`tools/mk-simg.py`, or `tools/flash-root.sh`, which converts
+anything over 768 MiB by itself): fastboot then sends it in `-S` chunks and
+the root's zero tail costs nothing. 11 GiB of root take about five minutes.
+
 **The console cannot scroll and blanks once per screenful.** `fbcon_newline()`
 clears the screen and restarts at row 0, so the last non-blank line is the
 newest output. Put the answer on the last line; earlier text is gone.

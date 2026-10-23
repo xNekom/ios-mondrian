@@ -41,6 +41,21 @@ printf "Type 'yes' to continue: "
 read -r answer
 [ "$answer" = yes ] || { echo "aborted"; exit 1; }
 
+# The bootloader serves 768 MiB per download and fastboot cannot split a raw
+# image (it tries to resparse it, and that wants to read the partition:
+# "Failed reading from userdata"). A sparse image needs no resparsing, so
+# anything bigger goes through tools/mk-simg.py first; the zero regions cost
+# nothing.
+max=$((768 * 1024 * 1024))
+if [ "$(wc -c < "$image")" -gt "$max" ] && [ "${image##*.}" != simg ]; then
+	sparse=${image%.img}.simg
+	if [ ! -f "$sparse" ]; then
+		echo "== converting to sparse ($sparse)"
+		python3 "$(dirname "$0")/mk-simg.py" "$image" "$sparse"
+	fi
+	image=$sparse
+fi
+
 # -S 512M: the big write needs the extra buffer, or the transfer stalls.
 fastboot -S 512M flash "$partition" "$image"
 
