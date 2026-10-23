@@ -68,6 +68,40 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 17:55: the photo named two real bugs; menu v0.3 flashed to boot_b
+
+**Bug 1 (why the keys never worked): the SPMI `reg` was parsed with the
+wrong number of cells.** `spmi@c42d000` declares `#address-cells=2` for
+its PMIC children, but its own `reg` is five (address, size) pairs of one
+cell each; `fdt_node_regs()` reads the node's own cells, produced three
+pairs and the probe refused ("regions"). `fdt_node_regs_cells(..., 5, 1,
+1)` now. **Bug 1b (which gpio): a pmic gpio is its own peripheral page
+(0x88 + index - 1)**; the probe walks pages 0x88..0x8f at SID 1, so
+`vol_up` cannot depend on an index mapping that the tree alone does not
+pin. Reads stay read-only EXT_READL with bounded loops.
+
+**Bug 2 (the menu's look): the colours followed the selection.** The
+photo showed the fruit in green because the selected card tinted its
+logo, and console text crossed the cards. menu v0.3: title, labels,
+notes and countdown **white**; **the fruit white**, **only the Android
+head green** `#3DDC84`; the selection is the green ring alone; the keys
+line is 2x (readable in a photo) and, when the probe refused, it ends
+with `spmi code N` (1 no arbiter, 2 reg-names, 3 regions, 4 missing,
+5 version gate, 6 no pon, 7 pon ppid, 8 pon apid, 9 no gpios, 10 gpio
+ppid, 11 gpio apid, 12 vol_up phandle); the shim clears the page to the
+menu's background after the menu, so the loader and kernel consoles no
+longer print over the cards.
+
+**Flashed:** `boot_b` = menu v0.3 (`31609df8…`, 7.42 MB) at 17:56
+(getvar b → volatile `fastboot boot` OK → write OKAY 0.027 s →
+reboot). The kernel inside is the GIC-fixed one; xnu 0088 (VFS_ROOT
+errno) is a separate next step via CI `39981084699` (queued).
+
+**Reading the next photo:** white menu with a green ring around the
+selected card and a white fruit; `keys: on pon=.. g=..` at the bottom if
+the probe gated, `spmi code N` otherwise. Pressing Vol+ (PM8350 gpio)
+must move the ring; Power (PON bit 0) must start immediately.
+
 ## 2026-10-23 17:46: keys wired, corporate apple, xnu 0088, and the plain-HFS+ test image
 
 **Keys wired into the menu (shim v0.2).** `menu_show(fdt)` now calls

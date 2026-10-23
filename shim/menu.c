@@ -40,8 +40,9 @@
 #define M_HI_FG		0xff001014U	/* its label */
 #define M_DIM		0xff8a8a96U	/* the notes under the choices */
 #define M_CD		0xffffff00U	/* the countdown */
-#define M_APPLE		0xffe7e5e4U	/* the fruit, near-white */
+#define M_APPLE		0xffffffffU	/* the fruit, white (user's pick) */
 #define M_DROID		0xff3ddc84U	/* the robot, the Android green */
+#define M_WHITE		0xffffffffU	/* every text of the menu */
 
 #define M_SCALE_TITLE	5
 #define M_SCALE_ITEM	5
@@ -214,23 +215,14 @@ m_card(int cx, const unsigned char *bits, int bw, int bh, int scale,
 	/* The logo, vertically centered on the tallest logo's slab. */
 	my = M_CARD_Y + M_LOGO_Y + (slab_h - lh) / 2;
 	m_blit(cx + (M_CARD_W - lw) / 2, my, bits, bw, bh, scale,
-	    sel ? M_HI_BG : (bits == m_apple ? M_APPLE : M_DROID), M_CARD);
+	    bits == m_apple ? M_APPLE : M_DROID, M_CARD);
 
-	/* The label; the selected one is inverted. */
-	if (sel) {
-		int tw = m_w(label, M_SCALE_ITEM);
-
-		m_rect(cx + (M_CARD_W - tw) / 2 - 24,
-		    M_CARD_Y + M_LABEL_Y - 8, tw + 48,
-		    16 * M_SCALE_ITEM + 16, M_HI_BG);
-		m_in(cx, M_CARD_W, M_CARD_Y + M_LABEL_Y, label,
-		    M_SCALE_ITEM, M_HI_FG);
-	} else
-		m_in(cx, M_CARD_W, M_CARD_Y + M_LABEL_Y, label,
-		    M_SCALE_ITEM, M_FG);
+	/* The label: white on both cards; the accent ring is the mark. */
+	m_in(cx, M_CARD_W, M_CARD_Y + M_LABEL_Y, label, M_SCALE_ITEM,
+	    M_WHITE);
 
 	/* The note under the label. */
-	m_in(cx, M_CARD_W, M_CARD_Y + M_NOTE_Y, note, M_SCALE_NOTE, M_DIM);
+	m_in(cx, M_CARD_W, M_CARD_Y + M_NOTE_Y, note, M_SCALE_NOTE, M_WHITE);
 }
 
 /* The title and the two cards: everything a selection change repaints. */
@@ -245,7 +237,7 @@ m_screen(int sel)
 	};
 
 	m_rect(0, 0, FB_W, FB_H, M_BG);
-	m_center(140, title, M_SCALE_TITLE, M_FG);
+	m_center(140, title, M_SCALE_TITLE, M_WHITE);
 	/* Two cards centered as a pair: 60 + 600 + 120 + 600 + 60. The
 	 * logos share a slab of three times the fruit's height. */
 	m_card(60, m_apple, m_apple_W, m_apple_H, 3, m_apple_H * 3,
@@ -265,25 +257,37 @@ m_keys_line(unsigned char pon, unsigned char gpio, int ready)
 	buf[1] = 'e';
 	buf[2] = 'y';
 	buf[3] = 's';
-	buf[4] = ':';
-	buf[5] = ' ';
-	buf[6] = ready ? 'p' : 'o';
-	buf[7] = ready ? 'o' : 'f';
-	buf[8] = ready ? 'n' : 'f';
-	buf[9] = ' ';
-	buf[10] = hex[pon >> 4];
-	buf[11] = hex[pon & 15];
-	buf[12] = ' ';
-	buf[13] = 'g';
-	buf[14] = 'p';
-	buf[15] = 'i';
-	buf[16] = 'o';
-	buf[17] = ' ';
-	buf[18] = hex[gpio >> 4];
-	buf[19] = hex[gpio & 15];
-	buf[20] = 0;
-	m_rect(0, 3030, FB_W, 20, M_BG);
-	m_str(24, 3030, buf, 1, M_DIM);
+	buf[4] = ' ';
+	buf[5] = ready ? 'o' : 'o';
+	buf[6] = ready ? 'n' : 'f';
+	buf[7] = ready ? ' ' : 'f';
+	buf[8] = ready ? 'p' : ' ';
+	buf[9] = ready ? 'o' : ' ';
+	buf[10] = ready ? 'n' : ' ';
+	buf[11] = ready ? '=' : ' ';
+	buf[12] = ready ? hex[pon >> 4] : ' ';
+	buf[13] = ready ? hex[pon & 15] : ' ';
+	buf[14] = ' ';
+	buf[15] = ready ? 'g' : ' ';
+	buf[16] = ready ? '=' : ' ';
+	buf[17] = ready ? hex[gpio >> 4] : ' ';
+	buf[18] = ready ? hex[gpio & 15] : ' ';
+	buf[19] = 0;
+	m_rect(0, 3000, FB_W, 32, M_BG);
+	m_str(24, 3000, buf, 2, M_WHITE);
+	if (!ready) {
+		static const char tag[] = "spmi code ";
+		char nb[8];
+		int w = spmi_why(), n = 0;
+
+		if (w >= 10)
+			nb[n++] = (char)('0' + w / 10);
+		nb[n++] = (char)('0' + w % 10);
+		nb[n] = 0;
+		m_rect(0, 3020, FB_W, 32, M_BG);
+		m_str(24, 3020, tag, 2, M_WHITE);
+		m_str(24 + 10 * 8 * 2, 3020, nb, 2, M_WHITE);
+	}
 }
 
 int
@@ -295,9 +299,8 @@ menu_show(uintptr_t fdt)
 	int sel = MENU_DEFAULT;
 	int cd_y = 2700;
 	int ready;
-	unsigned char pon = 0, gpio = 0, last_pon = 0, last_gpio = 0;
-	int shown = -1;
-	int elapsed = 0;
+	unsigned char pon = 0, gpio = 0;
+	int page = 0, shown = -1, elapsed = 0;
 
 	if (!con_fb)
 		return sel;
@@ -311,9 +314,7 @@ menu_show(uintptr_t fdt)
 	spmi_init(fdt);
 	ready = spmi_ready();
 	if (ready)
-		(void)spmi_poll(&pon, &gpio);
-	last_pon = pon;
-	last_gpio = gpio;
+		(void)spmi_poll(&pon, &gpio, &page);
 
 	m_screen(sel);
 	m_keys_line(pon, gpio, ready);
@@ -328,21 +329,21 @@ menu_show(uintptr_t fdt)
 
 		if (ready) {
 			unsigned char p = 0, g = 0;
+			int e = spmi_poll(&p, &g, &page);
 
-			(void)spmi_poll(&p, &g);
-			if ((p & 1) && !(last_pon & 1)) {
-				/* the power key: confirm what is selected */
+			/* spmi.c reports RISING bits only: bit 0 of the PON
+			 * is KPDPWR (the power key: confirm); any other
+			 * rising bit moves the selection (the volume). */
+			if ((e & SPMI_PON_ANY) && (g & 1)) {
 				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
 				    M_BG);
-				m_center(cd_y, leaving, M_SCALE_CD, M_FG);
+				m_center(cd_y, leaving, M_SCALE_CD, M_WHITE);
 				return sel;
 			}
-			if ((p & ~last_pon) || (g & ~last_gpio)) {
+			if (e) {
 				sel = 1 - sel;
 				m_screen(sel);
 			}
-			last_pon = p;
-			last_gpio = g;
 			pon = p;
 			gpio = g;
 			m_keys_line(pon, gpio, ready);
@@ -363,11 +364,11 @@ menu_show(uintptr_t fdt)
 			*cp++ = 's';
 			*cp = 0;
 			m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
-			m_center(cd_y, cd_line, M_SCALE_CD, M_CD);
+			m_center(cd_y, cd_line, M_SCALE_CD, M_WHITE);
 		}
 	}
 	m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD, M_BG);
-	m_center(cd_y, leaving, M_SCALE_CD, M_FG);
+	m_center(cd_y, leaving, M_SCALE_CD, M_WHITE);
 
 	return sel;
 }

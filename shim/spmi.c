@@ -31,7 +31,10 @@ typedef volatile uint32_t *sp_reg;
 
 static sp_reg sp_core, sp_cnfg, sp_obs;
 static uint16_t ap_pon = NO_APID, ap_gpio = NO_APID;
-static unsigned char pon_prev = 0xff, gpio_prev = 0xff;
+static int sp_why;
+
+static uint16_t ap_gpio_pages[8];
+static unsigned char pon_prev = 0xff, gpio_prev[8];
 static int sp_ok;
 
 static uint32_t
@@ -197,10 +200,12 @@ spmi_init(uintptr_t fdt)
 	if (!fdt || !fdt_find_compatible(fdt, "qcom,spmi-pmic-arb",
 	    path, sizeof(path))) {
 		con_str("SPMI", "no arbiter in the tree");
+		sp_why = 1;
 		return;
 	}
 	if (!fdt_node_prop(fdt, path, "reg-names", &data, &len)) {
 		con_str("SPMI", "no reg-names");
+		sp_why = 2;
 		return;
 	}
 	while (acc < len && named < 5) {
@@ -214,8 +219,13 @@ spmi_init(uintptr_t fdt)
 		named++;
 		acc += str_len(tmp) + 1;
 	}
-	if (named != 5 || fdt_node_regs(fdt, path, regs, 5) < 5) {
+	/*
+	 * The node's #address-cells describe its PMIC children (a sid);
+	 * its own five reg pairs are one address and one size cell each.
+	 */
+	if (named != 5 || fdt_node_regs_cells(fdt, path, regs, 5, 1, 1) < 5) {
 		con_str("SPMI", "five regions expected");
+		sp_why = 3;
 		return;
 	}
 	for (int i = 0; i < 5; i++) {
@@ -228,6 +238,7 @@ spmi_init(uintptr_t fdt)
 	}
 	if (!sp_core || !sp_cnfg || !sp_obs) {
 		con_str("SPMI", "regions missing");
+		sp_why = 4;
 		return;
 	}
 	version = sp_rd(sp_core, 0);
@@ -235,51 +246,77 @@ spmi_init(uintptr_t fdt)
 	if (version < 0x50000000u || version >= 0x70000000u ||
 	    count == 0 || count > 512) {
 		con_hex64("SPMI version-gate", version);
+		sp_why = 5;
 		return;
 	}
 	if (!fdt_symbols_for(fdt, "pon_hlos@", path, sizeof(path))) {
 		con_str("SPMI", "no pon_hlos");
+		sp_why = 6;
 		return;
 	}
 	ap_pon = sp_ppid_of(fdt, path);
 	if (ap_pon == NO_APID) {
 		con_str("SPMI", "pon ppid refused");
+		sp_why = 7;
 		return;
 	}
 	ap_pon = sp_find_apid(ap_pon, count);
 	if (ap_pon == NO_APID) {
 		con_str("SPMI", "pon apid refused");
+		sp_why = 8;
 		return;
 	}
 	/* the gpio block behind /soc/gpio_keys/vol_up */
 	if (!fdt_node_prop(fdt, "/soc/gpio_keys/vol_up", "gpios", &data,
 	    &len) || len < 8) {
 		con_str("SPMI", "no vol_up gpios");
+		sp_why = 9;
 		return;
 	}
 	if (!fdt_find_phandle(fdt, be32at(data), path, sizeof(path))) {
 		con_str("SPMI", "no phandle of vol_up");
+		sp_why = 12;
 		return;
 	}
 	ap_gpio = sp_ppid_of(fdt, path);
 	if (ap_gpio == NO_APID) {
 		con_str("SPMI", "gpio ppid refused");
+		sp_why = 10;
 		return;
 	}
 	ap_gpio = sp_find_apid(ap_gpio, count);
 	if (ap_gpio == NO_APID) {
 		con_str("SPMI", "gpio apid refused");
+		sp_why = 11;
 		return;
+	}
+	/*
+	 * The gpio block's page 0x88 is the first gpio; the following
+	 * pages (0x89..) exist on this PMIC up to its pin count. Probe
+	 * them: a pin that does not exist simply has no APID, and reads
+	 * are bounded.
+	 */
+	for (int i = 0; i < 8; i++) {
+		uint16_t ppid = (uint16_t)((ap_gpio & 0xff00u) |
+		    (0x88u + (unsigned)i));
+
+		ap_gpio_pages[i] = sp_find_apid(ppid, count);
+		if (ap_gpio_pages[i] == NO_APID)
+			ap_gpio_pages[i] = (i == 0) ? ap_gpio : NO_APID;
 	}
 	sp_ok = 1;
 	/* the state the edges are taken against */
 	(void)sp_read(ap_pon, 0x10u, &pon_prev);
-	(void)sp_read(ap_gpio, 0x10u, &gpio_prev);
+	for (int i = 0; i < 8; i++) {
+		gpio_prev[i] = 0;
+		if (ap_gpio_pages[i] != NO_APID)
+			(void)sp_read(ap_gpio_pages[i], 0x10u, &gpio_prev[i]);
+	}
 	o = 0;
 	hexd(buf + o, pon_prev);
 	o += 2;
 	buf[o++] = ' ';
-	hexd(buf + o, gpio_prev);
+	hexd(buf + o, gpio_prev[0]);
 	o += 2;
 	buf[o++] = ' ';
 	hexd(buf + o, (unsigned char)(ap_pon >> 8));
@@ -304,22 +341,47 @@ spmi_ready(void)
  *   2 the gpio byte moved (the volume lives there)
  */
 int
-spmi_poll(unsigned char *pon, unsigned char *gpio)
+spmi_poll(unsigned char *pon, unsigned char *gpio, int *page)
 {
-	unsigned char v = pon_prev, g = gpio_prev;
+	unsigned char v = pon_prev;
 	int rc = 0;
 
 	if (!spmi_ready())
 		return 0;
-	if (sp_read(ap_pon, 0x10u, &v) && v != pon_prev) {
-		rc |= SPMI_PON_ANY;
+	/* a rising bit is a press; a falling one is a release and is only
+	 * recorded, so one press cannot cycle twice */
+	if (sp_read(ap_pon, 0x10u, &v)) {
+		if (v & ~pon_prev) {
+			rc |= SPMI_PON_ANY;
+			*gpio = v & ~pon_prev;	/* the bits that rose */
+		}
 		pon_prev = v;
 	}
-	if (sp_read(ap_gpio, 0x10u, &g) && g != gpio_prev) {
-		rc |= SPMI_GPIO_ANY;
-		gpio_prev = g;
+	for (int i = 0; i < 8; i++) {
+		unsigned char g = gpio_prev[i];
+
+		if (ap_gpio_pages[i] == NO_APID)
+			continue;
+		if (sp_read(ap_gpio_pages[i], 0x10u, &g)) {
+			if (g & ~gpio_prev[i]) {
+				rc |= SPMI_GPIO_ANY;
+				*gpio = g;
+				*page = i;
+			}
+			gpio_prev[i] = g;
+		}
 	}
 	*pon = pon_prev;
-	*gpio = gpio_prev;
 	return rc;
+}
+
+int
+spmi_why(void)
+{
+	/* The menu prints it as a number: a string table would need
+	 * absolute pointers (see the if-chain note). 1 no arbiter,
+	 * 2 no reg-names, 3 regions, 4 regions missing, 5 version gate,
+	 * 6 no pon, 7 pon ppid, 8 pon apid, 9 no gpios, 10 gpio ppid,
+	 * 11 gpio apid, 12 vol_up phandle. */
+	return sp_why;
 }

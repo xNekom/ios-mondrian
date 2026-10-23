@@ -718,6 +718,11 @@ void shim_main(uint64_t dtb)
 	 */
 	stage = "menu";
 	int choice = menu_show(dtb);
+	/* The console cursor sat where the bring-up stopped; the menu painted
+	 * over it. Clear to the menu's own background so the loader's verdict
+	 * and the kernel console start on a clean page instead of crossing
+	 * the cards. */
+	con_clear(0xff10101aU);
 	con_skip();
 
 	/*
@@ -726,7 +731,7 @@ void shim_main(uint64_t dtb)
 	 * the misc BCB in v2 -- so the boot behind it stays iOS while
 	 * the pick is recorded on the console for the photographs.
 	 */
-	con_hex("MENU choice", (uint64_t)choice);
+	con_hex("MENU choice", choice);
 
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

@@ -17,14 +17,18 @@
 void spmi_init(uintptr_t fdt);
 
 /*
- * Poll. Returns the edges observed since the last call, or 0:
- *   SPMI_PON_ANY  a PON status byte moved (power or resin candidate)
- *   SPMI_GPIO_ANY a gpio status byte moved (a volume candidate)
- * The changed bytes are copied out for the menu's screen line.
+ * Poll. Returns the RISING edges observed since the last call, or 0:
+ *   SPMI_PON_ANY   a PON status bit went up (bit 0 is KPDPWR)
+ *   SPMI_GPIO_ANY  a bit of the PM8350 gpio block went up (a volume)
+ * The current PON byte, the gpio byte that rose and its page index are
+ * copied out for the menu's screen line.
  */
 #define SPMI_PON_ANY	1
 #define SPMI_GPIO_ANY	2
-int spmi_poll(unsigned char *pon, unsigned char *gpio);
+int spmi_poll(unsigned char *pon, unsigned char *gpio, int *page);
 
 /* 1 when the init found and gated the regions */
 int spmi_ready(void);
+
+/* Why the init refused, as a code for the menu line (0 = it did not). */
+int spmi_why(void);
