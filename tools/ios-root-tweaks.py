@@ -16,6 +16,8 @@ screen (image versions v8-v14 in NOTES.md):
                   (on iOS they live on the data volume)
   preboot         /private/preboot/<boot-manifest-hash>/usr/standalone/firmware,
                   a copy of the firmware: launchd bind-mounts it from there
+  swap            /private/var/vm (the dynamic pager cannot open a swap file
+                  without the directory)
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
@@ -108,6 +110,15 @@ def preboot(root):
     print('preboot', os.path.relpath(dst, root))
 
 
+def swapdir(root):
+    d = os.path.join(root, 'private/var/vm')
+    if not os.path.isdir(d):
+        os.makedirs(d)
+        os.chown(d, 0, 0)
+        os.chmod(d, 0o755)
+        print('mkdir', d)
+
+
 def find_container(root, kind, identifier):
     for meta in glob.glob(os.path.join(root, 'private/var/containers', kind, '*',
                                        '.com.apple.mobile_container_manager.metadata.plist')):
@@ -155,6 +166,7 @@ def main():
     launchd(root)
     containers(root)
     preboot(root)
+    swapdir(root)
     activation(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
