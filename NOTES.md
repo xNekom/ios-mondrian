@@ -68,6 +68,61 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 16:55: boot_b flashed with menu0 (the fix reaches the persistent boot); menu v0.1 full-screen
+
+**The panic the user photographed on the persistent boot** (color bars,
+past the rootvp blocker, then `Kernel data abort` with `fault_code=0x10`)
+is **the known one**, not new: `0x10` = `FSC_SYNC_EXT_ABORT` (bus abort),
+and its site is the 0087 dump reading `GICR_IGROUPR0` after the VM was
+up. The persistent image in `boot_b` was the ~00:18 deploy one — OLD
+kernel build (no TYPER-only fix, intermittent abort; worked at 23:31,
+aborted at 06:43 and here) and OLD shim build (which is why it booted
+**without the menu**). The user trace's `MONDRIAN UFS: probe start` /
+`MONDRIAN GIC: gicd…` prints and the color bars are the shim
+self-test/bring-up console. Nothing points at the ADT or GIC
+configuration: the remap registers print exactly as measured
+(0x17100000+0x10000), the abort is the early-mapped alias being read
+after the VM takes over — kernel-side, already patched.
+
+**boot_b now holds menu0** (written 16:35 via `fastboot flash boot_b`,
+OKAY 0.016 s; target named by `getvar current-slot: b`; image
+`7064ac6e6f16…` proven three volatile boots; backup `boot_b-original
+7a7bdbd2…` verified — the whole graded sequence of the new policy).
+The kernel inside it is confirmed the TYPER-only one two ways: its
+binary carries `gicr typer=%llx` (and no second dump print besides the
+`pe_init_fiq` one that never aborts), and its bytes (modulo 8-byte
+packing inserts) are inside the flashed payload. So from this reboot
+on, the persistent boot carries the fix and shows the menu v0 band.
+
+**menu v0.1 (full-screen, logos)** built and volatile-booted at 16:47
+(`0d268aec3510…`): whole-screen page bg, title, two cards (600x860)
+with generated 1-bit logos (`shim/menu_logos.h`, generator
+`tools/gen-menu-logos.py`: fruit+leaf+bite for iOS `M_APPLE`,
+robot head with antennae+eyes in Android green `M_DROID`), labels and
+notes, countdown of 5 s → iOS. Same primitives as v0 (m_rect/m_glyph)
+plus `m_ring` and `m_blit`; compiles FULL and SMALL_SHIM=1 with zero
+ABS64 relocations; commit `7d65c89`. Pending: photo of the screen, then
+flash of v0.1 into boot_b (kernel inside it is the same verified one).
+Keys stay for v3 (SPMI PON power + a PM8350 volume) — nothing about
+v0.1 depends on them.
+
+**Kernel hash note**: the handoff logged the local kernel as `a3715411…`
+but the file now hashes `f43a4691…` with identical strings and identical
+bytes inside the flashed payload — treat `f43a4691…`
+(D:\... DEVELOPMENT_ARM64_MONDRIAN, mtime 07:21) as the reference local
+kernel for these images, keeping `gicr typer=` as the content
+discriminator.
+
+**Branch audit of the fork** (2026-10-23): default = `mondrian` (the
+active branch). `main` = fully absorbed (ahead 0, behind 130) — keep as
+the upstream/sweet reference, never the target of work.
+`display` = **KEEP**: it holds `0085: the mondrian display driver` which
+the active series deliberately skips (0081..0084, 0086..0087 exist; no
+0085) — its absorption into the series is a real pending task.
+`exp/no-early-console` (`0e63733`) and `exp/sweet-4k` (`1940dda`) =
+superseded one-commit experiments → proposed for deletion (pending user
+confirmation, shas recorded here so nothing is lost).
+
 ## 2026-10-23 16:10: the reboot of 0087 in TYPER-only, and the boot menu v0 of the shim
 
 **The panic of the 06:43 boot** was ours: `pe_mondrian_gic_dump()` reading
