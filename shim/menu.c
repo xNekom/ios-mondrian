@@ -354,9 +354,9 @@ menu_show(uintptr_t fdt)
 	 * move the selection. A press is an edge, so it reports once.
 	 */
 	for (;;) {
-		m_wait_ms(50);
+		m_wait_ms(10);
 		if (!user_active) {
-			elapsed += 50;
+			elapsed += 10;
 			if (elapsed >= MENU_SECONDS * 1000)
 				break;
 		}
@@ -381,9 +381,11 @@ menu_show(uintptr_t fdt)
 				m_border(old == 0 ? 60 : 780, 0);
 				m_border(sel == 0 ? 60 : 780, 1);
 			}
-			pon = p;
-			gpio = g;
-			m_keys_line(pon, gpio, ready);
+			if (p != pon || g != gpio) {
+				pon = p;
+				gpio = g;
+				m_keys_line(pon, gpio, ready);
+			}
 		}
 
 		if (user_active) {
