@@ -67,10 +67,26 @@ m_rect(int x, int y, int w, int h, uint32_t c)
 		w = FB_W - x;
 	if (y + h > FB_H)
 		h = FB_H - y;
+	uint64_t pair = ((uint64_t)c << 32) | c;
+
 	for (int i = 0; i < h; i++) {
 		volatile uint32_t *line = con_fb +
 		    (uint64_t)(y + i) * (FB_STRIDE / 4);
-		for (int j = 0; j < w; j++)
+		int j = 0;
+
+		if (x & 1) {
+			line[x] = c;	/* odd start: one pixel alone */
+			j = 1;
+		}
+		if (w - j >= 2) {
+			volatile uint64_t *d = (volatile uint64_t *)(line + x + j);
+			int n = (w - j) / 2;
+
+			for (int k = 0; k < n; k++)
+				d[k] = pair;
+			j += n * 2;
+		}
+		if (j < w)
 			line[x + j] = c;
 	}
 }
@@ -191,6 +207,8 @@ m_blit(int x, int y, const unsigned char *cov, int w, int h,
 		}
 }
 
+static uint32_t m_us_per_tick;
+
 static uint64_t
 m_ticks(void)
 {
@@ -275,7 +293,8 @@ m_screen(int sel)
 /* The key state at the bottom, in readable size: bytes when the probe
  * works, the refusal code and the arbiter version when it does not. */
 static void
-m_keys_line(unsigned char pon, unsigned char gpio, int ready)
+m_keys_line(unsigned char pon, unsigned char gpio, int ready,
+    uint32_t poll_us, uint32_t draw_us)
 {
 	static const char hex[] = "0123456789abcdef";
 	static const char pre[] = "keys ";
@@ -312,6 +331,22 @@ m_keys_line(unsigned char pon, unsigned char gpio, int ready)
 		for (int s = 28; s >= 0; s -= 4)
 			buf[o++] = hex[(v >> s) & 15];
 	}
+	/* the two costs, in microseconds: "t=123d=456" */
+	buf[o++] = ' ';
+	buf[o++] = 't';
+	buf[o++] = '=';
+	if (poll_us >= 1000)
+		buf[o++] = (char)('0' + (poll_us / 1000) % 10);
+	buf[o++] = (char)('0' + (poll_us / 100) % 10);
+	buf[o++] = (char)('0' + (poll_us / 10) % 10);
+	buf[o++] = (char)('0' + poll_us % 10);
+	buf[o++] = 'd';
+	buf[o++] = '=';
+	if (draw_us >= 1000)
+		buf[o++] = (char)('0' + (draw_us / 1000) % 10);
+	buf[o++] = (char)('0' + (draw_us / 100) % 10);
+	buf[o++] = (char)('0' + (draw_us / 10) % 10);
+	buf[o++] = (char)('0' + draw_us % 10);
 	buf[o] = 0;
 	m_rect(0, 2990, FB_W, 34, M_BG);
 	m_str(24, 2995, buf, 2, M_WHITE);
@@ -328,6 +363,7 @@ menu_show(uintptr_t fdt)
 	int ready;
 	unsigned char pon = 0, gpio = 0;
 	int page = 0, shown = -1, elapsed = 0, user_active = 0;
+	uint32_t poll_us = 0, draw_us = 0;
 
 	if (!con_fb)
 		return sel;
@@ -338,13 +374,21 @@ menu_show(uintptr_t fdt)
 	 * countdown as the only path, so the menu never depends on the
 	 * keys to produce a boot.
 	 */
+	{
+		uint64_t f;
+
+		__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+		m_us_per_tick = (uint32_t)(f / 1000000);	/* ticks per us */
+		if (m_us_per_tick == 0)
+			m_us_per_tick = 1;
+	}
 	spmi_init(fdt);
 	ready = spmi_ready();
 	if (ready)
 		(void)spmi_poll(&pon, &gpio, &page);
 
 	m_screen(sel);
-	m_keys_line(pon, gpio, ready);
+	m_keys_line(pon, gpio, ready, 0, 0);
 
 	/*
 	 * The countdown, polled at 50 ms. Any key press STOPS it: the menu
@@ -354,17 +398,20 @@ menu_show(uintptr_t fdt)
 	 * move the selection. A press is an edge, so it reports once.
 	 */
 	for (;;) {
-		m_wait_ms(10);
+		m_wait_ms(5);
 		if (!user_active) {
-			elapsed += 10;
+			elapsed += 5;
 			if (elapsed >= MENU_SECONDS * 1000)
 				break;
 		}
 
 		if (ready) {
 			unsigned char p = 0, g = 0;
+			uint64_t t0 = m_ticks();
 			int e = spmi_poll(&p, &g, &page);
+			uint64_t t1 = m_ticks();
 
+			poll_us = (uint32_t)((t1 - t0) / m_us_per_tick);
 			if (e & SPMI_KEY_POWER) {
 				m_rect(0, cd_y, FB_W, 16 * M_SCALE_CD,
 				    M_BG);
@@ -378,13 +425,17 @@ menu_show(uintptr_t fdt)
 				sel = 1 - sel;
 				/* two borders, not the whole screen: the
 				 * change lands at once, without a flash */
+				uint64_t t2 = m_ticks();
+
 				m_border(old == 0 ? 60 : 780, 0);
 				m_border(sel == 0 ? 60 : 780, 1);
+				draw_us = (uint32_t)((m_ticks() - t2) /
+				    m_us_per_tick);
 			}
-			if (p != pon || g != gpio) {
+			if (p != pon || g != gpio || e) {
 				pon = p;
 				gpio = g;
-				m_keys_line(pon, gpio, ready);
+				m_keys_line(pon, gpio, ready, poll_us, draw_us);
 			}
 		}
 
