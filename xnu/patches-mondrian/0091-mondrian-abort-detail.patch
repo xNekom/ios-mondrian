@@ -1,0 +1,43 @@
+xnu 0091: name the thread behind an unclassified abort
+
+A data abort the kernel cannot classify (a synchronous external abort, for
+example) ends in a bare register dump: the address is in the dump, but
+nothing says which process or which boot step caused the access. Print
+the same state next to the current task's pid and name, so a photo of the
+screen names the culprit.
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1631,6 +1631,31 @@
+ #endif
+ 	} else {
+ 		kprintf("Unclassified kernel abort (fault_code=0x%x)\n", fault_code);
++		/*
++		 * MONDRIAN: the panic dump above this line is the one that gets
++		 * photographed, so repeat the state next to the thread that
++		 * took the abort. The task name says which part of the boot
++		 * (or which daemon) is the one that touches the bad address.
++		 */
++		{
++			arm_saved_state64_t *ss = saved_state64(state);
++
++			kprintf("MONDRIAN ABORT: esr 0x%x far 0x%llx code 0x%x type %x"
++			    " pc 0x%llx lr 0x%llx sp 0x%llx cpsr 0x%x\n",
++			    esr, (uint64_t)fault_addr, fault_code, fault_type,
++			    ss->pc, ss->lr, ss->sp, ss->cpsr);
++			kprintf("MONDRIAN ABORT: thread %p tid %llu task %p\n",
++			    thread, (thread != NULL) ? thread_tid(thread) : 0,
++			    (thread != NULL) ? thread->t_tro->tro_task : NULL);
++			/*
++			 * An external abort on a VA the pmap still maps normally
++			 * is a page table entry that points outside RAM; one on
++			 * a VA with no PTE is the kernel walking off a buffer.
++			 */
++			kprintf("MONDRIAN ABORT: far 0x%llx -> pa 0x%llx\n",
++			    (uint64_t)fault_addr,
++			    (uint64_t)pmap_find_phys(kernel_pmap, (addr64_t)fault_addr) << 14);
++		}
+ 	}
+ 
+ 	panic_with_thread_kernel_state("Kernel data abort.", state);

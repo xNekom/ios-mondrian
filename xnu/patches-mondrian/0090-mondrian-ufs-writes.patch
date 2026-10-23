@@ -1,0 +1,256 @@
+xnu 0090: write support on the UFS root device
+
+launchd's first boot task mounts / read-write and fails: the block device
+has no write path (d_open returns EROFS for FWRITE, the strategy answers
+EROFS to every B_WRITE, and the disk ioctls still describe read-only
+media), so the root stays read-only and /private/var cannot be created.
+
+Add the write half of the same path the reads use: WRITE(10) into the
+bounce buffer, the data-out direction in the request descriptor and the
+command UPIU, a read-modify-write for ranges that do not cover whole
+2048-byte device blocks, and SYNCHRONIZE CACHE(10) after each transfer
+(the device caches the writes). d_open accepts FWRITE and the character
+device gets the matching physio. DKIOCISWRITABLE and the write limits now
+describe a writable disk: HFS turns HFS_WRITEABLE_MEDIA on only when the
+device says so, and the journal sizes its transfers from the limits. The
+transfer is synchronous, as the reads already were.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1,5 +1,5 @@
+ /*
+- * MONDRIAN internal UFS root device (read-only).
++ * MONDRIAN internal UFS root device (read/write).
+  *
+  * The Qualcomm UFS host (UFSHCI 3.1) is left enabled with the link up by the
+  * bootloader, which loaded our boot image from it. This driver reuses that
+@@ -231,10 +231,12 @@
+ 
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer.
+- * Read direction only. Returns 0 or an errno.
++ * `out` selects the direction: FALSE is data-in (the device fills the
++ * buffer), TRUE is data-out (the device reads it). Returns 0 or an errno.
+  */
+ static int
+-ufs_scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len)
++ufs_scsi(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len,
++    boolean_t out)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -245,7 +247,8 @@
+ 	bzero(ucd, sizeof(*ucd));
+ 
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+-	ucd->cmd[1] = len ? 0x40 : 0x00;        /* R: data in */
++	/* UPIU flags: 0x40 data-in, 0x20 data-out, 0x00 no data */
++	ucd->cmd[1] = len ? (out ? 0x20 : 0x40) : 0x00;
+ 	ucd->cmd[2] = lun;
+ 	ucd->cmd[3] = ++su.tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+@@ -254,7 +257,8 @@
+ 	ucd->cmd[15] = (uint8_t)len;
+ 	memcpy(&ucd->cmd[16], cdb, cdb_len);
+ 
+-	utrd->dw0 = (1u << 28) | ((len ? 2u : 0u) << 25);
++	/* [26:25] data direction: 1 = out, 2 = in (UFSHCI) */
++	utrd->dw0 = (1u << 28) | ((len ? (out ? 1u : 2u) : 0u) << 25);
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->task_tag = ucd->cmd[3];          /* the task tag (UFS 3.x) */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+@@ -279,7 +283,6 @@
+ 	__builtin_arm_dsb(0xf);
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+-	printf("MONDRIAN UFS: scsi 0x%02x on LUN 0x%02x sent, waiting\n", cdb[0], lun);
+ 	if (!ufs_wait_done(500)) {
+ 		/*
+ 		 * The host never finished the request. Print what it did with
+@@ -350,8 +353,35 @@
+ 		return EIO;
+ 	}
+ 	return 0;
++}
++
++/* WRITE(10) of count device blocks at lba from the bounce buffer. */
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++
++	printf("MONDRIAN UFS: write lba 0x%llx, %u blocks\n",
++	    lba, count);
++	return ufs_scsi(su.lun, cdb, sizeof(cdb), count * UFS_BLOCK, TRUE);
+ }
+ 
++/* SYNCHRONIZE CACHE(10): the device may hold the writes in its own cache. */
++static int
++ufs_flush(void)
++{
++	uint8_t cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++
++	return ufs_scsi(su.lun, cdb, sizeof(cdb), 0, FALSE);
++}
++
+ /* NOP OUT/IN verifies the UTP layer before the device-management queries. */
+ static int
+ ufs_nop_out(void)
+@@ -469,7 +499,7 @@
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+-	return ufs_scsi(su.lun, cdb, sizeof(cdb), count * UFS_BLOCK);
++	return ufs_scsi(su.lun, cdb, sizeof(cdb), count * UFS_BLOCK, FALSE);
+ }
+ 
+ static int
+@@ -645,7 +675,7 @@
+ 	if (!su.ready) {
+ 		return ENXIO;
+ 	}
+-	return (flags & FWRITE) ? EROFS : 0;
++	return 0;
+ }
+ 
+ static int
+@@ -664,10 +694,6 @@
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+ 	buf_setresid(bp, count);
+-	if (!(buf_flags(bp) & B_READ)) {
+-		error = EROFS;
+-		goto done;
+-	}
+ 	if (off > part_bytes || count > part_bytes - off) {
+ 		error = EINVAL;
+ 		goto done;
+@@ -687,14 +713,37 @@
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+ 		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+-		error = ufs_read_blocks(su.first_block + lba, blocks);
+-		if (error) {
+-			break;
++		if (buf_flags(bp) & B_READ) {
++			error = ufs_read_blocks(su.first_block + lba, blocks);
++			if (error) {
++				break;
++			}
++			memcpy(vaddr + done, (const void *)(su.dma + DMA_BOUNCE + skip), want);
++		} else {
++			/*
++			 * A write that does not cover whole device blocks has to
++			 * read them first: the rest of the block belongs to
++			 * somebody else.
++			 */
++			if (skip != 0 || want % UFS_BLOCK != 0) {
++				error = ufs_read_blocks(su.first_block + lba, blocks);
++				if (error) {
++					break;
++				}
++			}
++			memcpy((void *)(su.dma + DMA_BOUNCE + skip), vaddr + done,
++			    want);
++			error = ufs_write_blocks(su.first_block + lba, blocks);
++			if (error) {
++				break;
++			}
+ 		}
+-		memcpy(vaddr + done, (const void *)(su.dma + DMA_BOUNCE + skip), want);
+ 		done += want;
+ 		buf_setresid(bp, count - done);
+ 	}
++	if (!error && !(buf_flags(bp) & B_READ)) {
++		error = ufs_flush();
++	}
+ 	lck_mtx_unlock(&mondrian_ufs_lock);
+ 	buf_unmap(bp);
+ 
+@@ -732,17 +781,28 @@
+ 		*o = su.nblocks * UFS_BLOCK / su.secsize;
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+-		*f = 0;
++		*f = 1;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+ 		*o = BOUNCE_SIZE / su.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = 0;
++		*o = BOUNCE_SIZE / su.secsize;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXBYTECOUNTWRITE:
++		*o = BOUNCE_SIZE;
+ 		return 0;
++	case DKIOCGETMAXSEGMENTBYTECOUNTREAD:
++	case DKIOCGETMAXSEGMENTBYTECOUNTWRITE:
++		*o = PRDT_CHUNK;
++		return 0;
++	case DKIOCGETMINSEGMENTALIGNMENTBYTECOUNT:
++		*o = su.secsize;
++		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
++		*o = PRDT_MAX;
+ 		return 0;
+ 	default:
+ 		return ENOTTY;
+@@ -774,9 +834,10 @@
+ }
+ 
+ static int
+-mondrian_ufs_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++mondrian_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return EROFS;
++	return physio(mondrian_ufs_strategy, NULL, dev, B_WRITE, minphys, uio,
++	    (int)su.secsize);
+ }
+ 
+ static const struct bdevsw mondrian_ufs_bdevsw = {
+@@ -879,7 +940,7 @@
+ 			 * to it: the sense here is the baseline the retries below
+ 			 * are compared against, and 0082 never printed it.
+ 			 */
+-			tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
++			tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0, FALSE);
+ 			printf("MONDRIAN UFS: before any wake: TUR %d, power 0x%x,"
+ 			    " fDeviceInit 0x%x\n", tur_error, power & 0xff, flag & 1);
+ 			if (tur_error == 0) {
+@@ -900,13 +961,13 @@
+ 				for (unsigned int round = 0; round < 2; round++) {
+ 					uint8_t wake_lun = (round == 0) ? 0xd0 : (uint8_t)su.lun;
+ 					int wake = ufs_scsi(wake_lun, start_active,
+-					    sizeof(start_active), 0);
++					    sizeof(start_active), 0, FALSE);
+ 
+ 					printf("MONDRIAN UFS: START STOP ACTIVE on LUN 0x%02x: %d\n",
+ 					    wake_lun, wake);
+ 					error = ETIMEDOUT;
+ 					for (int i = 0; i < 8; i++) {
+-						tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0);
++						tur_error = ufs_scsi(su.lun, tur, sizeof(tur), 0, FALSE);
+ 						if (!tur_error) {
+ 							error = 0;
+ 							break;
+@@ -978,7 +1039,7 @@
+ 	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
+ 	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
+ 	su.ready = true;
+-	printf("MONDRIAN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read-only\n",
++	printf("MONDRIAN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read/write\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
+ 	return 0;
+ }
