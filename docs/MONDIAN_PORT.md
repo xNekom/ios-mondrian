@@ -144,11 +144,13 @@ authentication) and uses 39-bit virtual addresses, which ARMv9 still allows.
 
 ### 1. The iOS root
 
-Reads work end to end (UFS → GPT → `userdata` → HFS). Mount, root vnode and
-`VFS_ROOT` succeed on the 64 MB HFSX test image; the sealed-root check was
-what panicked (`rootvp not authenticated after mounting`, `0088`/`0089`).
-What is missing is the real root: a 12 GB iOS 16 image built with
-`tools/mkiosroot.sh`, and then userland.
+Reads work end to end (UFS → GPT → `userdata` → HFS). Mount, root vnode,
+`VFS_ROOT` and `bsd_init` succeed on the 64 MB HFSX test image; the
+sealed-root check returns `ENOTTY` on HFS and `0089` continues past it, so the
+boot reaches `load_init_program: attempting to load /sbin/launchd`. What is
+missing is that init: the real root is a 12 GB iOS 16 image built with
+`tools/mkiosroot.sh` (the test image also has no `/dev`, hence
+`devfs_kernel_mount: kernel_mount failed: 2`).
 
 The persistent console log (sweet `0047`: a 4 MiB ring at the end of
 `userdata`) is not ported because it needs the write path. Port it right after

@@ -28,26 +28,26 @@ Verified on the phone:
 - **Boot menu** in the shim: two cards with logos, 5 s countdown, and working
   SPMI keys (power confirms, volume moves the selection). The current menu
   build is flashed to `boot_b`.
-- **Root volume.** With the HFSX test image on `userdata`: GPT, mount and
-  `VFS_ROOT` all succeed, and the only thing that stopped the boot was the
-  sealed-root check (`rootvp not authenticated after mounting`). The HFSX
-  reader is not the defect; patch `0089` reports the failure and continues.
+- **Root volume and userland handoff.** With the HFSX test image on
+  `userdata`: GPT, mount and `VFS_ROOT` succeed, `FSIOC_KERNEL_ROOTAUTH` fails
+  with `error 25` (ENOTTY: HFS has no such ioctl, so it can never pass),
+  `0089` reports it and continues, and `bsd_init` runs to
+  `load_init_program: attempting to load /sbin/launchd`. The kernel side of
+  the root is done; what panics now is that the test image has no init.
 - **Recovery path.** `boot_a` keeps the stock Android image and
   `fastboot boot` writes nothing, so every experiment is volatile unless the
   image is explicitly installed.
 
 Current blocker, in order:
 
-1. **Root authentication.** `bsd_init` calls `FSIOC_KERNEL_ROOTAUTH` on the
-   root vnode and panics when it fails; an unsigned kernel with an HFS root
-   built by `tools/mkiosroot.sh` can never answer it. `0089` prints
-   `MONDRAN: root volume is not authenticated (error N); continuing unsealed`
-   and falls through. This is bring-up behaviour, not a security model.
-2. **The real iOS root is not on this Mac.** The 12 GB v15 image was built on
+1. **The real iOS root is not on this Mac.** The 12 GB v15 image was built on
    another machine; it has to be copied here (or rebuilt with
-   `tools/mkiosroot.sh`) before `userdata` gets the real root.
-3. **After the mount:** launchd/userland, then the persistent console log
-   (needs the write path), the display presentation, touch and USB.
+   `tools/mkiosroot.sh`) into `userdata` before `/sbin/launchd` exists. The
+   test image also lacks `/dev`, which is why `devfs_kernel_mount` returns
+   `ENOENT`; a real root has it.
+2. **After launchd:** the persistent console log (needs the UFS write path),
+   the display presentation, touch and USB. The root mounts read-only today,
+   which is enough to start the boot but not for `/private/var`.
 
 Next concrete actions:
 
