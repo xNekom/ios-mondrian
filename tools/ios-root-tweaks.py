@@ -14,6 +14,8 @@ screen (image versions v8-v14 in NOTES.md):
                   crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
+  preboot         /private/preboot/<boot-manifest-hash>/usr/standalone/firmware,
+                  a copy of the firmware: launchd bind-mounts it from there
   migration       LastSystemVersion so DataMigration does not run for an hour
                   on every boot
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
@@ -27,7 +29,7 @@ screen (image versions v8-v14 in NOTES.md):
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
 """
-import glob, os, plistlib, shutil, sys
+import glob, hashlib, os, plistlib, shutil, sys
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
@@ -82,6 +84,30 @@ def containers(root):
             print('mkdir', d)
 
 
+# The boot-manifest hash the ADT publishes (tools/mkadt.py hashes the same
+# string). launchd builds /private/preboot/<hash> from it and bind-mounts
+# /usr/standalone/firmware from there; a flattened root has no preboot volume.
+BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').hexdigest().upper()
+
+
+def preboot(root):
+    src = os.path.join(root, 'usr/standalone/firmware')
+    dst = os.path.join(root, 'private/preboot', BOOT_MANIFEST_HASH,
+                       'usr/standalone/firmware')
+    if not os.path.isdir(src) or os.path.exists(dst):
+        return
+    os.makedirs(os.path.dirname(dst))
+    shutil.copytree(src, dst)
+    for dirpath, dirnames, filenames in os.walk(dst):
+        os.chown(dirpath, 0, 0)
+        os.chmod(dirpath, 0o755)
+        for name in filenames:
+            f = os.path.join(dirpath, name)
+            os.chown(f, 0, 0)
+            os.chmod(f, 0o644)
+    print('preboot', os.path.relpath(dst, root))
+
+
 def find_container(root, kind, identifier):
     for meta in glob.glob(os.path.join(root, 'private/var/containers', kind, '*',
                                        '.com.apple.mobile_container_manager.metadata.plist')):
@@ -128,6 +154,7 @@ def main():
     root = sys.argv[1]
     launchd(root)
     containers(root)
+    preboot(root)
     activation(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
