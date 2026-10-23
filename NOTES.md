@@ -51,14 +51,17 @@ Current blocker, in order:
 Next concrete actions:
 
 ```sh
-gh workflow run xnu.yml -f board=mondrian          # 0088 in the series
-gh run download RUN_ID -n xnu-kernel-mondrian -D xnu/out
+tools/build-kernel-local.sh                        # -> /tmp/kernel.development.mondrian
 tools/mkadt.py shim/out/mondrian.adt --board mondrian
-tools/mkpayload.py xnu/out/kernel.development.mondrian shim/out/mondrian.adt \
+tools/mkpayload.py /tmp/kernel.development.mondrian shim/out/mondrian.adt \
     shim/out/payload.bin --board mondrian
 BOARD=mondrian shim/build.sh shim/out/payload.bin  # -> shim/out/shim-boot.img
 tools/phone-boot.sh                                # volatile; phone in fastboot
 ```
+
+The cloud build (`gh workflow run xnu.yml -f board=mondrian`) is the same
+series and stays as the reproducible reference; the local script is the loop
+to use while iterating.
 
 A definitive write to `boot_b` follows the graded protocol of
 `docs/MONDIAN_PORT.md` (volatile proof first, `fastboot getvar current-slot`,
@@ -67,21 +70,18 @@ verified backup, write, read back).
 ## Building and booting
 
 **Kernel.** `.github/workflows/xnu.yml` fetches xnu-8796.141.3, applies
-`xnu/patches-mondrian/` in order and uploads
-`kernel.development.mondrian`. Locally, `tools/apply-series.py` applies the
-series to a fresh tree in seconds and names what does not apply, and
+`xnu/patches-mondrian/` in order and uploads `kernel.development.mondrian`.
+`tools/build-kernel-local.sh` runs the same build on this Mac (pinned
+`blacktop/darwin-xnu-build` tree, same series, cached KDK 13.5) and fails if a
+numbered patch is skipped. `tools/apply-series.py` applies the series to a
+fresh tree in seconds and names what does not apply, and
 `tools/check-patches.sh` does the same against the cached tree in `research/`.
 
-**Local full build (the fast path, no CI round trip).** XNU 8796 needs the
-Xcode 15 `iig`: with a newer one the DriverKit stubs fail with
-`no member named 'kernelContent' in 'IORPC'`. The workaround is to copy the 17
-generated `*.iig.cpp`/`*.h` from the CI build-tree artifact into
-`build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/iokit/DEVELOPMENT/DriverKit/`
-(note the extra `DEVELOPMENT` component) and run the kernel `make` directly
-with `KDKROOT=` pointing at a KDK 13.5. `make` still exits 2 on
-`config_all`'s symbol-set validation; the linked kernel is already written.
-The loop is then `make` → `KERNEL=… tools/phone-deploy.sh build` → boot,
-about five minutes.
+**`iig` trap.** The build reuses the generated DriverKit stubs
+(`*.iig.cpp`/`*.h` under `build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/iokit/`,
+note the extra `DEVELOPMENT` component). Regenerating them with a newer
+Xcode's `iig` fails with `no member named 'kernelContent' in 'IORPC'`, so
+`build/kernel` must stay seeded from an Xcode 15 tree.
 
 **Image and deploy.** `tools/phone-boot.sh` builds if needed and boots
 volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path

@@ -122,6 +122,20 @@ gh workflow run xnu.yml -R YOU/ios-mondrian -f board=mondrian   # or board=sweet
 gh run download RUN_ID -R YOU/ios-mondrian -n xnu-kernel-mondrian -D xnu/out
 ```
 
+The same build runs on this Mac without the cloud, with the same pinned
+`blacktop/darwin-xnu-build` tree and patch series:
+
+```sh
+bash tools/build-kernel-local.sh            # -> /tmp/kernel.development.mondrian
+KERNEL_CONFIG=RELEASE bash tools/build-kernel-local.sh
+```
+
+It needs Xcode whose `iig` matches the xnu generation (Xcode 15 for xnu-8796),
+`jq`, `cmake`, `ninja`, and a KDK in `/private/tmp/kdk/root` (or `KDKROOT=`).
+The xnu checkout is reset before every build, so the series must apply to a
+clean tree; a numbered patch that is skipped fails the script instead of
+producing a kernel that is silently missing it.
+
 To check a patch locally before spending a run, `tools/apply-series.py` applies
 the whole series to a fresh xnu tree in seconds and `tools/xnu-cc.py` replays
 the compile command of a single file from a previous CI log.
@@ -195,6 +209,7 @@ tools/ios-crash.py                      # symbolicate the CRASH lines against th
 | `xnu/patches/` | the XNU patch series for sweet, plus staging scripts for libpthread, HFS and BearSSL |
 | `xnu/patches-mondrian/` | the XNU patch series for mondrian (see its README for the state of each patch) |
 | `.github/workflows/xnu.yml` | kernel CI build (`board` input) |
+| `tools/build-kernel-local.sh` | the same build on this Mac (same pinned dxb tree and series) |
 | `tools/boards.py` | the board table: MMIO, memory, CPU topology, page size, boot args |
 | `tools/mkadt.py`, `mkpayload.py` | generate the Apple Device Tree / pack kernel + ADT + boot args |
 | `tools/apply-series.py`, `check-patches.sh`, `port-series.py` | apply, validate and port patch series |
