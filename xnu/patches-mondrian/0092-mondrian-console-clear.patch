@@ -1,0 +1,62 @@
+xnu 0092: clear the console with 64-bit stores
+
+The console does not scroll: when the cursor reaches the last row it
+clears the whole text area and starts again at the top. That is 18 MB of
+writes per line once the screen is full, and with a verbose userland boot
+it is the difference between a log that follows the boot and one that
+lags seconds behind it. Fill 8 bytes at a time instead of 4.
+
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -746,28 +746,38 @@
+ 	return fbcon_phys_end;
+ }
+ 
++/*
++ * Fill whole scanlines with the background. A row is 5760 bytes and the
++ * console wraps by clearing the whole text area (18 MB) once the screen is
++ * full, so this is the busiest loop in a verbose boot: 64-bit stores halve
++ * the count and keep the write pipeline fed.
++ */
+ static void
+-fbcon_clear_row(uint32_t row)
++fbcon_fill_rows(uint32_t y0, uint32_t y1)
+ {
+-	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+-		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
++	uint64_t const bg = ((uint64_t)FBCON_BG << 32) | FBCON_BG;
++	uint32_t const words = fbcon_stride / sizeof(uint64_t);
++
++	for (uint32_t y = y0; y < y1; y++) {
++		volatile uint64_t *line =
++		    (volatile uint64_t *)(fbcon_base + y * (fbcon_stride / 4));
++		for (uint32_t i = 0; i < words; i++) {
++			line[i] = bg;
+ 		}
+ 	}
++}
++
++static void
++fbcon_clear_row(uint32_t row)
++{
++	fbcon_fill_rows(row * 16 * FBCON_SCALE, (row + 1) * 16 * FBCON_SCALE);
+ }
+ 
+ /* Blank the whole text area; the next glyph goes to the top row. */
+ static void
+ fbcon_clear_screen(void)
+ {
+-	uint32_t rows = fbcon_rows * 16 * FBCON_SCALE;
+-	for (uint32_t y = 0; y < rows; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+-		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = FBCON_BG;
+-		}
+-	}
++	fbcon_fill_rows(0, fbcon_rows * 16 * FBCON_SCALE);
+ }
+ 
+ static void

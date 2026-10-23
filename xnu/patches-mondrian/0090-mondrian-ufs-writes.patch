@@ -8,12 +8,13 @@ media), so the root stays read-only and /private/var cannot be created.
 Add the write half of the same path the reads use: WRITE(10) into the
 bounce buffer, the data-out direction in the request descriptor and the
 command UPIU, a read-modify-write for ranges that do not cover whole
-2048-byte device blocks, and SYNCHRONIZE CACHE(10) after each transfer
-(the device caches the writes). d_open accepts FWRITE and the character
-device gets the matching physio. DKIOCISWRITABLE and the write limits now
-describe a writable disk: HFS turns HFS_WRITEABLE_MEDIA on only when the
-device says so, and the journal sizes its transfers from the limits. The
-transfer is synchronous, as the reads already were.
+2048-byte device blocks, and the barrier HFS asks for (DKIOCSYNCHRONIZE,
+SYNCHRONIZE CACHE(10)) instead of flushing after every buffer. d_open
+accepts FWRITE and the character device gets the matching physio.
+DKIOCISWRITABLE and the write limits now describe a writable disk: HFS
+turns HFS_WRITEABLE_MEDIA on only when the device says so, and the journal
+sizes its transfers from the limits. The transfer is synchronous, as the
+reads already were.
 
 diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 --- a/bsd/dev/mondrian_ufs.c
@@ -68,11 +69,13 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	if (!ufs_wait_done(500)) {
  		/*
  		 * The host never finished the request. Print what it did with
-@@ -350,8 +353,35 @@
+@@ -350,6 +353,41 @@
  		return EIO;
  	}
  	return 0;
 +}
++
++static uint32_t ufs_writes;
 +
 +/* WRITE(10) of count device blocks at lba from the bounce buffer. */
 +static int
@@ -87,11 +90,17 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		0, (uint8_t)(count >> 8), (uint8_t)count, 0
 +	};
 +
-+	printf("MONDRIAN UFS: write lba 0x%llx, %u blocks\n",
-+	    lba, count);
++	/*
++	 * One line for the whole boot is enough to prove the path works; the
++	 * boot writes for minutes after a read-only volume has been mounted
++	 * read-write, and a print per command costs more than the command.
++	 */
++	if (ufs_writes++ == 0) {
++		printf("MONDRIAN UFS: write path in use (first lba 0x%llx)\n", lba);
++	}
 +	return ufs_scsi(su.lun, cdb, sizeof(cdb), count * UFS_BLOCK, TRUE);
- }
- 
++}
++
 +/* SYNCHRONIZE CACHE(10): the device may hold the writes in its own cache. */
 +static int
 +ufs_flush(void)
@@ -99,12 +108,10 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +	uint8_t cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 +
 +	return ufs_scsi(su.lun, cdb, sizeof(cdb), 0, FALSE);
-+}
-+
+ }
+ 
  /* NOP OUT/IN verifies the UTP layer before the device-management queries. */
- static int
- ufs_nop_out(void)
-@@ -469,7 +499,7 @@
+@@ -469,7 +507,7 @@
  		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
  		0, (uint8_t)(count >> 8), (uint8_t)count, 0
  	};
@@ -113,7 +120,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  }
  
  static int
-@@ -645,7 +675,7 @@
+@@ -645,7 +683,7 @@
  	if (!su.ready) {
  		return ENXIO;
  	}
@@ -122,7 +129,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  }
  
  static int
-@@ -664,10 +694,6 @@
+@@ -664,10 +702,6 @@
  	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
  
  	buf_setresid(bp, count);
@@ -133,7 +140,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	if (off > part_bytes || count > part_bytes - off) {
  		error = EINVAL;
  		goto done;
-@@ -687,14 +713,37 @@
+@@ -687,14 +721,39 @@
  		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
  		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
  		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
@@ -169,30 +176,48 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  		done += want;
  		buf_setresid(bp, count - done);
  	}
-+	if (!error && !(buf_flags(bp) & B_READ)) {
-+		error = ufs_flush();
-+	}
++	/*
++	 * No SYNCHRONIZE CACHE here: the file system puts a barrier where it
++	 * needs one (DKIOCSYNCHRONIZE, above), and flushing every buffer made
++	 * the first read-write boot spend most of its time in the flush.
++	 */
  	lck_mtx_unlock(&mondrian_ufs_lock);
  	buf_unmap(bp);
  
-@@ -732,17 +781,28 @@
+@@ -732,17 +791,44 @@
  		*o = su.nblocks * UFS_BLOCK / su.secsize;
  		return 0;
  	case DKIOCISWRITABLE:
 -		*f = 0;
 +		*f = 1;
  		return 0;
++	case DKIOCSYNCHRONIZE: {
++		/*
++		 * HFS's journal barrier (hfs_journal.c: DKIOCSYNCHRONIZE with
++		 * DK_SYNCHRONIZE_OPTION_BARRIER). Returning ENOTTY made every
++		 * journal commit print "flushing fs disk buffer returned 0x19".
++		 * Our flush covers the whole device, so the option is moot.
++		 */
++		int error = 0;
++
++		lck_mtx_lock(&mondrian_ufs_lock);
++		if (su.ready) {
++			error = ufs_flush();
++		}
++		lck_mtx_unlock(&mondrian_ufs_lock);
++		return error;
++	}
  	case DKIOCGETMAXBLOCKCOUNTREAD:
  		*o = BOUNCE_SIZE / su.secsize;
  		return 0;
  	case DKIOCGETMAXBLOCKCOUNTWRITE:
 -		*o = 0;
 +		*o = BOUNCE_SIZE / su.secsize;
-+		return 0;
+ 		return 0;
 +	case DKIOCGETMAXBYTECOUNTREAD:
 +	case DKIOCGETMAXBYTECOUNTWRITE:
 +		*o = BOUNCE_SIZE;
- 		return 0;
++		return 0;
 +	case DKIOCGETMAXSEGMENTBYTECOUNTREAD:
 +	case DKIOCGETMAXSEGMENTBYTECOUNTWRITE:
 +		*o = PRDT_CHUNK;
@@ -207,7 +232,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  		return 0;
  	default:
  		return ENOTTY;
-@@ -774,9 +834,10 @@
+@@ -774,9 +860,10 @@
  }
  
  static int
@@ -220,7 +245,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  }
  
  static const struct bdevsw mondrian_ufs_bdevsw = {
-@@ -879,7 +940,7 @@
+@@ -879,7 +966,7 @@
  			 * to it: the sense here is the baseline the retries below
  			 * are compared against, and 0082 never printed it.
  			 */
@@ -229,7 +254,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  			printf("MONDRIAN UFS: before any wake: TUR %d, power 0x%x,"
  			    " fDeviceInit 0x%x\n", tur_error, power & 0xff, flag & 1);
  			if (tur_error == 0) {
-@@ -900,13 +961,13 @@
+@@ -900,13 +987,13 @@
  				for (unsigned int round = 0; round < 2; round++) {
  					uint8_t wake_lun = (round == 0) ? 0xd0 : (uint8_t)su.lun;
  					int wake = ufs_scsi(wake_lun, start_active,
@@ -245,7 +270,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  						if (!tur_error) {
  							error = 0;
  							break;
-@@ -978,7 +1039,7 @@
+@@ -978,7 +1065,7 @@
  	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "ufsroot0");
  	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
  	su.ready = true;

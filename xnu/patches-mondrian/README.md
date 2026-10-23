@@ -20,7 +20,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0003`–`0055` | the generic half of the sweet series: RAM disk root, mockfs, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
 | `0056`–`0062` | the page-size work (commpage, zone map VA, bootstrap VA zone, no physical timer write, framebuffer alias reservation) and the first UFS 3.1 root device (`0059`); `0058` went away with the 4 KiB software page size |
 | `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
-| `0070`–`0082`, `0086`, `0090`–`0091` | the UFS 3.1 root device, its wake sequence, the write path (`0090`) and the task name in an unclassified abort (`0091`) |
+| `0070`–`0082`, `0086`, `0090`–`0092` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`) and the console's 64-bit clear (`0092`) |
 | `0083`–`0084` | panel memory kept off the free list, colour-bar self-test |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 
