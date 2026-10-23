@@ -13,6 +13,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "menu.h"
+#include "spmi.h"
 #include "ufs.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -707,16 +708,32 @@ void shim_main(uint64_t dtb)
 #endif
 
 	/*
-	 * The boot menu, v0: it draws the band and counts five seconds down
-	 * to the default (iOS). There is no input yet: the keys are polled
-	 * in a later version, and their sources (PON over SPMI for the
-	 * power key, maybe a TLMM gpio for one of the volumes) have to come
-	 * out of the stock device tree first. Everything behind the menu is
+	 * The boot menu: it paints its own screen (title, the two cards
+	 * with the logos, the countdown) and counts five seconds down to
+	 * the default (iOS). The menu takes no keys yet: the SPMI probe
+	 * below the menu prints the PON and the gpio status bytes so a
+	 * photo with a key pressed tells the bit that moves; the wired
+	 * keys are the next shim build. Everything behind the menu is
 	 * unchanged: the loader boots the kernel the build appended, so a
-	 * menu bug costs a band with a wrong line of text at most.
+	 * menu bug costs a wrong screen at most.
 	 */
 	stage = "menu";
 	menu_show();
+	con_skip();
+
+	/*
+	 * The SPMI probe (read-only EXT_READL of the PON and the gpio
+	 * status): its regions and the peripherals come out of the live
+	 * tree; the print is what maps the keys. Before the loader, so a
+	 * dead arbiter only costs a line, never the boot.
+	 */
+	stage = "spmi";
+	spmi_init(dtb);
+	{
+		unsigned char pon = 0, gpio = 0;
+
+		spmi_poll(&pon, &gpio);
+	}
 	con_skip();
 
 	const char *why = loader_boot(dtb);

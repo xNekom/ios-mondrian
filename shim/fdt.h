@@ -49,3 +49,8 @@ int fdt_find_name(uintptr_t fdt, const char *prefix, char *out, int out_len);
 int fdt_find_name_depth(uintptr_t fdt, const char *prefix, char *out, int out_len,
     int depth);
 int fdt_find_compatible(uintptr_t fdt, const char *compat, char *out, int out_len);
+
+/* First /__symbols__ value containing needle, as a node path string. */
+int fdt_symbols_for(uintptr_t fdt, const char *needle, char *out, int out_len);
+/* The node path whose "phandle" is the given handle. */
+int fdt_find_phandle(uintptr_t fdt, uint32_t want, char *out, int out_len);

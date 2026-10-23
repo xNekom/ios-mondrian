@@ -309,6 +309,139 @@ int fdt_find_name_depth(uintptr_t fdt, const char *prefix, char *out, int out_le
 }
 
 /*
+ * Under /__symbols__ every property is "symbol" = "path string". Return the
+ * first value whose text contains needle, so a caller can find the path of
+ * e.g. "pon_hlos@" or of a PMIC's gpio block without knowing the tree of
+ * this phone.
+ */
+int fdt_symbols_for(uintptr_t fdt, const char *needle, char *out, int out_len)
+{
+	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
+	uintptr_t p, strings;
+	int in_syms = 0;
+
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	p = fdt + be32(fdt + 8);
+	strings = fdt + be32(fdt + 12);
+	w.strings = strings;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			w.depth++;
+			path_push(&w, name);
+			p = align4(skip_str(p));
+			if (w.depth == 2)
+				in_syms = streq(w.path, "/__symbols__");
+			break;
+		}
+		case FDT_END_NODE:
+			path_pop(&w);
+			w.depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p);
+			uintptr_t val = p + 8;
+			p = align4(val + len);
+			if (!in_syms)
+				break;
+			/* a string property; scan it for the needle */
+			const char *s = (const char *)val;
+			uint32_t nl;
+			for (nl = 0; nl < len && s[nl]; nl++)
+				;
+			for (uint32_t k = 0; k + 1 < nl; k++) {
+				uint32_t j = 0;
+				while (s[k + j] && needle[j] &&
+				    s[k + j] == needle[j])
+					j++;
+				if (needle[j] == 0 && s[k + j] != 0) {
+					/* the needle matched a part; take
+					 * from the string start */
+					int o = 0;
+					uint32_t q = nl;
+					if (q > (uint32_t)(out_len - 1))
+						q = (uint32_t)(out_len - 1);
+					while (o < (int)q) {
+						out[o] = s[o];
+						o++;
+					}
+					out[o] = 0;
+					return 1;
+				}
+			}
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return 0;
+		}
+	}
+}
+
+/*
+ * The node whose "phandle" (or "linux,phandle") is the given handle; the
+ * full path of that node in out[].
+ */
+int
+fdt_find_phandle(uintptr_t fdt, uint32_t want, char *out, int out_len)
+{
+	struct fdt_walk w = { .fdt = fdt, .strings = 0, .len = 0, .depth = 0 };
+	uintptr_t p, strings;
+
+	if (!fdt || be32(fdt) != FDT_MAGIC)
+		return 0;
+	p = fdt + be32(fdt + 8);
+	strings = fdt + be32(fdt + 12);
+	w.strings = strings;
+
+	for (;;) {
+		uint32_t tok = be32(p);
+		p += 4;
+		switch (tok) {
+		case FDT_BEGIN_NODE: {
+			const char *name = (const char *)p;
+			w.depth++;
+			path_push(&w, name);
+			p = align4(skip_str(p));
+			break;
+		}
+		case FDT_END_NODE:
+			path_pop(&w);
+			w.depth--;
+			break;
+		case FDT_PROP: {
+			uint32_t len = be32(p), nameoff = be32(p + 4);
+			uintptr_t val = p + 8;
+			const char *nm = (const char *)(strings + nameoff);
+
+			p = align4(val + len);
+			if (len == 4 && (streq(nm, "phandle") ||
+			    streq(nm, "linux,phandle")) && be32(val) == want) {
+				int o = 0;
+				const char *s = w.path;
+
+				while (*s && o < out_len - 1)
+					out[o++] = *s++;
+				out[o] = 0;
+				return 1;
+			}
+			break;
+		}
+		case FDT_NOP:
+			break;
+		default:
+			return 0;
+		}
+	}
+}
+
+/*
  * The carve-outs of /reserved-memory. The nodes are children of
  * /reserved-memory, so their addresses use the cells of that node (2 and 2),
  * not the ones of the root.

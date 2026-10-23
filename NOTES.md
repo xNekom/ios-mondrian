@@ -68,6 +68,65 @@ the technical facts of the notes were kept. CI run `39968228607`
 (menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
 commit is `2afb8de`.
 
+## 2026-10-23 17:40: exact logos (vector sources), SPMI probe, and the protocol to flash boot_b
+
+**Exact logos (user directive: vector sources, no binary assets).**
+`tools/gen-menu-logos.py` was rewritten into a real vector pipeline: a
+full SVG path parser (m M l L h H v V c C s S q Q a A z Z, relative and
+implicit repeats), cubic flattening, the W3C center-parameterization arc
+conversion, and an even-odd scanline fill with 2x supersampling (so the
+nested subpaths — the Android eyes — punch out). Sources, credited in
+the generated header: **Apple** = Bootstrap Icons "apple" (MIT) — the
+leaf + stem + S-curve body + the bite, at 80x89; **Android** = Google
+Material Icons "android" (Apache 2.0) — which is already the bugdroid
+head (dome + antennae + eyes at the exact official proportions), at
+132x76, Android green `#3DDC84` (`M_DROID` in menu.c), apple near-white
+`M_APPLE`. `shim/menu.c` v0.1 blits both at scale 3 inside the 600x900
+cards; cards/labels/notes as before. Menu 0d268aec superseded; the
+final shim build compiles FULL and SMALL_SHIM=1 clean, no ABS64.
+
+**SPMI probe (the first honest step of the keys).** `shim/spmi.c` +
+`shim/spmi.h` (read-only; EXT_READL observer only; every loop bounded):
+the live tree decides EVERY number —
+the arbiter by compatible `qcom,spmi-pmic-arb`, its five regions bind by
+**reg-names** (cnfg/core/.../obsrvr), version-gate `core+0` in
+[0x50000000,0x70000000) with `core+4 & 0x7ff` APIDs; the power-on block
+through `/__symbols__` containing "pon_hlos@" (qcom,pmk8350@0 →
+peripheral 0x13, sid 0), and the volume through
+`/soc/gpio_keys/vol_up`'s "gpios" = `<phandle 6 flag>` + the new
+`fdt_find_phandle()` in fdt.c resolving to qcom,pm8350@1 (→ peripheral
+0x88 = 0x8800>>8, sid 1). Two new fdt.c functions:
+`fdt_symbols_for` and `fdt_find_phandle`.
+The bits of the status bytes are NOT assumed: the probe prints
+`SPMI <pon status> <gpio status> <pon-ppid> <gpio-ppid>` once, after
+the menu; the NEXT photo (one boot with Vol+ held, one without) fixes
+which bit is the key; then the menu wires: edges → selection/confirm.
+Per the live tree, mondrian has NO vol_down node: gpio_keys carries
+only `vol_up` (the user's statement "al menos un volumen en el PM8350"
+matches: vol_up = PM8350 gpio 6). **Caution recorded**: whether a pmic
+"gpio" index maps to a SEPARATE periph (0x88 + index - 1) or its status
+registers sit inside the one 0x88 peripheral stays an open semantics
+question — the probe's second clamp read will settle it; nothing in the
+prototype depends on it.
+
+**Final flash protocol for boot_b (the graded write, executed when the
+phone is in fastboot):**
+1. `fastboot boot` the exact image (volatile proof already done twice
+   for the fixed-kernel family; the LOGOS+probe build ran at 16:47
+   `0d268aec…` — the full-screen card menu with the pre-exact logos; the
+   final build `6a96546d…` still needs ITS volatile run before the
+   flash — do not skip: policy).
+2. `fastboot getvar current-slot` = b; refuse otherwise
+   (`boot_a` is out of reach of both the protocol and the tooling).
+3. backup check: `shasum -c backup/SHA256SUMS.mondrian-boot` (verified
+   today: 3 OK).
+4. `fastboot flash boot_b /tmp/boot-mondrian-menu1.img` → OKAY expected
+   in ~0.2 s.
+5. `fastboot reboot`: the phone then boots from the flash: menu with
+   the exact logos + the SPMI print line + the load of the fixed (dumb
+   kernel) — every boot CARRYING the fix from now on, and the
+   previous congelado loop takes its exits as before.
+
 ## 2026-10-23 16:55: boot_b flashed with menu0 (the fix reaches the persistent boot); menu v0.1 full-screen
 
 **The panic the user photographed on the persistent boot** (color bars,
