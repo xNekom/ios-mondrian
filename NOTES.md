@@ -48,17 +48,25 @@ blocked while the phone runs the kernel path).
 
 **Device status.** The menu0 volatile boot went through
 `tools/phone-boot.sh` (send OK, 0.17 s, booted); `fastboot devices`
-showed nothing afterwards (boot in progress or WDT loop, TBD). Pending:
-the boot photo(s), and when the phone is back in fastboot —
-`fastboot getvar current-slot` plus
-`partition-size:boot|vendor_boot|init_boot|recovery` to record the real
-topology, and re-read `boot_b` from the device to confirm it still holds
-the deploy image (the byte equality with the original comes from the 22:47
-dump, not re-read tonight).
+showed nothing afterwards (boot in progress or WDT loop, TBD). Then
+16:30: the phone WDT'd back into **fastboot** and the pending evidence
+is recorded — `fastboot getvar current-slot` = **b** (the boot did not
+change the slot), `product` = mondrian, `unlocked` = yes,
+`partition-size`: `boot` 0xC000000 (192 MiB, matches the 201,326,592-byte
+dumps), `vendor_boot` 0x6000000 (96 MiB), `recovery` 0x6400000 (100 MiB),
+`misc` 0x400000 (4 MiB — the BCB lives inside it), `vbmeta` 0x20000,
+`dtbo` 0x1800000; **`init_boot` does not exist** on this device
+(GetVar Variable Not found — the allow-list row stays "if present", which
+here means never). Still pending: the boot photo(s) and re-reading
+`boot_b` from the device via adb (the fastboot side cannot dump the
+partition; the byte-equality with the original comes from the 22:47
+dump, not re-read today).
 
 **Sanitization note.** Historical mentions of third-party assistant
 tooling were removed from `NOTES.md`/`AGENTS.md` per documentation policy;
-the technical facts of the notes were kept.
+the technical facts of the notes were kept. CI run `39968228607`
+(menu0/0087) completed **SUCCESS** (12 m 23 s); the push of this policy
+commit is `2afb8de`.
 
 ## 2026-10-23 16:10: the reboot of 0087 in TYPER-only, and the boot menu v0 of the shim
 
