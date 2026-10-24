@@ -78,7 +78,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	mondrian_sample_start();
  	return 0;
  }
-@@ -1095,5 +1108,276 @@
+@@ -1095,5 +1108,272 @@
  	*dev = su.bdev;
  	mondrian_sample_start();        /* retry if the early start failed */
  	return 0;
@@ -207,57 +207,32 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +}
 +
 +/*
-+ * Boot-arg mondriandumpmatch: up to four comma separated substrings; a line is
-+ * kept when it contains any of them (empty keeps everything). The boot log
-+ * runs at hundreds of lines per second, so "the last 40 lines" is a tenth of a
-+ * second: the filter is what makes the dump answer a question.
-+ */
-+static bool
-+mondrian_log_keep(const char *line, char *filter)
-+{
-+	if (filter[0] == 0) {
-+		return true;
-+	}
-+	for (char *f = filter; *f != 0; ) {
-+		char *end = strchr(f, ',');
-+		size_t len = end ? (size_t)(end - f) : strlen(f);
-+		char save = f[len];
-+		bool hit;
-+
-+		f[len] = 0;
-+		hit = mondrian_log_contains(line, f);
-+		f[len] = save;
-+		if (hit) {
-+			return true;
-+		}
-+		f = end ? end + 1 : f + len;
-+	}
-+	return false;
- }
-+
-+/*
-+ * Boot-arg mondriandump=N: print the last N lines of the PREVIOUS boot's
-+ * console log and stop the boot there. The panel shows one screenful and the
-+ * viewer shim has to drive the UFS host by itself; this uses the driver that
-+ * wrote the log, at the one moment it is already initialized. It runs before
-+ * the log thread exists, so nothing rewrites the area under the reads.
++ * Boot-arg mondriandump=N (N>0 turns it on) with mondriandumpmatch=a,b,c (up
++ * to four terms, default "SMP"): count the lines of the PREVIOUS boot's
++ * console log that contain each term and print the first and the last of each,
++ * then stop the boot there.
++ *
++ * The log runs at hundreds of lines a second, so "the last forty lines" is a
++ * tenth of a second of it, and the question is never "what was the last line"
++ * but "did this ever happen, and where was it". A count and the newest match
++ * answer that in a few lines that survive being read off a screen.
 + */
 +static void
 +mondrian_log_dump(uint32_t lines)
 +{
-+	/*
-+	 * The whole ring, not a tail: the boot log runs at hundreds of lines a
-+	 * second, and the sampler writes one line every five seconds, so a
-+	 * filtered window has to be minutes wide to contain any of them.
-+	 */
 +	static char text[MONDRIAN_LOG_SIZE + 1];
-+	static char *line[64];
-+	char filter[128] = "";
++	static char first[4][80], last[4][80];
++	static uint32_t hits[4];
++	char terms[128] = "SMP";
++	char *term[4];
++	uint32_t nterms = 0, nlines = 0, got = 0, have, ring;
 +	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
 +	uint64_t total, pos;
 +	char *h = (char *)(su.dma + DMA_BOUNCE);
-+	uint32_t ring, have, got = 0, n = 0, first = 0, i;
 +
++	if (lines == 0) {
++		return;
++	}
 +	if (ufs_read_blocks(base, 1)) {
 +		printf("MONDRIANDUMP: header read failed\n");
 +		return;
@@ -266,21 +241,35 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		printf("MONDRIANDUMP: no MONDLOG header (the log never flushed)\n");
 +		return;
 +	}
-+	(void)PE_parse_boot_argn("mondriandumpmatch", filter, sizeof(filter));
 +	ring = *(uint32_t *)(h + 12);
 +	total = *(uint64_t *)(h + 16);
-+	printf("MONDRIANDUMP: ring %u bytes, total %llu, seq %llu\n", ring, total,
-+	    *(uint64_t *)(h + 24));
 +	if (ring == 0 || ring > MONDRIAN_LOG_SIZE || total == 0) {
 +		printf("MONDRIANDUMP: empty or bad ring\n");
 +		return;
 +	}
++
++	/* The terms. */
++	(void)PE_parse_boot_argn("mondriandumpmatch", terms, sizeof(terms));
++	for (char *t = terms; *t != 0 && nterms < 4; ) {
++		char *end = strchr(t, ',');
++		size_t len = end ? (size_t)(end - t) : strlen(t);
++
++		if (len > 0) {
++			char save = t[len];
++
++			t[len] = 0;
++			term[nterms++] = t;
++			t[len] = save;
++		}
++		t = end ? end + 1 : t + len;
++	}
++
++	/* The whole ring: a filtered window has to be minutes wide. */
 +	have = total < ring ? (uint32_t)total : ring;
-+	if (have > sizeof(text) - 1) {
-+		have = sizeof(text) - 1;
++	if (have > MONDRIAN_LOG_SIZE) {
++		have = MONDRIAN_LOG_SIZE;
 +	}
 +	pos = (total % ring + ring - have) % ring;
-+	/* Whole blocks per command: one ring is 1024 block reads otherwise. */
 +	uint32_t const per_read = BOUNCE_SIZE / UFS_BLOCK;
 +	while (got < have) {
 +		uint32_t off = (uint32_t)(pos % ring);
@@ -301,10 +290,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		pos = (pos + n) % ring;
 +	}
 +	text[got] = 0;
-+	if (lines == 0 || lines > 64) {
-+		lines = 40;
-+	}
-+	/* The newest lines are the interesting ones: keep the last N. */
++
 +	for (char *c = text, *start = text; ; c++) {
 +		if (*c != '\n' && *c != 0) {
 +			continue;
@@ -312,11 +298,17 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		char stop = *c;
 +
 +		*c = 0;
-+		if (c > start && mondrian_log_keep(start, filter)) {
-+			line[first] = start;
-+			first = (first + 1) % lines;
-+			if (n < lines) {
-+				n++;
++		if (c > start) {
++			nlines++;
++			for (uint32_t t = 0; t < nterms; t++) {
++				if (!mondrian_log_contains(start, term[t])) {
++					continue;
++				}
++				hits[t]++;
++				if (first[t][0] == 0) {
++					snprintf(first[t], sizeof(first[t]), "%s", start);
++				}
++				snprintf(last[t], sizeof(last[t]), "%s", start);
 +			}
 +		}
 +		if (stop == 0) {
@@ -324,16 +316,20 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		}
 +		start = c + 1;
 +	}
-+	printf("MONDRIANDUMP: last %u lines matching \"%s\"\n", n, filter);
-+	uint32_t from = n < lines ? 0 : first;
-+	for (i = 0; i < n; i++) {
-+		printf("| %s\n", line[(from + i) % lines]);
++
++	printf("MONDRIANDUMP: %u lines, %llu bytes written, ring %u\n", nlines, total, ring);
++	for (uint32_t t = 0; t < nterms; t++) {
++		printf("MONDRIANDUMP: \"%s\" %u hits\n", term[t], hits[t]);
++		if (hits[t] != 0) {
++			printf("  first | %s\n", first[t]);
++			printf("  last  | %s\n", last[t]);
++		}
 +	}
 +	printf("MONDRIANDUMP: end\n");
 +	for (;;) {
 +		delay(1000);
 +	}
-+}
+ }
 +
 +static void
 +mondrian_log_start(void)
