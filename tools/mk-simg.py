@@ -30,7 +30,7 @@ RAW, DONT_CARE = 0xcac1, 0xcac3
 
 def flush(out, windows):
     """Write one chunk for a run of windows of the same kind."""
-    data = b''.join(windows[0][1:])
+    data = b''.join(w for _, w in windows)
     blocks = (len(data) + BLK - 1) // BLK
     if windows[0][0]:
         out.write(CHUNK.pack(DONT_CARE, 0, blocks, 12))
