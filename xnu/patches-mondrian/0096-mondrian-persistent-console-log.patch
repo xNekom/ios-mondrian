@@ -78,7 +78,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	mondrian_sample_start();
  	return 0;
  }
-@@ -1095,5 +1108,265 @@
+@@ -1095,5 +1108,276 @@
  	*dev = su.bdev;
  	mondrian_sample_start();        /* retry if the early start failed */
  	return 0;
@@ -187,7 +187,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		}
 +		flushed = total;
 +	}
- }
++}
 +
 +/* Does the line contain `want`? strstr(a,b) drawn at home. */
 +static bool
@@ -233,7 +233,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		f = end ? end + 1 : f + len;
 +	}
 +	return false;
-+}
+ }
 +
 +/*
 + * Boot-arg mondriandump=N: print the last N lines of the PREVIOUS boot's
@@ -245,7 +245,12 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +static void
 +mondrian_log_dump(uint32_t lines)
 +{
-+	static char text[64 * 1024 + 1];
++	/*
++	 * The whole ring, not a tail: the boot log runs at hundreds of lines a
++	 * second, and the sampler writes one line every five seconds, so a
++	 * filtered window has to be minutes wide to contain any of them.
++	 */
++	static char text[MONDRIAN_LOG_SIZE + 1];
 +	static char *line[64];
 +	char filter[128] = "";
 +	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
@@ -275,19 +280,25 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		have = sizeof(text) - 1;
 +	}
 +	pos = (total % ring + ring - have) % ring;
++	/* Whole blocks per command: one ring is 1024 block reads otherwise. */
++	uint32_t const per_read = BOUNCE_SIZE / UFS_BLOCK;
 +	while (got < have) {
-+		uint32_t off = (uint32_t)(pos % UFS_BLOCK), take = UFS_BLOCK - off;
++		uint32_t off = (uint32_t)(pos % ring);
++		uint32_t n = MIN(have - got, ring - off);
++		uint32_t blocks = (off % UFS_BLOCK + n + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t skip = off % UFS_BLOCK;
 +
-+		if (take > have - got) {
-+			take = have - got;
++		if (blocks > per_read) {
++			blocks = per_read;
 +		}
-+		if (ufs_read_blocks(base + 1 + pos / UFS_BLOCK, 1)) {
-+			printf("MONDRIANDUMP: read failed at ring offset %llu\n", pos);
++		if (ufs_read_blocks(base + 1 + off / UFS_BLOCK, blocks)) {
++			printf("MONDRIANDUMP: read failed at ring offset %u\n", off);
 +			break;
 +		}
-+		memcpy(text + got, (char *)(su.dma + DMA_BOUNCE) + off, take);
-+		got += take;
-+		pos = (pos + take) % ring;
++		n = MIN(n, blocks * UFS_BLOCK - skip);
++		memcpy(text + got, (char *)(su.dma + DMA_BOUNCE) + skip, n);
++		got += n;
++		pos = (pos + n) % ring;
 +	}
 +	text[got] = 0;
 +	if (lines == 0 || lines > 64) {
