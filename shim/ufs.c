@@ -425,7 +425,4 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
-#ifdef LOGVIEW
-	log_dump();
-#endif
 }

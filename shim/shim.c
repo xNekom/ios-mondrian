@@ -168,7 +168,12 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("X3", regs[3]);
 	con_hex("X29", regs[29]);
 	con_hex("X30", regs[30]);
+	/* The log viewer is read off the screen by hand: give it time. */
+#ifdef LOGVIEW
+	reset(300);
+#else
 	reset(40);
+#endif
 }
 
 /* ---- SMP ---- */
@@ -687,9 +692,13 @@ void shim_main(uint64_t dtb)
 
 #ifndef SMALL_SHIM
 	/* What the bootloader says about this phone. Always print it: it is the
-	 * cheapest way to check the board table against the device. */
+	 * cheapest way to check the board table against the device. The log
+	 * viewer leaves it out: it fills the screen and the console cannot
+	 * scroll, so the log would land past the bottom. */
+#if !defined(LOGVIEW)
 	dump_facts(dtb);
 	con_skip();
+#endif
 #endif
 
 	/*
@@ -704,11 +713,16 @@ void shim_main(uint64_t dtb)
 	con_skip();
 #ifdef LOGVIEW
 	/*
-	 * The log viewer: the previous boot's console log is on the screen and
-	 * the phone stops here, so it can be read and photographed. Nothing is
-	 * written: this image is only ever started with `fastboot boot`, and
-	 * power+volume-down goes back to fastboot.
+	 * The log viewer: the previous boot's console log, then stop. The clear
+	 * is not cosmetic -- the bring-up dump above has already used up rows,
+	 * and the console does not scroll, so without it the log would be drawn
+	 * past the bottom of the screen. Nothing is written: this image is only
+	 * ever started with `fastboot boot`, and power+volume-down goes back to
+	 * fastboot.
 	 */
+	con_clear(0xff000000U);
+	con_str("LOGVIEW", "previous boot, last lines of the console ring");
+	log_dump();
 	for (;;) {
 		__asm__ volatile("wfi");
 	}

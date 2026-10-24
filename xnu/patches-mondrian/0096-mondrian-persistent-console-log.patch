@@ -53,24 +53,32 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  #include <miscfs/devfs/devfs.h>
  #include <kern/locks.h>
  #include <kern/clock.h>
-@@ -46,6 +48,8 @@
+@@ -46,6 +48,9 @@
   * GIC actually look like on this phone. */
  extern void pe_mondrian_gic_dump(void);
  extern void mondrian_irq_dump(void);
 +extern int hz;
 +static void mondrian_log_start(void);
++static void mondrian_log_dump(uint32_t lines);
  
  #define REG_CAP          0x00
  #define REG_VER          0x08
-@@ -1076,6 +1080,7 @@
+@@ -1076,6 +1081,14 @@
  	su.ready = true;
  	printf("MONDRIAN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read/write\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	{
++		uint32_t dump = 0;
++
++		if (PE_parse_boot_argn("mondriandump", &dump, sizeof(dump)) && dump != 0) {
++			mondrian_log_dump(dump);        /* does not return */
++		}
++	}
 +	mondrian_log_start();
  	mondrian_sample_start();
  	return 0;
  }
-@@ -1095,5 +1100,130 @@
+@@ -1095,5 +1108,217 @@
  	*dev = su.bdev;
  	mondrian_sample_start();        /* retry if the early start failed */
  	return 0;
@@ -115,7 +123,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +	for (int i = 0; i < size; i++) {
 +		mondrian_log_ring[(at + (uint64_t)i) % MONDRIAN_LOG_SIZE] = c[i];
 +	}
-+}
+ }
 +
 +struct mondrian_log_header {
 +	char magic[8];
@@ -179,7 +187,94 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		}
 +		flushed = total;
 +	}
- }
++}
++
++/*
++ * Boot-arg mondriandump=N: print the last N lines of the PREVIOUS boot's
++ * console log and stop the boot there. The panel shows one screenful and the
++ * viewer shim has to drive the UFS host by itself; this uses the driver that
++ * wrote the log, at the one moment it is already initialized. It runs before
++ * the log thread exists, so nothing rewrites the area under the reads.
++ */
++static void
++mondrian_log_dump(uint32_t lines)
++{
++	static char text[64 * 1024 + 1];
++	static char *line[64];
++	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	uint64_t total, pos;
++	char *h = (char *)(su.dma + DMA_BOUNCE);
++	uint32_t ring, have, got = 0, n = 0, first = 0, i;
++
++	if (ufs_read_blocks(base, 1)) {
++		printf("MONDRIANDUMP: header read failed\n");
++		return;
++	}
++	if (memcmp(h, "MONDLOG", 7) != 0) {
++		printf("MONDRIANDUMP: no MONDLOG header (the log never flushed)\n");
++		return;
++	}
++	ring = *(uint32_t *)(h + 12);
++	total = *(uint64_t *)(h + 16);
++	printf("MONDRIANDUMP: ring %u bytes, total %llu, seq %llu\n", ring, total,
++	    *(uint64_t *)(h + 24));
++	if (ring == 0 || ring > MONDRIAN_LOG_SIZE || total == 0) {
++		printf("MONDRIANDUMP: empty or bad ring\n");
++		return;
++	}
++	have = total < ring ? (uint32_t)total : ring;
++	if (have > sizeof(text) - 1) {
++		have = sizeof(text) - 1;
++	}
++	pos = (total % ring + ring - have) % ring;
++	while (got < have) {
++		uint32_t off = (uint32_t)(pos % UFS_BLOCK), take = UFS_BLOCK - off;
++
++		if (take > have - got) {
++			take = have - got;
++		}
++		if (ufs_read_blocks(base + 1 + pos / UFS_BLOCK, 1)) {
++			printf("MONDRIANDUMP: read failed at ring offset %llu\n", pos);
++			break;
++		}
++		memcpy(text + got, (char *)(su.dma + DMA_BOUNCE) + off, take);
++		got += take;
++		pos = (pos + take) % ring;
++	}
++	text[got] = 0;
++	if (lines == 0 || lines > 64) {
++		lines = 40;
++	}
++	/* The newest lines are the interesting ones: keep the last N. */
++	for (char *c = text, *start = text; ; c++) {
++		if (*c != '\n' && *c != 0) {
++			continue;
++		}
++		char stop = *c;
++
++		*c = 0;
++		if (c > start) {
++			line[first] = start;
++			first = (first + 1) % lines;
++			if (n < lines) {
++				n++;
++			}
++		}
++		if (stop == 0) {
++			break;
++		}
++		start = c + 1;
++	}
++	printf("MONDRIANDUMP: last %u lines of the previous boot\n", n);
++	uint32_t from = n < lines ? 0 : first;
++	for (i = 0; i < n; i++) {
++		printf("| %s\n", line[(from + i) % lines]);
++	}
++	printf("MONDRIANDUMP: end\n");
++	for (;;) {
++		delay(1000);
++	}
++}
 +
 +static void
 +mondrian_log_start(void)
