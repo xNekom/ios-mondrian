@@ -78,7 +78,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
  	mondrian_sample_start();
  	return 0;
  }
-@@ -1095,5 +1108,217 @@
+@@ -1095,5 +1108,265 @@
  	*dev = su.bdev;
  	mondrian_sample_start();        /* retry if the early start failed */
  	return 0;
@@ -123,7 +123,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +	for (int i = 0; i < size; i++) {
 +		mondrian_log_ring[(at + (uint64_t)i) % MONDRIAN_LOG_SIZE] = c[i];
 +	}
- }
++}
 +
 +struct mondrian_log_header {
 +	char magic[8];
@@ -187,6 +187,52 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		}
 +		flushed = total;
 +	}
+ }
++
++/* Does the line contain `want`? strstr(a,b) drawn at home. */
++static bool
++mondrian_log_contains(const char *line, const char *want)
++{
++	size_t n = strlen(want);
++
++	if (n == 0) {
++		return true;
++	}
++	for (; *line != 0; line++) {
++		if (strncmp(line, want, n) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Boot-arg mondriandumpmatch: up to four comma separated substrings; a line is
++ * kept when it contains any of them (empty keeps everything). The boot log
++ * runs at hundreds of lines per second, so "the last 40 lines" is a tenth of a
++ * second: the filter is what makes the dump answer a question.
++ */
++static bool
++mondrian_log_keep(const char *line, char *filter)
++{
++	if (filter[0] == 0) {
++		return true;
++	}
++	for (char *f = filter; *f != 0; ) {
++		char *end = strchr(f, ',');
++		size_t len = end ? (size_t)(end - f) : strlen(f);
++		char save = f[len];
++		bool hit;
++
++		f[len] = 0;
++		hit = mondrian_log_contains(line, f);
++		f[len] = save;
++		if (hit) {
++			return true;
++		}
++		f = end ? end + 1 : f + len;
++	}
++	return false;
 +}
 +
 +/*
@@ -201,6 +247,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +{
 +	static char text[64 * 1024 + 1];
 +	static char *line[64];
++	char filter[128] = "";
 +	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
 +	uint64_t total, pos;
 +	char *h = (char *)(su.dma + DMA_BOUNCE);
@@ -214,6 +261,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		printf("MONDRIANDUMP: no MONDLOG header (the log never flushed)\n");
 +		return;
 +	}
++	(void)PE_parse_boot_argn("mondriandumpmatch", filter, sizeof(filter));
 +	ring = *(uint32_t *)(h + 12);
 +	total = *(uint64_t *)(h + 16);
 +	printf("MONDRIANDUMP: ring %u bytes, total %llu, seq %llu\n", ring, total,
@@ -253,7 +301,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		char stop = *c;
 +
 +		*c = 0;
-+		if (c > start) {
++		if (c > start && mondrian_log_keep(start, filter)) {
 +			line[first] = start;
 +			first = (first + 1) % lines;
 +			if (n < lines) {
@@ -265,7 +313,7 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 +		}
 +		start = c + 1;
 +	}
-+	printf("MONDRIANDUMP: last %u lines of the previous boot\n", n);
++	printf("MONDRIANDUMP: last %u lines matching \"%s\"\n", n, filter);
 +	uint32_t from = n < lines ? 0 : first;
 +	for (i = 0; i < n; i++) {
 +		printf("| %s\n", line[(from + i) % lines]);
