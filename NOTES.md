@@ -29,9 +29,9 @@ Verified on the phone:
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **Boot menu** in the shim: two cards with logos, 5 s countdown, and working
-  SPMI keys (power confirms, volume moves the selection). `boot_b` carries the
-  current shim and payload; `fastboot boot` is only for tests.
+- **No dual boot.** The shim has no menu: it only ever loads the payload it
+  carries, so there is nothing to choose and five seconds less to wait.
+  `boot_b` carries the current shim and payload; `fastboot boot` is for tests.
 - **iOS userland runs.** With the real root in `userdata`, `FSIOC_KERNEL_ROOTAUTH`
   fails with `error 25` (ENOTTY: HFS has no such ioctl) and `0089` continues;
   `/sbin/launchd` starts as pid 1, libignition registers the dyld shared
@@ -81,9 +81,12 @@ volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
 
 **Reading a boot.** The console does not scroll, so a photo only shows the
-last screenful: print the thing that matters last. The persisted ring
-(sweet 0047) is not ported yet, so there is no way to read the log from a
-terminal once userland starts.
+last screenful: print the thing that matters last. It also cannot keep up
+with a chatty boot: once the screen is full every new line clears the whole
+text area (18 MB), and `console_write()`'s ring buffer then hands the lines
+to it in bursts, so a per-call trace looks frozen and then jumps. Count
+what repeats (`0093`). The persisted ring (sweet 0047) is not ported yet, so
+there is no way to read the log from a terminal once userland starts.
 
 **Host-side testing.** `tools/qemu-ios.py` boots the same payload and decodes
 the framebuffer text; see `docs/QEMU_TESTING.md`. Note that `--kernel` only

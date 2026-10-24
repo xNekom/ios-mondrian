@@ -13,6 +13,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "menu.h"
+#include "spmi.h"
 #include "ufs.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -707,31 +708,16 @@ void shim_main(uint64_t dtb)
 #endif
 
 	/*
-	 * The boot menu: it paints its own screen (title, the two cards
-	 * with the logos, the countdown) and counts five seconds down to
-	 * the default (iOS). The menu takes no keys yet: the SPMI probe
-	 * below the menu prints the PON and the gpio status bytes so a
-	 * photo with a key pressed tells the bit that moves; the wired
-	 * keys are the next shim build. Everything behind the menu is
-	 * unchanged: the loader boots the kernel the build appended, so a
-	 * menu bug costs a wrong screen at most.
+	 * There is no dual boot: boot_a keeps the stock Android image but the
+	 * shim only ever loads the payload it carries, so the menu was five
+	 * seconds of countdown and one more thing that could go wrong before
+	 * the kernel's console appeared. The keyboard is still probed, because
+	 * the SPMI status bytes are worth seeing in a photo of a failed boot.
 	 */
 	stage = "menu";
-	int choice = menu_show(dtb);
-	/* The console cursor sat where the bring-up stopped; the menu painted
-	 * over it. Clear to the menu's own background so the loader's verdict
-	 * and the kernel console start on a clean page instead of crossing
-	 * the cards. */
+	spmi_init(dtb);
 	con_clear(0xff10101aU);
 	con_skip();
-
-	/*
-	 * The keyboard is inside the menu now (spmi_init there): the
-	 * selection is not used to switch anything yet -- Android arms
-	 * the misc BCB in v2 -- so the boot behind it stays iOS while
-	 * the pick is recorded on the console for the photographs.
-	 */
-	con_hex("MENU choice", choice);
 
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
