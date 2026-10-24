@@ -702,6 +702,17 @@ void shim_main(uint64_t dtb)
 	stage = "ufs";
 	test_ufs();
 	con_skip();
+#ifdef LOGVIEW
+	/*
+	 * The log viewer: the previous boot's console log is on the screen and
+	 * the phone stops here, so it can be read and photographed. Nothing is
+	 * written: this image is only ever started with `fastboot boot`, and
+	 * power+volume-down goes back to fastboot.
+	 */
+	for (;;) {
+		__asm__ volatile("wfi");
+	}
+#endif
 #elif defined(SHIM_NO_UFS)
 	con_str("UFS", "probe skipped (SHIM_NO_UFS)");
 	con_skip();

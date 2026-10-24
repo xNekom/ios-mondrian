@@ -1,0 +1,203 @@
+xnu 0096: keep the console log on the phone
+
+The console only exists as pixels on the panel, and a boot writes several
+screens of log: whatever the interesting line is -- a crash, the process
+sampler, a driver's first error -- it is off the screen long before anybody
+can photograph it. This is the same answer sweet has (its 0047), ported:
+every character that reaches the console is also kept in a 4 MiB ring in RAM,
+and a kernel thread rewrites the dirty blocks to the last 4 MiB + 4 KiB of
+userdata once every 5 s, flush included.
+
+The tee is in _cnputs(), so it catches kernel printf and the daemons' writes
+to /dev/console alike (and it is before the mute check, so a quiet screen
+still logs). Block 0 of the area is a header: "MONDLOG", u32 version, u32 ring
+size, u64 total bytes written, u64 flush sequence; byte n of the stream is at
+ring offset n % ring size. The area is behind the HFS image, which starts at
+the partition's first block.
+
+Read it back with the log viewer shim (shim/build.sh with LOGVIEW=1, started
+with fastboot boot: it reads the area, prints the last screenful and stops) or
+from a recovery with adb and tools/ios-log-pull.sh. Boot-arg mondrianlog=0
+turns it off.
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -270,6 +270,16 @@
+ _cnputs(char *c, int size, bool poll)
+ {
+ 	extern int disableConsoleOutput;
++
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * Before the mute check, and so before the panel: the persistent log in
++	 * bsd/dev/mondrian_ufs.c is what a boot is read from, the screen is
++	 * only the immediate view. It never blocks.
++	 */
++	extern void mondrian_log_append(const char *c, int size);
++	mondrian_log_append(c, size);
++#endif
+ 
+ 	if (disableConsoleOutput) {
+ 		return;
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -27,7 +27,9 @@
+ #include <sys/disk.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
++#include <sys/systm.h>
+ #include <sys/uio.h>
++#include <machine/atomic.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -46,6 +48,8 @@
+  * GIC actually look like on this phone. */
+ extern void pe_mondrian_gic_dump(void);
+ extern void mondrian_irq_dump(void);
++extern int hz;
++static void mondrian_log_start(void);
+ 
+ #define REG_CAP          0x00
+ #define REG_VER          0x08
+@@ -1076,6 +1080,7 @@
+ 	su.ready = true;
+ 	printf("MONDRIAN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read/write\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	mondrian_log_start();
+ 	mondrian_sample_start();
+ 	return 0;
+ }
+@@ -1095,5 +1100,130 @@
+ 	*dev = su.bdev;
+ 	mondrian_sample_start();        /* retry if the early start failed */
+ 	return 0;
++}
++
++/*
++ * Persistent console log ("mondrianlog"). A photo of the panel is the only
++ * other way to read a boot, and it shows one screenful of a log that is chatty
++ * enough to push the lines that matter off it. So every character that reaches
++ * the console -- kernel printf and the daemons' /dev/console writes, both
++ * through _cnputs -- is also kept in a 4 MiB ring in RAM, and once the
++ * partition is known a thread copies the new blocks to the LAST 4 MiB + 4 KiB
++ * of userdata, far behind the HFS image at its start. Device block 0 of that
++ * area is a header:
++ *
++ *   "MONDLOG" | u32 version 1 | u32 ring size | u64 total bytes written
++ *   | u64 flush sequence
++ *
++ * and byte n of the console stream is at ring offset n % ring size. Read it
++ * back by booting the log viewer shim (`shim/build.sh` with LOGVIEW=1, started
++ * with `fastboot boot`), or from a recovery with adb using
++ * tools/ios-log-pull.sh. Boot-arg mondrianlog=0 turns it off.
++ */
++#define MONDRIAN_LOG_SIZE       (4u << 20)
++#define MONDRIAN_LOG_BLOCKS     (1 + MONDRIAN_LOG_SIZE / UFS_BLOCK)
++#define MONDRIAN_LOG_TICKS      5
++
++static char mondrian_log_ring[MONDRIAN_LOG_SIZE];
++static uint64_t _Atomic mondrian_log_total;
++static int mondrian_log_chan;
++
++/* Called for every console character, in any context: never blocks. */
++void
++mondrian_log_append(const char *c, int size)
++{
++	uint64_t at;
++
++	if (size <= 0) {
++		return;
++	}
++	at = os_atomic_add_orig(&mondrian_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		mondrian_log_ring[(at + (uint64_t)i) % MONDRIAN_LOG_SIZE] = c[i];
++	}
++}
++
++struct mondrian_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	uint64_t flushed = 0, seq = 0;
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++
++	printf("MONDRIAN LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
++	    MONDRIAN_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	for (;;) {
++		uint64_t total, pos;
++		int error = 0;
++
++		(void)tsleep(&mondrian_log_chan, PZERO, "mondrianlog", MONDRIAN_LOG_TICKS * hz);
++		total = os_atomic_load(&mondrian_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		/*
++		 * Write whole device blocks, from the first block that holds
++		 * unflushed data: a partial block would lose the bytes that
++		 * follow it, and the ring is not block aligned.
++		 */
++		pos = (total - flushed >= MONDRIAN_LOG_SIZE) ? total - MONDRIAN_LOG_SIZE : flushed;
++		lck_mtx_lock(&mondrian_ufs_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % MONDRIAN_LOG_SIZE);
++			uint32_t blk = off / UFS_BLOCK;
++			uint64_t need = ((uint64_t)(off % UFS_BLOCK) + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(MONDRIAN_LOG_SIZE / UFS_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++
++			memcpy(bounce, mondrian_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++			error = ufs_write_blocks(base + 1 + blk, n);
++			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		}
++		if (!error) {
++			struct mondrian_log_header h = {
++				.magic = { 'M', 'O', 'N', 'D', 'L', 'O', 'G' },
++				.version = 1, .size = MONDRIAN_LOG_SIZE, .total = total, .seq = ++seq
++			};
++
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_blocks(base, 1);
++		}
++		if (!error) {
++			error = ufs_flush();
++		}
++		lck_mtx_unlock(&mondrian_ufs_lock);
++		if (error) {
++			printf("MONDRIAN LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
+ }
++
++static void
++mondrian_log_start(void)
++{
++	static int started;
++	uint32_t on = 1;
++	thread_t thread;
++
++	if (started || !su.ready) {
++		return;
++	}
++	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
++	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
++		return;
++	}
++	if (kernel_thread_start(mondrian_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		started = 1;
++		thread_deallocate(thread);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */

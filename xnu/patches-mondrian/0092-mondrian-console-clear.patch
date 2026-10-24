@@ -1,15 +1,28 @@
-xnu 0092: clear the console with 64-bit stores
+xnu 0092: wrap the console without clearing the screen
 
-The console does not scroll: when the cursor reaches the last row it
-clears the whole text area and starts again at the top. That is 18 MB of
-writes per line once the screen is full, and with a verbose userland boot
-it is the difference between a log that follows the boot and one that
-lags seconds behind it. Fill 8 bytes at a time instead of 4.
+When the cursor reached the last row the console cleared the whole text
+area before starting again at the top. The row it is about to write is
+cleared anyway, so the full clear was 18 MB of framebuffer writes for
+nothing: once the screen was full every line paid it, the console spent
+all its time clearing, console_write()'s ring buffer backed up and the log
+arrived in bursts instead of line by line.
+
+Wrap the row index instead (the text stays where it is, a ring) and mark
+the cursor cell, so a photo still says where the newest line is: it is the
+one above the mark, and the reading order continues at the top.
 
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -746,28 +746,38 @@
+@@ -722,6 +722,7 @@
+ #define FBCON_SCALE     2
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
++#define FBCON_CURSOR    0xff303060u
+ 
+ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+@@ -746,26 +747,49 @@
  	return fbcon_phys_end;
  }
  
@@ -37,26 +50,74 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 +			line[i] = bg;
  		}
  	}
-+}
-+
-+static void
-+fbcon_clear_row(uint32_t row)
-+{
-+	fbcon_fill_rows(row * 16 * FBCON_SCALE, (row + 1) * 16 * FBCON_SCALE);
  }
  
- /* Blank the whole text area; the next glyph goes to the top row. */
+-/* Blank the whole text area; the next glyph goes to the top row. */
  static void
- fbcon_clear_screen(void)
+-fbcon_clear_screen(void)
++fbcon_clear_row(uint32_t row)
  {
 -	uint32_t rows = fbcon_rows * 16 * FBCON_SCALE;
 -	for (uint32_t y = 0; y < rows; y++) {
 -		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
 -		for (uint32_t x = 0; x < fbcon_width; x++) {
 -			line[x] = FBCON_BG;
--		}
--	}
-+	fbcon_fill_rows(0, fbcon_rows * 16 * FBCON_SCALE);
++	fbcon_fill_rows(row * 16 * FBCON_SCALE, (row + 1) * 16 * FBCON_SCALE);
++}
++
++/* Blank the whole text area; the next glyph goes to the top row. */
++/*
++ * The cursor is a block in the cell the next character goes to. The console
++ * wraps without moving the text (a ring), so the newest line is the one above
++ * the marker and the reading order runs down from it, then continues at the
++ * top; without the marker there is no way to tell where "now" is on a photo.
++ */
++static void
++fbcon_mark_cursor(void)
++{
++	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
++
++	for (uint32_t y = y0; y < y0 + 16 * FBCON_SCALE; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4) + x0;
++		for (uint32_t x = 0; x < 8 * FBCON_SCALE; x++) {
++			line[x] = FBCON_CURSOR;
+ 		}
+ 	}
+ }
+@@ -774,13 +798,24 @@
+ fbcon_newline(void)
+ {
+ 	fbcon_col = 0;
+-	if (fbcon_row + 1 >= fbcon_rows) {
+-		fbcon_clear_screen();
++	/*
++	 * Wrap by reusing the top row instead of clearing the whole text area.
++	 * The row about to be written is cleared below anyway, so a full clear
++	 * was 18 MB of framebuffer writes per line once the screen was full:
++	 * the console spent all its time clearing, console_write()'s ring
++	 * buffer backed up, and the log arrived in bursts.
++	 */
++	if (++fbcon_row >= fbcon_rows) {
+ 		fbcon_row = 0;
+-	} else {
+-		fbcon_row++;
+ 	}
+ 	fbcon_clear_row(fbcon_row);
++	fbcon_mark_cursor();
++	/*
++	 * The framebuffer alias is write-combining: push the row out before
++	 * the next line starts, so the panel shows whole lines instead of
++	 * whatever the store buffer happened to have drained.
++	 */
++	__builtin_arm_dsb(0xf);
  }
  
- static void
+ /*
+@@ -865,6 +900,7 @@
+ 		}
+ 	}
+ 	fbcon_col++;
++	fbcon_mark_cursor();
+ }
+ 
+ static unsigned int

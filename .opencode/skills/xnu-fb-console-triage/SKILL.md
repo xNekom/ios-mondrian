@@ -33,13 +33,21 @@ Ambiguous digits in a hex value mean the value is *unconfirmed*. Ask for a
 second photo of the same boot only when the ambiguous value is the decision
 point; otherwise say which value is uncertain in your report.
 
-## 2. Blanking: the top of the screen is not the start
+## 2. The screen is a ring, not a page
 
-The console blanks once per screenful. If the top line is not the start of a
-known boot banner (`MONDRIAN ...`, `pmap ...`), then the screen is the
-**tail** of a longer log and everything before it is already gone. Say so: it
-means the kernel got at least one full screen further than the visible text
-suggests.
+The console wraps by reusing the top row (`0092`), so the text below the
+cursor marker is the older part of one screenful and the text above it is the
+newest. Find the cursor block (a dark blue cell): the line above it is the
+last line written, and the reading order runs down from it and continues at
+the top. The screen therefore always holds the *last* screenful, in two
+pieces.
+
+Before `0092` the console cleared the whole area on every wrap, which is also
+why a boot that ends in a full screen can hide several seconds of log: the
+screen you see is the newest, and the top row is the oldest. If the top line
+is not the start of a known boot banner (`MONDRIAN ...`, `pmap ...`), the log
+is longer than the screen and everything before the oldest visible line is
+gone.
 
 ## 3. Classify the last line
 

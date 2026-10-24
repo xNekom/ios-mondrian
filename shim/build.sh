@@ -53,6 +53,9 @@ fi
 # places the kernel, the device tree and the boot arguments, and jumps.
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra -D$BOARD_DEF ${EXTRA_CFLAGS:-}"
 [ -n "${SMALL_SHIM:-}" ] && CFLAGS="$CFLAGS -DSMALL_SHIM -DSHIM_NO_UFS"
+# LOGVIEW=1 builds the log viewer: it reads the persistent console log out of
+# the end of userdata, prints the last screenful and stops (see shim/ufs.c).
+[ -n "${LOGVIEW:-}" ] && CFLAGS="$CFLAGS -DLOGVIEW"
 mkdir -p out
 for f in start.S shim.c console.c menu.c mmu.c fdt.c loader.c ufs.c libc.c lz4.c spmi.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o

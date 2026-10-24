@@ -80,13 +80,13 @@ Xcode's `iig` fails with `no member named 'kernelContent' in 'IORPC'`, so
 volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
 
-**Reading a boot.** The console does not scroll, so a photo only shows the
-last screenful: print the thing that matters last. It also cannot keep up
-with a chatty boot: once the screen is full every new line clears the whole
-text area (18 MB), and `console_write()`'s ring buffer then hands the lines
-to it in bursts, so a per-call trace looks frozen and then jumps. Count
-what repeats (`0093`). The persisted ring (sweet 0047) is not ported yet, so
-there is no way to read the log from a terminal once userland starts.
+**Reading a boot.** A boot writes several screens and nothing scrolls, so the
+line that matters is off the panel before it can be photographed: the read
+path is storage, not pixels. `0096` keeps every console character (kernel
+`printf` and the daemons' `/dev/console`) in a 4 MiB ring and rewrites the
+dirty blocks to the last 4 MiB of `userdata` every 5 s; read the previous
+boot with `tools/phone-deploy.sh logview` + `fastboot boot`, or from a
+recovery with `tools/ios-log-pull.sh`. Count what repeats (`0093`).
 
 **Host-side testing.** `tools/qemu-ios.py` boots the same payload and decodes
 the framebuffer text; see `docs/QEMU_TESTING.md`. Note that `--kernel` only
@@ -216,9 +216,9 @@ image instead (`tools/mk-simg.py`, or `tools/flash-root.sh`, which converts
 anything over 768 MiB by itself): fastboot then sends it in `-S` chunks and
 the root's zero tail costs nothing. 11 GiB of root take about five minutes.
 
-**The console cannot scroll and blanks once per screenful.** `fbcon_newline()`
-clears the screen and restarts at row 0, so the last non-blank line is the
-newest output. Put the answer on the last line; earlier text is gone.
+**The console is a ring with a cursor block.** `fbcon_newline()` wraps to row 0
+and clears only that row, so no whole-screen blank per line; the newest line is
+the one above the cursor marker, then reading continues downward.
 
 **CI skips a patch that does not apply and still reports success.** Check the
 series locally (`tools/apply-series.py`, `tools/check-patches.sh`) before

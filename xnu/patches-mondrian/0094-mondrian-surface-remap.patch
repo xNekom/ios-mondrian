@@ -1,0 +1,87 @@
+xnu 0094: a second lookup of a surface this client already has
+
+IOSurface.framework looks a surface up again whenever it hands the same
+one to another process (backboardd does it for every snapshot). The user
+client counted that as a new reference: the framework then built a second
+IOSurfaceClient for the same id, and releasing it (traps 4 + 5) unmapped
+the memory under the first -- backboardd died in
+CGDataProviderCreateWithData while taking a snapshot.
+
+Answer the duplicate with base address -1 ("already yours, use the cached
+client"), as the real kernel does, and do not count it. Same fix as sweet
+0068, ported with the mondrian names.
+
+diff --git a/iokit/Kernel/arm/MondrianSurface.cpp b/iokit/Kernel/arm/MondrianSurface.cpp
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -407,7 +407,7 @@
+ 	OSArray *fRefs;
+ 
+ 	MondrianSurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(MondrianSurface *s, MondrianSurfaceRef **refOut);
++	IOReturn addRef(MondrianSurface *s, MondrianSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(MondrianSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+ 
+@@ -495,17 +495,25 @@
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it made the
++ * framework build a second client for the same id, and releasing that one
++ * (traps 4 + 5) unmapped the memory under the first: backboardd's snapshot
++ * crash in CGDataProviderCreateWithData (sweet 0068).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(MondrianSurface *s, MondrianSurfaceRef **refOut)
++IOSurfaceRootUserClient::addRef(MondrianSurface *s, MondrianSurfaceRef **refOut, bool *existing)
+ {
++	*existing = false;
+ 	IOLockLock(fLock);
+ 	MondrianSurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
+-		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		mondrian_surface_put(s);
+ 		*refOut = ref;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -528,11 +536,11 @@
+ 	IOLockLock(fLock);
+ 	MondrianSurfaceRef *raced = findRef(s->id, NULL);
+ 	if (raced != NULL && raced->surface == s) {
+-		/* Another thread mapped it meanwhile: count there, drop ours. */
+-		raced->count++;
++		/* Another thread mapped it meanwhile: use that one, drop ours. */
+ 		IOLockUnlock(fLock);
+ 		ref->release();
+ 		*refOut = raced;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	fRefs->setObject(ref);
+@@ -615,7 +623,8 @@
+ IOSurfaceRootUserClient::returnSurface(MondrianSurface *s, IOExternalMethodArguments *args)
+ {
+ 	MondrianSurfaceRef *ref = NULL;
+-	IOReturn ret = addRef(s, &ref);
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+@@ -624,6 +633,9 @@
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		mondrian_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
+ 		ret = mondrian_struct_out(args, out, MONDRIAN_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, MONDRIAN_SURFACE_RESULT_SIZE);
+ 	}

@@ -1,0 +1,371 @@
+xnu 0095: sample the userland when it stops making progress
+
+The boot reaches the daemons and then the console goes quiet: launchd is
+waiting for something and no daemon says what. The phone has no debugger and
+the daemons log nowhere readable, so a kernel thread prints, every 5 s, one
+line that fits anywhere:
+
+  SMP 134 procs | SpringBoard(71) pc=0x1aafbd12c | backboardd(69) pc=0x...
+
+A pid of -1 means the process does not exist; the pc is its first thread's
+user pc, which says whether it waits in mach_msg2_trap (an XPC), in a
+semaphore, or somewhere else. Every minute it also prints the process list
+and, for each wanted process, every thread's pc/lr/sp plus a frame-pointer
+backtrace, with pauses so the block can be read on the phone. The names come
+from boot-arg mondriansample (up to three, default
+"SpringBoard,backboardd,launchd"; "-" turns it off). Same tool as sweet
+0054, ported with the mondrian names.
+
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -990,6 +990,81 @@
+ 	printf("STR done: %llu KiB scanned, %d strings\n", scanned >> 10, lines);
+ 	kfree_data(buf, 65536);
+ }
++/*
++ * MONDRIAN process sampler (bsd/dev/mondrian_sample.c): user pc/lr/sp and a
++ * frame-pointer backtrace of every thread of a task, from the saved user
++ * state. A daemon blocked in an XPC or a syscall shows the stub in pc and its
++ * caller in lr/bt, which is the only way to see where a daemon without a
++ * debugger is stuck.
++ */
++void mondrian_sample_task(const char *name, int pid, task_t task);
++
++/* First thread's user pc: the one value worth a line in a chatty log. */
++uint64_t
++mondrian_sample_task_pc(task_t task)
++{
++	thread_t thread;
++	uint64_t pc = 0;
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *ss = find_user_regs(thread);
++
++		if (ss != NULL && is_saved_state64(ss)) {
++			pc = get_saved_state_pc(ss);
++			break;
++		}
++	}
++	task_unlock(task);
++	return pc;
++}
++
++void
++mondrian_sample_task(const char *name, int pid, task_t task)
++{
++	vm_map_t map = get_task_map(task);
++	uint64_t slide = 0;
++	int tn = 0;
++	thread_t thread;
++	vm_shared_region_t sr = vm_shared_region_get(task);
++
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide,
++	    task->mach_header_vm_address);
++
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		arm_saved_state_t *ss = find_user_regs(thread);
++		char line[400];
++		int n;
++		uint64_t fp;
++
++		if (ss == NULL || !is_saved_state64(ss)) {
++			continue;
++		}
++		fp = get_saved_state_fp(ss);
++		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt",
++		    name, tn++, get_saved_state_pc(ss), get_saved_state_lr(ss),
++		    get_saved_state_sp(ss));
++		for (int i = 0; i < 12 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++			uint64_t frame[2];
++			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++				break;
++			}
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			if (frame[0] <= fp) {
++				break;
++			}
++			fp = frame[0];
++		}
++		printf("%s\n", line);
++	}
++	task_unlock(task);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
+ 
+ kern_return_t
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/mondrian_ufs.c			standard
++bsd/dev/mondrian_sample.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -356,6 +356,8 @@
+ }
+ 
+ static uint32_t ufs_writes;
++
++extern void mondrian_sample_start(void);
+ 
+ /* WRITE(10) of count device blocks at lba from the bounce buffer. */
+ static int
+@@ -698,6 +700,13 @@
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++
++	/*
++	 * The first real I/O is the earliest moment the sampler can be started
++	 * with a live console: mondrian_ufs_init() runs before it, and its
++	 * output (and its kernel_thread_start verdict) was lost.
++	 */
++	mondrian_sample_start();
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+@@ -1067,6 +1076,7 @@
+ 	su.ready = true;
+ 	printf("MONDRIAN UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, read/write\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20);
++	mondrian_sample_start();
+ 	return 0;
+ }
+ 
+@@ -1083,6 +1093,7 @@
+ 		}
+ 	}
+ 	*dev = su.bdev;
++	mondrian_sample_start();        /* retry if the early start failed */
+ 	return 0;
+ }
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/mondrian_sample.c
+@@ -0,0 +1,210 @@
++/*
++ * MONDRIAN process sampler: where is a daemon stuck?
++ *
++ * The phone has no debugger, and daemons log nowhere readable. Every 5 s a
++ * kernel thread prints one line that fits anywhere, with the process count
++ * and the pid plus user pc of each name in boot-arg mondriansample
++ * (comma separated, up to three, default "SpringBoard,backboardd,launchd";
++ * "-" turns it off):
++ *
++ *   SMP 134 procs | SpringBoard(71) pc=0x1aafbd12c | backboardd(69) ...
++ *
++ * A pid of -1 means the process does not exist. Every minute it also prints
++ * the whole process list and, for each wanted process, every thread's user
++ * pc/lr/sp and a frame-pointer backtrace ("SMP name[pid] tN pc ... bt ..."),
++ * with pauses so the block can be read on the phone's screen.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++extern task_t proc_task(proc_t);
++extern int hz;
++extern void mondrian_sample_task(const char *name, int pid, task_t task);
++extern uint64_t mondrian_sample_task_pc(task_t task);
++
++#define MONDRIAN_SAMPLE_MAX     3
++
++static char     mondrian_names[MONDRIAN_SAMPLE_MAX][32];
++static int      mondrian_names_count;
++static int      mondrian_want_pid[MONDRIAN_SAMPLE_MAX];
++static uint64_t mondrian_want_pc[MONDRIAN_SAMPLE_MAX];
++
++static char     mondrian_proc_list[1024];
++static int      mondrian_proc_len;
++static int      mondrian_proc_count;
++
++static void
++mondrian_pause(int ticks)
++{
++	static int chan;
++
++	if (ticks > 0) {
++		(void)tsleep(&chan, PZERO, "mondriansmp", ticks);
++	}
++}
++
++/* Split the boot-arg list once. */
++static void
++mondrian_parse_names(void)
++{
++	char arg[128];
++	const char *t;
++	int n = 0;
++
++	if (!PE_parse_boot_argn("mondriansample", arg, sizeof(arg))) {
++		strlcpy(arg, "SpringBoard,backboardd,launchd", sizeof(arg));
++	}
++	for (t = arg; *t != 0 && n < MONDRIAN_SAMPLE_MAX;) {
++		const char *end = strchr(t, ',');
++		size_t len = end ? (size_t)(end - t) : strlen(t);
++
++		if (len > 0 && len < sizeof(mondrian_names[0])) {
++			memcpy(mondrian_names[n], t, len);
++			mondrian_names[n][len] = 0;
++			n++;
++		}
++		t = end ? end + 1 : t + len;
++	}
++	mondrian_names_count = n;
++}
++
++static int
++mondrian_name_index(const char *name)
++{
++	for (int i = 0; i < mondrian_names_count; i++) {
++		if (strcmp(mondrian_names[i], name) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static int
++mondrian_sample_list(proc_t p, __unused void *arg)
++{
++	char name[32];
++	int i;
++
++	mondrian_proc_count++;
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (mondrian_proc_len < (int)sizeof(mondrian_proc_list) - 40) {
++		mondrian_proc_len += snprintf(mondrian_proc_list + mondrian_proc_len,
++		    sizeof(mondrian_proc_list) - mondrian_proc_len, "%s(%d) ",
++		    proc_best_name(p), proc_pid(p));
++	}
++	i = mondrian_name_index(name);
++	if (i >= 0) {
++		mondrian_want_pid[i] = proc_pid(p);
++		mondrian_want_pc[i] = mondrian_sample_task_pc(proc_task(p));
++	}
++	return PROC_RETURNED;
++}
++
++/* The list, eight names per line, with time to read each line. */
++static void
++mondrian_print_list(int tick)
++{
++	char *p = mondrian_proc_list;
++	int n = 0;
++
++	while (*p != 0) {
++		char *end = p;
++		int names = 0;
++
++		while (*end != 0 && names < 8) {
++			end = strchr(end, ' ');
++			if (end == NULL) {
++				end = p + strlen(p);
++				break;
++			}
++			end++;
++			names++;
++		}
++		char save = *end;
++		*end = 0;
++		printf("SMP procs %d: %s\n", n++, p);
++		*end = save;
++		p = end;
++		mondrian_pause(tick / 2);
++	}
++}
++
++static int
++mondrian_sample_proc(proc_t p, __unused void *arg)
++{
++	char name[32];
++	task_t task;
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (mondrian_name_index(name) >= 0) {
++		task = proc_task(p);
++		if (task != TASK_NULL) {
++			mondrian_sample_task(name, proc_pid(p), task);
++		}
++	}
++	return PROC_RETURNED;
++}
++
++static void
++mondrian_sample_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++
++	mondrian_parse_names();
++	if (mondrian_names_count == 0 || mondrian_names[0][0] == '-') {
++		return;
++	}
++	for (int i = 0; i < 720; i++) {
++		int tick = hz > 0 ? hz : 100;
++
++		mondrian_proc_len = 0;
++		mondrian_proc_count = 0;
++		mondrian_proc_list[0] = 0;
++		for (int k = 0; k < mondrian_names_count; k++) {
++			mondrian_want_pid[k] = -1;
++			mondrian_want_pc[k] = 0;
++		}
++		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_list, NULL, NULL, NULL);
++
++		printf("SMP %d procs", mondrian_proc_count);
++		for (int k = 0; k < mondrian_names_count; k++) {
++			printf(" | %s(%d) pc=0x%llx", mondrian_names[k],
++			    mondrian_want_pid[k], mondrian_want_pc[k]);
++		}
++		printf("\n");
++
++		if ((i % 12) == 0) {
++			printf("SMP --- %d procs\n", mondrian_proc_count);
++			mondrian_print_list(tick);
++			mondrian_pause(3 * tick);
++			proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
++			mondrian_pause(3 * tick);
++		}
++		(void)tsleep(&chan, PZERO, "mondriansmp", 5 * tick);
++	}
++}
++
++void
++mondrian_sample_start(void)
++{
++	static int started;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (started) {
++		return;
++	}
++	kr = kernel_thread_start(mondrian_sample_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		started = 1;
++		thread_deallocate(thread);
++		printf("SMP: sampler thread started\n");
++	} else {
++		printf("SMP: kernel_thread_start failed 0x%x\n", kr);
++	}
++}

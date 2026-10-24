@@ -57,6 +57,15 @@ build)
 	cp shim/out/shim-boot.img "$IMAGE"
 	ls -l "$IMAGE" "$PAYLOAD"
 	;;
+logview)
+	# The log viewer: reads the persistent console log (xnu 0096) out of the
+	# end of userdata, prints the last screenful and stops there. Nothing is
+	# written to the phone; start it with `fastboot boot $IMAGE`.
+	[ -f "$PAYLOAD" ] || { echo "no hay payload: ejecuta build primero" >&2; exit 1; }
+	(cd shim && BOARD=$BOARD CROSS=${CROSS:-aarch64-elf-} LOGVIEW=1 ./build.sh "$PAYLOAD")
+	cp shim/out/shim-boot.img "$IMAGE"
+	ls -l "$IMAGE"
+	;;
 push)
 	need adb
 	adb wait-for-device

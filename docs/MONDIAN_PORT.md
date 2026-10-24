@@ -150,18 +150,20 @@ its boot tasks. Two things stop it: the root is read-only (the block device
 has no write path) and launchd expects a Data volume and
 `/private/preboot/<uuid>`, which a flattened HFS root does not have.
 
-The persistent console log (sweet `0047`: a 4 MiB ring at the end of
-`userdata`) is not ported because it needs the write path. Port it right after
-writes land: from the moment userland starts, a panic there is only visible
-through it — the console cannot scroll and the USB stack is not up.
+The persistent console log is ported (`0096`): every console character,
+kernel or daemon, goes to a 4 MiB ring that is rewritten into the last 4 MiB of
+`userdata` every 5 s. It is the only record of a userland that hangs — the
+console cannot scroll and the USB stack is not up — so read it with the viewer
+shim (`tools/phone-deploy.sh logview`, then `fastboot boot`) before assuming
+what a boot did or did not print.
 
 ### 2. The UFS root device
 
 The driver is read-only (`mondrian_ufs_write()` returns `EROFS`) and its
 commands do not touch the medium, so nothing here can damage the table. The
 bring-up sequence, the register state and the GPT-reader overflow debt are in
-`NOTES.md`. Writes are needed for the persistent log and for a writable root;
-`tools/backup-gpt.sh` records both copies of the GPT before that step.
+`NOTES.md`. Writes landed with `0090` (WRITE(10), read-modify-write and
+SYNCHRONIZE CACHE); `tools/backup-gpt.sh` records both copies of the GPT.
 
 ### 3. The display
 
@@ -195,8 +197,8 @@ sweet's static `IOPMPowerSource` stub for the first bring-up.
 Sweet's stack (0072–0077, 0081) is a DWC3 driver for SM7150. SM8475 has DWC3
 as well, with a different configuration space and a USB3 PHY that needs its
 own clock and power sequencing. The network path is what made sweet's bring-up
-possible without a screen, so it is worth porting early — but it is not needed
-while the console photo works.
+possible without a screen; here the log viewer shim already covers that need,
+so USB buys live logs, not logs.
 
 ## Getting the numbers off the device
 

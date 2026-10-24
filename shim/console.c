@@ -10,7 +10,15 @@
 #include "console.h"
 #include "font.h"
 
+/*
+ * The log viewer prints kernel lines, which run to ~90 characters: at scale 2
+ * the screen holds 87 columns and 98 rows instead of 58 and 65.
+ */
+#ifdef LOGVIEW
+#define SCALE		2
+#else
 #define SCALE		3
+#endif
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24

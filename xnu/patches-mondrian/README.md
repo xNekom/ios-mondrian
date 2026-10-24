@@ -20,7 +20,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0003`–`0055` | the generic half of the sweet series: RAM disk root, mockfs, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
 | `0056`–`0062` | the page-size work (commpage, zone map VA, bootstrap VA zone, no physical timer write, framebuffer alias reservation) and the first UFS 3.1 root device (`0059`); `0058` went away with the 4 KiB software page size |
 | `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
-| `0070`–`0082`, `0086`, `0090`–`0092` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`) and the console's 64-bit clear (`0092`) |
+| `0070`–`0082`, `0086`, `0090`–`0096` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`), the console's 64-bit clear (`0092`) and the key-store calls the userland makes, bounded (`0093`), the duplicate-surface lookup backboardd needs (`0094`), the userland sampler (`0095`) and the console log kept on the phone (`0096`) |
 | `0083`–`0084` | panel memory kept off the free list, colour-bar self-test |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 
@@ -54,12 +54,11 @@ The patches that talk to the sweet phone's hardware. They are listed in
 `HARDWARE_PATCHES` of `tools/port-series.py`; `docs/MONDIAN_PORT.md` has the
 work items:
 
-* writes for the UFS root device (reads work; the persistent console log needs
-  the same write path),
 * the display presentation driver (`0085`),
 * the touch (a Goodix on QUPv3 SPI),
 * the kernel-side keys and the dual-boot slot switch,
-* the USB stack (the SM8475 DWC3).
+* the USB stack (the SM8475 DWC3), which is what would make the log readable
+  without booting the viewer shim.
 
 `tools/port-series.py` does the mechanical part of a port: it takes a patch from
 the sweet series, renames the board identifiers, drops the context lines that

@@ -64,10 +64,9 @@ ABL (stock Xiaomi bootloader, unlocked)
 
 There is no serial port (the debug UART is wired as SPI on these boards). The
 kernel draws its console into the framebuffer the bootloader leaves — 1440x3200
-at `0xb8000000` on mondrian, 1080x2400 at `0x9c000000` on sweet — and the
-console does not scroll, so a photo shows the last screenful. On sweet the
-kernel also keeps a 4 MiB log ring at the end of `userdata`, readable from a
-recovery with `tools/ios-log-pull.sh`; that ring is not ported to mondrian yet.
+at `0xb8000000` on mondrian, 1080x2400 at `0x9c000000` on sweet — and keeps the
+whole log in a 4 MiB ring at the end of `userdata` (`0096`), because a screen
+only ever shows the last page of a boot.
 
 ## Boards
 
@@ -193,19 +192,21 @@ fastboot flash boot_b shim/out/shim-boot.img
 
 A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
 (volatile proof of the same image, `fastboot getvar current-slot`, verified
-backup, write, read back). To read the kernel log on sweet:
+backup, write, read back). To read the kernel log, boot the viewer shim: it
+reads the ring out of `userdata`, prints the last screenful and stops, and
+writes nothing to the phone. A recovery with adb reads the same area with
+`tools/ios-log-pull.sh`.
 
 ```sh
-fastboot boot recovery/recovery.img     # OrangeFox, temporary
-tools/ios-log-pull.sh logs/boot.txt     # 4 MiB console ring from the end of userdata
-tools/ios-crash.py                      # symbolicate the CRASH lines against the shared cache
+tools/phone-deploy.sh logview          # shim with LOGVIEW=1
+fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
 ```
 
 ## Repository layout
 
 | Path | What |
 | --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2; `board.h` holds the per-board constants, `menu.c` the dual-boot menu |
+| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2; `board.h` holds the per-board constants, `console.c` the text console, `ufs.c` the read-only UFS probe and the log viewer |
 | `xnu/patches/` | the XNU patch series for sweet, plus staging scripts for libpthread, HFS and BearSSL |
 | `xnu/patches-mondrian/` | the XNU patch series for mondrian (see its README for the state of each patch) |
 | `.github/workflows/xnu.yml` | kernel CI build (`board` input) |

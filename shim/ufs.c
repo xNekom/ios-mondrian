@@ -193,6 +193,8 @@ static const char *fs_type(uint32_t lba)
 }
 
 /* One line per GPT entry of at least 64 MiB: name, first LBA, size in MiB (4K blocks). */
+static uint64_t ud_first, ud_last;
+
 static void list_partitions(uint32_t entry_lba, uint32_t nent)
 {
 	static uint8_t ents[128 * 128] __attribute__((aligned(4096)));
@@ -212,6 +214,10 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 			name[c] = (ch >= 32 && ch < 127) ? ch : (ch ? '?' : 0);
 		}
 		name[16] = 0;
+		if (!__builtin_strcmp(name, "userdata")) {
+			ud_first = first;
+			ud_last = last;
+		}
 		if (((last - first + 1) >> 8) < 64)	/* keep the screen to the big ones */
 			continue;
 		con_hex2(name, "lba=", (uint32_t)first, "MiB=", (uint32_t)((last - first + 1) >> 8));
@@ -219,6 +225,133 @@ static void list_partitions(uint32_t entry_lba, uint32_t nent)
 		    !__builtin_strcmp(name, "cache"))
 			con_str(" fs", fs_type((uint32_t)first));
 	}
+}
+
+/*
+ * The persistent console log (xnu 0096): block 0 of the area is a header
+ * ("MONDLOG", version, ring size, total bytes written, flush sequence) and a
+ * 4 MiB ring follows. The kernel rewrites its dirty blocks a few seconds
+ * behind, and the area sits at the end of userdata, past the HFS image, so
+ * nothing else touches it.
+ *
+ * The panel shows one screenful and the boot log is chatty enough to push the
+ * lines that matter off it, so this is how a boot is read back: boot this
+ * image with `fastboot boot`, photograph the screen, power+vol-down.
+ */
+#define LOG_RING	(4u << 20)
+#define LOG_WINDOW	(256u << 10)	/* how much of the tail is looked at */
+#define LOG_LINES	92
+#define LOG_COLS	86
+
+static uint32_t le32(const uint8_t *p)
+{
+	return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* bsd/kern/mondrian_amfi.c and bsd/net print these on every denied call. */
+static int
+log_prefix(const char *l, const char *p)
+{
+	while (*p && *l == *p) {
+		l++;
+		p++;
+	}
+	return *p == 0;
+}
+
+static int
+log_skip(const char *l)
+{
+	/* No table of literals: the shim is loaded with no relocation pass. */
+	return log_prefix(l, "MONDRIAN Sandbox:") || log_prefix(l, "MONDRIAN NET:") ||
+	       log_prefix(l, "MONDRIAN AKS:") || log_prefix(l, "MONDRAN");
+}
+
+void log_dump(void)
+{
+	static char text[LOG_WINDOW + 1];
+	static char *lines[LOG_LINES];
+	uint64_t base, total, pos;
+	uint32_t ring, have, got = 0, nlines = 0, first = 0, i;
+
+	if (!ud_last) {
+		con_str("LOG", "no userdata partition in the GPT");
+		return;
+	}
+	base = ud_last + 1 - (LOG_RING / BLOCK + 1);
+	if (read_blocks((uint32_t)base, 1, data)) {
+		con_str("LOG", "header read failed");
+		return;
+	}
+	if (__builtin_memcmp(data, "MONDLOG", 7)) {
+		con_str("LOG", "no MONDLOG header: the ring never flushed");
+		return;
+	}
+	ring = le32(data + 12);
+	if (ring == 0 || ring > LOG_RING) {
+		con_str("LOG", "header: bad ring size");
+		return;
+	}
+	total = le64(data + 16);
+	con_hex2("MONDLOG", "total=", (uint32_t)(total >> 10), "seq=", (uint32_t)le64(data + 24));
+
+	have = total < ring ? (uint32_t)total : ring;
+	if (have > LOG_WINDOW)
+		have = LOG_WINDOW;
+	if (have == 0) {
+		con_str("LOG", "empty ring");
+		return;
+	}
+	/* The newest byte is the one before the next write position. */
+	pos = (total % ring + ring - have) % ring;
+	while (got < have) {
+		uint32_t off = (uint32_t)(pos % BLOCK), take = BLOCK - off;
+		if (take > have - got)
+			take = have - got;
+		if (read_blocks((uint32_t)(base + 1 + pos / BLOCK), 1, data))
+			break;
+		__builtin_memcpy(text + got, data + off, take);
+		got += take;
+		pos = (pos + take) % ring;
+	}
+	if (!got) {
+		con_str("LOG", "ring read failed");
+		return;
+	}
+	text[got] = 0;
+
+	/*
+	 * Keep the last LOG_LINES lines that are not the sandbox and network
+	 * spam: it repeats on every denied call and would push everything else
+	 * out of the window.
+	 */
+	char *line = text;
+	for (char *c = text; ; c++) {
+		if (*c != '\n' && *c != 0)
+			continue;
+		char stop = *c;
+		*c = 0;
+		if (c > line && !log_skip(line)) {
+			lines[first] = line;
+			first = (first + 1) % LOG_LINES;
+			if (nlines < LOG_LINES)
+				nlines++;
+		}
+		if (!stop)
+			break;
+		line = c + 1;
+	}
+	uint32_t from = nlines < LOG_LINES ? 0 : first;
+	for (i = 0; i < nlines; i++) {
+		char *l = lines[(from + i) % LOG_LINES];
+		uint32_t len = 0;
+		while (l[len] != 0)
+			len++;
+		if (len > LOG_COLS)
+			l[LOG_COLS] = 0;
+		con_line(l);
+	}
+	con_str("LOG", "power+vol-down for fastboot");
 }
 
 void test_ufs(void)
@@ -292,4 +425,7 @@ void test_ufs(void)
 	if (esz != 128 || nent > 128)
 		return;
 	list_partitions(elba, nent);
+#ifdef LOGVIEW
+	log_dump();
+#endif
 }

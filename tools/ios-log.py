@@ -13,6 +13,7 @@ import struct, sys
 
 data = open(sys.argv[1], 'rb').read()
 magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, 0)
+magic = magic.rstrip(b'\x00')
 if magic not in (b'SWEETLOG', b'MONDLOG'):
     sys.exit(f'no {magic.rstrip(b"!")} header (log never flushed, or wrong area)')
 ring = data[4096:4096 + size]
