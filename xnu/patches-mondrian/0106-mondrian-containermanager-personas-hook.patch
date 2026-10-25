@@ -1,0 +1,94 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,39 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++/*
++ * Opt-in bring-up hook for HackiOS's containermanagerd workaround and
++ * backboardd display diagnostics. Only those two images get the library; its
++ * Objective-C hooks resolve classes and selectors dynamically rather than
++ * relying on shared-cache addresses from another build.
++ */
++static bool
++mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	const char *name;
++	const char library[] = "DYLD_INSERT_LIBRARIES=/usr/libexec/mondrian-ui-hook.dylib";
++
++	if (!PE_parse_boot_argn("mondrian_ui_hook", &enabled, sizeof(enabled)) || !enabled ||
++	    imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(library) > size) {
++		return false;
++	}
++	if (!((imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
++	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) ||
++	    (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("backboardd") - 1 &&
++	    strncmp(name, "backboardd", sizeof("backboardd") - 1) == 0))) {
++		return false;
++	}
++	strlcpy(env, library, size);
++	return true;
++}
++#endif
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5774,27 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/* Inject only into the two diagnostic targets, and only when opted in. */
++	{
++		char inject_env[128];
++
++		if (mondrian_ui_hook_env(imgp, inject_env, sizeof(inject_env))) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++			printf("MONDRIAN exec: injected UI hook\n");
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -312,9 +312,12 @@
+ IOMobileFramebufferUserClient::start(IOService *provider)
+ {
+ 	fFB = OSDynamicCast(AppleCLCD, provider);
+ 	if (fFB == NULL || !IOUserClient::start(provider)) {
+ 		return false;
+ 	}
+ 	fFB->addClient(this);
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("MONDRIAN FB: %s user client opened\n", name);
+ 	return true;
+ }
+@@ -323,4 +326,7 @@
+ IOMobileFramebufferUserClient::clientClose(void)
+ {
+ 	if (fFB != NULL) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("MONDRIAN FB: %s user client closed\n", name);
+ 		fFB->removeClient(this);

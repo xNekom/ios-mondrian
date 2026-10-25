@@ -29,6 +29,13 @@ out=$4 size=${5:-16G}
 for d in "$os" "$sysos" "$appos"; do
 	[[ -f $d ]] || { echo "error: $d not found" >&2; exit 1; }
 done
+if [[ -n ${MONDRIAN_UI_HOOK_DYLIB:-} ]]; then
+	[[ -f "$MONDRIAN_UI_HOOK_DYLIB" ]] || {
+		echo "error: UI hook not found: $MONDRIAN_UI_HOOK_DYLIB" >&2
+		exit 1
+	}
+	codesign --verify --strict "$MONDRIAN_UI_HOOK_DYLIB"
+fi
 for t in hdiutil newfs_hfs rsync fsck_hfs; do
 	command -v "$t" >/dev/null || { echo "error: missing $t" >&2; exit 1; }
 done
@@ -139,7 +146,11 @@ install -m 0600 -o 0 -g 0 "$work/systembag.kb" \
 tweaks=$(cd "$(dirname "$0")" && pwd)/ios-root-tweaks.py
 if [[ ${APPLY_TWEAKS:-1} == 1 && -f $tweaks ]]; then
 	echo "== applying the bring-up tweaks ($tweaks)"
-	python3 "$tweaks" "$work/root"
+	if [[ -n ${MONDRIAN_UI_HOOK_DYLIB:-} ]]; then
+		python3 "$tweaks" "$work/root" --ui-hook "$MONDRIAN_UI_HOOK_DYLIB"
+	else
+		python3 "$tweaks" "$work/root"
+	fi
 fi
 
 df -h "$work/root"

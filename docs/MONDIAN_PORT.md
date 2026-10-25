@@ -21,7 +21,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | Pointer auth | none | none (compile plain arm64, like sweet) |
 | GICD | 0x17a00000 | **0x17100000** |
 | GICR | 0x17a60000, 2 RDs, stride 0x20000 | **0x17180000, 8 RDs, stride 0x40000** |
-| Timer INTID | 19 (Qualcomm PPI numbering) | 19 (same numbering) |
+| Timer INTID | 19 (Qualcomm PPI numbering) | **27 (GIC INTID; DT PPI 11)** |
 | UFS host | ufshc@1d84000, UFSHCI 2.1 | ufshc@1d84000, **UFS 3.1** |
 | Touch | Goodix GT9896 on I²C (GENI SE) | **Goodix on QUPv3 SPI** (`xiaomi,m11a-spi`, SE4 @ 0x990000) |
 | Buttons | PM6150 PON / SPMI | **PM8008** (PMR735A + PM8350B); volume up on PM8350 GPIO6 |
@@ -48,6 +48,16 @@ needs, and where the numbers come from. The boot history and the traps are in
 `0085` (the framebuffer presentation driver) is in this series. It presents
 userland IOSurface swaps on the framebuffer; the visible SpringBoard UI remains
 to be confirmed on-device.
+
+The next UI diagnosis follows HackiOS: opt-in patch `0106` injects a small
+dylib into containermanagerd and backboardd only with `mondrian_ui_hook=1`.
+It disables personas after validating the Objective-C method signature and
+traces `CAWindowServer._detectDisplays` by runtime lookup, without borrowed
+shared-cache offsets. The framebuffer client lifecycle, selectors and swaps
+are logged in the kernel. Build with `tools/build-mondrian-ui-hook.sh`, then
+include it in a newly built root with `MONDRIAN_UI_HOOK_DYLIB=...`. This test
+is not verified on-device; do not write it into `userdata` until its original
+has a verified workstation backup.
 
 ## Safety: what can and cannot brick the phone
 
@@ -120,7 +130,7 @@ are in `NOTES.md` ("The window of RAM"). The physmap slide comes from
 | `/reserved-memory` | 38 carve-outs: hypervisor 0x80000000+0x600000, AOP, SMEM, modem 0x8bc00000+0x13200000, splash 0xb8000000+0x2b00000, tags, QTEe |
 | framebuffer | 0xb8000000, 1440x3200, stride 5760 |
 | GIC | GICD 0x17100000+0x10000, GICR 0x17180000+0x200000, stride 0x40000 |
-| virtual timer | INTID 19 |
+| virtual timer | GIC INTID 27 (DT PPI 11) |
 | UFS host | 0x1d84000 (`ro.boot.bootdevice` = `1d84000.ufshc`) |
 
 The board table and the shim hold the window; the shim checks the live device

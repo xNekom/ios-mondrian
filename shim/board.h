@@ -24,9 +24,9 @@
 #define GICR_SIZE		0x200000UL
 #define GICR_PE_SIZE		0x40000UL
 
-/* Qualcomm numbers the architected timer PPIs 1/2/3/0, so the virtual timer
- * XNU uses is INTID 16 + 3 = 19 (same as on sweet). */
-#define VTIMER_INTID		19
+/* Qualcomm's arm,armv8-timer lists PPI 11 for the virtual timer, so the GIC
+ * INTID is 16 + 11 = 27 (sweet's older SoC uses PPI 3 = 19). */
+#define VTIMER_INTID		27
 #define PTIMER_INTID		18
 #define SGI_INTID		1
 

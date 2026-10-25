@@ -25,13 +25,14 @@ Verified on the phone:
   blocks and the generic Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
   scheduler, PRNG, libpthread and AMFI into `bsd_init`. The GIC is remapped
-  after the VM takes over, and the virtual timer (INTID 19) delivers.
+  after the VM takes over, and the virtual timer (GIC INTID 27) delivers.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **iOS userland.** Root-auth fails with ENOTTY and `0089` continues; launchd
-  runs its boot tasks and the sampler finds **SpringBoard alive (pid 27, 78
-  processes)**. backboardd came and went; no visible UI yet.
+- **iOS userland.** Root-auth ENOTTY is handled by `0089`; SpringBoard (pid 26)
+  and backboardd (pid 57) survive more than 180 samples. `ui3` makes four black
+  swaps; `CA_ENABLE_MBX2D=0` is injected but that boot opens no framebuffer.
+  `driverkitd` is killed for jetsam namespace 1/code 7 (per-process limit).
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
@@ -103,7 +104,7 @@ From the live device tree (and from the shim's own dump):
 | `/reserved-memory` | 38 carve-outs: hypervisor `0x80000000+0x600000`, AOP, SMEM, modem `0x8bc00000+0x13200000`, splash `0xb8000000+0x2b00000`, tags, QTEe |
 | framebuffer | `0xb8000000`, 1440x3200, stride 5760, 43 MiB |
 | GICD / GICR | `0x17100000+0x10000` / `0x17180000+0x200000`, 8 redistributors, stride `0x40000` |
-| virtual timer | INTID 19 (no `virtual-timer-intid` in the tree) |
+| virtual timer | GIC INTID 27 (DT PPI 11; no `virtual-timer-intid` in the tree) |
 | UFS host | `0x1d84000+0x3000`, `ro.boot.bootdevice` = `1d84000.ufshc` |
 | touch | Goodix on QUPv3 SPI, `xiaomi,m11a-spi`, SE4 `0x990000`, IRQ TLMM GPIO21, reset GPIO20 |
 | volume up key | PM8350 GPIO6 (`&pm8350_gpios 6`) |
@@ -318,11 +319,10 @@ switch without the kernel. `boot_a` stays untouched at all times:
   `pmap_map_bd` fix now merged into `0001`; `native-4k-user-abi.patch` is for
   later (four places where XNU hardcodes 16K decide what userspace sees). It
   also documents the UFS LU wake used by `0082`.
-- **`oosexgang/hackios-xnu-kernel`** — same XNU generation on a POCO, UFSHCI
-  driver for the same host at the same address, and the key map
-  (`redwood_buttons.c`). Proves the controller reads a list before a doorbell
-  is rung; keeps the bootloader's UFS driver resident and serves blocks from
-  the loader as an alternative to an in-kernel driver.
+- **Bergamota / Chlorophyll / HackiOS** — Bergamota documents a working CPU
+  fallback; Chlorophyll targets Adreno 630. HackiOS's iOS 16.5 hook disables
+  containermanagerd personas; `0106` redoes this for 20H392 with runtime method
+  checks, not borrowed shared-cache offsets.
 - **`palazik/ios-dodge`** — patch-per-lesson series: local TLB flush, timer
   quiesce, *do not touch* `CNTP_CTL_EL0` at handover, physmap alignment
   padding, framebuffer block-descriptor alignment.

@@ -276,7 +276,7 @@ MONDRIAN = Board(
     gcc=0x100000,
     ufs_gcc_branch=0x870,
     timebase=19200000,
-    vtimer_intid=19,             # Qualcomm's PPI numbering, as on sweet
+    vtimer_intid=27,             # PPI 11 + 16, the Qualcomm virtual timer
     ipi_sgi=1,
     # 16 KiB pages: XNU maps the kernel with 32 MB L2 block entries
     # (ARM_16K_TT_L2_SIZE).

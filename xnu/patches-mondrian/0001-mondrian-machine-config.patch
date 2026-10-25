@@ -276,7 +276,7 @@ new file mode 100644
 index 000000000..b6f4d864b
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/MONDRIAN.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,86 @@
 +/*
 + * Board config for the POCO F5 Pro / Redmi K60 ("mondrian", Qualcomm
 + * SM8475 / Snapdragon 8+ Gen 1): Cortex-X2 + 3 x Cortex-A710 + 4 x
@@ -326,11 +326,10 @@ index 000000000..b6f4d864b
 +#endif /* ! ASSEMBLER */
 +
 +/*
-+ * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys,
-+ * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
-+ * (CNTV) is INTID 16 + 3 = 19.
++ * The GIC reports the architected virtual timer (CNTV) as INTID 27, which is
++ * PPI 11 plus the 16 SGI IDs. Use the full GIC INTID in the acknowledge path.
 + */
-+#define MONDRIAN_VTIMER_INTID        19
++#define MONDRIAN_VTIMER_INTID        27
 +#define MONDRIAN_IPI_SGI             1       // SGI used for cross-CPU signals
 +
 +#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt

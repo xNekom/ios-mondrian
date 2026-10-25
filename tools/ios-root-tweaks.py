@@ -159,16 +159,35 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def install_ui_hook(root, source):
+    if not os.path.isfile(source):
+        sys.exit(f'error: personas hook not found: {source}')
+    directory = os.path.join(root, 'usr/libexec')
+    os.makedirs(directory, exist_ok=True)
+    destination = os.path.join(directory, 'mondrian-ui-hook.dylib')
+    shutil.copyfile(source, destination)
+    os.chown(destination, 0, 0)
+    os.chmod(destination, 0o755)
+    print('installed opt-in containermanagerd/backboardd UI hook')
+
+
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != '--ui-hook'):
         sys.exit(__doc__)
     root = sys.argv[1]
+    hook = sys.argv[3] if len(sys.argv) == 4 else None
+    if not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
+        sys.exit(__doc__)
+    if hook and not os.path.isfile(hook):
+        sys.exit(f'error: personas hook not found: {hook}')
     launchd(root)
     containers(root)
     preboot(root)
     swapdir(root)
     activation(root)
     audio(root)
+    if hook:
+        install_ui_hook(root, hook)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
