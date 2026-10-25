@@ -1,0 +1,67 @@
+xnu 0110: snapshot the virtual timer and PPI state without changing it
+
+The 0108 log proves that INTID 27 reaches the IRQ handler in early boot, but
+not that the timer remains unmasked or advances during userland. `timer_pending`
+was only CNTV_CTL_EL0.ISTATUS, not GIC pending state. Patch 0069 sets bit 1
+while describing it as EL1IRQEN; the architectural CNTV_CTL_EL0 bit is IMASK.
+Do not change the timer behavior until its readback is measured. Log CTL/CVAL/
+CNTVCT and deltas at sampler ticks, and read the GICR enable/pending/active bits
+immediately after setup while the bootstrap GICR mapping is known to work. Do
+not read these GICR registers from the later post-VM remap path, which has
+faulted on this board. The patch is diagnostic only.
+
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -266,6 +266,11 @@
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << mondrian_vtimer_intid) | (1U << MONDRIAN_IPI_SGI));
++	/* These reads are safe here, before the VM replaces the bootstrap MMIO map. */
++	kprintf("MONDRIAN GIC: vtimer PPI %u enable=%x pending=%x active=%x group=%x\n",
++	    mondrian_vtimer_intid, gicr_read32(GICR_ISENABLER0),
++	    gicr_read32(GICR_ISPENDR0), gicr_read32(GICR_ISACTIVER0),
++	    gicr_read32(GICR_IGROUPR0));
+ 	/*
+ 	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
+ 	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
+diff --git a/pexpert/pexpert/arm64/VMAPPLE.h b/pexpert/pexpert/arm64/VMAPPLE.h
+--- a/pexpert/pexpert/arm64/VMAPPLE.h
++++ b/pexpert/pexpert/arm64/VMAPPLE.h
+@@ -70,6 +70,8 @@
+ #define GICR_WAKER                              0x14
+ #define GICR_IGROUPR0                           0x10080
+ #define GICR_ISENABLER0                         0x10100
++#define GICR_ISPENDR0                           0x10200
++#define GICR_ISACTIVER0                         0x10300
+ 
+ #define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
+ #define GICR_TYPER_LAST                         0x10
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -185,6 +185,24 @@
+ 		    mondrian_want_pid[k], mondrian_want_pc[k]);
+ 	}
+ 	printf("\n");
++	{
++		static uint64_t previous_count;
++		static uint32_t snapshots;
++		uint64_t control = __builtin_arm_rsr64("CNTV_CTL_EL0");
++		uint64_t compare = __builtin_arm_rsr64("CNTV_CVAL_EL0");
++		uint64_t count = __builtin_arm_rsr64("CNTVCT_EL0");
++		uint64_t delta = snapshots != 0 ? count - previous_count : 0;
++
++		/* CNTV_CTL_EL0 bit 1 is architecturally IMASK; log readback, don't infer. */
++		if (snapshots < 16 || (snapshots & 15) == 0) {
++			printf("MONDRIAN TIMER: sample %u ctl 0x%llx cval 0x%llx cntvct 0x%llx delta 0x%llx\n",
++			    snapshots, (unsigned long long)control,
++			    (unsigned long long)compare, (unsigned long long)count,
++			    (unsigned long long)delta);
++		}
++		previous_count = count;
++		snapshots++;
++	}
+ 
+ 	/*
+ 	 * Once the process list is populated, dump every thread of the wanted
