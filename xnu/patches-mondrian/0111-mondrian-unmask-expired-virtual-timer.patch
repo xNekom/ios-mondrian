@@ -1,0 +1,82 @@
+xnu 0111: leave CNTV unmasked and print the retained PPI state
+
+The 0110 hook-off boot read CNTV_CTL_EL0 as 0x7 across 17 sampler snapshots:
+ENABLE=1, IMASK=1, ISTATUS=1, with CNTVCT advancing past the unchanged CVAL.
+The timer condition was expired but masked. Bit 1 is architecturally IMASK,
+not an EL1 interrupt-enable bit, so clear it and let the PPI reach the GIC.
+The first 0110 PPI snapshot was taken before the console was ready and never
+appeared in the ring. Cache its read-only GICR values during early setup and
+print them later from the post-VM GIC dump; do not reread the faulting GICR
+register page after the VM remap. This boot tests whether periodic kernel
+waits and the launchd handoff recover with the architectural mask value.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2272,18 +2272,13 @@
+ {
+ #if defined(MONDRIAN)
+ 	/*
+-	 * The virtual timer interrupt has to be unmasked for EL1 explicitly.
+-	 * On sweet the kernel gets the timer from the bootloader with no
+-	 * hypervisor in between, and there the EL0 view of CNTV_CTL_EL0 is
+-	 * all there is: bit 1 is IMASKED there, and XNU leaves it clear, so
+-	 * the interrupt goes out. This phone has the hypervisor (QHEE) in
+-	 * between, and with EL2 present the same encoding is the EL1 view,
+-	 * where bit 1 is EL1IRQEN instead: with XNU's value the timer
+-	 * interrupt is never enabled to EL1, so no timeout ever expires (the
+-	 * boot then waits forever in IOKitInitializeTime() for an RTC that
+-	 * this phone does not have).
++	 * CNTV_CTL_EL0 bit 1 is IMASK on the architectural register. The
++	 * 0110 readback showed 0x7 (ENABLE | IMASK | ISTATUS) while CNTVCT
++	 * advanced beyond CVAL: the compare was expired but masked. Clear
++	 * IMASK so the level-sensitive PPI can reach EL1. Keep the GIC PPI
++	 * snapshots in 0110 to confirm delivery on the next boot.
+ 	 */
+-	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE | (1 << 1); /* EL1IRQEN with EL2 present */
++	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE;
+ #else
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+ #endif
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -41,6 +41,10 @@
+ static vm_offset_t mondrian_gicr_phys;
+ static vm_offset_t mondrian_gicd_size;
+ static vm_offset_t mondrian_gicr_size;
++static uint32_t mondrian_vtimer_enable_state;
++static uint32_t mondrian_vtimer_pending_state;
++static uint32_t mondrian_vtimer_active_state;
++static uint32_t mondrian_vtimer_group_state;
+ #endif
+ 
+ static uint32_t
+@@ -128,6 +132,10 @@
+ 	if (!gicd_base) {
+ 		return;
+ 	}
++	kprintf("MONDRIAN GIC: early vtimer PPI %u enable=%x pending=%x active=%x group=%x\n",
++	    mondrian_vtimer_intid, mondrian_vtimer_enable_state,
++	    mondrian_vtimer_pending_state, mondrian_vtimer_active_state,
++	    mondrian_vtimer_group_state);
+ 	/*
+ 	 * Read only the first redistributor page. GICR_IGROUPR0 lives in the
+ 	 * SGI page (GICR base + 0x10080) and reading it *after* the VM is up
+@@ -266,11 +274,11 @@
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << mondrian_vtimer_intid) | (1U << MONDRIAN_IPI_SGI));
+-	/* These reads are safe here, before the VM replaces the bootstrap MMIO map. */
+-	kprintf("MONDRIAN GIC: vtimer PPI %u enable=%x pending=%x active=%x group=%x\n",
+-	    mondrian_vtimer_intid, gicr_read32(GICR_ISENABLER0),
+-	    gicr_read32(GICR_ISPENDR0), gicr_read32(GICR_ISACTIVER0),
+-	    gicr_read32(GICR_IGROUPR0));
++	/* Cache the read-only status while the bootstrap GICR mapping is safe. */
++	mondrian_vtimer_enable_state = gicr_read32(GICR_ISENABLER0);
++	mondrian_vtimer_pending_state = gicr_read32(GICR_ISPENDR0);
++	mondrian_vtimer_active_state = gicr_read32(GICR_ISACTIVER0);
++	mondrian_vtimer_group_state = gicr_read32(GICR_IGROUPR0);
+ 	/*
+ 	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
+ 	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
