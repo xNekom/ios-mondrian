@@ -59,11 +59,26 @@ persistent ring captures them). dyld honours `DYLD_INSERT_LIBRARIES` only when
 the MAC policy registered as `AMFI` answers `__mac_syscall` 0x5a (`0108`); under
 the old policy name it silently dropped the variable. Build with
 `tools/build-mondrian-ui-hook.sh`, then include it in the root with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. The first 0108 run confirms
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. The 0108 run confirms
 injection into containermanagerd and backboardd and installs backboardd's
 `_detectDisplays` hook, but the callback does not run and no framebuffer user
-client opens. The remaining blocker is display startup inside backboardd;
-visible UI is not yet confirmed.
+client opens. Patch `0109` waits for backboardd before taking the one-shot
+backtrace; visible UI is still unconfirmed.
+
+### Exporting the full console ring
+
+The raw area is a 4 KiB header plus a 4 MiB ring at the end of `userdata`.
+Root ADB in recovery reads its final 1,025 blocks; `fastboot fetch` is absent.
+Before reading, verify `userdata` is absent from `/proc/mounts` so recovery
+cannot write or repair it:
+
+```sh
+bytes=$(adb shell blockdev --getsize64 /dev/block/by-name/userdata | tr -d '\r')
+skip=$((bytes / 4096 - 1025))
+adb shell "dd if=/dev/block/by-name/userdata of=/tmp/mondrian-log.raw bs=4096 skip=$skip count=1025"
+adb pull /tmp/mondrian-log.raw mondrian-log.raw
+tools/decode-mondrian-log.py mondrian-log.raw > mondrian-console.log
+```
 
 ## Safety: what can and cannot brick the phone
 

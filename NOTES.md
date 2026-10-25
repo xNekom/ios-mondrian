@@ -30,10 +30,10 @@ Verified on the phone:
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
 - **iOS userland.** `0089` handles root-auth ENOTTY; SpringBoard (27) and
-  backboardd (57) survive; the ring captures 48 KiB. `0108` confirms both
-  dylibs load. backboardd installs `_detectDisplays`, but never calls it and
-  opens no framebuffer client. UI is unverified; `CA_ENABLE_MBX2D=0` also opens
-  no FB; `driverkitd` hits jetsam namespace 1/code 7.
+  backboardd (57) survive; the ring captures 40,709 bytes. `0108` loads both
+  dylibs and the personas hook. `backboardd` installs `_detectDisplays` but
+  never calls it or opens the framebuffer. `0109` defers its backtrace until
+  backboardd exists; visible UI remains unverified.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
@@ -41,8 +41,6 @@ Verified on the phone:
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager used
   `/System/Volumes/VM/swapfile` (`Failed to open swap file 2`, ENOENT). `0098`
   moves it to `/private/var/vm/swapfile` and creates that directory.
-- **Recovery.** `boot_a` remains stock; `fastboot boot` is volatile.
-
 Current blockers, in order:
 
 1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware and
@@ -222,7 +220,9 @@ line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
 e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 
 **The console is a ring with a cursor block.** The newest line is the one above
-the cursor marker; reading then continues downward and wraps to the top.
+the cursor marker; reading then continues downward and wraps to the top. The
+shim `LOGVIEW` currently faults synchronously at `STAGE ufs`; extract the ring
+through a compatible recovery and ADB instead.
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;

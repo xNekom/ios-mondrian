@@ -1,0 +1,39 @@
+xnu 0109: wait for the sampled daemon before the one-shot backtrace
+
+The 0108 ring showed the detailed sample fired at 70 processes, before
+backboardd existed; the sampler then set its one-shot flag and never captured
+the daemon whose stuck state matters. If backboardd is among the requested
+names, wait until it has a pid before consuming the one-shot. For other sample
+lists, keep the existing behavior but wait until at least one requested
+process exists. This makes the next ring contain backboardd's thread PCs and
+backtraces instead of an empty early sample.
+
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -191,7 +191,24 @@
+ 	 * processes with its pc/lr/sp and frame-pointer backtrace: the pc
+ 	 * alone says whether it waits in mach_msg, but not for what.
+ 	 */
+-	if (!dumped && mondrian_proc_count > 20) {
++	bool backboardd_selected = false;
++	bool target_present = false;
++	for (int k = 0; k < mondrian_names_count; k++) {
++		if (strcmp(mondrian_names[k], "backboardd") == 0) {
++			backboardd_selected = true;
++			target_present = mondrian_want_pid[k] > 0;
++			break;
++		}
++	}
++	if (!backboardd_selected) {
++		for (int k = 0; k < mondrian_names_count; k++) {
++			if (mondrian_want_pid[k] > 0) {
++				target_present = true;
++				break;
++			}
++		}
++	}
++	if (!dumped && mondrian_proc_count > 20 && target_present) {
+ 		dumped = true;
+ 		printf("SMP --- detailed sample, %d procs\n", mondrian_proc_count);
+ 		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
