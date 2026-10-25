@@ -25,18 +25,18 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	/*
  	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
  	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
-diff --git a/pexpert/pexpert/arm64/VMAPPLE.h b/pexpert/pexpert/arm64/VMAPPLE.h
---- a/pexpert/pexpert/arm64/VMAPPLE.h
-+++ b/pexpert/pexpert/arm64/VMAPPLE.h
-@@ -70,6 +70,8 @@
+diff --git a/pexpert/pexpert/arm64/MONDRIAN.h b/pexpert/pexpert/arm64/MONDRIAN.h
+--- a/pexpert/pexpert/arm64/MONDRIAN.h
++++ b/pexpert/pexpert/arm64/MONDRIAN.h
+@@ -78,6 +78,8 @@
  #define GICR_WAKER                              0x14
  #define GICR_IGROUPR0                           0x10080
  #define GICR_ISENABLER0                         0x10100
 +#define GICR_ISPENDR0                           0x10200
 +#define GICR_ISACTIVER0                         0x10300
+ #define GICR_IPRIORITYR0                        0x10400
  
  #define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
- #define GICR_TYPER_LAST                         0x10
 diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
 --- a/bsd/dev/mondrian_sample.c
 +++ b/bsd/dev/mondrian_sample.c
