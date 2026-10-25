@@ -29,9 +29,6 @@ Verified on the phone:
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **No dual boot.** The shim has no menu: it only ever loads the payload it
-  carries, so there is nothing to choose and five seconds less to wait.
-  `boot_b` carries the current shim and payload; `fastboot boot` is for tests.
 - **iOS userland.** Root-auth fails with ENOTTY and `0089` continues; launchd
   registers dyld, runs boot tasks, and starts backboardd/HID. `exec SpringBoard`
   is observed, but a visible UI is not confirmed.
@@ -39,16 +36,18 @@ Verified on the phone:
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
   disables kernel text at the first swap; later logs are not panel output.
+- **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager used
+  `/System/Volumes/VM/swapfile` (`Failed to open swap file 2`, ENOENT). `0098`
+  moves it to `/private/var/vm/swapfile` and creates that directory.
 - **Recovery.** `boot_a` remains stock; `fastboot boot` is volatile.
 
 Current blockers, in order:
 
-1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware, containers
-   and `/private/var/vm`. Swap error 2 is ENOENT; rebuild with the tweaks if it
-   recurs. Flattened HFS still lacks a separate Data volume.
-2. **Pid-1 diagnosis.** Framebuffer text can be stale. Namespace 1/code 0xe is
-   `JETSAM_REASON_MEMORY_SUSTAINED_PRESSURE`; `CS_KILLED` separately marks invalid pages.
-   Read `CODE SIGNING`/`CRASH` before changing AMFI or Sandbox.
+1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware and
+   containers; flattened HFS still lacks a separate Data volume.
+2. **Pid-1 diagnosis.** Framebuffer text can be stale. Namespace 1/code 0xe
+   is `JETSAM_REASON_MEMORY_SUSTAINED_PRESSURE`; `CS_KILLED` marks invalid
+   pages. Read `CODE SIGNING`/`CRASH` before changing AMFI or Sandbox.
 3. **UI.** SpringBoard exec is observed; visible presentation and touch remain
    unverified.
 
@@ -83,15 +82,14 @@ for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring; `0097` starts persistence after root mount, flushes immediately, and
-verifies the header by reading it back. To inspect a previous boot, first run
-the real kernel, then boot a dump kernel with `mondriandump=1` and
-  `mondriandumpmatch=SMP,CRASH,CODE,memorystatus`. The dump reads the
-  prior ring before starting its own writer. The shim `logview` is unreliable
-  on this UFS host; do not use it for diagnosis.
+verifies the header. Inspect a previous boot by running the real kernel, then a
+dump kernel with `mondriandump=1` and
+`mondriandumpmatch=SMP,CRASH,swap,memorystatus` (`0099` splits the list). The
+dump reads the prior ring before starting its own writer; the shim `logview` is
+unreliable on this UFS host.
 
-**Host-side testing.** `tools/qemu-ios.py` boots the same payload; see
-`docs/QEMU_TESTING.md`. `--kernel` only feeds the decoder: rebuild the payload
-or QEMU silently boots the old kernel.
+**Host-side testing.** `tools/qemu-ios.py` boots the payload; `--kernel` only
+feeds its decoder (`docs/QEMU_TESTING.md`), so rebuild the payload.
 
 ## Measured hardware facts
 
@@ -216,13 +214,16 @@ image instead (`tools/mk-simg.py`, or `tools/flash-root.sh`, which converts
 anything over 768 MiB by itself): fastboot then sends it in `-S` chunks and
 the root's zero tail costs nothing. 11 GiB of root take about five minutes.
 
-**The console is a ring with a cursor block.** `fbcon_newline()` wraps to row 0
-and clears only that row, so no whole-screen blank per line; the newest line is
-the one above the cursor marker, then reading continues downward.
+**Kernel timeouts stop after userland starts.** Threads paced by
+`tsleep(timeout)` wake once and never again (2026-10-25: the sampler printed one
+line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
+e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
+
+**The console is a ring with a cursor block.** The newest line is the one above
+the cursor marker; reading then continues downward and wraps to the top.
 
 **CI skips a patch that does not apply and still reports success.** Check the
-series locally (`tools/apply-series.py`, `tools/check-patches.sh`) before
-spending a run; also note that a *cancelled* job shows up as `failure`.
+series locally before a run; a *cancelled* job also shows up as `failure`.
 
 **`git apply` fails a hunk that ends with added lines and no trailing
 context**, and a patch that touches a staged source (the HFS/BearSSL trees)

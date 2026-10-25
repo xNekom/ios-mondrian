@@ -1,0 +1,170 @@
+xnu 0098: put the swap file on the iOS root
+
+/private/var/vm exists in the root image, yet the pager still failed to open
+swapfile0 with ENOENT (2): the kernel is built with the macOS SDK, so
+XNU_TARGET_OS_OSX selects /System/Volumes/VM/swapfile, a path an iOS root does
+not have. Point SWAP_FILE_NAME at /private/var/vm/swapfile on this board, and
+create /private/var/vm after the root vnode is installed in case the image was
+built without tools/ios-root-tweaks.py. Without a swap file the compressor
+cannot drain; that sustained memory pressure is what makes Jetsam kill launchd.
+
+diff --git a/osfmk/vm/vm_compressor_backing_store.h b/osfmk/vm/vm_compressor_backing_store.h
+index 8f176da3d..cc46f71f2 100644
+--- a/osfmk/vm/vm_compressor_backing_store.h
++++ b/osfmk/vm/vm_compressor_backing_store.h
+@@ -53,7 +53,12 @@
+ 
+ #endif /* !XNU_TARGET_OS_OSX */
+ 
+-#if defined(XNU_TARGET_OS_OSX)
++/*
++ * MONDRIAN builds with the macOS SDK, so XNU_TARGET_OS_OSX is defined even
++ * though the userland is iOS: the swap file has to live where the iOS root
++ * keeps it, not in /System/Volumes, which the root does not have.
++ */
++#if defined(XNU_TARGET_OS_OSX) && !defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ #define SWAP_VOLUME_NAME        "/System/Volumes"
+ #define SWAP_FILE_NAME          SWAP_VOLUME_NAME "/VM/swapfile"
+ #else
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 25062cc..020381a 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -29,6 +29,8 @@
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <sys/uio.h>
++#include <sys/namei.h>
++#include <sys/vnode_internal.h>
+ #include <machine/atomic.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+@@ -51,6 +53,7 @@ extern void mondrian_irq_dump(void);
+ extern int hz;
+ void mondrian_log_start(void);
+ static void mondrian_log_dump(uint32_t lines);
++void mondrian_root_fixups(void);
+ 
+ #define REG_CAP          0x00
+ #define REG_VER          0x08
+@@ -1395,4 +1398,68 @@ mondrian_log_start(void)
+ 		printf("MONDRIAN LOG: writer thread start failed (%d)\n", kr);
+ 	}
+ }
++
++/*
++ * The iOS layout keeps /private/var on its own data volume; the flattened HFS
++ * root that mkiosroot.sh builds does not. The dynamic pager opens
++ * /private/var/vm/swapfile0 outright, so without that directory it gets
++ * ENOENT, the compressor cannot drain, and the sustained memory pressure is
++ * what makes Jetsam kill launchd. Create the directory once the root vnode is
++ * installed, before load_init_program().
++ */
++static int
++mondrian_root_mkdir(const char *path, int mode)
++{
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t dvp, vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int error;
++
++	VATTR_INIT(&va);
++	va.va_mode = mode & 07777;
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE,
++	    CAST_USER_ADDR_T(path), ctx);
++	nd.ni_cnd.cn_flags |= WILLBEDIR;
++	error = namei(&nd);
++	if (error) {
++		return error;
++	}
++	dvp = nd.ni_dvp;
++	if (nd.ni_vp != NULLVP) {
++		vnode_put(nd.ni_vp);
++		error = EEXIST;
++		goto out;
++	}
++	VATTR_SET(&va, va_type, VDIR);
++	error = vn_authorize_mkdir(dvp, &nd.ni_cnd, &va, ctx, NULL);
++	if (error == 0) {
++		error = VNOP_MKDIR(dvp, &vp, &nd.ni_cnd, &va, ctx);
++	}
++out:
++	nameidone(&nd);
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	vnode_put(dvp);
++	return error;
++}
++
++void
++mondrian_root_fixups(void)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int error;
++
++	error = vnode_lookup("/private/var/vm", 0, &vp, ctx);
++	if (error == 0) {
++		vnode_put(vp);
++		printf("MONDRIAN ROOT: /private/var/vm present\n");
++		return;
++	}
++	printf("MONDRIAN ROOT: /private/var/vm lookup %d, creating it\n", error);
++	error = mondrian_root_mkdir("/private/var/vm", 0755);
++	printf("MONDRIAN ROOT: mkdir /private/var/vm -> %d\n", error);
++}
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 3d7b2e4..d9c2ffd 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -943,6 +943,8 @@ bsd_init(void)
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ 	/* Start persistent console writes only after userdata is the mounted root. */
+ 	extern void mondrian_log_start(void);
++	extern void mondrian_root_fixups(void);
++	mondrian_root_fixups();
+ 	mondrian_log_start();
+ #endif
+ 
+diff --git a/bsd/vm/vm_compressor_backing_file.c b/bsd/vm/vm_compressor_backing_file.c
+index d0278bf26..7ef60cd81 100644
+--- a/bsd/vm/vm_compressor_backing_file.c
++++ b/bsd/vm/vm_compressor_backing_file.c
+@@ -62,6 +62,9 @@ vm_swapfile_open(const char *path, vnode_t *vp)
+ 	vfs_context_t   ctx = vfs_context_kernel();
+ 
+ 	if ((error = vnode_open(path, (O_CREAT | O_TRUNC | FREAD | FWRITE), S_IRUSR | S_IWUSR, 0, vp, ctx))) {
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++		printf("MONDRIAN SWAP: open %s failed (%d)\n", path, error);
++#endif
+ 		printf("Failed to open swap file %d\n", error);
+ 		*vp = NULL;
+ 		return;
+@@ -80,6 +83,9 @@ vm_swapfile_open(const char *path, vnode_t *vp)
+ 	}
+ 
+ 	vnode_put(*vp);
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	printf("MONDRIAN SWAP: %s opened\n", path);
++#endif
+ }
+ 
+ uint64_t
+diff --git a/osfmk/vm/vm_compressor_backing_store.c b/osfmk/vm/vm_compressor_backing_store.c
+index a645750c7..eafd8b44b 100644
+--- a/osfmk/vm/vm_compressor_backing_store.c
++++ b/osfmk/vm/vm_compressor_backing_store.c
+@@ -1536,6 +1536,10 @@ vm_swap_create_file()
+ 	}
+ 
+ 	vm_swapfile_open(swf->swp_path, &swf->swp_vp);
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	printf("MONDRIAN SWAP: create %s -> %s\n", swf->swp_path,
++	    swf->swp_vp != NULL ? "ok" : "failed");
++#endif
+ 
+ 	if (swf->swp_vp == NULL) {
+ 		if (swap_file_reuse == FALSE) {

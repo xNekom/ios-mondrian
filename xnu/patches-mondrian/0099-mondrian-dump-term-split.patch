@@ -1,0 +1,25 @@
+xnu 0099: the dump's term list is comma separated
+
+mondriandumpmatch=SMP,CRASH,CODE,memorystatus parsed as "SMP", "SN", "DE"
+and "morystatus": the splitter restored each separator after recording the
+term (so the term still carried the rest of the list) and then advanced by the
+term length again. Keep the NUL in place and step over the separator only.
+The dump then prints one counter, first line and last line per term.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 020381a..727f376 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1298,11 +1298,8 @@ mondrian_log_dump(uint32_t lines)
+ 		size_t len = end ? (size_t)(end - t) : strlen(t);
+ 
+ 		if (len > 0) {
+-			char save = t[len];
+-
+-			t[len] = 0;
++			t[len] = 0;             /* the separator stays NUL */
+ 			term[nterms++] = t;
+-			t[len] = save;
+ 		}
+ 		t = end ? end + 1 : t + len;
+ 	}

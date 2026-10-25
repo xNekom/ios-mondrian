@@ -1,0 +1,99 @@
+xnu 0101: make the sampler one callable sample
+
+Split the sampler loop into mondrian_sample_tick(), one line with the process
+count and the pid/pc of each wanted process. 0100 calls it from the UFS write
+path; the thread keeps calling it with tsleep in between as a fallback. This
+is what shows whether SpringBoard exists and where its first thread sits.
+
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+index 487369a..a38d1ec 100644
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -26,6 +26,7 @@ extern task_t proc_task(proc_t);
+ extern int hz;
+ extern void mondrian_sample_task(const char *name, int pid, task_t task);
+ extern uint64_t mondrian_sample_task_pc(task_t task);
++void mondrian_sample_tick(void);
+ 
+ #define MONDRIAN_SAMPLE_MAX     3
+ 
+@@ -150,41 +151,50 @@ mondrian_sample_proc(proc_t p, __unused void *arg)
+ 	return PROC_RETURNED;
+ }
+ 
+-static void
+-mondrian_sample_thread(__unused void *arg, __unused wait_result_t wr)
++/*
++ * One sample: the process count and, for each wanted name, its pid and the
++ * first thread's user pc. Called from the UFS write path (see 0100) because
++ * the tsleep() timeout stops firing after userland starts, and from the
++ * sampler thread as a slow fallback.
++ */
++void
++mondrian_sample_tick(void)
+ {
+-	static int chan;
++	static bool armed;
+ 
+-	mondrian_parse_names();
++	if (!armed) {
++		armed = true;
++		mondrian_parse_names();
++		printf("MONDRIAN SMP: samples armed (%d names)\n", mondrian_names_count);
++	}
+ 	if (mondrian_names_count == 0 || mondrian_names[0][0] == '-') {
+ 		return;
+ 	}
+-	for (int i = 0; i < 720; i++) {
+-		int tick = hz > 0 ? hz : 100;
+-
+-		mondrian_proc_len = 0;
+-		mondrian_proc_count = 0;
+-		mondrian_proc_list[0] = 0;
+-		for (int k = 0; k < mondrian_names_count; k++) {
+-			mondrian_want_pid[k] = -1;
+-			mondrian_want_pc[k] = 0;
+-		}
+-		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_list, NULL, NULL, NULL);
++	mondrian_proc_len = 0;
++	mondrian_proc_count = 0;
++	mondrian_proc_list[0] = 0;
++	for (int k = 0; k < mondrian_names_count; k++) {
++		mondrian_want_pid[k] = -1;
++		mondrian_want_pc[k] = 0;
++	}
++	proc_iterate(PROC_ALLPROCLIST, mondrian_sample_list, NULL, NULL, NULL);
+ 
+-		printf("SMP %d procs", mondrian_proc_count);
+-		for (int k = 0; k < mondrian_names_count; k++) {
+-			printf(" | %s(%d) pc=0x%llx", mondrian_names[k],
+-			    mondrian_want_pid[k], mondrian_want_pc[k]);
+-		}
+-		printf("\n");
+-
+-		if ((i % 12) == 0) {
+-			printf("SMP --- %d procs\n", mondrian_proc_count);
+-			mondrian_print_list(tick);
+-			mondrian_pause(3 * tick);
+-			proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
+-			mondrian_pause(3 * tick);
+-		}
++	printf("SMP %d procs", mondrian_proc_count);
++	for (int k = 0; k < mondrian_names_count; k++) {
++		printf(" | %s(%d) pc=0x%llx", mondrian_names[k],
++		    mondrian_want_pid[k], mondrian_want_pc[k]);
++	}
++	printf("\n");
++}
++
++static void
++mondrian_sample_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int tick = hz > 0 ? hz : 100;
++
++	for (;;) {
++		mondrian_sample_tick();
+ 		(void)tsleep(&chan, PZERO, "mondriansmp", 5 * tick);
+ 	}
+ }

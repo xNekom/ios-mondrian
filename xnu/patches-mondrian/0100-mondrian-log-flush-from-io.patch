@@ -1,0 +1,207 @@
+xnu 0100: flush the console ring and the sampler from the UFS write path
+
+tsleep() timeouts stop waking kernel threads once userland starts on this
+board: the sampler prints its first line and the log writer flushes the first
+137 lines, then neither ever runs again (measured with the corrected dump).
+Neither can be paced by a timer. Flush the ring from
+mondrian_ufs_strategy() whenever 32 KiB are pending (try_lock, so an I/O in
+progress only defers it) and take one sampler line every 256 calls of the same
+hook. The writer thread stays as the first-flush/fallback path.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 727f376..9b03aed 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -52,6 +52,7 @@ extern void pe_mondrian_gic_dump(void);
+ extern void mondrian_irq_dump(void);
+ extern int hz;
+ void mondrian_log_start(void);
++void mondrian_log_kick(void);
+ static void mondrian_log_dump(uint32_t lines);
+ void mondrian_root_fixups(void);
+ 
+@@ -715,6 +716,7 @@ mondrian_ufs_strategy(buf_t bp)
+ 	 * output (and its kernel_thread_start verdict) was lost.
+ 	 */
+ 	mondrian_sample_start();
++	mondrian_log_kick();
+ 	uint32_t count = buf_count(bp);
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+@@ -1159,76 +1161,105 @@ struct mondrian_log_header {
+ 	uint64_t total, seq;
+ };
+ 
++static uint64_t _Atomic mondrian_log_flushed;
++static int _Atomic mondrian_log_ready;
++static uint32_t _Atomic mondrian_log_seq;
++static uint64_t mondrian_log_base;
++
++#define MONDRIAN_LOG_KICK_BYTES (32u << 10)
++
++/*
++ * Move the ring to the partition. Called from the log thread and, more
++ * importantly, from the UFS write path: the tsleep() timeout that used to pace
++ * this never fires after userland starts on this board (both the sampler and
++ * the log thread wake once and never again), so the writer cannot depend on a
++ * timer. try_lock, never lock: a caller may be in the middle of an I/O.
++ */
+ static void
+-mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
++mondrian_log_store(uint64_t total)
+ {
+-	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
+-	uint64_t flushed = 0, seq = 0;
++	uint64_t flushed, pos;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+-	bool first_flush = true, verified = false;
++	int error = 0;
+ 
+-	printf("MONDRIAN LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
+-	    MONDRIAN_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+-	for (;;) {
+-		uint64_t total, pos;
+-		int error = 0;
++	if (!os_atomic_load(&mondrian_log_ready, relaxed)) {
++		return;
++	}
++	flushed = os_atomic_load(&mondrian_log_flushed, relaxed);
++	if (total <= flushed) {
++		return;
++	}
++	/*
++	 * Write whole device blocks, from the first block that holds unflushed
++	 * data: a partial block would lose the bytes that follow it, and the
++	 * ring is not block aligned.
++	 */
++	pos = (total - flushed >= MONDRIAN_LOG_SIZE) ? total - MONDRIAN_LOG_SIZE : flushed;
++	if (!lck_mtx_try_lock(&mondrian_ufs_lock)) {
++		return;
++	}
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % MONDRIAN_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)(off % UFS_BLOCK) + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(MONDRIAN_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 
+-		if (!first_flush) {
+-			(void)tsleep(&mondrian_log_chan, PZERO, "mondrianlog", MONDRIAN_LOG_TICKS * hz);
+-		}
+-		first_flush = false;
+-		total = os_atomic_load(&mondrian_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
++		memcpy(bounce, mondrian_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(mondrian_log_base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
+ 		struct mondrian_log_header h = {
+ 			.magic = { 'M', 'O', 'N', 'D', 'L', 'O', 'G' },
+-			.version = 1, .size = MONDRIAN_LOG_SIZE, .total = total, .seq = ++seq
++			.version = 1, .size = MONDRIAN_LOG_SIZE, .total = total,
++			.seq = (uint64_t)(os_atomic_add_orig(&mondrian_log_seq, 1, relaxed) + 1)
+ 		};
+-		/*
+-		 * Write whole device blocks, from the first block that holds
+-		 * unflushed data: a partial block would lose the bytes that
+-		 * follow it, and the ring is not block aligned.
+-		 */
+-		pos = (total - flushed >= MONDRIAN_LOG_SIZE) ? total - MONDRIAN_LOG_SIZE : flushed;
+-		lck_mtx_lock(&mondrian_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % MONDRIAN_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)(off % UFS_BLOCK) + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(MONDRIAN_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-
+-			memcpy(bounce, mondrian_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_flush();
+-		}
+-		if (!error && !verified) {
+-			error = ufs_read_blocks(base, 1);
+-			if (!error && memcmp(bounce, &h, sizeof(h)) != 0) {
+-				error = EIO;
+-			}
+-			if (!error) {
+-				verified = true;
+-				printf("MONDRIAN LOG: initial header verified (total %llu, seq %llu)\n",
+-				    total, h.seq);
+-			}
+-		}
+-		lck_mtx_unlock(&mondrian_ufs_lock);
+-		if (error) {
+-			printf("MONDRIAN LOG: flush failed at total %llu (%d), stopping\n",
+-			    total, error);
+-			return;
+-		}
+-		flushed = total;
++
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(mondrian_log_base, 1);
++	}
++	if (!error) {
++		error = ufs_flush();
++	}
++	lck_mtx_unlock(&mondrian_ufs_lock);
++	if (error) {
++		printf("MONDRIAN LOG: flush failed at total %llu (%d)\n", total, error);
++		return;
++	}
++	os_atomic_store(&mondrian_log_flushed, total, relaxed);
++}
++
++/* Called from the UFS write path, which runs throughout the boot. */
++void
++mondrian_log_kick(void)
++{
++	uint64_t total = os_atomic_load(&mondrian_log_total, relaxed);
++
++	static uint32_t calls;
++
++	if (total - os_atomic_load(&mondrian_log_flushed, relaxed) >= MONDRIAN_LOG_KICK_BYTES) {
++		mondrian_log_store(total);
++	}
++	/*
++	 * The sampler has the same dead timeout, so give it this clock too:
++	 * one line every 256 write-path calls.
++	 */
++	if ((++calls & 0xff) == 0) {
++		extern void mondrian_sample_tick(void);
++		mondrian_sample_tick();
++	}
++}
++
++static void
++mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	printf("MONDRIAN LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
++	    MONDRIAN_LOG_BLOCKS * UFS_BLOCK >> 10, mondrian_log_base);
++	for (;;) {
++		mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed));
++		(void)tsleep(&mondrian_log_chan, PZERO, "mondrianlog", MONDRIAN_LOG_TICKS * hz);
+ 	}
+ }
+ 
+@@ -1386,6 +1417,8 @@ mondrian_log_start(void)
+ 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
+ 		return;
+ 	}
++	mondrian_log_base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	os_atomic_store(&mondrian_log_ready, 1, relaxed);
+ 	kr = kernel_thread_start(mondrian_log_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		started = 1;
