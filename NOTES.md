@@ -30,10 +30,10 @@ Verified on the phone:
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
 - **iOS userland.** `0089` handles root-auth ENOTTY; SpringBoard (27) and
-  backboardd (57) survive; the ring captures 773 lines. AMFI's wrong policy
-  name made dyld drop `DYLD_INSERT_LIBRARIES` from `0106`; `0108` fixes it.
-  Hook/UI are untested. `ui3` made four black swaps; `CA_ENABLE_MBX2D=0` opened
-  no framebuffer; `driverkitd` hits jetsam namespace 1/code 7.
+  backboardd (57) survive; the ring captures 48 KiB. `0108` confirms both
+  dylibs load. backboardd installs `_detectDisplays`, but never calls it and
+  opens no framebuffer client. UI is unverified; `CA_ENABLE_MBX2D=0` also opens
+  no FB; `driverkitd` hits jetsam namespace 1/code 7.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`

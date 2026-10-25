@@ -59,8 +59,11 @@ persistent ring captures them). dyld honours `DYLD_INSERT_LIBRARIES` only when
 the MAC policy registered as `AMFI` answers `__mac_syscall` 0x5a (`0108`); under
 the old policy name it silently dropped the variable. Build with
 `tools/build-mondrian-ui-hook.sh`, then include it in the root with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `MONDRIAN UI:` lines in the
-ring prove the library loaded; the UI itself is not yet confirmed on-device.
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. The first 0108 run confirms
+injection into containermanagerd and backboardd and installs backboardd's
+`_detectDisplays` hook, but the callback does not run and no framebuffer user
+client opens. The remaining blocker is display startup inside backboardd;
+visible UI is not yet confirmed.
 
 ## Safety: what can and cannot brick the phone
 
