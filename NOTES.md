@@ -30,8 +30,8 @@ Verified on the phone:
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
 - **iOS userland.** Root-auth fails with ENOTTY and `0089` continues; launchd
-  registers dyld, runs boot tasks, and starts backboardd/HID. `exec SpringBoard`
-  is observed, but a visible UI is not confirmed.
+  runs its boot tasks and the sampler finds **SpringBoard alive (pid 27, 78
+  processes)**. backboardd came and went; no visible UI yet.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`

@@ -1,0 +1,38 @@
+xnu 0102: one detailed sampler dump with thread backtraces
+
+The one-line sample proved SpringBoard exists (pid 27) but not what it waits
+on. Once the process list has more than 20 entries, print every thread of each
+wanted process with pc/lr/sp and a frame-pointer backtrace (the existing
+mondrian_sample_task()), once per boot.
+
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+index a38d1ec..e762c6c 100644
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -160,7 +160,7 @@ mondrian_sample_proc(proc_t p, __unused void *arg)
+ void
+ mondrian_sample_tick(void)
+ {
+-	static bool armed;
++	static bool armed, dumped;
+ 
+ 	if (!armed) {
+ 		armed = true;
+@@ -185,6 +185,17 @@ mondrian_sample_tick(void)
+ 		    mondrian_want_pid[k], mondrian_want_pc[k]);
+ 	}
+ 	printf("\n");
++
++	/*
++	 * Once the process list is populated, dump every thread of the wanted
++	 * processes with its pc/lr/sp and frame-pointer backtrace: the pc
++	 * alone says whether it waits in mach_msg, but not for what.
++	 */
++	if (!dumped && mondrian_proc_count > 20) {
++		dumped = true;
++		printf("SMP --- detailed sample, %d procs\n", mondrian_proc_count);
++		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
++	}
+ }
+ 
+ static void
