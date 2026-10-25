@@ -3,13 +3,14 @@ xnu 0103: wake the log writer from the console stream
 After boot the root sees almost no UFS writes, so the write-path trigger
 (0100) stops flushing and the ring only held the first ~40 KiB: SpringBoard
 was visible in one sample but the later CRASH/backtrace lines were lost. Wake
-the writer from mondrian_log_append() with wakeup() every 32 KiB; the writer
-blocks on assert_wait/thread_block instead of tsleep, and takes a sampler line
-every eighth wake. wakeup() is safe from interrupt context, where the tee
-also runs.
+the writer from mondrian_log_append() with wakeup() every 32 KiB once
+mondrian_log_start() has armed the thread (the tee runs from the first printf,
+long before the scheduler exists), and have the writer block on
+assert_wait/thread_block instead of tsleep, taking a sampler line every eighth
+wake. wakeup() is safe from interrupt context, where the tee also runs.
 
 diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
-index 9b03aed..3b6e053 100644
+index 9b03aed..df52666 100644
 --- a/bsd/dev/mondrian_ufs.c
 +++ b/bsd/dev/mondrian_ufs.c
 @@ -35,6 +35,8 @@
@@ -21,7 +22,7 @@ index 9b03aed..3b6e053 100644
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
  #include <vm/pmap.h>
-@@ -1137,7 +1139,10 @@ mondrian_ufs_rootdev(dev_t *dev)
+@@ -1137,7 +1139,11 @@ mondrian_ufs_rootdev(dev_t *dev)
  #define MONDRIAN_LOG_TICKS      5
  
  static char mondrian_log_ring[MONDRIAN_LOG_SIZE];
@@ -29,18 +30,23 @@ index 9b03aed..3b6e053 100644
 +
  static uint64_t _Atomic mondrian_log_total;
 +static uint64_t _Atomic mondrian_log_next_wake;
++static int _Atomic mondrian_log_ready;
  static int mondrian_log_chan;
  
  /* Called for every console character, in any context: never blocks. */
-@@ -1153,6 +1158,16 @@ mondrian_log_append(const char *c, int size)
+@@ -1153,6 +1159,20 @@ mondrian_log_append(const char *c, int size)
  	for (int i = 0; i < size; i++) {
  		mondrian_log_ring[(at + (uint64_t)i) % MONDRIAN_LOG_SIZE] = c[i];
  	}
 +	/*
 +	 * Wake the writer from the console stream itself: after boot there is
-+	 * almost no UFS write traffic, and the tsleep() timeout is dead. wakeup()
-+	 * is safe from any context, including an interrupt.
++	 * almost no UFS write traffic, and the tsleep() timeout is dead. Never
++	 * before mondrian_log_start() has armed the thread: the tee runs from
++	 * the first printf, when the scheduler does not exist yet.
 +	 */
++	if (!os_atomic_load(&mondrian_log_ready, relaxed)) {
++		return;
++	}
 +	if (at + (uint64_t)size >= os_atomic_load(&mondrian_log_next_wake, relaxed)) {
 +		os_atomic_store(&mondrian_log_next_wake, at + (uint64_t)size + MONDRIAN_LOG_KICK_BYTES,
 +		    relaxed);
@@ -49,7 +55,11 @@ index 9b03aed..3b6e053 100644
  }
  
  struct mondrian_log_header {
-@@ -1166,8 +1181,6 @@ static int _Atomic mondrian_log_ready;
+@@ -1162,12 +1182,9 @@ struct mondrian_log_header {
+ };
+ 
+ static uint64_t _Atomic mondrian_log_flushed;
+-static int _Atomic mondrian_log_ready;
  static uint32_t _Atomic mondrian_log_seq;
  static uint64_t mondrian_log_base;
  
@@ -58,7 +68,7 @@ index 9b03aed..3b6e053 100644
  /*
   * Move the ring to the partition. Called from the log thread and, more
   * importantly, from the UFS write path: the tsleep() timeout that used to pace
-@@ -1257,9 +1270,16 @@ mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -1257,9 +1274,16 @@ mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
  	printf("MONDRIAN LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
  	    MONDRIAN_LOG_BLOCKS * UFS_BLOCK >> 10, mondrian_log_base);
@@ -76,3 +86,12 @@ index 9b03aed..3b6e053 100644
  	}
  }
  
+@@ -1418,6 +1442,8 @@ mondrian_log_start(void)
+ 		return;
+ 	}
+ 	mondrian_log_base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	os_atomic_store(&mondrian_log_next_wake,
++	    os_atomic_load(&mondrian_log_total, relaxed) + MONDRIAN_LOG_KICK_BYTES, relaxed);
+ 	os_atomic_store(&mondrian_log_ready, 1, relaxed);
+ 	kr = kernel_thread_start(mondrian_log_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {

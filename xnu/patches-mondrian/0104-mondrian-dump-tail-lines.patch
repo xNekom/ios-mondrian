@@ -1,0 +1,44 @@
+xnu 0104: the dump prints the last six matches per term
+
+First and last are not enough for a multi-line block: the detailed sampler
+dump of SpringBoard prints a header and one line per thread, and only the last
+of them survived. Keep a six-line ring per term and print it after the first
+line, so a photo carries the whole thread set.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index df52666..88f9c4e 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1319,7 +1319,7 @@ static void
+ mondrian_log_dump(uint32_t lines)
+ {
+ 	static char text[MONDRIAN_LOG_SIZE + 1];
+-	static char first[4][80], last[4][80];
++	static char first[4][80], last[4][6][80];
+ 	static uint32_t hits[4];
+ 	char terms[128] = "SMP";
+ 	char *term[4];
+@@ -1403,7 +1403,7 @@ mondrian_log_dump(uint32_t lines)
+ 				if (first[t][0] == 0) {
+ 					snprintf(first[t], sizeof(first[t]), "%s", start);
+ 				}
+-				snprintf(last[t], sizeof(last[t]), "%s", start);
++				snprintf(last[t][hits[t] % 6], sizeof(last[t][0]), "%s", start);
+ 			}
+ 		}
+ 		if (stop == 0) {
+@@ -1416,8 +1416,13 @@ mondrian_log_dump(uint32_t lines)
+ 	for (uint32_t t = 0; t < nterms; t++) {
+ 		printf("MONDRIANDUMP: \"%s\" %u hits\n", term[t], hits[t]);
+ 		if (hits[t] != 0) {
++			uint32_t n = hits[t] < 6 ? hits[t] : 6;
++
+ 			printf("  first | %s\n", first[t]);
+-			printf("  last  | %s\n", last[t]);
++			for (uint32_t i = 0; i < n; i++) {
++				printf("  tail  | %s\n",
++				    last[t][(hits[t] + 6 - n + i) % 6]);
++			}
+ 		}
+ 	}
+ 	printf("MONDRIANDUMP: end\n");
