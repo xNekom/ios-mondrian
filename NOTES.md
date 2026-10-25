@@ -11,7 +11,7 @@ learn. The work list, the hardware delta and the partition safety rules are in
 implementation and is not re-described here: `xnu/patches/` and the upstream
 README are its record.
 
-## State (2026-10-23)
+## State (2026-10-25)
 
 Verified on the phone:
 
@@ -32,24 +32,25 @@ Verified on the phone:
 - **No dual boot.** The shim has no menu: it only ever loads the payload it
   carries, so there is nothing to choose and five seconds less to wait.
   `boot_b` carries the current shim and payload; `fastboot boot` is for tests.
-- **iOS userland runs.** With the real root in `userdata`, `FSIOC_KERNEL_ROOTAUTH`
-  fails with `error 25` (ENOTTY: HFS has no such ioctl) and `0089` continues;
-  `/sbin/launchd` starts as pid 1, libignition registers the dyld shared
-  cache, and launchd runs its boot tasks. It gets as far as `backboardd`
-  loading its HID plugins and opening `MondrianHIDTouch`.
-- **The root is read-write.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the
-  write half of the block device; `DKIOCISWRITABLE` had to say so too, or HFS
-  keeps `HFS_WRITEABLE_MEDIA` off and never writes at all.
-- **Recovery path.** `boot_a` keeps the stock Android image and `fastboot
-  boot` writes nothing: experiments are volatile unless the image is installed.
+- **iOS userland.** Root-auth fails with ENOTTY and `0089` continues; launchd
+  registers dyld, runs boot tasks, and starts backboardd/HID. `exec SpringBoard`
+  is observed, but a visible UI is not confirmed.
+- **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
+  path; `DKIOCISWRITABLE` must agree or HFS disables writes.
+- **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
+  disables kernel text at the first swap; later logs are not panel output.
+- **Recovery.** `boot_a` remains stock; `fastboot boot` is volatile.
 
-Current blocker, in order:
+Current blockers, in order:
 
-1. **Volume layout.** launchd expects a Data volume and
-   `/private/preboot/<hash>/usr/standalone/firmware`; the flattened HFS root
-   has one volume and a `private/preboot/Cryptexes` directory, so those boot
-   steps fail (they do not stop launchd). Grow the paths in the root image.
-2. **Then:** the display presentation (`0085`), touch and USB.
+1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware, containers
+   and `/private/var/vm`. Swap error 2 is ENOENT; rebuild with the tweaks if it
+   recurs. Flattened HFS still lacks a separate Data volume.
+2. **Pid-1 diagnosis.** Framebuffer text can be stale. Namespace 1/code 0xe is
+   `JETSAM_REASON_MEMORY_SUSTAINED_PRESSURE`; `CS_KILLED` separately marks invalid pages.
+   Read `CODE SIGNING`/`CRASH` before changing AMFI or Sandbox.
+3. **UI.** SpringBoard exec is observed; visible presentation and touch remain
+   unverified.
 
 ```sh
 tools/build-kernel-local.sh                        # -> /tmp/kernel.development.mondrian
@@ -80,18 +81,17 @@ Xcode's `iig` fails with `no member named 'kernelContent' in 'IORPC'`, so
 volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
 
-**Reading a boot.** A boot writes several screens and nothing scrolls, so the
-line that matters is off the panel before it can be photographed: the read
-path is storage, not pixels. `0096` keeps every console character (kernel
-`printf` and the daemons' `/dev/console`) in a 4 MiB ring and rewrites the
-dirty blocks to the last 4 MiB of `userdata` every 5 s; read the previous
-boot with `tools/phone-deploy.sh logview` + `fastboot boot`, or from a
-recovery with `tools/ios-log-pull.sh`. Count what repeats (`0093`).
+**Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
+ring; `0097` starts persistence after root mount, flushes immediately, and
+verifies the header by reading it back. To inspect a previous boot, first run
+the real kernel, then boot a dump kernel with `mondriandump=1` and
+  `mondriandumpmatch=SMP,CRASH,CODE,memorystatus`. The dump reads the
+  prior ring before starting its own writer. The shim `logview` is unreliable
+  on this UFS host; do not use it for diagnosis.
 
-**Host-side testing.** `tools/qemu-ios.py` boots the same payload and decodes
-the framebuffer text; see `docs/QEMU_TESTING.md`. Note that `--kernel` only
-feeds the text decoder: the kernel comes from the payload, so a new kernel needs
-a rebuilt payload or the run silently boots the old one.
+**Host-side testing.** `tools/qemu-ios.py` boots the same payload; see
+`docs/QEMU_TESTING.md`. `--kernel` only feeds the decoder: rebuild the payload
+or QEMU silently boots the old kernel.
 
 ## Measured hardware facts
 
@@ -269,9 +269,8 @@ framebuffer at 1440x3200. What follows from it:
 - `0084` paints four colour bars in the two rows the console leaves free: one
   photo says whether the packing is XRGB or XBGR, whether alpha is honoured
   and whether 1440 is the live width.
-- `0085` is sweet's IOSurface + IOMobileFramebuffer pair ported to this board
-  (`AppleCLCD` on `/arm-io/disp0`). It lives on branch **`display`** and is
-  deliberately not in the active series until the root mounts.
+- `0085` ports sweet's IOSurface + IOMobileFramebuffer pair to `AppleCLCD` on
+  `/arm-io/disp0`; backboardd swaps are observed. The visible UI is unverified.
 - Sweet's `0056` (present at most every few vsyncs) and `0079`
   (`RequestPowerChange`, the panel-off fade that the power button uses) have
   to be rebased onto the mondrian framebuffer driver when they are needed.

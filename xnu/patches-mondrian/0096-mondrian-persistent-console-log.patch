@@ -15,10 +15,10 @@ size, u64 total bytes written, u64 flush sequence; byte n of the stream is at
 ring offset n % ring size. The area is behind the HFS image, which starts at
 the partition's first block.
 
-Read it back with the log viewer shim (shim/build.sh with LOGVIEW=1, started
-with fastboot boot: it reads the area, prints the last screenful and stops) or
-from a recovery with adb and tools/ios-log-pull.sh. Boot-arg mondrianlog=0
-turns it off.
+Read a previous boot by starting a dump kernel with boot-arg
+mondriandump=1; it scans the ring and prints selected first/last matches before
+stopping. The shim log viewer is unreliable on this UFS host. Boot-arg
+mondrianlog=0 turns persistence off.
 
 diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
 --- a/osfmk/console/serial_console.c
@@ -97,10 +97,10 @@ diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
 + *   "MONDLOG" | u32 version 1 | u32 ring size | u64 total bytes written
 + *   | u64 flush sequence
 + *
-+ * and byte n of the console stream is at ring offset n % ring size. Read it
-+ * back by booting the log viewer shim (`shim/build.sh` with LOGVIEW=1, started
-+ * with `fastboot boot`), or from a recovery with adb using
-+ * tools/ios-log-pull.sh. Boot-arg mondrianlog=0 turns it off.
++ * and byte n of the console stream is at ring offset n % ring size. Read a
++ * previous boot with a dump kernel (`mondriandump=1`), which prints selected
++ * first/last matches before stopping. The shim log viewer is unreliable on
++ * this UFS host. Boot-arg mondrianlog=0 turns persistence off.
 + */
 +#define MONDRIAN_LOG_SIZE       (4u << 20)
 +#define MONDRIAN_LOG_BLOCKS     (1 + MONDRIAN_LOG_SIZE / UFS_BLOCK)

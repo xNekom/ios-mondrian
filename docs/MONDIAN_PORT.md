@@ -41,12 +41,13 @@ needs, and where the numbers come from. The boot history and the traps are in
 | `xnu/patches-mondrian/0003`–`0055` | the generic half of the sweet series, ported (RAM disk root, AMFI, HFS+, BearSSL, console, crash log, HID, SMP, iPhone identity) |
 | `xnu/patches-mondrian/0056`–`0062` | page-size work (commpage, zone map VA, bootstrap VA, no physical timer, framebuffer alias) and the first UFS root device (`0059`); `0058` is gone with the 4 KiB software page size |
 | `xnu/patches-mondrian/0063`–`0082`, `0086` | the boot diagnostics and the UFS 3.1 root device |
-| `xnu/patches-mondrian/0083`–`0084`, `0087`, `0088` | panel memory reservation, colour-bar self-test, GIC remap after the VM, VFS_ROOT errno |
+| `xnu/patches-mondrian/0083`–`0085`, `0087`–`0088` | panel memory reservation, colour-bar self-test, framebuffer presentation, GIC remap after the VM, VFS_ROOT errno |
 | `tools/apply-series.py`, `tools/check-patches.sh` | apply a series to a fresh xnu tree in seconds and report what does not apply |
 | `tools/port-series.py` | ports a patch of the sweet series, renaming the board identifiers, and lists the hardware patches it skips |
 
-`0085` (the framebuffer driver) lives on branch `display` and is merged only
-once the root mounts.
+`0085` (the framebuffer presentation driver) is in this series. It presents
+userland IOSurface swaps on the framebuffer; the visible SpringBoard UI remains
+to be confirmed on-device.
 
 ## Safety: what can and cannot brick the phone
 
@@ -143,35 +144,32 @@ authentication).
 
 ### 1. The iOS root
 
-Reads work end to end (UFS → GPT → `userdata` → HFS), and with the real
-iOS 16 root built by `tools/mkiosroot.sh` on `userdata` the boot reaches
-launchd: pid 1 runs libignition, registers the dyld shared cache and starts
-its boot tasks. Two things stop it: the root is read-only (the block device
-has no write path) and launchd expects a Data volume and
-`/private/preboot/<uuid>`, which a flattened HFS root does not have.
+Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the iOS
+16 root built by `tools/mkiosroot.sh` and prepared by `tools/ios-root-tweaks.py`,
+launchd runs boot tasks, backboardd opens the mondrian HID services, and
+`exec SpringBoard` is observed. The flattened HFS root is not a stock volume
+layout: launchd still expects a Data volume and
+`/private/preboot/<uuid>/usr/standalone/firmware`.
 
-The persistent console log is ported (`0096`): every console character,
-kernel or daemon, goes to a 4 MiB ring that is rewritten into the last 4 MiB of
-`userdata` every 5 s. It is the only record of a userland that hangs — the
-console cannot scroll and the USB stack is not up — so read it with the viewer
-shim (`tools/phone-deploy.sh logview`, then `fastboot boot`) before assuming
-what a boot did or did not print.
+The persistent console log is `0096`; `0097` starts its writer after root mount,
+flushes immediately, and verifies the initial header. Read a prior boot with
+`mondriandump=1` and
+`mondriandumpmatch=SMP,CRASH,CODE,memorystatus`. The log-viewer shim is unreliable
+on this UFS host, so use the kernel dump path instead.
 
 ### 2. The UFS root device
 
-The driver is read-only (`mondrian_ufs_write()` returns `EROFS`) and its
-commands do not touch the medium, so nothing here can damage the table. The
-bring-up sequence, the register state and the GPT-reader overflow debt are in
-`NOTES.md`. Writes landed with `0090` (WRITE(10), read-modify-write and
-SYNCHRONIZE CACHE); `tools/backup-gpt.sh` records both copies of the GPT.
+The driver supports WRITE(10), read-modify-write and SYNCHRONIZE CACHE through
+`0090`; `tools/backup-gpt.sh` records both GPT copies. The bring-up sequence,
+register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 
 ### 3. The display
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
-is not on the critical path. Outstanding: `0083` (panel memory off the free
-list), `0084` (colour bar self-test: XRGB vs XBGR, alpha, width) and `0085`
-(sweet's IOSurface + IOMobileFramebuffer pair, branch `display`), plus the
-rebases of sweet `0056`/`0079` (present rate, `RequestPowerChange`).
+is not on the critical path. `0083` reserves panel memory, `0084` tests pixel
+packing, and `0085` presents backboardd swaps; a swap is observed, but a usable
+SpringBoard UI is not yet confirmed. Remaining display work is the rebase of
+sweet `0056`/`0079` (present rate, `RequestPowerChange`).
 If the scanout ever stops, the fallback is a real MDSS driver: the
 `qcom,mdss_mdp@ae00000` node, the panel
 `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, and the gamma/DSC tables from the
@@ -196,9 +194,9 @@ sweet's static `IOPMPowerSource` stub for the first bring-up.
 
 Sweet's stack (0072–0077, 0081) is a DWC3 driver for SM7150. SM8475 has DWC3
 as well, with a different configuration space and a USB3 PHY that needs its
-own clock and power sequencing. The network path is what made sweet's bring-up
-possible without a screen; here the log viewer shim already covers that need,
-so USB buys live logs, not logs.
+own clock and power sequencing. The network path made sweet's bring-up possible
+without a screen; mondrian uses a dump kernel to read prior logs, so USB is for
+live diagnostics rather than a prerequisite for log access.
 
 ## Getting the numbers off the device
 
