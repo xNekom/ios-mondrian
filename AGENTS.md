@@ -16,20 +16,23 @@ Pro, SM8475) is the port being done here.
 - The board table lives in `tools/boards.py`; the shim has its own copy in
   `shim/board.h`. Change both together, and prefer reading the live device
   tree (the shim prints it) over guessing a number.
-- **Hardware safety outranks persistence (policy, 2026-10-23).** The
+- **Hardware safety outranks persistence (policy, 2026-10-25).** This phone is
+  a dedicated test unit: the high-level partitions may be erased and flashed
+  freely — including `userdata`, which holds the iOS root — without a
+  workstation backup, because a reachable fastboot restores the device. The
   firmware-level partition set (`xbl`, `xbl_config`, `abl`, `tz`, `hyp`,
   `modem*`, `persist`, `uefi*`/`uefisecapp` and every other low-level image the
-  stock ROM ships) is never written: a cooked image there bricks the boot chain
-  irreversibly. Writable storage is the high-level set only — `boot_<slot>`
-  (the shim boots from slot b; `boot_a` keeps the stock Android escape hatch
-  and the deploy tooling refuses it), `vendor_boot` (only with a verified dump
+  stock ROM ships) is still never written: a cooked image there bricks the boot
+  chain irreversibly. Writable storage is the high-level set only — `boot_<slot>`
+  (the shim boots from slot b; `boot_a` keeps the stock Android escape hatch and
+  the deploy tooling refuses it), `vendor_boot` (only with a verified dump
   first: the shim reads its live device tree), `init_boot`/`recovery` if
   present, and `userdata` (the iOS root; wiping Android data there is
-  acceptable and recoverable). Every definitive write needs the graded
-  safeguards: a proven `fastboot boot` of the same image, `fastboot getvar
-  current-slot` to name the target, and verified originals in `backup/`
-  (`SHA256SUMS`). The stock fastboot ROM is the disaster-recovery baseline.
-  `tools/flash-root.sh` (userdata) still asks before every flash.
+  acceptable and recoverable). Before any `boot_<slot>` write, prove the same
+  image with `fastboot boot` and pin the target with `fastboot getvar
+  current-slot`; `tools/flash-root.sh` (userdata) still asks before every
+  flash. Keep the stock fastboot ROM available when convenient, but fastboot
+  access is the real disaster baseline.
 - **Never build an image from guessed addresses.** The shim takes the
   framebuffer and the UFS host from the device tree, and `mkadt.py` /
   `mkpayload.py` refuse a board whose values are still provisional

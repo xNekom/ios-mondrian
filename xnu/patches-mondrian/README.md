@@ -20,7 +20,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0003`–`0055` | the generic half of the sweet series: RAM disk root, mockfs, AMFI, HFS+, BearSSL, the console, the crash log, the HID services, the SMP and the iPhone identity |
 | `0056`–`0062` | the page-size work (commpage, zone map VA, bootstrap VA zone, no physical timer write, framebuffer alias reservation) and the first UFS 3.1 root device (`0059`); `0058` went away with the 4 KiB software page size |
 | `0063`–`0069` | boot diagnostics and the interrupt path: `bsd_init` trail, console beacon, EL1 timer interrupt |
-| `0070`–`0082`, `0086`, `0090`–`0107` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`), the console's 64-bit clear (`0092`), bounded key-store calls (`0093`), the duplicate-surface lookup backboardd needs (`0094`), the userland sampler (`0095`), persistent logging with post-root startup and readback verification (`0096`–`0097`), the iOS swap path and `/private/var/vm` (`0098`), the dump's comma-separated term list (`0099`), the log/sampler paced by the UFS write path instead of dead timeouts (`0100`–`0101`), the one-shot detailed sampler dump (`0102`), the writer woken by console output (`0103`), the dump's six-line tails (`0104`), the console tee at the funnel point (`0105`), the opt-in personas/display diagnostics (`0106`) and the lost-wakeup/exit-log fix (`0107`) |
+| `0070`–`0082`, `0086`, `0090`–`0108` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`), the console's 64-bit clear (`0092`), bounded key-store calls (`0093`), the duplicate-surface lookup backboardd needs (`0094`), the userland sampler (`0095`), persistent logging with post-root startup and readback verification (`0096`–`0097`), the iOS swap path and `/private/var/vm` (`0098`), the dump's comma-separated term list (`0099`), the log/sampler paced by the UFS write path instead of dead timeouts (`0100`–`0101`), the one-shot detailed sampler dump (`0102`), the writer woken by console output (`0103`), the dump's six-line tails (`0104`), the console tee at the funnel point (`0105`), the opt-in personas/display diagnostics (`0106`), the lost-wakeup/exit-log fix (`0107`) and the `AMFI` dyld-policy answer that lets inserted libraries load (`0108`) |
 | `0083`–`0085` | panel memory reservation, colour-bar self-test, IOSurface/IOMobileFramebuffer presentation |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 
@@ -37,15 +37,15 @@ tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 
 The CI **skips** a patch that does not apply and still reports success, so run
 the command above (or `tools/check-patches.sh`) before pushing. It reports
-106/106 for the current series. Two traps it catches: `git apply` rejects a hunk
+107/107 for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
-ran.
+ran. A *cancelled* job is reported as `failure` too.
 
 `tools/validate-repo.py` is stricter than `git apply`, and three of its
 findings on this series are known and harmless: the prose preamble of `0087`
 (its diff starts further down, which `git apply` accepts) and a hunk count in
-`0060`. All 105 patches apply with `git apply`; CI validates the kernel build.
+`0060`. All 107 patches apply with `git apply`; CI validates the kernel build.
 
 ## What is still missing
 

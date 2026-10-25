@@ -54,10 +54,13 @@ dylib into containermanagerd and backboardd only with `mondrian_ui_hook=1`.
 It disables personas after validating the Objective-C method signature and
 traces `CAWindowServer._detectDisplays` by runtime lookup, without borrowed
 shared-cache offsets. The framebuffer client lifecycle, selectors and swaps
-are logged in the kernel. Build with `tools/build-mondrian-ui-hook.sh`, then
-include it in a newly built root with `MONDRIAN_UI_HOOK_DYLIB=...`. This test
-is not verified on-device; do not write it into `userdata` until its original
-has a verified workstation backup.
+are logged in the kernel; the dylib's own traces go to `/dev/console` (the
+persistent ring captures them). dyld honours `DYLD_INSERT_LIBRARIES` only when
+the MAC policy registered as `AMFI` answers `__mac_syscall` 0x5a (`0108`); under
+the old policy name it silently dropped the variable. Build with
+`tools/build-mondrian-ui-hook.sh`, then include it in the root with
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `MONDRIAN UI:` lines in the
+ring prove the library loaded; the UI itself is not yet confirmed on-device.
 
 ## Safety: what can and cannot brick the phone
 
@@ -95,14 +98,14 @@ copy can break verified boot or device-tree delivery: `vbmeta`, `dtbo`.
    leaves the phone in fastboot and nothing worse.
 2. **Name the target.** `fastboot getvar current-slot`; the write pins to that
    `boot_<slot>`, so `boot_a` is never hit by accident.
-3. **Verified originals.** Dump the target, pull it to `backup/`, record it in
-   `SHA256SUMS` and check the sum before writing. The copy on the phone dies
-   with the next `userdata` wipe; the one on the workstation is the durable
-   one.
+3. **Verified originals.** For `boot_<slot>` and `vendor_boot`, dump the
+   target, pull it to `backup/`, record it in `SHA256SUMS` and check the sum
+   before writing. `userdata` is exempt on this test unit: it is erased and
+   rewritten freely, and a reachable fastboot is the recovery path.
 4. **Write, read back, reboot, confirm the slot** the next boot came from.
 5. **Keep the disaster baseline.** The complete stock fastboot ROM of this
-   exact model restores every allow-list partition; keep it on disk before the
-   first definitive write.
+   exact model restores every allow-list partition; keep it on disk when
+   convenient. The hard requirement is that fastboot stays reachable.
 
 Two rules cover the other failure mode, writing to the wrong place:
 

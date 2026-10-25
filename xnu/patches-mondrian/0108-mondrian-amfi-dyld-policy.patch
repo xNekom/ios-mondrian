@@ -1,0 +1,97 @@
+xnu 0108: answer the AMFI policy call that gates dyld's environment
+
+The diagnostic dylib never ran: dyld silently ignores DYLD_INSERT_LIBRARIES
+unless the MAC policy registered under the exact name "AMFI" answers
+__mac_syscall 0x5a ("check dyld policy"). The stand-in was registered as
+"MONDRIAN AMFI", so the call failed with ENOPOLICY and nothing was logged.
+Register as "AMFI", return 0xff for 0x5a (@paths, the DYLD_* variables,
+inserted libraries and interposing) and the AMFI-disabling bits for 0x60
+("query boot-arg state"), as HackiOS's miniamfi does. The latter also stops
+ExtensionKit from waiting for a signature check this kernel cannot perform.
+
+diff --git a/bsd/kern/mondrian_amfi.c b/bsd/kern/mondrian_amfi.c
+--- a/bsd/kern/mondrian_amfi.c
++++ b/bsd/kern/mondrian_amfi.c
+@@ -26,8 +26,10 @@
+ #include <kern/debug.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
++#include <libkern/copyio.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/errno.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -302,11 +304,53 @@
+ 		return ENOENT;
+ 	default:
+ 		return 0;
++	}
++}
++
++/*
++ * dyld asks the AMFI policy, through __mac_syscall(), what it may do for the
++ * process it is starting. The lookup is by name, and the name is "AMFI": a
++ * policy registered as "MONDRIAN AMFI" is invisible to that call, which then
++ * returns ENOPOLICY and makes dyld silently ignore DYLD_INSERT_LIBRARIES --
++ * the diagnostic dylib is never loaded, with no error anywhere. Request
++ * 0x5a ("check dyld policy") carries { flags in, address of flags out } and
++ * gates @paths, the DYLD_* variables, inserted libraries and interposing;
++ * 0xff allows all of them. Request 0x60 ("query boot-arg state") points at
++ * 64 bits, one per AMFI-disabling boot argument; 0x86 marks one as set, so
++ * ExtensionKit does not wait for a signature check this kernel cannot do.
++ */
++#define MONDRIAN_AMFI_CHECK_DYLD_POLICY 0x5a
++#define MONDRIAN_AMFI_DYLD_ALLOW_ALL    0xffULL
++#define MONDRIAN_AMFI_QUERY_BOOTARGS    0x60
++#define MONDRIAN_AMFI_NOT_ENFORCING     0x86ULL
++
++static int
++mondrian_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = MONDRIAN_AMFI_DYLD_ALLOW_ALL;
++	uint64_t state = MONDRIAN_AMFI_NOT_ENFORCING;
++	int error;
++
++	if (call == MONDRIAN_AMFI_QUERY_BOOTARGS) {
++		return copyout(&state, arg, sizeof(state));
+ 	}
++	if (call != MONDRIAN_AMFI_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
+ }
+ 
+ static const struct mac_policy_ops mondrian_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = mondrian_amfi_vnode_check_signature,
++	.mpo_policy_syscall = mondrian_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +404,7 @@
+ static mac_policy_handle_t mondrian_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf mondrian_amfi_mac_conf = {
+-	.mpc_name = "MONDRIAN AMFI",
++	.mpc_name = "AMFI",
+ 	.mpc_fullname = "MONDRIAN built-in Mobile File Integrity",
+ 	.mpc_ops = &mondrian_amfi_mac_ops,
+ };
+@@ -374,7 +418,7 @@
+ mondrian_amfi_policy_register(void)
+ {
+ 	int error = mac_policy_register(&mondrian_amfi_mac_conf, &mondrian_amfi_mac_handle, NULL);
+-	printf("MONDRIAN AMFI: platform binary policy %s (%d)\n",
++	printf("MONDRIAN AMFI: platform binary and dyld policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+ 	error = mac_policy_register(&mondrian_sandbox_mac_conf, &mondrian_sandbox_mac_handle, NULL);
+ 	printf("MONDRIAN Sandbox: permissive policy %s (%d)\n",

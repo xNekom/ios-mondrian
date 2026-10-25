@@ -29,10 +29,11 @@ Verified on the phone:
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **iOS userland.** Root-auth ENOTTY is handled by `0089`; SpringBoard (pid 26)
-  and backboardd (pid 57) survive more than 180 samples. `ui3` makes four black
-  swaps; `CA_ENABLE_MBX2D=0` is injected but that boot opens no framebuffer.
-  `driverkitd` is killed for jetsam namespace 1/code 7 (per-process limit).
+- **iOS userland.** `0089` handles root-auth ENOTTY; SpringBoard (27) and
+  backboardd (57) survive; the ring captures 773 lines. AMFI's wrong policy
+  name made dyld drop `DYLD_INSERT_LIBRARIES` from `0106`; `0108` fixes it.
+  Hook/UI are untested. `ui3` made four black swaps; `CA_ENABLE_MBX2D=0` opened
+  no framebuffer; `driverkitd` hits jetsam namespace 1/code 7.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
@@ -223,12 +224,11 @@ e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 **The console is a ring with a cursor block.** The newest line is the one above
 the cursor marker; reading then continues downward and wraps to the top.
 
-**CI skips a patch that does not apply and still reports success.** Check the
-series locally before a run; a *cancelled* job also shows up as `failure`.
-
-**`git apply` fails a hunk that ends with added lines and no trailing
-context**, and a patch that touches a staged source (the HFS/BearSSL trees)
-only applies after its `00NN-stage-*.sh` ran.
+**dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
+`AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
+dyld then drops the variable silently (no error, no crash, the process stays
+healthy) and the library never loads. `0108` registers `AMFI` and allows
+everything for 0x5a and 0x60.
 
 ## UFS bring-up, the sequence that works
 
