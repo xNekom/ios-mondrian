@@ -1,0 +1,46 @@
+xnu 0105: tee the console at console_write, not at _cnputs
+
+The persistent ring stopped at ~40 KiB in every userland boot: console_write()
+returns early once console_io_allowed() is false, and _cnputs() (where 0096
+teed) is below that check. console_write() is the funnel for both kernel
+printf and /dev/console writes, and it is reached even when the console is
+disabled, so the stream now continues for the whole boot.
+
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 62859fa..c02211e 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -271,16 +271,6 @@ _cnputs(char *c, int size, bool poll)
+ {
+ 	extern int disableConsoleOutput;
+ 
+-#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+-	/*
+-	 * Before the mute check, and so before the panel: the persistent log in
+-	 * bsd/dev/mondrian_ufs.c is what a boot is read from, the screen is
+-	 * only the immediate view. It never blocks.
+-	 */
+-	extern void mondrian_log_append(const char *c, int size);
+-	mondrian_log_append(c, size);
+-#endif
+-
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+@@ -522,6 +512,16 @@ console_resume()
+ void
+ console_write(char *str, int size)
+ {
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * The single funnel for kernel printf and /dev/console writes, and the
++	 * only point that still runs after console_io_allowed() turns false:
++	 * _cnputs() is below that check, which froze the persistent ring at
++	 * ~40 KiB once userland started.
++	 */
++	extern void mondrian_log_append(const char *c, int size);
++	mondrian_log_append(str, size);
++#endif
+ 	assert(str != NULL);
+ 
+ 	char *write_ptr = NULL;
