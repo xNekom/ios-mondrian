@@ -1,0 +1,77 @@
+xnu 0107: stop losing the console-ring wakeup, and log process exits
+
+The persistent ring still held only its first ~40 KiB in every userland boot:
+the writer stored, then armed assert_wait() and blocked without re-checking, so
+a wakeup from console_write() in that window was lost and the thread never ran
+again. Arm the wait first, re-read the counters after arming, and clear the
+wait when there is work: the race becomes harmless and a failed flush sleeps
+instead of spinning. The dump's tail ring also indexed one slot early, which
+is why every `tail |` line printed empty; print the slot the line was stored
+in. Finally, one `exit name[pid] status` line per reaped process pairs with
+the existing `exec name`: a daemon that exits by itself leaves no CRASH line
+and was invisible in the log.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1277,13 +1277,31 @@
+ 	uint32_t wakes = 0;
+ 
+ 	for (;;) {
+-		mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed));
++		uint64_t before, total;
++
++		total = os_atomic_load(&mondrian_log_total, relaxed);
++		before = os_atomic_load(&mondrian_log_flushed, relaxed);
++		mondrian_log_store(total);
+ 		if ((++wakes & 7) == 0) {
+ 			extern void mondrian_sample_tick(void);
+ 			mondrian_sample_tick();
+ 		}
++		/*
++		 * Arm the wait before re-reading the counters. console_write()
++		 * wakes the writer from any context, and a wakeup between the
++		 * store and assert_wait() used to be lost: the ring then kept
++		 * only its first flush for the rest of the boot. Re-checking
++		 * after arming makes that race harmless; a failed flush (the
++		 * counters did not move) sleeps instead of spinning.
++		 */
+ 		assert_wait((event_t)&mondrian_log_chan, THREAD_UNINT);
+-		thread_block(THREAD_CONTINUE_NULL);
++		if (os_atomic_load(&mondrian_log_total, relaxed) ==
++		    os_atomic_load(&mondrian_log_flushed, relaxed) ||
++		    os_atomic_load(&mondrian_log_flushed, relaxed) == before) {
++			thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		}
+ 	}
+ }
+ 
+@@ -1421,7 +1439,7 @@
+ 			printf("  first | %s\n", first[t]);
+ 			for (uint32_t i = 0; i < n; i++) {
+ 				printf("  tail  | %s\n",
+-				    last[t][(hits[t] + 6 - n + i) % 6]);
++				    last[t][(hits[t] + 6 - n + 1 + i) % 6]);
+ 			}
+ 		}
+ 	}
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2113,6 +2113,14 @@
+ 	uth = current_uthread();
+ 
+ 	proc_lock(p);
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * One line per reaped process, next to the exec line: a daemon that
++	 * exits without a signal leaves no CRASH line, and "did backboardd
++	 * ever run, and how did it end" is otherwise unanswerable.
++	 */
++	printf("exit %s[%d] status 0x%x\n", p->p_comm, proc_getpid(p), p->p_xstat);
++#endif
+ 	proc_transstart(p, 1, 0);
+ 	if (!(p->p_lflag & P_LEXIT)) {
+ 		/*

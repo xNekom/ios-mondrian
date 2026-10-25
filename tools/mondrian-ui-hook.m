@@ -2,8 +2,65 @@
 #import <objc/objc.h>
 #import <objc/runtime.h>
 
+#include <fcntl.h>
+#include <pthread.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <unistd.h>
+
+/*
+ * The daemons' stderr is /dev/null, so the traces go to the system console:
+ * on this port that is the framebuffer console, the only readable channel
+ * before the UI works. Keep the lines short: they share the screen with the
+ * kernel log.
+ */
+static int console_fd = -1;
+
+static void
+say(const char *message)
+{
+	size_t len = __builtin_strlen(message);
+
+	(void)write(STDERR_FILENO, message, len);
+	if (console_fd >= 0) {
+		(void)write(console_fd, message, len);
+	}
+}
+
+static void
+say_pid(const char *what)
+{
+	char buf[64];
+	int n = snprintf(buf, sizeof(buf), "MONDRIAN %s pid %d\n", what, getpid());
+
+	if (n > 0) {
+		say(buf);
+	}
+}
+
+/*
+ * backboardd can die or block without a kernel CRASH line when it exits by
+ * itself. A slow heartbeat proves the image is loaded and alive, and the
+ * last beat tells how far it got before the screen stopped.
+ */
+static void *
+heartbeat(void *unused)
+{
+	(void)unused;
+	for (int i = 0; i < 30; i++) {
+		sleep(2);
+		say("MONDRIAN UI: heartbeat\n");
+	}
+	return NULL;
+}
+
+static void
+start_heartbeat(void)
+{
+	pthread_t thread;
+
+	(void)pthread_create(&thread, NULL, heartbeat, NULL);
+}
 
 static int
 is_boolean_encoding(const char *type)
@@ -29,12 +86,6 @@ is_void_encoding(const char *type)
 	return *type == 'v';
 }
 
-static void
-say(const char *message)
-{
-	(void)write(STDERR_FILENO, message, __builtin_strlen(message));
-}
-
 static BOOL
 mondrian_personas_disabled(id self, SEL selector)
 {
@@ -48,9 +99,9 @@ static void (*original_detect_displays)(id, SEL);
 static void
 mondrian_detect_displays(id self, SEL selector)
 {
-	say("MONDRIAN UI: CAWindowServer._detectDisplays enter\n");
+	say("MONDRIAN UI: _detectDisplays enter\n");
 	original_detect_displays(self, selector);
-	say("MONDRIAN UI: CAWindowServer._detectDisplays return\n");
+	say("MONDRIAN UI: _detectDisplays return\n");
 }
 
 static void
@@ -87,6 +138,7 @@ install_display_diagnostic(void)
 	IMP original;
 
 	if (cls == Nil) {
+		say("MONDRIAN UI: CAWindowServer missing\n");
 		return;
 	}
 	if (method == NULL) {
@@ -115,6 +167,9 @@ __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
 {
+	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	say_pid("UI: dylib loaded");
 	install_personas_hook();
 	install_display_diagnostic();
+	start_heartbeat();
 }
