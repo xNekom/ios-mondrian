@@ -25,11 +25,12 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 
 ## The layers, in the order they have to work
 
-1. **PMIC regulator for IOVDD.** The `vdd-supply` LDO must be on before the
-   part answers. The shim already talks SPMI for the keys (`shim/spmi.c`);
-   the same path can read the LDO state and, if it is off, turn it on with
-   the vendor's voltage from the PMIC dtsi. Do not guess the LDO number: it
-   is the `0x301` phandle in the live tree.
+1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
+   (`qcom,rpmh-vrm-regulator`, resource `ldoc2`, 1.8 V, init mode 4), not an
+   SPMI-driven LDO: it needs an RPMh (RSC, `apps_rsc@17a00000`) vote, and the
+   port has no RPMh driver. The ABL may leave the rail on; check that before
+   writing one (the touch IRQ pin stays high when it is powered and out of
+   reset). The shim's SPMI is read-only by design, so it cannot set it.
 2. **TLMM pins.** Reset (20) low, then high after the part's power-up delay;
    AVDD enable (71) high; IRQ pin (21) as input with pull-down. The TLMM
    register layout is mainline `pinctrl-msm` (GPIO_CFG at `0x1000 * n`,
