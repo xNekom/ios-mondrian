@@ -178,9 +178,8 @@ layout: launchd still expects a Data volume and
 
 The persistent console log is `0096`; `0097` starts its writer after root mount,
 flushes immediately, and verifies the initial header. Read a prior boot with
-`mondriandump=1` and
-`mondriandumpmatch=SMP,CRASH,CODE,memorystatus`. The log-viewer shim is unreliable
-on this UFS host, so use the kernel dump path instead.
+`mondriandump=1` and `mondriandumpmatch=SMP,CRASH,CODE,memorystatus`; the
+log-viewer shim is unreliable on this UFS host, so use the kernel dump path.
 
 ### 2. The UFS root device
 
@@ -191,16 +190,21 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 ### 3. The display
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
-is not on the critical path. `0083` reserves panel memory, `0084` tests pixel
-packing, and `0085` presents IOSurface swaps. In the 0111 A/B run hook-off
-`backboardd` opens the framebuffer user client but sends no swaps, the injected
-one never opens it or calls `_detectDisplays`, and `SpringBoard` is exec'd but
-never appears in the `mondriansample` list. Next: a beacon-only injection
-(`mondrian_ui_hook=5`) to tell a failed exec from an early death, then port
-sweet `0056`/`0079` (present rate, `RequestPowerChange`) once frames arrive.
-If scanout stops, the fallback is a real MDSS driver: the `qcom,mdss_mdp@ae00000`
-node, the panel `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, and the gamma/DSC tables
-from the vendor tree.
+is not on the critical path: `0083` reserves panel memory, `0084` tests pixel
+packing, `0085` presents IOSurface swaps. `0112` injects the dylib per
+daemon: with `mondrian_ui_hook=7` SpringBoard and backboardd load it, and
+backboardd opens AppleCLCD, probes it with the real iOS 16.7 selectors (57, 15,
+22, 29, 33, 79, 74) and enters `_detectDisplays`. QuartzCore then polls
+`IOAcceleratorES` for 30 s (`CAMetalContextCreate`, 100 ms per try) before it
+falls back to the CPU renderer, so a boot reset sooner cannot show the UI;
+`disp0` declares the panel canvas (1440x3200), which the driver copies 1:1.
+Next: leave a boot alone for at least three minutes and look for
+`_detectDisplays return`, swaps and the console giving way to the UI; only then
+port sweet `0056`/`0079` (selector 17 `RequestPowerChange`, not 12). If it
+still does not swap, fill in 29 `GetDisplayArea` (8 bytes) and 74
+`SupportedFrameInfo` (64 bytes). If scanout stops, the fallback is a real MDSS
+driver: the `qcom,mdss_mdp@ae00000` node, the
+`qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` panel, vendor gamma/DSC tables.
 
 ### 4. The touch
 

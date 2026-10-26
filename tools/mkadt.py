@@ -195,15 +195,15 @@ def build(board, seed=None, qemu=False, altmem=False):
         # ignore the -wdt_no_pmu boot-arg).
         node('wdt', [ph(), ('no-pmu', u32(1))]),
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
-        # with this device_type and reads the canvas size from the node
-        # (the presented iPhone X size, see the framebuffer driver);
-        # the kernel's AppleCLCD matches the compatible string.
+        # with this device_type and reads the canvas size from the node; it
+        # matches the panel in the framebuffer driver, which copies layers
+        # 1:1 and does not scale.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr(board.dt_prefix + ',display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(board.fb_w)),
+            ('canvas-height', u32(board.fb_h)),
         ])])
 
     fbcon = node(board.dt_prefix + '-fbcon', [

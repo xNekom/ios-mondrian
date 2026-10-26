@@ -6,41 +6,40 @@ open-source XNU (xnu-8796, the iOS 16 generation) running the unmodified
 iPhone X iOS 16.7.16 userland.
 
 This file holds the state of the port and the facts that were expensive to
-learn. The work list, the hardware delta and the partition safety rules are in
+learn; the work list, the hardware delta and the partition rules are in
 `docs/MONDIAN_PORT.md`. The upstream `sweet` port is the reference
-implementation and is not re-described here: `xnu/patches/` and the upstream
-README are its record.
+implementation and is not re-described here: `xnu/patches/` is its record.
 
-## State (2026-10-25)
-
-Verified on the phone:
+## State (2026-10-26)
 
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   kernel console draws into the splash framebuffer the ABL leaves at
   **0xB8000000** (1440x3200, stride 5760).
-- **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1` (the
-  shim prints it as `tg16`), so the shim, the payload and the kernel all run
-  the granule iOS is built for: `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2
-  blocks and the generic Apple VA layout.
+- **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
+  shim, payload and kernel all run the granule iOS is built for:
+  `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
   scheduler, PRNG, libpthread and AMFI into `bsd_init`. The GIC is remapped
   after the VM takes over, and the virtual timer (GIC INTID 27) delivers.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **iOS userland.** `0089` handles root-auth ENOTTY; SpringBoard (27) and
-  backboardd (57) survive; the ring captures 40,709 bytes. `0108` loads both
-  dylibs and the personas hook. `backboardd` installs `_detectDisplays` but
-  never calls it or opens the framebuffer. `0109` defers its backtrace until
-  backboardd exists; visible UI remains unverified.
+- **iOS userland.** `0089` handles root-auth ENOTTY; `0111` clears the
+  virtual-timer `IMASK` (`CNTV_CTL_EL0 = 0x7`); launchd then reaches 130
+  processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
+  containermanagerd, 2 backboardd, 4 SpringBoard). With `hook=7` backboardd
+  opens the framebuffer, enters `_detectDisplays`, no return, no swaps, no UI.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display.** `0085` logs 1440x3200 userland swaps. `mondrianfb_noconsole=1`
-  disables kernel text at the first swap; later logs are not panel output.
-- **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager used
-  `/System/Volumes/VM/swapfile` (`Failed to open swap file 2`, ENOENT). `0098`
-  moves it to `/private/var/vm/swapfile` and creates that directory.
+- **Display.** `0085` logs 1440x3200 userland swaps; `mondrianfb_noconsole=1`
+  disables kernel text at the first swap, so later lines are not panel output.
+  QuartzCore's display probe waits up to 30 s for the GPU
+  (`CAMetalContextCreate` polls `IOAcceleratorES` every 100 ms) before falling
+  back to the CPU renderer: a boot reset sooner proves nothing about display.
+- **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
+  for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
+
 Current blockers, in order:
 
 1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware and
