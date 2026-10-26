@@ -49,21 +49,15 @@ needs, and where the numbers come from. The boot history and the traps are in
 userland IOSurface swaps on the framebuffer; the visible SpringBoard UI remains
 to be confirmed on-device.
 
-The next UI diagnosis follows HackiOS: opt-in patch `0106` injects a small
-dylib into containermanagerd and backboardd only with `mondrian_ui_hook=1`.
-It disables personas after validating the Objective-C method signature and
-traces `CAWindowServer._detectDisplays` by runtime lookup, without borrowed
-shared-cache offsets. The framebuffer client lifecycle, selectors and swaps
-are logged in the kernel; the dylib's own traces go to `/dev/console` (the
-persistent ring captures them). dyld honours `DYLD_INSERT_LIBRARIES` only when
-the MAC policy registered as `AMFI` answers `__mac_syscall` 0x5a (`0108`); under
-the old policy name it silently dropped the variable. Build with
-`tools/build-mondrian-ui-hook.sh`, then include it in the root with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. The 0108 run confirms
-injection into containermanagerd and backboardd and installs backboardd's
-`_detectDisplays` hook, but the callback does not run and no framebuffer user
-client opens. Patch `0109` waits for backboardd before taking the one-shot
-backtrace; visible UI is still unconfirmed.
+UI probe `0106` injects a diagnostic dylib into the UI daemons selected by the
+bitmask `mondrian_ui_hook` (`0112`): 1 `containermanagerd`, 2 `backboardd`,
+4 `SpringBoard`, OR-ed (5 = containermanagerd + SpringBoard, 7 = all three),
+0 off. It disables personas after signature validation and dynamically wraps
+`CAWindowServer._detectDisplays`; dyld needs the `AMFI` policy answer to
+`__mac_syscall` 0x5a (`0108`), or it drops `DYLD_INSERT_LIBRARIES`. Build with
+`tools/build-mondrian-ui-hook.sh`, then install with
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `0110`/`0111` also expose
+and correct the virtual timer mask, which prevented reliable userland startup.
 
 ### Exporting the full console ring
 
@@ -198,13 +192,15 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
 is not on the critical path. `0083` reserves panel memory, `0084` tests pixel
-packing, and `0085` presents backboardd swaps; a swap is observed, but a usable
-SpringBoard UI is not yet confirmed. Remaining display work is the rebase of
-sweet `0056`/`0079` (present rate, `RequestPowerChange`).
-If the scanout ever stops, the fallback is a real MDSS driver: the
-`qcom,mdss_mdp@ae00000` node, the panel
-`qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, and the gamma/DSC tables from the
-vendor tree.
+packing, and `0085` presents IOSurface swaps. In the 0111 A/B run hook-off
+`backboardd` opens the framebuffer user client but sends no swaps, the injected
+one never opens it or calls `_detectDisplays`, and `SpringBoard` is exec'd but
+never appears in the `mondriansample` list. Next: a beacon-only injection
+(`mondrian_ui_hook=5`) to tell a failed exec from an early death, then port
+sweet `0056`/`0079` (present rate, `RequestPowerChange`) once frames arrive.
+If scanout stops, the fallback is a real MDSS driver: the `qcom,mdss_mdp@ae00000`
+node, the panel `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, and the gamma/DSC tables
+from the vendor tree.
 
 ### 4. The touch
 

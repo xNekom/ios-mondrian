@@ -1,0 +1,73 @@
+xnu 0112: choose which daemon receives the UI diagnostic dylib
+
+The 0111 A/B run with the same kernel shows that hook-off backboardd opens the
+framebuffer user client, while hook-on backboardd never appears in the process
+sample. At the same time SpringBoard is exec'd in every run but never sampled,
+so both UI daemons fail early. The single on/off boot argument cannot isolate
+which injected image is responsible, and the personas workaround is needed by
+containermanagerd while the display diagnostics belong to backboardd.
+
+Turn the argument into a bitmask without changing the dylib: 1 injects
+containermanagerd, 2 backboardd, 4 SpringBoard, and their OR selects several
+(3 = both daemons, 7 = all three). 0 stays off. This allows the personas
+workaround to run alone, and a beacon-only SpringBoard injection to show
+whether its image reaches dyld at all.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5570,30 +5570,43 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ /*
+- * Opt-in bring-up hook for HackiOS's containermanagerd workaround and
+- * backboardd display diagnostics. Only those two images get the library; its
+- * Objective-C hooks resolve classes and selectors dynamically rather than
+- * relying on shared-cache addresses from another build.
++ * Opt-in bring-up hook for HackiOS's containermanagerd workaround and the
++ * backboardd/SpringBoard display diagnostics. Its Objective-C hooks resolve
++ * classes and selectors dynamically rather than relying on shared-cache
++ * addresses from another build.
+  */
++#define MONDRIAN_HOOK_CONTAINERMANAGERD 0x1
++#define MONDRIAN_HOOK_BACKBOARDD        0x2
++#define MONDRIAN_HOOK_SPRINGBOARD       0x4
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+-	int enabled = 0;
++	int targets = 0;
++	uint32_t wanted = 0;
+ 	const char *name;
+ 	const char library[] = "DYLD_INSERT_LIBRARIES=/usr/libexec/mondrian-ui-hook.dylib";
+ 
+-	if (!PE_parse_boot_argn("mondrian_ui_hook", &enabled, sizeof(enabled)) || !enabled ||
+-	    imgp->ip_ndp == NULL) {
++	/* A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard. */
++	if (!PE_parse_boot_argn("mondrian_ui_hook", &targets, sizeof(targets)) ||
++	    targets <= 0 || imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+ 	if (name == NULL || sizeof(library) > size) {
+ 		return false;
+ 	}
+-	if (!((imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
+-	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) ||
+-	    (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("backboardd") - 1 &&
+-	    strncmp(name, "backboardd", sizeof("backboardd") - 1) == 0))) {
++	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
++	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) {
++		wanted = MONDRIAN_HOOK_CONTAINERMANAGERD;
++	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("backboardd") - 1 &&
++	    strncmp(name, "backboardd", sizeof("backboardd") - 1) == 0) {
++		wanted = MONDRIAN_HOOK_BACKBOARDD;
++	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("SpringBoard") - 1 &&
++	    strncmp(name, "SpringBoard", sizeof("SpringBoard") - 1) == 0) {
++		wanted = MONDRIAN_HOOK_SPRINGBOARD;
++	}
++	if (wanted == 0 || (targets & wanted) == 0) {
+ 		return false;
+ 	}
+ 	strlcpy(env, library, size);
