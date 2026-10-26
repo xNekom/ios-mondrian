@@ -1,0 +1,50 @@
+xnu 0115: give the sampler a clock the board delivers and a screen heartbeat
+
+The sampler thread's tsleep() timeout never fires on this board, so the only
+samples that used to arrive came from the UFS write path, and 0113 removed
+that call: the 0114 run logged one sample and then nothing, which leaves a
+stalled boot and a slow one impossible to tell apart.
+
+The framebuffer's vsync timer does run (60 Hz, re-armed by its own callback),
+so tick the sampler from it every five seconds. Also move a white block on the
+panel twice a second, written straight into the framebuffer: the panel scans
+that memory by itself, so when the console goes quiet the block still says
+whether the kernel runs or is wedged. It stops at the first swap, when the UI
+takes the screen.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -293,6 +293,33 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	sender->setTimeoutUS(MONDRIAN_FB_VSYNC_US);
++	/*
++	 * The kernel's tsleep() timeouts never fire on this board, so the
++	 * sampler's own thread ticks once and sleeps for ever. This timer does
++	 * run: give the sampler a clock it can trust, every five seconds.
++	 */
++	if ((count % (MONDRIAN_FB_REFRESH_HZ * 5)) == 0) {
++		extern "C" void mondrian_sample_tick(void);
++		mondrian_sample_tick();
++	}
++	/*
++	 * Liveness marker that needs neither the console nor printf: the panel
++	 * scans this memory by itself, so a block that moves twice a second
++	 * proves the kernel still runs when the log has stopped. It goes away
++	 * with the console at the first swap, when the UI owns the screen.
++	 */
++	if (!fb->fConsolePaused && (count % (MONDRIAN_FB_REFRESH_HZ / 2)) == 0) {
++		uint32_t phase = (uint32_t)((count / (MONDRIAN_FB_REFRESH_HZ / 2)) & 1);
++		uint8_t *row = (uint8_t *)fb->fPixels + (size_t)(phase ? 72 : 16) * fb->fRowBytes;
++
++		for (uint32_t y = 0; y < 32; y++) {
++			uint32_t *pixel = (uint32_t *)(row + (size_t)y * fb->fRowBytes) + 16;
++
++			for (uint32_t x = 0; x < 64; x++) {
++				pixel[x] = 0x00ffffff;
++			}
++		}
++	}
+ }
+ 
+ void

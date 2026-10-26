@@ -20,8 +20,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   shim, payload and kernel all run the granule iOS is built for:
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
-  scheduler, PRNG, libpthread and AMFI into `bsd_init`. The GIC is remapped
-  after the VM takes over, and the virtual timer (GIC INTID 27) delivers.
+  scheduler and AMFI into `bsd_init`. The GIC is remapped after the VM takes
+  over; the vtimer PPI never arrives, so no timed wait returns (`0116`).
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
@@ -48,8 +48,8 @@ Current blockers, in order:
 2. **Pid-1 diagnosis.** Framebuffer text can be stale. Namespace 1/code 0xe
    is `JETSAM_REASON_MEMORY_SUSTAINED_PRESSURE`; `CS_KILLED` marks invalid
    pages. Read `CODE SIGNING`/`CRASH` before changing AMFI or Sandbox.
-3. **UI.** SpringBoard exec is observed; visible presentation and touch remain
-   unverified.
+3. **Timers.** No timer interrupt reaches EL1, so every timed wait hangs and
+   userland cannot draw (`0116` measures it); presentation and touch untested.
 
 ```sh
 tools/build-kernel-local.sh                        # -> /tmp/kernel.development.mondrian
