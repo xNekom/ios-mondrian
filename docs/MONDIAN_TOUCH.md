@@ -23,6 +23,23 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 | Panels | two panel phandles; the touch node is shared |
 | TLMM | `qcom,cape-pinctrl` node `0x0f000000+0x1000000`, but the pin registers start at **0x0f100000** (GPIO n at `+0x1000*n`); summary IRQ GIC SPI 208 |
 
+## What the bootloader leaves (measured)
+
+`0117` read the three pads: all come up in the TLMM reset state, function 0
+(gpio), pull-down, input, level low, `INTR_CFG 0xe2` with the interrupt
+itself disabled. The bootloader does not power the part: AVDD (GPIO71) is an
+input and reset (GPIO20) is low. `0119` therefore drives the sequence: AVDD
+on, 10 ms with reset held low, release and wait 50 ms, with GPIO21 left an
+input and a pull-down. The Goodix asserts IRQ low, so a powered part out of
+reset drives the line high; that level is the milestone-1 signal. On a high
+line the pad is switched to the vendor's active pull-up.
+
+Measured with `0119`: AVDD and reset read back as outputs high (`0x200/0x3`
+and `0x2c0/0x3`), and the IRQ pad reads 0 with the pull-down and 1 with the
+pull-up, i.e. the line floats. That fits an unpowered part, but it is not
+proof: an open-drain INT also floats when deasserted, so "is it alive" has to
+come from the SPI ID read (milestone 3), not from this pin.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
@@ -35,13 +52,19 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
    AVDD enable (71) high; IRQ pin (21) as input with pull-down. The pin
    registers are the mainline `pinctrl-msm` layout at `0x0f100000 + 0x1000*n`:
    `GPIO_CFG` (pull 0-1, function 2-4, drive 6-8, output enable 9), `IN_OUT`
-   (level 0, output value 1), `INTR_CFG` and `INTR_STATUS`. The kernel has no
-   TLMM driver yet.
-3. **GCC clocks.** `se-clk` (branch 94) and the two AHB branches (134, 135).
-   The port already pokes the UFS branch from `tools/boards.py`
-   (`gcc=0x100000`, `ufs_gcc_branch=0x870`) and the shim does it at boot; the
-   SE needs the same treatment, in the kernel this time, before the first
-   register access or the bus hangs.
+   (level 0, output value 1), `INTR_CFG` and `INTR_STATUS`. `0117`/`0119`
+   read and drive the three pads from `bsd/dev/mondrian_touch.c`; there is no
+   general pinctrl driver yet.
+3. **GCC clocks.** The four branches the SE needs are all bits of GCC
+   `0x62008`: `m-ahb` bit 6, `s-ahb` bit 7, the wrap core bit 8, core 2x bit 9
+   and `se-clk` (clock id 94, `GCC_QUPV3_WRAP0_S4_CLK`) bit 14. The SE clock
+   source is an RCG at `0x274e4`; whether the bootloader left it programmed
+   (and at what rate) is measured by the first GENI read. The port already
+   pokes the UFS branch from `tools/boards.py` (`gcc=0x100000`,
+   `ufs_gcc_branch=0x870`, register `branch * 0x100`), but maps only one 4 KB
+   page while the branch registers live at `0x87000`: it never ran (the
+   bootloader left the UFS clocked), so map the whole `0x70000` window for the
+   SE. Nothing may touch the SE before its clocks are on, or the bus hangs.
 4. **GENI SE as SPI.** Mainline `spi-geni-qcom.c` + `qcom-geni-se.h` give the
    sequence: set `GENI_CFG` (protocol SPI, FIFO mode, CS), program
    `GENI_IO_MUX`/`SPI_CONFIG` (CPOL/CPHA, CS polarity, word length), write the
@@ -59,9 +82,10 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 
 ## Milestones, each one testable in a single boot
 
-1. TLMM reset + IOVDD on + SE clock on, no SPI traffic: the part's IRQ pin
-   must go high (read `INTR_STATUS`). This proves power, pins and clocks
-   without risking a bus hang.
+1. AVDD + reset, no SPI traffic: a powered part out of reset holds IRQ
+   (GPIO21) high; `0119` drives the pads and prints the level. This proves
+   the pins (and, if the level stays low, points at the IOVDD rail) without
+   risking the bus.
 2. GENI init and `GENI_FW_REVISION` read: proves the SE clock and the register
    window.
 3. Goodix product ID over SPI: proves the transport and the protocol.
