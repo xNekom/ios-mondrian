@@ -18,8 +18,8 @@ before code.
 
 ## Memory
 
-- mondrian runs **PAGE_SHIFT 12** (4 KiB). XNU's arm64 tree can be built with
-  16 KiB pages; do not mix numbers from a 16 K build.
+- mondrian runs **PAGE_SHIFT 14** (16 KiB), the granule iOS userland and its
+  dyld shared cache are built for. Do not mix numbers from a 4 KiB build.
 - The kernel's usable window is `0xB0000000` + `0x46000000`. It cannot shrink
   much below `0x3a000000`: the physmap of the window has to fit inside the
   window itself.
@@ -35,24 +35,27 @@ before code.
 - `kmem_alloc_contig()` does not scale: 1 page and 36 pages return, 256 pages
   (1 MiB) never returns on mondrian. Keep contiguous requests at or below
   ~128 KiB and build larger buffers from a fixed contiguous pool instead.
+- The panel is written through the console alias (`mondrian_early_fb_va()`),
+  never through an `IOMemoryDescriptor` over its physical range: a device
+  pager on VM-managed pages corrupts the pmap PV lists and panics in
+  `pmap_remove_pv`. `PE_initialize_console(kPEDisableScreen)` unmaps that
+  alias and panics the same way; stop the screen console with
+  `disableConsoleOutput` instead.
 
-## Time is not proven yet
+## Time
 
 - `pexpert/arm/pe_identify_machine.c` takes the timebase frequency from the
-  ADT (`timebase-frequency`), defaulting to 24 MHz. There is no `CNTFRQ_EL0`
-  read anywhere in this tree.
-- On mondrian the **timer interrupt has never been observed**, and 0082 hung
-  the boot at the first call to `mach_absolute_time()`/`delay()` (the UFS
-  START STOP UNIT wait). Until a beacon proves otherwise:
-  - do not put `delay()` or `mach_absolute_time()` on the critical path of
-    early boot;
-  - count CPU spins instead, calibrated once against the counter and printed,
-    so the log itself says whether the counter moves
-    (`ufs_calibrate_spins()` in `bsd/dev/mondrian_ufs.c` is the model);
-  - a bounded spin wait must be bounded by iterations, never by a deadline
-    computed from a possibly frozen counter.
-- If a boot freezes with no error line after a `... sent, waiting` print, the
-  first hypothesis is the clock, not the device.
+  ADT (`timebase-frequency`, 19.2 MHz here). There is no `CNTFRQ_EL0` read.
+- The vtimer PPI (27) does **not** deliver out of the box, and that breaks
+  every timed wait (`tsleep`, `usleep`, dispatch timers, CoreAnimation's frame
+  pacing) while the boot still looks alive. `0116` fixes it: end and clear the
+  PPI (`GICR_ICACTIVER0`/`GICR_ICPENDR0`), clear its Group 1 secure modifier
+  (`GICR_IGRPMODR0`), zero `ICC_AP1R0_EL1`, then enable it. Check the timer
+  IRQ counter and DAIF in the sampler line instead of assuming.
+- Before the GIC is up, `delay()`/`mach_absolute_time()` can block the boot
+  (0082). Keep early waits bounded by spin counts
+  (`ufs_calibrate_spins()` in `bsd/dev/mondrian_ufs.c` is the model), never by
+  a deadline computed from a possibly frozen counter.
 
 ## Interrupts
 
