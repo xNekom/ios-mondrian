@@ -208,9 +208,10 @@ is a real MDSS driver: the `qcom,mdss_mdp@ae00000` node,
 ### 4. The touch
 
 Sweet drives a Goodix GT9896 over GENI I²C and takes its rail from RPMh.
-Mondrian has a Goodix on **SPI** (`xiaomi,m11a-spi`, IRQ TLMM GPIO21, reset
-GPIO20) on QUPv3 SE4 at 0x990000 (GIC SPI 605). The protocol is Goodix; the
-transport is a QUPv3 SPI transfer, with sweet's GENI FIFO packing reworked.
+Mondrian has a Goodix on **SPI** (`xiaomi,m11a-spi`, CS0 on QUPv3 SE4 at
+0x990000, IRQ TLMM GPIO21, reset GPIO20): TLMM, the GCC SE clocks, the GENI
+SPI transport and the Goodix protocol are missing. Live-tree values and the
+milestone order: `docs/MONDIAN_TOUCH.md`.
 
 ### 5. The buttons, the battery and the menu
 

@@ -220,6 +220,7 @@ fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
 | `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
+| `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
 
 Not in git: partition backups, live device trees, recovery images, Apple
