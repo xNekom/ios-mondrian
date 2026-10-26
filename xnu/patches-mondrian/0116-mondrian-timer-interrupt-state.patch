@@ -8,11 +8,12 @@ where the interrupt is lost.
 
 End and drop the PPI before enabling it -- an interrupt the loader left active
 can never be taken again -- and clear its Group 1 secure modifier, which would
-keep it away from EL1 entirely. Print the live PPI state (pending/active), the
-count of timer interrupts the CPU actually took, DAIF and the CPU interface's
-group/priority mask with the CNTV registers. Print the GIC and IRQ dumps with
-printf instead of kprintf so the panel and the ring see them at all, and wake
-the ring every 8 KiB so those lines arrive during boot instead of once.
+keep it away from EL1 entirely. That makes the timer deliver: the beacon in
+the timer interrupt counts up and every timed wait returns. Print the timer
+interrupt count, DAIF and the CPU interface's group/priority mask with the
+CNTV registers, print the GIC and IRQ dumps with printf instead of kprintf so
+the panel and the ring see them, and wake the ring every 8 KiB so those lines
+arrive during boot instead of once.
 
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
@@ -41,34 +42,7 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	printf("MONDRIAN GIC: gicd %llx+%llx -> %llx, gicr %llx+%llx -> %llx\n",
  	    (unsigned long long)mondrian_gicd_phys, (unsigned long long)mondrian_gicd_size,
  	    (unsigned long long)gicd_base,
-@@ -125,6 +129,26 @@
- 	    (unsigned long long)gicr_base);
- }
- 
-+/*
-+ * Live vtimer PPI state: bit 0 pending, bit 1 active. The sampler prints it
-+ * next to CNTV_CTL: when the compare has expired and ISTATUS reads 1, this
-+ * says whether the GIC ever saw the line, which separates "the timer is not
-+ * signalling" from "the GIC is not delivering it".
-+ */
-+uint32_t
-+mondrian_gicr_vtimer_status(void)
-+{
-+	uint32_t pend, act;
-+
-+	if (mondrian_gicr_pe == 0) {
-+		return 0;
-+	}
-+	pend = _gic_read32(mondrian_gicr_pe + GICR_ISPENDR0);
-+	act = _gic_read32(mondrian_gicr_pe + GICR_ISACTIVER0);
-+	return ((pend >> mondrian_vtimer_intid) & 1) |
-+	    (((act >> mondrian_vtimer_intid) & 1) << 1);
-+}
-+
- void
- pe_mondrian_gic_dump(void)
- {
-@@ -132,10 +156,10 @@
+@@ -132,10 +136,10 @@
  	if (!gicd_base) {
  		return;
  	}
@@ -81,7 +55,7 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	/*
  	 * Read only the first redistributor page. GICR_IGROUPR0 lives in the
  	 * SGI page (GICR base + 0x10080) and reading it *after* the VM is up
-@@ -147,7 +171,7 @@
+@@ -147,7 +151,7 @@
  	 * the remap above is for -- and it has never faulted.
  	 */
  	uint64_t typer = *(volatile uint64_t *)(gicr_base + GICR_TYPER);
@@ -90,7 +64,7 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	    mondrian_vtimer_intid, (unsigned long long)typer,
  	    ml_get_timer_pending());
  }
-@@ -243,6 +267,7 @@
+@@ -243,6 +247,7 @@
  
  	// Find the redistributor for this processor
  	vm_offset_t gicr_pe_base = find_gicr_pe_base();
@@ -98,7 +72,7 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  
  	// Mark this PE to be awake
  	uint32_t gicr_waker = gicr_read32(GICR_WAKER);
-@@ -270,6 +295,17 @@
+@@ -270,6 +275,17 @@
  	 * from the non-secure side even after this write; delivery still works.
  	 */
  	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
@@ -116,7 +90,7 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	for (unsigned int i = 0; i < 32; i += 4) {
  		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
  	}
-@@ -279,6 +315,7 @@
+@@ -279,6 +295,7 @@
  	mondrian_vtimer_pending_state = gicr_read32(GICR_ISPENDR0);
  	mondrian_vtimer_active_state = gicr_read32(GICR_ISACTIVER0);
  	mondrian_vtimer_group_state = gicr_read32(GICR_IGROUPR0);
@@ -124,6 +98,55 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	/*
  	 * Which group is the timer PPI in? Group 0 belongs to TrustZone and
  	 * is not forwarded to this CPU (GICD_CTLR only has the Group 1 bits
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -941,7 +941,26 @@
+  * means the CPU is stuck; the PC it shows says where. No locks, no
+  * allocation: this runs in interrupt context.
+  */
++/* Set when the UI owns the screen: stop painting the beacon over it. */
++int mondrian_fbcon_quiet;
++
++/* A square of colour on the panel, for a liveness mark that must not print. */
+ void
++mondrian_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color)
++{
++	if (fbcon_base == NULL || x + size > fbcon_width || y + size > fbcon_height) {
++		return;
++	}
++	for (uint32_t row = 0; row < size; row++) {
++		volatile uint32_t *line = fbcon_base + (y + row) * (fbcon_stride / 4) + x;
++
++		for (uint32_t col = 0; col < size; col++) {
++			line[col] = color;
++		}
++	}
++}
++
++void
+ mondrian_fbcon_beacon(uint64_t pc, uint64_t count)
+ {
+ 	static const char hexd[] = "0123456789abcdef";
+@@ -949,7 +968,7 @@
+ 	unsigned int n = 0;
+ 	uint32_t row;
+ 
+-	if (fbcon_base == NULL || fbcon_rows < 8) {
++	if (fbcon_base == NULL || fbcon_rows < 8 || mondrian_fbcon_quiet) {
+ 		return;
+ 	}
+ 	/* A fixed row: the beacon stays where it is, so a photo shows it
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -56,6 +56,8 @@
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+ void mondrian_fbcon_beacon(uint64_t pc, uint64_t count);
++void mondrian_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color);
++extern int mondrian_fbcon_quiet;
+ /* The panel's memory, which the page allocator must not hand out. */
+ uint64_t mondrian_fb_reserved_start(void);
+ uint64_t mondrian_fb_reserved_end(void);
 --- a/pexpert/pexpert/arm64/MONDRIAN.h
 +++ b/pexpert/pexpert/arm64/MONDRIAN.h
 @@ -78,9 +78,12 @@
@@ -141,15 +164,16 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  #define GICR_TYPER_LAST                         0x10
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1878,6 +1878,7 @@
+@@ -1878,6 +1878,8 @@
   * the timer ever interrupted. */
  static uint32_t mondrian_intids[8];
  static unsigned int mondrian_intid_n;
 +static uint64_t mondrian_irq_count;
++static uint64_t mondrian_last_irq_pc;
  #endif
  
  /*
-@@ -1889,12 +1890,25 @@
+@@ -1889,12 +1891,35 @@
  mondrian_irq_dump(void)
  {
  #if defined(MONDRIAN)
@@ -173,10 +197,20 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
 +#endif
 +}
 +
++uint64_t
++mondrian_timer_last_pc(void)
++{
++#if defined(MONDRIAN)
++	return mondrian_last_irq_pc;
++#else
++	return 0;
++#endif
++}
++
  void
  sleh_irq(arm_saved_state_t *state)
  {
-@@ -1909,7 +1923,6 @@
+@@ -1909,7 +1934,6 @@
  	 * mondrian: TrustZone owns GIC Group 0, so the timer and IPIs that other
  	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
  	 */
@@ -184,18 +218,92 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
  	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
  
+@@ -1928,6 +1952,7 @@
+ 		 * the screen is alive, and the PC it shows is where the CPU
+ 		 * was; if it stops, the CPU is stuck.
+ 		 */
++		mondrian_last_irq_pc = get_saved_state_pc(state);
+ 		if ((++mondrian_irq_count & 0x3) == 0) {
+ 			mondrian_fbcon_beacon(get_saved_state_pc(state), mondrian_irq_count);
+ 		}
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1020,7 +1020,7 @@
+ }
+ 
+ #define MONDRIAN_DUMP_THREADS   8
+-#define MONDRIAN_DUMP_BT        8
++#define MONDRIAN_DUMP_BT        20
+ 
+ struct mondrian_thread_dump {
+ 	uint64_t pc;
+@@ -1086,7 +1086,7 @@
+ 	 */
+ 	printf("SMP %s threads %d shown %d\n", name, threads, shown);
+ 	for (int j = 0; j < shown; j++) {
+-		char line[320];
++		char line[640];
+ 		int n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt",
+ 		    name, j, dump[j].pc, dump[j].lr, dump[j].sp);
+ 
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -236,7 +236,14 @@
+ 	size_t nbytes = sizeof(entropy);
+ 	int32_t nsamples = mondrian_getentropy(&nbytes, entropy, mondrian_getentropy_arg);
+ 	if (nsamples < 0) {
+-		panic("MONDRIAN PRNG entropy health test failed");
++		/*
++		 * This board has no entropy source for the DRBG (no Apple SPU,
++		 * no corecrypto kext). A failed health test must not panic the
++		 * boot: keep generating from the seed the boot loader gave us.
++		 */
++		cc_clear(sizeof(entropy), entropy);
++		lck_mtx_unlock(&mondrian_prng_lock);
++		return;
+ 	}
+ 	if (nsamples >= 256) {
+ 		assert(nbytes >= SEED_SIZE && nbytes <= sizeof(entropy));
 --- a/bsd/dev/mondrian_sample.c
 +++ b/bsd/dev/mondrian_sample.c
-@@ -215,6 +215,8 @@
+@@ -176,6 +176,27 @@
+ 	static bool armed, dumped;
+ 	uint64_t now;
+ 
++	/*
++	 * mondriansampleblind=1: do not print at all, just move a coloured
++	 * square. The console can wedge and take every printf with it; this
++	 * mark is drawn straight into the panel and says whether the kernel
++	 * still runs.
++	 */
++	{
++		static int blind = -1;
++
++		if (blind < 0) {
++			blind = 0;
++			(void)PE_parse_boot_argn("mondriansampleblind", &blind, sizeof(blind));
++		}
++		if (blind != 0) {
++			static uint32_t phase;
++			extern void mondrian_fbcon_square(uint32_t x, uint32_t y, uint32_t size, uint32_t color);
++
++			mondrian_fbcon_square(320, (phase++ & 1) ? 300 : 380, 48, 0x0000ff00);
++			return;
++		}
++	}
+ 	if (!armed) {
+ 		armed = true;
+ 		mondrian_parse_names();
+@@ -215,6 +236,8 @@
  	}
  	printf("\n");
  	{
-+		extern uint32_t mondrian_gicr_vtimer_status(void);
 +		extern uint64_t mondrian_timer_irqs(void);
++		extern uint64_t mondrian_timer_last_pc(void);
  		static uint64_t previous_count;
  		static uint32_t snapshots;
  		uint64_t control = __builtin_arm_rsr64("CNTV_CTL_EL0");
-@@ -222,13 +224,21 @@
+@@ -222,13 +245,22 @@
  		uint64_t count = __builtin_arm_rsr64("CNTVCT_EL0");
  		uint64_t delta = snapshots != 0 ? count - previous_count : 0;
  
@@ -213,10 +321,11 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
 +		 * three together separate "not armed", "armed but masked",
 +		 * "GIC never saw it" and "taken".
 +		 */
-+		printf("MONDRIAN TIMER: sample %u ctl 0x%llx cval 0x%llx cntvct 0x%llx delta 0x%llx gic 0x%x irqs %llu daif 0x%llx grp 0x%llx pmr 0x%llx\n",
++		printf("MONDRIAN TIMER: sample %u ctl 0x%llx cval 0x%llx cntvct 0x%llx delta 0x%llx pc 0x%llx irqs %llu daif 0x%llx grp 0x%llx pmr 0x%llx\n",
 +		    snapshots, (unsigned long long)control,
 +		    (unsigned long long)compare, (unsigned long long)count,
-+		    (unsigned long long)delta, mondrian_gicr_vtimer_status(),
++		    (unsigned long long)delta,
++		    (unsigned long long)mondrian_timer_last_pc(),
 +		    (unsigned long long)mondrian_timer_irqs(),
 +		    (unsigned long long)__builtin_arm_rsr64("DAIF"),
 +		    (unsigned long long)__builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
@@ -224,6 +333,46 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  		previous_count = count;
  		snapshots++;
  	}
+@@ -255,11 +287,35 @@
+ 			}
+ 		}
+ 	}
+-	if (!dumped && mondrian_proc_count > 20 && target_present) {
+-		dumped = true;
+-		printf("SMP --- detailed sample, %d procs\n", mondrian_proc_count);
+-		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
++	/*
++	 * The first dump catches the daemons while they load; the later ones,
++	 * once a minute, catch them in whatever they settle into (the boot
++	 * stops at the Apple logo long after the first one).
++	 */
++	{
++		static uint64_t last_dump;
++		static int dumps;
++
++		if (!dumped && mondrian_proc_count > 20 && target_present) {
++			dumped = true;
++			last_dump = now;
++			dumps = 1;
++			printf("SMP --- detailed sample 1, %d procs\n", mondrian_proc_count);
++			proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
++		} else if (dumped && target_present && mondrian_proc_count > 20 && dumps < 6 &&
++		    now - last_dump >= 60000000000ULL) {
++			last_dump = now;
++			dumps++;
++			printf("SMP --- detailed sample %d at t=%llus, %d procs\n", dumps,
++			    (unsigned long long)(now / 1000000000ULL), mondrian_proc_count);
++			proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
++		}
+ 	}
++	{
++		extern void mondrian_log_flush_now(void);
++
++		mondrian_log_flush_now();
++	}
+ 	mondrian_in_tick = 0;
+ }
+ 
 --- a/bsd/dev/mondrian_ufs.c
 +++ b/bsd/dev/mondrian_ufs.c
 @@ -1139,7 +1139,7 @@
@@ -235,7 +384,25 @@ the ring every 8 KiB so those lines arrive during boot instead of once.
  
  static uint64_t _Atomic mondrian_log_total;
  static uint64_t _Atomic mondrian_log_next_wake;
-@@ -1269,15 +1269,17 @@
+@@ -1248,6 +1248,17 @@
+ 	os_atomic_store(&mondrian_log_flushed, total, relaxed);
+ }
+ 
++/*
++ * Put what is in the ring on the disk now. The sampler calls this after it
++ * prints, so the line describing the last timer interrupt survives the hang
++ * that follows it.
++ */
++void
++mondrian_log_flush_now(void)
++{
++	mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed));
++}
++
+ /* Called from the UFS write path, which runs throughout the boot. */
+ void
+ mondrian_log_kick(void)
+@@ -1269,15 +1280,17 @@
  {
  	printf("MONDRIAN LOG: console ring in the last %u KiB of the partition (block 0x%llx)\n",
  	    MONDRIAN_LOG_BLOCKS * UFS_BLOCK >> 10, mondrian_log_base);

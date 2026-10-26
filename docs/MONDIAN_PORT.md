@@ -170,11 +170,11 @@ authentication).
 ### 1. The iOS root
 
 Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the iOS
-16 root built by `tools/mkiosroot.sh` and prepared by `tools/ios-root-tweaks.py`,
-launchd runs boot tasks, backboardd opens the mondrian HID services, and
-`exec SpringBoard` is observed. The flattened HFS root is not a stock volume
-layout: launchd still expects a Data volume and
-`/private/preboot/<uuid>/usr/standalone/firmware`.
+16 root built by `tools/mkiosroot.sh`, prepared by `tools/ios-root-tweaks.py`
+and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
+`mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
+The flattened HFS root is not a stock volume layout: launchd still expects a
+Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`.
 
 The persistent console log is `0096`; `0097` starts its writer after root mount,
 flushes immediately, and verifies the initial header. Read a prior boot with
@@ -191,18 +191,18 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
 is not on the critical path: `0083` reserves panel memory, `0084` tests pixel
-packing, `0085` presents IOSurface swaps. `0112` injects the dylib per
-daemon: with `mondrian_ui_hook=7` backboardd opens AppleCLCD, probes it with
-the real iOS 16.7 selectors (57, 15, 22, 29, 33, 79, 74) and enters
-`_detectDisplays`. It then draws nothing for two reasons `0114` fixes:
-QuartzCore polls the registry for an `IOAcceleratorES` service for 30 s before
-it looks for a renderer at all, and a display without `TimingElements` and
-`ColorElements` has no mode, so CoreAnimation renders nothing. The port now
-publishes one 60 Hz timing at 1440x3200, one 8-bit RGB colour mode and an
-empty `IOAcceleratorES` that Metal and OpenGL ES both pass over, which leaves
-CoreAnimation's own software rasterizer as the renderer. A boot needs three
-minutes before it can be judged. If scanout stops, the fallback is a real MDSS
-driver: the `qcom,mdss_mdp@ae00000` node,
+packing, `0085` presents IOSurface swaps, and the lock screen now comes up.
+Three things had to line up: CoreAnimation waits 30 s for an `IOAcceleratorES`
+service and draws nothing without `TimingElements`/`ColorElements` (`0114`
+publishes one 60 Hz mode and an empty accelerator, leaving the software
+renderer); the panel must be written through the console alias, not through an
+`IOMemoryDescriptor`, whose device pager over managed pages panics
+`pmap_remove_pv`; and the screen console is stopped with
+`disableConsoleOutput`, because `PE_initialize_console(kPEDisableScreen)`
+unmaps that alias and panics the same way (`0115`). SpringBoard then blocks in
+`-[SBLockdownManager _setupActivationState]` on MobileActivation; the dylib
+forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
+is a real MDSS driver: the `qcom,mdss_mdp@ae00000` node,
 `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` panel, vendor gamma/DSC tables.
 
 ### 4. The touch

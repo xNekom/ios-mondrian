@@ -21,35 +21,35 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
   scheduler and AMFI into `bsd_init`. The GIC is remapped after the VM takes
-  over; the vtimer PPI never arrives, so no timed wait returns (`0116`).
+  over; the vtimer PPI (27) delivers once its active state is ended and its
+  Group 1 secure modifier cleared (`0116`), and every timed wait returns.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, and the block
   device reaches HFS.
-- **iOS userland.** `0089` handles root-auth ENOTTY; `0111` clears the
-  virtual-timer `IMASK` (`CNTV_CTL_EL0 = 0x7`); launchd then reaches 130
+- **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
-  containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` gives no swaps yet.
+  containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display.** `0085` logs 1440x3200 userland swaps; `mondrianfb_noconsole=1`
-  disables kernel text at the first swap, so later lines are not panel output.
-  Two things gate CoreAnimation on a display without a GPU: it polls for an
-  `IOAcceleratorES` service for 30 s before it looks for a renderer, and it
-  needs `TimingElements`/`ColorElements` on the display or it has no mode and
-  draws nothing. `0114` publishes one 60 Hz mode and an empty accelerator,
-  which leaves CoreAnimation's software rasterizer as the renderer.
+- **Display and UI.** The lock screen is up. CoreAnimation needs
+  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
+  waits 30 s and draws nothing); `0114` publishes them and leaves the software
+  renderer. The panel is written through the console alias, never through an
+  `IOMemoryDescriptor` or `PE_initialize_console(kPEDisableScreen)`: both put a
+  device pager on managed pages and panic in `pmap_remove_pv`. SpringBoard then
+  waits on MobileActivation in `_setupActivationState`; the dylib forces
+  activation and skips Setup.
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **Root image.** `tools/ios-root-tweaks.py` adds preboot firmware and
-   containers; flattened HFS still lacks a separate Data volume.
-2. **Pid-1 diagnosis.** Framebuffer text can be stale. Namespace 1/code 0xe
-   is `JETSAM_REASON_MEMORY_SUSTAINED_PRESSURE`; `CS_KILLED` marks invalid
-   pages. Read `CODE SIGNING`/`CRASH` before changing AMFI or Sandbox.
-3. **Timers.** No timer interrupt reaches EL1, so every timed wait hangs and
-   userland cannot draw (`0116` measures it); presentation and touch untested.
+1. **Touch and buttons.** The lock screen cannot be unlocked: the kernel
+   publishes HID stubs, but no touch driver reads the panel's Goodix over
+   SPI, and the buttons only exist in the shim's menu.
+2. **Date and time.** There is no RTC: iOS shows 31 December 1970.
+3. **Rest of the phone.** Audio, USB, modem, cameras and the GPU are untouched;
+   the daemons that abort (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
 ```sh
 tools/build-kernel-local.sh                        # -> /tmp/kernel.development.mondrian

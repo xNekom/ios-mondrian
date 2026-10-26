@@ -1,9 +1,16 @@
-xnu 0115: give the sampler a clock the board delivers and a screen heartbeat
+xnu 0115: the panel as device memory, and a clock for the sampler
 
 The sampler thread's tsleep() timeout never fires on this board, so the only
 samples that used to arrive came from the UFS write path, and 0113 removed
 that call: the 0114 run logged one sample and then nothing, which leaves a
 stalled boot and a slow one impossible to tell apart.
+
+The default surface was an IOMemoryDescriptor over the panel's physical
+range, and mapping it with IOMemoryDescriptor::map() put a device pager on
+pages the VM still manages: IOKit prints "physical with managed page", the
+pmap PV lists end up inconsistent, and the boot dies in pmap_remove_pv. Map
+the panel with ml_io_map instead and let the default surface be ordinary
+memory that swap() copies from.
 
 The framebuffer's vsync timer does run (60 Hz, re-armed by its own callback),
 so tick the sampler from it every five seconds. Also move a white block on the
@@ -14,24 +21,72 @@ takes the screen.
 
 --- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
 +++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
-@@ -293,6 +293,33 @@
+@@ -69,6 +69,11 @@
+ #define MONDRIAN_FB_VSYNC_US               16667
+ #define MONDRIAN_FB_DOT_PITCH              526     /* ppi, 6.67" 1440x3200 */
+ #define MONDRIAN_FB_FORMAT_BGRA            0x42475241
++/* bsd/dev/mondrian_sample.c: the sampler, ticked from this driver's timer. */
++extern "C" void mondrian_sample_tick(void);
++/* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
++extern "C" uint64_t mondrian_early_fb_va(void);
++
+ #define MONDRIAN_FB_REFRESH_HZ             60
+ #define MONDRIAN_FB_TIMING_ID              1
+ #define MONDRIAN_FB_COLOR_ID               1
+@@ -246,10 +251,18 @@
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+-	fSurface = mondrian_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, MONDRIAN_FB_FORMAT_BGRA);
+-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/*
++	 * The panel is device memory: write it through the alias the console
++	 * already uses, never through an IOMemoryDescriptor (its device pager
++	 * over the VM's managed pages corrupts the pmap PV lists). The default
++	 * surface CoreAnimation draws into is ordinary memory; swap() copies
++	 * it to the panel.
++	 */
++	fSurface = mondrian_surface_create_vm(fWidth, fHeight, fRowBytes, MONDRIAN_FB_FORMAT_BGRA);
++	fPixels = (uintptr_t)mondrian_early_fb_va();
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
++	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
++	    fWorkLoop == NULL) {
+ 		IOLog("MONDRIAN FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+@@ -267,6 +280,21 @@
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	mondrian_publish_modes(this, fWidth, fHeight);
+ 	registerService();
++	/*
++	 * mondrianfb_noscreen=1: leave the panel to the liveness marker. The
++	 * console still reaches the persistent ring, so a boot can be read
++	 * afterwards even though nothing can be read on the screen.
++	 */
++	{
++		int noscreen = 0;
++
++		if (PE_parse_boot_argn("mondrianfb_noscreen", &noscreen, sizeof(noscreen)) && noscreen != 0) {
++			PE_Video video_now;
++
++			PE_current_console(&video_now);
++			PE_initialize_console(&video_now, kPEDisableScreen);
++		}
++	}
+ 	mondrian_publish_accelerator(provider);
+ 	IOLog("MONDRIAN FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
+@@ -293,6 +321,33 @@
  	}
  	IOLockUnlock(fb->fLock);
  	sender->setTimeoutUS(MONDRIAN_FB_VSYNC_US);
-+	/*
-+	 * The kernel's tsleep() timeouts never fire on this board, so the
-+	 * sampler's own thread ticks once and sleeps for ever. This timer does
-+	 * run: give the sampler a clock it can trust, every five seconds.
-+	 */
-+	if ((count % (MONDRIAN_FB_REFRESH_HZ * 5)) == 0) {
-+		extern "C" void mondrian_sample_tick(void);
-+		mondrian_sample_tick();
-+	}
 +	/*
 +	 * Liveness marker that needs neither the console nor printf: the panel
 +	 * scans this memory by itself, so a block that moves twice a second
 +	 * proves the kernel still runs when the log has stopped. It goes away
 +	 * with the console at the first swap, when the UI owns the screen.
++	 * Drawn before the sampler below, whose printf can block.
 +	 */
 +	if (!fb->fConsolePaused && (count % (MONDRIAN_FB_REFRESH_HZ / 2)) == 0) {
 +		uint32_t phase = (uint32_t)((count / (MONDRIAN_FB_REFRESH_HZ / 2)) & 1);
@@ -45,6 +100,95 @@ takes the screen.
 +			}
 +		}
 +	}
++	/*
++	 * The kernel's tsleep() timeouts never fire on this board, so the
++	 * sampler's own thread ticks once and sleeps for ever. This timer does
++	 * run: give the sampler a clock it can trust, every five seconds.
++	 */
++	if ((count % (MONDRIAN_FB_REFRESH_HZ * 5)) == 0) {
++		mondrian_sample_tick();
++	}
  }
  
  void
+@@ -332,11 +387,21 @@
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
++
+ 		fConsolePaused = true;
+ 		if (PE_parse_boot_argn("mondrianfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			PE_Video video;
+-			PE_current_console(&video);
+-			PE_initialize_console(&video, kPEDisableScreen);
++			/*
++			 * Stop the screen console without unmapping it:
++			 * PE_initialize_console(kPEDisableScreen) tears the panel
++			 * alias out of the pmap and this board panics in
++			 * pmap_remove_pv. _cnputs() drops everything once this is
++			 * set, and the persistent ring still records it.
++			 */
++			extern int disableConsoleOutput;
++			extern int mondrian_fbcon_quiet;
++
++			disableConsoleOutput = 1;
++			mondrian_fbcon_quiet = 1;
+ 		}
+ 	}
+ 
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -224,7 +224,40 @@
+ 	return ok;
+ }
+ 
++/*
++ * Ordinary kernel pages, not device memory: the framebuffer's default surface
++ * must not describe the panel's managed pages to IOMemoryDescriptor, which
++ * would put a device pager on them and corrupt the pmap's PV lists (the
++ * "physical with managed page" backtrace, then a pmap_remove_pv panic).
++ */
+ MondrianSurface *
++mondrian_surface_create_vm(uint32_t width, uint32_t height, uint32_t bytesPerRow,
++    uint32_t pixelFormat)
++{
++	MondrianSurface *s = mondrian_surface_alloc();
++
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page((uint64_t)bytesPerRow * height);
++	s->memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	s->mapCache = kIOMapDefaultCache;
++	if (s->memory == NULL || !mondrian_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	bzero((void *)s->kernelAddress(), s->allocSize);
++	return s;
++}
++
++MondrianSurface *
+ mondrian_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+     uint32_t bytesPerRow, uint32_t pixelFormat)
+ {
+--- a/iokit/Kernel/arm/MondrianSurface.h
++++ b/iokit/Kernel/arm/MondrianSurface.h
+@@ -58,6 +58,10 @@
+ MondrianSurface *mondrian_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/* A surface backed by ordinary kernel pages (the default framebuffer). */
++MondrianSurface *mondrian_surface_create_vm(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t mondrian_surface_port_in_task(MondrianSurface *surface, task_t task);
+ 

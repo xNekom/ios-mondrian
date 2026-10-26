@@ -163,6 +163,68 @@ install_display_diagnostic(void)
 	say("MONDRIAN UI: _detectDisplays hook installed (runtime lookup)\n");
 }
 
+/*
+ * SpringBoard asks MobileActivation for the activation state before it shows
+ * the lock screen (-[SBLockdownManager _setupActivationState], a synchronous
+ * XPC call). On hardware that is not an iPhone nothing answers, the state
+ * stays 0, and the boot sits at the Apple logo for ever. Force the state the
+ * lock screen wants and skip the setup assistant.
+ */
+static int mondrian_activation_offset = -1;
+
+static void
+mondrian_setup_activation_state(id self, __unused SEL selector)
+{
+	if (mondrian_activation_offset < 0) {
+		return;
+	}
+	*(int *)((char *)self + mondrian_activation_offset) = 2;      /* activated */
+	say("MONDRIAN UI: SBLockdownManager activation -> 2\n");
+}
+
+static void (*original_set_setup_reason)(id, SEL, long);
+
+static void
+mondrian_set_setup_reason(id self, SEL selector, long reason)
+{
+	if (reason != 0) {
+		say("MONDRIAN UI: SpringBoard wants the setup assistant; skipped\n");
+	}
+	if (original_set_setup_reason != NULL) {
+		original_set_setup_reason(self, selector, 0);
+	}
+}
+
+static void
+install_activation_hooks(void)
+{
+	Class lockdown = objc_getClass("SBLockdownManager");
+	SEL setup_sel = sel_registerName("_setupActivationState");
+	Method setup = lockdown != Nil ? class_getInstanceMethod(lockdown, setup_sel) : NULL;
+
+	if (lockdown == Nil) {
+		say("MONDRIAN UI: SBLockdownManager missing\n");
+	} else if (setup == NULL) {
+		say("MONDRIAN UI: _setupActivationState missing\n");
+	} else {
+		Ivar ivar = class_getInstanceVariable(lockdown, "_activationState");
+
+		mondrian_activation_offset = ivar != NULL ? ivar_getOffset(ivar) : 8;
+		method_setImplementation(setup, (IMP)mondrian_setup_activation_state);
+		say("MONDRIAN UI: activation hook installed\n");
+	}
+
+	Class setup_manager = objc_getClass("SBSetupManager");
+	SEL reason_sel = sel_registerName("_setSetupRequiredReason:");
+	Method reason = setup_manager != Nil ? class_getInstanceMethod(setup_manager, reason_sel) : NULL;
+
+	if (reason != NULL && method_getNumberOfArguments(reason) == 3) {
+		original_set_setup_reason = (void (*)(id, SEL, long))method_setImplementation(
+		    reason, (IMP)mondrian_set_setup_reason);
+		say("MONDRIAN UI: setup-assistant hook installed\n");
+	}
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -171,5 +233,6 @@ mondrian_install_ui_hooks(void)
 	say_pid("UI: dylib loaded");
 	install_personas_hook();
 	install_display_diagnostic();
+	install_activation_hooks();
 	start_heartbeat();
 }
