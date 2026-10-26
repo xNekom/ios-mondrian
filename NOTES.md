@@ -28,15 +28,16 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **iOS userland.** `0089` handles root-auth ENOTTY; `0111` clears the
   virtual-timer `IMASK` (`CNTV_CTL_EL0 = 0x7`); launchd then reaches 130
   processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
-  containermanagerd, 2 backboardd, 4 SpringBoard). With `hook=7` backboardd
-  opens the framebuffer, enters `_detectDisplays`, no return, no swaps, no UI.
+  containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` gives no swaps yet.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display.** `0085` logs 1440x3200 userland swaps; `mondrianfb_noconsole=1`
   disables kernel text at the first swap, so later lines are not panel output.
-  QuartzCore's display probe waits up to 30 s for the GPU
-  (`CAMetalContextCreate` polls `IOAcceleratorES` every 100 ms) before falling
-  back to the CPU renderer: a boot reset sooner proves nothing about display.
+  Two things gate CoreAnimation on a display without a GPU: it polls for an
+  `IOAcceleratorES` service for 30 s before it looks for a renderer, and it
+  needs `TimingElements`/`ColorElements` on the display or it has no mode and
+  draws nothing. `0114` publishes one 60 Hz mode and an empty accelerator,
+  which leaves CoreAnimation's software rasterizer as the renderer.
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 

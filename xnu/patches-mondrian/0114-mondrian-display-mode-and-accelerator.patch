@@ -1,0 +1,197 @@
+xnu 0114: publish the display mode and an accelerator stub
+
+With 0112 backboardd enters _detectDisplays and then sits there: QuartzCore
+asks the registry for IOAcceleratorES before it looks for a renderer at all,
+and this port publishes no such service, so the probe polls for it for 30 s
+per process. Even past that point CoreAnimation would draw nothing, because a
+display has to carry TimingElements and ColorElements to have a mode at all.
+
+Publish one 60 Hz timing at the panel size and one 8-bit RGB colour mode, and
+an empty IOAcceleratorES. It carries neither MetalPluginName nor
+MetalPluginClassName, so Metal and OpenGL ES pass it over and CoreAnimation
+falls back to its own software rasterizer, which is the renderer this port
+has. GetID answers 1 instead of 0, GetBlock 0x40 returns the current mode's
+IDs, and selector 77 returns mach_absolute_time().
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -40,6 +40,10 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -54,6 +58,8 @@
+ 	kMondrianFBIsMainDisplay           = 18,
+ 	kMondrianFBGetDotPitch             = 28,
+ 	kMondrianFBNotifications           = 72,
++	kMondrianFBGetCurrentAbsoluteTime  = 77,
++	kMondrianFBGetBlock                = 79,
+ };
+ 
+ #define MONDRIAN_FB_SWAP_REC_SIZE          0x46c
+@@ -63,6 +69,9 @@
+ #define MONDRIAN_FB_VSYNC_US               16667
+ #define MONDRIAN_FB_DOT_PITCH              526     /* ppi, 6.67" 1440x3200 */
+ #define MONDRIAN_FB_FORMAT_BGRA            0x42475241
++#define MONDRIAN_FB_REFRESH_HZ             60
++#define MONDRIAN_FB_TIMING_ID              1
++#define MONDRIAN_FB_COLOR_ID               1
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -70,6 +79,101 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * The graphics accelerator. There is no GPU driver here, but CoreAnimation
++ * waits 30 s for a service of this class before it looks for a renderer at
++ * all, once per process. Without MetalPluginName and MetalPluginClassName
++ * both Metal and OpenGL ES pass it over, which leaves CoreAnimation's own
++ * software rasterizer as the renderer.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++mondrian_publish_accelerator(IOService *provider)
++{
++	IOAcceleratorES *accelerator = OSTypeAlloc(IOAcceleratorES);
++
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->registerService();
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++
++static void
++mondrian_set_number(OSDictionary *dict, const char *key, uint64_t value)
++{
++	OSNumber *number = OSNumber::withNumber(value, 32);
++
++	if (number != NULL) {
++		dict->setObject(key, number);
++		number->release();
++	}
++}
++
++/*
++ * The modes of the display, as CoreAnimation reads them (properties
++ * TimingElements and ColorElements; without a mode it draws nothing): one
++ * timing at the panel's size and MONDRIAN_FB_REFRESH_HZ, one 8-bit RGB colour
++ * mode. Their IDs are what GetBlock 0x40 answers with.
++ */
++static void
++mondrian_publish_modes(IOService *fb, uint32_t width, uint32_t height)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = MONDRIAN_FB_REFRESH_HZ << 16;      /* 16.16 fixed point */
++
++	if (timing == NULL || horizontal == NULL || vertical == NULL || color == NULL ||
++	    timings == NULL || colors == NULL) {
++		goto done;
++	}
++	mondrian_set_number(color, "ID", MONDRIAN_FB_COLOR_ID);
++	mondrian_set_number(color, "PixelEncoding", 0);          /* RGB 4:4:4 */
++	mondrian_set_number(color, "Depth", 8);
++	mondrian_set_number(color, "Colorimetry", 1);
++	mondrian_set_number(color, "EOTF", 1);
++	mondrian_set_number(color, "DynamicRange", 0);
++	mondrian_set_number(color, "Score", 1);
++	color->setObject("IsVirtual", kOSBooleanFalse);
++	colors->setObject(color);
++
++	mondrian_set_number(horizontal, "Active", width);
++	mondrian_set_number(horizontal, "Total", width);
++	mondrian_set_number(horizontal, "SyncRate", rate);
++	mondrian_set_number(horizontal, "PreciseSyncRate", rate);
++	mondrian_set_number(vertical, "Active", height);
++	mondrian_set_number(vertical, "Total", height);
++	mondrian_set_number(vertical, "SyncRate", rate);
++	mondrian_set_number(vertical, "PreciseSyncRate", rate);
++	mondrian_set_number(timing, "ID", MONDRIAN_FB_TIMING_ID);
++	mondrian_set_number(timing, "Score", 1);
++	timing->setObject("IsVirtual", kOSBooleanFalse);
++	timing->setObject("IsOverscanned", kOSBooleanFalse);
++	timing->setObject("HorizontalAttributes", horizontal);
++	timing->setObject("VerticalAttributes", vertical);
++	timing->setObject("ColorModes", colors);
++	timings->setObject(timing);
++
++	fb->setProperty("TimingElements", timings);
++	fb->setProperty("ColorElements", colors);
++done:
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -161,7 +265,9 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	mondrian_publish_modes(this, fWidth, fHeight);
+ 	registerService();
++	mondrian_publish_accelerator(provider);
+ 	IOLog("MONDRIAN FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
+ 	return true;
+@@ -406,7 +512,7 @@
+ 		break;
+ 	}
+ 	case kMondrianFBGetID:
+-		out[0] = 0;
++		out[0] = 1;
+ 		outCount = 1;
+ 		break;
+ 	case kMondrianFBGetDisplaySize:
+@@ -422,6 +528,10 @@
+ 		out[0] = MONDRIAN_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kMondrianFBGetCurrentAbsoluteTime:
++		out[0] = mach_absolute_time();
++		outCount = 1;
++		break;
+ 	case kMondrianFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < MONDRIAN_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+@@ -445,6 +555,17 @@
+ 	}
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
++		/*
++		 * GetBlock(0x40) is "the current mode": CoreAnimation reads it
++		 * back after the TimingElements/ColorElements properties, and
++		 * the IDs have to be the ones those properties published.
++		 */
++		if (selector == kMondrianFBGetBlock && args->structureOutputSize >= 12 &&
++		    args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40) {
++			uint32_t ids[2] = { MONDRIAN_FB_COLOR_ID, MONDRIAN_FB_TIMING_ID };
++
++			memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++		}
+ 	}
+ 	if (selector >= 64 || !(mondrian_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {

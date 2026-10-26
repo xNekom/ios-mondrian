@@ -1,0 +1,211 @@
+xnu 0113: keep the sampler out of the console and UFS paths
+
+The 0112 runs freeze about 30 s after the daemons start: the last console line
+is arbitrary, the sampler stops and the panel keeps the last line until the
+phone is reset. The sampler is the only new code that printf()s from inside
+the console path (the log thread) and from inside the UFS strategy path
+(mondrian_log_kick), and its printf() goes straight back through both, so a
+re-entry there wedges the machine with the console lock held.
+
+Tick at most once a second and never from inside a tick, and drop the call
+from the UFS strategy path; the log thread and the sampler thread still drive
+it. Print the per-thread dump after dropping the task lock, because the
+printf() sleeps on the console and on the UFS-backed ring. The sample line
+now carries the uptime in seconds, so a boot that stops early can be measured
+instead of guessed.
+
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -18,6 +18,7 @@
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
++#include <kern/clock.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -157,10 +158,23 @@
+  * the tsleep() timeout stops firing after userland starts, and from the
+  * sampler thread as a slow fallback.
+  */
++static uint64_t mondrian_last_tick;
++static int      mondrian_in_tick;
++
++static uint64_t
++mondrian_uptime_ns(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns;
++}
++
+ void
+ mondrian_sample_tick(void)
+ {
+ 	static bool armed, dumped;
++	uint64_t now;
+ 
+ 	if (!armed) {
+ 		armed = true;
+@@ -168,8 +182,22 @@
+ 		printf("MONDRIAN SMP: samples armed (%d names)\n", mondrian_names_count);
+ 	}
+ 	if (mondrian_names_count == 0 || mondrian_names[0][0] == '-') {
++		return;
++	}
++	/*
++	 * The tick is also called from the console and UFS paths, and printf
++	 * runs back through both. Re-entering here, or printing on every write,
++	 * wedged the boot: run at most once a second and never from a tick.
++	 */
++	if (mondrian_in_tick) {
+ 		return;
+ 	}
++	now = mondrian_uptime_ns();
++	if (now - mondrian_last_tick < 1000000000ULL) {
++		return;
++	}
++	mondrian_last_tick = now;
++	mondrian_in_tick = 1;
+ 	mondrian_proc_len = 0;
+ 	mondrian_proc_count = 0;
+ 	mondrian_proc_list[0] = 0;
+@@ -179,7 +207,8 @@
+ 	}
+ 	proc_iterate(PROC_ALLPROCLIST, mondrian_sample_list, NULL, NULL, NULL);
+ 
+-	printf("SMP %d procs", mondrian_proc_count);
++	printf("SMP t=%llus %d procs", (unsigned long long)(now / 1000000000ULL),
++	    mondrian_proc_count);
+ 	for (int k = 0; k < mondrian_names_count; k++) {
+ 		printf(" | %s(%d) pc=0x%llx", mondrian_names[k],
+ 		    mondrian_want_pid[k], mondrian_want_pc[k]);
+@@ -231,6 +260,7 @@
+ 		printf("SMP --- detailed sample, %d procs\n", mondrian_proc_count);
+ 		proc_iterate(PROC_ALLPROCLIST, mondrian_sample_proc, NULL, NULL, NULL);
+ 	}
++	mondrian_in_tick = 0;
+ }
+ 
+ static void
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1253,20 +1253,15 @@
+ mondrian_log_kick(void)
+ {
+ 	uint64_t total = os_atomic_load(&mondrian_log_total, relaxed);
+-
+-	static uint32_t calls;
+ 
+ 	if (total - os_atomic_load(&mondrian_log_flushed, relaxed) >= MONDRIAN_LOG_KICK_BYTES) {
+ 		mondrian_log_store(total);
+ 	}
+ 	/*
+-	 * The sampler has the same dead timeout, so give it this clock too:
+-	 * one line every 256 write-path calls.
++	 * No sampler tick here: this runs inside the UFS strategy path, and the
++	 * sampler's printf goes back out through the console and this same
++	 * driver. The log thread draws the samples from console traffic instead.
+ 	 */
+-	if ((++calls & 0xff) == 0) {
+-		extern void mondrian_sample_tick(void);
+-		mondrian_sample_tick();
+-	}
+ }
+ 
+ static void
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1018,13 +1018,25 @@
+ 	task_unlock(task);
+ 	return pc;
+ }
++
++#define MONDRIAN_DUMP_THREADS   8
++#define MONDRIAN_DUMP_BT        8
++
++struct mondrian_thread_dump {
++	uint64_t pc;
++	uint64_t lr;
++	uint64_t sp;
++	uint64_t bt[MONDRIAN_DUMP_BT];
++	int      nbt;
++};
+ 
+ void
+ mondrian_sample_task(const char *name, int pid, task_t task)
+ {
+ 	vm_map_t map = get_task_map(task);
+ 	uint64_t slide = 0;
+-	int tn = 0;
++	struct mondrian_thread_dump dump[MONDRIAN_DUMP_THREADS];
++	int threads = 0, shown = 0;
+ 	thread_t thread;
+ 	vm_shared_region_t sr = vm_shared_region_get(task);
+ 
+@@ -1035,34 +1047,54 @@
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide,
+ 	    task->mach_header_vm_address);
+ 
++	bzero(dump, sizeof(dump));
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
+-		int n;
++		struct mondrian_thread_dump *d;
+ 		uint64_t fp;
+ 
+-		if (ss == NULL || !is_saved_state64(ss)) {
++		threads++;
++		if (ss == NULL || !is_saved_state64(ss) || shown >= MONDRIAN_DUMP_THREADS) {
+ 			continue;
+ 		}
+-		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt",
+-		    name, tn++, get_saved_state_pc(ss), get_saved_state_lr(ss),
+-		    get_saved_state_sp(ss));
+-		for (int i = 0; i < 12 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
++		d = &dump[shown];
++		d->pc = get_saved_state_pc(ss);
++		d->lr = get_saved_state_lr(ss);
++		d->sp = get_saved_state_sp(ss);
++		d->nbt = 0;
++		fp = get_saved_state_fp(ss);
++		for (int i = 0; i < MONDRIAN_DUMP_BT && fp != 0 && (fp & 7) == 0; i++) {
+ 			uint64_t frame[2];
++
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+ 			}
+-			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", frame[1]);
++			d->bt[d->nbt++] = frame[1];
+ 			if (frame[0] <= fp) {
+ 				break;
+ 			}
+ 			fp = frame[0];
+ 		}
+-		printf("%s\n", line);
++		shown++;
+ 	}
+ 	task_unlock(task);
++
++	/*
++	 * Print after dropping the task lock: printf sleeps on the console and
++	 * on the UFS-backed log ring, and backboardd cannot be held there.
++	 */
++	printf("SMP %s threads %d shown %d\n", name, threads, shown);
++	for (int j = 0; j < shown; j++) {
++		char line[320];
++		int n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt",
++		    name, j, dump[j].pc, dump[j].lr, dump[j].sp);
++
++		for (int i = 0; i < dump[j].nbt && n < (int)sizeof(line) - 20; i++) {
++			n += snprintf(line + n, sizeof(line) - n, " 0x%llx", dump[j].bt[i]);
++		}
++		printf("%s\n", line);
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
