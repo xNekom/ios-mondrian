@@ -45,6 +45,11 @@ build)
 	fi
 	[ -f "$KERNEL" ] || { echo "no hay kernel; baja el artefacto del CI" >&2; exit 1; }
 	[ -f "$RAMDISK" ] || { printf '#!/bin/sh\nexec /bin/sh\n' > "$RAMDISK"; }
+	# The PMK8350 RTC has never been set, so the kernel takes the host's UTC
+	# time from the command line (`bsd/dev/mondrian_clock.c` reads
+	# mondriantime, in seconds since 1970). Stamped at build time.
+	: "${CMDLINE:=$(python3 -c "from tools.boards import BOARDS; print(BOARDS['$BOARD'].cmdline)")}"
+	CMDLINE="$CMDLINE mondriantime=$(date +%s)"
 	python3 tools/mkadt.py --board "$BOARD" "$ADT"
 	python3 tools/mkpayload.py "$KERNEL" "$ADT" "$PAYLOAD" --board "$BOARD" \
 		--ramdisk "$RAMDISK" ${CMDLINE:+--cmdline "$CMDLINE"}
