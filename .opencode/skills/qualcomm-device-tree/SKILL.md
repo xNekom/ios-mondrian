@@ -38,13 +38,19 @@ The shim also prints the tree it was handed at boot; when shim output and
 | `qcom,mdss_mdp@ae00000` | display controller. Not used while the splash buffer is alive |
 | panel node (`mdss_dsi_m11a_42_02_0a_dsc_cmd`) | timings/format; only needed if MDSS/DSI is ever driven |
 | `gcc` / clock controllers | the UFS clock branch (`0x870`) had to be enabled by hand |
-| TLMM, SPMI/PMIC | touch, buttons, battery: not started |
+| TLMM | pin registers at `0x0f100000 + 0x1000*n`; the node's 16 MB region at `0x0f000000` starts with a 1 MB hole |
+| SPMI/PMIC | touch rail, battery: not started |
 
 ## Traps
 
 - **Cell counts.** `reg` is meaningless without the parent's `#address-cells`
   and `#size-cells`. A 2/2 parent gives `<addr_hi addr_lo size_hi size_lo>`;
   reading it as 1/1 halves the addresses and looks plausible.
+- **`reg` can cover a hole.** A node's window is not the register block.
+  `pinctrl@f000000` declares `0x0f000000+0x1000000`, but the pin registers are
+  at `0x0f100000` (mainline `pinctrl-sm8450`); reading the first megabyte
+  wedges the interconnect with no abort and no further timer interrupts. Check
+  the register base against the mainline driver for the SoC, not the node name.
 - **Interrupt numbering.** DT `interrupts` are GIC SPIs counted from 0; XNU
   INTIDs are SPI + 32. Copy the DT number into XNU and the handler never
   runs, with no error anywhere.

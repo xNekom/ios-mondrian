@@ -80,6 +80,12 @@ before code.
   build flag.
 - The real DTB is reference data for filling those tables, never an input to
   the build. See the `qualcomm-device-tree` skill for reading it.
+- An MMIO node's `reg` can cover a superset with holes. Cape's
+  `pinctrl@f000000` declares 16 MB, but the pin registers start at
+  `0x0f100000` (mainline `pinctrl-sm8450`); a read at `0x0f014000` does not
+  abort, it wedges the interconnect, the timer interrupt stops and the
+  watchdog resets the phone. Cross-check a register base against mainline's
+  driver for the SoC before the first read, and flush the ring before it.
 
 ## Order of an early boot, as a diagnostic ladder
 

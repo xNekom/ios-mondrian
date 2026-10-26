@@ -105,7 +105,7 @@ From the live device tree (and from the shim's own dump):
 | GICD / GICR | `0x17100000+0x10000` / `0x17180000+0x200000`, 8 redistributors, stride `0x40000` |
 | virtual timer | GIC INTID 27 (DT PPI 11; no `virtual-timer-intid` in the tree) |
 | UFS host | `0x1d84000+0x3000`, `ro.boot.bootdevice` = `1d84000.ufshc` |
-| touch | Goodix on QUPv3 SPI, `xiaomi,m11a-spi`, SE4 `0x990000`, IRQ TLMM GPIO21, reset GPIO20 |
+| touch | Goodix on QUPv3 SPI, `xiaomi,m11a-spi`, SE4 `0x990000`, IRQ TLMM GPIO21, reset GPIO20, AVDD GPIO71; its pin registers are at `0x0f100000`, not the `0x0f000000` the DT node declares: that 16 MB region starts with a 1 MB hole, and a read there wedges the interconnect until the watchdog resets the phone |
 | volume up key | PM8350 GPIO6 (`&pm8350_gpios 6`) |
 | SPMI arbiter | version 7 (`0x70000000`) |
 

@@ -21,7 +21,7 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 | IOVDD | PMIC regulator, phandle `0x301` (`vdd-supply`) |
 | Coordinates | `panel-max-x = 14400`, `-y = 32000` (0.1 mm units) |
 | Panels | two panel phandles; the touch node is shared |
-| TLMM | `qcom,cape-pinctrl` at **0x0f000000**, summary IRQ GIC SPI 208 |
+| TLMM | `qcom,cape-pinctrl` node `0x0f000000+0x1000000`, but the pin registers start at **0x0f100000** (GPIO n at `+0x1000*n`); summary IRQ GIC SPI 208 |
 
 ## The layers, in the order they have to work
 
@@ -32,9 +32,11 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
    writing one (the touch IRQ pin stays high when it is powered and out of
    reset). The shim's SPMI is read-only by design, so it cannot set it.
 2. **TLMM pins.** Reset (20) low, then high after the part's power-up delay;
-   AVDD enable (71) high; IRQ pin (21) as input with pull-down. The TLMM
-   register layout is mainline `pinctrl-msm` (GPIO_CFG at `0x1000 * n`,
-   `INTR_CFG`, `INTR_STATUS`); the kernel has no TLMM driver yet.
+   AVDD enable (71) high; IRQ pin (21) as input with pull-down. The pin
+   registers are the mainline `pinctrl-msm` layout at `0x0f100000 + 0x1000*n`:
+   `GPIO_CFG` (pull 0-1, function 2-4, drive 6-8, output enable 9), `IN_OUT`
+   (level 0, output value 1), `INTR_CFG` and `INTR_STATUS`. The kernel has no
+   TLMM driver yet.
 3. **GCC clocks.** `se-clk` (branch 94) and the two AHB branches (134, 135).
    The port already pokes the UFS branch from `tools/boards.py`
    (`gcc=0x100000`, `ufs_gcc_branch=0x870`) and the shim does it at boot; the
@@ -69,6 +71,12 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 
 ## Traps
 
+- **The pin registers are not at the DT node's base.** `pinctrl@f000000`
+  declares `0x0f000000+0x1000000`, but its first megabyte is a hole: the pin
+  registers live at `0x0f100000`, as mainline's `pinctrl-sm8450` has it. A
+  read of `0x0f014000` (GPIO20 at the wrong base) does not abort: it wedges
+  the interconnect, the timer interrupt stops arriving, and the phone resets
+  on the watchdog. Read `0x0f114000` instead, one 4 KB page per pin.
 - **The SE bus hangs the CPU when its clock is gated.** Every register access
   after a failed clock enable spins forever with interrupts off; the beacon in
   the timer interrupt stops. Enable the clocks first, and keep a spin-counted
