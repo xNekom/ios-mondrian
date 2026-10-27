@@ -1,0 +1,255 @@
+xnu 0131: single-frame bit-bang, a MISO float test and the ldoc2 vote
+
+The first bit-bang read returned zeros in both framings. Two things changed:
+the command/address and the data now share one CS frame (the part latches
+the address and drives MISO with CS still low), and the clock is slower
+(~600 kHz). Before reading, MISO is sampled with a pull-up and with a
+pull-down: a floating pad means nothing drives the part's IO, which for a
+powered and de-reset part means its IOVDD rail is off.
+
+That rail is pm8350c_l2, an RPMh VRM: read its address from the AOP command
+DB (0x80860000, key "ldoc2") and send voltage 1800 mV and enable through the
+first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
+3.0 layout), then sample MISO again.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -30,6 +30,7 @@
+ 
+ /* osfmk/vm/pmap.h: not exported to the BSD layer */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern uint64_t ml_get_timebase(void);
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -143,6 +144,30 @@
+ #define MONDRIAN_M_CMD_DONE		(1u << 0)
+ #define MONDRIAN_M_CMD_FAILURE		(1u << 3)
+ #define MONDRIAN_M_CMD_ABORT		(1u << 5)
++
++/*
++ * RPMh: apps_rsc drv-2 (0x17a20000), TCS block at +0xd00, 672 bytes per TCS.
++ * The resource address of an LDO comes from the AOP command DB (0x80860000,
++ * header 0x90 bytes, 8 rsc headers of 16, entries of 24: id[8], prio[8],
++ * addr, len, offset). rpmh-rsc 3.0 register layout.
++ */
++#define MONDRIAN_CMD_DB_PA	0x80860000UL
++#define MONDRIAN_CMD_DB_SIZE	0x20000
++#define MONDRIAN_RSC_PA		0x17a20000UL
++#define MONDRIAN_RSC_SIZE	0x10000
++#define MONDRIAN_RSC_TCS_OFF	0xd00
++#define MONDRIAN_RSC_TCS_STRIDE	672
++#define MONDRIAN_RSC_STATUS	0x28
++#define MONDRIAN_RSC_CMD_ENABLE	0x2c
++#define MONDRIAN_RSC_CONTROL	0x24
++#define MONDRIAN_RSC_CMD_MSGID	0x34
++#define MONDRIAN_RSC_CMD_ADDR	0x38
++#define MONDRIAN_RSC_CMD_DATA	0x3c
++#define MONDRIAN_RSC_CMD_STATUS	0x40
++#define MONDRIAN_RSC_CMD_STEP	24
++#define MONDRIAN_CMD_MSGID_LEN	3u
++#define MONDRIAN_CMD_MSGID_WRITE	(1u << 16)
++#define MONDRIAN_CMD_MSGID_RESP	(1u << 8)
+ 
+ #define MONDRIAN_TOUCH_RESET_GPIO	20
+ #define MONDRIAN_TOUCH_IRQ_GPIO		21
+@@ -379,6 +404,103 @@
+ 		}
+ 	}
+ 	return -1;
++}
++
++/*
++ * The LDO resource address lives in the command DB, keyed by the vendor's
++ * qcom,resource-name ("ldoc2" for pm8350c_l2).
++ */
++static uint32_t
++mondrian_cmd_db_addr(const char *id)
++{
++	vm_offset_t db = ml_io_map(MONDRIAN_CMD_DB_PA, MONDRIAN_CMD_DB_SIZE);
++	const uint8_t *b = (const uint8_t *)db;
++	uint32_t i, j;
++
++	if (db == 0) {
++		return 0;
++	}
++	if (b[4] != 0xdb || b[5] != 0x30 || b[6] != 0x03 || b[7] != 0x0c) {
++		printf("MONDRIAN TOUCH: cmd-db magic %02x %02x %02x %02x\n",
++		    b[4], b[5], b[6], b[7]);
++		return 0;
++	}
++	for (i = 0; i < 8; i++) {
++		const uint8_t *h = b + 8 + 16 * i;
++		uint32_t count, eoff;
++		const uint8_t *e;
++
++		if ((h[0] | (h[1] << 8)) == 0) {
++			break;
++		}
++		eoff = h[2] | (h[3] << 8);
++		count = h[6] | (h[7] << 8);
++		e = b + 0x90 + eoff;
++		for (j = 0; j < count; j++, e += 24) {
++			if (memcmp(e, id, strlen(id)) == 0) {
++				uint32_t addr;
++
++				memcpy(&addr, e + 16, 4);
++				printf("MONDRIAN TOUCH: cmd-db \"%s\" 0x%x\n", id, addr);
++				return addr;
++			}
++		}
++	}
++	printf("MONDRIAN TOUCH: cmd-db has no \"%s\"\n", id);
++	return 0;
++}
++
++/*
++ * Vote for pm8350c_l2 on (1.8 V, enabled) through the first ACTIVE TCS. The
++ * VRM registers behind the resource address are +0x0 voltage in millivolts,
++ * +0x4 enable (bit 0) and +0x8 mode.
++ */
++static int
++mondrian_rpmh_ldo2(void)
++{
++	vm_offset_t rsc;
++	uint32_t addr = mondrian_cmd_db_addr("ldoc2");
++	uint32_t base = MONDRIAN_RSC_TCS_OFF;
++	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
++	    MONDRIAN_CMD_MSGID_RESP;
++	uint32_t i, idle;
++
++	if (addr == 0) {
++		return -1;
++	}
++	rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	if (rsc == 0) {
++		return -1;
++	}
++	idle = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE);
++	printf("MONDRIAN TOUCH: rpmh tcs0 enable 0x%x status 0x%x\n", idle,
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS));
++	mondrian_log_flush_now();
++	if (idle != 0) {
++		printf("MONDRIAN TOUCH: rpmh tcs0 busy, not voting\n");
++		return -1;
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID, msgid);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR, addr);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA, 1800);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_MSGID, msgid);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_ADDR, addr + 4);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_DATA, 1);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0x3);
++	__builtin_arm_dsb(0xf);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, 1);
++	__builtin_arm_dsb(0xf);
++	for (i = 0; i < 1000000; i++) {
++		if (!(mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & 0x3)) {
++			break;
++		}
++	}
++	printf("MONDRIAN TOUCH: rpmh vote done, status 0x%x cmd 0x%x/0x%x\n",
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS),
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS),
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
++	mondrian_log_flush_now();
++	return 0;
+ }
+ 
+ /*
+@@ -407,12 +529,12 @@
+ mondrian_spi_bit(int mosi)
+ {
+ 	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
+-	mondrian_spi_delay(400);
++	mondrian_spi_delay(800);
+ 	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
+-	mondrian_spi_delay(400);
++	mondrian_spi_delay(800);
+ 	int miso = (int)(mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+ 	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
+-	mondrian_spi_delay(400);
++	mondrian_spi_delay(800);
+ 	return miso;
+ }
+ 
+@@ -422,9 +544,13 @@
+ 	uint32_t i, b;
+ 	uint8_t in;
+ 
+-	mondrian_spi_delay(1000);
++	/*
++	 * One CS frame for the command/address and the data: the part latches
++	 * the address on the write and drives MISO for the following clocks
++	 * with CS still low.
++	 */
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
+-	mondrian_spi_delay(1000);
++	mondrian_spi_delay(2000);
+ 	for (i = 0; i < txlen; i++) {
+ 		for (b = 0; b < 8; b++) {
+ 			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
+@@ -437,9 +563,9 @@
+ 		}
+ 		rx[i] = in;
+ 	}
+-	mondrian_spi_delay(1000);
++	mondrian_spi_delay(2000);
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
+-	mondrian_spi_delay(1000);
++	mondrian_spi_delay(2000);
+ 	return 0;
+ }
+ 
+@@ -498,10 +624,50 @@
+ 		mondrian_log_flush_now();
+ 		return;
+ 	}
+-	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~1 MHz, mode 0\n");
++	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~600 kHz, mode 0\n");
+ 	mondrian_log_flush_now();
+ 	delay(20000);
+ 
++	/* Is anything driving MISO? A part with IOVDD drives it; a dead one
++	 * lets the pad's own bias decide. */
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
++	mondrian_spi_delay(2000);
++	printf("MONDRIAN TOUCH: spi: miso pull-up %u\n",
++	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++	mondrian_spi_delay(2000);
++	printf("MONDRIAN TOUCH: spi: miso pull-down %u\n",
++	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_log_flush_now();
++
++	/*
++	 * A floating MISO means the part is not driving its IO; for a powered
++	 * part out of reset that means the IOVDD rail (pm8350c_l2, RPMh) is
++	 * off. Vote it on and look again.
++	 */
++	if ((mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1) == 0) {
++		printf("MONDRIAN TOUCH: spi: miso floats, voting ldoc2\n");
++		mondrian_log_flush_now();
++		if (mondrian_rpmh_ldo2() == 0) {
++			delay(20000);
++			mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++			    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP,
++			    MONDRIAN_TLMM_DRIVE_2MA, 0));
++			mondrian_spi_delay(2000);
++			printf("MONDRIAN TOUCH: spi: after the vote miso pull-up %u\n",
++			    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++			mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++			    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN,
++			    MONDRIAN_TLMM_DRIVE_2MA, 0));
++			mondrian_spi_delay(2000);
++			printf("MONDRIAN TOUCH: spi: after the vote miso pull-down %u\n",
++			    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++			mondrian_log_flush_now();
++		}
++	}
++
+ 	(void)mondrian_spi_xfer(id_a, sizeof(id_a), rx, 4);
+ 	printf("MONDRIAN TOUCH: spi: id a rx %02x %02x %02x %02x\n",
+ 	    rx[0], rx[1], rx[2], rx[3]);
