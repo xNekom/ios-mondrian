@@ -1,0 +1,56 @@
+xnu 0145: power-cycle the touch rail before the reset pulse
+
+The rail stays enabled across warm resets, and this port has been writing to
+the part with frames it never understood (including a blind 0xC900 write), so
+a part left in a bad state never restarts. Turn ldoc2 off, wait 100 ms, turn
+it back on and only then run the reset pulse and the confirm.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -257,7 +257,7 @@
+  * IRQ low, so a powered part out of reset holds it high, and an unpowered or
+  * reset one leaves the pull-down in charge.
+  */
+-static int mondrian_rpmh_rail(const char *name, uint32_t mv);
++static int mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on);
+ static vm_offset_t mondrian_touch_reset_page, mondrian_touch_avdd_page,
+     mondrian_touch_irq_page;
+ static int mondrian_rpmh_read(uint32_t addr, uint32_t *out);
+@@ -295,9 +295,17 @@
+ 	 */
+ 	printf("MONDRIAN TOUCH: power: voting iovdd (ldoc2)\n");
+ 	mondrian_log_flush_now();
+-	(void)mondrian_rpmh_rail("ldoc2", 1800);
++	/*
++	 * A full power cycle first: the rail stays on across warm resets, so a
++	 * part left in a bad state by an earlier transfer would never restart.
++	 */
++	printf("MONDRIAN TOUCH: power: iovdd off/on cycle\n");
++	mondrian_log_flush_now();
++	(void)mondrian_rpmh_rail("ldoc2", 1800, 0);
++	delay(100000);
++	(void)mondrian_rpmh_rail("ldoc2", 1800, 1);
+ 	/* L7C (3.0 V) is the likely feed of the AVDD switch on gpio71. */
+-	(void)mondrian_rpmh_rail("ldoc7", 3000);
++	(void)mondrian_rpmh_rail("ldoc7", 3000, 1);
+ 	delay(3000);
+ 
+ 	mondrian_tlmm_output(avdd_page, 0, MONDRIAN_TLMM_DRIVE_2MA, 1);
+@@ -483,7 +491,7 @@
+  * value is the PMIC5 LDO one, not the DT's RPMH mode: HPM is 7.
+  */
+ static int
+-mondrian_rpmh_rail(const char *name, uint32_t mv)
++mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on)
+ {
+ 	static const uint32_t reg[3] = { 0x0, 0x4, 0x8 };
+ 	uint32_t val[3];
+@@ -495,7 +503,7 @@
+ 	uint32_t i, idle, ctrl;
+ 
+ 	val[0] = mv;
+-	val[1] = 1;
++	val[1] = on ? 1 : 0;
+ 	val[2] = 7;
+ 	if (addr == 0) {
+ 		return -1;
