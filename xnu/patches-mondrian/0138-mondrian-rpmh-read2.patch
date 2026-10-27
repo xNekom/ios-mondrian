@@ -1,0 +1,92 @@
+xnu 0138: vote in an ACTIVE TCS, read the VRM back, probe the MISO bias
+
+The vote went to TCS 0, which is a WAKE TCS on this SoC: qcom,tcs-config is
+<WAKE 3, ACTIVE 2, SLEEP 2, CONTROL 0, FAST 1> and rpmh_probe_tcs_config
+assigns the offsets in that order, so the first ACTIVE TCS is 3. A wake vote
+only takes effect when the AP votes for sleep, which never happens here. Use
+TCS 3 (tcs_base + 3 * 672).
+
+Two diagnostics ride along. The read-back in 0135 never ran because it bailed
+out on CMD_ENABLE, and the hardware does not clear those bits: the driver
+does, so clear them here too and print the answer and CONTROL either way. The
+echo read now runs twice, with MISO pulled down and pulled up: a part that
+drives the line returns the same bytes both ways, a pad with nothing behind it
+returns all zeros one way and all ones the other.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -161,6 +161,15 @@
+ #define MONDRIAN_RSC_SIZE	0x10000
+ #define MONDRIAN_RSC_TCS_OFF	0xd00
+ #define MONDRIAN_RSC_TCS_STRIDE	672
++/*
++ * qcom,tcs-config is <WAKE 3, ACTIVE 2, SLEEP 2, CONTROL 0, FAST 1> and
++ * rpmh_probe_tcs_config assigns offsets in that order, so TCS 0-2 are WAKE
++ * and the first ACTIVE TCS is 3. A WAKE command only takes effect when the
++ * AP votes for sleep, which never happens here.
++ */
++#define MONDRIAN_RSC_ACTIVE_TCS	3
++#define MONDRIAN_RSC_ACTIVE_BASE	\
++	(MONDRIAN_RSC_TCS_OFF + MONDRIAN_RSC_ACTIVE_TCS * MONDRIAN_RSC_TCS_STRIDE)
+ #define MONDRIAN_RSC_STATUS	0x18
+ #define MONDRIAN_RSC_CMD_ENABLE	0x1c
+ #define MONDRIAN_RSC_CONTROL	0x14
+@@ -471,7 +480,7 @@
+ 	static const uint32_t val[3] = { 1800, 1, 7 };
+ 	vm_offset_t rsc;
+ 	uint32_t addr = mondrian_cmd_db_addr("ldoc2");
+-	uint32_t base = MONDRIAN_RSC_TCS_OFF;
++	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
+ 	    MONDRIAN_CMD_MSGID_RESP;
+ 	uint32_t i, idle, ctrl;
+@@ -550,13 +559,15 @@
+ mondrian_rpmh_read(uint32_t addr, uint32_t *out)
+ {
+ 	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
+-	uint32_t base = MONDRIAN_RSC_TCS_OFF;
++	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_RESP;
+ 	uint32_t i, ctrl, sts = 0;
+ 
+-	if (rsc == 0 || mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) != 0) {
++	if (rsc == 0) {
+ 		return -1;
+ 	}
++	/* The driver clears the enable bits after a transfer, not the hardware. */
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0);
+ 	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID, msgid);
+ 	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR, addr);
+ 	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA, 0);
+@@ -579,7 +590,8 @@
+ 		}
+ 	}
+ 	*out = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_RESP_DATA);
+-	printf("MONDRIAN TOUCH: rpmh read 0x%x -> 0x%x (sts 0x%x)\n", addr, *out, sts);
++	printf("MONDRIAN TOUCH: rpmh read 0x%x -> 0x%x (sts 0x%x ctl 0x%x)\n", addr, *out,
++	    sts, mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL));
+ 	mondrian_log_flush_now();
+ 	return (sts & 0x10000) ? 0 : -1;
+ }
+@@ -776,6 +788,21 @@
+ 	    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
+ 	mondrian_log_flush_now();
+ 
++	/*
++	 * Repeat the same read with MISO pulled up. A part that drives the line
++	 * returns the same bytes both ways; a floating pad returns all zeros
++	 * with the pull-down and all ones with the pull-up.
++	 */
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
++	mondrian_spi_delay(2000);
++	(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
++	printf("MONDRIAN TOUCH: spi: echo pull-up rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++	mondrian_log_flush_now();
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++
+ 	(void)mondrian_goodix_read(0x8140, id, sizeof(id));
+ 	printf("MONDRIAN TOUCH: spi: id 0x8140 %02x %02x %02x %02x\n",
+ 	    id[0], id[1], id[2], id[3]);
