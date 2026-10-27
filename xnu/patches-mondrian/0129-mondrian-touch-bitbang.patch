@@ -1,0 +1,309 @@
+xnu 0129: bit-bang SPI on the touch pads
+
+The GENI route is closed for this SE: the FIFO interface is disabled by the
+firmware (GENI_IF_DISABLE_RO = 1) and the SE DMA path wedges the interconnect
+(the boot stops right after the DMA buffer is announced), while GPI/GSI is a
+driver of its own. For the first touch driver, clock the part from the TLMM
+instead: GPIO16 clk, 17 mosi, 18 miso, 19 cs as GPIOs, mode 0, MSB first,
+about 1 MHz from the 19.2 MHz timebase, CS driven by hand. The probe reads
+the product id at 0x8140 in the two common framings.
+
+Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -381,179 +381,134 @@
+ 	return -1;
+ }
+ 
+-static vm_offset_t mondrian_touch_dma;
+-static uint64_t mondrian_touch_dma_pa;
++/*
++ * Bit-banged SPI on the touch pads. The QUPv3 SE has its FIFO interface
++ * disabled by firmware (GENI_IF_DISABLE_RO = 1, 0126) and its SE DMA path
++ * wedges the interconnect (0129), so the first touch driver clocks the part
++ * from the TLMM: GPIO16 clk, 17 mosi, 18 miso, 19 cs, mode 0, MSB first.
++ * ~500 ns per half period (about 1 MHz) from the 19.2 MHz timebase.
++ */
++static vm_offset_t mondrian_spi_clk, mondrian_spi_mosi, mondrian_spi_miso,
++    mondrian_spi_cs;
++static uint64_t mondrian_spi_hz;
+ 
+-static int
+-mondrian_touch_dma_alloc(void)
++static void
++mondrian_spi_delay(uint32_t ns)
+ {
+-	kern_return_t kr;
+-	ppnum_t pn;
++	uint64_t ticks = ((uint64_t)ns * mondrian_spi_hz) / 1000000000ull + 1;
++	uint64_t start = mach_absolute_time();
+ 
+-	if (mondrian_touch_dma != 0) {
+-		return 0;
++	while (mach_absolute_time() - start < ticks) {
++		;
+ 	}
+-	kr = kmem_alloc_contig(kernel_map, &mondrian_touch_dma, PAGE_SIZE, PAGE_MASK,
+-	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
+-	if (kr != KERN_SUCCESS) {
+-		return ENOMEM;
+-	}
+-	pn = pmap_find_phys(kernel_pmap, (addr64_t)mondrian_touch_dma);
+-	if (pn == 0) {
+-		return ENOMEM;
+-	}
+-	mondrian_touch_dma_pa = ptoa_64(pn);
+-	return 0;
+ }
+ 
+-/*
+- * One SPI transfer through the SE's own DMA engine. This SE has the FIFO
+- * interface disabled (GENI_IF_DISABLE_RO = 1, measured on 0126); a FIFO
+- * command stays active for ever, so the bytes have to come from a DMA
+- * buffer. TX buffer at offset 0 of the page, RX at 64.
+- */
+ static int
+-mondrian_spi_xfer(vm_offset_t se, const uint8_t *tx, uint32_t txlen,
+-    uint8_t *rx, uint32_t rxlen)
++mondrian_spi_bit(int mosi)
+ {
+-	uint64_t txpa = mondrian_touch_dma_pa;
+-	uint64_t rxpa = mondrian_touch_dma_pa + MONDRIAN_TOUCH_DMA_RX_OFF;
+-	int st;
++	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
++	mondrian_spi_delay(400);
++	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
++	mondrian_spi_delay(400);
++	int miso = (int)(mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_spi_delay(400);
++	return miso;
++}
+ 
+-	if (mondrian_touch_dma == 0) {
+-		return -1;
+-	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_DMA_MODE_EN, 1);
+-	if (txlen) {
+-		memcpy((void *)mondrian_touch_dma, tx, txlen);
+-		flush_dcache64(txpa, txlen, TRUE);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TX_TRANS_LEN, (txlen + 3) / 4);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_IRQ_CLR, 0xffffffffu);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_IRQ_EN_SET, 0x7u);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_PTR_L, (uint32_t)txpa);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_PTR_H, (uint32_t)(txpa >> 32));
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_ATTR, 1);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_LEN, txlen);
++static int
++mondrian_spi_xfer(const uint8_t *tx, uint32_t txlen, uint8_t *rx, uint32_t rxlen)
++{
++	uint32_t i, b;
++	uint8_t in;
++
++	mondrian_spi_delay(1000);
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
++	mondrian_spi_delay(1000);
++	for (i = 0; i < txlen; i++) {
++		for (b = 0; b < 8; b++) {
++			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
++		}
+ 	}
+-	if (rxlen) {
+-		flush_dcache64(rxpa, rxlen, TRUE);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_SPI_RX_TRANS_LEN, (rxlen + 3) / 4);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_IRQ_CLR, 0xffffffffu);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_IRQ_EN_SET, 0x7u);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_PTR_L, (uint32_t)rxpa);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_PTR_H, (uint32_t)(rxpa >> 32));
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_ATTR, 1);
+-		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_LEN, rxlen);
++	for (i = 0; i < rxlen; i++) {
++		in = 0;
++		for (b = 0; b < 8; b++) {
++			in = (uint8_t)((in << 1) | mondrian_spi_bit(1));
++		}
++		rx[i] = in;
+ 	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_TX_RX);
+-	st = mondrian_spi_wait_done(se, 2000000);
+-	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
+-		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2);
+-	} else if (rxlen) {
+-		flush_dcache64(rxpa, rxlen, TRUE);
+-		memcpy(rx, (const void *)(mondrian_touch_dma + MONDRIAN_TOUCH_DMA_RX_OFF),
+-		    rxlen);
++	mondrian_spi_delay(1000);
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
++	mondrian_spi_delay(1000);
++	return 0;
++}
++
++static int
++mondrian_spi_pins(void)
++{
++	static const uint32_t pins[4] = {
++		MONDRIAN_TOUCH_SPI_CLK_GPIO, MONDRIAN_TOUCH_SPI_MOSI_GPIO,
++		MONDRIAN_TOUCH_SPI_MISO_GPIO, MONDRIAN_TOUCH_SPI_CS_GPIO
++	};
++	vm_offset_t page[4];
++	uint32_t i;
++
++	for (i = 0; i < 4; i++) {
++		page[i] = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * pins[i], 0x1000);
++		if (page[i] == 0) {
++			return ENOMEM;
++		}
++	}
++	mondrian_spi_clk = page[0];
++	mondrian_spi_mosi = page[1];
++	mondrian_spi_miso = page[2];
++	mondrian_spi_cs = page[3];
++
++	/* clk, mosi and cs: gpio outputs, idle low/high as the protocol wants. */
++	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_NONE, MONDRIAN_TLMM_DRIVE_8MA, 1));
++	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_NONE, MONDRIAN_TLMM_DRIVE_8MA, 1));
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_8MA, 1));
++	/* miso: input. */
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++
++	mondrian_spi_hz = ml_get_timebase();
++	if (mondrian_spi_hz == 0) {
++		mondrian_spi_hz = 19200000;
+ 	}
+-	return st;
++	return 0;
+ }
+ 
+ static void
+-mondrian_touch_spi_probe(vm_offset_t se)
++mondrian_touch_spi_probe(void)
+ {
+ 	/* The two common Goodix SPI framings for a register read. */
+ 	static const uint8_t id_a[3] = { 0x20, 0x81, 0x40 };
+ 	static const uint8_t id_b[2] = { 0x81, 0x40 };
+-	uint8_t rx[8];
+-	vm_offset_t pin;
+-	int st, i, good;
++	uint8_t rx[8] = { 0 };
+ 
+-	printf("MONDRIAN TOUCH: spi: pins 16-19 to qup4, 1.2 MHz, mode 0\n");
+-	mondrian_log_flush_now();
+-	for (i = 0; i < 4; i++) {
+-		pin = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL *
+-		    (MONDRIAN_TOUCH_SPI_CLK_GPIO + i), 0x1000);
+-		if (pin == 0) {
+-			printf("MONDRIAN TOUCH: spi: cannot map gpio%u\n",
+-			    MONDRIAN_TOUCH_SPI_CLK_GPIO + i);
+-			mondrian_log_flush_now();
+-			return;
+-		}
+-		mondrian_tlmm_write(pin, MONDRIAN_TLMM_CFG,
+-		    mondrian_tlmm_cfg(MONDRIAN_TLMM_FUNC_QUP4,
+-		    i == 3 ? MONDRIAN_TLMM_PULL_UP : MONDRIAN_TLMM_PULL_NONE,
+-		    MONDRIAN_TLMM_DRIVE_8MA, 0));
+-	}
+-
+-	/*
+-	 * geni_se_io_init() + geni_se_io_set_mode(): mainline runs these before
+-	 * any transfer. GENI_OUTPUT_CTRL enables the SPI outputs and SE_IRQ_EN
+-	 * the M/S event logic; without them the engine accepts the command,
+-	 * never starts it and reports no error (measured on 0123).
+-	 */
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CGC_CTRL,
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_CGC_CTRL) | 0x7fu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_DMA_GENERAL_CFG,
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_GENERAL_CFG) | 0x0fu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_OUTPUT_CTRL, 0x7fu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_FORCE_DEFAULT, 1);
+-	printf("MONDRIAN TOUCH: spi: dump fifo_dis 0x%x mctrl 0x%x irqen 0x%x out 0x%x clk 0x%x ro 0x%x\n",
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_IF_DISABLE_RO),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_CTRL),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_IRQ_EN),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_OUTPUT_CTRL),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_CLK_CTRL_RO));
+-	mondrian_log_flush_now();
+-	mondrian_tlmm_write(se, MONDRIAN_SE_IRQ_EN, 0x0fu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GSI_EVENT_EN, 0);
+-	/* 8-bit words, four per FIFO word, MSB first (mainline's
+-	 * geni_se_config_packing(8, 4, true, true, true)). */
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_DMA_MODE_EN, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_TX_PACKING_0, 0x0007f8fe);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_TX_PACKING_1, 0x000ffefe);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_RX_PACKING_0, 0x0007f8fe);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_RX_PACKING_1, 0x000ffefe);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_BYTE_GRAN, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_WORD_LEN, 8 - 4);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_CPHA, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_CPOL, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TRANS_CFG, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_DEMUX_SEL, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG, (16u << 4) | 1u);
+-	printf("MONDRIAN TOUCH: spi: status 0x%x clk cfg 0x%x\n",
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG));
+-	mondrian_log_flush_now();
+-
+-	/*
+-	 * The SE clock is the XO at 19.2 MHz, which is DFS level 2 of its rate
+-	 * table (7.37M, 14.7M, 19.2M).
+-	 */
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, 2);
+-	if (mondrian_touch_dma_alloc() != 0) {
+-		printf("MONDRIAN TOUCH: spi: no dma buffer\n");
++	if (mondrian_spi_pins() != 0) {
++		printf("MONDRIAN TOUCH: spi: cannot map the pads\n");
+ 		mondrian_log_flush_now();
+ 		return;
+ 	}
+-	printf("MONDRIAN TOUCH: spi: dma pa 0x%llx\n",
+-	    (unsigned long long)mondrian_touch_dma_pa);
++	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~1 MHz, mode 0\n");
+ 	mondrian_log_flush_now();
++	delay(20000);
+ 
+-	/* Register 0x8140, the product id, in the two framings. */
+-	st = mondrian_spi_xfer(se, id_a, sizeof(id_a), rx, 4);
+-	printf("MONDRIAN TOUCH: spi: id a st 0x%x rx %02x %02x %02x %02x\n",
+-	    (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
+-	printf("MONDRIAN TOUCH: spi: a st 0x%x irq 0x%x err 0x%x dtx 0x%x drx 0x%x\n",
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_TX_IRQ_STAT),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_RX_IRQ_STAT));
++	(void)mondrian_spi_xfer(id_a, sizeof(id_a), rx, 4);
++	printf("MONDRIAN TOUCH: spi: id a rx %02x %02x %02x %02x\n",
++	    rx[0], rx[1], rx[2], rx[3]);
+ 	mondrian_log_flush_now();
+-	st = mondrian_spi_xfer(se, id_b, sizeof(id_b), rx, 4);
+-	printf("MONDRIAN TOUCH: spi: id b st 0x%x rx %02x %02x %02x %02x\n",
+-	    (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
++	(void)mondrian_spi_xfer(id_b, sizeof(id_b), rx, 4);
++	printf("MONDRIAN TOUCH: spi: id b rx %02x %02x %02x %02x\n",
++	    rx[0], rx[1], rx[2], rx[3]);
+ 	mondrian_log_flush_now();
+ }
+ 
+@@ -568,11 +523,5 @@
+ 	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
+ 	mondrian_touch_power();
+ 	mondrian_touch_geni_probe();
+-	{
+-		vm_offset_t se = ml_io_map(MONDRIAN_SPI_SE4_BASE, 0x4000);
+-
+-		if (se != 0) {
+-			mondrian_touch_spi_probe(se);
+-		}
+-	}
++	mondrian_touch_spi_probe();
+ }
