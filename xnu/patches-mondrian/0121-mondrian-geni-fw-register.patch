@@ -1,0 +1,75 @@
+xnu 0121: read the SE firmware at the register that exists
+
+0120 read SE_GENI_FW_REVISION at 0x1000, the newer GENI layout. On this SE
+that address is not there: the read wedges the interconnect (the console
+stopped right after the CLK_CTRL line and the watchdog reset the phone). The
+classic register is GENI_FW_REVISION_RO at 0x68, with the protocol in bits
+15-8; read that and SE_GENI_STATUS instead.
+
+Also check the SE clock root unconditionally: 0120 only touched the RCG when
+the first read found ROOT_OFF set, but the value is read again after the
+branch write, which can clear it. Print cmd/cfg after the writes so the next
+boot says whether the root is on.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -66,7 +66,8 @@
+ #define MONDRIAN_SE_INIT_CFG_REV	0x0
+ #define MONDRIAN_SE_CGC_CTRL		0x28
+ #define MONDRIAN_SE_CLK_CTRL_RO		0x60
+-#define MONDRIAN_SE_FW_REV		0x1000
++#define MONDRIAN_SE_FW_REV		0x68
++#define MONDRIAN_SE_STATUS		0x40
+ 
+ #define MONDRIAN_TOUCH_RESET_GPIO	20
+ #define MONDRIAN_TOUCH_IRQ_GPIO		21
+@@ -236,9 +237,14 @@
+ 	    mondrian_tlmm_read(gcc, MONDRIAN_GCC_QUPV3_WRAP0_CBCR));
+ 	mondrian_log_flush_now();
+ 
+-	/* No SE clock root yet: pick the XO (19.2 MHz, source 0) with div 1. */
+-	if (mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR) & MONDRIAN_GCC_RCG_ROOT_OFF) {
+-		cfg = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR);
++	/* Root the SE clock on the XO (19.2 MHz, source 0) with divider 1. The
++	 * branch above may or may not have cleared ROOT_OFF; check and write. */
++	cmd = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR);
++	cfg = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR);
++	printf("MONDRIAN TOUCH: geni: se4 cmd 0x%x cfg 0x%x after the branches\n",
++	    cmd, cfg);
++	mondrian_log_flush_now();
++	if (cmd & MONDRIAN_GCC_RCG_ROOT_OFF) {
+ 		cfg &= ~0x1fu;          /* divider */
+ 		cfg &= ~0x700u;         /* source select */
+ 		mondrian_tlmm_write(gcc, MONDRIAN_GCC_SE4_CFG_RCGR, cfg);
+@@ -253,11 +259,11 @@
+ 		mondrian_tlmm_write(gcc, MONDRIAN_GCC_SE4_CMD_RCGR,
+ 		    cmd | MONDRIAN_GCC_RCG_ROOT_EN);
+ 		delay(1000);
+-		printf("MONDRIAN TOUCH: geni: se4 clock was off, cmd now 0x%x cfg 0x%x\n",
+-		    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR),
+-		    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR));
+-		mondrian_log_flush_now();
+-	}
++	}
++	printf("MONDRIAN TOUCH: geni: se4 cmd now 0x%x cfg 0x%x\n",
++	    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR),
++	    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR));
++	mondrian_log_flush_now();
+ 
+ 	printf("MONDRIAN TOUCH: geni: wrapper hw ver 0x%x\n",
+ 	    mondrian_tlmm_read(wrap, MONDRIAN_QUPV3_HW_VER));
+@@ -272,6 +278,14 @@
+ 	printf("MONDRIAN TOUCH: geni: se clk 0x%x\n",
+ 	    mondrian_tlmm_read(se, MONDRIAN_SE_CLK_CTRL_RO));
+ 	mondrian_log_flush_now();
++	/*
++	 * FW_REVISION lives at 0x68 with the protocol in bits 15-8. Do not
++	 * read the 0x1000 alias of the newer GENI layout: on this SE that
++	 * address wedges the interconnect (measured on 0120).
++	 */
++	printf("MONDRIAN TOUCH: geni: se status 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_STATUS));
++	mondrian_log_flush_now();
+ 	printf("MONDRIAN TOUCH: geni: se fw 0x%x\n",
+ 	    mondrian_tlmm_read(se, MONDRIAN_SE_FW_REV));
+ 	mondrian_log_flush_now();
