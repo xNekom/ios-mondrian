@@ -1,0 +1,369 @@
+xnu 0153: load the touch firmware, so the part can actually report
+
+The part has no firmware of its own: the vendor driver writes an ISP stage and
+five sections (223744 bytes) into its RAM on every boot. Until it does, the IC
+info block answers (length 193, config 0x46) but its misc fields read as zeros —
+so touch_data_addr comes back as 0x1 and the "reports" the 0152 thread reads
+from 0x10308 are noise.
+
+Read the package from a blob area in front of the log ring
+(mondrian_ufs.c: mondrian_reserved_read; 256 KiB reserved, written once from
+recovery with dd, no file system involved), then follow
+goodix_brl_fwupdate.c for Berlin D: reset, hold the CPU (0x0002 = 01 00, read
+0x2000 until three reads agree), misctl at 0xD804 = 0x20700000, watchdog off at
+0xD040, ISP to 0x23800, eight 0x55 bytes at 0x10000, reset and check that
+patch_pid[3..5] is "ISP", then each section in 4 KB packets (data plus a 32-bit
+checksum to 0x12410, then a 0xBB command with its own checksum to 0x12400, ack
+and status 0xEE).
+
+The report thread now starts only after a successful load, and the IC info is
+read after it, when misc carries the real touch_data_addr.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -890,8 +890,274 @@
+ 	} else {
+ 		printf("MONDRIAN TOUCH: ic info unusable, keeping 0x%x\n",
+ 		    mondrian_touch_data_addr);
++	}
++	mondrian_log_flush_now();
++}
++
++/* ---- firmware ---------------------------------------------------------- */
++
++/* bsd/dev/mondrian_ufs.c: the blob area in front of the log ring. */
++extern uint32_t mondrian_reserved_read(void *dst, uint32_t bytes);
++
++#define MONDRIAN_FW_MAX			(256u << 10)
++#define MONDRIAN_FW_HEADER		512u
++#define MONDRIAN_FW_TABLE		42u
++#define MONDRIAN_FW_ENTRY		10u
++#define MONDRIAN_FW_SECTIONS		8
++#define MONDRIAN_FW_CHUNK		4096u
++
++#define MONDRIAN_FW_ISP_RAM		0x00023800u
++#define MONDRIAN_FW_BOOT_OPTION		0x00010000u
++#define MONDRIAN_FW_CMD_REG		0x00012400u
++#define MONDRIAN_FW_BUF_REG		0x00012410u
++#define MONDRIAN_FW_MISCTL		0x0000d804u
++#define MONDRIAN_FW_WATCHDOG		0x0000d040u
++#define MONDRIAN_FW_HOLD_CPU_W		0x00000002u
++#define MONDRIAN_FW_HOLD_CPU_R		0x00002000u
++
++static uint8_t mondrian_fw[MONDRIAN_FW_MAX];
++static uint8_t mondrian_fw_packet[MONDRIAN_FW_CHUNK + 8];
++static uint8_t mondrian_fw_tx[MONDRIAN_FW_CHUNK + 9];
++
++static uint32_t
++mondrian_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* A write longer than the 11 bytes the normal helper accepts: the firmware
++ * protocol moves kilobytes per frame. */
++static int
++mondrian_fw_write_big(uint32_t addr, const uint8_t *buf, uint32_t len)
++{
++	if (len > MONDRIAN_FW_CHUNK) {
++		return -1;
++	}
++	memcpy(mondrian_fw_tx + 5, buf, len);
++	mondrian_fw_tx[0] = 0xf0;
++	mondrian_fw_tx[1] = (uint8_t)(addr >> 24);
++	mondrian_fw_tx[2] = (uint8_t)(addr >> 16);
++	mondrian_fw_tx[3] = (uint8_t)(addr >> 8);
++	mondrian_fw_tx[4] = (uint8_t)addr;
++	return mondrian_spi_frame(mondrian_fw_tx, len + 5, NULL, 0);
++}
++
++/* Write and read back the first bytes: the ISP load must land before the part
++ * is told to run it. */
++static int
++mondrian_fw_write_confirm(uint32_t addr, const uint8_t *buf, uint32_t len)
++{
++	uint32_t n = MIN(len, 64u);
++	int tries;
++
++	for (tries = 0; tries < 3; tries++) {
++		(void)mondrian_fw_write_big(addr, buf, len);
++		delay(2000);
++		(void)mondrian_goodix_read(addr, mondrian_fw_packet, n);
++		if (memcmp(buf, mondrian_fw_packet, n) == 0) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++mondrian_fw_hold_cpu(void)
++{
++	uint8_t hold[2] = { 0x01, 0x00 }, a[4], b[4], c[4];
++	int tries;
++
++	for (tries = 0; tries < 100; tries++) {
++		(void)mondrian_goodix_write(MONDRIAN_FW_HOLD_CPU_W, hold, sizeof(hold));
++		delay(1000);
++		(void)mondrian_goodix_read(MONDRIAN_FW_HOLD_CPU_R, a, sizeof(a));
++		(void)mondrian_goodix_read(MONDRIAN_FW_HOLD_CPU_R, b, sizeof(b));
++		(void)mondrian_goodix_read(MONDRIAN_FW_HOLD_CPU_R, c, sizeof(c));
++		if (memcmp(a, b, sizeof(a)) == 0 && memcmp(b, c, sizeof(c)) == 0) {
++			return 0;
++		}
++		delay(1000);
++	}
++	return -1;
++}
++
++/* One 4 KB packet: data plus a 32-bit checksum into the ISP buffer, then a
++ * 16-byte command to the flash register. The part acks 0xEE, and 0xEE again
++ * in the status byte once the packet is in. */
++static int
++mondrian_fw_package(uint8_t type, const uint8_t *data, uint32_t len, uint32_t addr)
++{
++	uint8_t cmd[16];
++	uint32_t sum = 0, i;
++	int tries;
++
++	for (i = 0; i < len; i += 2) {
++		sum += (uint32_t)data[i] | ((uint32_t)data[i + 1] << 8);
++	}
++	memcpy(mondrian_fw_packet, data, len);
++	mondrian_fw_packet[len] = sum & 0xff;
++	mondrian_fw_packet[len + 1] = (sum >> 8) & 0xff;
++	mondrian_fw_packet[len + 2] = (sum >> 16) & 0xff;
++	mondrian_fw_packet[len + 3] = (sum >> 24) & 0xff;
++	if (mondrian_fw_write_big(MONDRIAN_FW_BUF_REG, mondrian_fw_packet, len + 4) < 0) {
++		return -1;
++	}
++	for (i = 0; i < sizeof(cmd); i++) {
++		cmd[i] = 0;
++	}
++	cmd[2] = 11;
++	cmd[3] = 0xbb;
++	cmd[4] = type;
++	cmd[5] = (uint8_t)((len + 4) & 0xff);
++	cmd[6] = (uint8_t)(((len + 4) >> 8) & 0xff);
++	cmd[7] = (uint8_t)(addr & 0xff);
++	cmd[8] = (uint8_t)((addr >> 8) & 0xff);
++	cmd[9] = (uint8_t)((addr >> 16) & 0xff);
++	cmd[10] = (uint8_t)((addr >> 24) & 0xff);
++	sum = 0;
++	for (i = 2; i < 11; i++) {
++		sum += cmd[i];
++	}
++	cmd[11] = sum & 0xff;
++	cmd[12] = (sum >> 8) & 0xff;
++	(void)mondrian_fw_write_big(MONDRIAN_FW_CMD_REG, cmd, sizeof(cmd));
++	for (tries = 0; tries < 5; tries++) {
++		delay(5000);
++		(void)mondrian_goodix_read(MONDRIAN_FW_CMD_REG, cmd, sizeof(cmd));
++		if (cmd[1] == 0xee) {
++			break;
++		}
++	}
++	if (cmd[1] != 0xee) {
++		return -1;
++	}
++	delay(50000);
++	for (tries = 0; tries < 20; tries++) {
++		(void)mondrian_goodix_read(MONDRIAN_FW_CMD_REG, cmd, sizeof(cmd));
++		if (cmd[1] == 0xee && cmd[0] == 0xee) {
++			return 0;
++		}
++		delay(10000);
+ 	}
++	return -1;
++}
++
++/*
++ * The chip runs from RAM, so every boot is: hold its CPU, load the ISP stage
++ * into its RAM, point it at the ISP and reset, then flash the five firmware
++ * sections in 4 KB packets. The blob is the vendor package, read from the
++ * reserved area; its header is size + checksum, a 512-byte header, a table of
++ * 10-byte section entries at offset 42 and the data in order.
++ */
++static int
++mondrian_touch_fw_load(void)
++{
++	uint32_t len, fw_len, i, off, chunk;
++	uint32_t type[MONDRIAN_FW_SECTIONS], size[MONDRIAN_FW_SECTIONS];
++	uint32_t addr[MONDRIAN_FW_SECTIONS], data_off[MONDRIAN_FW_SECTIONS];
++	uint32_t count = 0, next = MONDRIAN_FW_HEADER;
++	uint8_t run[8], id[36];
++
++	len = mondrian_reserved_read(mondrian_fw, sizeof(mondrian_fw));
++	if (len < MONDRIAN_FW_HEADER) {
++		printf("MONDRIAN TOUCH: no firmware blob (read %u)\n", len);
++		return -1;
++	}
++	fw_len = mondrian_le32(mondrian_fw) + 8;
++	{
++		uint32_t sum = 0, k;
++
++		for (k = 8; k + 1 < fw_len; k += 2) {
++			sum += (uint32_t)mondrian_fw[k] | ((uint32_t)mondrian_fw[k + 1] << 8);
++		}
++		if (fw_len < MONDRIAN_FW_HEADER || fw_len > len ||
++		    sum != mondrian_le32(mondrian_fw + 4)) {
++			printf("MONDRIAN TOUCH: bad firmware blob (len %u, read %u)\n",
++			    fw_len, len);
++			return -1;
++		}
++	}
++	len = fw_len;
++	for (i = 0; i < MONDRIAN_FW_SECTIONS; i++) {
++		const uint8_t *entry = mondrian_fw + MONDRIAN_FW_TABLE + i * MONDRIAN_FW_ENTRY;
++
++		type[i] = entry[0];
++		size[i] = mondrian_le32(entry + 1);
++		addr[i] = mondrian_le32(entry + 5);
++		data_off[i] = next;
++		if (size[i] == 0 || next + size[i] > len) {
++			break;
++		}
++		next += size[i];
++		count++;
++	}
++	printf("MONDRIAN TOUCH: firmware %u bytes, %u sections, isp %u\n",
++	    len, count, count > 0 ? size[0] : 0);
+ 	mondrian_log_flush_now();
++	if (count < 2) {
++		return -1;
++	}
++
++	mondrian_touch_reset_pulse();
++	if (mondrian_fw_hold_cpu() < 0) {
++		printf("MONDRIAN TOUCH: hold cpu failed\n");
++		return -1;
++	}
++	run[0] = 0x00;
++	run[1] = 0x00;
++	run[2] = 0x70;
++	run[3] = 0x20;                  /* 0x20700000, misctl on */
++	(void)mondrian_goodix_write(MONDRIAN_FW_MISCTL, run, 4);
++	run[0] = 0x00;
++	(void)mondrian_goodix_write(MONDRIAN_FW_WATCHDOG, run, 1);
++
++	if (mondrian_fw_write_confirm(MONDRIAN_FW_ISP_RAM, mondrian_fw + data_off[0], size[0]) < 0) {
++		printf("MONDRIAN TOUCH: isp load failed\n");
++		return -1;
++	}
++	for (i = 0; i < sizeof(run); i++) {
++		run[i] = 0x55;
++	}
++	if (mondrian_fw_write_confirm(MONDRIAN_FW_BOOT_OPTION, run, sizeof(run)) < 0) {
++		printf("MONDRIAN TOUCH: boot option failed\n");
++		return -1;
++	}
++	mondrian_touch_reset_pulse();
++	for (i = 0; i < sizeof(id); i++) {
++		id[i] = 0;
++	}
++	(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
++	printf("MONDRIAN TOUCH: after isp %c%c%c%c%c%c %c%c%c\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5], id[13], id[14], id[15]);
++	mondrian_log_flush_now();
++	if (id[13] != 'I' || id[14] != 'S' || id[15] != 'P') {
++		printf("MONDRIAN TOUCH: isp did not start\n");
++		return -1;
++	}
++
++	for (i = 1; i < count; i++) {
++		for (off = 0; off < size[i]; off += MONDRIAN_FW_CHUNK) {
++			chunk = MIN(MONDRIAN_FW_CHUNK, size[i] - off);
++			if (mondrian_fw_package((uint8_t)type[i],
++			    mondrian_fw + data_off[i] + off, chunk, addr[i] + off) < 0) {
++				printf("MONDRIAN TOUCH: section %u offset %u failed\n", i, off);
++				return -1;
++			}
++		}
++		printf("MONDRIAN TOUCH: section %u type %u at 0x%x, %u bytes\n",
++		    i, type[i], addr[i], size[i]);
++		mondrian_log_flush_now();
++	}
++	mondrian_touch_reset_pulse();
++	for (i = 0; i < sizeof(id); i++) {
++		id[i] = 0;
++	}
++	(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
++	printf("MONDRIAN TOUCH: running %c%c%c%c%c%c patch %c%c%c%c%c\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5], id[10], id[11], id[12], id[13], id[14]);
++	mondrian_log_flush_now();
++	return 0;
+ }
+ 
+ /*
+@@ -1061,12 +1327,16 @@
+ 	mondrian_touch_power();
+ 	mondrian_touch_geni_probe();
+ 	mondrian_touch_spi_probe();
+-	mondrian_touch_ic_info();
+-	if (kernel_thread_start(mondrian_touch_thread, NULL, &touch_thread) == KERN_SUCCESS) {
+-		thread_deallocate(touch_thread);
+-		printf("MONDRIAN TOUCH: report thread started\n");
++	if (mondrian_touch_fw_load() == 0) {
++		mondrian_touch_ic_info();
++		if (kernel_thread_start(mondrian_touch_thread, NULL, &touch_thread) == KERN_SUCCESS) {
++			thread_deallocate(touch_thread);
++			printf("MONDRIAN TOUCH: report thread started\n");
++		} else {
++			printf("MONDRIAN TOUCH: report thread failed to start\n");
++		}
+ 	} else {
+-		printf("MONDRIAN TOUCH: report thread failed to start\n");
++		printf("MONDRIAN TOUCH: no firmware, no reports\n");
+ 	}
+ 	mondrian_log_flush_now();
+ }
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1136,6 +1136,12 @@
+  */
+ #define MONDRIAN_LOG_SIZE       (4u << 20)
+ #define MONDRIAN_LOG_BLOCKS     (1 + MONDRIAN_LOG_SIZE / UFS_BLOCK)
++/*
++ * A blob area in front of the log ring: the touch firmware is written there
++ * from recovery with dd (nothing else in userdata is touched) and read back by
++ * the touch driver, which cannot use the file system at that point.
++ */
++#define MONDRIAN_FW_BLOCKS      (256u << 10) / UFS_BLOCK
+ #define MONDRIAN_LOG_TICKS      5
+ 
+ static char mondrian_log_ring[MONDRIAN_LOG_SIZE];
+@@ -1558,7 +1564,33 @@
+ 	printf("MONDRIANDUMP: end\n");
+ 	for (;;) {
+ 		delay(1000);
++	}
++}
++
++/*
++ * Read the blob area in front of the log ring. Returns the bytes copied;
++ * callers tell a missing blob from a short read by the length they asked for.
++ */
++uint32_t
++mondrian_reserved_read(void *dst, uint32_t bytes)
++{
++	uint64_t lba = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS - MONDRIAN_FW_BLOCKS;
++	uint8_t *out = dst;
++	uint32_t done = 0;
++
++	if (bytes > MONDRIAN_FW_BLOCKS * UFS_BLOCK) {
++		bytes = MONDRIAN_FW_BLOCKS * UFS_BLOCK;
+ 	}
++	while (done < bytes) {
++		uint32_t chunk = MIN(bytes - done, BOUNCE_SIZE);
++
++		if (ufs_read_blocks(lba + done / UFS_BLOCK, chunk / UFS_BLOCK) != 0) {
++			break;
++		}
++		memcpy(out + done, (const void *)(su.dma + DMA_BOUNCE), chunk);
++		done += chunk;
++	}
++	return done;
+ }
+ 
+ void
