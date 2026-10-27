@@ -38,16 +38,21 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `IOMemoryDescriptor` or `PE_initialize_console(kPEDisableScreen)`: both put a
   device pager on managed pages and panic in `pmap_remove_pv`. SpringBoard then
   waits on MobileActivation in `_setupActivationState`; the dylib forces
-  activation and skips Setup.
+  activation and skips Setup. A root that was just flashed takes the setup
+  path instead (no `mobileactivationd` container to seed, and `budd` runs), so
+  the dylib also forces the state from `SBLockdownManager`'s
+  `init`/`sharedInstance` and answers `SBSetupManager -isSetupRequired` with
+  NO. Without that the boot sits at the Apple logo.
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **Touch and buttons.** The lock screen cannot be unlocked: the kernel
-   publishes HID stubs, but no touch driver reads the panel's Goodix over
-   SPI, and the buttons only exist in the shim's menu.
-2. **Date and time.** There is no RTC: iOS shows 31 December 1970.
+1. **Touch.** The pads are cs19, clk18, mosi17, miso16 (measured with `0151`):
+   the boot-option echo and "BERLIN" come back. Reports live at `0x10308`
+   (8-byte head, 8-byte points) but need the part's RAM firmware loaded first.
+2. **Buttons.** Power/volume-down are on the PMK8350 PON and volume-up on
+   PM8350 GPIO6; the HID side exists, nothing reads them yet.
 3. **Rest of the phone.** Audio, USB, modem, cameras and the GPU are untouched;
    the daemons that abort (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
@@ -262,23 +267,18 @@ multiplying, in the same patch that enables writes.
 
 ## Display
 
-The important finding: the panel does not need a driver for the lock screen.
-The ABL brings up DSI/DSC/MDP and keeps scanning the reserved buffer, so the
-kernel console and, later, the userland framebuffer driver get a plain linear
-framebuffer at 1440x3200. What follows from it:
+The panel does not need a driver for the lock screen: the ABL brings up
+DSI/DSC/MDP and keeps scanning the reserved buffer, so the console and the
+userland framebuffer driver get a plain linear 1440x3200 framebuffer.
 
 - `0083` keeps the panel's frames off the free list (see the trap above).
-- `0084` paints four colour bars in the two rows the console leaves free: one
-  photo says whether the packing is XRGB or XBGR, whether alpha is honoured
-  and whether 1440 is the live width.
 - `0085` ports sweet's IOSurface + IOMobileFramebuffer pair to `AppleCLCD` on
-  `/arm-io/disp0`; backboardd swaps are observed. The visible UI is unverified.
+  `/arm-io/disp0`; backboardd swaps are observed and the lock screen renders.
 - Sweet's `0056` (present at most every few vsyncs) and `0079`
   (`RequestPowerChange`, the panel-off fade that the power button uses) have
   to be rebased onto the mondrian framebuffer driver when they are needed.
 
-A fallback MDSS/DSI driver is weeks of work and is only needed if the scanout
-ever stops (blank or frozen panel after a while).
+A fallback MDSS/DSI driver is only needed if the scanout ever stops.
 
 ## Boot menu and dual boot
 

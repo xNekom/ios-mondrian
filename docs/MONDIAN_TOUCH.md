@@ -1,9 +1,11 @@
 # The mondrian touch screen: bring-up plan
 
-The panel's digitizer is a Goodix part on **SPI**, wired to QUPv3 SE4. Nothing
-of the transport exists in the kernel yet: this file is the register-level plan
-and the facts measured from the live device tree (`/sys/firmware/fdt`, dumped
-with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
+The panel's digitizer is a Goodix part on **SPI**, wired to QUPv3 SE4. This
+file is the register-level record: what the live device tree says
+(`/sys/firmware/fdt`, dumped with `dtc -I dtb -O dts`), what the working
+system's driver measures, and what the port has proved with the bit-banged
+transport in `bsd/dev/mondrian_touch.c`. The work list entry is
+`docs/MONDIAN_PORT.md` §5.
 
 ## What the device tree says
 
@@ -33,16 +35,16 @@ input and reset (GPIO20) is low. The sequence is AVDD on, reset **asserted**
 transfer. The DT's flag cell (`flags 0`) does not describe the line: the vendor
 driver uses the raw gpio API and drives it high to run, low to reset.
 
-The part drives INT low once it has booted, so with GPIO21 as an input and the
-vendor's pull-up (`mi_ts_active`) a level of 0 is the milestone-1 signal and 1
-means unpowered, held in reset, or dead.
+The part does **not** pull INT low after reset here: with GPIO21 as an input it
+reads 1 against both the internal pull-down and the vendor's pull-up, so its
+level says nothing about power. What proves the part is alive is the bus: with
+the right pad order the 0xAA boot-option echo at `0x10000` comes straight back
+and `0x10014` answers the version block (`0151`).
 
-Measured with `0140`: driving MISO high with the pad's own output stage reads
-back 1, so no ESD diode clamps the pin and **IOVDD really reaches the part**.
-The part still never drives MISO nor pulls INT low, with both read framings,
-at 600 kHz and 2.5 MHz, at every AVDD/reset level, after a full IOVDD power
-cycle (`0141`-`0146`). What is left is the part's own supply or state, not the
-port's pads.
+The earlier runs (`0140`-`0146`) found no answer because the pad order was
+wrong: the same frames read zeros at every AVDD/reset level, both read
+framings and every speed, and the pad self-test only proved that the SoC drives
+its own pins, not that the part was powered.
 
 ## What the working system says
 
@@ -110,9 +112,22 @@ Do **not** read `0x1000`: the newer GENI layout puts FW_REVISION there, this
 SE does not decode it, and the read wedges the interconnect (the console
 stops and the watchdog resets the phone). `0x68` is the register that exists.
 
-The SPI bus is on **GPIO16-19** (clk, mosi, miso, cs) with the `qup4`
-function (TLMM mux value 1, the group-local function index) and CS0; the
-touch's reset/IRQ pads (20/21) are separate.
+The SPI bus is on **GPIO16-19** with the `qup4` function (TLMM mux value 1,
+the group-local function index) and CS0; the touch's reset/IRQ pads (20/21)
+are separate. **The order is not the one the tree implies** (measured with
+`0151`, confirmed by reading the product id):
+
+| Pad | Signal |
+| --- | --- |
+| gpio16 | MISO |
+| gpio17 | MOSI |
+| gpio18 | CLK |
+| gpio19 | CS |
+
+With 16/17/18/19 as clk/mosi/miso/cs every read returns zeros; with the table
+above the 0xAA boot-option echo comes back and `0x00010014` answers the version
+block: `42 45 52 4c 49 4e` ("BERLIN") at the first byte of the payload,
+`rom_vid 02 00 04`, `patch_pid "9916R"`.
 
 ## The SPI transfer (`0122`)
 
@@ -163,6 +178,34 @@ completion poll passes instantly and nothing reaches the PMIC. The trigger is
 also not `CONTROL = 1`: clear TRIGGER (bit 24) and ENABLE (bit 16), write
 ENABLE, then ENABLE|TRIGGER.
 
+## The report block, from the working system's IC info
+
+`goodix_core.ko` prints the whole `goodix_ic_info` block it reads at `0x10070`
+(`print_ic_info` in the working dmesg); that dump is where these numbers come
+from. The blob is 193 bytes on this part, config version `0x46`.
+
+| Field | Value |
+| --- | --- |
+| `touch_data_addr` | `0x00010308` |
+| `touch_data_head_len` | 8 |
+| `point_struct_len` | 8 |
+| `cmd_addr` | `0x00010174`, 16 bytes |
+| `fw_state_addr` | `0x00010218`, 92 bytes |
+| `fw_buffer_addr` | `0x0001205c`, 4200 bytes |
+| `esd_addr` | `0x00010170` |
+| panel mapping | 18 x 40, sensor id 255 |
+
+In the packed `goodix_ic_info` the fields sit at fixed offsets:
+`misc.touch_data_addr` at 161, `touch_data_head_len` at 165 and
+`point_struct_len` at 167, so one 200-byte read recovers them from the part
+instead of hardcoding the constant.
+
+A report is an 8-byte head, `touch_num = head[2] & 0x0f`, then `touch_num`
+points of 8 bytes (id in the high nibble of byte 0, x/y/w little-endian 16-bit
+at +2/+4/+6), then a 2-byte checksum. After reading, write **one zero byte**
+back to `touch_data_addr`: that clears the report and releases IRQ (GPIO21,
+active low, GIC 305).
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
@@ -207,12 +250,12 @@ ENABLE, then ENABLE|TRIGGER.
 
 ## Milestones, each one testable in a single boot
 
-1. AVDD, IOVDD and reset, no SPI traffic: a part out of reset pulls IRQ
-   (GPIO21) low within 150 ms; the probe prints the level. A level of 1 points
-   at the rail, the reset line or the part.
+1. AVDD, IOVDD and reset: nothing here proves power by itself. IRQ stays high
+   after reset on this part, and the pad self-test only proves the SoC drives
+   its own pins. The first real proof is the echo in item 3.
 2. GENI init and `GENI_FW_REVISION` read: proves the SE clock and the register
    window.
-3. Goodix product ID over SPI: proves the transport and the protocol.
+3. The pad order and the product ID: a read of `0x00010014` returns "BERLIN".
 4. One touch report into `MondrianHIDTouch`: the lock screen unlocks with a
    swipe.
 5. Multi-touch, then the buttons (power/volume) through the HID button service.
@@ -229,6 +272,15 @@ ENABLE, then ENABLE|TRIGGER.
   after a failed clock enable spins forever with interrupts off; the beacon in
   the timer interrupt stops. Enable the clocks first, and keep a spin-counted
   timeout on every poll.
+- **A QUP's four pads are not in signal order.** The device tree lists
+  gpio16-19 for `qup4` without saying which SPI signal each one carries, and
+  the obvious guess (16 clk, 17 mosi, 18 miso, 19 cs) reads zeros for ever.
+  The measured order on this board is **gpio16 MISO, gpio17 MOSI, gpio18 CLK,
+  gpio19 CS**. Do not try to identify MISO by pulling each pad down: the part
+  pulls CS up, so the CS pad reads high and looks like a driven output. Sweep
+  the 24 assignments and keep the one whose read of `0x10014` starts with
+  "BERLIN" — on the first payload byte, because `mondrian_goodix_read()`
+  already strips the 8-byte prefix (the raw trace shows it at byte 8).
 - **GPIO numbers in the DT are TLMM numbers**, not Linux global numbers. The
   pin table is 1:1.
 - **The live tree is the source of truth.** Two panels share the touch node;

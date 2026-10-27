@@ -188,7 +188,14 @@ them and `docs/MONDIAN_PORT.md` lists what they do.
 tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot flash boot_b shim/out/shim-boot.img
+tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
+sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
+python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 ```
+
+Editing the image only needs root for the mount; `flash-root.sh` reuses an
+existing `.simg` when it is handed the `.img`, so regenerate the sparse file by
+hand or the phone gets the previous one.
 
 A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
 (volatile proof of the same image, `fastboot getvar current-slot`, verified

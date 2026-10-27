@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 /*
@@ -172,6 +174,60 @@ install_display_diagnostic(void)
  */
 static int mondrian_activation_offset = -1;
 
+/*
+ * What SpringBoard asks before it shows anything is -[SBSetupManager
+ * isSetupRequired], not the lockdown activation state: on a root that was just
+ * flashed the answer is yes, SpringBoard runs budd instead of the lock screen,
+ * and SBLockdownManager is never created. Print the class's selectors and
+ * ivars once (the log is the only way to learn the names on this build), then
+ * answer no to the two questions that gate the lock screen.
+ */
+static void
+mondrian_dump_class(const char *name)
+{
+	Class cls = objc_getClass(name);
+	Method *methods;
+	Ivar *ivars;
+	unsigned int count = 0, i;
+	char line[160];
+	const char *name_of;
+
+	if (cls == Nil) {
+		snprintf(line, sizeof(line), "MONDRIAN UI: %s missing\n", name);
+		say(line);
+		return;
+	}
+	methods = class_copyMethodList(cls, &count);
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s %u methods\n", name, count);
+	say(line);
+	for (i = 0; i < count; i++) {
+		name_of = sel_getName(method_getName(methods[i]));
+		if (strstr(name_of, "etup") == NULL && strstr(name_of, "ctiv") == NULL &&
+		    strstr(name_of, "ock") == NULL && strstr(name_of, "State") == NULL) {
+			continue;
+		}
+		snprintf(line, sizeof(line), "  %s\n", name_of);
+		say(line);
+	}
+	free(methods);
+	ivars = class_copyIvarList(cls, &count);
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s %u ivars\n", name, count);
+	say(line);
+	for (i = 0; i < count; i++) {
+		snprintf(line, sizeof(line), "  %s\n", ivar_getName(ivars[i]));
+		say(line);
+	}
+	free(ivars);
+}
+
+static BOOL
+mondrian_setup_not_required(id self, __unused SEL selector)
+{
+	(void)self;
+	say("MONDRIAN UI: setup not required\n");
+	return NO;
+}
+
 static void
 mondrian_setup_activation_state(id self, __unused SEL selector)
 {
@@ -195,28 +251,102 @@ mondrian_set_setup_reason(id self, SEL selector, long reason)
 	}
 }
 
+/*
+ * A root that has just been flashed never reaches -_setupActivationState:
+ * SpringBoard takes the setup path first, so the ivar that method is supposed
+ * to fill keeps its zero and the boot sits at the Apple logo. Write the same
+ * value whenever the manager is handed out or created, so the lock screen has
+ * an activated state whatever path SpringBoard takes.
+ */
+static id (*original_lockdown_init)(id, SEL);
+static id (*original_shared_instance)(id, SEL);
+
+static void
+mondrian_force_activation(id manager, const char *where)
+{
+	int *state;
+
+	if (manager == nil || mondrian_activation_offset < 0) {
+		return;
+	}
+	state = (int *)((char *)manager + mondrian_activation_offset);
+	if (*state != 2) {
+		*state = 2;    /* activated */
+		say(where);
+	}
+}
+
+static id
+mondrian_lockdown_init(id self, SEL selector)
+{
+	id manager = original_lockdown_init != NULL ? original_lockdown_init(self, selector) : self;
+
+	mondrian_force_activation(manager, "MONDRIAN UI: lockdown init -> activated\n");
+	return manager;
+}
+
+static id
+mondrian_lockdown_shared(id self, SEL selector)
+{
+	id manager = original_shared_instance != NULL ? original_shared_instance(self, selector) : nil;
+
+	mondrian_force_activation(manager, "MONDRIAN UI: lockdown sharedInstance -> activated\n");
+	return manager;
+}
+
 static void
 install_activation_hooks(void)
 {
+	char line[96];
 	Class lockdown = objc_getClass("SBLockdownManager");
 	SEL setup_sel = sel_registerName("_setupActivationState");
 	Method setup = lockdown != Nil ? class_getInstanceMethod(lockdown, setup_sel) : NULL;
 
 	if (lockdown == Nil) {
 		say("MONDRIAN UI: SBLockdownManager missing\n");
-	} else if (setup == NULL) {
-		say("MONDRIAN UI: _setupActivationState missing\n");
 	} else {
 		Ivar ivar = class_getInstanceVariable(lockdown, "_activationState");
 
 		mondrian_activation_offset = ivar != NULL ? ivar_getOffset(ivar) : 8;
-		method_setImplementation(setup, (IMP)mondrian_setup_activation_state);
-		say("MONDRIAN UI: activation hook installed\n");
+		if (setup != NULL) {
+			method_setImplementation(setup, (IMP)mondrian_setup_activation_state);
+			say("MONDRIAN UI: activation hook installed\n");
+		}
+		Method init = class_getInstanceMethod(lockdown, sel_registerName("init"));
+		if (init != NULL) {
+			original_lockdown_init = (id (*)(id, SEL))method_setImplementation(
+			    init, (IMP)mondrian_lockdown_init);
+			say("MONDRIAN UI: lockdown init hook installed\n");
+		}
+		Method shared = class_getClassMethod(lockdown, sel_registerName("sharedInstance"));
+		if (shared != NULL) {
+			original_shared_instance = (id (*)(id, SEL))method_setImplementation(
+			    shared, (IMP)mondrian_lockdown_shared);
+			say("MONDRIAN UI: lockdown sharedInstance hook installed\n");
+		}
 	}
 
 	Class setup_manager = objc_getClass("SBSetupManager");
 	SEL reason_sel = sel_registerName("_setSetupRequiredReason:");
 	Method reason = setup_manager != Nil ? class_getInstanceMethod(setup_manager, reason_sel) : NULL;
+
+	if (setup_manager != Nil) {
+		static const char *const questions[] = {
+			"isSetupRequired", "isSetupAssistantRunning",
+		};
+
+		mondrian_dump_class("SBSetupManager");
+		for (unsigned i = 0; i < sizeof(questions) / sizeof(questions[0]); i++) {
+			Method m = class_getInstanceMethod(setup_manager,
+			    sel_registerName(questions[i]));
+
+			if (m != NULL) {
+				method_setImplementation(m, (IMP)mondrian_setup_not_required);
+				snprintf(line, sizeof(line), "MONDRIAN UI: %s -> NO\n", questions[i]);
+				say(line);
+			}
+		}
+	}
 
 	if (reason != NULL && method_getNumberOfArguments(reason) == 3) {
 		original_set_setup_reason = (void (*)(id, SEL, long))method_setImplementation(
