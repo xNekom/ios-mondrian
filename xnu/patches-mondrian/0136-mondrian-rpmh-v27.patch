@@ -1,0 +1,52 @@
+xnu 0136: use the rpmh-rsc 2.7 register layout on this SoC
+
+The ldoc2 vote never reached the PMIC: every register was written 8 to 12
+bytes past its real offset. The vendor kernel's rpmh-rsc.c for mondrian has a
+single, fixed layout -- TCS 672 bytes, commands 20 apart, CONTROL 0x14,
+STATUS 0x18, CMD_ENABLE 0x1C, MSGID 0x30, ADDR 0x34, DATA 0x38, STATUS 0x3C,
+RESP_DATA 0x40 -- while this driver used mainline's 3.0 offsets (stride 24,
+MSGID 0x34). CMD_ENABLE at 0x2C read back zero every time, the poll "completed"
+instantly, and the three command statuses were stale words.
+
+With the right offsets the AMC trigger from 0134 has somewhere to land.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -149,7 +149,11 @@
+  * RPMh: apps_rsc drv-2 (0x17a20000), TCS block at +0xd00, 672 bytes per TCS.
+  * The resource address of an LDO comes from the AOP command DB (0x80860000,
+  * header 0x90 bytes, 8 rsc headers of 16, entries of 24: id[8], prio[8],
+- * addr, len, offset). rpmh-rsc 3.0 register layout.
++ * addr, len, offset). The register layout is the rpmh-rsc **2.7** one the
++ * vendor kernel uses on this SoC: TCS 672 bytes, commands 20 apart,
++ * CONTROL 0x14, STATUS 0x18, CMD_ENABLE 0x1C, MSGID 0x30, ADDR 0x34,
++ * DATA 0x38, STATUS 0x3C, RESP_DATA 0x40. The 3.0 layout (stride 24,
++ * MSGID 0x34) writes past every command and the TCS never triggers.
+  */
+ #define MONDRIAN_CMD_DB_PA	0x80860000UL
+ #define MONDRIAN_CMD_DB_SIZE	0x20000
+@@ -157,15 +161,15 @@
+ #define MONDRIAN_RSC_SIZE	0x10000
+ #define MONDRIAN_RSC_TCS_OFF	0xd00
+ #define MONDRIAN_RSC_TCS_STRIDE	672
+-#define MONDRIAN_RSC_STATUS	0x28
+-#define MONDRIAN_RSC_CMD_ENABLE	0x2c
+-#define MONDRIAN_RSC_CONTROL	0x24
+-#define MONDRIAN_RSC_CMD_MSGID	0x34
+-#define MONDRIAN_RSC_CMD_ADDR	0x38
+-#define MONDRIAN_RSC_CMD_DATA	0x3c
+-#define MONDRIAN_RSC_CMD_STATUS	0x40
+-#define MONDRIAN_RSC_CMD_RESP_DATA	0x44
+-#define MONDRIAN_RSC_CMD_STEP	24
++#define MONDRIAN_RSC_STATUS	0x18
++#define MONDRIAN_RSC_CMD_ENABLE	0x1c
++#define MONDRIAN_RSC_CONTROL	0x14
++#define MONDRIAN_RSC_CMD_MSGID	0x30
++#define MONDRIAN_RSC_CMD_ADDR	0x34
++#define MONDRIAN_RSC_CMD_DATA	0x38
++#define MONDRIAN_RSC_CMD_STATUS	0x3c
++#define MONDRIAN_RSC_CMD_RESP_DATA	0x40
++#define MONDRIAN_RSC_CMD_STEP	20
+ #define MONDRIAN_TCS_AMC_ENABLE	(1u << 16)
+ #define MONDRIAN_TCS_AMC_TRIGGER	(1u << 24)
+ 
