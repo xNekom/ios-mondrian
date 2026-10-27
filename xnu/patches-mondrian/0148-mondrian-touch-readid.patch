@@ -1,0 +1,48 @@
+xnu 0148: read the chip the way Android does, at 0x10014
+
+The SPI trace from the working system shows plain reads: f1 + 32-bit address
++ three 0xFF bytes, and the part answers 36 bytes at 0x00010014 starting with
+"BERLIN" (42 45 52 4c 49 4e), plus 0xc1 at 0x00010070. That read needs no
+write first, so it separates "the pad transport is wrong" from "the confirm
+write is wrong".
+
+Read both addresses with the same frame and print the bytes.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -912,7 +912,35 @@
+ 				break;
+ 			}
+ 			delay(5000);
++		}
++	}
++
++	{
++		/*
++		 * Android's trace shows the part answers a plain read: 36 bytes
++		 * at 0x00010014 begin with 42 45 52 4c 49 4e ("BERLIN"), and
++		 * 0x00010070 reads 0xc1. Same frame, same address, no write
++		 * first: if these bytes do not appear, the transport is wrong.
++		 */
++		uint8_t id[36], v[10];
++		uint32_t j;
++
++		for (j = 0; j < sizeof(id); j++) {
++			id[j] = 0;
+ 		}
++		(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
++		printf("MONDRIAN TOUCH: read 0x10014 %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x (%c%c%c%c%c%c)\n",
++		    id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15],
++		    id[16], id[17], id[18], id[19],
++		    id[8], id[9], id[10], id[11], id[12], id[13]);
++		mondrian_log_flush_now();
++		for (j = 0; j < sizeof(v); j++) {
++			v[j] = 0;
++		}
++		(void)mondrian_goodix_read(0x00010070, v, sizeof(v));
++		printf("MONDRIAN TOUCH: read 0x10070 %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
++		mondrian_log_flush_now();
+ 	}
+ 
+ 	(void)mondrian_touch_level_sweep();
