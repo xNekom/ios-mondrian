@@ -57,6 +57,32 @@ The SPI bus is on **GPIO16-19** (clk, mosi, miso, cs) with the `qup4`
 function (TLMM mux value 1, the group-local function index) and CS0; the
 touch's reset/IRQ pads (20/21) are separate.
 
+## The SPI transfer (`0122`)
+
+The engine runs FIFO mode, 8-bit words packed four per FIFO word, MSB first,
+mode 0, CS0, 1.2 MHz (XO 19.2 MHz / divider 16). Per transfer: CS assert
+(`M_CMD0 = 8 << 27`), lengths in `SE_SPI_TX/RX_TRANS_LEN` (in FIFO words),
+`M_CMD0 = 7 << 27` for TX/RX, push the TX words, poll `M_IRQ_STATUS` bit 0
+(done), 3 (failure) or 5 (abort), drain `RX_FIFO`, CS deassert (`9 << 27`).
+`SE_SPI_WORD_LEN` is `bits - 4` (8 bits -> 4); the packing words are
+`0x7f8fe`/`0xffefe` (`geni_se_config_packing(8, 4, true, true, true)`).
+
+The vendor touch driver is **not** in the MiCode OSS kernel (`mondrian-s-oss`
+only carries mainline's I2C Goodix), so the Goodix SPI framing is measured,
+not read: `0122` does an internal loopback and then tries the two common
+framings of the product-id read at `0x8140`.
+
+## The IOVDD rail, if the part is unpowered
+
+`pm8350c_l2` is an RPMh VRM, so the vote is a TCS command for `ldoc2`. The
+RSC node is `rsc@17a00000` (drv-2), `qcom,tcs-offset = 0xd00`, TCS config
+WAKE 3 / ACTIVE 2 / SLEEP 2 / CONTROL 0 / FAST 1. The resource address comes
+from the AOP command DB (`aop_cmd_db_region@80860000`, 0x20000; entries are
+`{u8 id[8], u32 priority[2], u32 addr, u16 len, u16 offset}`, key `"ldoc2"`).
+Behind that address the VRM has +0x0 voltage in millivolts (bits 12-0), +0x4
+enable (bit 0) and +0x8 mode (bits 2-0); the DT's init is 1800 mV and mode 4.
+The port has no RPMh driver yet: this is the map for writing one.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
