@@ -1,0 +1,45 @@
+xnu 0126: dump the SE state around a command
+
+The engine accepts the TX/RX command and never starts it for any clock level.
+Before guessing further, read the state that decides it: GENI_IF_DISABLE_RO
+(0x64, if the FIFO interface is disabled only the DMA path works),
+M_CMD_CTRL, SE_IRQ_EN, GENI_OUTPUT_CTRL, the serial clock config and
+CLK_CTRL_RO at setup, and after writing the command print GENI_STATUS (is
+M_GENI_CMD_ACTIVE set?) and M_CMD0 (did the command stick?).
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -93,6 +93,7 @@
+ #define MONDRIAN_SE_GENI_TX_PACKING_1	0x264
+ #define MONDRIAN_SE_GENI_RX_PACKING_0	0x284
+ #define MONDRIAN_SE_GENI_RX_PACKING_1	0x288
++#define MONDRIAN_SE_GENI_IF_DISABLE_RO	0x64
+ #define MONDRIAN_SE_GENI_M_CMD0		0x600
+ #define MONDRIAN_SE_GENI_M_CMD_CTRL	0x604
+ #define MONDRIAN_SE_GENI_M_IRQ_STATUS	0x610
+@@ -385,6 +386,10 @@
+ 		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_TX_FIFO, word);
+ 	}
+ 
++	printf("MONDRIAN TOUCH: spi: cmd->status 0x%x cmd0 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD0));
++	mondrian_log_flush_now();
+ 	st = mondrian_spi_wait_done(se, 2000000);
+ 	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
+ 		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2); /* abort */
+@@ -445,6 +450,14 @@
+ 	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_GENERAL_CFG) | 0x0fu);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_OUTPUT_CTRL, 0x7fu);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_FORCE_DEFAULT, 1);
++	printf("MONDRIAN TOUCH: spi: dump fifo_dis 0x%x mctrl 0x%x irqen 0x%x out 0x%x clk 0x%x ro 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_IF_DISABLE_RO),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_CTRL),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_IRQ_EN),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_OUTPUT_CTRL),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_CLK_CTRL_RO));
++	mondrian_log_flush_now();
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_IRQ_EN, 0x0fu);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GSI_EVENT_EN, 0);
+ 	/* 8-bit words, four per FIFO word, MSB first (mainline's
