@@ -206,6 +206,37 @@ at +2/+4/+6), then a 2-byte checksum. After reading, write **one zero byte**
 back to `touch_data_addr`: that clears the report and releases IRQ (GPIO21,
 active low, GIC 305).
 
+## Loading the firmware (the part runs from RAM)
+
+The chip has no firmware of its own: `goodix_core.ko` writes 223736 bytes (an
+ISP stage plus six subsystems) into it over SPI on every boot, and only then
+does the part scan. This is the sequence from `goodix_brl_fwupdate.c` for
+Berlin D (`CHIP_TYPE_BRD 0x98`):
+
+| Step | Register or address |
+| --- | --- |
+| ISP code | `0x23800` (`ISP_RAM_ADDR_BRD`), write then read back |
+| boot option | `0x10000`, eight `0x55` bytes |
+| flash command | `0x12400` (`FLASH_CMD_REG_BRD`), 16 bytes |
+| ISP buffer | `0x12410` (`HW_REG_ISP_BUFFER_BRD`) |
+| configuration | `0x3E000` (`CONFIG_DATA_ADDR_BRD`) |
+| `misctl` | `0xD804` = `0x20700000` |
+| watchdog | `0xD040` |
+| config id | `0x10076` (`GOODIX_CFG_ID_ADDR_BRD`) |
+
+After the ISP goes in, reset and read `0x10014`: `patch_pid[3..5]` must be
+`ISP`. Each firmware chunk (4096 bytes) is written to the ISP buffer with a
+16-bit little-endian checksum appended, then a command is written to
+`0x12400`: `status 0`, `ack 0`, `len 11`, `cmd 0xBB`, `fw_type`, `fw_len`
+(LE16, data + 4), `fw_addr` (LE32) and a byte checksum over bytes 2..10. Poll
+until `ack == 0xEE`, wait 50 ms, then until `status == 0xEE`.
+
+The quirks already paid for: the firmware is RAM, so a power cycle loses it;
+`goodix_update_prepare` holds the CPU (`0x0002 = 01 00`, read `0x2000` until
+three reads agree) before enabling the clocks (`0xD807 = 0xFF`,
+`0xD806 = 0x77`, `0xD006 = 0x3C`), and the part only answers the boot option
+after a reset pulse of at least 15 ms.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
