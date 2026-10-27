@@ -1,0 +1,81 @@
+xnu 0125: find the SE clock level that starts the engine
+
+The engine still accepts the SPI command and never starts it. GENI_CLK_SEL
+is the DFS level of the SE clock, and the RCG rate table for the XO runs
+7.37M, 14.7M, 19.2M, ...: 19.2 MHz is level 2, while 0122-0124 wrote 0.
+Rather than guess, try levels 0, 1 and 2 with the loopback in one boot (it
+does not involve the part), print the status of each and continue with the
+level that completed.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -414,7 +414,7 @@
+ 	static const uint8_t id_b[2] = { 0x81, 0x40 };
+ 	uint8_t rx[8];
+ 	vm_offset_t pin;
+-	int st, i;
++	int st, i, good;
+ 
+ 	printf("MONDRIAN TOUCH: spi: pins 16-19 to qup4, 1.2 MHz, mode 0\n");
+ 	mondrian_log_flush_now();
+@@ -460,28 +460,46 @@
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_CPOL, 0);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TRANS_CFG, 0);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_DEMUX_SEL, 0);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, 0);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG, (16u << 4) | 1u);
+ 	printf("MONDRIAN TOUCH: spi: status 0x%x clk cfg 0x%x\n",
+ 	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+ 	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_SER_M_CLK_CFG));
+ 	mondrian_log_flush_now();
+ 
+-	/* Loopback first: proves the engine and the FIFO packing without the
+-	 * part. The SE loops MOSI back into MISO inside the block. */
++	/*
++	 * The engine only starts when GENI_CLK_SEL names the DFS level the RCG
++	 * is running at: the SE clock's rate table for the XO is
++	 * 7.37M/14.7M/19.2M/..., so 19.2 MHz is level 2. Try all three in one
++	 * boot (the loopback does not depend on the part) and keep the one
++	 * that completes.
++	 */
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_LOOPBACK, 1);
+-	st = mondrian_spi_xfer(se, echo, 4, rx, 4);
+-	printf("MONDRIAN TOUCH: spi: loopback st 0x%x rx %02x %02x %02x %02x\n",
+-	    (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
+-	mondrian_log_flush_now();
+-	printf("MONDRIAN TOUCH: spi: st 0x%x irq 0x%x err 0x%x rxf 0x%x txf 0x%x\n",
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_TX_FIFO_STS));
+-	mondrian_log_flush_now();
++	good = -1;
++	for (i = 0; i < 3; i++) {
++		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, (uint32_t)i);
++		st = mondrian_spi_xfer(se, echo, 4, rx, 4);
++		printf("MONDRIAN TOUCH: spi: clk_sel %d loopback st 0x%x rx %02x %02x %02x %02x\n",
++		    i, (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
++		printf("MONDRIAN TOUCH: spi: sel %d st 0x%x irq 0x%x err 0x%x rxf 0x%x txf 0x%x\n",
++		    i,
++		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
++		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
++		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
++		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS),
++		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_TX_FIFO_STS));
++		mondrian_log_flush_now();
++		if (st >= 0 && (st & MONDRIAN_M_CMD_DONE)) {
++			good = i;
++			break;
++		}
++	}
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_LOOPBACK, 0);
++	if (good < 0) {
++		printf("MONDRIAN TOUCH: spi: no clock select started the engine\n");
++		mondrian_log_flush_now();
++		return;
++	}
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, (uint32_t)good);
+ 
+ 	/* Register 0x8140, the product id, in the two framings. */
+ 	st = mondrian_spi_xfer(se, id_a, sizeof(id_a), rx, 4);
