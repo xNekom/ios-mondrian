@@ -1,0 +1,321 @@
+xnu 0132: power the touch part the way the vendor does, and speak Goodix SPI
+
+Three fixes, all visible in one boot:
+
+- The reset line is active high in the live tree (flags 0), so the old code
+  held the part in reset while calling it a release. Assert it while AVDD
+  settles, then release it low, 150 ms before the first transfer.
+- IOVDD (pm8350c_l2) is an RPMh vote and used to be cast after the part was
+  already out of reset. Vote it first: voltage 1800 mV at +0x0 (the vendor
+  driver sends millivolts), enable at +0x4 and PMIC5 LDO mode 7 (HPM, not the
+  DT's RPMH mode 4) at +0x8, three commands in one TCS. CMD_MSGID_LEN is 8 in
+  both the vendor and mainline rpmh-rsc, not 3.
+- The transfer used to guess the framing. The Goodix SPI protocol is a 0xF1
+  read (0xF0 write) byte, the address as 32-bit big endian and three dummy
+  bytes, all inside one CS frame (drivers/hid/hid-goodix-spi.c). The probe now
+  writes eight 0xAA bytes to 0x10000 and reads them back, which proves power,
+  reset and framing at once, then reads the classic id at 0x8140.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -165,7 +165,7 @@
+ #define MONDRIAN_RSC_CMD_DATA	0x3c
+ #define MONDRIAN_RSC_CMD_STATUS	0x40
+ #define MONDRIAN_RSC_CMD_STEP	24
+-#define MONDRIAN_CMD_MSGID_LEN	3u
++#define MONDRIAN_CMD_MSGID_LEN	8u
+ #define MONDRIAN_CMD_MSGID_WRITE	(1u << 16)
+ #define MONDRIAN_CMD_MSGID_RESP	(1u << 8)
+ 
+@@ -240,6 +240,8 @@
+  * IRQ low, so a powered part out of reset holds it high, and an unpowered or
+  * reset one leaves the pull-down in charge.
+  */
++static int mondrian_rpmh_ldo2(void);
++
+ static void
+ mondrian_touch_power(void)
+ {
+@@ -255,21 +257,32 @@
+ 		return;
+ 	}
+ 
+-	printf("MONDRIAN TOUCH: power: avdd on, reset low, irq pull-down\n");
++	/*
++	 * The live tree gives the reset line flags 0 (active high): driving it
++	 * high holds the part in reset, low releases it. Keep it asserted while
++	 * AVDD settles, bring IOVDD up, then release.
++	 */
++	printf("MONDRIAN TOUCH: power: avdd on, reset asserted\n");
+ 	mondrian_log_flush_now();
+ 
+ 	mondrian_tlmm_output(avdd_page, 0, MONDRIAN_TLMM_DRIVE_2MA, 1);
+-	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
+ 	mondrian_tlmm_write(irq_page, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
+ 
+ 	delay(10000);   /* AVDD settles while the part is held in reset */
+ 
++	/* IOVDD (pm8350c_l2) has to be up before the part boots. */
++	printf("MONDRIAN TOUCH: power: voting iovdd\n");
++	mondrian_log_flush_now();
++	(void)mondrian_rpmh_ldo2();
++	delay(5000);
++
+ 	printf("MONDRIAN TOUCH: power: releasing reset\n");
+ 	mondrian_log_flush_now();
+-	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
+ 
+-	delay(50000);   /* Goodix boot time */
++	delay(150000);  /* Goodix boot time */
+ 
+ 	printf("MONDRIAN TOUCH: power: avdd cfg 0x%x io 0x%x, reset cfg 0x%x io 0x%x\n",
+ 	    mondrian_tlmm_read(avdd_page, MONDRIAN_TLMM_CFG),
+@@ -281,21 +294,6 @@
+ 	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_CFG),
+ 	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT), level);
+ 	mondrian_log_flush_now();
+-
+-	/*
+-	 * The pull-down alone cannot tell an unpowered part (line high-Z, reads
+-	 * low) from a powered one asserting IRQ (also low). Repeat with a
+-	 * pull-up: unpowered reads high, driven low stays low, driven high stays
+-	 * high. Leave the vendor's active pull-up in place.
+-	 */
+-	mondrian_tlmm_write(irq_page, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
+-	delay(1000);
+-	printf("MONDRIAN TOUCH: power: irq pull-up cfg 0x%x io 0x%x level %u\n",
+-	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_CFG),
+-	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT),
+-	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT) & 1);
+-	mondrian_log_flush_now();
+ }
+ 
+ /*
+@@ -451,13 +449,16 @@
+ }
+ 
+ /*
+- * Vote for pm8350c_l2 on (1.8 V, enabled) through the first ACTIVE TCS. The
+- * VRM registers behind the resource address are +0x0 voltage in millivolts,
+- * +0x4 enable (bit 0) and +0x8 mode.
++ * Vote for pm8350c_l2 on through the first ACTIVE TCS. The VRM registers
++ * behind the resource address are +0x0 voltage in millivolts (the vendor
++ * driver sends DIV_ROUND_UP(uV, 1000)), +0x4 enable and +0x8 mode. The mode
++ * value is the PMIC5 LDO one, not the DT's RPMH mode: HPM is 7.
+  */
+ static int
+ mondrian_rpmh_ldo2(void)
+ {
++	static const uint32_t reg[3] = { 0x0, 0x4, 0x8 };
++	static const uint32_t val[3] = { 1800, 1, 7 };
+ 	vm_offset_t rsc;
+ 	uint32_t addr = mondrian_cmd_db_addr("ldoc2");
+ 	uint32_t base = MONDRIAN_RSC_TCS_OFF;
+@@ -480,25 +481,28 @@
+ 		printf("MONDRIAN TOUCH: rpmh tcs0 busy, not voting\n");
+ 		return -1;
+ 	}
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID, msgid);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR, addr);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA, 1800);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_MSGID, msgid);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_ADDR, addr + 4);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_DATA, 1);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0x3);
++	for (i = 0; i < 3; i++) {
++		mondrian_tlmm_write(rsc, base + i * MONDRIAN_RSC_CMD_STEP +
++		    MONDRIAN_RSC_CMD_MSGID, msgid);
++		mondrian_tlmm_write(rsc, base + i * MONDRIAN_RSC_CMD_STEP +
++		    MONDRIAN_RSC_CMD_ADDR, addr + reg[i]);
++		mondrian_tlmm_write(rsc, base + i * MONDRIAN_RSC_CMD_STEP +
++		    MONDRIAN_RSC_CMD_DATA, val[i]);
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0x7);
+ 	__builtin_arm_dsb(0xf);
+ 	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, 1);
+ 	__builtin_arm_dsb(0xf);
+ 	for (i = 0; i < 1000000; i++) {
+-		if (!(mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & 0x3)) {
++		if (!(mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & 0x7)) {
+ 			break;
+ 		}
+ 	}
+-	printf("MONDRIAN TOUCH: rpmh vote done, status 0x%x cmd 0x%x/0x%x\n",
+-	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS),
++	printf("MONDRIAN TOUCH: rpmh vote enable 0x%x, sts 0x%x 0x%x 0x%x\n",
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE),
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS),
+-	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS),
++	    mondrian_tlmm_read(rsc, base + 2 * MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
+ 	mondrian_log_flush_now();
+ 	return 0;
+ }
+@@ -539,15 +543,14 @@
+ }
+ 
+ static int
+-mondrian_spi_xfer(const uint8_t *tx, uint32_t txlen, uint8_t *rx, uint32_t rxlen)
++mondrian_spi_frame(const uint8_t *tx, uint32_t txlen, uint8_t *rx, uint32_t rxlen)
+ {
+ 	uint32_t i, b;
+ 	uint8_t in;
+ 
+ 	/*
+-	 * One CS frame for the command/address and the data: the part latches
+-	 * the address on the write and drives MISO for the following clocks
+-	 * with CS still low.
++	 * Everything in one CS frame: the part latches the prefix and drives
++	 * MISO for the following clocks with CS still low.
+ 	 */
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
+ 	mondrian_spi_delay(2000);
+@@ -559,7 +562,7 @@
+ 	for (i = 0; i < rxlen; i++) {
+ 		in = 0;
+ 		for (b = 0; b < 8; b++) {
+-			in = (uint8_t)((in << 1) | mondrian_spi_bit(1));
++			in = (uint8_t)((in << 1) | mondrian_spi_bit(0));
+ 		}
+ 		rx[i] = in;
+ 	}
+@@ -567,9 +570,49 @@
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
+ 	mondrian_spi_delay(2000);
+ 	return 0;
++}
++
++/*
++ * The Goodix SPI framing from drivers/hid/hid-goodix-spi.c: a 0xF1 read (or
++ * 0xF0 write) byte, the register address as 32-bit big endian, and for a read
++ * three dummy bytes before the data, all with CS asserted.
++ */
++static void
++mondrian_goodix_prefix(uint8_t *tx, uint8_t flag, uint32_t addr)
++{
++	tx[0] = flag;
++	tx[1] = (uint8_t)(addr >> 24);
++	tx[2] = (uint8_t)(addr >> 16);
++	tx[3] = (uint8_t)(addr >> 8);
++	tx[4] = (uint8_t)addr;
++	tx[5] = 0;
++	tx[6] = 0;
++	tx[7] = 0;
+ }
+ 
+ static int
++mondrian_goodix_read(uint32_t addr, uint8_t *buf, uint32_t len)
++{
++	uint8_t tx[8];
++
++	mondrian_goodix_prefix(tx, 0xf1, addr);
++	return mondrian_spi_frame(tx, sizeof(tx), buf, len);
++}
++
++static int
++mondrian_goodix_write(uint32_t addr, const uint8_t *buf, uint32_t len)
++{
++	uint8_t tx[16];
++
++	if (len > sizeof(tx) - 8) {
++		len = sizeof(tx) - 8;
++	}
++	mondrian_goodix_prefix(tx, 0xf0, addr);
++	memcpy(tx + 8, buf, len);
++	return mondrian_spi_frame(tx, 8 + len, NULL, 0);
++}
++
++static int
+ mondrian_spi_pins(void)
+ {
+ 	static const uint32_t pins[4] = {
+@@ -614,68 +657,35 @@
+ static void
+ mondrian_touch_spi_probe(void)
+ {
+-	/* The two common Goodix SPI framings for a register read. */
+-	static const uint8_t id_a[3] = { 0x20, 0x81, 0x40 };
+-	static const uint8_t id_b[2] = { 0x81, 0x40 };
+-	uint8_t rx[8] = { 0 };
++	uint8_t tx[8], rx[8], id[4] = { 0 };
++	uint32_t i;
+ 
+ 	if (mondrian_spi_pins() != 0) {
+ 		printf("MONDRIAN TOUCH: spi: cannot map the pads\n");
+ 		mondrian_log_flush_now();
+ 		return;
+ 	}
+-	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~600 kHz, mode 0\n");
++	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~600 kHz, goodix framing\n");
+ 	mondrian_log_flush_now();
+-	delay(20000);
+ 
+-	/* Is anything driving MISO? A part with IOVDD drives it; a dead one
+-	 * lets the pad's own bias decide. */
+-	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
+-	mondrian_spi_delay(2000);
+-	printf("MONDRIAN TOUCH: spi: miso pull-up %u\n",
+-	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+-	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
+-	mondrian_spi_delay(2000);
+-	printf("MONDRIAN TOUCH: spi: miso pull-down %u\n",
+-	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+-	mondrian_log_flush_now();
+-
+ 	/*
+-	 * A floating MISO means the part is not driving its IO; for a powered
+-	 * part out of reset that means the IOVDD rail (pm8350c_l2, RPMh) is
+-	 * off. Vote it on and look again.
++	 * The Berlin family answers a memory echo at 0x10000: write eight 0xAA
++	 * bytes and read them back. One test covers power, reset and framing.
+ 	 */
+-	if ((mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1) == 0) {
+-		printf("MONDRIAN TOUCH: spi: miso floats, voting ldoc2\n");
+-		mondrian_log_flush_now();
+-		if (mondrian_rpmh_ldo2() == 0) {
+-			delay(20000);
+-			mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-			    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP,
+-			    MONDRIAN_TLMM_DRIVE_2MA, 0));
+-			mondrian_spi_delay(2000);
+-			printf("MONDRIAN TOUCH: spi: after the vote miso pull-up %u\n",
+-			    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+-			mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-			    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN,
+-			    MONDRIAN_TLMM_DRIVE_2MA, 0));
+-			mondrian_spi_delay(2000);
+-			printf("MONDRIAN TOUCH: spi: after the vote miso pull-down %u\n",
+-			    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+-			mondrian_log_flush_now();
+-		}
++	for (i = 0; i < sizeof(tx); i++) {
++		tx[i] = 0xaa;
+ 	}
++	(void)mondrian_goodix_write(0x10000, tx, sizeof(tx));
++	delay(1000);
++	(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
++	printf("MONDRIAN TOUCH: spi: echo 0x10000 rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
++	    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++	mondrian_log_flush_now();
+ 
+-	(void)mondrian_spi_xfer(id_a, sizeof(id_a), rx, 4);
+-	printf("MONDRIAN TOUCH: spi: id a rx %02x %02x %02x %02x\n",
+-	    rx[0], rx[1], rx[2], rx[3]);
++	(void)mondrian_goodix_read(0x8140, id, sizeof(id));
++	printf("MONDRIAN TOUCH: spi: id 0x8140 %02x %02x %02x %02x\n",
++	    id[0], id[1], id[2], id[3]);
+ 	mondrian_log_flush_now();
+-	(void)mondrian_spi_xfer(id_b, sizeof(id_b), rx, 4);
+-	printf("MONDRIAN TOUCH: spi: id b rx %02x %02x %02x %02x\n",
+-	    rx[0], rx[1], rx[2], rx[3]);
+-	mondrian_log_flush_now();
+ }
+ 
+ void
