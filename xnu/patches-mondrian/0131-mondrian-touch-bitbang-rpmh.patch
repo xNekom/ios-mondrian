@@ -14,19 +14,10 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -30,6 +30,7 @@
- 
- /* osfmk/vm/pmap.h: not exported to the BSD layer */
- extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
-+extern uint64_t ml_get_timebase(void);
- 
- /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
- extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-@@ -143,6 +144,30 @@
- #define MONDRIAN_M_CMD_DONE		(1u << 0)
+@@ -145,6 +145,30 @@
  #define MONDRIAN_M_CMD_FAILURE		(1u << 3)
  #define MONDRIAN_M_CMD_ABORT		(1u << 5)
-+
+ 
 +/*
 + * RPMh: apps_rsc drv-2 (0x17a20000), TCS block at +0xd00, 672 bytes per TCS.
 + * The resource address of an LDO comes from the AOP command DB (0x80860000,
@@ -50,16 +41,14 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
 +#define MONDRIAN_CMD_MSGID_LEN	3u
 +#define MONDRIAN_CMD_MSGID_WRITE	(1u << 16)
 +#define MONDRIAN_CMD_MSGID_RESP	(1u << 8)
- 
++
  #define MONDRIAN_TOUCH_RESET_GPIO	20
  #define MONDRIAN_TOUCH_IRQ_GPIO		21
-@@ -379,6 +404,103 @@
- 		}
- 	}
- 	return -1;
-+}
-+
-+/*
+ #define MONDRIAN_TOUCH_AVDD_GPIO	71
+@@ -383,6 +407,103 @@
+ }
+ 
+ /*
 + * The LDO resource address lives in the command DB, keyed by the vendor's
 + * qcom,resource-name ("ldoc2" for pm8350c_l2).
 + */
@@ -154,10 +143,13 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
 +	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
 +	mondrian_log_flush_now();
 +	return 0;
- }
- 
- /*
-@@ -407,12 +529,12 @@
++}
++
++/*
+  * Bit-banged SPI on the touch pads. The QUPv3 SE has its FIFO interface
+  * disabled by firmware (GENI_IF_DISABLE_RO = 1, 0126) and its SE DMA path
+  * wedges the interconnect (0129), so the first touch driver clocks the part
+@@ -408,12 +529,12 @@
  mondrian_spi_bit(int mosi)
  {
  	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
@@ -173,7 +165,7 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
  	return miso;
  }
  
-@@ -422,9 +544,13 @@
+@@ -423,9 +544,13 @@
  	uint32_t i, b;
  	uint8_t in;
  
@@ -189,7 +181,7 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
  	for (i = 0; i < txlen; i++) {
  		for (b = 0; b < 8; b++) {
  			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
-@@ -437,9 +563,9 @@
+@@ -438,9 +563,9 @@
  		}
  		rx[i] = in;
  	}
@@ -201,7 +193,7 @@ first ACTIVE TCS of apps_rsc drv-2 (0x17a20000, TCS block +0xd00, rpmh-rsc
  	return 0;
  }
  
-@@ -498,10 +624,50 @@
+@@ -499,10 +624,50 @@
  		mondrian_log_flush_now();
  		return;
  	}
