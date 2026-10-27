@@ -12,7 +12,15 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -381,179 +381,134 @@
+@@ -30,6 +30,7 @@
+ 
+ /* osfmk/vm/pmap.h: not exported to the BSD layer */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern uint64_t ml_get_timebase(void);
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -381,179 +382,134 @@
  	return -1;
  }
  
@@ -63,14 +71,9 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 - * command stays active for ever, so the bytes have to come from a DMA
 - * buffer. TX buffer at offset 0 of the page, RX at 64.
 - */
- static int
--mondrian_spi_xfer(vm_offset_t se, const uint8_t *tx, uint32_t txlen,
--    uint8_t *rx, uint32_t rxlen)
++static int
 +mondrian_spi_bit(int mosi)
- {
--	uint64_t txpa = mondrian_touch_dma_pa;
--	uint64_t rxpa = mondrian_touch_dma_pa + MONDRIAN_TOUCH_DMA_RX_OFF;
--	int st;
++{
 +	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
 +	mondrian_spi_delay(400);
 +	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
@@ -80,10 +83,28 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 +	mondrian_spi_delay(400);
 +	return miso;
 +}
++
+ static int
+-mondrian_spi_xfer(vm_offset_t se, const uint8_t *tx, uint32_t txlen,
+-    uint8_t *rx, uint32_t rxlen)
++mondrian_spi_xfer(const uint8_t *tx, uint32_t txlen, uint8_t *rx, uint32_t rxlen)
+ {
+-	uint64_t txpa = mondrian_touch_dma_pa;
+-	uint64_t rxpa = mondrian_touch_dma_pa + MONDRIAN_TOUCH_DMA_RX_OFF;
+-	int st;
++	uint32_t i, b;
++	uint8_t in;
  
 -	if (mondrian_touch_dma == 0) {
 -		return -1;
--	}
++	mondrian_spi_delay(1000);
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
++	mondrian_spi_delay(1000);
++	for (i = 0; i < txlen; i++) {
++		for (b = 0; b < 8; b++) {
++			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
++		}
+ 	}
 -	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_DMA_MODE_EN, 1);
 -	if (txlen) {
 -		memcpy((void *)mondrian_touch_dma, tx, txlen);
@@ -95,19 +116,12 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_PTR_H, (uint32_t)(txpa >> 32));
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_ATTR, 1);
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_LEN, txlen);
-+static int
-+mondrian_spi_xfer(const uint8_t *tx, uint32_t txlen, uint8_t *rx, uint32_t rxlen)
-+{
-+	uint32_t i, b;
-+	uint8_t in;
-+
-+	mondrian_spi_delay(1000);
-+	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
-+	mondrian_spi_delay(1000);
-+	for (i = 0; i < txlen; i++) {
++	for (i = 0; i < rxlen; i++) {
++		in = 0;
 +		for (b = 0; b < 8; b++) {
-+			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
++			in = (uint8_t)((in << 1) | mondrian_spi_bit(1));
 +		}
++		rx[i] = in;
  	}
 -	if (rxlen) {
 -		flush_dcache64(rxpa, rxlen, TRUE);
@@ -118,22 +132,6 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_PTR_H, (uint32_t)(rxpa >> 32));
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_ATTR, 1);
 -		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_LEN, rxlen);
-+	for (i = 0; i < rxlen; i++) {
-+		in = 0;
-+		for (b = 0; b < 8; b++) {
-+			in = (uint8_t)((in << 1) | mondrian_spi_bit(1));
-+		}
-+		rx[i] = in;
- 	}
--	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
--	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_TX_RX);
--	st = mondrian_spi_wait_done(se, 2000000);
--	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
--		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2);
--	} else if (rxlen) {
--		flush_dcache64(rxpa, rxlen, TRUE);
--		memcpy(rx, (const void *)(mondrian_touch_dma + MONDRIAN_TOUCH_DMA_RX_OFF),
--		    rxlen);
 +	mondrian_spi_delay(1000);
 +	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
 +	mondrian_spi_delay(1000);
@@ -155,7 +153,16 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
 +		if (page[i] == 0) {
 +			return ENOMEM;
 +		}
-+	}
+ 	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_TX_RX);
+-	st = mondrian_spi_wait_done(se, 2000000);
+-	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
+-		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2);
+-	} else if (rxlen) {
+-		flush_dcache64(rxpa, rxlen, TRUE);
+-		memcpy(rx, (const void *)(mondrian_touch_dma + MONDRIAN_TOUCH_DMA_RX_OFF),
+-		    rxlen);
 +	mondrian_spi_clk = page[0];
 +	mondrian_spi_mosi = page[1];
 +	mondrian_spi_miso = page[2];
@@ -294,7 +301,7 @@ Slow, but it does not depend on the QUP firmware and cannot wedge a bus.
  	mondrian_log_flush_now();
  }
  
-@@ -568,11 +523,5 @@
+@@ -568,11 +524,5 @@
  	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
  	mondrian_touch_power();
  	mondrian_touch_geni_probe();
