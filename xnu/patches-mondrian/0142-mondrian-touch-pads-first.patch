@@ -1,0 +1,118 @@
+xnu 0142: drive the SPI pads before power-on, and try 2.5 MHz
+
+Android's QUP owns the four SPI pads before the part leaves reset (clock low,
+CS high). This driver configured them only after power-on, so the part came
+out of reset with its bus floating, and a slave that samples its interface at
+reset release can latch the wrong mode. Map and drive the pads first.
+
+The confirm also runs at 2.5 MHz after three tries at 600 kHz: the working
+driver talks to the part at up to 15 MHz, and a slave with a transfer timeout
+would ignore a clock that is 25 times slower.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -614,6 +614,8 @@
+ static vm_offset_t mondrian_spi_clk, mondrian_spi_mosi, mondrian_spi_miso,
+     mondrian_spi_cs;
+ static uint64_t mondrian_spi_hz;
++/* Half a bit period in nanoseconds; the part runs at 15 MHz in Android. */
++static uint32_t mondrian_spi_half = 800;
+ 
+ static void
+ mondrian_spi_delay(uint32_t ns)
+@@ -630,12 +632,12 @@
+ mondrian_spi_bit(int mosi)
+ {
+ 	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
+-	mondrian_spi_delay(800);
++	mondrian_spi_delay(mondrian_spi_half);
+ 	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
+-	mondrian_spi_delay(800);
++	mondrian_spi_delay(mondrian_spi_half);
+ 	int miso = (int)(mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+ 	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
+-	mondrian_spi_delay(800);
++	mondrian_spi_delay(mondrian_spi_half);
+ 	return miso;
+ }
+ 
+@@ -778,18 +780,13 @@
+ static void
+ mondrian_touch_spi_probe(void)
+ {
+-	if (mondrian_spi_pins() != 0) {
+-		printf("MONDRIAN TOUCH: spi: cannot map the pads\n");
+-		mondrian_log_flush_now();
+-		return;
+-	}
+ 	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~600 kHz, goodix framing\n");
+ 	mondrian_log_flush_now();
+ 
+ 	{
+ 		uint8_t tx[8], rx[8];
+ 		uint32_t j;
+-		int same = 1;
++		int same = 1, tries;
+ 
+ 		/*
+ 		 * brl_dev_confirm: eight 0xAA bytes at 0x10000, read back and
+@@ -798,18 +795,30 @@
+ 		for (j = 0; j < sizeof(tx); j++) {
+ 			tx[j] = 0xaa;
+ 		}
+-		(void)mondrian_goodix_write(0x10000, tx, sizeof(tx));
+-		delay(1000);
+-		(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
+-		for (j = 0; j < sizeof(rx); j++) {
+-			if (rx[j] != tx[j]) {
+-				same = 0;
++		for (tries = 0; tries < 6; tries++) {
++			/* Three tries at 600 kHz, then three at 2.5 MHz. */
++			mondrian_spi_half = (tries < 3) ? 800 : 200;
++			for (j = 0; j < sizeof(tx); j++) {
++				rx[j] = 0;
+ 			}
++			(void)mondrian_goodix_write(0x10000, tx, sizeof(tx));
++			delay(1000);
++			(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
++			same = 1;
++			for (j = 0; j < sizeof(rx); j++) {
++				if (rx[j] != tx[j]) {
++					same = 0;
++				}
++			}
++			printf("MONDRIAN TOUCH: echo 0x10000 try %d half %u ns rx %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
++			    tries, mondrian_spi_half, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
++			    same ? " (confirmed)" : "");
++			mondrian_log_flush_now();
++			if (same) {
++				break;
++			}
++			delay(5000);
+ 		}
+-		printf("MONDRIAN TOUCH: echo 0x10000 rx %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
+-		    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
+-		    same ? " (confirmed)" : "");
+-		mondrian_log_flush_now();
+ 	}
+ 
+ 	/*
+@@ -843,6 +852,18 @@
+ 	mondrian_touch_pin("reset", MONDRIAN_TOUCH_RESET_GPIO);
+ 	mondrian_touch_pin("irq", MONDRIAN_TOUCH_IRQ_GPIO);
+ 	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
++	/*
++	 * Drive the SPI pads before the part leaves reset. Android's QUP owns
++	 * them (clock low, CS high) at that moment; here they were still floating
++	 * inputs, and a part that samples its bus at reset release can latch the
++	 * wrong interface mode.
++	 */
++	if (mondrian_spi_pins() == 0) {
++		printf("MONDRIAN TOUCH: spi pads driven before power-on\n");
++	} else {
++		printf("MONDRIAN TOUCH: spi pads could not be mapped\n");
++	}
++	mondrian_log_flush_now();
+ 	mondrian_touch_power();
+ 	mondrian_touch_geni_probe();
+ 	mondrian_touch_spi_probe();
