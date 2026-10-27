@@ -1,10 +1,10 @@
 xnu 0153: load the touch firmware, so the part can actually report
 
 The part has no firmware of its own: the vendor driver writes an ISP stage and
-five sections (223744 bytes) into its RAM on every boot. Until it does, the IC
-info block answers (length 193, config 0x46) but its misc fields read as zeros —
-so touch_data_addr comes back as 0x1 and the "reports" the 0152 thread reads
-from 0x10308 are noise.
+five sections (223744 bytes) into it on every boot. Until it does, the IC info
+block answers (length 193, config 0x46) but its misc fields read as zeros — so
+touch_data_addr comes back as 0x1 and the "reports" the 0152 thread reads from
+0x10308 are noise.
 
 Read the package from a blob area in front of the log ring
 (mondrian_ufs.c: mondrian_reserved_read; 256 KiB reserved, written once from
@@ -16,12 +16,19 @@ patch_pid[3..5] is "ISP", then each section in 4 KB packets (data plus a 32-bit
 checksum to 0x12410, then a 0xBB command with its own checksum to 0x12400, ack
 and status 0xEE).
 
-The report thread now starts only after a successful load, and the IC info is
-read after it, when misc carries the real touch_data_addr.
+The blob also carries the sensor config (1488 bytes, type 4 at 0x3e000), which
+the vendor flashes before the five firmware sections; tools/mk-touch-blob.py
+repacks it as table entry 1, so the kernel's table order matches. The update
+resets use brl_reset's 2 ms low pulse, not brl_power_on's 15 ms one.
+
+The report thread starts only after a successful load, and the IC info is read
+after it, when misc carries the real touch_data_addr. The loader also prints
+patch_vid, sensor_id and the config ID at 0x10076, so one boot log says whether
+the part is running the firmware or still the ROM.
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -890,8 +890,274 @@
+@@ -890,8 +890,291 @@
  	} else {
  		printf("MONDRIAN TOUCH: ic info unusable, keeping 0x%x\n",
  		    mondrian_touch_data_addr);
@@ -33,6 +40,12 @@ read after it, when misc carries the real touch_data_addr.
 +
 +/* bsd/dev/mondrian_ufs.c: the blob area in front of the log ring. */
 +extern uint32_t mondrian_reserved_read(void *dst, uint32_t bytes);
++
++/* Defined below, once the ROM is up: the firmware loader pulses reset before
++ * and after the ISP stage. The power-on pulse is 15 ms (brl_power_on); the
++ * update sequence uses brl_reset's 2 ms pulse. */
++static void mondrian_touch_reset_pulse(void);
++static void mondrian_touch_update_reset(void);
 +
 +#define MONDRIAN_FW_MAX			(256u << 10)
 +#define MONDRIAN_FW_HEADER		512u
@@ -66,7 +79,7 @@ read after it, when misc carries the real touch_data_addr.
 +static int
 +mondrian_fw_write_big(uint32_t addr, const uint8_t *buf, uint32_t len)
 +{
-+	if (len > MONDRIAN_FW_CHUNK) {
++	if (len + 5 > sizeof(mondrian_fw_tx)) {
 +		return -1;
 +	}
 +	memcpy(mondrian_fw_tx + 5, buf, len);
@@ -174,7 +187,7 @@ read after it, when misc carries the real touch_data_addr.
 +			return 0;
 +		}
 +		delay(10000);
- 	}
++	}
 +	return -1;
 +}
 +
@@ -198,7 +211,7 @@ read after it, when misc carries the real touch_data_addr.
 +	if (len < MONDRIAN_FW_HEADER) {
 +		printf("MONDRIAN TOUCH: no firmware blob (read %u)\n", len);
 +		return -1;
-+	}
+ 	}
 +	fw_len = mondrian_le32(mondrian_fw) + 8;
 +	{
 +		uint32_t sum = 0, k;
@@ -234,7 +247,7 @@ read after it, when misc carries the real touch_data_addr.
 +		return -1;
 +	}
 +
-+	mondrian_touch_reset_pulse();
++	mondrian_touch_update_reset();
 +	if (mondrian_fw_hold_cpu() < 0) {
 +		printf("MONDRIAN TOUCH: hold cpu failed\n");
 +		return -1;
@@ -258,7 +271,7 @@ read after it, when misc carries the real touch_data_addr.
 +		printf("MONDRIAN TOUCH: boot option failed\n");
 +		return -1;
 +	}
-+	mondrian_touch_reset_pulse();
++	mondrian_touch_update_reset();
 +	for (i = 0; i < sizeof(id); i++) {
 +		id[i] = 0;
 +	}
@@ -284,19 +297,49 @@ read after it, when misc carries the real touch_data_addr.
 +		    i, type[i], addr[i], size[i]);
 +		mondrian_log_flush_now();
 +	}
-+	mondrian_touch_reset_pulse();
++	mondrian_touch_update_reset();
 +	for (i = 0; i < sizeof(id); i++) {
 +		id[i] = 0;
 +	}
 +	(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
-+	printf("MONDRIAN TOUCH: running %c%c%c%c%c%c patch %c%c%c%c%c\n",
-+	    id[0], id[1], id[2], id[3], id[4], id[5], id[10], id[11], id[12], id[13], id[14]);
++	printf("MONDRIAN TOUCH: running %c%c%c%c%c%c patch %c%c%c%c%c vid %02x %02x %02x %02x sensor %u ck %02x %02x\n",
++	    id[0], id[1], id[2], id[3], id[4], id[5], id[10], id[11], id[12], id[13], id[14],
++	    id[18], id[19], id[20], id[21], id[23], id[26], id[27]);
++	{
++		uint8_t cfgid[4];
++
++		for (i = 0; i < sizeof(cfgid); i++) {
++			cfgid[i] = 0;
++		}
++		(void)mondrian_goodix_read(0x00010076, cfgid, sizeof(cfgid));
++		printf("MONDRIAN TOUCH: config id %02x %02x %02x %02x\n",
++		    cfgid[0], cfgid[1], cfgid[2], cfgid[3]);
++	}
 +	mondrian_log_flush_now();
 +	return 0;
  }
  
  /*
-@@ -1061,12 +1327,16 @@
+@@ -975,7 +1258,18 @@
+ 	}
+ }
+ 
++/* brl_reset: 2 ms low, then brl_reset(delay=100)'s wait. The update entry
++ * resets with this, not with the 15 ms power-on pulse. */
+ static void
++mondrian_touch_update_reset(void)
++{
++	mondrian_tlmm_output(mondrian_touch_reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
++	delay(2000);
++	mondrian_tlmm_output(mondrian_touch_reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
++	delay(100000);
++}
++
++static void
+ mondrian_touch_reset_pulse(void)
+ {
+ 	/* A reset pulse restarts the part's ROM: with IOVDD and AVDD up there is
+@@ -1061,12 +1355,16 @@
  	mondrian_touch_power();
  	mondrian_touch_geni_probe();
  	mondrian_touch_spi_probe();

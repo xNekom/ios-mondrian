@@ -247,6 +247,12 @@ to `0x23800`); sections 1-5 are types 3/2/2/2/2 at `0x1c000`, `0x1000`,
 1488-byte group for sensor 255 from `goodix_cfg_group_m11a.bin`, flashed the
 same way.
 
+The kernel gets the package without a file system: the 64 blocks in front of
+the log ring at the end of `userdata` are reserved for it, `tools/
+flash-touch-firmware.sh` writes it there from recovery with `dd`, and
+`mondrian_reserved_read()` in `bsd/dev/mondrian_ufs.c` reads it back. Nothing
+else in `userdata` moves, and no sudo is needed.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
