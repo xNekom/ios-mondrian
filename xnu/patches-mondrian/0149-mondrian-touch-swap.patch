@@ -1,0 +1,56 @@
+xnu 0149: try the SPI pads with MOSI and MISO exchanged
+
+The device tree lists gpio16-19 as the four QUP4 signals but not which signal
+each pad carries, and every read with the assumed order (16 clk, 17 mosi,
+18 miso) returns zeros while Android reads "BERLIN" from the same address. If
+MOSI and MISO are swapped, this driver drives the part's MISO and reads its
+MOSI, which floats: exactly what a pull-down reads.
+
+Read the id with both mappings and print them.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -912,7 +912,43 @@
+ 				break;
+ 			}
+ 			delay(5000);
++		}
++	}
++
++	{
++		/*
++		 * The pin order in the device tree does not say which QUP signal
++		 * each pad carries. Read the id with the mapping this driver
++		 * assumes, then with MOSI and MISO exchanged: if the second one
++		 * answers, the pads were the wrong way round.
++		 */
++		uint8_t id[36];
++		uint32_t j;
++		vm_offset_t t;
++
++		for (j = 0; j < sizeof(id); j++) {
++			id[j] = 0;
++		}
++		(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
++		printf("MONDRIAN TOUCH: id clk16 mosi17 miso18 %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]);
++		mondrian_log_flush_now();
++
++		t = mondrian_spi_mosi;
++		mondrian_spi_mosi = mondrian_spi_miso;
++		mondrian_spi_miso = t;
++		mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, 0);
++		mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_CFG,
++		    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_NONE, MONDRIAN_TLMM_DRIVE_8MA, 1));
++		mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++		    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++		for (j = 0; j < sizeof(id); j++) {
++			id[j] = 0;
+ 		}
++		(void)mondrian_goodix_read(0x00010014, id, sizeof(id));
++		printf("MONDRIAN TOUCH: id clk16 mosi18 miso17 %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]);
++		mondrian_log_flush_now();
+ 	}
+ 
+ 	{
