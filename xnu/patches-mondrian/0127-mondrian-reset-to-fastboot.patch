@@ -1,0 +1,104 @@
+xnu 0127: reboot to fastboot on a timer, so reading the ring needs no keys
+
+Reading the ring means stopping iOS with the key combo and booting recovery
+every time. The bootloader picks fastboot from the BCB (the first block of
+"misc", first 32 bytes = command). With `mondrianreset=<seconds>` a thread
+waits that long, flushes the ring, patches only the command field of that
+block ("boot-fastboot") through the same UFS write path the ring uses, and
+stops the CPU; the hardware watchdog that already ends a wedged bus resets
+the SoC and the bootloader enters fastboot. Without the boot argument nothing
+changes.
+
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1259,6 +1259,73 @@
+ 	mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed));
+ }
+ 
++/*
++ * Ask the bootloader for fastboot: it reads the BCB, the first 4 KiB block of
++ * "misc", whose first 32 bytes are a command ("boot-fastboot"). Only the
++ * command field is touched; the A/B metadata lives in the rest of the block.
++ */
++static int
++mondrian_ufs_bcb_set(const char *command)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t saved_first, saved_nblocks, misc = 0;
++	int error;
++
++	if (!su.ready || strlen(command) >= 32) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&mondrian_ufs_lock);
++	saved_first = su.first_block;
++	saved_nblocks = su.nblocks;
++	error = ufs_find_partition("misc");
++	if (!error) {
++		misc = su.first_block;
++		error = ufs_read_blocks(misc, 1);
++	}
++	if (!error) {
++		bzero(b, 32);
++		memcpy(b, command, strlen(command));
++		error = ufs_write_blocks(misc, 1);
++	}
++	if (!error) {
++		error = ufs_flush();
++	}
++	su.first_block = saved_first;
++	su.nblocks = saved_nblocks;
++	lck_mtx_unlock(&mondrian_ufs_lock);
++	printf("MONDRIAN RESET: BCB \"%s\" at misc block 0x%llx: %d\n",
++	    command, misc, error);
++	return error;
++}
++
++/*
++ * mondrianreset=<seconds>: after that long, put the ring on the disk, set the
++ * BCB to "boot-fastboot" and stop this CPU. The hardware watchdog resets the
++ * SoC (the same one that ends a wedged bus), and the bootloader then enters
++ * fastboot instead of booting a slot: no key presses to read the log.
++ */
++static void
++mondrian_reset_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int seconds = 0;
++
++	if (!PE_parse_boot_argn("mondrianreset", &seconds, sizeof(seconds)) || seconds <= 0) {
++		return;
++	}
++	printf("MONDRIAN RESET: fastboot in %d s\n", seconds);
++	for (int i = 0; i < seconds; i++) {
++		tsleep(&seconds, PUSER, "mondrianrst", hz);
++	}
++	mondrian_log_flush_now();
++	(void)mondrian_ufs_bcb_set("boot-fastboot");
++	mondrian_log_flush_now();
++	printf("MONDRIAN RESET: hanging for the watchdog\n");
++	(void)splhigh();
++	for (;;) {
++		;
++	}
++}
++
+ /* Called from the UFS write path, which runs throughout the boot. */
+ void
+ mondrian_log_kick(void)
+@@ -1483,6 +1550,16 @@
+ 		printf("MONDRIAN LOG: writer thread started\n");
+ 	} else {
+ 		printf("MONDRIAN LOG: writer thread start failed (%d)\n", kr);
++	}
++
++	{
++		int seconds = 0;
++
++		if (PE_parse_boot_argn("mondrianreset", &seconds, sizeof(seconds)) && seconds > 0) {
++			if (kernel_thread_start(mondrian_reset_thread, NULL, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++			}
++		}
+ 	}
+ 
+ 	/*
