@@ -1,0 +1,45 @@
+xnu 0124: run the GENI I/O init before the first transfer
+
+0123 showed the engine accepting the TX/RX command and never starting it
+(M_IRQ_STATUS stays 0, M_CMD_ERR_STATUS 0, both FIFOs empty). Mainline calls
+geni_se_io_init() and geni_se_io_set_mode() before any transfer; the two
+writes that matter here are GENI_OUTPUT_CTRL = 0x7f (enables the SPI outputs)
+and SE_IRQ_EN |= GENI_M/S + DMA (the event logic), plus FORCE_DEFAULT and the
+CGC/DMA clock gates. Do the same before the first transfer.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -82,6 +82,12 @@
+ #define MONDRIAN_SE_GENI_SER_M_CLK_CFG	0x48
+ #define MONDRIAN_SE_GENI_CLK_SEL	0x7c
+ #define MONDRIAN_SE_GENI_DMA_MODE_EN	0x258
++#define MONDRIAN_SE_GENI_FORCE_DEFAULT	0x20
++#define MONDRIAN_SE_GENI_OUTPUT_CTRL	0x24
++#define MONDRIAN_SE_GENI_CGC_CTRL	0x28
++#define MONDRIAN_SE_GSI_EVENT_EN	0xe18
++#define MONDRIAN_SE_IRQ_EN		0xe1c
++#define MONDRIAN_SE_DMA_GENERAL_CFG	0xe30
+ #define MONDRIAN_SE_GENI_BYTE_GRAN	0x254
+ #define MONDRIAN_SE_GENI_TX_PACKING_0	0x260
+ #define MONDRIAN_SE_GENI_TX_PACKING_1	0x264
+@@ -427,6 +433,20 @@
+ 		    MONDRIAN_TLMM_DRIVE_8MA, 0));
+ 	}
+ 
++	/*
++	 * geni_se_io_init() + geni_se_io_set_mode(): mainline runs these before
++	 * any transfer. GENI_OUTPUT_CTRL enables the SPI outputs and SE_IRQ_EN
++	 * the M/S event logic; without them the engine accepts the command,
++	 * never starts it and reports no error (measured on 0123).
++	 */
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CGC_CTRL,
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_CGC_CTRL) | 0x7fu);
++	mondrian_tlmm_write(se, MONDRIAN_SE_DMA_GENERAL_CFG,
++	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_GENERAL_CFG) | 0x0fu);
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_OUTPUT_CTRL, 0x7fu);
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_FORCE_DEFAULT, 1);
++	mondrian_tlmm_write(se, MONDRIAN_SE_IRQ_EN, 0x0fu);
++	mondrian_tlmm_write(se, MONDRIAN_SE_GSI_EVENT_EN, 0);
+ 	/* 8-bit words, four per FIFO word, MSB first (mainline's
+ 	 * geni_se_config_packing(8, 4, true, true, true)). */
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_DMA_MODE_EN, 0);
