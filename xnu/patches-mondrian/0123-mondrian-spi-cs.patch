@@ -1,0 +1,72 @@
+xnu 0123: let the SPI engine drive CS itself
+
+0122 issued SPI_CS_ASSERT before every transfer and SPI_CS_DEASSERT after it.
+In master mode the engine asserts CS as part of the TX/RX command (mainline
+never touches those opcodes), and the manual assert leaves the engine waiting:
+the first id read never completed and the second returned the stale state.
+
+Drop the CS commands, read the RX FIFO only by its word count, and print the
+status, IRQ, error and FIFO words after the loopback so the next boot says
+exactly what the engine thinks.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -91,6 +91,7 @@
+ #define MONDRIAN_SE_GENI_M_CMD_CTRL	0x604
+ #define MONDRIAN_SE_GENI_M_IRQ_STATUS	0x610
+ #define MONDRIAN_SE_GENI_M_IRQ_CLEAR	0x618
++#define MONDRIAN_SE_GENI_M_CMD_ERR_STATUS 0x624
+ #define MONDRIAN_SE_GENI_TX_FIFO	0x700
+ #define MONDRIAN_SE_GENI_RX_FIFO	0x780
+ #define MONDRIAN_SE_GENI_TX_FIFO_STS	0x800
+@@ -362,9 +363,11 @@
+ 	int st;
+ 
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_CS_ASSERT);
+-	delay(1000);
+-
++	/*
++	 * In master mode the engine asserts CS itself for the TX/RX command
++	 * (mainline never issues CS_ASSERT/DEASSERT here); sending them first
++	 * leaves the engine waiting and the first transfer never completes.
++	 */
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TX_TRANS_LEN, tw);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_RX_TRANS_LEN, rw);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_TX_RX);
+@@ -380,6 +383,12 @@
+ 	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
+ 		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2); /* abort */
+ 	} else {
++		uint32_t have = mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS);
++		uint32_t words = have & 0x0fffffffu;
++
++		if (words < rw) {
++			rw = words;
++		}
+ 		for (i = 0; i < rw; i++) {
+ 			word = mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO);
+ 			for (j = 0; j < 4 && i * 4 + j < rxlen; j++) {
+@@ -387,8 +396,6 @@
+ 			}
+ 		}
+ 	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_CS_DEASSERT);
+-	delay(1000);
+ 	return st;
+ }
+ 
+@@ -447,6 +454,13 @@
+ 	printf("MONDRIAN TOUCH: spi: loopback st 0x%x rx %02x %02x %02x %02x\n",
+ 	    (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
+ 	mondrian_log_flush_now();
++	printf("MONDRIAN TOUCH: spi: st 0x%x irq 0x%x err 0x%x rxf 0x%x txf 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_TX_FIFO_STS));
++	mondrian_log_flush_now();
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_LOOPBACK, 0);
+ 
+ 	/* Register 0x8140, the product id, in the two framings. */
