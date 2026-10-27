@@ -76,7 +76,7 @@ changes.
 +	(void)mondrian_ufs_bcb_set("boot-fastboot");
 +	mondrian_log_flush_now();
 +	printf("MONDRIAN RESET: hanging for the watchdog\n");
-+	(void)splhigh();
++	(void)ml_set_interrupts_enabled(FALSE);
 +	for (;;) {
 +		;
 +	}

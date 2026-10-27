@@ -29,7 +29,7 @@ status words next to the command status.
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
  extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  
-@@ -103,6 +110,23 @@
+@@ -103,7 +110,24 @@
  #define MONDRIAN_SE_GENI_RX_FIFO	0x780
  #define MONDRIAN_SE_GENI_TX_FIFO_STS	0x800
  #define MONDRIAN_SE_GENI_RX_FIFO_STS	0x804
@@ -48,12 +48,41 @@ status words next to the command status.
 +#define MONDRIAN_SE_DMA_RX_IRQ_STAT	0xd40
 +#define MONDRIAN_SE_DMA_RX_IRQ_CLR	0xd44
 +#define MONDRIAN_SE_DMA_RX_IRQ_EN_SET	0xd4c
-+
-+#define MONDRIAN_TOUCH_DMA_RX_OFF	64
  
++#define MONDRIAN_TOUCH_DMA_RX_OFF	64
++
  #define MONDRIAN_SE_SPI_CPHA		0x224
  #define MONDRIAN_SE_SPI_LOOPBACK	0x22c
-@@ -358,62 +382,85 @@
+ #define MONDRIAN_SE_SPI_CPOL		0x230
+@@ -355,57 +379,81 @@
+ 		}
+ 	}
+ 	return -1;
++}
++
++static vm_offset_t mondrian_touch_dma;
++static uint64_t mondrian_touch_dma_pa;
++
++static int
++mondrian_touch_dma_alloc(void)
++{
++	kern_return_t kr;
++	ppnum_t pn;
++
++	if (mondrian_touch_dma != 0) {
++		return 0;
++	}
++	kr = kmem_alloc_contig(kernel_map, &mondrian_touch_dma, PAGE_SIZE, PAGE_MASK,
++	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)mondrian_touch_dma);
++	if (pn == 0) {
++		return ENOMEM;
++	}
++	mondrian_touch_dma_pa = ptoa_64(pn);
++	return 0;
  }
  
  /*
@@ -144,32 +173,7 @@ status words next to the command status.
  	}
  	return st;
  }
- 
-+static vm_offset_t mondrian_touch_dma;
-+static uint64_t mondrian_touch_dma_pa;
-+
-+static int
-+mondrian_touch_dma_alloc(void)
-+{
-+	kern_return_t kr;
-+	ppnum_t pn;
-+
-+	if (mondrian_touch_dma != 0) {
-+		return 0;
-+	}
-+	kr = kmem_alloc_contig(kernel_map, &mondrian_touch_dma, PAGE_SIZE, PAGE_MASK,
-+	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
-+	if (kr != KERN_SUCCESS) {
-+		return ENOMEM;
-+	}
-+	pn = pmap_find_phys(kernel_pmap, (addr64_t)mondrian_touch_dma);
-+	if (pn == 0) {
-+		return ENOMEM;
-+	}
-+	mondrian_touch_dma_pa = ptoa_64(pn);
-+	return 0;
-+}
-+
+@@ -413,7 +461,6 @@
  static void
  mondrian_touch_spi_probe(vm_offset_t se)
  {
