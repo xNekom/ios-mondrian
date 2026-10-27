@@ -1,0 +1,76 @@
+xnu 0147: run the bit-bang as fast as the pads allow, and time the frame
+
+Android proves the part answers the same confirm: the working driver logs
+"brl_dev_confirm: device connected" and its chip_info reads rom_pid BERLIN,
+config_version 46. It talks over the QUP at up to 15 MHz; this driver clocks
+at about 0.6 MHz, and a slave with a transfer timeout would drop a frame that
+slow.
+
+Drop the artificial delays (half period 0) and measure the real frame time
+with the timebase, so the log says how fast the pads actually go. Two tries
+each at 600 kHz, 2.5 MHz, 10 MHz and as fast as the writes allow.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -634,11 +634,17 @@
+ static uint64_t mondrian_spi_hz;
+ /* Half a bit period in nanoseconds; the part runs at 15 MHz in Android. */
+ static uint32_t mondrian_spi_half = 800;
++static uint64_t mondrian_spi_frame_start, mondrian_spi_frame_ticks;
+ 
+ static void
+ mondrian_spi_delay(uint32_t ns)
+ {
+-	uint64_t ticks = ((uint64_t)ns * mondrian_spi_hz) / 1000000000ull + 1;
++	uint64_t ticks;
++
++	if (ns == 0) {
++		return;
++	}
++	ticks = ((uint64_t)ns * mondrian_spi_hz) / 1000000000ull + 1;
+ 	uint64_t start = mach_absolute_time();
+ 
+ 	while (mach_absolute_time() - start < ticks) {
+@@ -671,6 +677,7 @@
+ 	 */
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
+ 	mondrian_spi_delay(2000);
++	mondrian_spi_frame_start = mach_absolute_time();
+ 	for (i = 0; i < txlen; i++) {
+ 		for (b = 0; b < 8; b++) {
+ 			(void)mondrian_spi_bit((tx[i] >> (7 - b)) & 1);
+@@ -686,6 +693,7 @@
+ 	mondrian_spi_delay(2000);
+ 	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
+ 	mondrian_spi_delay(2000);
++	mondrian_spi_frame_ticks = mach_absolute_time() - mondrian_spi_frame_start;
+ 	return 0;
+ }
+ 
+@@ -878,9 +886,10 @@
+ 		for (j = 0; j < sizeof(tx); j++) {
+ 			tx[j] = 0xaa;
+ 		}
+-		for (tries = 0; tries < 6; tries++) {
+-			/* Three tries at 600 kHz, then three at 2.5 MHz. */
+-			mondrian_spi_half = (tries < 3) ? 800 : 200;
++		for (tries = 0; tries < 8; tries++) {
++			static const uint32_t half[8] = { 800, 800, 200, 200, 50, 50, 0, 0 };
++
++			mondrian_spi_half = half[tries];
+ 			for (j = 0; j < sizeof(tx); j++) {
+ 				rx[j] = 0;
+ 			}
+@@ -893,8 +902,10 @@
+ 					same = 0;
+ 				}
+ 			}
+-			printf("MONDRIAN TOUCH: echo 0x10000 try %d half %u ns rx %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
+-			    tries, mondrian_spi_half, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
++			printf("MONDRIAN TOUCH: echo 0x10000 try %d half %u ns frame %llu us rx %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
++			    tries, mondrian_spi_half,
++			    (unsigned long long)(mondrian_spi_frame_ticks / (mondrian_spi_hz / 1000000)),
++			    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
+ 			    same ? " (confirmed)" : "");
+ 			mondrian_log_flush_now();
+ 			if (same) {
