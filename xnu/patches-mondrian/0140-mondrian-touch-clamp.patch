@@ -1,0 +1,50 @@
+xnu 0140: measure whether the part's IOVDD reaches its pads
+
+Every echo is still zeros with both framings at every AVDD/reset level, and
+the RPMh read-back only returns the vote, not the PMIC's output. Drive MISO
+high with the pad's own output stage and read it back: with no supply behind
+the part its ESD diode clamps the pin near 0.7 V, below the input threshold,
+and the read comes back 0; with IOVDD up it reads 1. Driving low is the
+control. That separates "the vote landed but the rail is not there" from
+"the rail is there and the part still will not talk".
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -498,7 +498,8 @@
+ 		return -1;
+ 	}
+ 	idle = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE);
+-	printf("MONDRIAN TOUCH: rpmh tcs0 enable 0x%x status 0x%x\n", idle,
++	printf("MONDRIAN TOUCH: rpmh tcs%u enable 0x%x status 0x%x\n",
++	    MONDRIAN_RSC_ACTIVE_TCS, idle,
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS));
+ 	mondrian_log_flush_now();
+ 	if (idle != 0) {
+@@ -841,6 +842,27 @@
+ 	 * so run it once per AVDD/reset level combination.
+ 	 */
+ 	(void)mondrian_touch_power_matrix();
++
++	/*
++	 * Does the part's IOVDD physically reach its pads? Drive MISO high with
++	 * the pad's own output stage and read it back: with no supply behind the
++	 * part, its ESD diode clamps the pin near 0.7 V, below the input
++	 * threshold, and the read comes back 0. With IOVDD up it reads 1.
++	 * Driving low is the control (always 0).
++	 */
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT, 2);
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_NONE, MONDRIAN_TLMM_DRIVE_8MA, 1));
++	mondrian_spi_delay(2000);
++	printf("MONDRIAN TOUCH: clamp miso driven high reads %u",
++	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_spi_delay(2000);
++	printf(", driven low reads %u\n",
++	    mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_log_flush_now();
++	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
+ }
+ 
+ void
