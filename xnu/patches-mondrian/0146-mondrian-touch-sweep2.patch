@@ -1,0 +1,94 @@
+xnu 0146: repeat the AVDD/reset sweep with the real read frame
+
+The level sweep that tried every AVDD and reset combination ran before the
+read frame was fixed: it sent three zero dummy bytes where the working driver
+sends 0xFF, so its "AVDD low" cases never made a valid read. Repeat all four
+combinations now that the frame is right, and print the IRQ level with each.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -792,10 +792,75 @@
+ 	if (mondrian_spi_hz == 0) {
+ 		mondrian_spi_hz = 19200000;
+ 	}
++
++	/*
++	 * Drive each output and read its own input bit back. If a pad does not
++	 * follow, nothing on the wire can explain the silence of the part and
++	 * the problem is here, not in the part.
++	 */
++	for (i = 0; i < 3; i++) {
++		vm_offset_t page = (i == 0) ? mondrian_spi_clk :
++		    ((i == 1) ? mondrian_spi_mosi : mondrian_spi_cs);
++		uint32_t lo, hi;
++
++		mondrian_tlmm_write(page, MONDRIAN_TLMM_IN_OUT, 0);
++		mondrian_spi_delay(2000);
++		lo = mondrian_tlmm_read(page, MONDRIAN_TLMM_IN_OUT) & 1;
++		mondrian_tlmm_write(page, MONDRIAN_TLMM_IN_OUT, 2);
++		mondrian_spi_delay(2000);
++		hi = mondrian_tlmm_read(page, MONDRIAN_TLMM_IN_OUT) & 1;
++		printf("MONDRIAN TOUCH: pad self-test %s low %u high %u\n",
++		    (i == 0) ? "clk" : ((i == 1) ? "mosi" : "cs"), lo, hi);
++	}
++	mondrian_log_flush_now();
++	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, 0);
++	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);
+ 	return 0;
+ }
+ 
++/*
++ * The earlier level sweep used the old read frame (zero dummy bytes), so its
++ * avdd=0 cases never saw a valid read. Repeat it with the driver's frame:
++ * every combination of AVDD and reset, 150 ms apart, one confirm each.
++ */
+ static void
++mondrian_touch_level_sweep(void)
++{
++	static const int avdd_level[4] = { 1, 1, 0, 0 };
++	static const int reset_level[4] = { 1, 0, 1, 0 };
++	uint8_t tx[8], rx[8];
++	int i, j, same;
++
++	for (i = 0; i < 4; i++) {
++		mondrian_tlmm_output(mondrian_touch_avdd_page, 0,
++		    MONDRIAN_TLMM_DRIVE_2MA, avdd_level[i]);
++		mondrian_tlmm_output(mondrian_touch_reset_page, 0,
++		    MONDRIAN_TLMM_DRIVE_8MA, reset_level[i]);
++		delay(150000);
++		for (j = 0; j < 8; j++) {
++			tx[j] = 0xaa;
++			rx[j] = 0;
++		}
++		(void)mondrian_goodix_write(0x10000, tx, 8);
++		delay(1000);
++		(void)mondrian_goodix_read(0x10000, rx, 8);
++		same = 1;
++		for (j = 0; j < 8; j++) {
++			if (rx[j] != tx[j]) {
++				same = 0;
++			}
++		}
++		printf("MONDRIAN TOUCH: sweep avdd %d reset %d irq %u echo %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
++		    avdd_level[i], reset_level[i],
++		    mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1,
++		    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
++		    same ? " (confirmed)" : "");
++		mondrian_log_flush_now();
++	}
++}
++
++static void
+ mondrian_touch_spi_probe(void)
+ {
+ 	printf("MONDRIAN TOUCH: spi: bit-bang on gpio16-19, ~600 kHz, goodix framing\n");
+@@ -839,6 +904,8 @@
+ 		}
+ 	}
+ 
++	(void)mondrian_touch_level_sweep();
++
+ 	/*
+ 	 * Does the part's IOVDD physically reach its pads? Drive MISO high with
+ 	 * the pad's own output stage and read it back: with no supply behind the
