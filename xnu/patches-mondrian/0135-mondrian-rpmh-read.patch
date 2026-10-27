@@ -1,0 +1,107 @@
+xnu 0135: read the rail back and try the 0xC900 SPI-mode switch
+
+Two diagnostics that fit in one boot:
+
+- A read command through the same RSC TCS (message ID without the WRITE bit
+  and with RESP_REQ, answer in CMD_RESP_DATA) reads ldoc2's enable and voltage
+  registers back. That separates "the vote never reached the PMIC" from "the
+  vote arrived and the rail is on but the part still does not answer".
+- The vendor driver writes 1 to register 0xC900 and reads it back to put the
+  part in SPI mode (brl_select_spi_mode in goodix_core.ko). A part that boots
+  in another bus mode drives nothing until that write.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -164,6 +164,7 @@
+ #define MONDRIAN_RSC_CMD_ADDR	0x38
+ #define MONDRIAN_RSC_CMD_DATA	0x3c
+ #define MONDRIAN_RSC_CMD_STATUS	0x40
++#define MONDRIAN_RSC_CMD_RESP_DATA	0x44
+ #define MONDRIAN_RSC_CMD_STEP	24
+ #define MONDRIAN_TCS_AMC_ENABLE	(1u << 16)
+ #define MONDRIAN_TCS_AMC_TRIGGER	(1u << 24)
+@@ -244,6 +245,7 @@
+  * reset one leaves the pull-down in charge.
+  */
+ static int mondrian_rpmh_ldo2(void);
++static int mondrian_rpmh_read(uint32_t addr, uint32_t *out);
+ 
+ static void
+ mondrian_touch_power(void)
+@@ -524,7 +526,57 @@
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS),
+ 	    mondrian_tlmm_read(rsc, base + 2 * MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
+ 	mondrian_log_flush_now();
++	{
++		uint32_t val = 0;
++
++		(void)mondrian_rpmh_read(addr + 0x4, &val);
++		(void)mondrian_rpmh_read(addr + 0x0, &val);
++	}
+ 	return 0;
++}
++
++/*
++ * Read one word back through the RPMh. The framework in this tree only
++ * writes, but the RSC hardware takes a read command: same TCS, message ID
++ * without the WRITE bit and with RESP_REQ, and the answer lands in
++ * CMD_RESP_DATA. A timeout leaves the rail question open instead of hanging.
++ */
++static int
++mondrian_rpmh_read(uint32_t addr, uint32_t *out)
++{
++	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	uint32_t base = MONDRIAN_RSC_TCS_OFF;
++	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_RESP;
++	uint32_t i, ctrl, sts = 0;
++
++	if (rsc == 0 || mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) != 0) {
++		return -1;
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID, msgid);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR, addr);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA, 0);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0x1);
++	__builtin_arm_dsb(0xf);
++	ctrl = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL);
++	ctrl &= ~MONDRIAN_TCS_AMC_TRIGGER;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	ctrl &= ~MONDRIAN_TCS_AMC_ENABLE;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, MONDRIAN_TCS_AMC_ENABLE);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    MONDRIAN_TCS_AMC_ENABLE | MONDRIAN_TCS_AMC_TRIGGER);
++	__builtin_arm_dsb(0xf);
++	for (i = 0; i < 1000000; i++) {
++		sts = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS);
++		if ((sts & 0x10000) ||
++		    (mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & 0x1) == 0) {
++			break;
++		}
++	}
++	*out = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_RESP_DATA);
++	printf("MONDRIAN TOUCH: rpmh read 0x%x -> 0x%x (sts 0x%x)\n", addr, *out, sts);
++	mondrian_log_flush_now();
++	return (sts & 0x10000) ? 0 : -1;
+ }
+ 
+ /*
+@@ -692,6 +744,18 @@
+ 	 * The Berlin family answers a memory echo at 0x10000: write eight 0xAA
+ 	 * bytes and read them back. One test covers power, reset and framing.
+ 	 */
++	/*
++	 * The vendor driver writes 1 to 0xC900 and reads it back to put the
++	 * part in SPI mode (brl_select_spi_mode). Cheap, and a part that boots
++	 * in another bus mode answers nothing until it is done.
++	 */
++	tx[0] = 0x01;
++	(void)mondrian_goodix_write(0xc900, tx, 1);
++	delay(2000);
++	(void)mondrian_goodix_read(0xc900, rx, 1);
++	printf("MONDRIAN TOUCH: spi: 0xc900 now %02x\n", rx[0]);
++	mondrian_log_flush_now();
++
+ 	for (i = 0; i < sizeof(tx); i++) {
+ 		tx[i] = 0xaa;
+ 	}
