@@ -55,6 +55,22 @@ address + data, zeros during the read data phase. A plain read of `0x00010014`
 returns `42 45 52 4c 49 4e` ("BERLIN") and `0x00010070` returns `0xc1`, so the
 part answers reads with no write first.
 
+The part is a **Berlin D**, not a Berlin A: `goodix_get_ic_type` logs
+`ic type is BerlinD` and the firmware package calls itself `GT9916R`. That
+matters for the frame, because the two generations differ in the read prefix:
+Berlin A sends four dummy bytes and takes the data from byte 9
+(`goodix_spi_read_bra`), Berlin D sends three and takes it from byte 8
+(`goodix_spi_read`). This driver builds the Berlin D frame, and the `tracefs`
+capture above is that frame, so the protocol is not where the silence comes
+from.
+
+After a power cycle the part always comes back in ROM mode, and the first
+thing it answers is the boot-option echo: the driver writes eight `0xAA` bytes
+to `0x10000` and reads them back (`brl_dev_confirm`, about 120 ms after the
+reset release), then loads the ISP and rewrites the firmware over the same bus
+(`0x55` at `0x10000`, `fw_version equal` yet `need to upgrade`). Any probe has
+to start with that write, not with a read of `0x10014`.
+
 The input device reports ABS 0..14400 x 0..32000 (the HID service must divide
 by those, not by 1440/3200) and the touch IRQ is GPIO21 (GIC 305, `msmgpio`,
 edge). Only `pm8350c_l2` is enabled for the touch; `l7` is off in the working
@@ -229,6 +245,13 @@ ENABLE, then ENABLE|TRIGGER.
 - **The RSC layout is 2.7 on this SoC** (the vendor tree has no 3.0 table).
   Using mainline's newer offsets fails silently: every write lands in the
   wrong register and the TCS never triggers.
-- **The touch IC is a GT9916** (`goodix,gt9916`, "BerlinA"), not a
-  register-compatible gt9xx: the id register at `0x8140` may not exist, the
-  liveness test is the eight-byte echo at `0x10000`.
+- **The touch IC is a GT9916R, and the driver resolves it to Berlin D**, not
+  the Berlin A that the older `gt9916` DTs name; the two differ in the read
+  prefix length. It is not a register-compatible gt9xx either: the id register
+  at `0x8140` does not exist, and the liveness test is the eight-byte echo at
+  `0x10000`.
+- **The TLMM bit layout is the sm8450 one**, not the msm8998 one: mux in bits
+  2-4, pull in bits 0-1 (0 none, 1 down, 3 up), drive in bits 6-8, output
+  enable in bit 9 (`pinctrl-sm8450.c`'s `PINGROUP`). Inside `IN_OUT`, bit 0 is
+  the pin level and bit 1 is the output value, so driving a pad and reading it
+  back is `write 2`, then `read & 1`.
