@@ -237,6 +237,16 @@ three reads agree) before enabling the clocks (`0xD807 = 0xFF`,
 `0xD806 = 0x77`, `0xD006 = 0x3C`), and the part only answers the boot option
 after a reset pulse of at least 15 ms.
 
+The package itself, checked against `goodix_firmware_m11a.bin` (223744 bytes):
+`size` and a 32-bit `checksum` of the 16-bit words from offset 8, then a
+512-byte header, a table of 10-byte entries at offset 42 (`type`, `size`
+LE32, `flash_addr` LE32, one reserved byte) and the section data in order from
+512. Section 0 is the ISP (2048 bytes, address `0xffffffff`, ignored: it goes
+to `0x23800`); sections 1-5 are types 3/2/2/2/2 at `0x1c000`, `0x1000`,
+`0x4000`, `0x26000` and `0x0`. The config blob (`0x3E000`, type 4) is the
+1488-byte group for sensor 255 from `goodix_cfg_group_m11a.bin`, flashed the
+same way.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
