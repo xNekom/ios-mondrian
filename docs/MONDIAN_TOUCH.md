@@ -15,8 +15,8 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 | Wrapper | `qcom,qupv3_1_geni_se@ac0000` (QUPv3 wrapper 1) |
 | Chip select / speed | CS0, 15 MHz max (`spi-max-frequency = <0xe4e1c0>`) |
 | Touch node | `xiaomi,m11a-spi` at `spi@990000/xiaomi_touch@0` |
-| Reset | TLMM **GPIO 20**, active low |
-| IRQ | TLMM **GPIO 21**, edge rising (`0x2008`), pull down |
+| Reset | TLMM **GPIO 20**, active high (`flags 0`): high holds the part in reset |
+| IRQ | TLMM **GPIO 21**, active low (`interrupts = <0x2008>`, ONESHOT + TRIGGER_LOW) |
 | AVDD enable | TLMM **GPIO 71** |
 | IOVDD | PMIC regulator, phandle `0x301` (`vdd-supply`) |
 | Coordinates | `panel-max-x = 14400`, `-y = 32000` (0.1 mm units) |
@@ -28,17 +28,15 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 `0117` read the three pads: all come up in the TLMM reset state, function 0
 (gpio), pull-down, input, level low, `INTR_CFG 0xe2` with the interrupt
 itself disabled. The bootloader does not power the part: AVDD (GPIO71) is an
-input and reset (GPIO20) is low. `0119` therefore drives the sequence: AVDD
-on, 10 ms with reset held low, release and wait 50 ms, with GPIO21 left an
-input and a pull-down. The Goodix asserts IRQ low, so a powered part out of
-reset drives the line high; that level is the milestone-1 signal. On a high
-line the pad is switched to the vendor's active pull-up.
+input and reset (GPIO20) is low. The sequence is AVDD on, reset **asserted**
+(GPIO20 high: the live tree gives the line flags 0, active high), IOVDD up,
+then reset released low and 150 ms before the first transfer.
 
-Measured with `0119`: AVDD and reset read back as outputs high (`0x200/0x3`
-and `0x2c0/0x3`), and the IRQ pad reads 0 with the pull-down and 1 with the
-pull-up, i.e. the line floats. That fits an unpowered part, but it is not
-proof: an open-drain INT also floats when deasserted, so "is it alive" has to
-come from the SPI ID read (milestone 3), not from this pin.
+The part drives INT low once it has booted, so with GPIO21 as an input and the
+vendor's pull-up (`mi_ts_active`) a level of 0 is the milestone-1 signal and 1
+means unpowered, held in reset, or dead. Measured with `0119` (which had the
+polarity backwards and no IOVDD): the line read 1 both ways, which is exactly
+what a part held in reset looks like.
 
 ## The SE, measured (`0120`/`0121`)
 
@@ -86,13 +84,13 @@ The port has no RPMh driver yet: this is the map for writing one.
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
-   (`qcom,rpmh-vrm-regulator`, resource `ldoc2`, 1.8 V, init mode 4), not an
-   SPMI-driven LDO: it needs an RPMh (RSC, `apps_rsc@17a00000`) vote, and the
-   port has no RPMh driver. The ABL may leave the rail on; check that before
-   writing one (the touch IRQ pin stays high when it is powered and out of
-   reset). The shim's SPMI is read-only by design, so it cannot set it.
-2. **TLMM pins.** Reset (20) low, then high after the part's power-up delay;
-   AVDD enable (71) high; IRQ pin (21) as input with pull-down. The pin
+   (`qcom,rpmh-vrm-regulator`, resource `ldoc2`, 1800 mV), not an
+   SPMI-driven LDO: it needs an RPMh (RSC, `apps_rsc@17a00000`) vote, which
+   `0131`/`0132` implement. The shim's SPMI is read-only by design, so it
+   cannot set it.
+2. **TLMM pins.** Reset (20) high while AVDD settles and IOVDD comes up, then
+   low; AVDD enable (71) high; IRQ pin (21) as input with the vendor's pull-up.
+   The pin
    registers are the mainline `pinctrl-msm` layout at `0x0f100000 + 0x1000*n`:
    `GPIO_CFG` (pull 0-1, function 2-4, drive 6-8, output enable 9), `IN_OUT`
    (level 0, output value 1), `INTR_CFG` and `INTR_STATUS`. `0117`/`0119`
@@ -114,21 +112,22 @@ The port has no RPMh driver yet: this is the map for writing one.
    address/length into the TX FIFO, then `GENI_GO` with the DMA/FIFO bit and
    wait for `GENI_IRQ_STATUS` done. The SE firmware version must be read first
    (`GENI_FW_REVISION`) and logged: this SoC's SE firmware is version 3.
-5. **Goodix over SPI.** The protocol (command byte, register address, read
-   length, ACK from the part) is the same one sweet implements over GENI I2C
-   (`xnu/patches/0063-sweet-goodix-geni-packing.patch`): the transport changes,
-   the register map does not. Start by reading the product ID (`0x8140`,
-   four bytes ASCII) and the config version; log them and stop there.
+5. **Goodix over SPI.** Not the I2C register protocol: Goodix's SPI parts use
+   a frame of `0xF1` (read) or `0xF0` (write), the register address as 32-bit
+   big endian, and for a read three dummy bytes, all inside one CS frame
+   (`drivers/hid/hid-goodix-spi.c` upstream). Data starts at byte 8. The
+   Berlin family answers a memory echo at `0x10000` (write eight `0xAA` bytes,
+   read them back), which proves power, reset and framing in one transfer;
+   the classic product ID is at `0x8140`.
 6. **HID wiring.** `MondrianHIDTouch` already publishes a digitizer service
    (`0048`); feed it from the touch thread with `IOHIDEventCreateDigitizerEvent`
    style collections in the same way `MondrianHIDButtons` feeds keys.
 
 ## Milestones, each one testable in a single boot
 
-1. AVDD + reset, no SPI traffic: a powered part out of reset holds IRQ
-   (GPIO21) high; `0119` drives the pads and prints the level. This proves
-   the pins (and, if the level stays low, points at the IOVDD rail) without
-   risking the bus.
+1. AVDD, IOVDD and reset, no SPI traffic: a part out of reset pulls IRQ
+   (GPIO21) low within 150 ms; the probe prints the level. A level of 1 points
+   at the rail, the reset line or the part.
 2. GENI init and `GENI_FW_REVISION` read: proves the SE clock and the register
    window.
 3. Goodix product ID over SPI: proves the transport and the protocol.
@@ -153,5 +152,10 @@ The port has no RPMh driver yet: this is the map for writing one.
 - **The live tree is the source of truth.** Two panels share the touch node;
   the panel-max values are the same for both, so the touch works with either
   panel without a panel-specific table.
-- **SPI mode matters**: the vendor driver uses mode 0 at 15 MHz; the Goodix
-  ACK window is short, so start at 1 MHz until the ID reads.
+- **SPI mode matters**: mode 0, MSB first. Bit-bang it at about 600 kHz until
+  the echo answers; the part tolerates 15 MHz once the framing is right.
+- **The reset line is active high** in this tree (`flags 0`), so `0119`'s
+  "release" (driving it high) held the part in reset for every earlier test.
+- **The VRM mode is the PMIC5 one**: 7 = HPM for an LDO, not the DT's RPMH
+  mode 4. `CMD_MSGID_LEN` is 8 in rpmh-rsc, and the voltage register takes
+  millivolts, not a selector index.
