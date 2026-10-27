@@ -81,10 +81,15 @@ grep -q 'VALID_ARCHS="x86_64 arm64e arm64"' "$DXB_DIR/build.sh" || {
 	exit 1
 }
 
-if [ -d "$DXB_DIR/xnu/.git" ]; then
+if [ -d "$DXB_DIR/xnu/.git" ] &&
+	git -C "$DXB_DIR/xnu" rev-parse --verify -q HEAD >/dev/null; then
 	echo "== resetting the xnu checkout"
 	git -C "$DXB_DIR/xnu" reset -q --hard
 	git -C "$DXB_DIR/xnu" clean -qfdx
+elif [ -d "$DXB_DIR/xnu" ]; then
+	# Without its own history, "git -C xnu" walks up to the dxb repo and the
+	# clean would delete the whole kernel tree (that happened once).
+	echo "warning: $DXB_DIR/xnu has no git HEAD; leaving it untouched" >&2
 fi
 
 # build.sh skips the kernel when this marker exists (it only asks whether the
