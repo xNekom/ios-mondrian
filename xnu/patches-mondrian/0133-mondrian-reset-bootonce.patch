@@ -1,13 +1,14 @@
-xnu 0133: point the BCB at the bootloader, not at fastbootd
+xnu 0133: pick the BCB command this bootloader understands
 
-The BCB reset path works -- it drove the bootloader into fastboot -- but it
-wrote "boot-fastboot", which selects fastbootd, and fastbootd rejects
-"fastboot boot". "bootonce-bootloader" is the command that selects the
-bootloader's own fastboot for one boot.
+The BCB reset path works -- it drove the bootloader into fastboot -- but
+"bootonce-bootloader" is not a command this ABL knows: it fell through to a
+normal boot and stopped at the splash. "boot-fastboot" is the one it honours,
+and it selects fastbootd; from there `fastboot reboot bootloader` reaches the
+bootloader's own fastboot, which is the mode that accepts `fastboot boot`.
 
-Keep the IMEM restart reason and the PSCI reset too: the BCB alone froze the
-phone with interrupts off because the hardware watchdog does not fire on a
-spinning CPU.
+The IMEM restart reason and the PSCI reset stay: the BCB alone froze the phone
+with interrupts off because the hardware watchdog does not fire on a spinning
+CPU.
 
 --- a/bsd/dev/mondrian_ufs.c
 +++ b/bsd/dev/mondrian_ufs.c
@@ -21,7 +22,7 @@ spinning CPU.
 - * the BCB route alone leaves the phone frozen.
 + * Two steps land in the bootloader's fastboot. The BCB (the first 4 KiB block
 + * of "misc", command in its first 32 bytes) is what the bootloader reads
-+ * first, and "bootonce-bootloader" is the command that picks fastboot proper;
++ * first, and "boot-fastboot" is the command that picks fastboot proper;
 + * "boot-fastboot" picks fastbootd instead, which does not accept
 + * "fastboot boot". Then the IMEM restart reason and a PSCI reset actually
 + * restart the SoC, which the hardware watchdog does not do to a spinning CPU.
@@ -86,7 +87,7 @@ spinning CPU.
  		tsleep(&seconds, PUSER, "mondrianrst", hz);
  	}
 +	mondrian_log_flush_now();
-+	(void)mondrian_ufs_bcb_set("bootonce-bootloader");
++	(void)mondrian_ufs_bcb_set("boot-fastboot");
  	mondrian_log_flush_now();
  	mondrian_reset_to_bootloader();
  	mondrian_log_flush_now();

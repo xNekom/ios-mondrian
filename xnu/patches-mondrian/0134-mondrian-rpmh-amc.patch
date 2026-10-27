@@ -1,0 +1,64 @@
+xnu 0134: trigger the RPMh TCS in AMC mode
+
+The ldoc2 vote completed without moving the rail because CONTROL was written
+as a plain 1. rpmh-rsc triggers an active TCS in AMC mode: clear the stale
+TRIGGER (bit 24) and ENABLE (bit 16) bits, write ENABLE, then ENABLE|TRIGGER.
+The probe prints CONTROL before and after so the next log shows whether the
+sequence took.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -165,6 +165,9 @@
+ #define MONDRIAN_RSC_CMD_DATA	0x3c
+ #define MONDRIAN_RSC_CMD_STATUS	0x40
+ #define MONDRIAN_RSC_CMD_STEP	24
++#define MONDRIAN_TCS_AMC_ENABLE	(1u << 16)
++#define MONDRIAN_TCS_AMC_TRIGGER	(1u << 24)
++
+ #define MONDRIAN_CMD_MSGID_LEN	8u
+ #define MONDRIAN_CMD_MSGID_WRITE	(1u << 16)
+ #define MONDRIAN_CMD_MSGID_RESP	(1u << 8)
+@@ -464,7 +467,7 @@
+ 	uint32_t base = MONDRIAN_RSC_TCS_OFF;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
+ 	    MONDRIAN_CMD_MSGID_RESP;
+-	uint32_t i, idle;
++	uint32_t i, idle, ctrl;
+ 
+ 	if (addr == 0) {
+ 		return -1;
+@@ -491,15 +494,32 @@
+ 	}
+ 	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0x7);
+ 	__builtin_arm_dsb(0xf);
+-	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, 1);
++
++	/*
++	 * Trigger the TCS the way rpmh-rsc does: AMC mode, four writes that
++	 * clear the stale trigger and enable bits, then enable and trigger.
++	 * A plain write of 1 to CONTROL does not start the transfer.
++	 */
++	ctrl = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL);
++	printf("MONDRIAN TOUCH: rpmh control 0x%x\n", ctrl);
++	mondrian_log_flush_now();
++	ctrl &= ~MONDRIAN_TCS_AMC_TRIGGER;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	ctrl &= ~MONDRIAN_TCS_AMC_ENABLE;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, MONDRIAN_TCS_AMC_ENABLE);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    MONDRIAN_TCS_AMC_ENABLE | MONDRIAN_TCS_AMC_TRIGGER);
+ 	__builtin_arm_dsb(0xf);
++
+ 	for (i = 0; i < 1000000; i++) {
+ 		if (!(mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & 0x7)) {
+ 			break;
+ 		}
+ 	}
+-	printf("MONDRIAN TOUCH: rpmh vote enable 0x%x, sts 0x%x 0x%x 0x%x\n",
++	printf("MONDRIAN TOUCH: rpmh vote enable 0x%x control 0x%x, sts 0x%x 0x%x 0x%x\n",
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE),
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL),
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS),
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS),
+ 	    mondrian_tlmm_read(rsc, base + 2 * MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
