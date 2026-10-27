@@ -1,0 +1,92 @@
+xnu 0133: point the BCB at the bootloader, not at fastbootd
+
+The BCB reset path works -- it drove the bootloader into fastboot -- but it
+wrote "boot-fastboot", which selects fastbootd, and fastbootd rejects
+"fastboot boot". "bootonce-bootloader" is the command that selects the
+bootloader's own fastboot for one boot.
+
+Keep the IMEM restart reason and the PSCI reset too: the BCB alone froze the
+phone with interrupts off because the hardware watchdog does not fire on a
+spinning CPU.
+
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1260,11 +1260,51 @@
+ }
+ 
+ /*
+- * The shim's proven way to land in fastboot: tell the bootloader why the
+- * SoC is resetting (IMEM restart_reason = RESTART_BOOTLOADER) and then reset
+- * through PSCI. The hardware watchdog does not fire on a spinning CPU, so
+- * the BCB route alone leaves the phone frozen.
++ * Two steps land in the bootloader's fastboot. The BCB (the first 4 KiB block
++ * of "misc", command in its first 32 bytes) is what the bootloader reads
++ * first, and "bootonce-bootloader" is the command that picks fastboot proper;
++ * "boot-fastboot" picks fastbootd instead, which does not accept
++ * "fastboot boot". Then the IMEM restart reason and a PSCI reset actually
++ * restart the SoC, which the hardware watchdog does not do to a spinning CPU.
++ */
++/*
++ * Only the command field of the BCB is touched; the A/B metadata lives in the
++ * rest of the block.
+  */
++static int
++mondrian_ufs_bcb_set(const char *command)
++{
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t saved_first, saved_nblocks, misc = 0;
++	int error;
++
++	if (!su.ready || strlen(command) >= 32) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&mondrian_ufs_lock);
++	saved_first = su.first_block;
++	saved_nblocks = su.nblocks;
++	error = ufs_find_partition("misc");
++	if (!error) {
++		misc = su.first_block;
++		error = ufs_read_blocks(misc, 1);
++	}
++	if (!error) {
++		bzero(b, 32);
++		memcpy(b, command, strlen(command));
++		error = ufs_write_blocks(misc, 1);
++	}
++	if (!error) {
++		error = ufs_flush();
++	}
++	su.first_block = saved_first;
++	su.nblocks = saved_nblocks;
++	lck_mtx_unlock(&mondrian_ufs_lock);
++	printf("MONDRIAN RESET: BCB \"%s\" at misc block 0x%llx: %d\n",
++	    command, misc, error);
++	return error;
++}
++
+ static uint64_t
+ mondrian_smc(uint64_t fn)
+ {
+@@ -1295,10 +1335,9 @@
+ }
+ 
+ /*
+- * mondrianreset=<seconds>: after that long, put the ring on the disk, set the
+- * BCB to "boot-fastboot" and stop this CPU. The hardware watchdog resets the
+- * SoC (the same one that ends a wedged bus), and the bootloader then enters
+- * fastboot instead of booting a slot: no key presses to read the log.
++ * mondrianreset=<seconds>: after that long, put the ring on the disk, point
++ * the BCB at the bootloader and reset the SoC, so the next boot lands in
++ * fastboot with the ring readable: no key presses to collect a log.
+  */
+ static void
+ mondrian_reset_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -1312,6 +1351,8 @@
+ 	for (int i = 0; i < seconds; i++) {
+ 		tsleep(&seconds, PUSER, "mondrianrst", hz);
+ 	}
++	mondrian_log_flush_now();
++	(void)mondrian_ufs_bcb_set("bootonce-bootloader");
+ 	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader();
+ 	mondrian_log_flush_now();
