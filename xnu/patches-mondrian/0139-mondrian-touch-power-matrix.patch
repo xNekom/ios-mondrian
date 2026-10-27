@@ -1,0 +1,196 @@
+xnu 0139: try every AVDD/reset level and both read framings
+
+The read-back through the ACTIVE TCS says the rail is enabled at 1800 mV, and
+MISO returns zeros with a pull-down and ones with a pull-up, so nothing drives
+it: the part is not running, or it never accepted the frame.
+
+Two lines are left, AVDD (GPIO71) and reset (GPIO20), and their polarity is
+only inferable from the vendor binary. Try all four level combinations, 150 ms
+apart, and read the 0x10000 echo after each one, with the IRQ level printed
+alongside.
+
+The echo is read with both framings goodix_core.ko carries: the standard one
+(0xF1, address, 00 00 FF) and the "bra" one (0xF1, address, four 0xFF bytes).
+Whichever combination answers is the wiring, in one boot instead of eight.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -258,6 +258,8 @@
+  * reset one leaves the pull-down in charge.
+  */
+ static int mondrian_rpmh_ldo2(void);
++static vm_offset_t mondrian_touch_reset_page, mondrian_touch_avdd_page,
++    mondrian_touch_irq_page;
+ static int mondrian_rpmh_read(uint32_t addr, uint32_t *out);
+ 
+ static void
+@@ -269,6 +271,9 @@
+ 	reset_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_RESET_GPIO, 0x1000);
+ 	irq_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_IRQ_GPIO, 0x1000);
+ 	avdd_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_AVDD_GPIO, 0x1000);
++	mondrian_touch_reset_page = reset_page;
++	mondrian_touch_irq_page = irq_page;
++	mondrian_touch_avdd_page = avdd_page;
+ 	if (reset_page == 0 || irq_page == 0 || avdd_page == 0) {
+ 		printf("MONDRIAN TOUCH: power: cannot map the pins\n");
+ 		mondrian_log_flush_now();
+@@ -679,16 +684,34 @@
+ 	tx[7] = 0;
+ }
+ 
+-static int
+-mondrian_goodix_read(uint32_t addr, uint8_t *buf, uint32_t len)
++/*
++ * Berlin parts come in two read framings: the standard three dummy bytes
++ * (byte 7 is 0xFF) and the "bra" one, whose four dummy bytes are all 0xFF.
++ * goodix_core.ko carries both (goodix_spi_read and goodix_spi_read_bra).
++ */
++static int
++mondrian_goodix_read_ex(uint32_t addr, uint8_t *buf, uint32_t len, int bra)
+ {
+-	uint8_t tx[8];
++	uint8_t tx[9];
+ 
+ 	mondrian_goodix_prefix(tx, 0xf1, addr);
+-	return mondrian_spi_frame(tx, sizeof(tx), buf, len);
++	if (bra) {
++		tx[5] = 0xff;
++		tx[6] = 0xff;
++		tx[7] = 0xff;
++		tx[8] = 0xff;
++		return mondrian_spi_frame(tx, 9, buf, len);
++	}
++	return mondrian_spi_frame(tx, 8, buf, len);
+ }
+ 
+ static int
++mondrian_goodix_read(uint32_t addr, uint8_t *buf, uint32_t len)
++{
++	return mondrian_goodix_read_ex(addr, buf, len, 0);
++}
++
++static int
+ mondrian_goodix_write(uint32_t addr, const uint8_t *buf, uint32_t len)
+ {
+ 	uint8_t tx[16];
+@@ -746,14 +769,64 @@
+ 		mondrian_spi_hz = 19200000;
+ 	}
+ 	return 0;
++}
++
++/*
++ * The rail is on (the RPMh read-back says enable 1, 1800 mV) and MISO is
++ * floating (all zeros with a pull-down, all ones with a pull-up), so the part
++ * is not running. AVDD (GPIO71) and reset (GPIO20) are the two lines left;
++ * try every level combination, waiting long enough for the part to boot after
++ * each one, and read the echo. First idea wins and the log names it.
++ */
++static int
++mondrian_touch_power_matrix(void)
++{
++	static const int avdd_level[4] = { 1, 1, 0, 0 };
++	static const int reset_level[4] = { 1, 0, 1, 0 };
++	uint8_t tx[8], rx[8];
++	int i, j, bra, nonzero;
++
++	for (i = 0; i < 4; i++) {
++		mondrian_tlmm_output(mondrian_touch_avdd_page, 0,
++		    MONDRIAN_TLMM_DRIVE_2MA, avdd_level[i]);
++		mondrian_tlmm_output(mondrian_touch_reset_page, 0,
++		    MONDRIAN_TLMM_DRIVE_8MA, reset_level[i]);
++		delay(150000);
++
++		tx[0] = 0x01;
++		(void)mondrian_goodix_write(0xc900, tx, 1);
++		delay(2000);
++		for (j = 0; j < 8; j++) {
++			tx[j] = 0xaa;
++		}
++		(void)mondrian_goodix_write(0x10000, tx, 8);
++		delay(1000);
++		for (bra = 0; bra < 2; bra++) {
++			(void)mondrian_goodix_read_ex(0x10000, rx, 8, bra);
++			nonzero = 0;
++			for (j = 0; j < 8; j++) {
++				if (rx[j] != 0) {
++					nonzero = 1;
++				}
++			}
++			printf("MONDRIAN TOUCH: matrix avdd %d reset %d irq %u %s echo %02x %02x %02x %02x %02x %02x %02x %02x%s\n",
++			    avdd_level[i], reset_level[i],
++			    mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1,
++			    bra ? "bra" : "std",
++			    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
++			    nonzero ? " (answered)" : "");
++			mondrian_log_flush_now();
++			if (nonzero) {
++				return 0;
++			}
++		}
++	}
++	return -1;
+ }
+ 
+ static void
+ mondrian_touch_spi_probe(void)
+ {
+-	uint8_t tx[8], rx[8], id[4] = { 0 };
+-	uint32_t i;
+-
+ 	if (mondrian_spi_pins() != 0) {
+ 		printf("MONDRIAN TOUCH: spi: cannot map the pads\n");
+ 		mondrian_log_flush_now();
+@@ -764,49 +837,10 @@
+ 
+ 	/*
+ 	 * The Berlin family answers a memory echo at 0x10000: write eight 0xAA
+-	 * bytes and read them back. One test covers power, reset and framing.
++	 * bytes and read them back. One test covers power, reset and framing,
++	 * so run it once per AVDD/reset level combination.
+ 	 */
+-	/*
+-	 * The vendor driver writes 1 to 0xC900 and reads it back to put the
+-	 * part in SPI mode (brl_select_spi_mode). Cheap, and a part that boots
+-	 * in another bus mode answers nothing until it is done.
+-	 */
+-	tx[0] = 0x01;
+-	(void)mondrian_goodix_write(0xc900, tx, 1);
+-	delay(2000);
+-	(void)mondrian_goodix_read(0xc900, rx, 1);
+-	printf("MONDRIAN TOUCH: spi: 0xc900 now %02x\n", rx[0]);
+-	mondrian_log_flush_now();
+-
+-	for (i = 0; i < sizeof(tx); i++) {
+-		tx[i] = 0xaa;
+-	}
+-	(void)mondrian_goodix_write(0x10000, tx, sizeof(tx));
+-	delay(1000);
+-	(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
+-	printf("MONDRIAN TOUCH: spi: echo 0x10000 rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-	    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
+-	mondrian_log_flush_now();
+-
+-	/*
+-	 * Repeat the same read with MISO pulled up. A part that drives the line
+-	 * returns the same bytes both ways; a floating pad returns all zeros
+-	 * with the pull-down and all ones with the pull-up.
+-	 */
+-	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
+-	mondrian_spi_delay(2000);
+-	(void)mondrian_goodix_read(0x10000, rx, sizeof(rx));
+-	printf("MONDRIAN TOUCH: spi: echo pull-up rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-	    rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
+-	mondrian_log_flush_now();
+-	mondrian_tlmm_write(mondrian_spi_miso, MONDRIAN_TLMM_CFG,
+-	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
+-
+-	(void)mondrian_goodix_read(0x8140, id, sizeof(id));
+-	printf("MONDRIAN TOUCH: spi: id 0x8140 %02x %02x %02x %02x\n",
+-	    id[0], id[1], id[2], id[3]);
+-	mondrian_log_flush_now();
++	(void)mondrian_touch_power_matrix();
+ }
+ 
+ void
