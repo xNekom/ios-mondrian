@@ -1,0 +1,80 @@
+xnu 0143: vote the rail that feeds the AVDD switch too
+
+Lineage's tree leaves the touch's AVDD to a gpio-controlled switch on GPIO71
+and has the regulator path commented out, with L7C (pm8350c_l7, 3.0 V) as the
+rail it would have used. Nobody enables L7C at boot, so the switch may have
+nothing to pass even when GPIO71 is high.
+
+Generalise the vote (resource name + millivolts) and enable ldoc7 as well as
+ldoc2, then read both back. The read-back is the useful part: it says whether
+the rail was already on before the vote.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -257,7 +257,7 @@
+  * IRQ low, so a powered part out of reset holds it high, and an unpowered or
+  * reset one leaves the pull-down in charge.
+  */
+-static int mondrian_rpmh_ldo2(void);
++static int mondrian_rpmh_rail(const char *name, uint32_t mv);
+ static vm_offset_t mondrian_touch_reset_page, mondrian_touch_avdd_page,
+     mondrian_touch_irq_page;
+ static int mondrian_rpmh_read(uint32_t addr, uint32_t *out);
+@@ -295,7 +295,9 @@
+ 	 */
+ 	printf("MONDRIAN TOUCH: power: voting iovdd (ldoc2)\n");
+ 	mondrian_log_flush_now();
+-	(void)mondrian_rpmh_ldo2();
++	(void)mondrian_rpmh_rail("ldoc2", 1800);
++	/* L7C (3.0 V) is the likely feed of the AVDD switch on gpio71. */
++	(void)mondrian_rpmh_rail("ldoc7", 3000);
+ 	delay(3000);
+ 
+ 	mondrian_tlmm_output(avdd_page, 0, MONDRIAN_TLMM_DRIVE_2MA, 1);
+@@ -481,17 +483,20 @@
+  * value is the PMIC5 LDO one, not the DT's RPMH mode: HPM is 7.
+  */
+ static int
+-mondrian_rpmh_ldo2(void)
++mondrian_rpmh_rail(const char *name, uint32_t mv)
+ {
+ 	static const uint32_t reg[3] = { 0x0, 0x4, 0x8 };
+-	static const uint32_t val[3] = { 1800, 1, 7 };
++	uint32_t val[3];
+ 	vm_offset_t rsc;
+-	uint32_t addr = mondrian_cmd_db_addr("ldoc2");
++	uint32_t addr = mondrian_cmd_db_addr(name);
+ 	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
+ 	    MONDRIAN_CMD_MSGID_RESP;
+ 	uint32_t i, idle, ctrl;
+ 
++	val[0] = mv;
++	val[1] = 1;
++	val[2] = 7;
+ 	if (addr == 0) {
+ 		return -1;
+ 	}
+@@ -500,7 +505,7 @@
+ 		return -1;
+ 	}
+ 	idle = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE);
+-	printf("MONDRIAN TOUCH: rpmh tcs%u enable 0x%x status 0x%x\n",
++	printf("MONDRIAN TOUCH: %s tcs%u enable 0x%x status 0x%x\n", name,
+ 	    MONDRIAN_RSC_ACTIVE_TCS, idle,
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS));
+ 	mondrian_log_flush_now();
+@@ -549,10 +554,10 @@
+ 	    mondrian_tlmm_read(rsc, base + 2 * MONDRIAN_RSC_CMD_STEP + MONDRIAN_RSC_CMD_STATUS));
+ 	mondrian_log_flush_now();
+ 	{
+-		uint32_t val = 0;
++		uint32_t v = 0;
+ 
+-		(void)mondrian_rpmh_read(addr + 0x4, &val);
+-		(void)mondrian_rpmh_read(addr + 0x0, &val);
++		(void)mondrian_rpmh_read(addr + 0x4, &v);
++		(void)mondrian_rpmh_read(addr + 0x0, &v);
+ 	}
+ 	return 0;
+ }
