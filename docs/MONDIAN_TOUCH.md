@@ -88,6 +88,12 @@ address the VRM has +0x0 voltage in **millivolts** (`DIV_ROUND_UP(uV, 1000)` in
 the vendor driver, so 1800), +0x4 enable (1) and +0x8 mode (PMIC5 LDO HPM is
 **7**, not the DT's RPMH mode 4).
 
+The vote must go to an **ACTIVE** TCS. `qcom,tcs-config` is `<WAKE 3, ACTIVE 2,
+SLEEP 2, CONTROL 0, FAST 1>` and the driver assigns offsets in that order, so
+TCS 0-2 are WAKE and the first ACTIVE TCS is **3** (`0xd00 + 3*672`). A command
+left in a WAKE TCS is applied when the AP votes for sleep, which never
+happens here, so the rail never moves.
+
 The RSC is the **2.7** layout: TCS 672 bytes, commands 20 apart, `CONTROL`
 0x14, `STATUS` 0x18, `CMD_ENABLE` 0x1C, `CMD_MSGID` 0x30, `ADDR` 0x34, `DATA`
 0x38, `CMD_STATUS` 0x3C, `RESP_DATA` 0x40. Mainline's 3.0 offsets (stride 24,
