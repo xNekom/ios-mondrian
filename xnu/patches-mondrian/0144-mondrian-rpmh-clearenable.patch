@@ -1,0 +1,25 @@
+xnu 0144: clear the TCS enable bits before a second vote
+
+The ldoc7 vote never ran: the ldoc2 vote left CMD_ENABLE at 1 (the driver
+clears those bits itself, the hardware does not), so the second rail saw the
+TCS busy and bailed out. Clear the bits and reuse the TCS.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -509,9 +509,14 @@
+ 	    MONDRIAN_RSC_ACTIVE_TCS, idle,
+ 	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS));
+ 	mondrian_log_flush_now();
++	/*
++	 * The enable bits stay set after a transfer (the driver clears them,
++	 * the hardware does not), so a second vote would see the TCS busy and
++	 * bail out. Clear them and reuse the TCS.
++	 */
+ 	if (idle != 0) {
+-		printf("MONDRIAN TOUCH: rpmh tcs0 busy, not voting\n");
+-		return -1;
++		mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0);
++		__builtin_arm_dsb(0xf);
+ 	}
+ 	for (i = 0; i < 3; i++) {
+ 		mondrian_tlmm_write(rsc, base + i * MONDRIAN_RSC_CMD_STEP +
