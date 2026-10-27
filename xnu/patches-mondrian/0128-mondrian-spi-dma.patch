@@ -1,0 +1,238 @@
+xnu 0128: SPI through the SE DMA engine, because FIFO is disabled
+
+0126 measured GENI_IF_DISABLE_RO = 1: this SE has the FIFO interface off, so
+a FIFO command stays active for ever (GENI_STATUS bit 0 set, no error, empty
+FIFOs). Move the transfer to the SE's own DMA: one contiguous page, TX at
+offset 0 and RX at 64, physical address from pmap_find_phys, cache clean and
+invalidate around the transfer, SE_DMA_TX/RX pointer/length/attr registers,
+DMA mode, then the same TX/RX command.
+
+The probe now does the two product-id framings directly (the loopback said
+nothing on a master whose MOSI is not wired to MISO) and prints the DMA
+status words next to the command status.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -22,8 +22,15 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ 
++/* osfmk/vm/pmap.h: not exported to the BSD layer */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -103,6 +110,23 @@
+ #define MONDRIAN_SE_GENI_RX_FIFO	0x780
+ #define MONDRIAN_SE_GENI_TX_FIFO_STS	0x800
+ #define MONDRIAN_SE_GENI_RX_FIFO_STS	0x804
++
++#define MONDRIAN_SE_DMA_TX_PTR_L	0xc30
++#define MONDRIAN_SE_DMA_TX_PTR_H	0xc34
++#define MONDRIAN_SE_DMA_TX_ATTR		0xc38
++#define MONDRIAN_SE_DMA_TX_LEN		0xc3c
++#define MONDRIAN_SE_DMA_TX_IRQ_STAT	0xc40
++#define MONDRIAN_SE_DMA_TX_IRQ_CLR	0xc44
++#define MONDRIAN_SE_DMA_TX_IRQ_EN_SET	0xc4c
++#define MONDRIAN_SE_DMA_RX_PTR_L	0xd30
++#define MONDRIAN_SE_DMA_RX_PTR_H	0xd34
++#define MONDRIAN_SE_DMA_RX_ATTR		0xd38
++#define MONDRIAN_SE_DMA_RX_LEN		0xd3c
++#define MONDRIAN_SE_DMA_RX_IRQ_STAT	0xd40
++#define MONDRIAN_SE_DMA_RX_IRQ_CLR	0xd44
++#define MONDRIAN_SE_DMA_RX_IRQ_EN_SET	0xd4c
++
++#define MONDRIAN_TOUCH_DMA_RX_OFF	64
+ 
+ #define MONDRIAN_SE_SPI_CPHA		0x224
+ #define MONDRIAN_SE_SPI_LOOPBACK	0x22c
+@@ -358,62 +382,85 @@
+ }
+ 
+ /*
+- * One polled SPI transfer: CS asserted, the TX words pushed into the FIFO,
+- * the TX/RX command, wait for the engine, drain the RX FIFO. Returns the
+- * IRQ status word, or -1 if the command never completed.
++ * One SPI transfer through the SE's own DMA engine. This SE has the FIFO
++ * interface disabled (GENI_IF_DISABLE_RO = 1, measured on 0126); a FIFO
++ * command stays active for ever, so the bytes have to come from a DMA
++ * buffer. TX buffer at offset 0 of the page, RX at 64.
+  */
+ static int
+ mondrian_spi_xfer(vm_offset_t se, const uint8_t *tx, uint32_t txlen,
+     uint8_t *rx, uint32_t rxlen)
+ {
+-	uint32_t i, j, word, tw = (txlen + 3) / 4, rw = (rxlen + 3) / 4;
++	uint64_t txpa = mondrian_touch_dma_pa;
++	uint64_t rxpa = mondrian_touch_dma_pa + MONDRIAN_TOUCH_DMA_RX_OFF;
+ 	int st;
+ 
++	if (mondrian_touch_dma == 0) {
++		return -1;
++	}
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_DMA_MODE_EN, 1);
++	if (txlen) {
++		memcpy((void *)mondrian_touch_dma, tx, txlen);
++		flush_dcache64(txpa, txlen, TRUE);
++		mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TX_TRANS_LEN, (txlen + 3) / 4);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_IRQ_EN_SET, 0x7u);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_PTR_L, (uint32_t)txpa);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_PTR_H, (uint32_t)(txpa >> 32));
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_ATTR, 1);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_TX_LEN, txlen);
++	}
++	if (rxlen) {
++		flush_dcache64(rxpa, rxlen, TRUE);
++		mondrian_tlmm_write(se, MONDRIAN_SE_SPI_RX_TRANS_LEN, (rxlen + 3) / 4);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_IRQ_EN_SET, 0x7u);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_PTR_L, (uint32_t)rxpa);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_PTR_H, (uint32_t)(rxpa >> 32));
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_ATTR, 1);
++		mondrian_tlmm_write(se, MONDRIAN_SE_DMA_RX_LEN, rxlen);
++	}
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+-	/*
+-	 * In master mode the engine asserts CS itself for the TX/RX command
+-	 * (mainline never issues CS_ASSERT/DEASSERT here); sending them first
+-	 * leaves the engine waiting and the first transfer never completes.
+-	 */
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_TX_TRANS_LEN, tw);
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_RX_TRANS_LEN, rw);
+ 	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD0, MONDRIAN_SPI_TX_RX);
+-	for (i = 0; i < tw; i++) {
+-		word = 0;
+-		for (j = 0; j < 4 && i * 4 + j < txlen; j++) {
+-			word |= (uint32_t)tx[i * 4 + j] << (8 * j);
+-		}
+-		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_TX_FIFO, word);
+-	}
+-
+-	printf("MONDRIAN TOUCH: spi: cmd->status 0x%x cmd0 0x%x\n",
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+-	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD0));
+-	mondrian_log_flush_now();
+ 	st = mondrian_spi_wait_done(se, 2000000);
+ 	if (st < 0 || (st & (MONDRIAN_M_CMD_FAILURE | MONDRIAN_M_CMD_ABORT))) {
+-		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2); /* abort */
+-	} else {
+-		uint32_t have = mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS);
+-		uint32_t words = have & 0x0fffffffu;
+-
+-		if (words < rw) {
+-			rw = words;
+-		}
+-		for (i = 0; i < rw; i++) {
+-			word = mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO);
+-			for (j = 0; j < 4 && i * 4 + j < rxlen; j++) {
+-				rx[i * 4 + j] = (uint8_t)(word >> (8 * j));
+-			}
+-		}
++		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_M_CMD_CTRL, 2);
++	} else if (rxlen) {
++		flush_dcache64(rxpa, rxlen, TRUE);
++		memcpy(rx, (const void *)(mondrian_touch_dma + MONDRIAN_TOUCH_DMA_RX_OFF),
++		    rxlen);
+ 	}
+ 	return st;
+ }
+ 
++static vm_offset_t mondrian_touch_dma;
++static uint64_t mondrian_touch_dma_pa;
++
++static int
++mondrian_touch_dma_alloc(void)
++{
++	kern_return_t kr;
++	ppnum_t pn;
++
++	if (mondrian_touch_dma != 0) {
++		return 0;
++	}
++	kr = kmem_alloc_contig(kernel_map, &mondrian_touch_dma, PAGE_SIZE, PAGE_MASK,
++	    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)mondrian_touch_dma);
++	if (pn == 0) {
++		return ENOMEM;
++	}
++	mondrian_touch_dma_pa = ptoa_64(pn);
++	return 0;
++}
++
+ static void
+ mondrian_touch_spi_probe(vm_offset_t se)
+ {
+-	static const uint8_t echo[4] = { 0x12, 0x34, 0x56, 0x78 };
+ 	/* The two common Goodix SPI framings for a register read. */
+ 	static const uint8_t id_a[3] = { 0x20, 0x81, 0x40 };
+ 	static const uint8_t id_b[2] = { 0x81, 0x40 };
+@@ -480,44 +527,29 @@
+ 	mondrian_log_flush_now();
+ 
+ 	/*
+-	 * The engine only starts when GENI_CLK_SEL names the DFS level the RCG
+-	 * is running at: the SE clock's rate table for the XO is
+-	 * 7.37M/14.7M/19.2M/..., so 19.2 MHz is level 2. Try all three in one
+-	 * boot (the loopback does not depend on the part) and keep the one
+-	 * that completes.
++	 * The SE clock is the XO at 19.2 MHz, which is DFS level 2 of its rate
++	 * table (7.37M, 14.7M, 19.2M).
+ 	 */
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_LOOPBACK, 1);
+-	good = -1;
+-	for (i = 0; i < 3; i++) {
+-		mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, (uint32_t)i);
+-		st = mondrian_spi_xfer(se, echo, 4, rx, 4);
+-		printf("MONDRIAN TOUCH: spi: clk_sel %d loopback st 0x%x rx %02x %02x %02x %02x\n",
+-		    i, (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
+-		printf("MONDRIAN TOUCH: spi: sel %d st 0x%x irq 0x%x err 0x%x rxf 0x%x txf 0x%x\n",
+-		    i,
+-		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
+-		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
+-		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
+-		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_RX_FIFO_STS),
+-		    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_TX_FIFO_STS));
++	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, 2);
++	if (mondrian_touch_dma_alloc() != 0) {
++		printf("MONDRIAN TOUCH: spi: no dma buffer\n");
+ 		mondrian_log_flush_now();
+-		if (st >= 0 && (st & MONDRIAN_M_CMD_DONE)) {
+-			good = i;
+-			break;
+-		}
+-	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_SPI_LOOPBACK, 0);
+-	if (good < 0) {
+-		printf("MONDRIAN TOUCH: spi: no clock select started the engine\n");
+-		mondrian_log_flush_now();
+ 		return;
+ 	}
+-	mondrian_tlmm_write(se, MONDRIAN_SE_GENI_CLK_SEL, (uint32_t)good);
++	printf("MONDRIAN TOUCH: spi: dma pa 0x%llx\n",
++	    (unsigned long long)mondrian_touch_dma_pa);
++	mondrian_log_flush_now();
+ 
+ 	/* Register 0x8140, the product id, in the two framings. */
+ 	st = mondrian_spi_xfer(se, id_a, sizeof(id_a), rx, 4);
+ 	printf("MONDRIAN TOUCH: spi: id a st 0x%x rx %02x %02x %02x %02x\n",
+ 	    (unsigned)st, rx[0], rx[1], rx[2], rx[3]);
++	printf("MONDRIAN TOUCH: spi: a st 0x%x irq 0x%x err 0x%x dtx 0x%x drx 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_IRQ_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_GENI_M_CMD_ERR_STATUS),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_TX_IRQ_STAT),
++	    mondrian_tlmm_read(se, MONDRIAN_SE_DMA_RX_IRQ_STAT));
+ 	mondrian_log_flush_now();
+ 	st = mondrian_spi_xfer(se, id_b, sizeof(id_b), rx, 4);
+ 	printf("MONDRIAN TOUCH: spi: id b st 0x%x rx %02x %02x %02x %02x\n",
