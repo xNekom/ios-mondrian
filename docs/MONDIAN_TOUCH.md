@@ -66,9 +66,14 @@ mode 0, CS0, 1.2 MHz (XO 19.2 MHz / divider 16). Per transfer: CS assert
 `0x7f8fe`/`0xffefe` (`geni_se_config_packing(8, 4, true, true, true)`).
 
 The vendor touch driver is **not** in the MiCode OSS kernel (`mondrian-s-oss`
-only carries mainline's I2C Goodix), so the Goodix SPI framing is measured,
-not read: `0122` does an internal loopback and then tries the two common
-framings of the product-id read at `0x8140`.
+only carries mainline's I2C Goodix), but it ships in Android's `vendor_dlkm`
+as `goodix_core.ko` (mount it from recovery: `mount -t erofs
+/dev/block/by-name/vendor_dlkm /mnt/vd`). It is the **GT9916 (BerlinA)**
+driver: `goodix_spi_read` builds `0xF1` + 32-bit big-endian address + three
+dummy bytes in one `spi_sync`, and `brl_dev_confirm` echoes eight bytes at
+`0x10000`. `goodix_spi_read_bra` is the same with a nine-byte prefix.
+`brl_power_on` drives three GPIOs high (3/15/5 ms) and then writes 1 to
+`0xC900` (`brl_select_spi_mode`).
 
 ## The IOVDD rail, if the part is unpowered
 
@@ -77,9 +82,18 @@ RSC node is `rsc@17a00000` (drv-2), `qcom,tcs-offset = 0xd00`, TCS config
 WAKE 3 / ACTIVE 2 / SLEEP 2 / CONTROL 0 / FAST 1. The resource address comes
 from the AOP command DB (`aop_cmd_db_region@80860000`, 0x20000; entries are
 `{u8 id[8], u32 priority[2], u32 addr, u16 len, u16 offset}`, key `"ldoc2"`).
-Behind that address the VRM has +0x0 voltage in millivolts (bits 12-0), +0x4
-enable (bit 0) and +0x8 mode (bits 2-0); the DT's init is 1800 mV and mode 4.
-The port has no RPMh driver yet: this is the map for writing one.
+Measured with `0131`: the command DB answers `ldoc2` = `0x42c00`. Behind that
+address the VRM has +0x0 voltage in **millivolts** (`DIV_ROUND_UP(uV, 1000)` in
+the vendor driver, so 1800), +0x4 enable (1) and +0x8 mode (PMIC5 LDO HPM is
+**7**, not the DT's RPMH mode 4).
+
+The RSC is the **2.7** layout: TCS 672 bytes, commands 20 apart, `CONTROL`
+0x14, `STATUS` 0x18, `CMD_ENABLE` 0x1C, `CMD_MSGID` 0x30, `ADDR` 0x34, `DATA`
+0x38, `CMD_STATUS` 0x3C, `RESP_DATA` 0x40. Mainline's 3.0 offsets (stride 24,
+MSGID 0x34) write past every command: `CMD_ENABLE` at 0x2C reads zero, the
+completion poll passes instantly and nothing reaches the PMIC. The trigger is
+also not `CONTROL = 1`: clear TRIGGER (bit 24) and ENABLE (bit 16), write
+ENABLE, then ENABLE|TRIGGER.
 
 ## The layers, in the order they have to work
 
@@ -159,3 +173,9 @@ The port has no RPMh driver yet: this is the map for writing one.
 - **The VRM mode is the PMIC5 one**: 7 = HPM for an LDO, not the DT's RPMH
   mode 4. `CMD_MSGID_LEN` is 8 in rpmh-rsc, and the voltage register takes
   millivolts, not a selector index.
+- **The RSC layout is 2.7 on this SoC** (the vendor tree has no 3.0 table).
+  Using mainline's newer offsets fails silently: every write lands in the
+  wrong register and the TCS never triggers.
+- **The touch IC is a GT9916** (`goodix,gt9916`, "BerlinA"), not a
+  register-compatible gt9xx: the id register at `0x8140` may not exist, the
+  liveness test is the eight-byte echo at `0x10000`.
