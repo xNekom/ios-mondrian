@@ -1,0 +1,167 @@
+xnu 0118: take the date from the host boot arguments
+
+The PMK8350 RTC on this phone has never been set: it reads 467613 s, five
+days past the epoch, so iOS shows 31 December 1970. The port has no RTC
+driver either. Add bsd/dev/mondrian_clock.c: it reads
+`mondriantime=<seconds since 1970>` from the boot arguments, stamps
+mach_absolute_time() on the first call and lets the kernel clock advance from
+there. PEGetUTCTimeOfDay()/PESetUTCTimeOfDay() fall back to it when the
+platform expert has no time of its own (the base class returns 0), which is
+the call clock_initialize_calendar() makes at boot. Without the boot argument
+nothing changes.
+
+tools/phone-deploy.sh stamps the value into the command line at build time.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/mondrian_ufs.c			standard
+ bsd/dev/mondrian_sample.c		standard
++bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/mondrian_clock.c
++++ b/bsd/dev/mondrian_clock.c
+@@ -0,0 +1,95 @@
++/*
++ * MONDRIAN clock: the date comes from the host.
++ *
++ * The phone's only RTC is the PMK8350 one, and it has never been set: it
++ * reads 467613 s, i.e. five days past the epoch. Until the port reads and
++ * writes that RTC, take the time from the boot command line,
++ * `mondriantime=<seconds since 1970>`, stamp mach_absolute_time() on the
++ * first read and let the kernel clock advance from there. Without the boot
++ * argument nothing changes: the date stays at the epoch.
++ *
++ * PEGetUTCTimeOfDay()/PESetUTCTimeOfDay() call these when the platform
++ * expert has no clock of its own (iokit/Kernel/IOPlatformExpert.cpp).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <mach/clock_types.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern uint64_t ml_get_timebase(void);
++
++static uint64_t mondrian_utc_epoch;     /* 0 = no mondriantime argument */
++static uint64_t mondrian_utc_ticks;     /* mach_absolute_time() when armed */
++static uint64_t mondrian_utc_hz;        /* timebase; never 0 once armed */
++
++static void
++mondrian_utc_arm(void)
++{
++	uint64_t v = 0;
++
++	if (mondrian_utc_hz == 0) {
++		mondrian_utc_hz = ml_get_timebase();
++		if (mondrian_utc_hz == 0) {
++			mondrian_utc_hz = 1;
++		}
++	}
++	if (mondrian_utc_epoch != 0) {
++		return;
++	}
++	/*
++	 * PE_parse_boot_argn parses the value as a number into the destination
++	 * (argnumcpy), it does not copy the string: pass a uint64_t, not a
++	 * char buffer. Keep trying on every call: the first PEGetUTCTimeOfDay
++	 * can happen before the argument is reachable.
++	 */
++	if (!PE_parse_boot_argn("mondriantime", &v, sizeof(v)) || v == 0) {
++		return;
++	}
++	mondrian_utc_epoch = v;
++	mondrian_utc_ticks = mach_absolute_time();
++}
++
++static uint64_t
++mondrian_utc_elapsed_ns(void)
++{
++	uint64_t ticks = mach_absolute_time() - mondrian_utc_ticks;
++	uint64_t hz = mondrian_utc_hz;
++
++	return (ticks / hz) * NSEC_PER_SEC + ((ticks % hz) * NSEC_PER_SEC) / hz;
++}
++
++int
++mondrian_pe_get_utc(clock_sec_t *secs, clock_usec_t *usecs)
++{
++	uint64_t ns;
++
++	mondrian_utc_arm();
++	if (mondrian_utc_epoch == 0) {
++		return 0;
++	}
++	ns = mondrian_utc_elapsed_ns();
++	*secs = (clock_sec_t)(mondrian_utc_epoch + ns / NSEC_PER_SEC);
++	*usecs = (clock_usec_t)((ns % NSEC_PER_SEC) / NSEC_PER_USEC);
++	return 1;
++}
++
++int
++mondrian_pe_set_utc(clock_sec_t secs, clock_usec_t usecs)
++{
++	uint64_t elapsed;
++
++	mondrian_utc_arm();
++	if (mondrian_utc_epoch == 0) {
++		/* Not armed yet: start counting from the caller's time now. */
++		mondrian_utc_ticks = mach_absolute_time();
++	}
++	elapsed = mondrian_utc_elapsed_ns() / NSEC_PER_SEC;
++	if ((uint64_t)secs < elapsed) {
++		return 0;
++	}
++	mondrian_utc_epoch = (uint64_t)secs - elapsed;
++	(void)usecs;
++	return 1;
++}
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1357,6 +1357,14 @@
+ 	PESetUTCTimeOfDay(secs, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++/* bsd/dev/mondrian_clock.c: host-supplied time, for a board with no RTC. */
++extern "C" {
++int mondrian_pe_get_utc(clock_sec_t *, clock_usec_t *);
++int mondrian_pe_set_utc(clock_sec_t, clock_usec_t);
++}
++#endif
++
+ void
+ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ {
+@@ -1366,7 +1374,17 @@
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	if (*secs == 0) {
++		clock_usec_t usec = 0;
+ 
++		if (mondrian_pe_get_utc(secs, &usec)) {
++			*usecs = usec;
++			return;
++		}
++	}
++#endif
++
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;
+ }
+@@ -1378,6 +1396,9 @@
+ 	if (gIOPlatform) {
+ 		gIOPlatform->setUTCTimeOfDay(secs, usecs * NSEC_PER_USEC);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	mondrian_pe_set_utc(secs, usecs);
++#endif
+ }
+ 
+ coprocessor_type_t

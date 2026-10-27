@@ -1,0 +1,139 @@
+xnu 0120: turn the QUPv3 clocks on and read the serial engine
+
+The touch SPI is SE4 of QUPv3 wrapper 0 (0x990000, inside the wrapper at
+0x9c0000). This patch maps GCC over the window the branch registers need
+(0x70000, not the one page the UFS clock path maps), enables the four wrap
+clocks and the SE4 branch in one write to GCC 0x62008 (bits 6, 7, 8, 9 and
+14), roots the SE clock on the XO (19.2 MHz, source 0, divider 1) when the
+bootloader left it off, and reads the identities: QUPV3_HW_VER,
+GENI_INIT_CFG_REVISION, CGC_CTRL, CLK_CTRL_RO and FW_REVISION.
+
+No transfer yet: this is the clock and register-window milestone, and every
+read is flushed first so a stalled bus leaves the last line on disk.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -44,6 +44,30 @@
+ /* bsd/dev/mondrian_ufs.c: put the ring on the disk now. */
+ extern void mondrian_log_flush_now(void);
+ 
++/*
++ * QUPv3: the SPI's serial engine (SE4) lives in wrapper 0. The AHB clocks and
++ * the SE branch are bits of one GCC register; the SE's own clock comes from
++ * the RCG at 0x274e4 (CMD) / 0x274e8 (CFG), whose bit 31 says whether the
++ * root is off.
++ */
++#define MONDRIAN_GCC_BASE		0x00100000UL
++#define MONDRIAN_GCC_QUPV3_WRAP0_CBCR	0x62008
++#define MONDRIAN_GCC_SE4_CMD_RCGR	0x274e4
++#define MONDRIAN_GCC_SE4_CFG_RCGR	0x274e8
++#define MONDRIAN_GCC_RCG_ROOT_OFF	(1u << 31)
++#define MONDRIAN_GCC_RCG_ROOT_EN	(1u << 1)
++#define MONDRIAN_GCC_RCG_UPDATE		(1u << 0)
++
++#define MONDRIAN_QUPV3_WRAP0_BASE	0x009c0000UL
++#define MONDRIAN_SPI_SE4_BASE		0x00990000UL
++
++#define MONDRIAN_QUPV3_HW_VER		0x4
++
++#define MONDRIAN_SE_INIT_CFG_REV	0x0
++#define MONDRIAN_SE_CGC_CTRL		0x28
++#define MONDRIAN_SE_CLK_CTRL_RO		0x60
++#define MONDRIAN_SE_FW_REV		0x1000
++
+ #define MONDRIAN_TOUCH_RESET_GPIO	20
+ #define MONDRIAN_TOUCH_IRQ_GPIO		21
+ #define MONDRIAN_TOUCH_AVDD_GPIO	71
+@@ -173,6 +197,86 @@
+ 	mondrian_log_flush_now();
+ }
+ 
++/*
++ * Turn the QUPv3 clocks on and read the SE's identity. No transfer yet: this
++ * is the milestone that proves the clock gate, the register window and which
++ * GENI firmware the SE runs, without risking a stalled bus.
++ */
++static void
++mondrian_touch_geni_probe(void)
++{
++	vm_offset_t gcc, wrap, se;
++	uint32_t cbc, cmd, cfg;
++	int i;
++
++	printf("MONDRIAN TOUCH: geni: mapping gcc/wrapper/se\n");
++	mondrian_log_flush_now();
++	gcc = ml_io_map(MONDRIAN_GCC_BASE, 0x70000);
++	wrap = ml_io_map(MONDRIAN_QUPV3_WRAP0_BASE, 0x2000);
++	se = ml_io_map(MONDRIAN_SPI_SE4_BASE, 0x4000);
++	if (gcc == 0 || wrap == 0 || se == 0) {
++		printf("MONDRIAN TOUCH: geni: cannot map gcc 0x%lx wrap 0x%lx se 0x%lx\n",
++		    (unsigned long)gcc, (unsigned long)wrap, (unsigned long)se);
++		mondrian_log_flush_now();
++		return;
++	}
++
++	cbc = mondrian_tlmm_read(gcc, MONDRIAN_GCC_QUPV3_WRAP0_CBCR);
++	cmd = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR);
++	cfg = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR);
++	printf("MONDRIAN TOUCH: geni: gcc cbc 0x%x se4 cmd 0x%x cfg 0x%x\n",
++	    cbc, cmd, cfg);
++	mondrian_log_flush_now();
++
++	/* m-ahb (6), s-ahb (7), wrap core (8), core 2x (9), SE4 (14). */
++	mondrian_tlmm_write(gcc, MONDRIAN_GCC_QUPV3_WRAP0_CBCR,
++	    cbc | (1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14));
++	delay(1000);
++	printf("MONDRIAN TOUCH: geni: gcc cbc now 0x%x\n",
++	    mondrian_tlmm_read(gcc, MONDRIAN_GCC_QUPV3_WRAP0_CBCR));
++	mondrian_log_flush_now();
++
++	/* No SE clock root yet: pick the XO (19.2 MHz, source 0) with div 1. */
++	if (mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR) & MONDRIAN_GCC_RCG_ROOT_OFF) {
++		cfg = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR);
++		cfg &= ~0x1fu;          /* divider */
++		cfg &= ~0x700u;         /* source select */
++		mondrian_tlmm_write(gcc, MONDRIAN_GCC_SE4_CFG_RCGR, cfg);
++		mondrian_tlmm_write(gcc, MONDRIAN_GCC_SE4_CMD_RCGR, MONDRIAN_GCC_RCG_UPDATE);
++		for (i = 0; i < 1000; i++) {
++			if (!(mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR) &
++			    MONDRIAN_GCC_RCG_UPDATE)) {
++				break;
++			}
++		}
++		cmd = mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR);
++		mondrian_tlmm_write(gcc, MONDRIAN_GCC_SE4_CMD_RCGR,
++		    cmd | MONDRIAN_GCC_RCG_ROOT_EN);
++		delay(1000);
++		printf("MONDRIAN TOUCH: geni: se4 clock was off, cmd now 0x%x cfg 0x%x\n",
++		    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CMD_RCGR),
++		    mondrian_tlmm_read(gcc, MONDRIAN_GCC_SE4_CFG_RCGR));
++		mondrian_log_flush_now();
++	}
++
++	printf("MONDRIAN TOUCH: geni: wrapper hw ver 0x%x\n",
++	    mondrian_tlmm_read(wrap, MONDRIAN_QUPV3_HW_VER));
++	mondrian_log_flush_now();
++	/* One line per read: if the bus stalls, the next line is the culprit. */
++	printf("MONDRIAN TOUCH: geni: se init 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_INIT_CFG_REV));
++	mondrian_log_flush_now();
++	printf("MONDRIAN TOUCH: geni: se cgc 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_CGC_CTRL));
++	mondrian_log_flush_now();
++	printf("MONDRIAN TOUCH: geni: se clk 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_CLK_CTRL_RO));
++	mondrian_log_flush_now();
++	printf("MONDRIAN TOUCH: geni: se fw 0x%x\n",
++	    mondrian_tlmm_read(se, MONDRIAN_SE_FW_REV));
++	mondrian_log_flush_now();
++}
++
+ void
+ mondrian_touch_probe(void)
+ {
+@@ -183,4 +287,5 @@
+ 	mondrian_touch_pin("irq", MONDRIAN_TOUCH_IRQ_GPIO);
+ 	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
+ 	mondrian_touch_power();
++	mondrian_touch_geni_probe();
+ }

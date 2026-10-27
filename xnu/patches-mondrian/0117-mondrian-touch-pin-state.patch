@@ -1,0 +1,134 @@
+xnu 0117: read the touch pins the bootloader left
+
+The panel's touch part is a Goodix on QUPv3 SE4, with reset on TLMM GPIO20,
+IRQ on GPIO21 and AVDD enable on GPIO71; its IOVDD is the RPMh rail
+pm8350c_l2. Driving any of that needs the TLMM first, so start by reading:
+the probe prints CFG/IN_OUT/INTR_CFG/INTR_STATUS for the three pins once the
+log thread is running, one single-page mapping per pin (an 18 MB ml_io_map
+has failed on this board), with a ring flush before each read so a fault
+leaves the last line on disk.
+
+The pin registers are at 0x0f100000 + 0x1000*n, not at the 0x0f000000 of the
+live tree's pinctrl node: that node's 16 MB region starts with a 1 MB hole,
+and reading 0x0f014000 wedges the interconnect (no abort, no more timer
+interrupts, watchdog reset). Mainline's pinctrl-sm8450 uses 0x0f100000.
+
+Reading only is deliberate: it says how the bootloader left the pins and
+whether the rail is up before anything writes to the PMIC or the pads.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/mondrian_ufs.c			standard
+ bsd/dev/mondrian_sample.c		standard
++bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1483,6 +1483,16 @@
+ 		printf("MONDRIAN LOG: writer thread started\n");
+ 	} else {
+ 		printf("MONDRIAN LOG: writer thread start failed (%d)\n", kr);
++	}
++
++	/*
++	 * Only now: the ring is armed, and the probe flushes after every line,
++	 * so a fault or a hang in the TLMM read leaves the last one on disk.
++	 */
++	{
++		extern void mondrian_touch_probe(void);
++
++		mondrian_touch_probe();
+ 	}
+ }
+ 
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -0,0 +1,84 @@
++/*
++ * MONDRIAN touch: the digitizer's pins, as the bootloader left them.
++ *
++ * The panel's touch part is a Goodix on QUPv3 SE4 (spi@990000), wired with
++ * reset on TLMM GPIO20, IRQ on GPIO21 and AVDD enable on GPIO71; its IOVDD is
++ * the RPMh rail pm8350c_l2. This file starts with reads only: it prints the
++ * TLMM registers of those three pins so that the next step (driving the rail,
++ * the reset and the pins) starts from measured state instead of a guess.
++ *
++ * TLMM register layout (mainline pinctrl-msm, sm8450): GPIO_CFG(n) at
++ * 0x1000 * n from the pin base, then IN_OUT, INTR_CFG and INTR_STATUS.
++ * CFG bits: 0-1 pull, 2-4 function (0 = gpio), 6-8 drive, 9 output enable.
++ * IN_OUT: bit 0 is the pin level, bit 1 the output value.
++ *
++ * The pin base is 0x0f100000, NOT the 0x0f000000 of the live tree's
++ * pinctrl@f000000 node: that node declares a 16 MB region whose first
++ * megabyte is a hole (mainline calls the pin block 0x0f100000). Reading
++ * 0x0f014000 for GPIO20 wedges the interconnect: no abort, no more
++ * interrupts, and the phone resets on the watchdog.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define MONDRIAN_TLMM_BASE	0x0f100000UL
++
++#define MONDRIAN_TLMM_CFG		0x0
++#define MONDRIAN_TLMM_IN_OUT		0x4
++#define MONDRIAN_TLMM_INTR_CFG		0x8
++#define MONDRIAN_TLMM_INTR_STATUS	0xc
++
++/* bsd/dev/mondrian_ufs.c: put the ring on the disk now. */
++extern void mondrian_log_flush_now(void);
++
++#define MONDRIAN_TOUCH_RESET_GPIO	20
++#define MONDRIAN_TOUCH_IRQ_GPIO		21
++#define MONDRIAN_TOUCH_AVDD_GPIO	71
++
++static uint32_t
++mondrian_tlmm_read(vm_offset_t page, uint32_t off)
++{
++	return *(volatile uint32_t *)(page + off);
++}
++
++static void
++mondrian_touch_pin(const char *name, uint32_t pin)
++{
++	vm_offset_t page;
++
++	/* One line and one flush before each risky step: a bad TLMM address
++	 * aborts and takes the console with it. */
++	printf("MONDRIAN TOUCH: mapping %s gpio%u page 0x%lx\n", name, pin,
++	    (unsigned long)(MONDRIAN_TLMM_BASE + 0x1000UL * pin));
++	mondrian_log_flush_now();
++	page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * pin, 0x1000);
++	if (page == 0) {
++		printf("MONDRIAN TOUCH: %s gpio%u: cannot map its TLMM page\n", name, pin);
++		mondrian_log_flush_now();
++		return;
++	}
++	printf("MONDRIAN TOUCH: %s gpio%u at 0x%lx, reading\n", name, pin, (unsigned long)page);
++	mondrian_log_flush_now();
++	printf("MONDRIAN TOUCH: %s gpio%u cfg 0x%x io 0x%x intr 0x%x/%x\n",
++	    name, pin,
++	    mondrian_tlmm_read(page, MONDRIAN_TLMM_CFG),
++	    mondrian_tlmm_read(page, MONDRIAN_TLMM_IN_OUT),
++	    mondrian_tlmm_read(page, MONDRIAN_TLMM_INTR_CFG),
++	    mondrian_tlmm_read(page, MONDRIAN_TLMM_INTR_STATUS));
++	mondrian_log_flush_now();
++}
++
++void
++mondrian_touch_probe(void)
++{
++	printf("MONDRIAN TOUCH: TLMM at 0x%lx, reset/irq/avdd pins\n",
++	    (unsigned long)MONDRIAN_TLMM_BASE);
++	mondrian_log_flush_now();
++	mondrian_touch_pin("reset", MONDRIAN_TOUCH_RESET_GPIO);
++	mondrian_touch_pin("irq", MONDRIAN_TOUCH_IRQ_GPIO);
++	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
++}

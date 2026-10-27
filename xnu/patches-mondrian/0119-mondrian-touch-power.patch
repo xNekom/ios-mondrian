@@ -1,0 +1,187 @@
+xnu 0119: power the touch part and ask it to answer
+
+0117 read the three TLMM pads the bootloader leaves alone: GPIO20 (reset),
+GPIO21 (IRQ) and GPIO71 (AVDD) all come up as function 0, pull-down, input,
+level low. This patch drives them: AVDD on, reset held low while the rail
+settles, then released; the IRQ pad stays an input.
+
+Two reads of that pad make the answer unambiguous. With a pull-down, an
+unpowered part leaves the line high-Z (reads low) and a powered one either
+asserts IRQ (low, since the Goodix asserts low) or drives it high; with a
+pull-up, an unpowered part reads high while a part driving low still reads
+low. The pair separates "no power" from "powered". The pad keeps the
+vendor's active pull-up afterwards.
+
+The delays (10 ms with reset asserted, 50 ms for the part to boot) are the
+vendor driver's numbers.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1,15 +1,16 @@
+ /*
+- * MONDRIAN touch: the digitizer's pins, as the bootloader left them.
++ * MONDRIAN touch: the digitizer's pins.
+  *
+  * The panel's touch part is a Goodix on QUPv3 SE4 (spi@990000), wired with
+  * reset on TLMM GPIO20, IRQ on GPIO21 and AVDD enable on GPIO71; its IOVDD is
+- * the RPMh rail pm8350c_l2. This file starts with reads only: it prints the
+- * TLMM registers of those three pins so that the next step (driving the rail,
+- * the reset and the pins) starts from measured state instead of a guess.
++ * the RPMh rail pm8350c_l2. The bootloader leaves all three pins in the reset
++ * state (GPIO function, pull down, input), so this file first prints the
++ * state it found, then powers the part up and reports whether it answers.
+  *
+  * TLMM register layout (mainline pinctrl-msm, sm8450): GPIO_CFG(n) at
+  * 0x1000 * n from the pin base, then IN_OUT, INTR_CFG and INTR_STATUS.
+- * CFG bits: 0-1 pull, 2-4 function (0 = gpio), 6-8 drive, 9 output enable.
++ * CFG bits: 0-1 pull (0 none, 1 down, 2 keeper, 3 up), 2-4 function (0 = gpio),
++ * 6-8 drive (0 = 2 mA, 3 = 8 mA), 9 output enable.
+  * IN_OUT: bit 0 is the pin level, bit 1 the output value.
+  *
+  * The pin base is 0x0f100000, NOT the 0x0f000000 of the live tree's
+@@ -20,6 +21,7 @@
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ 
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -32,6 +34,13 @@
+ #define MONDRIAN_TLMM_INTR_CFG		0x8
+ #define MONDRIAN_TLMM_INTR_STATUS	0xc
+ 
++#define MONDRIAN_TLMM_PULL_NONE		0
++#define MONDRIAN_TLMM_PULL_DOWN		1
++#define MONDRIAN_TLMM_PULL_UP		3
++
++#define MONDRIAN_TLMM_DRIVE_2MA		0
++#define MONDRIAN_TLMM_DRIVE_8MA		3
++
+ /* bsd/dev/mondrian_ufs.c: put the ring on the disk now. */
+ extern void mondrian_log_flush_now(void);
+ 
+@@ -42,16 +51,43 @@
+ static uint32_t
+ mondrian_tlmm_read(vm_offset_t page, uint32_t off)
+ {
+-	return *(volatile uint32_t *)(page + off);
++	uint32_t value;
++
++	value = *(volatile uint32_t *)(page + off);
++	__builtin_arm_dsb(0xf);
++	return value;
+ }
+ 
+ static void
++mondrian_tlmm_write(vm_offset_t page, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(page + off) = value;
++	__builtin_arm_dsb(0xf);
++}
++
++static uint32_t
++mondrian_tlmm_cfg(uint32_t function, uint32_t pull, uint32_t drive, int output)
++{
++	return (function << 2) | pull | (drive << 6) | (output ? (1u << 9) : 0);
++}
++
++/* Set the pad's output value, then its configuration (so enabling the output
++ * does not drive the old value for a moment). */
++static void
++mondrian_tlmm_output(vm_offset_t page, uint32_t function, uint32_t drive, int level)
++{
++	mondrian_tlmm_write(page, MONDRIAN_TLMM_IN_OUT, level ? 2 : 0);
++	mondrian_tlmm_write(page, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(function, MONDRIAN_TLMM_PULL_NONE, drive, 1));
++}
++
++static void
+ mondrian_touch_pin(const char *name, uint32_t pin)
+ {
+ 	vm_offset_t page;
+ 
+ 	/* One line and one flush before each risky step: a bad TLMM address
+-	 * aborts and takes the console with it. */
++	 * wedges the interconnect and takes the console with it. */
+ 	printf("MONDRIAN TOUCH: mapping %s gpio%u page 0x%lx\n", name, pin,
+ 	    (unsigned long)(MONDRIAN_TLMM_BASE + 0x1000UL * pin));
+ 	mondrian_log_flush_now();
+@@ -72,6 +108,71 @@
+ 	mondrian_log_flush_now();
+ }
+ 
++/*
++ * Power the part and see whether it answers. AVDD first, reset held low while
++ * it settles, then released; the IRQ pad is left as an input with a pull-down
++ * so its level says whether the part is driving the line: the Goodix asserts
++ * IRQ low, so a powered part out of reset holds it high, and an unpowered or
++ * reset one leaves the pull-down in charge.
++ */
++static void
++mondrian_touch_power(void)
++{
++	vm_offset_t reset_page, irq_page, avdd_page;
++	uint32_t level;
++
++	reset_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_RESET_GPIO, 0x1000);
++	irq_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_IRQ_GPIO, 0x1000);
++	avdd_page = ml_io_map(MONDRIAN_TLMM_BASE + 0x1000UL * MONDRIAN_TOUCH_AVDD_GPIO, 0x1000);
++	if (reset_page == 0 || irq_page == 0 || avdd_page == 0) {
++		printf("MONDRIAN TOUCH: power: cannot map the pins\n");
++		mondrian_log_flush_now();
++		return;
++	}
++
++	printf("MONDRIAN TOUCH: power: avdd on, reset low, irq pull-down\n");
++	mondrian_log_flush_now();
++
++	mondrian_tlmm_output(avdd_page, 0, MONDRIAN_TLMM_DRIVE_2MA, 1);
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
++	mondrian_tlmm_write(irq_page, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_DOWN, MONDRIAN_TLMM_DRIVE_2MA, 0));
++
++	delay(10000);   /* AVDD settles while the part is held in reset */
++
++	printf("MONDRIAN TOUCH: power: releasing reset\n");
++	mondrian_log_flush_now();
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
++
++	delay(50000);   /* Goodix boot time */
++
++	printf("MONDRIAN TOUCH: power: avdd cfg 0x%x io 0x%x, reset cfg 0x%x io 0x%x\n",
++	    mondrian_tlmm_read(avdd_page, MONDRIAN_TLMM_CFG),
++	    mondrian_tlmm_read(avdd_page, MONDRIAN_TLMM_IN_OUT),
++	    mondrian_tlmm_read(reset_page, MONDRIAN_TLMM_CFG),
++	    mondrian_tlmm_read(reset_page, MONDRIAN_TLMM_IN_OUT));
++	level = mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT) & 1;
++	printf("MONDRIAN TOUCH: power: irq cfg 0x%x io 0x%x level %u\n",
++	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_CFG),
++	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT), level);
++	mondrian_log_flush_now();
++
++	/*
++	 * The pull-down alone cannot tell an unpowered part (line high-Z, reads
++	 * low) from a powered one asserting IRQ (also low). Repeat with a
++	 * pull-up: unpowered reads high, driven low stays low, driven high stays
++	 * high. Leave the vendor's active pull-up in place.
++	 */
++	mondrian_tlmm_write(irq_page, MONDRIAN_TLMM_CFG,
++	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
++	delay(1000);
++	printf("MONDRIAN TOUCH: power: irq pull-up cfg 0x%x io 0x%x level %u\n",
++	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_CFG),
++	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT),
++	    mondrian_tlmm_read(irq_page, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_log_flush_now();
++}
++
+ void
+ mondrian_touch_probe(void)
+ {
+@@ -81,4 +182,5 @@
+ 	mondrian_touch_pin("reset", MONDRIAN_TOUCH_RESET_GPIO);
+ 	mondrian_touch_pin("irq", MONDRIAN_TOUCH_IRQ_GPIO);
+ 	mondrian_touch_pin("avdd", MONDRIAN_TOUCH_AVDD_GPIO);
++	mondrian_touch_power();
+ }
