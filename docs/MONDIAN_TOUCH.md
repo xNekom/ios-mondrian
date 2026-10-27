@@ -40,6 +40,23 @@ pull-up, i.e. the line floats. That fits an unpowered part, but it is not
 proof: an open-drain INT also floats when deasserted, so "is it alive" has to
 come from the SPI ID read (milestone 3), not from this pin.
 
+## The SE, measured (`0120`/`0121`)
+
+The QUPv3 wrapper answers (`QUPV3_HW_VER 0x30080000`) and the SE reports
+`GENI_INIT_CFG_REVISION 0x9`, `CGC 0x7f`, `STATUS 0` and
+`GENI_FW_REVISION_RO (=0x68) 0x102`: firmware version 2, protocol **1 = SPI**.
+The bootloader left the SE clock off (RCG `CMD 0x80000000`, root off, and the
+SE4 branch bit clear); rooting it on the XO (source 0, divider 1, 19.2 MHz)
+clears `CMD` to 0 and the registers work.
+
+Do **not** read `0x1000`: the newer GENI layout puts FW_REVISION there, this
+SE does not decode it, and the read wedges the interconnect (the console
+stops and the watchdog resets the phone). `0x68` is the register that exists.
+
+The SPI bus is on **GPIO16-19** (clk, mosi, miso, cs) with the `qup4`
+function (TLMM mux value 1, the group-local function index) and CS0; the
+touch's reset/IRQ pads (20/21) are separate.
+
 ## The layers, in the order they have to work
 
 1. **The IOVDD rail.** `vdd-supply` is `pm8350c_l2`, an **RPMh VRM**
