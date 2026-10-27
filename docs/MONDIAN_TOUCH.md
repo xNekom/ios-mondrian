@@ -44,6 +44,31 @@ at 600 kHz and 2.5 MHz, at every AVDD/reset level, after a full IOVDD power
 cycle (`0141`-`0146`). What is left is the part's own supply or state, not the
 port's pads.
 
+## What the working system says
+
+LineageOS 24 runs on this phone with the vendor driver (`goodix_core.ko` from
+`vendor_dlkm`) and logs `brl_dev_confirm: device connected`; its sysfs reads
+the part (`rom_pid:BERLIN`, `config_version:46`). Its SPI frames, captured
+with `tracefs` (`/sys/kernel/tracing/events/spi`), are exactly the ones this
+driver builds: read `f1` + 32-bit address + `ff ff ff`, write `f0` + 32-bit
+address + data, zeros during the read data phase. A plain read of `0x00010014`
+returns `42 45 52 4c 49 4e` ("BERLIN") and `0x00010070` returns `0xc1`, so the
+part answers reads with no write first.
+
+The input device reports ABS 0..14400 x 0..32000 (the HID service must divide
+by those, not by 1440/3200) and the touch IRQ is GPIO21 (GIC 305, `msmgpio`,
+edge). Only `pm8350c_l2` is enabled for the touch; `l7` is off in the working
+system too.
+
+Conclusion: the frame is right, the part is alive, and what separates this
+port from the working system is the transport itself (bit-banged pads versus
+the QUP), not the protocol.
+
+The rest of the reference is captured by `tools/android-capture.sh`: dmesg,
+logcat, kernel config, FDT, interrupts, iomem, regulators, input devices,
+power supply, GPU (Adreno730v3, 220-900 MHz), thermal zones, devfreq (UFS
+75-850 MHz) and the module list.
+
 The working reference is LineageOS, which supports this device officially:
 `drivers/input/touchscreen/goodix_berlin_driver` in
 `LineageOS/android_kernel_xiaomi_sm8450` (branch `lineage-24.0`) is the same
