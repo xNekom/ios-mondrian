@@ -1,0 +1,47 @@
+xnu 0137: hold the touch reset low and release it high
+
+The reset line is active low on this board. The vendor's brl_power_on drives
+its three GPIOs high in order (3, 15 and 5 ms apart) and its error/off path
+drives the same lines low, so low is reset and high is running; the DT's flag
+cell is ignored because that driver uses the raw gpio API. The port had it
+backwards and held the part in reset through every test, which is exactly
+what an unpowered part looks like.
+
+Assert low while AVDD settles and IOVDD comes up, release high, then wait.
+
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -267,15 +267,16 @@
+ 	}
+ 
+ 	/*
+-	 * The live tree gives the reset line flags 0 (active high): driving it
+-	 * high holds the part in reset, low releases it. Keep it asserted while
+-	 * AVDD settles, bring IOVDD up, then release.
++	 * The reset line is active low: the vendor's power-on leaves it high and
++	 * its error/off path drives it low (brl_power_on in goodix_core.ko), and
++	 * the DT's flag cell is ignored by that driver. Hold it low while AVDD
++	 * settles and IOVDD comes up, then release it high.
+ 	 */
+-	printf("MONDRIAN TOUCH: power: avdd on, reset asserted\n");
++	printf("MONDRIAN TOUCH: power: avdd on, reset asserted (low)\n");
+ 	mondrian_log_flush_now();
+ 
+ 	mondrian_tlmm_output(avdd_page, 0, MONDRIAN_TLMM_DRIVE_2MA, 1);
+-	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
+ 	mondrian_tlmm_write(irq_page, MONDRIAN_TLMM_CFG,
+ 	    mondrian_tlmm_cfg(0, MONDRIAN_TLMM_PULL_UP, MONDRIAN_TLMM_DRIVE_2MA, 0));
+ 
+@@ -287,9 +288,9 @@
+ 	(void)mondrian_rpmh_ldo2();
+ 	delay(5000);
+ 
+-	printf("MONDRIAN TOUCH: power: releasing reset\n");
++	printf("MONDRIAN TOUCH: power: releasing reset (high)\n");
+ 	mondrian_log_flush_now();
+-	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 0);
++	mondrian_tlmm_output(reset_page, 0, MONDRIAN_TLMM_DRIVE_8MA, 1);
+ 
+ 	delay(150000);  /* Goodix boot time */
+ 
