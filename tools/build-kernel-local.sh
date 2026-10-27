@@ -110,8 +110,11 @@ if grep -E 'Skipping patch .*/patches/[0-9]{4}-' "$LOG"; then
 	exit 1
 fi
 
-KERNEL=$(ls -t "$DXB_DIR"/build/xnu.obj/"$KERNEL_CONFIG"_ARM64_"$MACHINE"/kernel.*"$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')" 2>/dev/null | head -1)
-if [ -z "$KERNEL" ] || [ ! "$KERNEL" -nt "$STAMP" ]; then
+# The kernel is kernel.<config>.<machine>; a glob such as kernel.*development
+# matches nothing (the name continues), and the failing assignment aborted the
+# script before the copy.
+KERNEL="$DXB_DIR/build/xnu.obj/${KERNEL_CONFIG}_ARM64_${MACHINE}/kernel.$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]').$(echo "$MACHINE" | tr '[:upper:]' '[:lower:]')"
+if [ ! -f "$KERNEL" ] || [ ! "$KERNEL" -nt "$STAMP" ]; then
 	echo "error: no kernel built in this run; the tail of $LOG:" >&2
 	grep -E "error:" "$LOG" | grep -v "does not apply" | tail -15 >&2
 	exit 1
