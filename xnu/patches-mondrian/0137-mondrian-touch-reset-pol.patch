@@ -1,13 +1,17 @@
-xnu 0137: hold the touch reset low and release it high
+xnu 0137: fix the touch reset polarity and the write prefix
 
 The reset line is active low on this board. The vendor's brl_power_on drives
 its three GPIOs high in order (3, 15 and 5 ms apart) and its error/off path
 drives the same lines low, so low is reset and high is running; the DT's flag
 cell is ignored because that driver uses the raw gpio API. The port had it
 backwards and held the part in reset through every test, which is exactly
-what an unpowered part looks like.
+what an unpowered part looks like. Assert low while AVDD settles and IOVDD
+comes up, release high, then wait.
 
-Assert low while AVDD settles and IOVDD comes up, release high, then wait.
+The write path also reused the read prefix: a Goodix write is 0xF0 + the
+32-bit address (five bytes) followed by the data, with no dummy bytes. Every
+write was sending three extra zeros in front of the payload, so the 0xC900
+mode switch and the echo write never landed.
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
@@ -45,3 +49,26 @@ Assert low while AVDD settles and IOVDD comes up, release high, then wait.
  
  	delay(150000);  /* Goodix boot time */
  
+@@ -680,12 +681,17 @@
+ {
+ 	uint8_t tx[16];
+ 
+-	if (len > sizeof(tx) - 8) {
+-		len = sizeof(tx) - 8;
++	/* A write is 0xF0 + the address only: no dummy bytes before the data. */
++	if (len > sizeof(tx) - 5) {
++		len = sizeof(tx) - 5;
+ 	}
+-	mondrian_goodix_prefix(tx, 0xf0, addr);
+-	memcpy(tx + 8, buf, len);
+-	return mondrian_spi_frame(tx, 8 + len, NULL, 0);
++	tx[0] = 0xf0;
++	tx[1] = (uint8_t)(addr >> 24);
++	tx[2] = (uint8_t)(addr >> 16);
++	tx[3] = (uint8_t)(addr >> 8);
++	tx[4] = (uint8_t)addr;
++	memcpy(tx + 5, buf, len);
++	return mondrian_spi_frame(tx, 5 + len, NULL, 0);
+ }
+ 
+ static int

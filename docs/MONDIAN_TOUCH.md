@@ -15,7 +15,7 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 | Wrapper | `qcom,qupv3_1_geni_se@ac0000` (QUPv3 wrapper 1) |
 | Chip select / speed | CS0, 15 MHz max (`spi-max-frequency = <0xe4e1c0>`) |
 | Touch node | `xiaomi,m11a-spi` at `spi@990000/xiaomi_touch@0` |
-| Reset | TLMM **GPIO 20**, active high (`flags 0`): high holds the part in reset |
+| Reset | TLMM **GPIO 20**, active low: low holds the part in reset, high runs |
 | IRQ | TLMM **GPIO 21**, active low (`interrupts = <0x2008>`, ONESHOT + TRIGGER_LOW) |
 | AVDD enable | TLMM **GPIO 71** |
 | IOVDD | PMIC regulator, phandle `0x301` (`vdd-supply`) |
@@ -29,8 +29,9 @@ with `dtc -I dtb -O dts`). The work list entry is `docs/MONDIAN_PORT.md` §5.
 (gpio), pull-down, input, level low, `INTR_CFG 0xe2` with the interrupt
 itself disabled. The bootloader does not power the part: AVDD (GPIO71) is an
 input and reset (GPIO20) is low. The sequence is AVDD on, reset **asserted**
-(GPIO20 high: the live tree gives the line flags 0, active high), IOVDD up,
-then reset released low and 150 ms before the first transfer.
+(GPIO20 low), IOVDD up, then reset released high and 150 ms before the first
+transfer. The DT's flag cell (`flags 0`) does not describe the line: the vendor
+driver uses the raw gpio API and drives it high to run, low to reset.
 
 The part drives INT low once it has booted, so with GPIO21 as an input and the
 vendor's pull-up (`mi_ts_active`) a level of 0 is the milestone-1 signal and 1
@@ -102,8 +103,8 @@ ENABLE, then ENABLE|TRIGGER.
    SPMI-driven LDO: it needs an RPMh (RSC, `apps_rsc@17a00000`) vote, which
    `0131`/`0132` implement. The shim's SPMI is read-only by design, so it
    cannot set it.
-2. **TLMM pins.** Reset (20) high while AVDD settles and IOVDD comes up, then
-   low; AVDD enable (71) high; IRQ pin (21) as input with the vendor's pull-up.
+2. **TLMM pins.** Reset (20) low while AVDD settles and IOVDD comes up, then
+   high; AVDD enable (71) high; IRQ pin (21) as input with the vendor's pull-up.
    The pin
    registers are the mainline `pinctrl-msm` layout at `0x0f100000 + 0x1000*n`:
    `GPIO_CFG` (pull 0-1, function 2-4, drive 6-8, output enable 9), `IN_OUT`
@@ -168,8 +169,9 @@ ENABLE, then ENABLE|TRIGGER.
   panel without a panel-specific table.
 - **SPI mode matters**: mode 0, MSB first. Bit-bang it at about 600 kHz until
   the echo answers; the part tolerates 15 MHz once the framing is right.
-- **The reset line is active high** in this tree (`flags 0`), so `0119`'s
-  "release" (driving it high) held the part in reset for every earlier test.
+- **The reset line is active low**, whatever the DT's flag cell says: the
+  vendor driver drives it high to run and low to reset, so an "asserted high"
+  sequence holds the part in reset and looks exactly like an unpowered part.
 - **The VRM mode is the PMIC5 one**: 7 = HPM for an LDO, not the DT's RPMH
   mode 4. `CMD_MSGID_LEN` is 8 in rpmh-rsc, and the voltage register takes
   millivolts, not a selector index.
