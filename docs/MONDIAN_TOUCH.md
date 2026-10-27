@@ -35,7 +35,24 @@ driver uses the raw gpio API and drives it high to run, low to reset.
 
 The part drives INT low once it has booted, so with GPIO21 as an input and the
 vendor's pull-up (`mi_ts_active`) a level of 0 is the milestone-1 signal and 1
-means unpowered, held in reset, or dead. Measured with `0119` (which had the
+means unpowered, held in reset, or dead.
+
+Measured with `0140`: driving MISO high with the pad's own output stage reads
+back 1, so no ESD diode clamps the pin and **IOVDD really reaches the part**.
+The part still never drives MISO nor pulls INT low, with both read framings,
+at 600 kHz and 2.5 MHz, at every AVDD/reset level, after a full IOVDD power
+cycle (`0141`-`0146`). What is left is the part's own supply or state, not the
+port's pads.
+
+The working reference is LineageOS, which supports this device officially:
+`drivers/input/touchscreen/goodix_berlin_driver` in
+`LineageOS/android_kernel_xiaomi_sm8450` (branch `lineage-24.0`) is the same
+driver, open, and `qcom/mondrian-sm8475.dtsi` in
+`android_kernel_xiaomi_sm8450-devicetrees` is its device tree (compatible
+`goodix,gt9916S`, same GPIOs and supplies as the live tree). Its read frame,
+power order and confirm are what `0141` follows. Its kernel is 5.10.269 and
+the shipped `goodix_core.ko` is built for 5.10.160, so the vendor module
+cannot be loaded into another kernel to compare. Measured with `0119` (which had the
 polarity backwards and no IOVDD): the line read 1 both ways, which is exactly
 what a part held in reset looks like.
 
@@ -83,7 +100,10 @@ RSC node is `rsc@17a00000` (drv-2), `qcom,tcs-offset = 0xd00`, TCS config
 WAKE 3 / ACTIVE 2 / SLEEP 2 / CONTROL 0 / FAST 1. The resource address comes
 from the AOP command DB (`aop_cmd_db_region@80860000`, 0x20000; entries are
 `{u8 id[8], u32 priority[2], u32 addr, u16 len, u16 offset}`, key `"ldoc2"`).
-Measured with `0131`: the command DB answers `ldoc2` = `0x42c00`. Behind that
+Measured with `0131`-`0143`: the command DB answers `ldoc2` = `0x42c00` and
+`ldoc7` = `0x41300`; both votes land and the read-back through the same TCS
+returns `0x80000001` (enable) and `0x80000708` / `0x80000bb8` (1800 / 3000 mV).
+`ldoc7` is the rail Lineage's tree leaves commented as the touch's AVDD feed. Behind that
 address the VRM has +0x0 voltage in **millivolts** (`DIV_ROUND_UP(uV, 1000)` in
 the vendor driver, so 1800), +0x4 enable (1) and +0x8 mode (PMIC5 LDO HPM is
 **7**, not the DT's RPMH mode 4).
