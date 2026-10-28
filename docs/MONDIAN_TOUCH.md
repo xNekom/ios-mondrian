@@ -208,10 +208,10 @@ active low, GIC 305).
 
 ## Loading the firmware (the part runs from RAM)
 
-The chip has no firmware of its own: `goodix_core.ko` writes 223736 bytes (an
-ISP stage plus six subsystems) into it over SPI on every boot, and only then
-does the part scan. This is the sequence from `goodix_brl_fwupdate.c` for
-Berlin D (`CHIP_TYPE_BRD 0x98`):
+The chip has no firmware of its own: `goodix_core.ko` writes the 223744-byte
+image (223736 payload bytes: an ISP stage plus five firmware subsystems) into
+it over SPI on every boot, and only then does the part scan. This is the
+sequence from `goodix_brl_fwupdate.c` for Berlin D (`CHIP_TYPE_BRD 0x98`):
 
 | Step | Register or address |
 | --- | --- |
@@ -237,21 +237,31 @@ three reads agree) before enabling the clocks (`0xD807 = 0xFF`,
 `0xD806 = 0x77`, `0xD006 = 0x3C`), and the part only answers the boot option
 after a reset pulse of at least 15 ms.
 
-The package itself, checked against `goodix_firmware_m11a.bin` (223744 bytes):
-`size` and a 32-bit `checksum` of the 16-bit words from offset 8, then a
-512-byte header, a table of 10-byte entries at offset 42 (`type`, `size`
-LE32, `flash_addr` LE32, one reserved byte) and the section data in order from
-512. Section 0 is the ISP (2048 bytes, address `0xffffffff`, ignored: it goes
-to `0x23800`); sections 1-5 are types 3/2/2/2/2 at `0x1c000`, `0x1000`,
-`0x4000`, `0x26000` and `0x0`. The config blob (`0x3E000`, type 4) is the
-1488-byte group for sensor 255 from `goodix_cfg_group_m11a.bin`, flashed the
-same way.
+The package itself, checked against `goodix_firmware_m11a.bin` (223744 bytes,
+the header says 223736): `size` and a 32-bit `checksum` of the 16-bit words
+from offset 8, then a 512-byte header, a subsystem count at `0x1D`, a table of
+10-byte entries at offset 42 (`type`, `size` LE32, `flash_addr` LE32, one
+reserved byte) and the section data in order from 512. Section 0 is the ISP
+(2048 bytes, address `0xffffffff`, ignored: it goes to `0x23800`); sections
+1-5 are types 3/2/2/2/2 at `0x1c000` (8192), `0x1000` (12288), `0x4000`
+(98304), `0x26000` (98304) and `0x0` (4096).
+
+The sensor config is a second file, not a section of that package:
+`goodix_cfg_group_m11a.bin` ends with one 1488-byte group (a 64-byte head
+whose U8 checksum and `cfg_len` identify it, then 1424 bytes of body), which
+the vendor flashes as type 4 at `0x3E000` **before** the firmware sections.
+`tools/mk-touch-blob.py` appends it as table entry 6, sets the count at `0x1D`
+to 7 and recomputes the package checksum, because the kernel validates one
+contiguous package. Each flash packet carries its own type and address, so
+the order of the writes does not matter; the config (`0x3e000..0x3e5cf`) and
+the firmware (`0x0..0x3dfff`) do not overlap.
 
 The kernel gets the package without a file system: the 64 blocks in front of
 the log ring at the end of `userdata` are reserved for it, `tools/
-flash-touch-firmware.sh` writes it there from recovery with `dd`, and
-`mondrian_reserved_read()` in `bsd/dev/mondrian_ufs.c` reads it back. Nothing
-else in `userdata` moves, and no sudo is needed.
+flash-touch-firmware.sh FIRMWARE.bin [CONFIG_GROUP.bin]` repacks it and writes
+it there from recovery with `dd`, and `mondrian_reserved_read()` in
+`bsd/dev/mondrian_ufs.c` reads it back. Nothing else in `userdata` moves, and
+no sudo is needed.
 
 ## The layers, in the order they have to work
 

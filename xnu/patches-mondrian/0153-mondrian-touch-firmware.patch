@@ -21,21 +21,121 @@ the vendor flashes before the five firmware sections; tools/mk-touch-blob.py
 repacks it as table entry 1, so the kernel's table order matches. The update
 resets use brl_reset's 2 ms low pulse, not brl_power_on's 15 ms one.
 
-The report thread starts only after a successful load, and the IC info is read
-after it, when misc carries the real touch_data_addr. The loader also prints
-patch_vid, sensor_id and the config ID at 0x10076, so one boot log says whether
-the part is running the firmware or still the ROM.
+The IC info's parm block is variable length (five count bytes, each followed by
+that many u16 values), so misc is not at a fixed offset. Parse the counts the
+way convert_ic_info does and read misc.touch_data_addr/head_len/point_len from
+the right place; only start the report thread for a sane address, or the thread
+reads a stale block and feeds backboardd noise. After the IC info, send
+brl_set_coor_mode's commands (0x90/0 rawdata off, 0x91/0x81 coordinates on) to
+misc.cmd_addr; without them the touch block returns rawdata, not points. The
+update's final reset is 2 ms (brl_reset); do brl_power_on's 15 ms reset once
+after it, as the vendor's resume does, before reading the IC info and enabling
+coordinates, or the part stays in the post-update rawdata state. After that
+reset, repeat brl_dev_confirm's eight 0xAA bytes at 0x10000: the vendor's
+power-on does it before the IC info and the coordinate mode.
+mondriantouch=0 skips the whole driver for UI-only boots; mondriantouchpoll=1
+makes the report thread read the block regardless of the IRQ pin, for bring-up.
+
+The loader also prints patch_vid, sensor_id and the config ID at 0x10076, so
+one boot log says whether the part is running the firmware or still the ROM.
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -890,8 +890,291 @@
- 	} else {
- 		printf("MONDRIAN TOUCH: ic info unusable, keeping 0x%x\n",
- 		    mondrian_touch_data_addr);
+@@ -860,41 +860,415 @@
+ #define MONDRIAN_TOUCH_FINGERS		10
+ 
+ static uint32_t mondrian_touch_data_addr = MONDRIAN_TOUCH_DATA_ADDR;
++static uint32_t mondrian_touch_cmd_addr;
++static uint16_t mondrian_touch_cmd_len;
++static int mondrian_touch_poll;
+ 
+ /*
+- * The register block at 0x10070 is the packed goodix_ic_info. The driver's
+- * struct puts misc.touch_data_addr at 161, touch_data_head_len at 165 and
+- * point_struct_len at 167, and the part's blob is 193 bytes long, so all
+- * three fields are inside it. Read them back instead of trusting the constant:
+- * this firmware's block could carry a different address.
++ * The register block at 0x10070 is the packed goodix_ic_info. The parm block
++ * is variable length: five count bytes (active scan rate, mutual/self tx/self
++ * rx/stylus frequencies), each followed by that many u16 values, so misc is
++ * not at a fixed offset (the driver's struct uses the maxima). Parse the
++ * counts the way convert_ic_info does, then read misc.touch_data_addr,
++ * touch_data_head_len and point_struct_len. Returns 0 only when the block
++ * gives a sane report address; otherwise the report thread must not start.
+  */
+-static void
++static int
+ mondrian_touch_ic_info(void)
+ {
+-	uint8_t info[200];
+-	uint32_t addr, i;
+-	uint16_t head, point;
++	uint8_t info[256], counts[5];
++	uint32_t i, off, misc, addr;
++	uint16_t length, head, point;
+ 
+ 	for (i = 0; i < sizeof(info); i++) {
+ 		info[i] = 0;
+ 	}
+-	(void)mondrian_goodix_read(0x00010070, info, sizeof(info));
+-	addr = (uint32_t)info[161] | ((uint32_t)info[162] << 8) |
+-	    ((uint32_t)info[163] << 16) | ((uint32_t)info[164] << 24);
+-	head = (uint16_t)(info[165] | (info[166] << 8));
+-	point = (uint16_t)(info[167] | (info[168] << 8));
+-	printf("MONDRIAN TOUCH: ic info len %u cfg 0x%x data 0x%x head %u point %u\n",
+-	    (unsigned)(info[0] | (info[1] << 8)), info[10], addr, head, point);
++	(void)mondrian_goodix_read(0x00010070, info, 2);
++	length = (uint16_t)(info[0] | (info[1] << 8));
++	if (length < 52 || length > sizeof(info)) {
++		printf("MONDRIAN TOUCH: ic info length %u invalid\n", length);
++		return -1;
 +	}
-+	mondrian_log_flush_now();
-+}
++	for (i = 0; i < sizeof(info); i++) {
++		info[i] = 0;
++	}
++	(void)mondrian_goodix_read(0x00010070, info, length);
 +
++	off = 2 + 16 + 10;              /* length, version, feature */
++	off += 4;                       /* drv, sen, button, force */
++	for (i = 0; i < 5; i++) {
++		counts[i] = info[off++];
++		if (counts[i] > 8 || off + counts[i] * 2 > length) {
++			printf("MONDRIAN TOUCH: ic info parm overrun (%u values at %u)\n",
++			    counts[i], off);
++			return -1;
++		}
++		off += counts[i] * 2;
++	}
++	misc = off;
++	if (misc + 52 > length) {
++		printf("MONDRIAN TOUCH: ic info misc %u past length %u\n", misc, length);
++		return -1;
++	}
++	addr = (uint32_t)info[misc + 44] | ((uint32_t)info[misc + 45] << 8) |
++	    ((uint32_t)info[misc + 46] << 16) | ((uint32_t)info[misc + 47] << 24);
++	head = (uint16_t)(info[misc + 48] | (info[misc + 49] << 8));
++	point = (uint16_t)(info[misc + 50] | (info[misc + 51] << 8));
++	mondrian_touch_cmd_addr = (uint32_t)info[misc] |
++	    ((uint32_t)info[misc + 1] << 8) | ((uint32_t)info[misc + 2] << 16) |
++	    ((uint32_t)info[misc + 3] << 24);
++	mondrian_touch_cmd_len = (uint16_t)(info[misc + 4] | (info[misc + 5] << 8));
++	printf("MONDRIAN TOUCH: ic info len %u counts %u %u %u %u %u misc %u"
++	    " data 0x%x head %u point %u cmd 0x%x/%u\n", length, counts[0], counts[1],
++	    counts[2], counts[3], counts[4], misc, addr, head, point,
++	    mondrian_touch_cmd_addr, mondrian_touch_cmd_len);
+ 	if (addr != 0 && head >= 8 && head <= 32 && point == MONDRIAN_TOUCH_POINT_LEN) {
+ 		mondrian_touch_data_addr = addr;
+-	} else {
+-		printf("MONDRIAN TOUCH: ic info unusable, keeping 0x%x\n",
+-		    mondrian_touch_data_addr);
++		mondrian_log_flush_now();
++		return 0;
+ 	}
++	printf("MONDRIAN TOUCH: ic info unusable, reports off\n");
+ 	mondrian_log_flush_now();
++	return -1;
+ }
+ 
 +/* ---- firmware ---------------------------------------------------------- */
 +
 +/* bsd/dev/mondrian_ufs.c: the blob area in front of the log ring. */
@@ -191,7 +291,7 @@ the part is running the firmware or still the ROM.
 +	return -1;
 +}
 +
-+/*
+ /*
 + * The chip runs from RAM, so every boot is: hold its CPU, load the ISP stage
 + * into its RAM, point it at the ISP and reset, then flash the five firmware
 + * sections in 4 KB packets. The blob is the vendor package, read from the
@@ -211,7 +311,7 @@ the part is running the firmware or still the ROM.
 +	if (len < MONDRIAN_FW_HEADER) {
 +		printf("MONDRIAN TOUCH: no firmware blob (read %u)\n", len);
 +		return -1;
- 	}
++	}
 +	fw_len = mondrian_le32(mondrian_fw) + 8;
 +	{
 +		uint32_t sum = 0, k;
@@ -242,7 +342,7 @@ the part is running the firmware or still the ROM.
 +	}
 +	printf("MONDRIAN TOUCH: firmware %u bytes, %u sections, isp %u\n",
 +	    len, count, count > 0 ? size[0] : 0);
- 	mondrian_log_flush_now();
++	mondrian_log_flush_now();
 +	if (count < 2) {
 +		return -1;
 +	}
@@ -317,10 +417,76 @@ the part is running the firmware or still the ROM.
 +	}
 +	mondrian_log_flush_now();
 +	return 0;
- }
- 
- /*
-@@ -975,7 +1258,18 @@
++}
++
++/*
++ * brl_send_cmd: a 16-byte goodix_ts_cmd at misc.cmd_addr, a U8 checksum over
++ * bytes 2..(len-1), then poll for CMD_ACK_OK (0x80). The vendor's
++ * brl_set_coor_mode sends 0x90/0 (rawdata off) and 0x91/0x81 (coordinates
++ * on); without them the touch block returns rawdata, not points.
++ */
++static int
++mondrian_touch_send_cmd(uint8_t cmd, uint8_t data0)
++{
++	uint8_t buf[16];
++	uint32_t i, sum = 0;
++	int tries;
++
++	if (mondrian_touch_cmd_addr == 0) {
++		return -1;
++	}
++	for (i = 0; i < sizeof(buf); i++) {
++		buf[i] = 0;
++	}
++	buf[2] = 5;
++	buf[3] = cmd;
++	buf[4] = data0;
++	for (i = 2; i < 5; i++) {
++		sum += buf[i];
++	}
++	buf[5] = (uint8_t)(sum & 0xff);
++	buf[6] = (uint8_t)((sum >> 8) & 0xff);
++	if (mondrian_fw_write_big(mondrian_touch_cmd_addr, buf, sizeof(buf)) < 0) {
++		return -1;
++	}
++	for (tries = 0; tries < 6; tries++) {
++		delay(1000);
++		(void)mondrian_goodix_read(mondrian_touch_cmd_addr, buf, sizeof(buf));
++		if (buf[1] == 0x80) {
++			delay(40000);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static int
++mondrian_touch_coor_mode(void)
++{
++	if (mondrian_touch_send_cmd(0x90, 0x00) < 0 ||
++	    mondrian_touch_send_cmd(0x91, 0x81) < 0) {
++		printf("MONDRIAN TOUCH: coordinate mode failed\n");
++		return -1;
++	}
++	printf("MONDRIAN TOUCH: coordinate mode enabled\n");
++	return 0;
++}
++
++/*
+  * The part raises IRQ (GPIO21, active low) when a report is ready and drops it
+  * when the host writes one zero byte back to the report address. Poll the line
+  * instead of wiring GIC 305 for now: once per 10 ms tick is enough to prove the
+@@ -920,7 +1294,8 @@
+ 	}
+ 	for (;;) {
+ 		(void)tsleep((caddr_t)&mondrian_touch_data_addr, PZERO - 1, "mtouch", 1);
+-		if ((mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
++		if (!mondrian_touch_poll &&
++		    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
+ 			continue;
+ 		}
+ 		(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
+@@ -975,7 +1350,18 @@
  	}
  }
  
@@ -339,7 +505,63 @@ the part is running the firmware or still the ROM.
  mondrian_touch_reset_pulse(void)
  {
  	/* A reset pulse restarts the part's ROM: with IOVDD and AVDD up there is
-@@ -1061,12 +1355,16 @@
+@@ -1036,10 +1422,55 @@
+ 
+ 
+ 
++/*
++ * brl_dev_confirm: the vendor's power-on writes 0xAA eight times to the boot
++ * option register (0x10000) and reads it back. The update uses 0x55 there to
++ * run the ISP; the 0xAA handshake is what the normal-mode power-on does, so
++ * repeat it after the firmware reset before asking for coordinates.
++ */
++static void
++mondrian_touch_confirm(void)
++{
++	uint8_t tx[8], rx[8];
++	uint32_t i;
++	int same = 1;
++
++	for (i = 0; i < sizeof(tx); i++) {
++		tx[i] = 0xaa;
++		rx[i] = 0;
++	}
++	(void)mondrian_goodix_write(0x00010000, tx, sizeof(tx));
++	delay(1000);
++	(void)mondrian_goodix_read(0x00010000, rx, sizeof(rx));
++	for (i = 0; i < sizeof(rx); i++) {
++		if (rx[i] != tx[i]) {
++			same = 0;
++		}
++	}
++	printf("MONDRIAN TOUCH: post-firmware confirm %s\n", same ? "ok" : "bad");
++}
++
+ void
+ mondrian_touch_probe(void)
+ {
+ 	thread_t touch_thread;
++	int touch_on = 1;
++
++	/*
++	 * mondriantouch=0 skips the whole driver. Useful while the UI is being
++	 * brought up: without the firmware the part has no reports and a stale
++	 * report address only feeds backboardd noise.
++	 */
++	PE_parse_boot_argn("mondriantouch", &touch_on, sizeof(touch_on));
++	PE_parse_boot_argn("mondriantouchpoll", &mondrian_touch_poll,
++	    sizeof(mondrian_touch_poll));
++	if (!touch_on) {
++		printf("MONDRIAN TOUCH: disabled by boot arg\n");
++		return;
++	}
++	if (mondrian_touch_poll) {
++		printf("MONDRIAN TOUCH: polling the report block\n");
++	}
+ 	printf("MONDRIAN TOUCH: TLMM at 0x%lx, reset/irq/avdd pins\n",
+ 	    (unsigned long)MONDRIAN_TLMM_BASE);
+ 	mondrian_log_flush_now();
+@@ -1061,12 +1492,28 @@
  	mondrian_touch_power();
  	mondrian_touch_geni_probe();
  	mondrian_touch_spi_probe();
@@ -348,8 +570,20 @@ the part is running the firmware or still the ROM.
 -		thread_deallocate(touch_thread);
 -		printf("MONDRIAN TOUCH: report thread started\n");
 +	if (mondrian_touch_fw_load() == 0) {
-+		mondrian_touch_ic_info();
-+		if (kernel_thread_start(mondrian_touch_thread, NULL, &touch_thread) == KERN_SUCCESS) {
++		/*
++		 * The update ends with brl_reset's 2 ms pulse. The vendor's
++		 * resume (display on) then does brl_power_on's 15 ms reset and
++		 * only afterwards reads the IC info and sends the coordinate
++		 * mode; without that normal-mode boot the part stays in the
++		 * post-update rawdata state and never writes touch points.
++		 */
++		mondrian_touch_reset_pulse();
++		mondrian_touch_confirm();
++		if (mondrian_touch_ic_info() != 0) {
++			printf("MONDRIAN TOUCH: no report address, reports off\n");
++		} else if (mondrian_touch_coor_mode() != 0) {
++			printf("MONDRIAN TOUCH: no coordinate mode, reports off\n");
++		} else if (kernel_thread_start(mondrian_touch_thread, NULL, &touch_thread) == KERN_SUCCESS) {
 +			thread_deallocate(touch_thread);
 +			printf("MONDRIAN TOUCH: report thread started\n");
 +		} else {

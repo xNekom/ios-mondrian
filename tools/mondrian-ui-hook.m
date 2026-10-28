@@ -1,6 +1,12 @@
 /* Opt-in containermanagerd/backboardd diagnostics for the mondrian bring-up test. */
 #import <objc/objc.h>
 #import <objc/runtime.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <mach/mach.h>
+#import <mach/thread_act.h>
+#import <mach/thread_state.h>
+#import <dlfcn.h>
+#import <xpc/xpc.h>
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -56,12 +62,71 @@ heartbeat(void *unused)
 	return NULL;
 }
 
+static mach_port_t mondrian_main_thread = MACH_PORT_NULL;
+
+static void
+sample_main_thread(void)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	char line[220];
+	uint64_t fp;
+	kern_return_t kr;
+
+	kr = thread_get_state(mondrian_main_thread, ARM_THREAD_STATE64,
+	    (thread_state_t)&state, &count);
+	if (kr != KERN_SUCCESS) {
+		snprintf(line, sizeof(line), "MONDRIAN UI: sample failed %d\n", kr);
+		say(line);
+		return;
+	}
+	snprintf(line, sizeof(line), "MONDRIAN UI: sample pc %llx lr %llx sp %llx fp %llx\n",
+	    (unsigned long long)state.__pc, (unsigned long long)state.__lr,
+	    (unsigned long long)state.__sp, (unsigned long long)state.__fp);
+	say(line);
+	fp = state.__fp;
+	for (int i = 0; i < 10 && fp >= 0x100000000ULL; i++) {
+		uint64_t frame[2];
+		vm_size_t out = 0;
+		Dl_info info;
+
+		kr = vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
+		    sizeof(frame), (vm_address_t)frame, &out);
+		if (kr != KERN_SUCCESS || out != sizeof(frame) || frame[1] == 0) {
+			break;
+		}
+		if (dladdr((void *)frame[1], &info) != 0) {
+			snprintf(line, sizeof(line), "MONDRIAN UI: frame %d %llx %s %s\n",
+			    i, (unsigned long long)frame[1],
+			    info.dli_fname != NULL ? info.dli_fname : "?",
+			    info.dli_sname != NULL ? info.dli_sname : "?");
+		} else {
+			snprintf(line, sizeof(line), "MONDRIAN UI: frame %d %llx ? ?\n",
+			    i, (unsigned long long)frame[1]);
+		}
+		say(line);
+		fp = frame[0];
+	}
+}
+
+static void *
+sampler(void *unused)
+{
+	(void)unused;
+	sleep(90);
+	say("MONDRIAN UI: sampling main thread\n");
+	sample_main_thread();
+	return NULL;
+}
+
 static void
 start_heartbeat(void)
 {
 	pthread_t thread;
 
+	mondrian_main_thread = mach_thread_self();
 	(void)pthread_create(&thread, NULL, heartbeat, NULL);
+	(void)pthread_create(&thread, NULL, sampler, NULL);
 }
 
 static int
@@ -214,18 +279,40 @@ mondrian_dump_class(const char *name)
 	snprintf(line, sizeof(line), "MONDRIAN UI: %s %u ivars\n", name, count);
 	say(line);
 	for (i = 0; i < count; i++) {
-		snprintf(line, sizeof(line), "  %s\n", ivar_getName(ivars[i]));
+		snprintf(line, sizeof(line), "  %s %s\n", ivar_getName(ivars[i]),
+		    ivar_getTypeEncoding(ivars[i]) != NULL ? ivar_getTypeEncoding(ivars[i]) : "?");
 		say(line);
 	}
 	free(ivars);
 }
 
+/*
+ * The real gate is -isInSetupMode (the class has 24 methods, and the dump
+ * showed isInSetupMode, _isInSetupMode, isInSetupModeReadyToExit and
+ * isInSetupModeForDeviceMigration; there is no -isSetupRequired). Answering no
+ * there and yes to "ready to exit" is what lets SpringBoard build the lock
+ * screen instead of parking in setup mode.
+ */
 static BOOL
-mondrian_setup_not_required(id self, __unused SEL selector)
+mondrian_answer_no(id self, SEL selector)
 {
+	char line[96];
+
 	(void)self;
-	say("MONDRIAN UI: setup not required\n");
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s -> NO\n", sel_getName(selector));
+	say(line);
 	return NO;
+}
+
+static BOOL
+mondrian_answer_yes(id self, SEL selector)
+{
+	char line[96];
+
+	(void)self;
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s -> YES\n", sel_getName(selector));
+	say(line);
+	return YES;
 }
 
 static void
@@ -252,46 +339,132 @@ mondrian_set_setup_reason(id self, SEL selector, long reason)
 }
 
 /*
- * A root that has just been flashed never reaches -_setupActivationState:
- * SpringBoard takes the setup path first, so the ivar that method is supposed
- * to fill keeps its zero and the boot sits at the Apple logo. Write the same
- * value whenever the manager is handed out or created, so the lock screen has
- * an activated state whatever path SpringBoard takes.
+ * The setup path is decided by SBSetupManager, not by -isInSetupMode alone:
+ * -updateInSetupMode and the setup-process notification are the entry points
+ * that present the assistant. Read the real ivar type from the runtime (the
+ * dump prints it), force the reason to zero before those methods run, and
+ * log every call so a boot log says which path SpringBoard took.
  */
-static id (*original_lockdown_init)(id, SEL);
-static id (*original_shared_instance)(id, SEL);
+static ptrdiff_t mondrian_setup_reason_offset = -1;
+static char mondrian_setup_reason_type;
+static void (*original_update_setup)(id, SEL);
+static void (*original_setup_changed)(id, SEL, id);
+static id (*original_setup_shared)(id, SEL);
 
 static void
-mondrian_force_activation(id manager, const char *where)
+mondrian_clear_setup_reason(id manager)
 {
-	int *state;
+	char *p;
 
-	if (manager == nil || mondrian_activation_offset < 0) {
+	if (manager == nil || mondrian_setup_reason_offset < 0) {
 		return;
 	}
-	state = (int *)((char *)manager + mondrian_activation_offset);
-	if (*state != 2) {
-		*state = 2;    /* activated */
-		say(where);
+	p = (char *)manager + mondrian_setup_reason_offset;
+	switch (mondrian_setup_reason_type) {
+	case 'c': case 'C': case 'B':
+		*(volatile char *)p = 0;
+		break;
+	case 's': case 'S':
+		*(volatile short *)p = 0;
+		break;
+	case 'i': case 'I':
+		*(volatile int *)p = 0;
+		break;
+	case 'q': case 'Q': case 'l': case 'L':
+		*(volatile long long *)p = 0;
+		break;
+	default:
+		break;
 	}
 }
 
 static id
-mondrian_lockdown_init(id self, SEL selector)
+mondrian_setup_shared(id self, SEL selector)
+{
+	id manager = original_setup_shared != NULL ? original_setup_shared(self, selector) : nil;
+
+	mondrian_clear_setup_reason(manager);
+	say("MONDRIAN UI: SBSetupManager sharedInstance, reason forced 0\n");
+	return manager;
+}
+
+static void
+mondrian_update_setup(id self, SEL selector)
+{
+	mondrian_clear_setup_reason(self);
+	say("MONDRIAN UI: updateInSetupMode, reason forced 0\n");
+	if (original_update_setup != NULL) {
+		original_update_setup(self, selector);
+	}
+}
+
+static void
+mondrian_setup_changed(id self, SEL selector, id notification)
+{
+	say("MONDRIAN UI: setupProcessChanged notification\n");
+	mondrian_clear_setup_reason(self);
+	if (original_setup_changed != NULL) {
+		original_setup_changed(self, selector, notification);
+	}
+}
+
+static id (*original_lockdown_init)(id, SEL);
+static id (*original_lockdown_shared)(id, SEL);
+
+static long
+mondrian_activation_getter(id self, SEL selector)
+{
+	(void)self;
+	say("MONDRIAN UI: SBLockdownManager activation getter -> 2\n");
+	return 2;
+}
+
+static id
+mondrian_lockdown_init_log(id self, SEL selector)
 {
 	id manager = original_lockdown_init != NULL ? original_lockdown_init(self, selector) : self;
 
-	mondrian_force_activation(manager, "MONDRIAN UI: lockdown init -> activated\n");
+	say("MONDRIAN UI: SBLockdownManager init\n");
 	return manager;
 }
 
 static id
-mondrian_lockdown_shared(id self, SEL selector)
+mondrian_lockdown_shared_log(id self, SEL selector)
 {
-	id manager = original_shared_instance != NULL ? original_shared_instance(self, selector) : nil;
+	id manager = original_lockdown_shared != NULL ? original_lockdown_shared(self, selector) : nil;
 
-	mondrian_force_activation(manager, "MONDRIAN UI: lockdown sharedInstance -> activated\n");
+	say("MONDRIAN UI: SBLockdownManager sharedInstance\n");
 	return manager;
+}
+
+static void
+mondrian_dump_class_methods(const char *name)
+{
+	Class cls = objc_getClass(name);
+	Class meta = cls != Nil ? object_getClass(cls) : Nil;
+	Method *methods;
+	unsigned int count = 0, i;
+	char line[160];
+
+	if (meta == Nil) {
+		snprintf(line, sizeof(line), "MONDRIAN UI: %s class missing\n", name);
+		say(line);
+		return;
+	}
+	methods = class_copyMethodList(meta, &count);
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s +%u methods\n", name, count);
+	say(line);
+	for (i = 0; i < count; i++) {
+		const char *method = sel_getName(method_getName(methods[i]));
+
+		if (strstr(method, "ctiv") == NULL && strstr(method, "State") == NULL &&
+		    strstr(method, "etup") == NULL && strstr(method, "ock") == NULL) {
+			continue;
+		}
+		snprintf(line, sizeof(line), "  +%s\n", method);
+		say(line);
+	}
+	free(methods);
 }
 
 static void
@@ -312,38 +485,118 @@ install_activation_hooks(void)
 			method_setImplementation(setup, (IMP)mondrian_setup_activation_state);
 			say("MONDRIAN UI: activation hook installed\n");
 		}
-		Method init = class_getInstanceMethod(lockdown, sel_registerName("init"));
-		if (init != NULL) {
-			original_lockdown_init = (id (*)(id, SEL))method_setImplementation(
-			    init, (IMP)mondrian_lockdown_init);
-			say("MONDRIAN UI: lockdown init hook installed\n");
+		mondrian_dump_class("SBLockdownManager");
+		mondrian_dump_class_methods("SBLockdownManager");
+		{
+			Method init = class_getInstanceMethod(lockdown, sel_registerName("init"));
+
+			if (init != NULL) {
+				original_lockdown_init = (id (*)(id, SEL))method_setImplementation(
+				    init, (IMP)mondrian_lockdown_init_log);
+				say("MONDRIAN UI: lockdown init logged\n");
+			}
+			Method shared = class_getClassMethod(lockdown, sel_registerName("sharedInstance"));
+			if (shared != NULL) {
+				original_lockdown_shared = (id (*)(id, SEL))method_setImplementation(
+				    shared, (IMP)mondrian_lockdown_shared_log);
+				say("MONDRIAN UI: lockdown sharedInstance logged\n");
+			}
 		}
-		Method shared = class_getClassMethod(lockdown, sel_registerName("sharedInstance"));
-		if (shared != NULL) {
-			original_shared_instance = (id (*)(id, SEL))method_setImplementation(
-			    shared, (IMP)mondrian_lockdown_shared);
-			say("MONDRIAN UI: lockdown sharedInstance hook installed\n");
+		{
+			static const char *const getters[] = {
+				"isActivated", "activationState", "isActivationState",
+			};
+
+			for (unsigned i = 0; i < sizeof(getters) / sizeof(getters[0]); i++) {
+				Method getter = class_getInstanceMethod(lockdown,
+				    sel_registerName(getters[i]));
+
+				if (getter != NULL) {
+					method_setImplementation(getter, (IMP)mondrian_activation_getter);
+					snprintf(line, sizeof(line), "MONDRIAN UI: hooked activation getter %s\n",
+					    getters[i]);
+					say(line);
+				}
+			}
 		}
 	}
+
+	mondrian_dump_class("MobileActivation");
+	mondrian_dump_class_methods("MobileActivation");
 
 	Class setup_manager = objc_getClass("SBSetupManager");
 	SEL reason_sel = sel_registerName("_setSetupRequiredReason:");
 	Method reason = setup_manager != Nil ? class_getInstanceMethod(setup_manager, reason_sel) : NULL;
 
 	if (setup_manager != Nil) {
-		static const char *const questions[] = {
-			"isSetupRequired", "isSetupAssistantRunning",
+		static const struct {
+			const char *selector;
+			BOOL yes;
+		} answers[] = {
+			{ "isInSetupMode", NO },
+			{ "_isInSetupMode", NO },
+			{ "isInSetupModeForDeviceMigration", NO },
+			{ "setupHasFinishedRestoringFromBackup", YES },
+			{ "isInSetupModeReadyToExit", YES },
 		};
 
-		mondrian_dump_class("SBSetupManager");
-		for (unsigned i = 0; i < sizeof(questions) / sizeof(questions[0]); i++) {
+		for (unsigned i = 0; i < sizeof(answers) / sizeof(answers[0]); i++) {
 			Method m = class_getInstanceMethod(setup_manager,
-			    sel_registerName(questions[i]));
+			    sel_registerName(answers[i].selector));
 
 			if (m != NULL) {
-				method_setImplementation(m, (IMP)mondrian_setup_not_required);
-				snprintf(line, sizeof(line), "MONDRIAN UI: %s -> NO\n", questions[i]);
+				method_setImplementation(m, answers[i].yes
+				    ? (IMP)mondrian_answer_yes : (IMP)mondrian_answer_no);
+				snprintf(line, sizeof(line), "MONDRIAN UI: hooked %s\n",
+				    answers[i].selector);
 				say(line);
+			}
+		}
+
+		{
+			Ivar reason_ivar = class_getInstanceVariable(setup_manager,
+			    "_setupRequiredReason");
+			const char *encoding = reason_ivar != NULL
+			    ? ivar_getTypeEncoding(reason_ivar) : NULL;
+
+			if (reason_ivar != NULL) {
+				mondrian_setup_reason_offset = ivar_getOffset(reason_ivar);
+				mondrian_setup_reason_type = encoding != NULL ? encoding[0] : 0;
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: _setupRequiredReason offset %ld type %c\n",
+				    (long)mondrian_setup_reason_offset,
+				    mondrian_setup_reason_type != 0 ? mondrian_setup_reason_type : '?');
+				say(line);
+			}
+		}
+		{
+			Method shared = class_getClassMethod(setup_manager,
+			    sel_registerName("sharedInstance"));
+
+			if (shared != NULL) {
+				original_setup_shared = (id (*)(id, SEL))method_setImplementation(
+				    shared, (IMP)mondrian_setup_shared);
+				say("MONDRIAN UI: SBSetupManager sharedInstance hook installed\n");
+			}
+		}
+		{
+			Method update = class_getInstanceMethod(setup_manager,
+			    sel_registerName("updateInSetupMode"));
+
+			if (update != NULL) {
+				original_update_setup = (void (*)(id, SEL))method_setImplementation(
+				    update, (IMP)mondrian_update_setup);
+				say("MONDRIAN UI: updateInSetupMode hook installed\n");
+			}
+		}
+		{
+			Method changed = class_getInstanceMethod(setup_manager,
+			    sel_registerName("_setupProcessChangedNotificationReceived:"));
+
+			if (changed != NULL) {
+				original_setup_changed = (void (*)(id, SEL, id))method_setImplementation(
+				    changed, (IMP)mondrian_setup_changed);
+				say("MONDRIAN UI: setupProcessChanged hook installed\n");
 			}
 		}
 	}

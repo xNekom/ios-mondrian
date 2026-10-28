@@ -13,14 +13,14 @@
 set -eu
 
 OUT=${1:-android-capture.tar}
-TMP=/data/local/tmp/capture
+TMP=${TMP:-android-capture}
 ADB=${ADB:-adb}
 
 $ADB root >/dev/null 2>&1 || true
-sleep 2
+sleep 3
 $ADB wait-for-device
-
-$ADB shell "rm -rf $TMP; mkdir -p $TMP/regmap $TMP/pinctrl $TMP/regulator $TMP/power_supply $TMP/input $TMP/clk"
+rm -rf "$TMP"
+mkdir -p "$TMP/regmap" "$TMP/pinctrl" "$TMP/regulator" "$TMP/power_supply" "$TMP/input" "$TMP/clk"
 
 # Kernel and firmware description.
 $ADB shell 'dmesg' > "$TMP/dmesg.txt" 2>/dev/null || true
@@ -73,6 +73,5 @@ $ADB shell 'ls /sys/class/udc 2>/dev/null; cat /sys/class/udc/*/state 2>/dev/nul
 # Android's own view, when the system booted.
 $ADB shell 'logcat -d -b all' > "$TMP/logcat.txt" 2>/dev/null || true
 
-$ADB shell "cd /data/local/tmp && tar -cf capture.tar capture" 2>/dev/null
-$ADB pull /data/local/tmp/capture.tar "$OUT"
-echo "captured to $OUT"
+tar -cf "$OUT" "$TMP"
+echo "captured to $OUT ($(du -sh "$TMP" | cut -f1) in $TMP)"
