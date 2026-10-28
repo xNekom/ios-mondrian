@@ -38,7 +38,7 @@ a PM8008.
 | Touch | done (Goodix on I²C) | to write (Goodix on SPI) |
 | Keys and battery | done (PM6150) | keys work in the shim; kernel side to write |
 | Boot menu / dual boot | n/a | menu with keys works; slot switch pending |
-| iOS userland | boots to the home screen | not yet |
+| iOS userland | boots to the home screen | yes (CPU rendering, touch, Settings) |
 
 On `sweet`, the reference implementation, the stock bootloader boots our shim
 volatile, XNU mounts a journaled HFS+ iOS root from `userdata` read/write, and
@@ -64,7 +64,8 @@ ABL (stock Xiaomi bootloader, unlocked)
 
 There is no serial port (the debug UART is wired as SPI on these boards). The
 kernel draws its console into the framebuffer the bootloader leaves — 1440x3200
-at `0xb8000000` on mondrian, 1080x2400 at `0x9c000000` on sweet — and keeps the
+at `0xb8000000` on mondrian (120 Hz; iOS/CA run at 60), 1080x2400 at
+`0x9c000000` on sweet — and keeps the
 whole log in a 4 MiB ring at the end of `userdata` (`0096`), because a screen
 only ever shows the last page of a boot.
 
@@ -166,7 +167,6 @@ tree, which MobileGestalt needs — extract it once, without the whole IPSW:
 python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
 ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
 ```
-
 ### 4. Build the boot image
 
 Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.

@@ -34,7 +34,8 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
 
 ## Brightness and display
 
-- Panel: `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` (DSC, command mode), from the
+- Panel: `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` (DSC, command mode, 1440x3200
+  at 120 Hz; the iPhone X userland/CA target 60), from the
   kernel command line.
 - Brightness is `bl_ctrl_dcs`: a DCS command to the panel, scale 0..4095
   (`/sys/class/backlight/panel0-backlight`), not a PWM.
