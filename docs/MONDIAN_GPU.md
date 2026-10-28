@@ -1,9 +1,9 @@
 # GPU and boot time
 
-The UI is CPU-rendered at 20-30 fps (`0114`, the software CoreAnimation
-renderer). The other ios-sweet ports render through **Mesa/freedreno OpenGL ES
-behind CoreAnimation's OpenGL ES renderer**; none of them has Metal. That is
-the path this port follows.
+The UI is CPU-rendered at 9-11 fps (111 ms/frame, copy 2.4 ms; `0114`, the
+software CoreAnimation renderer). The other ios-sweet ports render through
+**Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
+them has Metal. That is the path this port follows.
 
 ## Reference stack
 
@@ -34,7 +34,7 @@ the path this port follows.
   `a730_sqe.fw`, `a730_gmu.bin`, `a730_zap.mdt/.b02` from the vendor
   firmware. The references are a6xx: the a7xx registers, GMU/HFI, ZAP and
   SQE preamble are the new work.
-- Display: today `mondrianfb` (the ABL framebuffer, 30 Hz). The GPU path needs
+- Display: today `mondrianfb` (the ABL framebuffer, 60 Hz). The GPU path needs
   the MDP/DSI and the IOSurface/`IOMobileFramebuffer` presentation (topaz's
   `SweetSurface`), with the iPhone X 1125x2436 canvas on the 1440x3200 panel.
   The panel is **120 Hz**, but the iPhone X userland and CoreAnimation run at
@@ -50,21 +50,16 @@ the path this port follows.
   status at `0x953c` goes to `0x80001fe0`: CX is on. The kgsl-SMMU answers
   `idr0 0x2f0406`. A normal boot is untouched (`gpu=0`).
 - **Clocks**: the GCC GPU gates are on (`0x62000` bits 15/16, `0x81010`,
-  `0x81018`), the GMU RCG reads `0x505` (GPLL0/3 = 200 MHz), the HUB RCG
-  `0x507` (GPLL0/4 = 150 MHz) with `CMD_ROOT_EN` set, but the GPUCC AHB
-  branch (`0x911c`) still reads 0 and every GMU register reads
-  **`0xdeafbead`**: the sentinel for a block that is not clocked.
+  `0x81018`), the GMU RCG reads `0x505`, the HUB RCG `0x507` with
+  `CMD_ROOT_EN` set, but the GPUCC AHB branch (`0x911c`) still reads 0 and
+  every GMU register reads **`0xdeafbead`**: the block is not clocked.
   `GENERAL_9`/`GENERAL_10` reads hang. Root cause: the vendor's
   `gpu_cc_hub_clk_src` carries `HW_CLK_CTRL_MODE`, so the **hardware
-  (AO/RPMh) owns the hub clock**; the CPU-side enable is a no-op and the
-  hub only runs once the GPU power state is voted in RPMh (`gfx.lvl`,
-  `cx.lvl`, `mx.lvl`). The vendor's `gen7_gmu_first_boot` runs
-  `kgsl_pwrctrl_enable_cx_gdsc` -> `gen7_gmu_enable_clks` (gmu_clk and
-  hub_clk rates + `clk_bulk_prepare_enable`) -> firmware -> register
-  config -> `CM3_SYSRESET=0` -> PDC/RSC -> HFI, with the rail votes from
-  `gen7_build_rpmh_tables`/`gen7_complete_rpmh_votes` done by pwrctrl.
-  Next: port those RPMh votes (the touch driver already talks to cmd-db)
-  before the clock enable, then the firmware load.
+  (AO/RPMh) owns the hub clock**. `0170`-`0172` now vote `mx.lvl`/`cx.lvl` in
+  RPMh and put the hub/gmu RCGs in `HW_CLK_CTRL_MODE`: the CPU-side sequence
+  matches the vendor's, and the AO still does not enable the hub. Next: read
+  the AO/RSC state in XNU, or capture a live Android boot (needs a repartition
+  and a rooted/debug build; the 64 GiB split is undone), then the GMU firmware.
 - **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
   `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
   0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
@@ -72,11 +67,10 @@ the path this port follows.
 - **Firmware**: `/vendor/firmware` carries `gmu_gen70000.bin` (57 KiB)
   only; `a730_sqe.fw` and `a730_zap.mdt` (what the vendor dmesg asks for)
   are not there and have to come from the stock ROM or `imagefv`.
-- **Next**: port the vendor clock order (`kgsl_pwrctrl` enables the GCC
-  AXI clocks and the GPUCC hub/AHB branches; ours only touches GPUCC), then
-  the GMU firmware blocks (`{addr,size,type,value,data}` into ITCM/DTCM),
-  `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8, `HFI_CTRL_INIT`, and the
-  GMU SMMU context (CB5) for the HFI queue and the VRB.
+- **Next**: the GMU firmware blocks (`{addr,size,type,value,data}` into
+  ITCM/DTCM), `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8,
+  `HFI_CTRL_INIT`, and the GMU SMMU context (CB5) for the HFI queue and the
+  VRB.
 
 ## Port steps
 
@@ -97,18 +91,17 @@ the path this port follows.
 The eight cores already start (`cpus=8`, all `PSCI CPU_ON rc=0`). The remaining
 cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
 
-- **`bootcpu` / `cpufreq`**: HackiOS boots with `cpus=8 bootcpu=7 cpufreq=1`;
-  the mondrian series has neither. The boot CPU is 0 (a little core) and the
-  CPU OPPs are not set from XNU. HackiOS has `hakios.cpufreq.c` (EPSS: base,
-  a LUT at +0x100 and PERF_STATE at +0x320; the top row per domain with our
-  cores) and `loader_return.c` (`bootcpu=7`, the big core). The live SM8475
-  tree has `qcom,cpufreq-hw-epss` at **0x17d91000/0x17d92000/0x17d93000**,
+- **`bootcpu`**: `cpufreq` is in (`0154`: 1804/2496/2995 MHz on the three
+  domains); the boot CPU is still 0 (a little core). HackiOS boots with
+  `cpus=8 bootcpu=7 cpufreq=1`. The live SM8475 tree has
+  `qcom,cpufreq-hw-epss` at **0x17d91000/0x17d92000/0x17d93000**,
   `qcom,lut-row-size=4`; HackiOS's own base is 0x18591000, so only the base and
-  the domain table change. The topaz 0094 is the SM6225 variant. Port both.
+  the domain table change. The topaz 0094 is the SM6225 variant. Port the
+  `bootcpu` half.
 - **`IOAcceleratorES`**: topaz's 0138 (an empty `IOAcceleratorES`) saves ~30 s
   at every backboardd start; check what the mondrian's `0114` publishes.
 - **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
-  frames and 60 Hz; today `mondrianfb_hz=30` (the panel itself is 120 Hz).
+  frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
 - **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
   (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
   the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships

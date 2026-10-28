@@ -46,8 +46,8 @@ needs, and where the numbers come from. The boot history and the traps are in
 | `tools/port-series.py` | ports a patch of the sweet series, renaming the board identifiers, and lists the hardware patches it skips |
 
 `0085` (the framebuffer presentation driver) is in this series. It presents
-userland IOSurface swaps on the framebuffer; the visible SpringBoard UI remains
-to be confirmed on-device.
+userland IOSurface swaps on the framebuffer and the lock screen renders
+on-device.
 
 UI probe `0106` injects a diagnostic dylib into the UI daemons selected by the
 bitmask `mondrian_ui_hook` (`0112`): 1 `containermanagerd`, 2 `backboardd`,
@@ -56,8 +56,9 @@ bitmask `mondrian_ui_hook` (`0112`): 1 `containermanagerd`, 2 `backboardd`,
 `CAWindowServer._detectDisplays`; dyld needs the `AMFI` policy answer to
 `__mac_syscall` 0x5a (`0108`), or it drops `DYLD_INSERT_LIBRARIES`. Build with
 `tools/build-mondrian-ui-hook.sh`, then install with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `0110`/`0111` also expose
-and correct the virtual timer mask, which prevented reliable userland startup.
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `0110`/`0111` expose and
+correct the virtual timer mask; `0173` arms `CNTV_TVAL` before clearing IMASK,
+which the clean shim needs (the full shim used to arm it by accident).
 
 ### Exporting the full console ring
 
@@ -176,10 +177,11 @@ and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 The flattened HFS root is not a stock volume layout: launchd still expects a
 Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`.
 
-The persistent console log is `0096`; `0097` starts its writer after root mount,
-flushes immediately, and verifies the initial header. Read a prior boot with
-`mondriandump=1` and `mondriandumpmatch=SMP,CRASH,CODE,memorystatus`; the
-log-viewer shim is unreliable on this UFS host, so use the kernel dump path.
+The persistent console log is `0096`; `0174` arms its writer at the end of the
+UFS probe, before the root mount, so a failed mount still flushes its error.
+Read a prior boot with `mondriandump=1` and
+`mondriandumpmatch=SMP,CRASH,CODE,memorystatus`; the log-viewer shim is
+unreliable on this UFS host, so use the kernel dump path.
 
 ### 2. The UFS root device
 
@@ -205,13 +207,16 @@ forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
 is a real MDSS driver: the `qcom,mdss_mdp@ae00000` node,
 `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` panel, vendor gamma/DSC tables.
 
+The remaining wall is the CPU rasterizer: 9-11 fps (111 ms/frame, copy 2.4 ms).
+The Adreno 730 bring-up, the gen7 GMU map and the Glass/Mesa plan are in
+`docs/MONDIAN_GPU.md`.
+
 ### 4. The touch
 
-Sweet drives a Goodix GT9896 over GENI I²C and takes its rail from RPMh.
-Mondrian has a Goodix on **SPI** (`xiaomi,m11a-spi`, CS0 on QUPv3 SE4 at
-0x990000, IRQ TLMM GPIO21, reset GPIO20): TLMM, the GCC SE clocks, the GENI
-SPI transport and the Goodix protocol are missing. Live-tree values and the
-milestone order: `docs/MONDIAN_TOUCH.md`.
+Sweet drives a Goodix GT9896 over GENI I²C. Mondrian's Goodix on SPI is up
+(`0153`): TLMM, the GCC SE clocks, the GENI SPI transport and the 220 KB
+firmware load work, and the report thread is ticked from the vsync (`0161`).
+Live-tree values and the milestone order: `docs/MONDIAN_TOUCH.md`.
 
 ### 5. The buttons, the battery and the menu
 
@@ -223,11 +228,9 @@ sweet's static `IOPMPowerSource` stub for the first bring-up.
 
 ### 6. USB
 
-Sweet's stack (0072–0077, 0081) is a DWC3 driver for SM7150. SM8475 has DWC3
-as well, with a different configuration space and a USB3 PHY that needs its
-own clock and power sequencing. The network path made sweet's bring-up possible
-without a screen; mondrian uses a dump kernel to read prior logs, so USB is for
-live diagnostics rather than a prerequisite for log access.
+Sweet's DWC3 stack (0072–0077, 0081) targets SM7150; SM8475's DWC3 needs its
+own configuration space and USB3 PHY sequencing. USB is for live diagnostics,
+not a prerequisite for log access: the dump kernel reads prior rings.
 
 ## Getting the numbers off the device
 
@@ -258,26 +261,18 @@ dump (`parse_facts`, `apply_facts`).
 
 ## Boot arguments
 
-The board table carries the default command line (`boards.Board.cmdline`): the
-sweet's, with the framebuffer arguments renamed.
-
-```
-debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress
-rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1
-wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1
-wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=30
-```
-
-What the less obvious ones do:
+The board table carries the default command line
+(`tools/boards.py`, `BOARDS['mondrian'].cmdline`); do not copy it here. What
+the less obvious ones do:
 
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | root on the `userdata` partition, writable |
-| `cpus=6` | start the X2 and the first five cores; `cpus=8` is the full set, `cpus=1` the safe fallback |
+| `cpus=8` | all eight cores; `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
 | `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn) |
-| `mondrianfb_hz=30` | refresh rate of the CPU copy into the panel |
+| `mondrianfb_hz=60` | refresh rate of the CPU copy into the panel |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 
 ## References

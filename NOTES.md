@@ -10,22 +10,28 @@ learn; the work list, the hardware delta and the partition rules are in
 `docs/MONDIAN_PORT.md`. The upstream `sweet` port is the reference
 implementation and is not re-described here: `xnu/patches/` is its record.
 
-## State (2026-10-26)
+## State (2026-10-28)
 
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   kernel console draws into the splash framebuffer the ABL leaves at
-  **0xB8000000** (1440x3200, stride 5760).
+  **0xB8000000** (1440x3200, stride 5760). Build the shim with `SMALL_SHIM=1`
+  (`tools/phone-deploy.sh` does): the full shim's `test_gic()` storms and
+  never jumps, so the phone shows IRQ lines and no kernel.
 - **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
   shim, payload and kernel all run the granule iOS is built for:
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
 - **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
   scheduler and AMFI into `bsd_init`. The GIC is remapped after the VM takes
   over; the vtimer PPI (27) delivers once its active state is ended and its
-  Group 1 secure modifier cleared (`0116`), and every timed wait returns.
+  Group 1 secure modifier cleared (`0116`). `0173` arms `CNTV_TVAL` before
+  clearing IMASK: the loader leaves the compare expired, and the
+  level-sensitive PPI otherwise re-enters for ever before the UFS probe.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
-  the device well-known LUN, the GPT parsed, `userdata` located, and the block
-  device reaches HFS.
+  the device well-known LUN, the GPT parsed, `userdata` located, HFS+ root
+  mounted and `launchd` exec'd. The console ring is armed at the end of the
+  UFS probe, before `vfs_mountroot` (`0174`), so a failed mount leaves its
+  error on disk.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
@@ -36,17 +42,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   waits 30 s and draws nothing); `0114` publishes them and leaves the software
   renderer. The panel is written through the console alias, never through an
   `IOMemoryDescriptor` or `PE_initialize_console(kPEDisableScreen)`: both put a
-  device pager on managed pages and panic in `pmap_remove_pv`. SpringBoard then
+  device pager on managed pages and panic in `pmap_remove_pv`. SpringBoard
   waits on MobileActivation in `_setupActivationState`; the dylib forces
-  activation and skips Setup. A freshly flashed root takes the setup path (no
-  `mobileactivationd` container, `budd` runs), so the dylib also forces
-  `SBLockdownManager` `init`/`sharedInstance` and answers `SBSetupManager`'s
-  real gates (`-isInSetupMode`, `_isInSetupMode`,
-  `isInSetupModeForDeviceMigration` NO; `isInSetupModeReadyToExit`,
-  `setupHasFinishedRestoringFromBackup` YES). There is no `-isSetupRequired`.
-  The mondrian cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`; the
-  root must have `/usr/libexec/mondrian-ui-hook.dylib`, and a boot without the
-  hook sits at the Apple logo.
+  activation and skips Setup, including the `SBLockdownManager` and
+  `SBSetupManager` gates. The cmdline in `tools/boards.py` carries
+  `mondrian_ui_hook=7`; the root must have
+  `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
@@ -72,24 +73,33 @@ Current blockers, in order:
 numbered patch is skipped. `tools/apply-series.py` applies the series to a
 fresh tree in seconds and names what does not apply, and
 `tools/check-patches.sh` does the same against the cached tree in `research/`.
+Run it after touching the series: CI skips a patch that does not apply and
+still builds. On 2026-10-28 it caught `0161` (the touch vsync tick) never
+applying — `0157` already carried its first hunk — so that fix had been
+missing from every CI kernel; the series is 173/173.
 
-**`iig` trap.** The build reuses the generated DriverKit stubs
-(`*.iig.cpp`/`*.h` under `build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/iokit/`,
-note the extra `DEVELOPMENT` component). Regenerating them with a newer
-Xcode's `iig` fails with `no member named 'kernelContent' in 'IORPC'`, so
-`build/kernel` must stay seeded from an Xcode 15 tree.
+**Bisecting the early boot.** `mondrianstop=N` halts at early mark N with IRQs
+masked. `0174` extends the marks through `bsd_init` and `vfs_mountroot` and
+keeps marks above 20 visible after the console is switched off, so the last
+line on the panel names the function that hung.
+
+**`iig` trap.** The build reuses the generated DriverKit stubs under
+`build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/`; regenerating them with a newer
+Xcode's `iig` fails, so seed them from an Xcode 15 tree.
 
 **Image and deploy.** `tools/phone-boot.sh` builds if needed and boots
 volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
-ring; `0097` starts persistence after root mount, flushes immediately, and
-verifies the header. Inspect a previous boot by running the real kernel, then a
-dump kernel with `mondriandump=1` and
-`mondriandumpmatch=SMP,CRASH,swap,memorystatus` (`0099` splits the list). The
-dump reads the prior ring before starting its own writer; the shim `logview` is
-unreliable on this UFS host.
+ring; `0174` arms persistence at the end of the UFS probe, before
+`vfs_mountroot`, so a failed mount still leaves the log on disk. With
+`mondrianfb_noconsole=1` the kernel never repaints the panel: a photo can show
+a frame from an earlier boot, and the ring is the only truth. Inspect a
+previous boot by running the real kernel, then a dump kernel with
+`mondriandump=1` and `mondriandumpmatch=SMP,CRASH,swap,memorystatus` (`0099`
+splits the list). The dump reads the prior ring before starting its own
+writer; the shim `logview` is unreliable on this UFS host.
 
 **Host-side testing.** `tools/qemu-ios.py` boots the payload; `--kernel` only
 feeds its decoder (`docs/QEMU_TESTING.md`), so rebuild the payload.
@@ -174,8 +184,10 @@ everything can hide exactly this class of bug.
 as an *undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg would
 give) — patch `0061` drops the write. The virtual timer only fires once the
 guest unmasks it for EL1 (`CNTV_CTL_EL1 = ENABLE | EL1IRQEN`, patch `0069`);
-`CNTV_*`, `CNTKCTL_EL1` and `DAIF` are all accepted. There is no RTC service,
-so `IOKitInitializeTime()`'s 30 s `IORTC` wait never expires and has to be
+`CNTV_*`, `CNTKCTL_EL1` and `DAIF` are all accepted. `0173` programs
+`CNTV_TVAL` before clearing IMASK: the loader leaves the compare expired and
+the level-sensitive PPI otherwise storms. There is no RTC service, so
+`IOKitInitializeTime()`'s 30 s `IORTC` wait never expires and has to be
 skipped on this board.
 
 **Anything mapped with `ml_io_map()` before `STARTUP_SUB_KMEM` dies.** It is a
@@ -208,14 +220,19 @@ image drops on the fastboot USB link, so the payload is LZ4-compressed
 the UFS powered when it boots the normal way and powers it down in fastboot;
 either way the kernel now brings the host up itself (`0074`–`0076`).
 
+**The shim is not a no-op, and it can hide kernel bugs.** The full shim runs
+`test_gic()` before the jump: it arms `CNTV_TVAL`, storms until it gives up and
+leaves the UFS warm. Behind it the kernel looked healthy; with `SMALL_SHIM=1`
+the kernel has to arm the timer itself (`0173`) and wake the UFS from the state
+ABL leaves. If the panel shows IRQ lines and no `MONDRIAN EARLY`, check the
+shim before the kernel (`nm shim/out/shim.elf | grep test_gic`).
+
 **fastboot serves 768 MiB per download and cannot split a raw image.** The
-bootloader reports `max-download-size: 805306368`, and fastboot's answer to a
-bigger raw file is to resparse it, which wants to read the partition back:
-it fails at once with `fastboot: error: Failed reading from userdata` (the
-name in the message is the partition, not a file). Flash an Android sparse
-image instead (`tools/mk-simg.py`, or `tools/flash-root.sh`, which converts
-anything over 768 MiB by itself): fastboot then sends it in `-S` chunks and
-the root's zero tail costs nothing. 11 GiB of root take about five minutes.
+bootloader reports `max-download-size: 805306368`; a bigger raw file is
+resparsed, and reading the partition back fails with `Failed reading from
+userdata` (the partition name). Flash a sparse image instead (`tools/mk-simg.py`
+or `tools/flash-root.sh`): fastboot sends it in `-S` chunks and the zero tail
+costs nothing.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again (2026-10-25: the sampler printed one
@@ -263,88 +280,71 @@ bounds the entry table with `nent * esz > BOUNCE_SIZE`, a 32-bit product that
 a corrupt table can wrap; guard with `nent > BOUNCE_SIZE / esz` before
 multiplying, in the same patch that enables writes.
 
+**A failed mount can zero an HFS+ B-tree node.** `hfs_swap_BTNode: offset #0
+invalid` followed by `BTOpenPath returned (5) getting extentoverflow BT` means
+the extents file's first node read as zeros. Read that block from recovery
+before blaming the driver (for this root, volume block 2178, byte offset
+`0x882000`): if it is zeros on disk, restore the volume from a verified 16 GiB
+`gzip` image (`dd bs=1M count=16384` over `userdata`) and set the volume header
+attributes to `0x80000100` — journaled bit clear, unmounted bit set — or the
+next mount may replay the same transaction. The live GPT is the original single
+`userdata` (223.6 GiB); the 64 GiB `iosroot` split was temporary and undone.
+
 ## Display
 
-The panel does not need a driver for the lock screen: the ABL brings up
-DSI/DSC/MDP and keeps scanning the reserved buffer, so the console and the
-userland framebuffer driver get a plain linear 1440x3200 framebuffer. The panel
-is 120 Hz; the iPhone X userland and CoreAnimation run at 60 (no ProMotion), so
-`mondrianfb_hz=60` is the first target and 120 needs ProMotion.
+The panel needs no driver for the lock screen: the ABL brings up DSI/DSC/MDP
+and keeps scanning the reserved buffer, so the console and the userland
+framebuffer get a linear 1440x3200 buffer. The panel is 120 Hz; the iPhone X
+userland runs at 60, so `mondrianfb_hz=60` is the target.
 
-- `0083` keeps the panel's frames off the free list (see the trap above).
+- `0083` keeps the panel's frames off the free list.
 - `0085` ports sweet's IOSurface + IOMobileFramebuffer pair to `AppleCLCD` on
   `/arm-io/disp0`; backboardd swaps are observed and the lock screen renders.
 - Sweet's `0056` (present at most every few vsyncs) and `0079`
-  (`RequestPowerChange`, the panel-off fade that the power button uses) have
-  to be rebased onto the mondrian framebuffer driver when they are needed.
+  (`RequestPowerChange`) have to be rebased when the power button needs them.
 
 A fallback MDSS/DSI driver is only needed if the scanout ever stops.
 
 ## Boot menu and dual boot
 
-`shim/menu.c` + `shim/menu_logos.h` (rasterized by `tools/gen-menu-logos.py`
-from vector sources), preview in `docs/menu-preview.png`. Current build:
-full-screen page, one card per choice, Font Awesome apple and the Material
-bugdroid head at native size with 4-bit coverage, title/labels/countdown in
-white, selection as a ring, and a selection change repaints only the two card
-borders so the switch is immediate.
+`shim/menu.c` + `shim/menu_logos.h` (rasterized by `tools/gen-menu-logos.py`),
+preview in `docs/menu-preview.png`. Full-screen page, one card per choice,
+selection as a ring; a selection change repaints only the two card borders.
 
 **Keys (SPMI).** The arbiter is version 7: observer channel stride `0x20`,
-APID map at `core+0x2000+4n`, owner table at `cnfg+4n`. The status bits:
-`KPDPWR` = bit 7 (power), `RESIN` = bit 6 (volume down — which is why the tree
-has no `vol_down` gpio node), volume up = PM8350 GPIO6 on its own peripheral
-page `0x8d`, level bit 0, held LOW. A PMIC gpio is its own peripheral page
-(`0x88 + index - 1`), so do not map an index without the page table. The PON
-node has no `__symbols__` label on these trees; find it by the compatible
-string containing `pon`. Rising edges drive the menu, so one press does not
-cycle twice; bit 0 rising confirms.
+APID map at `core+0x2000+4n`, owner table at `cnfg+4n`. `KPDPWR` is bit 7
+(power), `RESIN` bit 6 (volume down — hence no `vol_down` node), volume up is
+PM8350 GPIO6 on peripheral page `0x8d`, level bit 0, held LOW. A PMIC gpio is
+its own page (`0x88 + index - 1`), so do not map an index without the table.
+The PON node has no `__symbols__` label; find it by the `pon` compatible.
+Rising edges drive the menu, so one press does not cycle twice.
 
 When the probe refuses it prints `spmi code N ver XXXXXXXX` (1 no arbiter,
 2 reg-names, 3 regions, 4 missing, 5 count, 6 no pon, 7 pon ppid, 8 pon apid,
 9 no gpios, 10 gpio ppid, 11 gpio apid, 12 vol_up phandle), so one photo names
 the defect.
 
-**Phases.** v0–v0.4 (draw, then keys) are done. Next: reboot from inside the
-kernel (the shim already does `PSCI_SYSTEM_RESET` + `PSHOLD` + restart reason
-in IMEM; a "MACH Reboot" still hangs, so validate the WDT reset first), then
-the A/B switch through the 4 KiB `misc` BCB — unproven with this ABL, and
-`shim/ufs.c` is read-only SCSI, so a WRITE(10) there might do the whole
-switch without the kernel. `boot_a` stays untouched at all times:
-`fastboot boot` (power + volume down) is the rescue path.
+**Phases.** v0–v0.4 (draw, keys) are done. Next: reboot from the kernel, then
+the A/B switch through the `misc` BCB; `boot_a` stays untouched and
+`fastboot boot` is the rescue path.
 
 ## Other ports worth reading
 
-- **`UniXNU/UniXNU`** — iOS *and* macOS on non-Apple arm64, same xnu-8796.141.3
-  and the same 4 KiB pages. Its `native-4k-bootstrap-capacity.patch` is the
-  `pmap_map_bd` fix now merged into `0001`; `native-4k-user-abi.patch` is for
-  later (four places where XNU hardcodes 16K decide what userspace sees). It
-  also documents the UFS LU wake used by `0082`.
-- **Bergamota / Chlorophyll / HackiOS** — Bergamota documents a working CPU
-  fallback; Chlorophyll targets Adreno 630. HackiOS's iOS 16.5 hook disables
-  containermanagerd personas; `0106` redoes this for 20H392 with runtime method
-  checks, not borrowed shared-cache offsets.
-- **`palazik/ios-dodge`** — patch-per-lesson series: local TLB flush, timer
-  quiesce, *do not touch* `CNTP_CTL_EL0` at handover, physmap alignment
-  padding, framebuffer block-descriptor alignment.
+- **`UniXNU/UniXNU`** — iOS and macOS on non-Apple arm64, same xnu; its
+  bootstrap-capacity patch is in `0001` and it documents the UFS LU wake.
+- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, Adreno 630, and the
+  iOS 16.5 persona hook that `0106` redoes for 20H392.
+- **`palazik/ios-dodge`** — patch-per-lesson: local TLB flush, timer quiesce,
+  *do not touch* `CNTP_CTL_EL0` at handover, framebuffer alignment.
 - **`mytiantian001/iPadOS-nabu`** — same CPU generation; `cpus=1` as the safe
-  default, and the 4 MiB persistent ring at the end of `userdata` readable
-  from recovery.
-- **`MakrSas/ios-topaz`** — boots to the home screen on SM6225; its walls are
-  the missing SGI/timer interrupt (fixed by preparing the GIC in the shim)
-  and ARMv8.0 without LSE/RCpc (needs an emulation path for the userland).
-- **`Gsjsjzhznsz/ios-raphael`** — reaches the lock screen; a CPU `compatible`
-  mismatch hung its bootstrap, and a DWC31 USB hang is the class of bug the
-  USB port will meet.
-- **`Log1nYT/ios-sweet` (venus)** — 23 patches past the sweet series: DWC3
-  probe with GCC clock gates, SPI touch on a QUP, PMIC keys, real battery over
-  SPMI, and echoing the previous boot's log into the console.
+  default and the persistent ring at the end of `userdata`.
+- **`MakrSas/ios-topaz`** — home screen on SM6225; walls: SGI/timer and the
+  ARMv8.0 LSE/RCpc emulation.
+- **`Gsjsjzhznsz/ios-raphael`**, **`Log1nYT/ios-sweet`** — lock screen; CPU
+  `compatible` match, DWC3 clocks and the SPI touch/PMIC keys.
 
 ## Sweet (upstream) notes
 
-The sweet half of this fork is the working reference: stock bootloader →
-`fastboot boot` → shim → XNU → UFS → HFS+ root in `userdata` → launchd →
-backboardd + SpringBoard. Its patch series in `xnu/patches/` is the source for
-every generic piece this port reuses, and its README documents the boot
-arguments, the iOS root image build and the diagnostic patches. `main` in this
-fork is fully absorbed into the upstream history and is kept only as the
-upstream/sweet reference — never the target of work.
+The sweet half is the working reference: stock bootloader → shim → XNU → UFS →
+HFS+ root → launchd → SpringBoard. Its series in `xnu/patches/` is the source
+for the generic pieces; `main` is kept only as that reference.
