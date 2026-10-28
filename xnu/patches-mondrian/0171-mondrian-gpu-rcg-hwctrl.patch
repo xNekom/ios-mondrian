@@ -1,0 +1,30 @@
+xnu 0171: put the hub/gmu RCGs in hardware-control mode
+
+gpucc-waipio marks gpu_cc_hub_clk_src and gpu_cc_gmu_clk_src
+HW_CLK_CTRL_MODE and clk-rcg2 ors CFG_HW_CLK_CTRL_MASK (bit 20) into
+the config, handing the clock to the AO/DCVS. Our config cleared it, so
+the hardware never owned the clock; with the RPMh votes in place, set
+the bit and let the AO run the hub and the GMU.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -50,6 +50,7 @@
+ #define RCG_UPDATE		(1u << 0)
+ #define RCG_ROOT_EN		(1u << 1)
+ #define RCG_ROOT_OFF		(1u << 31)
++#define RCG_HW_CLK_CTRL		(1u << 20)	/* HW_CLK_CTRL_MODE: AO owns it */
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+ #define GPUCC_CXO_CLK		0x9144
+@@ -101,7 +102,11 @@
+ 	uint32_t v;
+ 	int i;
+ 
+-	mondrian_gpu_write(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
++	/* The GPUCC hub and gmu RCGs are HW_CLK_CTRL_MODE: the config carries
++	 * the hardware-control bit so the AO/DCVS can run the clock once the
++	 * rails are voted. */
++	mondrian_gpu_write(gpucc, cmd + 4,
++	    (src << 8) | (2 * div - 1) | RCG_HW_CLK_CTRL);
+ 	v = mondrian_gpu_read(gpucc, cmd);
+ 	mondrian_gpu_write(gpucc, cmd, v | RCG_UPDATE);
+ 	for (i = 0; i < 100; i++) {
