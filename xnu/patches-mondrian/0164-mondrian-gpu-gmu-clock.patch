@@ -1,0 +1,105 @@
+xnu 0164: enable the GMU clock before touching the GMU (gpupower=1)
+
+The 0163 boot hung at the console: reading the GMU registers with its
+own clock gate off is the likely cause (CX on does not enable the GMU
+branch). Set the GMU RCG to 200 MHz from GPLL0 (src 5, div 3), enable
+the CX_GMU branch and delay 10 us before any GMU access. Also gate each
+read behind its own boot argument (gmuread, zapread) so the next hang
+says which block it was.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -32,6 +32,9 @@
+ #define GPUCC_CX_GDSCR		0x9108u
+ #define GPUCC_CX_HW_CTRL	0x953cu
+ #define GPUCC_CX_APB_CLK	0x912cu
++#define GPUCC_GMU_CLK_SRC	0x9318u
++#define GPUCC_CX_GMU_CLK	0x913cu
++#define RCG_UPDATE		(1u << 0)
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+ #define GPUCC_CXO_CLK		0x9144
+@@ -75,7 +78,25 @@
+  * controller status at 0x953c bit 31 for 2 ms. CX holds the GMU; GX (the 3D
+  * core) belongs to the GMU on a7xx and is not touched here.
+  */
++/* The GMU RCG: the divisor goes to cmd+4, then the UPDATE bit is pulsed. */
+ static void
++mondrian_gpu_rcg(vm_offset_t gpucc, uint32_t cmd, uint32_t src, uint32_t div)
++{
++	uint32_t v;
++	int i;
++
++	mondrian_gpu_write(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
++	v = mondrian_gpu_read(gpucc, cmd);
++	mondrian_gpu_write(gpucc, cmd, v | RCG_UPDATE);
++	for (i = 0; i < 100; i++) {
++		if ((mondrian_gpu_read(gpucc, cmd) & RCG_UPDATE) == 0) {
++			break;
++		}
++		delay(10);
++	}
++}
++
++static void
+ mondrian_gpu_power(vm_offset_t gpucc)
+ {
+ 	uint32_t gdscr = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
+@@ -110,12 +131,25 @@
+ 	printf("MONDRIAN GPU: power cx gdscr 0x%x hw 0x%x after %d us\n",
+ 	    mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR),
+ 	    mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL), waited);
++	/*
++	 * The GMU has its own clock gate inside CX: 200 MHz from GPLL0 (src 5,
++	 * div 3) and the CX_GMU branch. Reading its registers with the gate off
++	 * is the access that hung the last boot, so enable it here, before any
++	 * GMU read.
++	 */
++	mondrian_gpu_rcg(gpucc, GPUCC_GMU_CLK_SRC, 5, 3);
++	mondrian_gpu_write(gpucc, GPUCC_CX_GMU_CLK,
++	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK) | 1u);
++	delay(10);
++	printf("MONDRIAN GPU: gmu clk src 0x%x gmu 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_GMU_CLK_SRC),
++	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK));
+ }
+ 
+ int
+ mondrian_gpu_probe(void)
+ {
+-	int on = 0, power = 0;
++	int on = 0, power = 0, gmuread = 0, zapread = 0;
+ 	vm_offset_t gpucc, gpu, gmu, smmu;
+ 	uint32_t cx, gx, ahb, cxo;
+ 
+@@ -123,6 +157,8 @@
+ 		return 0;
+ 	}
+ 	(void)PE_parse_boot_argn("gpupower", &power, sizeof(power));
++	(void)PE_parse_boot_argn("gmuread", &gmuread, sizeof(gmuread));
++	(void)PE_parse_boot_argn("zapread", &zapread, sizeof(zapread));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
+ 	smmu = ml_io_map(MONDRIAN_SMMU_BASE, MONDRIAN_SMMU_SIZE);
+@@ -152,13 +188,15 @@
+ 		printf("MONDRIAN GPU: smmu idr0 0x%x idr1 0x%x idr2 0x%x\n",
+ 		    mondrian_gpu_read(smmu, 0x0), mondrian_gpu_read(smmu, 0x4),
+ 		    mondrian_gpu_read(smmu, 0x8));
+-		printf("MONDRIAN GPU: gmu reset 0x%x boot 0x%x init 0x%x intr 0x%x h2g 0x%x\n",
+-		    mondrian_gpu_read(gmu, GMU_CM3_SYSRESET),
+-		    mondrian_gpu_read(gmu, GMU_CM3_BOOT_CONFIG),
+-		    mondrian_gpu_read(gmu, GMU_CM3_FW_INIT_RESULT),
+-		    mondrian_gpu_read(gmu, GMU_GMU2HOST_INTR_INFO),
+-		    mondrian_gpu_read(gmu, GMU_HOST2GMU_INTR_SET));
+-		if (zap != 0) {
++		if (gmuread != 0) {
++			printf("MONDRIAN GPU: gmu reset 0x%x boot 0x%x init 0x%x intr 0x%x h2g 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_CM3_SYSRESET),
++			    mondrian_gpu_read(gmu, GMU_CM3_BOOT_CONFIG),
++			    mondrian_gpu_read(gmu, GMU_CM3_FW_INIT_RESULT),
++			    mondrian_gpu_read(gmu, GMU_GMU2HOST_INTR_INFO),
++			    mondrian_gpu_read(gmu, GMU_HOST2GMU_INTR_SET));
++		}
++		if (zapread != 0 && zap != 0) {
+ 			printf("MONDRIAN GPU: zap %08x %08x %08x %08x\n",
+ 			    mondrian_gpu_read(zap, 0x0), mondrian_gpu_read(zap, 0x4),
+ 			    mondrian_gpu_read(zap, 0x8), mondrian_gpu_read(zap, 0xc));
