@@ -1,0 +1,70 @@
+xnu 0155: mondrianfb_fps=1 logs the swap rate once a second
+
+The UI is drawn by the CPU, so the frame rate is the number that moves
+when the renderer or the CPU clock changes. The vsync timer already runs
+at the panel rate; count the swaps and print the difference every second.
+Off by default: it is a measurement, not a feature.
+ 
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -187,6 +187,9 @@
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	uint32_t            fSwapCount;      /* swaps since start (mondrianfb_fps=1) */
++	uint32_t            fFpsLast;        /* fSwapCount one second ago */
++	bool                fFpsLog;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+@@ -237,6 +240,9 @@
+ {
+ 	PE_Video video;
+ 
++	fSwapCount = 0;
++	fFpsLast = 0;
++	fFpsLog = false;
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+@@ -274,6 +280,13 @@
+ 		return false;
+ 	}
+ 	fVsync->setTimeoutUS(MONDRIAN_FB_VSYNC_US);
++	{
++		int fps = 0;
++
++		if (PE_parse_boot_argn("mondrianfb_fps", &fps, sizeof(fps)) && fps != 0) {
++			fFpsLog = true;
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -348,6 +361,17 @@
+ 	if ((count % (MONDRIAN_FB_REFRESH_HZ * 5)) == 0) {
+ 		mondrian_sample_tick();
+ 	}
++	/*
++	 * mondrianfb_fps=1: the swap rate, once a second. The UI is drawn by
++	 * the CPU, so this is the number that moves when the renderer or the
++	 * CPU clock changes; 60 is the panel's and the iPhone X mode's rate.
++	 */
++	if (fb->fFpsLog && (count % MONDRIAN_FB_REFRESH_HZ) == 0) {
++		uint32_t swaps = fb->fSwapCount;
++
++		IOLog("MONDRIAN FB: fps %u\n", swaps - fb->fFpsLast);
++		fb->fFpsLast = swaps;
++	}
+ }
+ 
+ void
+@@ -384,6 +408,8 @@
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++
++	fSwapCount++;
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
