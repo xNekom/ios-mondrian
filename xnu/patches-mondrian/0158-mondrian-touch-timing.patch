@@ -1,0 +1,103 @@
+xnu 0158: verify the touch SPI half period and the firmware split
+
+The bit-bang asked for 800 ns a half period and got 103 us because the
+tick count came from ml_get_timebase(); 0156 fixes the conversion. Print
+the last SPI frame with the timebase value, the cost of a raw TLMM read
+and of mach_absolute_time (per access), and split every firmware section
+into the 4 KB write and the ack wait. A correct boot shows the frame at
+tens of microseconds and write/ack in the hundreds of milliseconds.
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -988,6 +988,8 @@
+ #define MONDRIAN_FW_HOLD_CPU_R		0x00002000u
+ 
+ static uint8_t mondrian_fw[MONDRIAN_FW_MAX];
++/* 0158: where the firmware load spends its time, in mach ticks. */
++static uint64_t mondrian_fw_write_ticks, mondrian_fw_ack_ticks;
+ static uint8_t mondrian_fw_packet[MONDRIAN_FW_CHUNK + 8];
+ static uint8_t mondrian_fw_tx[MONDRIAN_FW_CHUNK + 9];
+ 
+@@ -1063,6 +1065,7 @@
+ 	uint8_t cmd[16];
+ 	uint32_t sum = 0, i;
+ 	int tries;
++	uint64_t began = mach_absolute_time(), done;
+ 
+ 	for (i = 0; i < len; i += 2) {
+ 		sum += (uint32_t)data[i] | ((uint32_t)data[i + 1] << 8);
+@@ -1075,6 +1078,9 @@
+ 	if (mondrian_fw_write_big(MONDRIAN_FW_BUF_REG, mondrian_fw_packet, len + 4) < 0) {
+ 		return -1;
+ 	}
++	done = mach_absolute_time();
++	mondrian_fw_write_ticks += done - began;
++	began = done;
+ 	for (i = 0; i < sizeof(cmd); i++) {
+ 		cmd[i] = 0;
+ 	}
+@@ -1108,10 +1114,12 @@
+ 	for (tries = 0; tries < 20; tries++) {
+ 		(void)mondrian_goodix_read(MONDRIAN_FW_CMD_REG, cmd, sizeof(cmd));
+ 		if (cmd[1] == 0xee && cmd[0] == 0xee) {
++			mondrian_fw_ack_ticks += mach_absolute_time() - began;
+ 			return 0;
+ 		}
+ 		delay(10000);
+ 	}
++	mondrian_fw_ack_ticks += mach_absolute_time() - began;
+ 	return -1;
+ }
+ 
+@@ -1209,6 +1217,10 @@
+ 	}
+ 
+ 	for (i = 1; i < count; i++) {
++		uint64_t ns;
++
++		mondrian_fw_write_ticks = 0;
++		mondrian_fw_ack_ticks = 0;
+ 		for (off = 0; off < size[i]; off += MONDRIAN_FW_CHUNK) {
+ 			chunk = MIN(MONDRIAN_FW_CHUNK, size[i] - off);
+ 			if (mondrian_fw_package((uint8_t)type[i],
+@@ -1217,8 +1229,11 @@
+ 				return -1;
+ 			}
+ 		}
+-		printf("MONDRIAN TOUCH: section %u type %u at 0x%x, %u bytes\n",
+-		    i, type[i], addr[i], size[i]);
++		absolutetime_to_nanoseconds(mondrian_fw_write_ticks, &ns);
++		printf("MONDRIAN TOUCH: section %u type %u at 0x%x, %u bytes: write %llu ms",
++		    i, type[i], addr[i], size[i], ns / 1000000ull);
++		absolutetime_to_nanoseconds(mondrian_fw_ack_ticks, &ns);
++		printf(", ack %llu ms\n", ns / 1000000ull);
+ 		mondrian_log_flush_now();
+ 	}
+ 	mondrian_touch_update_reset();
+@@ -1437,7 +1452,27 @@
+ 	}
+ 	printf("MONDRIAN TOUCH: confirm %s rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 	    same ? "ok" : "bad", rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
++	{
++		uint64_t began, ns;
++		uint32_t n;
+ 
++		absolutetime_to_nanoseconds(mondrian_spi_frame_ticks, &ns);
++		printf("MONDRIAN TOUCH: spi last frame %llu us, spi_hz %llu\n",
++		    ns / 1000ull, mondrian_spi_hz);
++		began = mach_absolute_time();
++		for (n = 0; n < 1000; n++) {
++			(void)mondrian_tlmm_read_raw(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		printf("MONDRIAN TOUCH: bench tlmm read %llu ns\n", ns / 1000ull);
++		began = mach_absolute_time();
++		for (n = 0; n < 1000; n++) {
++			(void)mach_absolute_time();
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		printf("MONDRIAN TOUCH: bench timebase %llu ns\n", ns / 1000ull);
++	}
++
+ 	for (j = 0; j < sizeof(id); j++) {
+ 		id[j] = 0;
+ 	}
