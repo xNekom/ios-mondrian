@@ -49,10 +49,15 @@ the path this port follows.
 - **CX**: `gpupower=1` clears `SW_COLLAPSE` at `0x9108` and the hardware
   status at `0x953c` goes to `0x80001fe0`: CX is on. The kgsl-SMMU answers
   `idr0 0x2f0406`. A normal boot is untouched (`gpu=0`).
-- **Clocks**: the GMU RCG reads back `0x505` (GPLL0/3 = 200 MHz) and the
-  HUB RCG `0x507` (GPLL0/4 = 150 MHz), but the GPUCC AHB branch (`0x911c`)
-  stays 0 and every GMU register reads **`0xdeafbead`**: the sentinel for a
-  block that is not clocked. `GENERAL_9`/`GENERAL_10` reads hang.
+- **Clocks**: the GCC GPU gates are on (`0x62000` bits 15/16, `0x81010`,
+  `0x81018`), the GMU RCG reads `0x505` (GPLL0/3 = 200 MHz), the HUB RCG
+  `0x507` (GPLL0/4 = 150 MHz) with `CMD_ROOT_EN` set, but the GPUCC AHB
+  branch (`0x911c`) still reads 0 and every GMU register reads
+  **`0xdeafbead`**: the sentinel for a block that is not clocked.
+  `GENERAL_9`/`GENERAL_10` reads hang. The AHB branch not taking the enable
+  is the current wall; the next step is the vendor `kgsl_pwrctrl` /
+  `adreno_gen7` power order (and a clk/register dump from a running
+  Android), not more bit guessing.
 - **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
   `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
   0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
