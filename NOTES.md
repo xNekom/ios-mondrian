@@ -124,7 +124,8 @@ From the live device tree (and from the shim's own dump):
 
 Partition geometry (from `fastboot getvar`): `boot` 192 MiB, `vendor_boot`
 96 MiB, `recovery` 100 MiB, `misc` 4 MiB (holds the A/B BCB), `vbmeta`
-0x20000, `dtbo` 0x1800000, `userdata` on LUN 0 starting at block `0x2f8a00`.
+0x20000, `dtbo` 0x1800000, `userdata` on LUN 0 starting at block `0x2f8a00`;
+the temporary Android split and its exact restore are in `docs/DUAL_BOOT.md`.
 This device has **no `init_boot`**.
 
 ## Traps already paid for
@@ -170,8 +171,7 @@ time:
 | `LOADER ramdisk overlaps kernel memory` | `virt_base` must sit one L2 block (32 MiB) below the text, so the kernel image reaches past a fixed 32 MiB scratch offset and the ramdisk copy overwrites the payload it reads from | `shim/loader.c` (unpack at the top of the window) |
 | no console at all after the shim | the granule is `BOARD_PG_SHIFT`: TCR TG0/TG1, 2048-entry tables, 32 MiB blocks | `shim/board.h`, `shim/mmu.c` |
 
-The 4 KiB era left `0056` (commpage), `0057` (zone map VA) and `0062` (32 MiB
-low-globals reservation) in the series; they still apply and are harmless.
+The 4 KiB era left `0056`/`0057`/`0062` (commpage, zone map VA, 32 MiB low globals); they still apply.
 
 **Instructions the platform does not have.** The kernel was once built with
 `-march=armv8.5-a+crypto`, which emits 226 RCpc `ldapr`s; this board's cores do

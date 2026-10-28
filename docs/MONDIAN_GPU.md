@@ -57,20 +57,41 @@ them has Metal. That is the path this port follows.
   `gpu_cc_hub_clk_src` carries `HW_CLK_CTRL_MODE`, so the **hardware
   (AO/RPMh) owns the hub clock**. `0170`-`0172` now vote `mx.lvl`/`cx.lvl` in
   RPMh and put the hub/gmu RCGs in `HW_CLK_CTRL_MODE`: the CPU-side sequence
-  matches the vendor's, and the AO still does not enable the hub. Next: read
-  the AO/RSC state in XNU, or capture a live Android boot (needs a repartition
-  and a rooted/debug build; the 64 GiB split is undone), then the GMU firmware.
+  matches the vendor's, and the AO still does not enable the hub. The live
+  Android capture (below) names the missing parent: the GX rail is PM8350C
+  **S2** (`pm8350c_s2_gfx_voter_level`). The ARC batch in `0175` votes
+  `mx.lvl`, `cx.lvl` and `gfx.lvl`; next enable S2, then the GX domain
+  (`0x99504`), then the hub/GMU.
 - **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
   `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
   0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
   `GENERAL_8/9/10 0x1f9cd/0x1f9ce/0x1f9cf`, `ITCM 0x1b400`, `DTCM 0x1c400`.
-- **Firmware**: `/vendor/firmware` carries `gmu_gen70000.bin` (57 KiB)
-  only; `a730_sqe.fw` and `a730_zap.mdt` (what the vendor dmesg asks for)
-  are not there and have to come from the stock ROM or `imagefv`.
-- **Next**: the GMU firmware blocks (`{addr,size,type,value,data}` into
-  ITCM/DTCM), `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8,
-  `HFI_CTRL_INIT`, and the GMU SMMU context (CB5) for the HFI queue and the
-  VRB.
+- **Firmware**: Android's `/vendor/firmware` carries `gmu_gen70000.bin`
+  (57 KiB), `a730_sqe.fw` (74 KiB) and `a730_zap.mdt/b00/b01/b02` (the ZAP
+  shader); the iOS root has only the first. Add the rest to the root image
+  before the GMU load. Android's direct load fails with `-2` and falls back to
+  the sysfs helper, which is why the vendor UI still works.
+- **Next**: enable PM8350C S2 (the GX parent) and the GX domain, then the GMU
+  firmware blocks (`{addr,size,type,value,data}` into ITCM/DTCM),
+  `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8, `HFI_CTRL_INIT`, and the GMU
+  SMMU context (CB5) for the HFI queue and the VRB.
+
+## Android capture (2026-10-28)
+
+A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug
+(`lineage_mondrian-userdebug`, Android 17) on the 5.10.269 GKI kernel, with
+the vendor GPU modules `gpucc-waipio.ko`, `gdsc-regulator.ko`,
+`qcom_rpmh.ko` and `icc-rpmh.ko`. Measured:
+
+- kgsl `Adreno730v3`, idle 285 MHz, OPPs 220-900 MHz, `gmu_ab 0x0a30`.
+- `gpu_cc_gx_gdsc` is supplied by `pm8350c_s2_gfx_voter_level` (PM8350C S2,
+  an ARC regulator); `gpu_cc_cx_gdsc` by `pm8350c_s6_level`.
+- The GX GDSC has `domain-addr 0x99504`, `sw-reset 0x99058/0x99358/0x9958c`
+  and `clamp 0x9060`; the vendor `gdsc-regulator` asserts/deasserts reset and
+  clamp, writes 0 to the domain register and only then clears `SW_COLLAPSE`.
+  The earlier domain write hung because S2 was off.
+- The kernel has no `debugfs` and recovery has no `/dev/mem`, so the GPUCC
+  registers cannot be read from Android; the sequence above is the reference.
 
 ## Port steps
 

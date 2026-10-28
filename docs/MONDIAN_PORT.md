@@ -97,6 +97,10 @@ Written — the allow-list; everything else is off:
 | `init_boot`, `recovery` | untouched so far (this device has no `init_boot`) | the same safeguards whenever a write is needed |
 | `userdata` | the iOS root | erasing Android user data here is acceptable and recoverable; `tools/flash-root.sh` writes it and asks first |
 
+On 2026-10-28 `boot_b` held Lineage userdebug and the iOS image ran from
+`fastboot boot`; the temporary Android split and its exact restore are in
+`docs/DUAL_BOOT.md`.
+
 Repeated volatile `fastboot boot` runs — including failures and panics — touch
 no partition, and a slot switch only marks state.
 
