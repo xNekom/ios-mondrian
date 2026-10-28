@@ -5,6 +5,7 @@
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/thread_state.h>
+#import <mach/thread_info.h>
 #import <dlfcn.h>
 #import <xpc/xpc.h>
 
@@ -64,47 +65,116 @@ heartbeat(void *unused)
 
 static mach_port_t mondrian_main_thread = MACH_PORT_NULL;
 
+/*
+ * B: a periodic sampler of the main thread. Every five seconds it takes 200
+ * stacks a millisecond apart, counts every return address and prints the six
+ * hottest symbols plus the thread's cpu_usage and run_state. That separates
+ * "the main thread is busy in the rasterizer" (high cpu, hot CA symbols) from
+ * "it waits" (low cpu) without Instruments. The sampling itself costs about
+ * 200 ms of a helper thread every five seconds.
+ */
+#define MONDRIAN_HOT_MAX		256
+#define MONDRIAN_SAMPLE_BURST	200
+
+struct mondrian_hot {
+	uint64_t addr;
+	uint32_t count;
+};
+
+static struct mondrian_hot mondrian_hot[MONDRIAN_HOT_MAX];
+static int mondrian_hot_count;
+
 static void
-sample_main_thread(void)
+hot_add(uint64_t addr)
+{
+	if (addr < 0x100000000ULL) {
+		return;
+	}
+	for (int i = 0; i < mondrian_hot_count; i++) {
+		if (mondrian_hot[i].addr == addr) {
+			mondrian_hot[i].count++;
+			return;
+		}
+	}
+	if (mondrian_hot_count < MONDRIAN_HOT_MAX) {
+		mondrian_hot[mondrian_hot_count].addr = addr;
+		mondrian_hot[mondrian_hot_count].count = 1;
+		mondrian_hot_count++;
+	}
+}
+
+static mach_port_t mondrian_target_thread = MACH_PORT_NULL;
+
+/*
+ * The main thread of backboardd/SpringBoard only waits in its run loop: the
+ * rasterizer runs in a CoreAnimation thread. Pick the busiest thread of the
+ * task (the sampler's own excluded) and sample that one.
+ */
+static mach_port_t
+busiest_thread(int *cpu_out)
+{
+	thread_act_array_t list = NULL;
+	mach_msg_type_number_t n = 0;
+	mach_port_t self = mach_thread_self();
+	mach_port_t best = MACH_PORT_NULL;
+	int best_cpu = -1;
+
+	if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) {
+		return MACH_PORT_NULL;
+	}
+	for (mach_msg_type_number_t i = 0; i < n; i++) {
+		struct thread_basic_info info;
+		mach_msg_type_number_t icount = THREAD_BASIC_INFO_COUNT;
+
+		if (list[i] == self) {
+			continue;
+		}
+		if (thread_info(list[i], THREAD_BASIC_INFO,
+		    (thread_info_t)&info, &icount) == KERN_SUCCESS) {
+			if ((int)info.cpu_usage > best_cpu) {
+				best_cpu = (int)info.cpu_usage;
+				best = list[i];
+			}
+		}
+	}
+	/* Keep the winner, drop the rest of the array (the ports stay valid). */
+	if (best != MACH_PORT_NULL) {
+		mach_port_mod_refs(mach_task_self(), best, MACH_PORT_RIGHT_SEND, 1);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)list,
+	    n * sizeof(thread_act_t));
+	mach_port_deallocate(mach_task_self(), self);
+	if (cpu_out != NULL) {
+		*cpu_out = best_cpu;
+	}
+	return best;
+}
+
+static void
+sample_main_thread_once(mach_port_t target)
 {
 	arm_thread_state64_t state;
 	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-	char line[220];
 	uint64_t fp;
 	kern_return_t kr;
 
-	kr = thread_get_state(mondrian_main_thread, ARM_THREAD_STATE64,
+	kr = thread_get_state(target, ARM_THREAD_STATE64,
 	    (thread_state_t)&state, &count);
 	if (kr != KERN_SUCCESS) {
-		snprintf(line, sizeof(line), "MONDRIAN UI: sample failed %d\n", kr);
-		say(line);
 		return;
 	}
-	snprintf(line, sizeof(line), "MONDRIAN UI: sample pc %llx lr %llx sp %llx fp %llx\n",
-	    (unsigned long long)state.__pc, (unsigned long long)state.__lr,
-	    (unsigned long long)state.__sp, (unsigned long long)state.__fp);
-	say(line);
+	hot_add(state.__pc);
 	fp = state.__fp;
 	for (int i = 0; i < 10 && fp >= 0x100000000ULL; i++) {
 		uint64_t frame[2];
 		vm_size_t out = 0;
-		Dl_info info;
 
 		kr = vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
 		    sizeof(frame), (vm_address_t)frame, &out);
 		if (kr != KERN_SUCCESS || out != sizeof(frame) || frame[1] == 0) {
 			break;
 		}
-		if (dladdr((void *)frame[1], &info) != 0) {
-			snprintf(line, sizeof(line), "MONDRIAN UI: frame %d %llx %s %s\n",
-			    i, (unsigned long long)frame[1],
-			    info.dli_fname != NULL ? info.dli_fname : "?",
-			    info.dli_sname != NULL ? info.dli_sname : "?");
-		} else {
-			snprintf(line, sizeof(line), "MONDRIAN UI: frame %d %llx ? ?\n",
-			    i, (unsigned long long)frame[1]);
-		}
-		say(line);
+		hot_add(frame[1]);
 		fp = frame[0];
 	}
 }
@@ -113,9 +183,61 @@ static void *
 sampler(void *unused)
 {
 	(void)unused;
-	sleep(90);
-	say("MONDRIAN UI: sampling main thread\n");
-	sample_main_thread();
+	for (;;) {
+		struct thread_basic_info info;
+		mach_msg_type_number_t icount = THREAD_BASIC_INFO_COUNT;
+		char line[200];
+		int cpu = -1, run = -1;
+		int i, k;
+
+		sleep(5);
+		if (mondrian_target_thread != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), mondrian_target_thread);
+			mondrian_target_thread = MACH_PORT_NULL;
+		}
+		mondrian_target_thread = busiest_thread(&cpu);
+		if (mondrian_target_thread == MACH_PORT_NULL) {
+			say("MONDRIAN UI: no threads\n");
+			continue;
+		}
+		mondrian_hot_count = 0;
+		for (i = 0; i < MONDRIAN_SAMPLE_BURST; i++) {
+			sample_main_thread_once(mondrian_target_thread);
+			usleep(1000);
+		}
+		if (thread_info(mondrian_target_thread, THREAD_BASIC_INFO,
+		    (thread_info_t)&info, &icount) == KERN_SUCCESS) {
+			cpu = info.cpu_usage;
+			run = info.run_state;
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: sample n %d cpu %d run %d\n",
+		    mondrian_hot_count, cpu, run);
+		say(line);
+		for (k = 0; k < 6 && mondrian_hot_count > 0; k++) {
+			int best = 0;
+			Dl_info dl;
+			const char *name = "?";
+
+			for (i = 1; i < mondrian_hot_count; i++) {
+				if (mondrian_hot[i].count > mondrian_hot[best].count) {
+					best = i;
+				}
+			}
+			if (mondrian_hot[best].count < 2) {
+				break;
+			}
+			if (dladdr((void *)mondrian_hot[best].addr, &dl) != 0 &&
+			    dl.dli_sname != NULL) {
+				name = dl.dli_sname;
+			}
+			snprintf(line, sizeof(line), "MONDRIAN UI: hot %u %llx %s\n",
+			    mondrian_hot[best].count,
+			    (unsigned long long)mondrian_hot[best].addr, name);
+			say(line);
+			mondrian_hot[best].count = 0;
+		}
+	}
 	return NULL;
 }
 
