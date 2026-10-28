@@ -1,0 +1,252 @@
+xnu 0175: vote the GPU ARC rails as a batch and fix the RCG update order
+
+The vendor's gen7_rpmh votes gfx.lvl, cx.lvl and mx.lvl as one RPMh batch;
+a single command per TCS trigger is a different transaction and the RSC
+checks the corners. Add a multi-command TCS write, vote the three rails at
+the GPU OPP level 0 (gfx/cx 0x1a0, mx 0x1c0) in one trigger, and print the
+TCS command status. Fix the RCG sequence to force the root while the config
+is written (the vendor's clk_rcg2_enable order): the old order left UPDATE
+stuck at 1 and the AHB branch at 0. Drop the unaligned GENERAL_9/10 and the
+RBBM_STATUS reads, which hang the bus while the GMU/GX are off. The hub
+clock still does not run; the Android capture in docs/MONDIAN_GPU.md shows
+the GX rail is PM8350C S2 and is the next thing to enable.
+
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -53,7 +53,11 @@
+ #define RCG_ROOT_EN		(1u << 1)
+ #define RCG_ROOT_OFF		(1u << 31)
+ #define RCG_HW_CLK_CTRL		(1u << 20)	/* HW_CLK_CTRL_MODE: AO owns it */
+-#define GPUCC_GX_GDSCR		0x905c
++#define GPUCC_GX_GDSCR		0x905cu
++#define GPUCC_GX_HW_CTRL	0x9538u
++#define GPUCC_GX_RESET		0x9058u
++#define GPUCC_GX_CLAMP		0x9060u
++#define GPUCC_GX_DOMAIN		0x99504u
+ #define GPUCC_AHB_CLK		0x911c
+ #define GPUCC_CXO_CLK		0x9144
+ #define GDSC_PWR_ON		(1u << 31)
+@@ -107,23 +111,26 @@
+ 	/* The GPUCC hub and gmu RCGs are HW_CLK_CTRL_MODE: the config carries
+ 	 * the hardware-control bit so the AO/DCVS can run the clock once the
+ 	 * rails are voted. */
++	/*
++	 * The vendor's clk_rcg2_enable() forces the root on while the config
++	 * is written and the UPDATE bit is waited out, then clears it and lets
++	 * HW_CLK_CTRL_MODE (the AO) own the root. Writing the config first and
++	 * the root enable afterwards leaves UPDATE stuck at 1 and the AHB
++	 * branch at 0.
++	 */
++	v = mondrian_gpu_read(gpucc, cmd);
++	mondrian_gpu_write(gpucc, cmd, v | RCG_ROOT_EN);
+ 	mondrian_gpu_write(gpucc, cmd + 4,
+ 	    (src << 8) | (2 * div - 1) | RCG_HW_CLK_CTRL);
+-	v = mondrian_gpu_read(gpucc, cmd);
+-	mondrian_gpu_write(gpucc, cmd, v | RCG_UPDATE);
+-	for (i = 0; i < 100; i++) {
++	mondrian_gpu_write(gpucc, cmd, v | RCG_ROOT_EN | RCG_UPDATE);
++	for (i = 0; i < 500; i++) {
+ 		if ((mondrian_gpu_read(gpucc, cmd) & RCG_UPDATE) == 0) {
+ 			break;
+ 		}
+-		delay(10);
++		delay(1);
+ 	}
+-	/*
+-	 * The shared RCGs also need their root enabled (CMD_ROOT_EN, bit 1);
+-	 * the update alone leaves the branch with no clock and the GPUCC AHB
+-	 * never enables. ROOT_OFF (bit 31) clears once the root runs.
+-	 */
+-	v = mondrian_gpu_read(gpucc, cmd);
+-	mondrian_gpu_write(gpucc, cmd, v | RCG_ROOT_EN);
++	mondrian_gpu_write(gpucc, cmd,
++	    mondrian_gpu_read(gpucc, cmd) & ~RCG_ROOT_EN);
+ 	for (i = 0; i < 100; i++) {
+ 		if ((mondrian_gpu_read(gpucc, cmd) & RCG_ROOT_OFF) == 0) {
+ 			break;
+@@ -136,27 +143,30 @@
+ extern uint32_t mondrian_cmd_db_addr(const char *id);
+ extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
+ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
++extern int mondrian_rpmh_write_batch(const uint32_t *addr, const uint32_t *data, uint32_t n);
+ 
+ /*
+  * The GPUCC hub clock is hardware-controlled (HW_CLK_CTRL_MODE): the AO
+  * keeps it off until the GPU rails are voted in RPMh. The cmd-db carries
+- * the ARC level table of each rail; vote MX (the parent supply) then CX at
+- * the highest level before any GPUCC access.
++ * the ARC level table of each rail; vote MX (the parent supply), CX and the
++ * GX rail (gfx.lvl) at the highest level before any GPUCC access. The vendor
++ * votes all three (`adreno_gen7_rpmh.c`); without gfx.lvl the AO leaves the
++ * GX domain and the GPUCC hub off.
+  */
+ static void
+ mondrian_gpu_vote_rails(void)
+ {
+-	static const char *rails[] = { "mx.lvl", "cx.lvl" };
+-	uint32_t r;
++	static const char *rails[] = { "mx.lvl", "cx.lvl", "gfx.lvl" };
++	uint32_t addr[3], data[3], n = 0, r;
+ 
+ 	for (r = 0; r < sizeof(rails) / sizeof(rails[0]); r++) {
+ 		uint32_t len = 0;
+-		uint32_t addr = mondrian_cmd_db_addr(rails[r]);
++		uint32_t a = mondrian_cmd_db_addr(rails[r]);
+ 		const uint16_t *tbl = mondrian_cmd_db_data(rails[r], &len);
+ 		uint16_t max = 0;
+ 		uint32_t i;
+ 
+-		if (addr == 0 || tbl == NULL || len < 2) {
++		if (a == 0 || tbl == NULL || len < 2) {
+ 			printf("MONDRIAN GPU: rail %s missing\n", rails[r]);
+ 			continue;
+ 		}
+@@ -165,10 +175,24 @@
+ 				max = tbl[i];
+ 			}
+ 		}
+-		printf("MONDRIAN GPU: rail %s addr 0x%x n %u max 0x%x\n",
+-		    rails[r], addr, len / 2, max);
+-		(void)mondrian_rpmh_write_one(addr, max);
++		/*
++		 * The GPU OPP level 0 pairs gfx 0x1a0 with cx 0x1a0
++		 * (qcom,cx-level in the live DT); the CX table's maximum
++		 * (0x1c0) is a corner the GPU table never asks for.
++		 */
++		if (strcmp(rails[r], "cx.lvl") == 0) {
++			max = 0x1a0;
++		}
++		printf("MONDRIAN GPU: rail %s addr 0x%x n %u vote 0x%x\n",
++		    rails[r], a, len / 2, max);
++		addr[n] = a;
++		data[n] = max;
++		n++;
+ 	}
++	if (n != 0) {
++		printf("MONDRIAN GPU: rpmh batch %u\n", n);
++		(void)mondrian_rpmh_write_batch(addr, data, n);
++	}
+ }
+ 
+ static void
+@@ -245,14 +269,15 @@
+ 	 * RCG (0x93ec) and the HUB AHB divider (0x9430). The GMU register
+ 	 * slave is behind that AHB, which is why the first GMU read hung.
+ 	 */
+-	mondrian_gpu_rcg(gpucc, GPUCC_HUB_CLK_SRC, 5, 4);   /* GPLL0 / 4 = 150 MHz */
++	mondrian_gpu_rcg(gpucc, GPUCC_HUB_CLK_SRC, 6, 2);   /* GPLL0_OUT_MAIN_DIV / 2 = 150 MHz (table entry) */
+ 	mondrian_gpu_write(gpucc, GPUCC_HUB_AHB_DIV, 0);    /* /1 */
+ 	mondrian_gpu_write(gpucc, GPUCC_HUB_AON_CLK,
+ 	    mondrian_gpu_read(gpucc, GPUCC_HUB_AON_CLK) | 1u);
+ 	mondrian_gpu_write(gpucc, GPUCC_AHB_CLK,
+ 	    mondrian_gpu_read(gpucc, GPUCC_AHB_CLK) | 1u);
+ 	delay(10);
+-	printf("MONDRIAN GPU: hub cfg 0x%x div 0x%x ahb 0x%x aon 0x%x\n",
++	printf("MONDRIAN GPU: hub cmd 0x%x cfg 0x%x div 0x%x ahb 0x%x aon 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_HUB_CLK_SRC),
+ 	    mondrian_gpu_read(gpucc, GPUCC_HUB_CLK_SRC + 4),
+ 	    mondrian_gpu_read(gpucc, GPUCC_HUB_AHB_DIV),
+ 	    mondrian_gpu_read(gpucc, GPUCC_AHB_CLK),
+@@ -333,10 +358,11 @@
+ 			printf("MONDRIAN GPU: gmu hfi 0x%x\n",
+ 			    mondrian_gpu_read(gmu, GMU_HFI_CTRL_STATUS));
+ 			mondrian_log_flush_now();
+-			printf("MONDRIAN GPU: gmu g9 0x%x g10 0x%x\n",
+-			    mondrian_gpu_read(gmu, GMU_GENERAL_9),
+-			    mondrian_gpu_read(gmu, GMU_GENERAL_10));
+-			mondrian_log_flush_now();
++			/*
++			 * GMU_GENERAL_9/10 (0x1f9ce/0x1f9cf) are unaligned
++			 * 32-bit reads and hang the bus while the GMU is off.
++			 * Leave them out until the block is clocked.
++			 */
+ 		}
+ 		if (zapread != 0 && zap != 0) {
+ 			printf("MONDRIAN GPU: zap %08x %08x %08x %08x\n",
+@@ -344,13 +370,11 @@
+ 			    mondrian_gpu_read(zap, 0x8), mondrian_gpu_read(zap, 0xc));
+ 		}
+ 	}
+-	if ((gx & GDSC_PWR_ON) != 0) {
+-		gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+-		if (gpu != 0) {
+-			printf("MONDRIAN GPU: rbmm status 0x%x\n",
+-			    mondrian_gpu_read(gpu, GPU_RBBM_STATUS));
+-		}
+-	}
++	/*
++	 * Do not read RBBM_STATUS here: GX power-on only says the GDSC is up,
++	 * the GX clock may still be off, and an unclocked GPU register read
++	 * hangs the interconnect (the boot thread is running this probe).
++	 */
+ 	printf("MONDRIAN GPU: probe done\n");
+ 	return 0;
+ }
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -594,6 +594,63 @@
+ }
+ 
+ /*
++ * Several single-word commands in one TCS trigger. The GPU's gfx/cx/mx ARC
++ * votes are sent as a batch by the vendor (rpmh_write_batch), and the RSC
++ * checks the corners of a batch; one command per trigger is not the same
++ * transaction. Returns 0 if every command reported success.
++ */
++int
++mondrian_rpmh_write_batch(const uint32_t *addr, const uint32_t *data, uint32_t n)
++{
++	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
++	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
++	    MONDRIAN_CMD_MSGID_RESP;
++	uint32_t i, ctrl, mask = 0;
++	int error = 0;
++
++	if (rsc == 0 || n == 0 || n > 8) {
++		return -1;
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0);
++	for (i = 0; i < n; i++) {
++		uint32_t off = i * MONDRIAN_RSC_CMD_STEP;
++
++		mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID + off, msgid);
++		mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR + off, addr[i]);
++		mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA + off, data[i]);
++		mask |= 1u << i;
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, mask);
++	__builtin_arm_dsb(0xf);
++	ctrl = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL);
++	ctrl &= ~MONDRIAN_TCS_AMC_TRIGGER;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	ctrl &= ~MONDRIAN_TCS_AMC_ENABLE;
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, ctrl);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL, MONDRIAN_TCS_AMC_ENABLE);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    MONDRIAN_TCS_AMC_ENABLE | MONDRIAN_TCS_AMC_TRIGGER);
++	__builtin_arm_dsb(0xf);
++	for (i = 0; i < 1000000; i++) {
++		if ((mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_ENABLE) & mask) == 0) {
++			break;
++		}
++	}
++	for (i = 0; i < n; i++) {
++		uint32_t off = i * MONDRIAN_RSC_CMD_STEP;
++		uint32_t status = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS + off);
++
++		if ((status & 0xff) != 0) {
++			printf("MONDRIAN RPMH: cmd %u addr 0x%x status 0x%x\n",
++			    i, addr[i], status);
++			error = -1;
++		}
++	}
++	return error;
++}
++
++/*
+  * Vote for pm8350c_l2 on through the first ACTIVE TCS. The VRM registers
+  * behind the resource address are +0x0 voltage in millivolts (the vendor
+  * driver sends DIV_ROUND_UP(uV, 1000)), +0x4 enable and +0x8 mode. The mode
