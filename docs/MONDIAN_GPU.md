@@ -44,6 +44,28 @@ the path this port follows.
   the AMFI/dyld policy that lets the GPU-backed GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
 
+## Measured bring-up state
+
+- **CX**: `gpupower=1` clears `SW_COLLAPSE` at `0x9108` and the hardware
+  status at `0x953c` goes to `0x80001fe0`: CX is on. The kgsl-SMMU answers
+  `idr0 0x2f0406`. A normal boot is untouched (`gpu=0`).
+- **Clocks**: the GMU RCG reads back `0x505` (GPLL0/3 = 200 MHz) and the
+  HUB RCG `0x507` (GPLL0/4 = 150 MHz), but the GPUCC AHB branch (`0x911c`)
+  stays 0 and every GMU register reads **`0xdeafbead`**: the sentinel for a
+  block that is not clocked. `GENERAL_9`/`GENERAL_10` reads hang.
+- **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
+  `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
+  0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
+  `GENERAL_8/9/10 0x1f9cd/0x1f9ce/0x1f9cf`, `ITCM 0x1b400`, `DTCM 0x1c400`.
+- **Firmware**: `/vendor/firmware` carries `gmu_gen70000.bin` (57 KiB)
+  only; `a730_sqe.fw` and `a730_zap.mdt` (what the vendor dmesg asks for)
+  are not there and have to come from the stock ROM or `imagefv`.
+- **Next**: port the vendor clock order (`kgsl_pwrctrl` enables the GCC
+  AXI clocks and the GPUCC hub/AHB branches; ours only touches GPUCC), then
+  the GMU firmware blocks (`{addr,size,type,value,data}` into ITCM/DTCM),
+  `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8, `HFI_CTRL_INIT`, and the
+  GMU SMMU context (CB5) for the HFI queue and the VRB.
+
 ## Port steps
 
 1. Import the topaz kernel GPU/display patches (`0900`-`0947`; `SweetSurface`
