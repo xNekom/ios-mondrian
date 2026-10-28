@@ -295,11 +295,10 @@ MONDRIAN = Board(
     # phone itself.
     provisional=frozenset(),
     # The boot arguments are the ones sweet uses, with the framebuffer
-    # arguments renamed for this board.
-    # cpus=1: the kernel starts the other cores through PSCI, and the shim
-    # does not implement that call yet, so the first bring-up wants a single
-    # core (what the QEMU run does too, its tree has one cpu node).
-    cmdline=('debug=0xc serial=3 cpus=8 cpufreq=1 keepsyms=1 -enable_kprintf_spam -noprogress '
+    # arguments renamed for this board. serial=0 keeps the boot log off the
+    # 115200-baud UART (it still goes to the ring, mondrianlog defaults on);
+    # all eight cores and the top EPSS row are the normal boot now.
+    cmdline=('debug=0xc serial=0 cpus=8 cpufreq=1 keepsyms=1 -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrian_ui_hook=7'),
