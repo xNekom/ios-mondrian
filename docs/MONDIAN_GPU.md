@@ -20,11 +20,20 @@ the path this port follows.
 
 ## Mondrian delta
 
-- GPU: **Adreno 730 (a730, a7xx)** at `3d00000.qcom,kgsl-3d0`, 220-900 MHz,
-  `msm-adreno-tz`; `gpucc` clocks, GX GDSC and RPMh votes; GMU, SQE and ZAP;
-  firmware `a730_sqe.fw`, `a730_gmu.bin`, `a730_zap.mbn` from the phone's
-  vendor firmware. The references are a6xx: the a7xx registers, GMU/ZAP/SQE
-  and the firmware are the new work.
+- GPU: **Adreno 730 (a730, a7xx)**, `qcom,gpu-model` **Adreno730v3**,
+  `qcom,chipid 0x7030002`, `qcom,ubwc-mode 4`, at `3d00000.qcom,kgsl-3d0`;
+  OPPs from 220 to 862 MHz (pwrlevel 0 = 0x33611380), `msm-adreno-tz`.
+  The live tree (measured, not guessed):
+  GPU `0x3d00000`+0x40000, GMU `0x3d68000`+0x37000 (`qcom,gen7-gmu`, PDC at
+  `0xb290000`, GMU ao at `0x3d40000`, HFI IRQ 304, GMU IRQ 305), GPUCC
+  `0x3d90000`+0xa000, GCC `0x100000`+0x1f4200, SMMU `0x3da0000`+0x40000
+  (TCU `0x3de6000`, `qcom,adreno-smmu`, 21 context banks, 24 SMRs, 3-level
+  tables), CX GDSC `0x3d99108`, GX GDSC `0x3d9905c`, GX domain `0x3d99504`,
+  GX reset `0x3d99058`, ZAP region `gpu_microcode_region` at `0x8b91a000`
+  (8 KiB). kgsl IRQ 300, frequency-limiter IRQ 286. Firmware:
+  `a730_sqe.fw`, `a730_gmu.bin`, `a730_zap.mdt/.b02` from the vendor
+  firmware. The references are a6xx: the a7xx registers, GMU/HFI, ZAP and
+  SQE preamble are the new work.
 - Display: today `mondrianfb` (the ABL framebuffer, 30 Hz). The GPU path needs
   the MDP/DSI and the IOSurface/`IOMobileFramebuffer` presentation (topaz's
   `SweetSurface`), with the iPhone X 1125x2436 canvas on the 1440x3200 panel.
