@@ -74,3 +74,14 @@ If the volume was mounted read-write after a hard reset, its attributes come
 back as `0x80004000` (mounted, journal off); rewrite `0x80000100` before the
 next boot. The HFS data itself is valid: the write count increases and the
 B-tree nodes stay valid, as measured on 2026-10-28.
+
+## Automatic capture
+
+`tools/mondrian-boot-log.sh IMAGE` does the cycle: it puts the phone in the
+bootloader, boots the image, waits for the `mondrianreset` return, boots the
+recovery, reads the last 1025 blocks of `userdata` (or `ROOT_PART=iosroot`),
+decodes them and, with `--ios IMAGE`, boots iOS again. Build the test image
+with `mondrianreset=45`; the script waits up to `--reset` plus 120 s. It
+starts from fastboot or adb, never from iOS: hold power + volume down first.
+`WORK`, `RECOVERY`, `IOS_IMAGE`, `SERIAL` and `ROOT_PART` override the
+defaults.
