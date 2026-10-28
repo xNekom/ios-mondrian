@@ -1,0 +1,40 @@
+xnu 0165: deassert the GMU reset before reading it (gpupower=1)
+
+The GMU clock now reads back configured (the config lives at cmd+4 and
+the update bit clears) and the CX_GMU branch enables, but the first GMU
+register read still hangs. The bootloader leaves the GMU block in reset;
+assert is bit 0 of the GMU BCR (0x9314), so clear it and delay 10 us
+before the read. Log the BCR and the clock config on the way.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -34,6 +34,7 @@
+ #define GPUCC_CX_APB_CLK	0x912cu
+ #define GPUCC_GMU_CLK_SRC	0x9318u
+ #define GPUCC_CX_GMU_CLK	0x913cu
++#define GPUCC_GMU_BCR		0x9314u
+ #define RCG_UPDATE		(1u << 0)
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+@@ -140,10 +141,19 @@
+ 	mondrian_gpu_rcg(gpucc, GPUCC_GMU_CLK_SRC, 5, 3);
+ 	mondrian_gpu_write(gpucc, GPUCC_CX_GMU_CLK,
+ 	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK) | 1u);
++	/*
++	 * The GMU's own reset: the bootloader leaves the block asserted. The
++	 * qcom BCR asserts with bit 0 set and deasserts with it clear.
++	 */
++	printf("MONDRIAN GPU: gmu bcr 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_GMU_BCR));
++	mondrian_gpu_write(gpucc, GPUCC_GMU_BCR,
++	    mondrian_gpu_read(gpucc, GPUCC_GMU_BCR) & ~1u);
+ 	delay(10);
+-	printf("MONDRIAN GPU: gmu clk src 0x%x gmu 0x%x\n",
+-	    mondrian_gpu_read(gpucc, GPUCC_GMU_CLK_SRC),
+-	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK));
++	printf("MONDRIAN GPU: gmu clk cfg 0x%x gmu 0x%x bcr 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_GMU_CLK_SRC + 4),
++	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK),
++	    mondrian_gpu_read(gpucc, GPUCC_GMU_BCR));
+ }
+ 
+ int
