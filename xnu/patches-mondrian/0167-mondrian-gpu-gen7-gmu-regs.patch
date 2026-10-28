@@ -1,0 +1,55 @@
+xnu 0167: read the gen7 GMU at its own offsets (gpu=1)
+
+The GMU read hung on 0x1f992/0x1f994, which are a6xx HFI registers; gen7
+moved them (HFI_CTRL_STATUS 0x1f980, HFI_CTRL_INIT 0x1f986, QTBL
+0x1f984/0x1f985, GENERAL_9/10 0x1f9ce/0x1f9cf). Read one register per
+line and flush after each, so a hang names the register instead of the
+whole group.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -49,11 +49,12 @@
+ 
+ /* GMU register offsets from the shared a6xx_gmu.xml; gen7 uses the same file
+  * with its own values, and these are the ones the CM3 boot sequence touches. */
+-#define GMU_CM3_SYSRESET	0x1f800u
++#define GMU_CM3_SYSRESET	0x1f800u	/* gen7_reg.h: same as a6xx */
+ #define GMU_CM3_BOOT_CONFIG	0x1f801u
+ #define GMU_CM3_FW_INIT_RESULT	0x1f81cu
+-#define GMU_GMU2HOST_INTR_INFO	0x1f992u
+-#define GMU_HOST2GMU_INTR_SET	0x1f994u
++#define GMU_HFI_CTRL_STATUS	0x1f980u	/* gen7: not the a6xx HFI range */
++#define GMU_GENERAL_9		0x1f9ceu
++#define GMU_GENERAL_10		0x1f9cfu
+ 
+ /* The bootloader owns the zap-shader region (8 KiB at 0x8b91a000). */
+ #define MONDRIAN_ZAP_BASE	0x08b91a000UL
+@@ -219,12 +220,23 @@
+ 		    mondrian_gpu_read(smmu, 0x0), mondrian_gpu_read(smmu, 0x4),
+ 		    mondrian_gpu_read(smmu, 0x8));
+ 		if (gmuread != 0) {
+-			printf("MONDRIAN GPU: gmu reset 0x%x boot 0x%x init 0x%x intr 0x%x h2g 0x%x\n",
+-			    mondrian_gpu_read(gmu, GMU_CM3_SYSRESET),
+-			    mondrian_gpu_read(gmu, GMU_CM3_BOOT_CONFIG),
+-			    mondrian_gpu_read(gmu, GMU_CM3_FW_INIT_RESULT),
+-			    mondrian_gpu_read(gmu, GMU_GMU2HOST_INTR_INFO),
+-			    mondrian_gpu_read(gmu, GMU_HOST2GMU_INTR_SET));
++			/* One register per line, flushed: if the block still hangs,
++			 * the last line names the register that did it. */
++			extern void mondrian_log_flush_now(void);
++
++			printf("MONDRIAN GPU: gmu reset 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_CM3_SYSRESET));
++			mondrian_log_flush_now();
++			printf("MONDRIAN GPU: gmu init 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_CM3_FW_INIT_RESULT));
++			mondrian_log_flush_now();
++			printf("MONDRIAN GPU: gmu hfi 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_HFI_CTRL_STATUS));
++			mondrian_log_flush_now();
++			printf("MONDRIAN GPU: gmu g9 0x%x g10 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_GENERAL_9),
++			    mondrian_gpu_read(gmu, GMU_GENERAL_10));
++			mondrian_log_flush_now();
+ 		}
+ 		if (zapread != 0 && zap != 0) {
+ 			printf("MONDRIAN GPU: zap %08x %08x %08x %08x\n",
