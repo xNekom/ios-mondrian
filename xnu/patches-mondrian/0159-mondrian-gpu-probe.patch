@@ -1,0 +1,124 @@
+xnu 0159: the first look at the Adreno 730 (gpu=1, read only)
+
+Nothing is powered or submitted: the probe maps GPUCC, GMU and the
+kgsl-SMMU at the addresses measured from the device tree, prints the CX
+and GX GDSCRs and the GPUCC AHB/CXO branches, and reads the SMMU ID and
+the GPU RBBM status only when the domain that owns them is already on.
+That says which domains the bootloader leaves up and whether the bases
+answer before any sequence that could wedge the interconnect. With gpu=0
+(the default) it does nothing.
+--- /dev/null
++++ b/bsd/dev/mondrian_gpu.c
+@@ -0,0 +1,89 @@
++/*
++ * MONDRIAN GPU: the first look at the Adreno 730 blocks.
++ *
++ * Boot-arg gpu=1 only. Nothing is powered on, voted or submitted here: the
++ * point is to learn which domains the bootloader leaves up and whether the
++ * register bases measured from the device tree answer at all, before any
++ * sequence that could hang the interconnect. The addresses are the live
++ * tree's (docs/MONDIAN_GPU.md), and the GPUCC offsets are the SM8475 ones
++ * from the Linux gpucc-sm8450 driver (GPU_CX_GDSCR 0x9108, GPU_GX_GDSCR
++ * 0x905c, GPU_CC_AHB_CLK 0x911c, GPU_CC_CXO_CLK 0x9144).
++ *
++ * A GDSCR with bit 31 set is powered on; bit 0 is the software collapse.
++ * The reads of the GPU and SMMU blocks happen only when the domain that
++ * owns them is already on, so a normal (gpu=0) boot is untouched and a
++ * gpu=1 boot cannot read an unclocked block.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define MONDRIAN_GPUCC_BASE	0x03d90000UL
++#define MONDRIAN_GPUCC_SIZE	0x00010000UL
++#define MONDRIAN_GPU_BASE	0x03d00000UL
++#define MONDRIAN_GPU_SIZE	0x00040000UL
++#define MONDRIAN_GMU_BASE	0x03d68000UL
++#define MONDRIAN_GMU_SIZE	0x00037000UL
++#define MONDRIAN_SMMU_BASE	0x03da0000UL
++#define MONDRIAN_SMMU_SIZE	0x00040000UL
++
++#define GPUCC_CX_GDSCR		0x9108u
++#define GPUCC_GX_GDSCR		0x905c
++#define GPUCC_AHB_CLK		0x911c
++#define GPUCC_CXO_CLK		0x9144
++#define GDSC_PWR_ON		(1u << 31)
++
++#define GPU_RBBM_STATUS		0x210u
++
++static uint32_t
++mondrian_gpu_read(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++int
++mondrian_gpu_probe(void)
++{
++	int on = 0;
++	vm_offset_t gpucc, gpu, gmu, smmu;
++	uint32_t cx, gx, ahb, cxo;
++
++	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0) {
++		return 0;
++	}
++	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
++	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
++	smmu = ml_io_map(MONDRIAN_SMMU_BASE, MONDRIAN_SMMU_SIZE);
++	if (gpucc == 0 || gmu == 0 || smmu == 0) {
++		printf("MONDRIAN GPU: map failed (gpucc 0x%lx gmu 0x%lx smmu 0x%lx)\n",
++		    (unsigned long)gpucc, (unsigned long)gmu, (unsigned long)smmu);
++		return 0;
++	}
++	cx = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
++	gx = mondrian_gpu_read(gpucc, GPUCC_GX_GDSCR);
++	ahb = mondrian_gpu_read(gpucc, GPUCC_AHB_CLK);
++	cxo = mondrian_gpu_read(gpucc, GPUCC_CXO_CLK);
++	printf("MONDRIAN GPU: gpucc cx 0x%x%s gx 0x%x%s ahb 0x%x cxo 0x%x\n",
++	    cx, (cx & GDSC_PWR_ON) ? " on" : " off",
++	    gx, (gx & GDSC_PWR_ON) ? " on" : " off", ahb, cxo);
++	/*
++	 * Only read what the domain above says is up. The GPU always-on
++	 * block (RBBM) lives in GX on a7xx and the SMMU in CX; a read of a
++	 * collapsed one is exactly the class of access that wedges the NoC.
++	 */
++	if ((cx & GDSC_PWR_ON) != 0) {
++		printf("MONDRIAN GPU: smmu idr0 0x%x idr1 0x%x idr2 0x%x\n",
++		    mondrian_gpu_read(smmu, 0x0), mondrian_gpu_read(smmu, 0x4),
++		    mondrian_gpu_read(smmu, 0x8));
++	}
++	if ((gx & GDSC_PWR_ON) != 0) {
++		gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
++		if (gpu != 0) {
++			printf("MONDRIAN GPU: rbmm status 0x%x\n",
++			    mondrian_gpu_read(gpu, GPU_RBBM_STATUS));
++		}
++	}
++	printf("MONDRIAN GPU: probe done\n");
++	return 0;
++}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@
+ bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
++bsd/dev/mondrian_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1641,8 +1641,10 @@
+ 	 * so a fault or a hang in the TLMM read leaves the last one on disk.
+ 	 */
+ 	{
++		extern int mondrian_gpu_probe(void);
+ 		extern void mondrian_touch_probe(void);
+ 
++		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 	}
+ }
