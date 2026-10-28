@@ -1,0 +1,111 @@
+xnu 0162: power the GPUCC CX domain (gpupower=1)
+
+The probe showed CX collapsed (gdscr 0x22f001, hw status off). Enable the
+GPUCC AHB/CXO/APB branches, clear SW_COLLAPSE in the CX GDSCR and poll
+the hardware-controller status at 0x953c bit 31, the Linux gdsc
+sequence. CX holds the GMU; GX is the GMU's and is not touched. Behind
+its own boot argument so the read-only probe keeps its meaning.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -16,6 +16,7 @@
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -29,10 +30,13 @@
+ #define MONDRIAN_SMMU_SIZE	0x00040000UL
+ 
+ #define GPUCC_CX_GDSCR		0x9108u
++#define GPUCC_CX_HW_CTRL	0x953cu
++#define GPUCC_CX_APB_CLK	0x912cu
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+ #define GPUCC_CXO_CLK		0x9144
+ #define GDSC_PWR_ON		(1u << 31)
++#define GDSC_SW_COLLAPSE	(1u << 0)
+ 
+ #define GPU_RBBM_STATUS		0x210u
+ 
+@@ -45,16 +49,68 @@
+ 	return *(volatile uint32_t *)(base + off);
+ }
+ 
++static void
++mondrian_gpu_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__builtin_arm_dsb(0xf);
++}
++
++/*
++ * gpupower=1: power the GPUCC CX domain, the first write of the port. The
++ * sequence is the Linux gdsc one: enable the GPUCC AHB/CXO/APB branches,
++ * clear SW_COLLAPSE in the CX GDSCR, wait 1 us and poll the hardware
++ * controller status at 0x953c bit 31 for 2 ms. CX holds the GMU; GX (the 3D
++ * core) belongs to the GMU on a7xx and is not touched here.
++ */
++static void
++mondrian_gpu_power(vm_offset_t gpucc)
++{
++	uint32_t gdscr = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
++	uint32_t hw = mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL);
++	uint32_t ahb, cxo, apb;
++	int i, waited = 0;
++
++	printf("MONDRIAN GPU: power cx gdscr 0x%x hw 0x%x\n", gdscr, hw);
++	if ((hw & GDSC_PWR_ON) != 0) {
++		printf("MONDRIAN GPU: power cx already on\n");
++		return;
++	}
++	ahb = mondrian_gpu_read(gpucc, GPUCC_AHB_CLK);
++	cxo = mondrian_gpu_read(gpucc, GPUCC_CXO_CLK);
++	apb = mondrian_gpu_read(gpucc, GPUCC_CX_APB_CLK);
++	mondrian_gpu_write(gpucc, GPUCC_AHB_CLK, ahb | 1u);
++	mondrian_gpu_write(gpucc, GPUCC_CXO_CLK, cxo | 1u);
++	mondrian_gpu_write(gpucc, GPUCC_CX_APB_CLK, apb | 1u);
++	printf("MONDRIAN GPU: power branches ahb 0x%x cxo 0x%x apb 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_AHB_CLK),
++	    mondrian_gpu_read(gpucc, GPUCC_CXO_CLK),
++	    mondrian_gpu_read(gpucc, GPUCC_CX_APB_CLK));
++	mondrian_gpu_write(gpucc, GPUCC_CX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	delay(1);
++	for (i = 0; i < 200; i++) {
++		if ((mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL) & GDSC_PWR_ON) != 0) {
++			break;
++		}
++		delay(10);
++		waited += 10;
++	}
++	printf("MONDRIAN GPU: power cx gdscr 0x%x hw 0x%x after %d us\n",
++	    mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR),
++	    mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL), waited);
++}
++
+ int
+ mondrian_gpu_probe(void)
+ {
+-	int on = 0;
++	int on = 0, power = 0;
+ 	vm_offset_t gpucc, gpu, gmu, smmu;
+ 	uint32_t cx, gx, ahb, cxo;
+ 
+ 	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0) {
+ 		return 0;
+ 	}
++	(void)PE_parse_boot_argn("gpupower", &power, sizeof(power));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
+ 	smmu = ml_io_map(MONDRIAN_SMMU_BASE, MONDRIAN_SMMU_SIZE);
+@@ -63,6 +119,9 @@
+ 		    (unsigned long)gpucc, (unsigned long)gmu, (unsigned long)smmu);
+ 		return 0;
+ 	}
++	if (power != 0) {
++		mondrian_gpu_power(gpucc);
++	}
+ 	cx = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
+ 	gx = mondrian_gpu_read(gpucc, GPUCC_GX_GDSCR);
+ 	ahb = mondrian_gpu_read(gpucc, GPUCC_AHB_CLK);
