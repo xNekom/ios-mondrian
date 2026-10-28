@@ -54,10 +54,17 @@ the path this port follows.
   `0x507` (GPLL0/4 = 150 MHz) with `CMD_ROOT_EN` set, but the GPUCC AHB
   branch (`0x911c`) still reads 0 and every GMU register reads
   **`0xdeafbead`**: the sentinel for a block that is not clocked.
-  `GENERAL_9`/`GENERAL_10` reads hang. The AHB branch not taking the enable
-  is the current wall; the next step is the vendor `kgsl_pwrctrl` /
-  `adreno_gen7` power order (and a clk/register dump from a running
-  Android), not more bit guessing.
+  `GENERAL_9`/`GENERAL_10` reads hang. Root cause: the vendor's
+  `gpu_cc_hub_clk_src` carries `HW_CLK_CTRL_MODE`, so the **hardware
+  (AO/RPMh) owns the hub clock**; the CPU-side enable is a no-op and the
+  hub only runs once the GPU power state is voted in RPMh (`gfx.lvl`,
+  `cx.lvl`, `mx.lvl`). The vendor's `gen7_gmu_first_boot` runs
+  `kgsl_pwrctrl_enable_cx_gdsc` -> `gen7_gmu_enable_clks` (gmu_clk and
+  hub_clk rates + `clk_bulk_prepare_enable`) -> firmware -> register
+  config -> `CM3_SYSRESET=0` -> PDC/RSC -> HFI, with the rail votes from
+  `gen7_build_rpmh_tables`/`gen7_complete_rpmh_votes` done by pwrctrl.
+  Next: port those RPMh votes (the touch driver already talks to cmd-db)
+  before the clock enable, then the firmware load.
 - **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
   `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
   0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
