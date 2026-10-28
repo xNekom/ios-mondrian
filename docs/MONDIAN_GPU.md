@@ -56,16 +56,22 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
 
 - **`bootcpu` / `cpufreq`**: HackiOS boots with `cpus=8 bootcpu=7 cpufreq=1`;
   the mondrian series has neither. The boot CPU is 0 (a little core) and the
-  CPU OPPs are not set from XNU. Port HackiOS's two patches: boot on the big
-  core and enable CPU DVFS (the `qcom,cpufreq-hw`/RPMh path).
+  CPU OPPs are not set from XNU. HackiOS has `hakios.cpufreq.c` (EPSS: base,
+  a LUT at +0x100 and PERF_STATE at +0x320; the top row per domain with our
+  cores) and `loader_return.c` (`bootcpu=7`, the big core). The live SM8475
+  tree has `qcom,cpufreq-hw-epss` at **0x17d91000/0x17d92000/0x17d93000**,
+  `qcom,lut-row-size=4`; HackiOS's own base is 0x18591000, so only the base and
+  the domain table change. The topaz 0094 is the SM6225 variant. Port both.
 - **`IOAcceleratorES`**: topaz's 0138 (an empty `IOAcceleratorES`) saves ~30 s
   at every backboardd start; check what the mondrian's `0114` publishes.
 - **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
   frames and 60 Hz; today `mondrianfb_hz=30` (the panel itself is 120 Hz).
 - **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
   (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
-  the new `OBJROOT` regenerates the stubs with the modern `iig`. Seed/copy the
-  generated `DEVELOPMENT_ARM64_MONDRIAN/iokit` stubs into the release tree.
+  the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships
+  `xnu-deps/` with a pregenerated `OSObject.iig.cpp`, `gen-iig-stubs.py` and a
+  host `iig`; use those (or copy the generated `DEVELOPMENT_ARM64_MONDRIAN`
+  `iokit` stubs) instead of the SDK's `iig`.
 - **Debug I/O**: `serial=0`, no `debug=0xc`, no `-enable_kprintf_spam` for
   normal boots; the `FB: swap`/HID/sampler logs go to the ring.
 - **First boot**: a freshly flashed data volume needs one long first boot to
