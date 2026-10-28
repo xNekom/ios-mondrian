@@ -38,7 +38,9 @@ def main(path):
         if m:
             at = (int(m.group(1)), int(m.group(2)))
         if "MONDRIAN FB: fps " in line:
-            fps.append(int(line.rsplit(" ", 1)[1]))
+            m = re.search(r"fps (\d+)", line)
+            if m:
+                fps.append(int(m.group(1)))
         for name, needle in MILESTONES:
             if name in seen or needle not in line:
                 continue

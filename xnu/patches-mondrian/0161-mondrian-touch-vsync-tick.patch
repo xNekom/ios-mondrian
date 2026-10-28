@@ -1,0 +1,134 @@
+xnu 0161: tick the touch report thread from the vsync
+
+The part reports at about 100 Hz, but the report thread waits in
+tsleep(..., 1 tick) and tsleep() deadlines do not fire on this board
+(the sampler had the same problem and is ticked from the framebuffer
+timer). Measured: 55 touch events in 110 s of interaction, so the UI
+saw 0.5 positions a second and felt frozen. Wake the thread from the
+framebuffer vsync instead (60 Hz, the panel rate) and print the reports
+read per second in the fps line. The copy and the rasterizer were not
+the cause: copy 2.3 ms, raster 10-14 ms.
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -211,13 +211,12 @@
+ }
+ 
+ /*
+- * The bit-bang path makes four accesses per bit. At ~1 MHz the DSB SY after
+- * every one of them is most of the transfer: a full barrier drains the
+- * interconnect, and the firmware load spends about two seconds per 4 KB
+- * packet, most of it here. These MMIO pages are device memory (nGnRnE), so
+- * the accesses are already ordered without a barrier; the protocol's own
+- * delays are the timing. Keep the barrier everywhere else (pin setup, power,
+- * RPMh), where a stale write could mean the wrong pad state.
++ * The bit-bang path makes four accesses per bit, and a DSB SY after each one
++ * drains the interconnect for nothing: these MMIO pages are device memory
++ * (nGnRnE), so the accesses are already ordered. (The two-minute load was the
++ * delay conversion of 0156, not this barrier.) Keep the barrier everywhere
++ * else (pin setup, power, RPMh), where a stale write could mean the wrong pad
++ * state.
+  */
+ static uint32_t
+ mondrian_tlmm_read_raw(vm_offset_t page, uint32_t off)
+@@ -884,11 +883,34 @@
+ /* The report block, from the working system's IC info dump (ic_info_length
+  * 193): touch_data_addr 0x00010308, head 8 bytes, 8 bytes per point. */
+ #define MONDRIAN_TOUCH_DATA_ADDR	0x00010308u
++/* Reports read since boot, for the fps line; and the vsync kick below. */
++static uint32_t mondrian_touch_reports_read;
++static uint32_t mondrian_touch_polls;
++
++uint32_t
++mondrian_touch_report_count(void)
++{
++	return mondrian_touch_reports_read;
++}
++
+ #define MONDRIAN_TOUCH_POINT_LEN	8
+ #define MONDRIAN_TOUCH_FINGERS		10
+ 
+ static uint32_t mondrian_touch_data_addr = MONDRIAN_TOUCH_DATA_ADDR;
+ static uint32_t mondrian_touch_cmd_addr;
++/*
++ * The report thread cannot wait on its own timeout: tsleep() deadlines do not
++ * fire on this board (the sampler has the same problem and is ticked from the
++ * framebuffer). Wake it from the vsync timer instead, so the part is read at
++ * the panel rate and not at whatever rate the broken timer allows.
++ */
++void
++mondrian_touch_vsync(void)
++{
++	if (mondrian_touch_data_addr != 0) {
++		wakeup((caddr_t)&mondrian_touch_data_addr);
++	}
++}
+ static uint16_t mondrian_touch_cmd_len;
+ static int mondrian_touch_poll;
+ 
+@@ -1337,11 +1359,13 @@
+ 	}
+ 	for (;;) {
+ 		(void)tsleep((caddr_t)&mondrian_touch_data_addr, PZERO - 1, "mtouch", 1);
++		mondrian_touch_polls++;
+ 		if (!mondrian_touch_poll &&
+ 		    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
+ 			continue;
+ 		}
+ 		(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
++		mondrian_touch_reports_read++;
+ 		num = head[2] & 0x0f;
+ 		if (num > MONDRIAN_TOUCH_FINGERS) {
+ 			num = MONDRIAN_TOUCH_FINGERS;
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -71,6 +71,8 @@
+ #define MONDRIAN_FB_FORMAT_BGRA            0x42475241
+ /* bsd/dev/mondrian_sample.c: the sampler, ticked from this driver's timer. */
+ extern "C" void mondrian_sample_tick(void);
++extern "C" void mondrian_touch_vsync(void);
++extern "C" uint32_t mondrian_touch_report_count(void);
+ /* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
+ extern "C" uint64_t mondrian_early_fb_va(void);
+ 
+@@ -194,6 +196,7 @@
+ 	uint64_t            fCopyMaxTicks;
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
++	uint32_t            fTouchRate;      /* touch reports read in the last second */
+ 	bool                fFpsLog;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -372,6 +375,21 @@
+ 		mondrian_sample_tick();
+ 	}
+ 	/*
++	 * The touch report thread is ticked from here: its own tsleep() deadline
++	 * never fires on this board, and the part reports at about 100 Hz.
++	 */
++	{
++		static uint32_t touched_last;
++
++		mondrian_touch_vsync();
++		if ((count % MONDRIAN_FB_REFRESH_HZ) == 0) {
++			uint32_t now_reports = mondrian_touch_report_count();
++
++			fb->fTouchRate = now_reports - touched_last;
++			touched_last = now_reports;
++		}
++	}
++	/*
+ 	 * mondrianfb_fps=1: the swap rate, once a second. The UI is drawn by
+ 	 * the CPU, so this is the number that moves when the renderer or the
+ 	 * CPU clock changes; 60 is the panel's and the iPhone X mode's rate.
+@@ -394,8 +412,9 @@
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us\n",
+-		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000);
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s\n",
++		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
++		    fb->fTouchRate);
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
