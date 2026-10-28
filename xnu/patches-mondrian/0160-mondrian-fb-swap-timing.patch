@@ -1,0 +1,97 @@
+xnu 0160: time the framebuffer swap and its lateness
+
+mondrianfb_fps=1 now prints, once a second, the copy time of every
+layer into the panel (average and maximum) and how long after the last
+vsync the swap arrived. A large late with a small copy is the software
+rasterizer; a copy near the frame budget is the 18 MB memcpy. It is the
+measurement that decides between the presenter thread, a pixel-count
+change and the GPU.
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -189,6 +189,11 @@
+ 	uint64_t            fVsyncCount;
+ 	uint32_t            fSwapCount;      /* swaps since start (mondrianfb_fps=1) */
+ 	uint32_t            fFpsLast;        /* fSwapCount one second ago */
++	uint64_t            fLastVsync;      /* mach time of the last vsync notify */
++	uint64_t            fCopyTicks;      /* time in swap() since the last line */
++	uint64_t            fCopyMaxTicks;
++	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
++	uint64_t            fLateMaxTicks;
+ 	bool                fFpsLog;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -242,6 +247,9 @@
+ 
+ 	fSwapCount = 0;
+ 	fFpsLast = 0;
++	fLastVsync = 0;
++	fCopyTicks = fCopyMaxTicks = 0;
++	fLateTicks = fLateMaxTicks = 0;
+ 	fFpsLog = false;
+ 	if (!IOService::start(provider)) {
+ 		return false;
+@@ -320,6 +328,8 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++
++	fb->fLastVsync = now;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -368,9 +378,27 @@
+ 	 */
+ 	if (fb->fFpsLog && (count % MONDRIAN_FB_REFRESH_HZ) == 0) {
+ 		uint32_t swaps = fb->fSwapCount;
++		uint32_t n = swaps - fb->fFpsLast;
++		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
+ 
+-		IOLog("MONDRIAN FB: fps %u\n", swaps - fb->fFpsLast);
++		if (n > 0) {
++			absolutetime_to_nanoseconds(fb->fCopyTicks, &copy_avg);
++			absolutetime_to_nanoseconds(fb->fCopyMaxTicks, &copy_max);
++			absolutetime_to_nanoseconds(fb->fLateTicks, &late_avg);
++			absolutetime_to_nanoseconds(fb->fLateMaxTicks, &late_max);
++			copy_avg /= n;
++			late_avg /= n;
++		}
++		/*
++		 * copy: the memcpy of every layer into the panel, in the caller's
++		 * thread. late: how long after the last vsync the swap arrived. A
++		 * large late with a small copy is the software rasterizer.
++		 */
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us\n",
++		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000);
+ 		fb->fFpsLast = swaps;
++		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
++		fb->fLateTicks = fb->fLateMaxTicks = 0;
+ 	}
+ }
+ 
+@@ -408,6 +436,9 @@
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uint64_t began = mach_absolute_time();
++	uint64_t late = (fLastVsync != 0 && began > fLastVsync) ? began - fLastVsync : 0;
++	uint64_t elapsed;
+ 
+ 	fSwapCount++;
+ 
+@@ -493,6 +524,16 @@
+ 		}
+ 		s->release();
+ 	}
++
++	elapsed = mach_absolute_time() - began;
++	fCopyTicks += elapsed;
++	if (elapsed > fCopyMaxTicks) {
++		fCopyMaxTicks = elapsed;
++	}
++	fLateTicks += late;
++	if (late > fLateMaxTicks) {
++		fLateMaxTicks = late;
++	}
+ }
+ 
+ bool
