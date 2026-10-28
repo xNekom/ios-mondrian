@@ -58,7 +58,7 @@ Current blockers, in order:
    `0156` uses nanoseconds_to_absolutetime, so it is 8 s and the touch is
    ready before the first frame (41 s vs 49 s). Keep the bring-up before
    `launchd`: a thread raced the RPMh iovdd vote and wedged userland. The CPU
-   renderer draws at ~27 fps; the GPU is next (MONDIAN_GPU.md).
+   renderer draws at 8-30 fps (43 peak); the GPU is next (MONDIAN_GPU.md).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
