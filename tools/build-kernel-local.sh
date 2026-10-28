@@ -92,6 +92,28 @@ elif [ -d "$DXB_DIR/xnu" ]; then
 	echo "warning: $DXB_DIR/xnu has no git HEAD; leaving it untouched" >&2
 fi
 
+# Xcode 16 and newer ship an iig that emits IORPC.kernelContent, a field this
+# xnu (8796) does not have: the CI pins Xcode 15 for that reason. The generated
+# DriverKit stubs do not depend on the kernel config, so a RELEASE build reuses
+# the ones a DEVELOPMENT build already generated instead of re-running iig.
+if [ "$KERNEL_CONFIG" = RELEASE ]; then
+	DEV="$DXB_DIR/build/xnu.obj/DEVELOPMENT_ARM64_${MACHINE}/iokit/DEVELOPMENT/DriverKit"
+	if [ -d "$DEV" ]; then
+		for REL in \
+			"$DXB_DIR/build/xnu.obj/RELEASE_ARM64_${MACHINE}/iokit/RELEASE/DriverKit" \
+			"$DXB_DIR/build/xnu.obj/RELEASE_ARM64_${MACHINE}/iokit/DriverKit"; do
+			mkdir -p "$REL"
+			cp "$DEV"/*.h "$DEV"/*.iig.cpp "$REL"/
+			touch "$REL"/*	# newer than the .iig sources: make does not rerun iig
+		done
+		echo "== seeded the RELEASE DriverKit stubs from DEVELOPMENT"
+	else
+		echo "error: a RELEASE build needs the iig stubs from a DEVELOPMENT" >&2
+		echo "       build first (Xcode 16+ iig does not match xnu-8796)" >&2
+		exit 1
+	fi
+fi
+
 # build.sh skips the kernel when this marker exists (it only asks whether the
 # file is there, not whether it is current), so drop it and keep a stamp: the
 # kernel has to be newer than the stamp or the build did nothing.
