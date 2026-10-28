@@ -1,0 +1,27 @@
+xnu 0156: the touch SPI delay uses the clock it compares against
+
+The bit-bang asks for an 800 ns half period and gets 103 us: the tick
+count came from ml_get_timebase(), which on this board is not the clock
+mach_absolute_time() counts on. The measured cost was 80 s of wire time
+for the 98 KB sections (the ack wait was 2.7 s). Convert with the
+kernel's own nanoseconds_to_absolutetime() instead; the half period is
+then the one asked for and the 220 KB firmware load should fall from
+about three minutes to about ten seconds.
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -652,7 +652,14 @@
+ 	if (ns == 0) {
+ 		return;
+ 	}
+-	ticks = ((uint64_t)ns * mondrian_spi_hz) / 1000000000ull + 1;
++	/*
++	 * ml_get_timebase() is not the clock mach_absolute_time() counts on
++	 * this board: the old arithmetic asked for 2.5 us a bit and produced
++	 * 103 (the whole 220 KB firmware load took 160 s). nanoseconds_to_
++	 * absolutetime() is the kernel's own conversion for the clock the
++	 * loop compares against, so the half period is the one asked for.
++	 */
++	nanoseconds_to_absolutetime(ns, &ticks);
+ 	uint64_t start = mach_absolute_time();
+ 
+ 	while (mach_absolute_time() - start < ticks) {
