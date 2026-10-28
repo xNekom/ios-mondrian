@@ -10,26 +10,6 @@ read per second in the fps line. The copy and the rasterizer were not
 the cause: copy 2.3 ms, raster 10-14 ms.
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -211,13 +211,12 @@
- }
- 
- /*
-- * The bit-bang path makes four accesses per bit. At ~1 MHz the DSB SY after
-- * every one of them is most of the transfer: a full barrier drains the
-- * interconnect, and the firmware load spends about two seconds per 4 KB
-- * packet, most of it here. These MMIO pages are device memory (nGnRnE), so
-- * the accesses are already ordered without a barrier; the protocol's own
-- * delays are the timing. Keep the barrier everywhere else (pin setup, power,
-- * RPMh), where a stale write could mean the wrong pad state.
-+ * The bit-bang path makes four accesses per bit, and a DSB SY after each one
-+ * drains the interconnect for nothing: these MMIO pages are device memory
-+ * (nGnRnE), so the accesses are already ordered. (The two-minute load was the
-+ * delay conversion of 0156, not this barrier.) Keep the barrier everywhere
-+ * else (pin setup, power, RPMh), where a stale write could mean the wrong pad
-+ * state.
-  */
- static uint32_t
- mondrian_tlmm_read_raw(vm_offset_t page, uint32_t off)
 @@ -884,11 +883,34 @@
  /* The report block, from the working system's IC info dump (ic_info_length
   * 193): touch_data_addr 0x00010308, head 8 bytes, 8 bytes per point. */
