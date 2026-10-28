@@ -53,15 +53,15 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 Current blockers, in order:
 
 1. **UI performance.** The touch works (`0153`), but its 220 KB firmware loads
-   over the bit-bang SPI at every cold boot; a DSB per GPIO access made that
-   117 s and the UI waited (`0157` drops it). Keep the bring-up before
-   `launchd`: in a thread it raced the RPMh iovdd vote with userland and wedged
-   it. The CPU renderer draws the lock screen and Settings; the GPU is next
-   (Mesa/freedreno behind CA GLES, MONDIAN_GPU.md).
-2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6;
-   the HID side exists, nothing reads them yet.
-3. **Rest.** Audio, USB, modem and cameras are untouched; the daemons that
-   abort (SiriTTSSynthesizer, KonaSynthesizer) want them.
+   over the bit-bang SPI at every boot. `ml_get_timebase()` reads 609 MHz
+   here, not the 19.2 MHz timer: 800 ns became 26 us and the load 160 s.
+   `0156` uses nanoseconds_to_absolutetime, so it is 8 s and the touch is
+   ready before the first frame (41 s vs 49 s). Keep the bring-up before
+   `launchd`: a thread raced the RPMh iovdd vote and wedged userland. The CPU
+   renderer draws at ~27 fps; the GPU is next (MONDIAN_GPU.md).
+2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
+3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
+   (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
 ## Building and booting
 
