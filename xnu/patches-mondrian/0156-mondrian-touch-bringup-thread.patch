@@ -10,7 +10,7 @@ works when the load finishes.
 
 --- a/bsd/dev/mondrian_touch.c
 +++ b/bsd/dev/mondrian_touch.c
-@@ -1450,27 +1450,31 @@
+@@ -1450,27 +1450,19 @@
  	printf("MONDRIAN TOUCH: post-firmware confirm %s\n", same ? "ok" : "bad");
  }
  
@@ -28,30 +28,29 @@ works when the load finishes.
 +mondrian_touch_bringup(void *arg, wait_result_t wait)
  {
 -	thread_t touch_thread;
- 	int touch_on = 1;
- 
-+	(void)arg;
-+	(void)wait;
- 	/*
- 	 * mondriantouch=0 skips the whole driver. Useful while the UI is being
- 	 * brought up: without the firmware the part has no reports and a stale
- 	 * report address only feeds backboardd noise.
- 	 */
- 	PE_parse_boot_argn("mondriantouch", &touch_on, sizeof(touch_on));
+-	int touch_on = 1;
+-
+-	/*
+-	 * mondriantouch=0 skips the whole driver. Useful while the UI is being
+-	 * brought up: without the firmware the part has no reports and a stale
+-	 * report address only feeds backboardd noise.
+-	 */
+-	PE_parse_boot_argn("mondriantouch", &touch_on, sizeof(touch_on));
 -	PE_parse_boot_argn("mondriantouchpoll", &mondrian_touch_poll,
 -	    sizeof(mondrian_touch_poll));
- 	if (!touch_on) {
- 		printf("MONDRIAN TOUCH: disabled by boot arg\n");
+-	if (!touch_on) {
+-		printf("MONDRIAN TOUCH: disabled by boot arg\n");
 -		return;
-+		thread_terminate_self();
- 	}
+-	}
 -	if (mondrian_touch_poll) {
 -		printf("MONDRIAN TOUCH: polling the report block\n");
 -	}
++	(void)arg;
++	(void)wait;
  	printf("MONDRIAN TOUCH: TLMM at 0x%lx, reset/irq/avdd pins\n",
  	    (unsigned long)MONDRIAN_TLMM_BASE);
  	mondrian_log_flush_now();
-@@ -1506,14 +1510,35 @@
+@@ -1506,14 +1498,50 @@
  			printf("MONDRIAN TOUCH: no report address, reports off\n");
  		} else if (mondrian_touch_coor_mode() != 0) {
  			printf("MONDRIAN TOUCH: no coordinate mode, reports off\n");
@@ -67,14 +66,29 @@ works when the load finishes.
  		printf("MONDRIAN TOUCH: no firmware, no reports\n");
  	}
  	mondrian_log_flush_now();
-+	thread_terminate_self();
++	/* No reports: park the thread for good; the driver stays out of the way. */
++	for (;;) {
++		(void)tsleep((caddr_t)&mondrian_touch_poll, PZERO - 1,
++		    "mtouchidle", 0);
++	}
  }
 +
 +void
 +mondrian_touch_probe(void)
 +{
 +	thread_t touch_thread;
++	int touch_on = 1;
 +
++	/*
++	 * mondriantouch=0 skips the whole driver. Useful while the UI is being
++	 * brought up: without the firmware the part has no reports and a stale
++	 * report address only feeds backboardd noise.
++	 */
++	PE_parse_boot_argn("mondriantouch", &touch_on, sizeof(touch_on));
++	if (!touch_on) {
++		printf("MONDRIAN TOUCH: disabled by boot arg\n");
++		return;
++	}
 +	PE_parse_boot_argn("mondriantouchpoll", &mondrian_touch_poll,
 +	    sizeof(mondrian_touch_poll));
 +	if (mondrian_touch_poll) {

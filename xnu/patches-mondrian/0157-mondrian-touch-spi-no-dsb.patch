@@ -1,0 +1,80 @@
+xnu 0157: no DSB in the touch bit-bang
+
+Every TLMM access in the SPI loop is followed by a DSB SY, four per bit.
+The barrier drains the interconnect and costs microseconds on this SoC,
+and it is most of the two seconds that a 4 KB firmware packet takes.
+These MMIO pages are device memory (nGnRnE), so the accesses are already
+ordered; drop the barrier in the bit loop only and keep it in the pin,
+power and RPMh paths. The load should fall from minutes to seconds, so
+the touch is ready when the UI appears instead of two minutes later.
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -210,7 +210,28 @@
+ 	__builtin_arm_dsb(0xf);
+ }
+ 
++/*
++ * The bit-bang path makes four accesses per bit. At ~1 MHz the DSB SY after
++ * every one of them is most of the transfer: a full barrier drains the
++ * interconnect, and the firmware load spends about two seconds per 4 KB
++ * packet, most of it here. These MMIO pages are device memory (nGnRnE), so
++ * the accesses are already ordered without a barrier; the protocol's own
++ * delays are the timing. Keep the barrier everywhere else (pin setup, power,
++ * RPMh), where a stale write could mean the wrong pad state.
++ */
+ static uint32_t
++mondrian_tlmm_read_raw(vm_offset_t page, uint32_t off)
++{
++	return *(volatile uint32_t *)(page + off);
++}
++
++static void
++mondrian_tlmm_write_raw(vm_offset_t page, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(page + off) = value;
++}
++
++static uint32_t
+ mondrian_tlmm_cfg(uint32_t function, uint32_t pull, uint32_t drive, int output)
+ {
+ 	return (function << 2) | pull | (drive << 6) | (output ? (1u << 9) : 0);
+@@ -665,16 +686,16 @@
+ {
+ 	int miso;
+ 
+-	mondrian_tlmm_write(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
++	mondrian_tlmm_write_raw(mondrian_spi_mosi, MONDRIAN_TLMM_IN_OUT, mosi ? 2 : 0);
+ 	mondrian_spi_delay(mondrian_spi_half);
+-	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
++	mondrian_tlmm_write_raw(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 2);
+ 	mondrian_spi_delay(mondrian_spi_half);
+ 	if (mondrian_spi_fall) {
+-		mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
++		mondrian_tlmm_write_raw(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
+ 		mondrian_spi_delay(mondrian_spi_half);
+ 	}
+-	miso = (int)(mondrian_tlmm_read(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
+-	mondrian_tlmm_write(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
++	miso = (int)(mondrian_tlmm_read_raw(mondrian_spi_miso, MONDRIAN_TLMM_IN_OUT) & 1);
++	mondrian_tlmm_write_raw(mondrian_spi_clk, MONDRIAN_TLMM_IN_OUT, 0);
+ 	mondrian_spi_delay(mondrian_spi_half);
+ 	return miso;
+ }
+@@ -689,7 +710,7 @@
+ 	 * Everything in one CS frame: the part latches the prefix and drives
+ 	 * MISO for the following clocks with CS still low.
+ 	 */
+-	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);   /* CS low */
++	mondrian_tlmm_write_raw(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 0);  /* CS low */
+ 	mondrian_spi_delay(2000);
+ 	mondrian_spi_frame_start = mach_absolute_time();
+ 	for (i = 0; i < txlen; i++) {
+@@ -705,7 +726,7 @@
+ 		rx[i] = in;
+ 	}
+ 	mondrian_spi_delay(2000);
+-	mondrian_tlmm_write(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2);   /* CS high */
++	mondrian_tlmm_write_raw(mondrian_spi_cs, MONDRIAN_TLMM_IN_OUT, 2); /* CS high */
+ 	mondrian_spi_delay(2000);
+ 	mondrian_spi_frame_ticks = mach_absolute_time() - mondrian_spi_frame_start;
+ 	return 0;
