@@ -1,0 +1,30 @@
+xnu 0173: arm the virtual timer before unmasking it
+
+fiq_context_init() writes CNTV_CTL_EL0 = ENABLE, clearing IMASK, without
+programming CNTV_TVAL/CNTV_CVAL. The loader does not arm the timer either,
+so the compare is whatever ABL left, usually in the past. The vtimer PPI is
+level-sensitive: with an expired compare it stays asserted and re-enters the
+handler for ever, and the boot never reaches the UFS probe. The diagnostic
+shim hid this because its GIC test re-armed CNTV_TVAL before jumping; the
+clean shim exposed it. Program a full tick before clearing IMASK; the timer
+code reprograms the deadline from ml_set_decrementer() later.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2278,6 +2278,15 @@
+ 	 * IMASK so the level-sensitive PPI can reach EL1. Keep the GIC PPI
+ 	 * snapshots in 0110 to confirm delivery on the next boot.
+ 	 */
++	/*
++	 * The loader does not arm the virtual timer: CNTV_CVAL is whatever
++	 * ABL left, usually in the past. Clearing IMASK with an expired
++	 * compare makes the level-sensitive PPI assert for ever before the
++	 * first ml_set_decrementer(), which is the early boot storm. Give it
++	 * a full tick first, then unmask; the timer code reprograms it.
++	 */
++	uint64_t cntfrq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	__builtin_arm_wsr64("CNTV_TVAL_EL0", cntfrq ? cntfrq / 100 : 240000);
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE;
+ #else
+ 	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */

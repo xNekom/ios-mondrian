@@ -1,0 +1,410 @@
+xnu 0174: boot bisection marks and the log before vfs_mountroot
+
+Two things cost a whole afternoon on 2026-10-28: the boot stopped before
+the UFS probe left anything on disk, and the only clue was a screen with
+the last early mark. Keep a mondrianstop=N boot argument that halts at
+early stage N with IRQs masked, extend the early marks through bsd_init
+and vfs_mountroot, and let marks above 20 draw after the console has been
+switched off. Arm the persistent console ring as soon as the UFS probe
+knows the partition, not after the root mount: a failed mount then leaves
+the mount error in the ring instead of in RAM. The mark blocks are clamped
+to the framebuffer width so a stage past 25 cannot write outside it.
+
+diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -10,6 +10,7 @@
+ #if defined(MONDRIAN)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/pexpert.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xb8000000;
+ #define EARLY_FB early_fb
+@@ -99,15 +100,32 @@
+ 	}
+ }
+ 
++static int mondrian_early_stop_stage = -1;
++
++/*
++ * Set once PE_init_platform() has installed PE_state.bootArgs: parsing a
++ * boot arg before that dereferences a NULL boot_args pointer and kills the
++ * kernel before the first line is on the screen.
++ */
+ void
++mondrian_early_set_stop(int stage)
++{
++	mondrian_early_stop_stage = stage;
++}
++
++void
+ mondrian_early_mark(unsigned int stage, const char *label)
+ {
+-	if (early_disabled || stage > 20) {
++	if ((early_disabled && stage < 21) || stage > 60) {
+ 		return;
+ 	}
++	if (stage >= 21) {
++		/* The console is off by now; keep the bisection marks visible. */
++		early_forced = 1;
++	}
+ 	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+ 	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++		for (unsigned int x = stage * 48; x < (stage + 1) * 48 && x < EARLY_WIDTH; x++) {
+ 			EARLY_FB[y * EARLY_STRIDE + x] = color;
+ 		}
+ 	}
+@@ -120,6 +138,13 @@
+ 	mondrian_early_string(": ");
+ 	mondrian_early_string(label);
+ 	mondrian_early_putc('\n');
++	if (mondrian_early_stop_stage == (int)stage) {
++		mondrian_early_string("MONDRIAN EARLY HALT\n");
++		__asm__ volatile("msr daifset, #0xf" ::: "memory");
++		for (;;) {
++			__asm__ volatile("wfi");
++		}
++	}
+ }
+ 
+ void
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -365,6 +365,19 @@
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	{
++		/*
++		 * mondrianstop=N halts at early stage N with IRQs masked; the
++		 * boot args are only valid now, after PE_init_platform().
++		 */
++		int stop = 0;
++
++		if (PE_parse_boot_argn("mondrianstop", &stop, sizeof(stop))) {
++			extern void mondrian_early_set_stop(int);
++
++			mondrian_early_set_stop(stop);
++		}
++	}
+ 	mondrian_early_mark(2, "PE_init_platform done");
+ 
+ #if __arm64__
+@@ -595,9 +608,13 @@
+ #endif
+ #endif
+ 
++	mondrian_early_mark(21, "before cpu_machine_idle_init");
+ 	cpu_machine_idle_init(TRUE);
++	mondrian_early_mark(22, "cpu_machine_idle_init done");
+ 
++	mondrian_early_mark(23, "before PE_init_platform(TRUE)");
+ 	PE_init_platform(TRUE, &BootCpuData);
++	mondrian_early_mark(24, "PE_init_platform(TRUE) done");
+ 
+ #if __arm64__
+ 	extern bool cpu_config_correct;
+@@ -614,6 +631,7 @@
+ #endif
+ 
+ 	cpu_timebase_init(TRUE);
++	mondrian_early_mark(25, "cpu_timebase_init done");
+ 
+ #if KPERF
+ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
+@@ -621,7 +639,9 @@
+ #endif /* KPERF */
+ 
+ 	PE_init_cpu();
++	mondrian_early_mark(26, "PE_init_cpu done");
+ 	fiq_context_init(TRUE);
++	mondrian_early_mark(27, "fiq_context_init done");
+ 
+ 
+ #if HIBERNATION
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -418,10 +418,13 @@
+ 	}
+ 	startup_phase = upto;
+ }
++
++extern void mondrian_early_mark(unsigned int stage, const char *label);
+ 
+ void
+ kernel_bootstrap(void)
+ {
++	mondrian_early_mark(28, "kernel_bootstrap entered");
+ 	kern_return_t   result;
+ 	thread_t        thread;
+ 	char            namep[16];
+@@ -432,6 +435,7 @@
+ 
+ 	kernel_bootstrap_log("vm_mem_bootstrap");
+ 	vm_mem_bootstrap();
++	mondrian_early_mark(29, "vm_mem_bootstrap done");
+ 
+ 	machine_info.memory_size = (uint32_t)mem_size;
+ #if XNU_TARGET_OS_OSX
+@@ -448,6 +452,7 @@
+ 	atm_init();
+ #endif
+ 	kernel_startup_initialize_upto(STARTUP_SUB_OSLOG);
++	mondrian_early_mark(30, "startup OSLOG done");
+ 
+ #if CONFIG_UBSAN_MINIMAL
+ 	kernel_bootstrap_log("UBSan minimal runtime init");
+@@ -476,12 +481,14 @@
+ 
+ 	kernel_bootstrap_log("console_init");
+ 	console_init();
++	mondrian_early_mark(31, "console_init done");
+ 
+ 	kernel_bootstrap_log("stackshot_init");
+ 	stackshot_init();
+ 
+ 	kernel_bootstrap_log("sched_init");
+ 	sched_init();
++	mondrian_early_mark(32, "sched_init done");
+ 
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_init");
+@@ -489,6 +496,7 @@
+ #endif
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_MACH_IPC);
++	mondrian_early_mark(33, "startup MACH_IPC done");
+ 
+ 	/*
+ 	 * As soon as the virtual memory system is up, we record
+@@ -496,18 +504,22 @@
+ 	 */
+ 	kernel_bootstrap_log("PMAP_ACTIVATE_KERNEL");
+ 	PMAP_ACTIVATE_KERNEL(master_cpu);
++	mondrian_early_mark(34, "PMAP_ACTIVATE_KERNEL done");
+ 
+ 	kernel_bootstrap_log("mapping_free_prime");
+ 	mapping_free_prime();                                           /* Load up with temporary mapping blocks */
+ 
+ 	kernel_bootstrap_log("machine_init");
+ 	machine_init();
++	mondrian_early_mark(35, "machine_init done");
+ 
+ 	kernel_bootstrap_log("thread_machine_init_template");
+ 	thread_machine_init_template();
+ 
++	mondrian_early_mark(36, "before clock_init");
+ 	kernel_bootstrap_log("clock_init");
+ 	clock_init();
++	mondrian_early_mark(37, "clock_init done");
+ 
+ 	/*
+ 	 *	Initialize the IPC, task, and thread subsystems.
+@@ -531,6 +543,7 @@
+ 
+ 	kernel_bootstrap_log("thread_init");
+ 	thread_init();
++	mondrian_early_mark(38, "thread_init done");
+ 
+ 	kernel_bootstrap_log("restartable_init");
+ 	restartable_init();
+@@ -561,6 +574,7 @@
+ 	 */
+ 
+ 	kernel_bootstrap_log("kernel_thread_create");
++	mondrian_early_mark(39, "before kernel_thread_create");
+ 	result = kernel_thread_create((thread_continue_t)kernel_bootstrap_thread, NULL, MAXPRI_KERNEL, &thread);
+ 
+ 	if (result != KERN_SUCCESS) {
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -473,6 +473,8 @@
+  * of the tro_ucred field so that the uthread structure can be
+  * used like any other.
+  */
++extern void mondrian_early_mark(unsigned int stage, const char *label);
++
+ void
+ bsd_init(void)
+ {
+@@ -510,14 +512,17 @@
+ #endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	mondrian_early_mark(40, "bsd_init entered");
+ 	kprintf("MONDRIAN bsd_init: entered\n");
+ #endif
+ 	throttle_init();
++	mondrian_early_mark(41, "throttle_init done");
+ 
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ 	kprintf("MONDRIAN bsd_init: past throttle_init\n");
+ #endif
+ 	printf(copyright);
++	mondrian_early_mark(42, "bsd banner done");
+ 
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+ 	kprintf("MONDRIAN bsd_init: past the banner\n");
+@@ -898,8 +903,10 @@
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
++		mondrian_early_mark(43, "before vfs_mountroot");
+ 		bsd_init_kprintf("vfs_mountroot\n");
+ 		if (0 == (err = vfs_mountroot())) {
++			mondrian_early_mark(44, "vfs_mountroot done");
+ 			break;
+ 		}
+ 		rootdevice[0] = '\0';
+@@ -1078,6 +1085,7 @@
+ 
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
++	mondrian_early_mark(45, "bsd_utaskbootstrap done");
+ 
+ 	pal_kernel_announce();
+ 
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1205,10 +1205,13 @@
+  * works or we have tried them all.
+  */
+ extern int (*mountroot)(void);
++
++extern void mondrian_early_mark(unsigned int stage, const char *label);
+ 
+ int
+ vfs_mountroot(void)
+ {
++	mondrian_early_mark(51, "vfs_mountroot entered");
+ #if CONFIG_MACF
+ 	struct vnode *vp;
+ #endif
+@@ -1248,6 +1251,7 @@
+ 	 * so keep a local copy for some house keeping.
+ 	 */
+ 	bdevvp_rootvp = rootvp;
++	mondrian_early_mark(52, "bdevvp done");
+ 
+ 	for (vfsp = vfsconf; vfsp; vfsp = vfsp->vfc_next) {
+ 		if (vfsp->vfc_mountroot == NULL
+@@ -1258,11 +1262,13 @@
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;
+ 
++		mondrian_early_mark(53, "before root mount");
+ 		if (vfsp->vfc_mountroot) {
+ 			error = (*vfsp->vfc_mountroot)(mp, rootvp, ctx);
+ 		} else {
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
++		mondrian_early_mark(54, error ? "root mount failed" : "root mount done");
+ 
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
+@@ -1280,6 +1286,7 @@
+ 				vnode_put(bdevvp_rootvp);
+ 			}
+ 			mp->mnt_devvp->v_specflags |= SI_MOUNTEDON;
++			mondrian_early_mark(55, "root mounted");
+ 
+ 			vfs_unbusy(mp);
+ 
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -54,6 +54,7 @@
+ extern void mondrian_irq_dump(void);
+ extern int hz;
+ void mondrian_log_start(void);
++void mondrian_log_start_early(void);
+ void mondrian_log_kick(void);
+ static void mondrian_log_dump(uint32_t lines);
+ void mondrian_root_fixups(void);
+@@ -922,8 +923,11 @@
+ 	unsigned int size = 0;
+ 	char want[64] = "userdata";
+ 	int error;
++
++	extern void mondrian_early_mark(unsigned int stage, const char *label);
+ 
+ 	printf("MONDRIAN UFS: probe start\n");
++	mondrian_early_mark(46, "ufs probe start");
+ 	pe_mondrian_gic_dump();
+ 	mondrian_irq_dump();
+ 	if (SecureDTLookupEntry(NULL, "/mondrian-ufs", &node) != kSuccess ||
+@@ -938,6 +942,7 @@
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	printf("MONDRIAN UFS: regs mapped at %llx\n", (uint64_t)su.regs);
++	mondrian_early_mark(47, "ufs regs mapped");
+ 	{
+ 		/* How much contiguous memory is there at all? */
+ 		vm_offset_t probe = 0;
+@@ -962,8 +967,10 @@
+ 	su.secsize = DEV_BSIZE;
+ 	printf("MONDRIAN UFS: dma pa 0x%llx, taking over the host\n", (uint64_t)su.dma_pa);
+ 
++	mondrian_early_mark(48, "ufs before take over");
+ 	lck_mtx_lock(&mondrian_ufs_lock);
+ 	error = ufs_take_over_host();
++	mondrian_early_mark(49, "ufs take over done");
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		static const uint8_t start_active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+@@ -972,6 +979,7 @@
+ 
+ 		ufs_calibrate_spins();
+ 		error = ufs_nop_out();
++		mondrian_early_mark(50, "ufs nop done");
+ 		if (!error) {
+ 			error = ufs_query_read(0x03, 0x02, "bCurrentPowerMode", &power);
+ 		}
+@@ -1112,6 +1120,7 @@
+ 		}
+ 	}
+ 	*dev = su.bdev;
++	mondrian_log_start_early();
+ 	mondrian_sample_start();        /* retry if the early start failed */
+ 	return 0;
+ }
+@@ -1593,8 +1602,13 @@
+ 	return done;
+ }
+ 
++/*
++ * Arm the console ring as soon as the UFS device is usable: the writer has to
++ * be running before vfs_mountroot(), or a failed root mount leaves the log
++ * that explains it in RAM and nothing on disk.
++ */
+ void
+-mondrian_log_start(void)
++mondrian_log_start_early(void)
+ {
+ 	static int started;
+ 	uint32_t on = 1;
+@@ -1636,6 +1650,18 @@
+ 		}
+ 	}
+ 
++}
++
++void
++mondrian_log_start(void)
++{
++	static int probes_done;
++
++	mondrian_log_start_early();
++	if (probes_done || !su.ready) {
++		return;
++	}
++	probes_done = 1;
+ 	/*
+ 	 * Only now: the ring is armed, and the probe flushes after every line,
+ 	 * so a fault or a hang in the TLMM read leaves the last one on disk.
