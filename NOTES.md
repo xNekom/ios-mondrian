@@ -52,13 +52,13 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **UI performance.** The touch works (`0153`), but its 220 KB firmware loads
-   over the bit-bang SPI at every boot. `ml_get_timebase()` reads 609 MHz
-   here, not the 19.2 MHz timer: 800 ns became 26 us and the load 160 s.
-   `0156` uses nanoseconds_to_absolutetime, so it is 8 s and the touch is
-   ready before the first frame (41 s vs 49 s). Keep the bring-up before
-   `launchd`: a thread raced the RPMh iovdd vote and wedged userland. The CPU
-   renderer draws at 8-30 fps (43 peak); the GPU is next (MONDIAN_GPU.md).
+1. **UI performance.** The touch works (`0153`) and its 220 KB firmware is
+   8 s of bit-bang SPI (`0156`: `ml_get_timebase()` is 609 MHz here, not the
+   19.2 MHz timer; keep the bring-up before `launchd`, a thread raced the
+   RPMh iovdd vote). The report thread is ticked from the vsync (`0161`): its
+   tsleep deadline never fires, so it polled at 0.5 Hz; now it reads the part
+   at 120 Hz. The wall is the CPU rasterizer: 9-11 fps (111 ms/frame, copy
+   2.4 ms, bursts to 43); the GPU is next (MONDIAN_GPU.md). First frame: 43 s.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
