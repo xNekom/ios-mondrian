@@ -52,14 +52,16 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **UI performance.** The touch works end to end (`0153`: firmware, dynamic IC
-   info, coordinate mode and HID reports) and the lock screen, home screen and
-   Settings run on the CPU renderer. The GPU (Mesa/freedreno behind the CA GLES
-   renderer) is the next milestone; see MONDIAN_GPU.md.
-2. **Buttons.** Power/volume-down are on the PMK8350 PON and volume-up on
-   PM8350 GPIO6; the HID side exists, nothing reads them yet.
-3. **Rest of the phone.** Audio, USB, modem and cameras are untouched; the
-   daemons that abort (SiriTTSSynthesizer, KonaSynthesizer) want them.
+1. **UI performance.** The touch works (`0153`), but its 220 KB firmware loads
+   over the bit-bang SPI at every cold boot; a DSB per GPIO access made that
+   117 s and the UI waited (`0157` drops it). Keep the bring-up before
+   `launchd`: in a thread it raced the RPMh iovdd vote with userland and wedged
+   it. The CPU renderer draws the lock screen and Settings; the GPU is next
+   (Mesa/freedreno behind CA GLES, MONDIAN_GPU.md).
+2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6;
+   the HID side exists, nothing reads them yet.
+3. **Rest.** Audio, USB, modem and cameras are untouched; the daemons that
+   abort (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
 ## Building and booting
 
