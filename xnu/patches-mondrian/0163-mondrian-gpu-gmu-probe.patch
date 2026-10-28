@@ -1,0 +1,51 @@
+xnu 0163: read the GMU and the zap-shader region (gpu=1)
+
+With CX powered, read the CM3 reset/boot/init registers and the HFI
+interrupt registers, plus the first words of the zap-shader region the
+bootloader owns at 0x8b91a000. It says whether the GMU is held in reset,
+whether it has run a firmware, and whether the ABL already left the ZAP
+shader there or we have to find it. Read only.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -40,6 +40,18 @@
+ 
+ #define GPU_RBBM_STATUS		0x210u
+ 
++/* GMU register offsets from the shared a6xx_gmu.xml; gen7 uses the same file
++ * with its own values, and these are the ones the CM3 boot sequence touches. */
++#define GMU_CM3_SYSRESET	0x1f800u
++#define GMU_CM3_BOOT_CONFIG	0x1f801u
++#define GMU_CM3_FW_INIT_RESULT	0x1f81cu
++#define GMU_GMU2HOST_INTR_INFO	0x1f992u
++#define GMU_HOST2GMU_INTR_SET	0x1f994u
++
++/* The bootloader owns the zap-shader region (8 KiB at 0x8b91a000). */
++#define MONDRIAN_ZAP_BASE	0x08b91a000UL
++#define MONDRIAN_ZAP_SIZE	0x00002000UL
++
+ /* <machine/machine_routines.h> is the generic one in a bsd file. */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -135,9 +147,22 @@
+ 	 * collapsed one is exactly the class of access that wedges the NoC.
+ 	 */
+ 	if ((cx & GDSC_PWR_ON) != 0) {
++		vm_offset_t zap = ml_io_map(MONDRIAN_ZAP_BASE, MONDRIAN_ZAP_SIZE);
++
+ 		printf("MONDRIAN GPU: smmu idr0 0x%x idr1 0x%x idr2 0x%x\n",
+ 		    mondrian_gpu_read(smmu, 0x0), mondrian_gpu_read(smmu, 0x4),
+ 		    mondrian_gpu_read(smmu, 0x8));
++		printf("MONDRIAN GPU: gmu reset 0x%x boot 0x%x init 0x%x intr 0x%x h2g 0x%x\n",
++		    mondrian_gpu_read(gmu, GMU_CM3_SYSRESET),
++		    mondrian_gpu_read(gmu, GMU_CM3_BOOT_CONFIG),
++		    mondrian_gpu_read(gmu, GMU_CM3_FW_INIT_RESULT),
++		    mondrian_gpu_read(gmu, GMU_GMU2HOST_INTR_INFO),
++		    mondrian_gpu_read(gmu, GMU_HOST2GMU_INTR_SET));
++		if (zap != 0) {
++			printf("MONDRIAN GPU: zap %08x %08x %08x %08x\n",
++			    mondrian_gpu_read(zap, 0x0), mondrian_gpu_read(zap, 0x4),
++			    mondrian_gpu_read(zap, 0x8), mondrian_gpu_read(zap, 0xc));
++		}
+ 	}
+ 	if ((gx & GDSC_PWR_ON) != 0) {
+ 		gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
