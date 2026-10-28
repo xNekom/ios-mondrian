@@ -1,0 +1,43 @@
+xnu 0166: configure the GPUCC HUB clock and the AHB branch (gpupower=1)
+
+The GMU RCG reads back correct (cfg 0x505, GPLL0/3) and the CX_GMU
+branch enables, but the GPUCC AHB branch stays at 0x0 and the first GMU
+read still hangs. The AHB branch has no parent until the HUB RCG
+(0x93ec) and its divider (0x9430) are set: GPLL0/4 = 150 MHz, /1, then
+the HUB AON and AHB branches. The GMU register slave is behind that AHB.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -35,6 +35,9 @@
+ #define GPUCC_GMU_CLK_SRC	0x9318u
+ #define GPUCC_CX_GMU_CLK	0x913cu
+ #define GPUCC_GMU_BCR		0x9314u
++#define GPUCC_HUB_CLK_SRC	0x93ecu
++#define GPUCC_HUB_AHB_DIV	0x9430u
++#define GPUCC_HUB_AON_CLK	0x93e8u
+ #define RCG_UPDATE		(1u << 0)
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+@@ -138,6 +141,23 @@
+ 	 * is the access that hung the last boot, so enable it here, before any
+ 	 * GMU read.
+ 	 */
++	/*
++	 * The AHB branch (0x911c) stays off until its parents exist: the HUB
++	 * RCG (0x93ec) and the HUB AHB divider (0x9430). The GMU register
++	 * slave is behind that AHB, which is why the first GMU read hung.
++	 */
++	mondrian_gpu_rcg(gpucc, GPUCC_HUB_CLK_SRC, 5, 4);   /* GPLL0 / 4 = 150 MHz */
++	mondrian_gpu_write(gpucc, GPUCC_HUB_AHB_DIV, 0);    /* /1 */
++	mondrian_gpu_write(gpucc, GPUCC_HUB_AON_CLK,
++	    mondrian_gpu_read(gpucc, GPUCC_HUB_AON_CLK) | 1u);
++	mondrian_gpu_write(gpucc, GPUCC_AHB_CLK,
++	    mondrian_gpu_read(gpucc, GPUCC_AHB_CLK) | 1u);
++	delay(10);
++	printf("MONDRIAN GPU: hub cfg 0x%x div 0x%x ahb 0x%x aon 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_HUB_CLK_SRC + 4),
++	    mondrian_gpu_read(gpucc, GPUCC_HUB_AHB_DIV),
++	    mondrian_gpu_read(gpucc, GPUCC_AHB_CLK),
++	    mondrian_gpu_read(gpucc, GPUCC_HUB_AON_CLK));
+ 	mondrian_gpu_rcg(gpucc, GPUCC_GMU_CLK_SRC, 5, 3);
+ 	mondrian_gpu_write(gpucc, GPUCC_CX_GMU_CLK,
+ 	    mondrian_gpu_read(gpucc, GPUCC_CX_GMU_CLK) | 1u);
