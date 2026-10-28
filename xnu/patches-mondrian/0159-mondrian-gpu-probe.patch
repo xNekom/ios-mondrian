@@ -9,7 +9,7 @@ answer before any sequence that could wedge the interconnect. With gpu=0
 (the default) it does nothing.
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,92 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -47,6 +47,9 @@ answer before any sequence that could wedge the interconnect. With gpu=0
 +#define GDSC_PWR_ON		(1u << 31)
 +
 +#define GPU_RBBM_STATUS		0x210u
++
++/* <machine/machine_routines.h> is the generic one in a bsd file. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +static uint32_t
 +mondrian_gpu_read(vm_offset_t base, uint32_t off)
