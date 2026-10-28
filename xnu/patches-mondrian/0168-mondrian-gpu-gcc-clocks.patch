@@ -1,0 +1,70 @@
+xnu 0168: gate the GPU's GPLL0 and AXI clocks in GCC first (gpupower=1)
+
+The GPUCC AHB branch never enables and the GMU reads back 0xdeafbead
+(not clocked). gcc-sm8450 gates the GPU's GPLL0 at 0x62000 bits 15/16
+and carries the GPU traffic on 0x81010 (memnoc) and 0x81018 (snoc dvm);
+without them the GPUCC RCGs have no parent. Enable GCC first, in the
+vendor order, then the GPUCC hub/AHB/GMU sequence. The GCC mapping must
+cover the whole block (0x1f4200): 0x20000 leaves 0x62000 outside and the
+read faults.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -20,6 +20,8 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
++#define MONDRIAN_GCC_BASE	0x00100000UL
++#define MONDRIAN_GCC_SIZE	0x00200000UL	/* the block is 0x1f4200, 0x62000 is inside */
+ #define MONDRIAN_GPUCC_BASE	0x03d90000UL
+ #define MONDRIAN_GPUCC_SIZE	0x00010000UL
+ #define MONDRIAN_GPU_BASE	0x03d00000UL
+@@ -38,6 +40,13 @@
+ #define GPUCC_HUB_CLK_SRC	0x93ecu
+ #define GPUCC_HUB_AHB_DIV	0x9430u
+ #define GPUCC_HUB_AON_CLK	0x93e8u
++
++/* GCC gates the GPU's GPLL0 sources and its two AXI branches (gcc-sm8450). */
++#define GCC_GPU_GPLL0_CTRL	0x62000u
++#define GCC_GPU_GPLL0_BIT	(1u << 15)
++#define GCC_GPU_GPLL0_DIV_BIT	(1u << 16)
++#define GCC_GPU_MEMNOC_GFX	0x81010u
++#define GCC_GPU_SNOC_DVM_GFX	0x81018u
+ #define RCG_UPDATE		(1u << 0)
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+@@ -104,6 +113,8 @@
+ static void
+ mondrian_gpu_power(vm_offset_t gpucc)
+ {
++	vm_offset_t gcc = ml_io_map(MONDRIAN_GCC_BASE, MONDRIAN_GCC_SIZE);
++	uint32_t v;
+ 	uint32_t gdscr = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
+ 	uint32_t hw = mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL);
+ 	uint32_t ahb, cxo, apb;
+@@ -114,6 +125,26 @@
+ 		printf("MONDRIAN GPU: power cx already on\n");
+ 		return;
+ 	}
++	/*
++	 * The vendor order: GCC first. gcc_gpu_gpll0_* (0x62000 bits 15/16)
++	 * gate the GPLL0 the GPUCC RCGs divide, and the two AXI branches carry
++	 * the GPU traffic. Without them the GPUCC AHB branch never runs and the
++	 * GMU reads back 0xdeafbead.
++	 */
++	if (gcc != 0) {
++		v = mondrian_gpu_read(gcc, GCC_GPU_GPLL0_CTRL);
++		mondrian_gpu_write(gcc, GCC_GPU_GPLL0_CTRL,
++		    v | GCC_GPU_GPLL0_BIT | GCC_GPU_GPLL0_DIV_BIT);
++		mondrian_gpu_write(gcc, GCC_GPU_MEMNOC_GFX,
++		    mondrian_gpu_read(gcc, GCC_GPU_MEMNOC_GFX) | 1u);
++		mondrian_gpu_write(gcc, GCC_GPU_SNOC_DVM_GFX,
++		    mondrian_gpu_read(gcc, GCC_GPU_SNOC_DVM_GFX) | 1u);
++		delay(10);
++		printf("MONDRIAN GPU: gcc gpll0 0x%x memnoc 0x%x snoc 0x%x\n",
++		    mondrian_gpu_read(gcc, GCC_GPU_GPLL0_CTRL),
++		    mondrian_gpu_read(gcc, GCC_GPU_MEMNOC_GFX),
++		    mondrian_gpu_read(gcc, GCC_GPU_SNOC_DVM_GFX));
++	}
+ 	ahb = mondrian_gpu_read(gpucc, GPUCC_AHB_CLK);
+ 	cxo = mondrian_gpu_read(gpucc, GPUCC_CXO_CLK);
+ 	apb = mondrian_gpu_read(gpucc, GPUCC_CX_APB_CLK);
