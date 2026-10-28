@@ -1,0 +1,114 @@
+xnu 0154: run the SM8475 CPU clusters at their top EPSS row
+
+The bootloader leaves the cores at a modest frequency. The SM8475 exposes
+qcom,cpufreq-hw-epss with three domains at 0x17d91000/0x17d92000/0x17d93000,
+a 4-byte-row LUT at +0x100 and PERF_STATE at +0x320 (the same block HackiOS's
+hakios.cpufreq.c drives at 0x18591000). With cpufreq=1, write the top row of
+every domain at root-mount time; nothing scales it back down until there is an
+XNU cpufreq driver.
+
+--- /dev/null
++++ b/bsd/dev/mondrian_cpufreq.c
+@@ -0,0 +1,78 @@
++/*
++ * MONDRIAN: put the CPU clusters at their top EPSS row.
++ *
++ * The bootloader leaves the cores at a modest row and expects the OS to ask
++ * for more. The SM8475 exposes qcom,cpufreq-hw-epss with three frequency
++ * domains (small/big/biggest) at 0x17d91000/0x17d92000/0x17d93000, a LUT of
++ * 4-byte rows at +0x100 and PERF_STATE at +0x320 (the same EPSS layout as
++ * HackiOS's hakios.cpufreq.c, whose base is 0x18591000 on the SM6375).
++ *
++ * With cpufreq=1, select the top row of every domain that has one of our
++ * cores. Nothing scales it back down: there is no XNU cpufreq driver yet.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define MONDRIAN_EPSS_BASE		0x17d91000u
++#define MONDRIAN_EPSS_DOMAIN_SIZE	0x1000u
++#define MONDRIAN_EPSS_DOMAINS		3
++#define MONDRIAN_EPSS_LUT		0x100u
++#define MONDRIAN_EPSS_ROW		4u
++#define MONDRIAN_EPSS_ROWS		40u
++#define MONDRIAN_EPSS_PERF_STATE	0x320u
++#define MONDRIAN_XO_KHZ			19200u
++#define MONDRIAN_ALTERNATE_KHZ		300000u
++
++int
++mondrian_cpufreq_max(void)
++{
++	int on = 1;
++	int d;
++
++	PE_parse_boot_argn("cpufreq", &on, sizeof(on));
++	if (!on) {
++		return 0;
++	}
++
++	for (d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++		vm_offset_t base = ml_io_map(
++		    MONDRIAN_EPSS_BASE + (uint32_t)d * MONDRIAN_EPSS_DOMAIN_SIZE,
++		    MONDRIAN_EPSS_DOMAIN_SIZE);
++		uint32_t best = 0, best_khz = 0, prev_khz = 0, i;
++
++		if (base == 0) {
++			printf("MONDRIAN CPUFREQ: domain %d not mapped\n", d);
++			continue;
++		}
++		for (i = 0; i < MONDRIAN_EPSS_ROWS; i++) {
++			uint32_t v = *(volatile uint32_t *)(base + MONDRIAN_EPSS_LUT +
++			    i * MONDRIAN_EPSS_ROW);
++			uint32_t src = (v >> 30) & 3u;
++			uint32_t khz = src ? MONDRIAN_XO_KHZ * (v & 0xffu) :
++			    MONDRIAN_ALTERNATE_KHZ;
++
++			if (i > 0 && khz == prev_khz) {
++				break;		/* the LUT repeats its last row */
++			}
++			prev_khz = khz;
++			if (khz > best_khz) {
++				best_khz = khz;
++				best = i;
++			}
++		}
++		{
++			uint32_t old = *(volatile uint32_t *)(base + MONDRIAN_EPSS_PERF_STATE);
++
++			__builtin_arm_dsb(0xf);
++			*(volatile uint32_t *)(base + MONDRIAN_EPSS_PERF_STATE) = best;
++			__builtin_arm_dsb(0xf);
++			printf("MONDRIAN CPUFREQ: domain %d row %u -> %u (%u MHz)\n",
++			    d, old, best, best_khz / 1000);
++		}
++	}
++	return 0;
++}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@
+ bsd/dev/mondrian_sample.c		standard
+ bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
++bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1604,6 +1604,11 @@
+ 	if (started || !su.ready) {
+ 		return;
+ 	}
++	{
++		extern int mondrian_cpufreq_max(void);
++
++		(void)mondrian_cpufreq_max();
++	}
+ 	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
+ 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
+ 		return;
