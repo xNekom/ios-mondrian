@@ -59,9 +59,15 @@ them has Metal. That is the path this port follows.
   RPMh and put the hub/gmu RCGs in `HW_CLK_CTRL_MODE`: the CPU-side sequence
   matches the vendor's, and the AO still does not enable the hub. The live
   Android capture (below) names the missing parent: the GX rail is PM8350C
-  **S2** (`pm8350c_s2_gfx_voter_level`). The ARC batch in `0175` votes
-  `mx.lvl`, `cx.lvl` and `gfx.lvl`; next enable S2, then the GX domain
-  (`0x99504`), then the hub/GMU.
+  **S2** (`pm8350c_s2_gfx_voter_level`), whose cmd-db resource is
+  **`mxc.lvl`** (`0x300a0`), not `s2`. Voting `mx`/`cx`/`mxc`/`gfx` as one
+  batch and sending the VRM voltage/enable/mode per rail
+  (`mondrian_rpmh_rail`) makes the `+4` enable read 1, but the ARC level
+  (`+0`) still reads 0 and the GX domain write (`0x99504`) hangs: the rail is
+  not physically on. The missing piece is the vendor `rpmh-regulator-arc`
+  command (or the AOP GPU state), not another clock write. Never read or
+  write the GX domain/ACD/IROOT registers while GX is off; the access hangs
+  the interconnect.
 - **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
   `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
   0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
@@ -92,6 +98,13 @@ the vendor GPU modules `gpucc-waipio.ko`, `gdsc-regulator.ko`,
   The earlier domain write hung because S2 was off.
 - The kernel has no `debugfs` and recovery has no `/dev/mem`, so the GPUCC
   registers cannot be read from Android; the sequence above is the reference.
+
+The first XNU attempt after the capture votes `mx`/`cx`/`mxc`/`gfx`
+(`0x1c0`/`0x1a0`/`0x1c0`/`0x1a0`) and sends the VRM voltage/enable/mode for
+`mxc.lvl` and `gfx.lvl`: the TCS returns done and `+4` reads 1, but `+0`
+(the ARC level) reads 0 and the `0x99504` domain write still hangs. The GX
+rail is not physically on, so the next step is the vendor
+`rpmh-regulator-arc` command or the AOP GPU state, not another read.
 
 ## Port steps
 
