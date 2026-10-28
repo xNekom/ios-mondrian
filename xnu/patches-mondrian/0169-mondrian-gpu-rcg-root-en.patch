@@ -1,0 +1,38 @@
+xnu 0169: enable the RCG root (CMD_ROOT_EN) after the update
+
+The GPUCC AHB branch still would not enable with GCC and the HUB RCG
+configured. The shared RCGs need CMD_ROOT_EN (bit 1) as well as the
+UPDATE pulse: clk-rcg2 sets the root enable in its enable path and the
+root stays off otherwise (CMD_ROOT_OFF, bit 31, stays set), so the
+branch has no parent clock. Set the root and wait for ROOT_OFF to clear.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -48,6 +48,8 @@
+ #define GCC_GPU_MEMNOC_GFX	0x81010u
+ #define GCC_GPU_SNOC_DVM_GFX	0x81018u
+ #define RCG_UPDATE		(1u << 0)
++#define RCG_ROOT_EN		(1u << 1)
++#define RCG_ROOT_OFF		(1u << 31)
+ #define GPUCC_GX_GDSCR		0x905c
+ #define GPUCC_AHB_CLK		0x911c
+ #define GPUCC_CXO_CLK		0x9144
+@@ -108,6 +110,19 @@
+ 		}
+ 		delay(10);
+ 	}
++	/*
++	 * The shared RCGs also need their root enabled (CMD_ROOT_EN, bit 1);
++	 * the update alone leaves the branch with no clock and the GPUCC AHB
++	 * never enables. ROOT_OFF (bit 31) clears once the root runs.
++	 */
++	v = mondrian_gpu_read(gpucc, cmd);
++	mondrian_gpu_write(gpucc, cmd, v | RCG_ROOT_EN);
++	for (i = 0; i < 100; i++) {
++		if ((mondrian_gpu_read(gpucc, cmd) & RCG_ROOT_OFF) == 0) {
++			break;
++		}
++		delay(10);
++	}
+ }
+ 
+ static void
