@@ -1,0 +1,123 @@
+xnu 0176: let CoreAnimation render a smaller canvas and scale it in swap
+
+The CPU rasterizer is the UI wall (9-11 fps at 1440x3200). A boot-arg pair,
+mondrianfb_canvas_w/h, makes the default surface and the advertised canvas
+smaller than the panel (default: the panel, so a normal boot is unchanged);
+swap() then scales a full canvas-sized layer to the panel with a nearest
+neighbour pass, which stays in the few-ms budget. The panel timing and the
+scanout stay at 1440x3200; the provider carries canvas-width/canvas-height
+and GetDisplaySize returns the canvas. The 900x2000 boot accepts the canvas
+(AppleCLCD panel 1440x3200 canvas 900x2000); its swap/fps measurement was
+cut short by a forced HFS fsck, so the UI gain is still to be measured with
+mondrianfb_fps=1.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -203,7 +203,8 @@
+ 
+ public:
+ 	uint64_t      fPhys;
+-	uint32_t      fWidth, fHeight, fRowBytes;
++	uint32_t      fWidth, fHeight, fRowBytes;      /* the panel and its scanout */
++	uint32_t      fCanvasWidth, fCanvasHeight;    /* what CoreAnimation renders */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	MondrianSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -266,6 +267,23 @@
+ 		IOLog("MONDRIAN FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	/*
++	 * mondrianfb_canvas_w/h: make CoreAnimation render into a smaller
++	 * surface and scale it to the panel in swap(). The panel timing and
++	 * the scanout stay at fWidth x fHeight. Default: the panel itself.
++	 */
++	fCanvasWidth = fWidth;
++	fCanvasHeight = fHeight;
++	{
++		int cw = 0, ch = 0;
++
++		if (PE_parse_boot_argn("mondrianfb_canvas_w", &cw, sizeof(cw)) &&
++		    PE_parse_boot_argn("mondrianfb_canvas_h", &ch, sizeof(ch)) &&
++		    cw > 0 && ch > 0 && (uint32_t)cw <= fWidth && (uint32_t)ch <= fHeight) {
++			fCanvasWidth = (uint32_t)cw;
++			fCanvasHeight = (uint32_t)ch;
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/*
+@@ -275,7 +293,8 @@
+ 	 * surface CoreAnimation draws into is ordinary memory; swap() copies
+ 	 * it to the panel.
+ 	 */
+-	fSurface = mondrian_surface_create_vm(fWidth, fHeight, fRowBytes, MONDRIAN_FB_FORMAT_BGRA);
++	fSurface = mondrian_surface_create_vm(fCanvasWidth, fCanvasHeight,
++	    fCanvasWidth * 4, MONDRIAN_FB_FORMAT_BGRA);
+ 	fPixels = (uintptr_t)mondrian_early_fb_va();
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
+@@ -302,6 +321,9 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/* The framework reads the canvas size from the provider. */
++	provider->setProperty("canvas-width", fCanvasWidth, 32);
++	provider->setProperty("canvas-height", fCanvasHeight, 32);
+ 	mondrian_publish_modes(this, fWidth, fHeight);
+ 	registerService();
+ 	/*
+@@ -320,8 +342,8 @@
+ 		}
+ 	}
+ 	mondrian_publish_accelerator(provider);
+-	IOLog("MONDRIAN FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id);
++	IOLog("MONDRIAN FB: AppleCLCD panel %ux%u canvas %ux%u stride %u at 0x%llx, default surface %u\n",
++	    fWidth, fHeight, fCanvasWidth, fCanvasHeight, fRowBytes, fPhys, fSurface->id);
+ 	return true;
+ }
+ 
+@@ -506,6 +528,30 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		/*
++		 * A full canvas-sized layer is scaled to the panel. Nearest
++		 * neighbour on purpose: the copy stays in the few-ms budget and
++		 * the raster, not this pass, was the wall.
++		 */
++		if (bpe == 4 && src != 0 && s->width == fCanvasWidth &&
++		    s->height == fCanvasHeight &&
++		    (s->width != fWidth || s->height != fHeight) &&
++		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
++		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow +
++		    (uint64_t)s->width * 4 <= s->memory->getLength()) {
++			for (int32_t y = 0; y < (int32_t)fHeight; y++) {
++				uint32_t sy2 = (uint32_t)((uint64_t)y * s->height / fHeight);
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)sy2 * s->bytesPerRow);
++				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++
++				for (int32_t x = 0; x < (int32_t)fWidth; x++) {
++					drow[x] = srow[(uint32_t)((uint64_t)x * s->width / fWidth)];
++				}
++			}
++			s->release();
++			continue;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -667,8 +713,8 @@
+ 		outCount = 1;
+ 		break;
+ 	case kMondrianFBGetDisplaySize:
+-		out[0] = fFB->fWidth;
+-		out[1] = fFB->fHeight;
++		out[0] = fFB->fCanvasWidth;
++		out[1] = fFB->fCanvasHeight;
+ 		outCount = 2;
+ 		break;
+ 	case kMondrianFBIsMainDisplay:

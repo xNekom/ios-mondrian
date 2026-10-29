@@ -136,6 +136,12 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
   at every backboardd start; check what the mondrian's `0114` publishes.
 - **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
   frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
+- **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
+  CoreAnimation into a smaller surface and scales it to the panel in
+  `swap()`; the 900x2000 boot accepted it (`AppleCLCD panel 1440x3200
+  canvas 900x2000`) but a forced HFS fsck ate the 45 s window before the
+  first swap. Retest with `mondrianreset=240` and `mondrianfb_fps=1`;
+  `tools/mondrian-boot-log.sh` collects the log.
 - **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
   (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
   the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships
