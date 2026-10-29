@@ -212,9 +212,9 @@ forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
 is a real MDSS driver: the `qcom,mdss_mdp@ae00000` node,
 `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` panel, vendor gamma/DSC tables.
 
-The remaining wall is the CPU rasterizer: 9-11 fps (111 ms/frame, copy 2.4 ms).
-The Adreno 730 bring-up, the gen7 GMU map and the Glass/Mesa plan are in
-`docs/MONDIAN_GPU.md`.
+The remaining wall is the CPU rasterizer: 6.4 fps full panel (max 23, copy
+2.4 ms), 9.3 at 900x2000. The GMU/HFI/GX bring-up (tables ACKed, GX on) does
+not change that; the Glass/Mesa/CP plan is in `docs/MONDIAN_GPU.md`.
 
 ### 4. The touch
 

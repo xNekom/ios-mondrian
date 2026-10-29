@@ -58,8 +58,9 @@ Current blockers, in order:
    19.2 MHz timer; keep the bring-up before `launchd`, a thread raced the
    RPMh iovdd vote). The report thread is ticked from the vsync (`0161`): its
    tsleep deadline never fires, so it polled at 0.5 Hz; now it reads the part
-   at 120 Hz. The wall is the CPU rasterizer: 9-11 fps (111 ms/frame, copy
-   2.4 ms, bursts to 43); the GPU is next (MONDIAN_GPU.md). First frame: 43 s.
+   at 120 Hz. The wall is the CPU rasterizer: 6.4 fps full panel (max 23,
+   copy 2.4 ms), 9.3 at 900x2000; the GMU HFI tables and GX on change nothing
+   (8.1 active, max 35). The GPU driver is next (MONDIAN_GPU.md); first frame 43 s.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
@@ -76,7 +77,7 @@ fresh tree in seconds and names what does not apply, and
 Run it after touching the series: CI skips a patch that does not apply and
 still builds. On 2026-10-28 it caught `0161` (the touch vsync tick) never
 applying — `0157` already carried its first hunk — so that fix had been
-missing from every CI kernel; the series is 173/173.
+missing from every CI kernel; the series is 179/179.
 
 **Bisecting the early boot.** `mondrianstop=N` halts at early mark N with IRQs
 masked. `0174` extends the marks through `bsd_init` and `vfs_mountroot` and
@@ -196,6 +197,11 @@ address space the device is mapped nowhere and the next read is a bus abort
 (`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`). `0087` re-maps GICD/GICR through
 `ml_io_map()` after the VM is up; the early framebuffer survives only because
 `0062` keeps a reserved low-global alias for it.
+
+**`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** The touch command
+DB (128 KiB) and RSC (64 KiB) were re-mapped per cmd-db lookup and rail vote;
+the GPU power tables added dozens and the next `kmem_alloc(..., 131072,
+KMA_NOFAIL)` panicked in `io_map`. Map a window once (`0179`).
 
 **Never free the panel's memory.** The ABL leaves MDP → DSC → DSI scanning a
 reserved buffer, so a linear framebuffer exists — but the boot arguments
@@ -342,9 +348,3 @@ the A/B switch through the `misc` BCB; `boot_a` stays untouched and
   ARMv8.0 LSE/RCpc emulation.
 - **`Gsjsjzhznsz/ios-raphael`**, **`Log1nYT/ios-sweet`** — lock screen; CPU
   `compatible` match, DWC3 clocks and the SPI touch/PMIC keys.
-
-## Sweet (upstream) notes
-
-The sweet half is the working reference: stock bootloader → shim → XNU → UFS →
-HFS+ root → launchd → SpringBoard. Its series in `xnu/patches/` is the source
-for the generic pieces; `main` is kept only as that reference.

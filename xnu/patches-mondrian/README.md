@@ -23,6 +23,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0070`–`0082`, `0086`, `0090`–`0116` | the UFS 3.1 root device, its wake sequence, the write path (`0090`), the task name in an unclassified abort (`0091`), the console's 64-bit clear (`0092`), bounded key-store calls (`0093`), the duplicate-surface lookup backboardd needs (`0094`), the userland sampler (`0095`), persistent logging with post-root startup and readback verification (`0096`–`0097`), the iOS swap path and `/private/var/vm` (`0098`), the dump's comma-separated term list (`0099`), the log/sampler paced by the UFS write path instead of dead timeouts (`0100`–`0101`), the one-shot detailed sampler dump (`0102`), the writer woken by console output (`0103`), the dump's six-line tails (`0104`), the console tee at the funnel point (`0105`), the opt-in personas/display diagnostics (`0106`), the lost-wakeup/exit-log fix (`0107`), the `AMFI` dyld-policy answer (`0108`), the target-aware detailed-sample trigger (`0109`), timer/GIC register snapshots (`0110`), the CNTV IMASK correction (`0111`), per-daemon injection modes (`0112`), the sampler kept out of the console and UFS paths (`0113`), the display mode plus empty `IOAcceleratorES` that let CoreAnimation fall back to its software renderer (`0114`), the panel written through the console alias with the console paused without unmapping it (`0115`), and the vtimer PPI fix (active state, Group 1 modifier) with the timer/interrupt diagnostics (`0116`) |
 | `0083`–`0085` | panel memory reservation, colour-bar self-test, IOSurface/IOMobileFramebuffer presentation |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
+| `0117`–`0180` | the hardware bring-up after the display: the Goodix touch (TLMM, GENI SPI, 220 KB firmware, vsync reports), the GPU probe (GMU SMMU and firmware, HFI power tables, GX, the ARC votes), the `0173` timer arm, the boot bisect marks, the canvas CFData types, and the cmd-db/RSC mapping cache |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`.
@@ -37,7 +38,7 @@ tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 
 The CI **skips** a patch that does not apply and still reports success, so run
 the command above (or `tools/check-patches.sh`) before pushing. It reports
-115/115 for the current series. Two traps it catches: `git apply` rejects a hunk
+179/179 for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
 ran. A *cancelled* job is reported as `failure` too.

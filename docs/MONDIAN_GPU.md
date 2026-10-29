@@ -1,8 +1,9 @@
 # GPU and boot time
 
-The UI is CPU-rendered at about 6 fps (3-12 measured with `mondrianfb_fps=1`
-at 1440x3200, copy ~2.3 ms per swap; `0114`, the software CoreAnimation
-renderer). The other ios-sweet ports render through
+The UI is CPU-rendered at 6.4 fps (active seconds, max 23 with
+`mondrianfb_fps=1` at 1440x3200, copy ~2.3 ms per swap; `0114`, the software
+CoreAnimation renderer); a 900x2000 canvas reaches 9.3. The GPU probe and
+GX add no frames yet. The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
 
@@ -92,16 +93,20 @@ them has Metal. That is the path this port follows.
   <build>/bsd/dev/mondrian_gmu_fw.h` before building with `gmustart=1`. The
   header is generated from the device dump and is not committed; without it
   the kernel builds and prints `no gmu firmware built in`.
-- **GX**: enabling the GX GDSC after the GMU/HFI are up still leaves
-  `PWR_ON=0` (`gx hw 0x0 gdscr 0x6822f000`). The vendor does not power GX from
-  the host votes alone: the GMU firmware votes the gfx/cx/mx rails from the
-  **HFI PERF_TBL/BW_TBL** tables (`adreno_gen7_rpmh.c` `build_dcvs_table`).
-  Sending HFI ids 4 (perf, 58 words), 3 (bw, 159), 14 (core start) and 30
-  (default vote) plus `oob_gpu`, as `PongAdrenoGmuStartPower` does, is the
-  next step before GX.
-- **Next**: HFI power tables, GX clocks, SQE/ZAP and CP initialization; the firmware
-  blocks, the GMU context bank and the CM3 start are in `mondrian_gpu.c`
-  under `gmustart=1`.
+- **HFI power and GX**: the GMU ACKs PERF (id 4, 58 words), BW (id 3, 159),
+  CORE_FW_START (14), the default vote (30, `gpu 2 bus 2`) and START10 with
+  `err 0`; `oob_gpu` is held and GX reads `PWR_ON=1` (`gdscr 0xf8222800`,
+  `gx hw 0x0`). The tables come from the live cmd-db (`gfx/mx/cx`,
+  SH0/MC0/ACV) and the 13 mondrian OPPs, the same data as Pong's
+  `PongAdrenoPower.c`. A full boot with the tables and GX on reaches
+  SpringBoard and the touch report thread; one 150 s boot measured 8.1 active
+  fps (max 35) against the 6.4 (max 23) CPU baseline, so the userland is
+  still the software renderer.
+  The 8 MiB `io_submap` is the trap: `ml_io_map()` has no unmap and the touch
+  command DB/RSC windows were re-mapped per lookup; `0179` caches both.
+- **Next**: CP/SQE/ZAP and the ring (`PongAdrenoCp.cpp`), then the Mesa
+  `FD730`/`RedwoodGPU` port; the firmware blocks, the GMU context bank and the
+  CM3 start are in `mondrian_gpu.c` under `gmustart=1`.
 
 ## Android capture (2026-10-28)
 

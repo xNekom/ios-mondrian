@@ -1,0 +1,387 @@
+xnu 0180: publish the GMU HFI power tables and hold the GX rail
+
+FW_INIT_RESULT=0x100 and CORE_FW_START prove the CM3 runs, but without the
+PERF (id 4) and BW (id 3) tables the GMU does not know the SM8475 OPPs, and
+without the default vote (id 30) it never applies them. Port the same
+PongAdrenoPower tables: read the gfx/mx/cx level and SH0/MC0/ACV bandwidth
+resources from the cmd-db, build the 58-word PERF and 159-word BW payloads,
+send them, then CORE_FW_START and the default vote, and finally the oob_gpu
+hold. The GMU ACKs every message with err 0, the default vote reports
+gpu 2 / bus 2, and the GX GDSCR reads PWR_ON=1. The CPU-side GDSC sequence
+stays as a fallback; gmustart=1 and gpugx=1 still gate the new path.
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+index 67d1cb6..1fede77 100644
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -731,6 +731,321 @@ mondrian_gpu_hfi_poll(vm_offset_t hfi, uint32_t seq, uint32_t *out, uint32_t *co
+ 	return 1;
+ }
+ 
++
++/* ------------------------------------------------------------------ */
++/* HFI power tables (ported from PongAdrenoPower.c, same SM8475 A730) */
++/* ------------------------------------------------------------------ */
++struct mondrian_power_res {
++	uint32_t address;
++	const uint8_t *aux;
++	uint32_t bytes;
++};
++
++struct mondrian_power_level {
++	uint32_t hz, level, cx_level, bus, bus_min, bus_max, acd;
++};
++
++static const struct mondrian_power_level mondrian_power_levels[13] = {
++	{ 0x35a4e900u, 0x1a0u, 0x1a0u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
++	{ 0x33611380u, 0x180u, 0x180u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
++	{ 0x3093e9c0u, 0x140u, 0x140u, 0xbu, 0xau, 0xbu, 0x882b5ffdu },
++	{ 0x2d98f940u, 0x100u, 0x100u, 0xau, 0x9u, 0xbu, 0x882c5ffdu },
++	{ 0x2a51bd80u, 0xe0u, 0x100u, 0xau, 0x6u, 0xbu, 0x882c5ffdu },
++	{ 0x2671eb40u, 0xc0u, 0xc0u, 0x8u, 0x6u, 0x9u, 0x882d5ffdu },
++	{ 0x22921900u, 0x90u, 0xc0u, 0x8u, 0x6u, 0x9u, 0x882e5ffdu },
++	{ 0x1eb246c0u, 0x80u, 0x80u, 0x6u, 0x6u, 0x8u, 0x882e5ffdu },
++	{ 0x1a2a9bc0u, 0x60u, 0x80u, 0x6u, 0x3u, 0x8u, 0xc0285ffdu },
++	{ 0x15b23300u, 0x50u, 0x80u, 0x3u, 0x1u, 0x6u, 0xc0285ffdu },
++	{ 0x134fd900u, 0x40u, 0x40u, 0x2u, 0x1u, 0x6u, 0xc02a5ffdu },
++	{ 0x10fcc140u, 0x38u, 0x40u, 0x2u, 0x1u, 0x5u, 0xc02c5ffdu },
++	{ 0xd1cef00u, 0x30u, 0x40u, 0x2u, 0x1u, 0x5u, 0xc8285ffdu },
++};
++
++static const uint32_t mondrian_ddr_bandwidth[12] = {
++	0u, 781250u, 1761718u, 2136718u, 2660156u, 3000000u,
++	6074218u, 6671875u, 8171875u, 10687500u, 12484375u, 13085937u
++};
++
++static uint16_t
++mondrian_le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | (uint16_t)p[1] << 8);
++}
++
++static uint32_t
++mondrian_le32(const uint8_t *p)
++{
++	return (uint32_t)mondrian_le16(p) | (uint32_t)mondrian_le16(p + 2) << 16;
++}
++
++static int
++mondrian_power_res(const char *name, struct mondrian_power_res *r)
++{
++	uint32_t len = 0;
++	const void *aux = mondrian_cmd_db_data(name, &len);
++
++	r->address = mondrian_cmd_db_addr(name);
++	r->aux = (const uint8_t *)aux;
++	r->bytes = len;
++	return r->address != 0 && aux != NULL && len != 0;
++}
++
++static unsigned
++mondrian_rail_count(const struct mondrian_power_res *r)
++{
++	unsigned n, active, i;
++	uint16_t previous = 0;
++
++	if (r->aux == NULL || r->bytes == 0 || (r->bytes & 1) || r->bytes > 512 ||
++	    r->address == 0 || (r->address & 3) || ((r->address >> 16) & 7) != 3 ||
++	    mondrian_le16(r->aux) != 0) {
++		return 0;
++	}
++	n = r->bytes / 2;
++	active = n;
++	for (i = 1; i < n; i++) {
++		uint16_t level = mondrian_le16(r->aux + 2 * i);
++
++		if (level == 0) {
++			if (active == n) {
++				active = i;
++			}
++		} else if (active != n || level < previous) {
++			return 0;
++		}
++		previous = level;
++	}
++	return active > 1 ? active : 0;
++}
++
++static int
++mondrian_index_for(const struct mondrian_power_res *r, unsigned count, uint32_t level,
++    unsigned *out)
++{
++	unsigned i;
++
++	for (i = 0; i < count; i++) {
++		if (mondrian_le16(r->aux + 2 * i) >= level) {
++			*out = i;
++			return 0;
++		}
++	}
++	return 1;
++}
++
++static int
++mondrian_power_vote(const struct mondrian_power_res *primary, unsigned pn,
++    const struct mondrian_power_res *secondary, unsigned sn, uint32_t level,
++    uint32_t *out)
++{
++	unsigned p, s;
++	uint32_t actual;
++
++	if (mondrian_index_for(primary, pn, level, &p)) {
++		return 1;
++	}
++	actual = mondrian_le16(primary->aux + 2 * p);
++	if (mondrian_index_for(secondary, sn, actual, &s)) {
++		s = sn - 1;
++	}
++	*out = (actual << 16) | (s << 8) | p;
++	return 0;
++}
++
++static int
++mondrian_power_bcm(const struct mondrian_power_res *r, uint32_t kbps, unsigned width,
++    unsigned fixed, unsigned commit, uint32_t *out)
++{
++	uint32_t unit, word;
++	unsigned connection;
++	uint64_t peak;
++
++	if (r->aux == NULL || r->bytes != 8 || r->address == 0 ||
++	    (r->address & 3) || ((r->address >> 16) & 7) != 5 || r->aux[7]) {
++		return 1;
++	}
++	unit = mondrian_le32(r->aux);
++	connection = mondrian_le16(r->aux + 4);
++	if (!fixed && (unit == 0 || connection == 0 || width == 0)) {
++		return 1;
++	}
++	word = commit ? 0x40000000u : 0;
++	if (kbps != 0) {
++		peak = fixed ? 8 : ((uint64_t)kbps * connection / width) * 1000 / unit;
++		if (peak == 0) {
++			peak = 1;
++		}
++		if (peak > 0x3fffu) {
++			peak = 0x3fffu;
++		}
++		word |= 0x20000000u | (uint32_t)peak;
++	}
++	*out = word;
++	return 0;
++}
++
++static int
++mondrian_gpu_build_power_tables(uint32_t *perf, uint32_t *bw, uint32_t *gpu_idx,
++    uint32_t *bus_idx)
++{
++	struct mondrian_power_res gfx, mx, cx, sh0, mc0, acv, cn0;
++	unsigned gn, mn, cn, i, j;
++	static const uint32_t gmu_hz[3] = { 0, 200000000u, 500000000u };
++	static const uint32_t gmu_level[3] = { 0, 64, 128 };
++
++	if (!mondrian_power_res("gfx.lvl", &gfx) || !mondrian_power_res("mx.lvl", &mx) ||
++	    !mondrian_power_res("cx.lvl", &cx) || !mondrian_power_res("SH0", &sh0) ||
++	    !mondrian_power_res("MC0", &mc0) || !mondrian_power_res("ACV", &acv) ||
++	    !mondrian_power_res("CN0", &cn0)) {
++		return -1;
++	}
++	gn = mondrian_rail_count(&gfx);
++	mn = mondrian_rail_count(&mx);
++	cn = mondrian_rail_count(&cx);
++	if (gn == 0 || mn == 0 || cn == 0) {
++		return -1;
++	}
++	perf[0] = 14;
++	perf[1] = 3;
++	for (i = 0; i < 14; i++) {
++		uint32_t level = i ? mondrian_power_levels[13 - i].level : 0;
++		uint32_t v;
++		unsigned ci;
++
++		if (mondrian_power_vote(&gfx, gn, &mx, mn, level, &v) ||
++		    mondrian_index_for(&cx, cn,
++		    i ? mondrian_power_levels[13 - i].cx_level : 0, &ci)) {
++			return -1;
++		}
++		perf[2 + 3 * i] = v;
++		perf[3 + 3 * i] = ci;
++		perf[4 + 3 * i] = i ? mondrian_power_levels[13 - i].hz / 1000 : 0;
++	}
++	for (i = 0; i < 3; i++) {
++		uint32_t v;
++
++		if (mondrian_power_vote(&cx, cn, &mx, mn, gmu_level[i], &v)) {
++			return -1;
++		}
++		perf[50 + 2 * i] = v;
++		perf[51 + 2 * i] = gmu_hz[i] / 1000;
++	}
++
++	bw[0] = 12;
++	bw[1] = 1;
++	bw[2] = 3;
++	bw[3] = 1;
++	bw[5] = cn0.address;
++	for (i = 0; i < 2; i++) {
++		if (mondrian_power_bcm(&cn0, i ? 100 : 0, 4, 0, 1, &bw[11 + 6 * i])) {
++			return -1;
++		}
++	}
++	for (j = 0; j < 3; j++) {
++		const struct mondrian_power_res *ddr[3] = { &sh0, &mc0, &acv };
++		static const unsigned widths[3] = { 16, 4, 0 };
++		unsigned commit = j == 2 ||
++		    (ddr[j + 1]->aux != NULL && ddr[j + 1]->bytes == 8 &&
++		    ddr[j]->aux[6] != ddr[j + 1]->aux[6]);
++
++		if (commit) {
++			bw[4] |= 1u << j;
++		}
++		bw[23 + j] = ddr[j]->address;
++		for (i = 0; i < 12; i++) {
++			if (mondrian_power_bcm(ddr[j], mondrian_ddr_bandwidth[i],
++			    widths[j], j == 2, commit, &bw[31 + 8 * i + j])) {
++				return -1;
++			}
++		}
++	}
++	*gpu_idx = 2;
++	*bus_idx = mondrian_power_levels[11].bus;
++	return 0;
++}
++
++static int
++mondrian_gpu_hfi_wait(vm_offset_t gmu, vm_offset_t hfi, uint64_t hfi_pa,
++    uint32_t seq, uint32_t *countp, uint32_t *errp)
++{
++	uint32_t out[16], count = 0;
++	int i, r = 0;
++
++	for (i = 0; i < 100; i++) {
++		flush_dcache64((addr64_t)hfi_pa, 0x4000, TRUE);
++		r = mondrian_gpu_hfi_poll(hfi, seq, out, &count);
++		if (r != 0) {
++			break;
++		}
++		delay(1000);
++	}
++	*countp = count;
++	*errp = count > 2 ? out[2] : 0;
++	return r;
++}
++
++static void
++mondrian_gpu_hfi_power(vm_offset_t gmu, vm_offset_t hfi, uint64_t hfi_pa,
++    uint32_t hfi_iova)
++{
++	uint32_t perf[58] = { 0 }, bw[159] = { 0 };
++	uint32_t gpu_idx = 0, bus_idx = 0, count, err, vote[3];
++	uint32_t seq = 2, s, out[16];
++	int r, i;
++
++	(void)hfi_iova;
++	if (mondrian_gpu_build_power_tables(perf, bw, &gpu_idx, &bus_idx)) {
++		printf("MONDRIAN GPU: hfi power tables missing\n");
++		return;
++	}
++	printf("MONDRIAN GPU: hfi power gpu %u bus %u\n", gpu_idx, bus_idx);
++
++	s = seq++;
++	mondrian_gpu_hfi_send(gmu, hfi, 4, perf, 58, s);
++	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
++	printf("MONDRIAN GPU: hfi perf r %d cnt %u err 0x%x\n", r, count, err);
++
++	s = seq++;
++	mondrian_gpu_hfi_send(gmu, hfi, 3, bw, 159, s);
++	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
++	printf("MONDRIAN GPU: hfi bw r %d cnt %u err 0x%x\n", r, count, err);
++
++	{
++		uint32_t core_start = 0;
++
++		s = seq++;
++		mondrian_gpu_hfi_send(gmu, hfi, 14, &core_start, 1, s);
++		r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
++		printf("MONDRIAN GPU: hfi core r %d cnt %u err 0x%x\n", r, count, err);
++	}
++	vote[0] = 1;
++	vote[1] = gpu_idx;
++	vote[2] = bus_idx;
++	s = seq++;
++	mondrian_gpu_hfi_send(gmu, hfi, 30, vote, 3, s);
++	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
++	printf("MONDRIAN GPU: hfi vote r %d cnt %u err 0x%x\n", r, count, err);
++
++	/* oob_gpu: hold the GPU, then the HFI hold command. */
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f991u), 1u << 31);
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f994u), 1u << 30);
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_gpu_read(gmu, GMU_OFF(0x1f992u)) & (1u << 31)) != 0) {
++			break;
++		}
++		delay(10);
++	}
++	printf("MONDRIAN GPU: hfi oob info 0x%x\n",
++	    mondrian_gpu_read(gmu, GMU_OFF(0x1f992u)));
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f991u), 1u << 31);
++	s = seq++;
++	mondrian_gpu_hfi_send(gmu, hfi, 10, NULL, 0, s);
++	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
++	printf("MONDRIAN GPU: hfi hold r %d cnt %u err 0x%x\n", r, count, err);
++	mondrian_log_flush_now();
++	(void)out;
++}
++
+ /*
+  * Program the GMU context bank and stream, load the full GMU firmware
+  * (TCM plus the 57 KiB external block at IOVA 0x4000) and start the CM3.
+@@ -1045,25 +1360,8 @@ mondrian_gpu_gmu_bringup(vm_offset_t gpucc, vm_offset_t gpu, vm_offset_t gmu,
+ 		mondrian_log_flush_now();
+ 	}
+ 	if ((v & 1u) != 0) {
+-		uint32_t core_start = 0, out[16], count = 0;
+-		uint32_t seq = 1;
+-		int r = 0;
+-
+-		mondrian_gpu_hfi_send(gmu, hfi.va, 14, &core_start, 1, seq);
+-		flush_dcache64((addr64_t)hfi.pa, hfi.bytes, TRUE);
+-		for (i = 0; i < 100; i++) {
+-			flush_dcache64((addr64_t)hfi.pa, hfi.bytes, TRUE);
+-			r = mondrian_gpu_hfi_poll(hfi.va, seq, out, &count);
+-			if (r != 0) {
+-				break;
+-			}
+-			delay(1000);
+-		}
+-		printf("MONDRIAN GPU: hfi core start r %d hdr 0x%x cnt %u err 0x%x\n",
+-		    r, count ? out[0] : 0, count, count > 2 ? out[2] : 0);
+-		mondrian_log_flush_now();
+-	}
+-}
++		mondrian_gpu_hfi_power(gmu, hfi.va, hfi.pa, hfi.iova);
++	}}
+ 
+ /*
+  * GX power-up. The vendor enables this only after the GMU is up and HFI is
+@@ -1160,6 +1458,21 @@ mondrian_gpu_probe(void)
+ 		if (mondrian_gpu_gx) {
+ 			mondrian_gpu_gx_on(gpucc);
+ 		}
++		if (gmustart != 0) {
++			/*
++			 * GEN7_GMU_GFX_PWR_CLK_STATUS: bit 0 GX GDSC off, bit 1 GX
++			 * clock off, so 0 means the GMU believes both are up. The
++			 * three GPUCC branches are read raw: 0x90a8 gx_gfx3d,
++			 * 0x90bc gx_gmu, 0x90c8 gx_gfx3d_rdvm.
++			 */
++			printf("MONDRIAN GPU: gfx pwr clk 0x%x\n",
++			    mondrian_gpu_read(gmu, GMU_OFF(0x1f8d0u)));
++			printf("MONDRIAN GPU: gx clk 0x%x 0x%x 0x%x\n",
++			    mondrian_gpu_read(gpucc, 0x90a8),
++			    mondrian_gpu_read(gpucc, 0x90bc),
++			    mondrian_gpu_read(gpucc, 0x90c8));
++			mondrian_log_flush_now();
++		}
+ 		/*
+ 		 * Pong releases the CX GBIF halt before any GMU access: GDSC
+ 		 * retention can preserve the boot firmware's halt, and every

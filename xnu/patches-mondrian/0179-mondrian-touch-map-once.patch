@@ -1,0 +1,107 @@
+xnu 0179: map the touch command DB and RSC once
+
+ml_io_map() carves its VA out of the fixed 8 MiB io_submap and has no
+matching unmap in this tree, but mondrian_cmd_db_addr(), mondrian_cmd_db_data()
+and the RPMh calls mapped the 128 KiB command DB and the 64 KiB RSC window on
+every lookup. The GPU probe's power-table builder alone asks for fourteen
+resources, and each rail vote maps both windows again, so the submap filled
+and the next kernel allocation (the touch ldoc2 vote at power-on) panicked
+with kmem_alloc(..., 131072, KMA_NOFAIL) in io_map. Cache both windows in
+static VAs and reuse them; the command DB is mapped once and the RSC once.
+The boot then reaches the UI with the GPU probe and the touch power sequence
+both enabled.
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+index b7dc45b..fe8ec3c 100644
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -463,6 +463,36 @@ mondrian_spi_wait_done(vm_offset_t se, int spins)
+ 	return -1;
+ }
+ 
++/*
++ * The command DB is a 128 KiB window and the RSC a 64 KiB one. ml_io_map()
++ * carves the VA out of the 8 MiB io_submap and has no unmap here, so mapping
++ * them on every resource lookup (the rail votes and the GPU power tables do
++ * dozens) exhausts the submap and the next KMA_NOFAIL kmem_alloc panics.
++ * Map each window once and reuse it.
++ */
++static vm_offset_t
++mondrian_cmd_db_map(void)
++{
++	static vm_offset_t db;
++
++	if (db == 0) {
++		db = ml_io_map(MONDRIAN_CMD_DB_PA, MONDRIAN_CMD_DB_SIZE);
++		printf("MONDRIAN TOUCH: cmd-db mapped at 0x%lx\n", (unsigned long)db);
++	}
++	return db;
++}
++
++static vm_offset_t
++mondrian_rsc_map(void)
++{
++	static vm_offset_t rsc;
++
++	if (rsc == 0) {
++		rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	}
++	return rsc;
++}
++
+ /*
+  * The LDO resource address lives in the command DB, keyed by the vendor's
+  * qcom,resource-name ("ldoc2" for pm8350c_l2).
+@@ -470,7 +500,7 @@ mondrian_spi_wait_done(vm_offset_t se, int spins)
+ uint32_t
+ mondrian_cmd_db_addr(const char *id)
+ {
+-	vm_offset_t db = ml_io_map(MONDRIAN_CMD_DB_PA, MONDRIAN_CMD_DB_SIZE);
++	vm_offset_t db = mondrian_cmd_db_map();
+ 	const uint8_t *b = (const uint8_t *)db;
+ 	uint32_t i, j;
+ 
+@@ -516,7 +546,7 @@ mondrian_cmd_db_addr(const char *id)
+ const void *
+ mondrian_cmd_db_data(const char *id, uint32_t *len)
+ {
+-	vm_offset_t db = ml_io_map(MONDRIAN_CMD_DB_PA, MONDRIAN_CMD_DB_SIZE);
++	vm_offset_t db = mondrian_cmd_db_map();
+ 	const uint8_t *b = (const uint8_t *)db;
+ 	uint32_t i, j;
+ 
+@@ -561,7 +591,7 @@ mondrian_cmd_db_data(const char *id, uint32_t *len)
+ int
+ mondrian_rpmh_write_one(uint32_t addr, uint32_t data)
+ {
+-	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	vm_offset_t rsc = mondrian_rsc_map();
+ 	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
+ 	    MONDRIAN_CMD_MSGID_RESP;
+@@ -602,7 +632,7 @@ mondrian_rpmh_write_one(uint32_t addr, uint32_t data)
+ int
+ mondrian_rpmh_write_batch(const uint32_t *addr, const uint32_t *data, uint32_t n)
+ {
+-	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	vm_offset_t rsc = mondrian_rsc_map();
+ 	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
+ 	    MONDRIAN_CMD_MSGID_RESP;
+@@ -674,7 +704,7 @@ mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on)
+ 	if (addr == 0) {
+ 		return -1;
+ 	}
+-	rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	rsc = mondrian_rsc_map();
+ 	if (rsc == 0) {
+ 		return -1;
+ 	}
+@@ -750,7 +780,7 @@ mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on)
+ static int
+ mondrian_rpmh_read(uint32_t addr, uint32_t *out)
+ {
+-	vm_offset_t rsc = ml_io_map(MONDRIAN_RSC_PA, MONDRIAN_RSC_SIZE);
++	vm_offset_t rsc = mondrian_rsc_map();
+ 	uint32_t base = MONDRIAN_RSC_ACTIVE_BASE;
+ 	uint32_t msgid = MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_RESP;
+ 	uint32_t i, ctrl, sts = 0;
