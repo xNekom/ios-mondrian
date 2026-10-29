@@ -29,6 +29,7 @@ import argparse
 import os
 import re
 import struct
+import subprocess
 import sys
 
 CPU_ARM64 = 0x0100000C
@@ -131,6 +132,26 @@ def demangle_name(name):
     return re.sub(r"^_+Z(TV|TI|NK|N|St)?", "", name)
 
 
+def dump_words(dsc, address, size):
+    """The vtable words as the cache holds them.
+
+    An extracted image can lose the pointers that live in the cache's
+    __AUTH_CONST region, so the measurement is taken from the cache itself.
+    """
+    result = subprocess.run(["ipsw", "dyld", "dump", dsc, f"{address:#x}",
+                             "-a", "-c", str(size // 8)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    words = []
+    for line in result.stdout.split():
+        try:
+            words.append(int(line, 16))
+        except ValueError:
+            return None
+    return words if len(words) == size // 8 else None
+
+
 def find_symbols(macho, pattern):
     """[(name, address)] whose symbol name matches, shortest name first."""
     return [(name, macho.symbols[name]) for name in
@@ -151,6 +172,8 @@ def main():
     ap.add_argument("--base", default="0x180000000", help="the cache's base address (default 0x180000000)")
     ap.add_argument("--vtable", default=DEFAULT_VTABLE, help=f"vtable symbol to look for (default {DEFAULT_VTABLE})")
     ap.add_argument("--method", action="append", help="method symbol to look for (default: the two GLContext methods)")
+    ap.add_argument("--dsc", help="read the vtable from this dyld shared cache instead of the "
+                    "image (required for builds whose vtable lives in __AUTH_CONST)")
     ap.add_argument("-o", "--output", help="rewrite the numbers in this mondrian_offsets.h")
     args = ap.parse_args()
 
@@ -164,10 +187,15 @@ def main():
     print(f"vtable   {vtable_address - base:#x}  {vtable_name}")
 
     # The vtable itself: offset-to-top, the typeinfo pointer, then one entry per virtual method.
-    window = macho.read(vtable_address, VTABLE_WINDOW)
-    if window is None:
-        sys.exit("the vtable is not in a file-backed segment")
-    entries = [struct.unpack_from("<Q", window, at)[0] for at in range(0, len(window), 8)]
+    if args.dsc:
+        entries = dump_words(args.dsc, vtable_address, VTABLE_WINDOW)
+        if entries is None:
+            sys.exit(f"could not read the vtable at {vtable_address:#x} from {args.dsc}")
+    else:
+        window = macho.read(vtable_address, VTABLE_WINDOW)
+        if window is None:
+            sys.exit("the vtable is not in a file-backed segment")
+        entries = [struct.unpack_from("<Q", window, at)[0] for at in range(0, len(window), 8)]
 
     found, slots = {}, {}
     for method in methods:

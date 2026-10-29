@@ -75,8 +75,14 @@ The values are this build's (iPhone X 16.7.16, 20H392) and only inputs to a chec
 patches a slot only while it holds the named function, and says so when it does not. Re-derive them
 when the root changes or the log says "slot holds ..., expected ...".
 
-1. `ipsw dyld extract <dyld_shared_cache_arm64*> /System/Library/PrivateFrameworks/QuartzCore.framework/QuartzCore -o /tmp/qc`
-2. `tools/gpu/mondrian-offsets.py /tmp/qc/QuartzCore/QuartzCore -o tools/gpu/mondrian_offsets.h`
+1. `ipsw dyld extract <dyld_shared_cache_arm64*> /System/Library/Frameworks/QuartzCore.framework/QuartzCore -o /tmp/qc`
+   (a public framework, and this build's cache is `arm64`, not `arm64e`)
+2. `tools/gpu/mondrian-offsets.py /tmp/qc/QuartzCore --dsc <cache> -o tools/gpu/mondrian_offsets.h`
+
+   `--dsc` matters: the vtable lives in the cache's `__AUTH_CONST`, and an extracted image loses
+   those pointers, so the slots come back empty without it. Measured on the 16.7.16 build this way:
+   vtable `0x1d5b2f6e8`, `function_supported` at slot `0x378` (entry 111) and `function_uniform`
+   at `0x388` (entry 113) — the values the header already carried.
 3. With `glslots=1` on the device: `mkeagl.py --from-log <log> --write-slots eagl_slots.txt`, rebuild.
 
 Step 2 reads QuartzCore's symbol table, finds `__ZTV...GLESContextE` and the two
