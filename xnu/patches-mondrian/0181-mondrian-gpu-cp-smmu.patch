@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..461d36a
+index 0000000..7ca6fbb
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3133 @@
+@@ -0,0 +1,3219 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -83,7 +83,11 @@ index 0000000..461d36a
 +#define MONDRIAN_UC_IOVA_END	0x80000000ull
 +
 +static int mondrian_uc_up;
++static int mondrian_uc_logged;
++static uint32_t mondrian_uc_pm4;
++static int mondrian_uc_noblit;
 +static vm_offset_t mondrian_uc_gpu;
++static vm_offset_t mondrian_uc_smmu;
 +static uint32_t mondrian_uc_at;
 +static uint32_t mondrian_uc_fence;
 +static uint32_t mondrian_uc_table_next = 1;
@@ -2279,7 +2283,7 @@ index 0000000..461d36a
 +	    CPR(GEN7_RB_CMP_DBG_ECO_CNTL) | (1u << 11));
 +	printf("MONDRIAN GPU: cp hw uche ok\n");
 +	mondrian_log_flush_now();
-+	CPW(GEN7_CP_PROTECT_CNTL, 0);	/* test: the table is a740's */
++	CPW(GEN7_CP_PROTECT_CNTL, 0);	/* the table is a740's: leave it off */
 +	for (i = 1; i <= 2; i++) {
 +		CPW(GEN7_CP_APERTURE_CNTL_HOST, i << 12);
 +		CPW(GEN7_GRAS_NC_MODE_CNTL, bank << 5);
@@ -2293,7 +2297,7 @@ index 0000000..461d36a
 +	mondrian_log_flush_now();
 +	/* Vendor value: bit 0 marks instruction-cache fetches privileged, and
 +	 * the SQE is mapped read-only privileged (perms 5), as pong does. */
-+	CPW(GEN7_CP_APRIV_CNTL, 0x6fu);
++	CPW(GEN7_CP_APRIV_CNTL, 0x6fu);	/* icache fetches privileged */
 +	CPW(GEN7_CP_BV_APRIV_CNTL, 0xfu);
 +	CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xfu);
 +	CPW(GEN7_CP_CHICKEN_DBG, 1);
@@ -2630,6 +2634,7 @@ index 0000000..461d36a
 +		/* From here the ring belongs to the user client, which
 +		 * continues at this dword. */
 +		mondrian_uc_gpu = gpu;
++		mondrian_uc_smmu = smmu;
 +		mondrian_uc_at = at;
 +		mondrian_uc_up = 1;
 +		if (rptr >= at) {
@@ -2747,6 +2752,18 @@ index 0000000..461d36a
 +mondrian_gpu_uc_ready(void)
 +{
 +	return mondrian_uc_up;
++}
++
++uint32_t
++mondrian_gpu_uc_pm4_limit(void)
++{
++	return mondrian_uc_pm4;
++}
++
++int
++mondrian_gpu_uc_noblit(void)
++{
++	return mondrian_uc_noblit;
 +}
 +
 +int
@@ -2947,6 +2964,55 @@ index 0000000..461d36a
 +	mondrian_uc_at = at;
 +	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
 +	*fence = seq;
++	if (dwords > 16 && mondrian_uc_logged < 8) {
++		/* A command stream from a real driver, not the bring-up probe:
++		 * wait for its own fence here and say what the CP did with it. */
++		volatile uint32_t *view =
++		    (volatile uint32_t *)mondrian_cp_memptr_view;
++		uint32_t waited, value = 0;
++
++		for (waited = 0; waited < 300; waited++) {
++			__asm__ volatile("dsb sy" ::: "memory");
++			value = view[mondrian_uc_fence_word(seq)];
++			if ((int32_t)(value - seq) >= 0) {
++				break;
++			}
++			delay(1000);
++		}
++		mondrian_uc_logged++;
++		/* An opcode error names the packet the ucode would not take:
++		 * SQE_STAT index 0 is the ucode PC, index 1 the packet. */
++		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_SQE_STAT_ADDR * 4u, 0);
++		{
++			uint32_t pc = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_SQE_STAT_DATA * 4u);
++			uint32_t packet = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_SQE_STAT_DATA * 4u);
++
++			uint32_t base = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB1_BASE * 4u);
++			uint32_t rem = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB1_REM_SIZE * 4u);
++
++			printf("MONDRIAN GPU: uc sqe pc 0x%x packet 0x%08x ib1 0x%x rem 0x%x ib2 0x%x rem2 0x%x\n",
++			    pc, packet, base, rem,
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB2_BASE * 4u),
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB2_REM_SIZE * 4u));
++			printf("MONDRIAN GPU: uc ib1 stopped at %u dwords\n",
++			    rem >= dwords ? 0u : dwords - rem);
++		}
++		printf("MONDRIAN GPU: uc big %u dwords fence %u done %u in %u ms int 0x%x fault 0x%x protect 0x%x fsr 0x%x\n",
++		    dwords, seq, (int32_t)(value - seq) >= 0, waited,
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_INTERRUPT_STATUS * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_HW_FAULT * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_PROTECT_STATUS * 4u),
++		    mondrian_gpu_read(mondrian_uc_smmu, 0x20058u));
++		mondrian_log_flush_now();
++	}
 +	return 0;
 +}
 +
@@ -2964,6 +3030,22 @@ index 0000000..461d36a
 +		__asm__ volatile("dsb sy" ::: "memory");
 +		value = view[mondrian_uc_fence_word(fence)];
 +		if ((int32_t)(value - fence) >= 0) {
++			if (mondrian_uc_logged < 10) {
++				mondrian_uc_logged++;
++				printf("MONDRIAN GPU: uc fence %u int 0x%x fault 0x%x fsr 0x%x rptr 0x%x wptr 0x%x\n",
++				    fence,
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_INTERRUPT_STATUS * 4u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_HW_FAULT * 4u),
++				    mondrian_gpu_read(mondrian_uc_smmu,
++				    0x20058u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_RB_RPTR * 4u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_RB_WPTR * 4u));
++				mondrian_log_flush_now();
++			}
 +			return 0;
 +		}
 +		if (waited >= limit) {
@@ -2999,6 +3081,10 @@ index 0000000..461d36a
 +	    sizeof(mondrian_cp_zap));
 +	(void)PE_parse_boot_argn("gpustart", &mondrian_cp_run,
 +	    sizeof(mondrian_cp_run));
++	(void)PE_parse_boot_argn("gpupm4", &mondrian_uc_pm4,
++	    sizeof(mondrian_uc_pm4));
++	(void)PE_parse_boot_argn("gpunoblit", &mondrian_uc_noblit,
++	    sizeof(mondrian_uc_noblit));
 +	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
 +	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
 +	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
@@ -3166,10 +3252,10 @@ index 0000000..461d36a
 +}
 diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
 new file mode 100644
-index 0000000..606ff0e
+index 0000000..881511f
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu_api.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,58 @@
 +/*
 + * What the IOKit driver (iokit/Kernel/arm/MondrianGPU.cpp) asks of the GPU
 + * bring-up in mondrian_gpu.c. The C side owns the SMMU page tables, the IOVA
@@ -3214,6 +3300,14 @@ index 0000000..606ff0e
 +
 +/* Wait for a fence; timeout 0 means the default patience. */
 +int mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms);
++
++/* gpupm4=N truncates a submitted stream to N dwords, to bisect a stream the
++ * CP will not finish. Zero submits it whole. */
++uint32_t mondrian_gpu_uc_pm4_limit(void);
++
++/* gpunoblit=1 turns every CP_BLIT in a submission into a CP_NOP, to tell a
++ * packet the CP will not take from the state around it. */
++int mondrian_gpu_uc_noblit(void);
 +
 +#ifdef __cplusplus
 +}

@@ -100,10 +100,15 @@ mondrian_mesa_test(void)
 	}
 	IOObjectRelease(service);
 
-	/* Buffer layouts are not trusted yet; sysmem keeps every resource in
-	 * plain memory where a wrong tiling shows up as wrong pixels instead
-	 * of a GPU fault. */
-	setenv("FD_MESA_DEBUG", "sysmem", 1);
+	/*
+	 * sysmem keeps every resource in plain memory, where a wrong tiling
+	 * shows up as wrong pixels instead of a GPU fault. noblit keeps the
+	 * driver off CP_BLIT, which this board's SQE firmware answers with an
+	 * opcode error (measured: tools/mondrian-gpu-test ... see
+	 * docs/MONDIAN_GPU.md), and sends clears through the generic draw
+	 * path instead.
+	 */
+	setenv("FD_MESA_DEBUG", "sysmem,noblit", 1);
 
 	library = dlopen(kMesaPath, RTLD_NOW);
 	if (library == NULL) {

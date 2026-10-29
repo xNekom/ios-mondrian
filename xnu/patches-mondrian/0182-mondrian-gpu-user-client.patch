@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..185cc29
+index 0000000..048dacb
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,830 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -198,6 +198,9 @@ index 0000000..185cc29
 +	uint32_t fNextHandle;
 +	uint32_t fNextQueue;
 +	uint32_t fLastFence;
++	uint32_t fLogged;
++	uint32_t fDumped;
++	uint32_t fNested;
 +};
 +
 +class MondrianGPU : public IOService
@@ -292,6 +295,9 @@ index 0000000..185cc29
 +	fNextHandle = 1;
 +	fNextQueue = 0;
 +	fLastFence = 0;
++	fLogged = 0;
++	fDumped = 0;
++	fNested = 0;
 +	if (fLock == NULL) {
 +		return false;
 +	}
@@ -392,9 +398,15 @@ index 0000000..185cc29
 +	    kMondrianBuffers) {
 +		return NULL;
 +	}
++	/*
++	 * Page-wise, not physically contiguous: the stage-1 mapping walks the
++	 * descriptor page by page, and asking for a contiguous megabyte makes
++	 * the VM hunt for one (measured: vm_page_find_contiguous with
++	 * num=256, a zone GC and a boot that never finished the allocation).
++	 */
 +	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-+	    (size + 0xfffu) & ~0xfffull, 0x00000000fffff000ull);
++	    kIODirectionInOut, (size + 0xfffu) & ~0xfffull,
++	    0x00000000fffff000ull);
 +	if (memory == NULL) {
 +		return NULL;
 +	}
@@ -535,12 +547,48 @@ index 0000000..185cc29
 +	    request->nr_cmds * sizeof(cmds[0])) != 0) {
 +		return kIOReturnBadArgument;
 +	}
++	if (fLogged < 4) {
++		fLogged++;
++		IOLog("MondrianGPU: submit flags 0x%x bos %u cmds %u type %u size %u "
++		    "relocs %u idx %u\n", request->flags, request->nr_bos,
++		    request->nr_cmds, cmds[0].type, cmds[0].size,
++		    cmds[0].nr_relocs, cmds[0].submit_idx);
++	}
++	if (mondrian_gpu_uc_noblit()) {
++		uint32_t b;
++
++		for (b = 0; b < request->nr_bos; b++) {
++			mondrian_buffer *bo = bufferForType(bos[b].handle);
++			uint64_t at = 0;
++			uint32_t word;
++
++			if (bo == NULL || bo->size > 0x10000) {
++				continue;
++			}
++			while (at + 4 <= bo->size) {
++				if (bo->memory->readBytes(at, &word, 4) != 4) {
++					break;
++				}
++				if ((word >> 28) == 7 && ((word >> 16) & 0x7f) == 0x2c) {
++					uint32_t nop = 0x70000000u |
++					    (word & 0x3fff);
++
++					bo->memory->writeBytes(at, &nop, 4);
++				}
++				at += 4;
++			}
++		}
++	}
 +	IOLockLock(fLock);
 +	for (i = 0; i < request->nr_cmds; i++) {
 +		mondrian_buffer *buffer;
 +
 +		if (cmds[i].type != MSM_SUBMIT_CMD_BUF || cmds[i].nr_relocs != 0 ||
 +		    cmds[i].size == 0 || cmds[i].submit_idx >= request->nr_bos) {
++			IOLog("MondrianGPU: command %u refused (type %u relocs %u "
++			    "size %u idx %u of %u)\n", i, cmds[i].type,
++			    cmds[i].nr_relocs, cmds[i].size,
++			    cmds[i].submit_idx, request->nr_bos);
 +			result = kIOReturnUnsupported;
 +			break;
 +		}
@@ -548,6 +596,95 @@ index 0000000..185cc29
 +		if (buffer == NULL) {
 +			result = kIOReturnBadArgument;
 +			break;
++		}
++		/*
++		 * The stream Mesa submits chains the draw through its own
++		 * CP_INDIRECT_BUFFER; that target is where a real driver's
++		 * packets live, so dump it too, once.
++		 */
++		if (fNested < 1 && cmds[i].size > 64) {
++			uint32_t words[8];
++			uint32_t at = 0;
++
++			fNested++;
++			while (at + 4 <= cmds[i].size) {
++				if (buffer->memory->readBytes(
++				    cmds[i].submit_offset + at, words, 16) != 16) {
++					break;
++				}
++				if ((words[0] >> 28) == 7 &&
++				    ((words[0] >> 16) & 0x7f) == 0x3f &&
++				    (words[0] & 0x3fff) == 3) {
++					uint64_t addr = words[1] |
++					    ((uint64_t)words[2] << 32);
++					uint32_t size = words[3];
++					uint32_t b;
++
++					IOLog("MondrianGPU: nested ib 0x%llx %u dwords\n",
++					    (unsigned long long)addr, size);
++					for (b = 0; b < request->nr_bos; b++) {
++						mondrian_buffer *target =
++						    bufferForType(bos[b].handle);
++						uint32_t q;
++
++						if (target == NULL ||
++						    addr < target->iova ||
++						    addr + 4ull * size >
++						    target->iova + target->size) {
++							continue;
++						}
++						for (q = 0; q < size; q += 8) {
++							bzero(words, sizeof(words));
++							if (target->memory->
++							    readBytes(addr - target->iova +
++							    q * 4, words, sizeof(words)) !=
++							    sizeof(words)) {
++								break;
++							}
++							IOLog("MondrianGPU: pm4 %u %08x %08x %08x %08x %08x %08x %08x %08x\n",
++							    q * 4, words[0], words[1],
++							    words[2], words[3], words[4],
++							    words[5], words[6], words[7]);
++						}
++						break;
++					}
++					at += 16;
++					continue;
++				}
++				if ((words[0] >> 28) == 7) {
++					at += 4 * (1 + (words[0] & 0x3fff));
++				} else {
++					at += 4;
++				}
++			}
++		}
++		if (cmds[i].size > 64 && fDumped < 3) {
++			/* The whole first driver-sized stream, eight words a
++			 * line, so tools/pm4-decode.py can name every packet. */
++			uint32_t words[8];
++			uint32_t at = 0;
++
++			fDumped++;
++			IOLog("MondrianGPU: pm4 stream %u size %u\n", fDumped,
++			    cmds[i].size);
++			while (at < cmds[i].size) {
++				uint32_t chunk = cmds[i].size - at;
++
++				if (chunk > sizeof(words)) {
++					chunk = sizeof(words);
++				}
++				bzero(words, sizeof(words));
++				if (buffer->memory->readBytes(
++				    cmds[i].submit_offset + at, words, chunk) !=
++				    chunk) {
++					break;
++				}
++				IOLog("MondrianGPU: pm4 %u %08x %08x %08x %08x "
++				    "%08x %08x %08x %08x\n", at, words[0],
++				    words[1], words[2], words[3], words[4],
++				    words[5], words[6], words[7]);
++				at += chunk;
++			}
 +		}
 +		{
 +			uint64_t off = cmds[i].submit_offset;
@@ -564,10 +701,18 @@ index 0000000..185cc29
 +				}
 +			}
 +		}
-+		if (mondrian_gpu_uc_submit(buffer->iova + cmds[i].submit_offset,
-+		    cmds[i].size / 4, &fence) != 0) {
-+			result = kIOReturnError;
-+			break;
++		{
++			uint32_t dwords = cmds[i].size / 4;
++			uint32_t limit = mondrian_gpu_uc_pm4_limit();
++
++			if (limit != 0 && dwords > limit) {
++				dwords = limit;		/* gpupm4=N: bisect */
++			}
++			if (mondrian_gpu_uc_submit(buffer->iova +
++			    cmds[i].submit_offset, dwords, &fence) != 0) {
++				result = kIOReturnError;
++				break;
++			}
 +		}
 +	}
 +	IOLockUnlock(fLock);

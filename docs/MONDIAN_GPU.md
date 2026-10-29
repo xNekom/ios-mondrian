@@ -243,6 +243,25 @@ them has Metal. That is the path this port follows.
   implemented and compiled but has no caller until the CoreAnimation hooks
   are wired), relocations (Mesa uses softpin), and prime/syncobj file
   descriptors (stubs that return `ENOSYS`).
+- **Mesa runs on the GPU and submits; the CP refuses some packet types.**
+  OSMesa over freedreno's msm backend reports `vendor freedreno`,
+  `renderer FD725`, Mesa 25.0.7, and submits through `MondrianGPU` with
+  softpin (no relocations). Its first stream (222 dwords: `CP_SET_MODE`,
+  `CP_THREAD_CONTROL`, CCU invalidates, `CP_INDIRECT_BUFFER`, type-4 register
+  writes, `CP_SET_AMBLE`, a `CACHE_FLUSH_TS` fence) **completes**, and so does
+  every prefix of it up to 34 dwords. `CP_BLIT` is the packet this CP answers
+  with an opcode error (`CP_INTERRUPT_STATUS` bit 0, `CP_HW_FAULT` 0, SMMU FSR
+  clean, `CP_IB1/IB2_REM_SIZE` 0 because the fetch already finished): replacing
+  every `CP_BLIT` with a `CP_NOP` (`gpunoblit=1`) makes all of Mesa's
+  submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
+  fails, so the draw path is refused too, which points at the packet set the
+  SQE firmware accepts rather than at one packet.
+- **The packet-level tools** are `tools/pm4-decode.py` (names every packet from
+  Mesa's `adreno_pm4.xml`, honouring the a7xx variants of a number),
+  `gpupm4=N` (truncate a submitted stream to N dwords) and `gpunoblit=1`
+  (rewrite `CP_BLIT` to `CP_NOP`). The user client also dumps the first
+  streams, the nested `CP_INDIRECT_BUFFER` target and `CP_IB1/IB2_REM_SIZE` on
+  a failure; that is how the offending packet was found.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
