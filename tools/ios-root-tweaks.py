@@ -2,7 +2,11 @@
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
   sudo ios-root-tweaks.py MOUNTED_ROOT [--ui-hook DYLIB] [--gpu-test DYLIB]
-                                 [--mesa STAGE_DIR]
+                                 [--mesa-test DYLIB] [--mesa STAGE_DIR]
+
+MONDRIAN_INSTALL_ONLY=1 copies the dylibs and Mesa and skips the rest of the
+bring-up, which is already in the image; that works on a noowners mount
+without root.
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -37,7 +41,8 @@ screen (image versions v8-v14 in NOTES.md):
                   containermanagerd/backboardd/SpringBoard when the boot
                   argument mondrian_ui_hook selects them. --gpu-test copies
                   /usr/libexec/mondrian-gpu-test.dylib, which the UI hook
-                  dlopens when it is there. --mesa copies libOSMesa.8.dylib
+                  dlopens when it is there. --mesa-test copies the Mesa
+                  smoke test the same way. --mesa copies libOSMesa.8.dylib
                   from the directory tools/mk-mesa-ios.sh stages into
                   /usr/lib, where its install name points.
 """
@@ -174,7 +179,17 @@ def audio(root):
 DYLIB_OPTIONS = {
     '--ui-hook': ('mondrian-ui-hook.dylib', 'UI hook'),
     '--gpu-test': ('mondrian-gpu-test.dylib', 'GPU test'),
+    '--mesa-test': ('mondrian-mesa-test.dylib', 'Mesa test'),
 }
+
+
+def set_owner(path):
+    """Root ownership is what iOS ships, but these images are built noowners:
+    the volume does not track it and chown is not permitted on it."""
+    try:
+        os.chown(path, 0, 0)
+    except PermissionError:
+        pass
 
 
 def install_dylib(root, source, name, what):
@@ -183,7 +198,7 @@ def install_dylib(root, source, name, what):
     os.makedirs(directory, exist_ok=True)
     destination = os.path.join(directory, name)
     shutil.copyfile(source, destination)
-    os.chown(destination, 0, 0)
+    set_owner(destination)
     os.chmod(destination, 0o755)
     print('installed', os.path.relpath(destination, root))
 
@@ -201,7 +216,7 @@ def install_mesa(root, source):
     os.makedirs(directory, exist_ok=True)
     destination = os.path.join(directory, MESA_LIBRARY)
     shutil.copyfile(library, destination)
-    os.chown(destination, 0, 0)
+    set_owner(destination)
     os.chmod(destination, 0o755)
     print('installed', os.path.relpath(destination, root))
 
@@ -230,17 +245,20 @@ def main():
                 sys.exit(f'error: Mesa library not found: {source}')
         elif not os.path.isfile(source):
             sys.exit(f'error: {DYLIB_OPTIONS[option][1]} not found: {source}')
-    launchd(root)
-    containers(root)
-    preboot(root)
-    swapdir(root)
-    activation(root)
-    audio(root)
+    if os.environ.get('MONDRIAN_INSTALL_ONLY') != '1':
+        launchd(root)
+        containers(root)
+        preboot(root)
+        swapdir(root)
+        activation(root)
+        audio(root)
     for option, (name, what) in DYLIB_OPTIONS.items():
         if option in options:
             install_dylib(root, options[option], name, what)
     if MESA_OPTION in options:
         install_mesa(root, options[MESA_OPTION])
+    if os.environ.get('MONDRIAN_INSTALL_ONLY') == '1':
+        return
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

@@ -823,6 +823,13 @@ load_gpu_test(void)
 	handle = dlopen("/usr/libexec/mondrian-gpu-test.dylib", RTLD_NOW);
 	say(handle != NULL ? "MONDRIAN UI: gpu test loaded\n"
 	    : "MONDRIAN UI: gpu test dlopen failed\n");
+	/* Mesa drawing on the GPU, independent of CoreAnimation. */
+	if (access("/usr/libexec/mondrian-mesa-test.dylib", R_OK) == 0) {
+		handle = dlopen("/usr/libexec/mondrian-mesa-test.dylib",
+		    RTLD_NOW);
+		say(handle != NULL ? "MONDRIAN UI: mesa test loaded\n"
+		    : "MONDRIAN UI: mesa test dlopen failed\n");
+	}
 }
 
 __attribute__((constructor))
