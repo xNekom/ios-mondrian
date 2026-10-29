@@ -184,6 +184,11 @@ them has Metal. That is the path this port follows.
   touches therefore needs `AP[1]=1` (user accessible), which is pong's
   `perms 3` for the ring, memptr, power-up list and scratch, and the vendor's
   `IOMMU_READ`-without-`IOMMU_PRIV` for user buffers. The SQE stays `perms 5`.
+- **Back-to-back submissions work.** Two `mondrian_gpu_uc_submit` calls in a
+  row (the exact call the user client makes) return fences 1 and 2, both
+  waits complete, both canaries and both fence dwords land: ring advance,
+  fence slots and the publish/wait pair are in order, which is what Mesa's
+  msm backend produces.
 - **Indirect buffers work.** `CP_INDIRECT_BUFFER_PFE` (0x3f, payload addr
   lo/hi and the size in dwords) pointing at a 9-dword IB runs the whole
   stream: the canary and the fence inside it land, `rptr` reaches `wptr`, no

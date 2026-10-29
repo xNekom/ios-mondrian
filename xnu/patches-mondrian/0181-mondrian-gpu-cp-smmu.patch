@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..91bab62
+index 0000000..0e3ead9
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3060 @@
+@@ -0,0 +1,3102 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2632,6 +2632,48 @@ index 0000000..91bab62
 +		mondrian_uc_gpu = gpu;
 +		mondrian_uc_at = at;
 +		mondrian_uc_up = 1;
++		if (rptr >= at) {
++			/* Two submissions through the call the user client
++			 * uses, back to back: ring advance, fence slots and
++			 * the publish/wait pair, in the order Mesa's msm
++			 * backend produces them. */
++			uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
++			volatile uint32_t *mv =
++			    (volatile uint32_t *)mondrian_cp_memptr_view;
++			uint32_t f[2] = { 0, 0 };
++			uint32_t k, w[2];
++
++			for (k = 0; k < 2; k++) {
++				uint32_t *p = ib + k * 64;
++				uint64_t dst = mondrian_cp_memptr.iova +
++				    0x900u + 4u * k;
++				uint64_t fen = mondrian_cp_memptr.iova +
++				    0x910u + 4u * k;
++				uint32_t n = 0;
++
++				p[n++] = mondrian_pm4_type7(0x3du, 3);
++				p[n++] = (uint32_t)dst;
++				p[n++] = (uint32_t)(dst >> 32);
++				p[n++] = 0x600d0001u + k;
++				p[n++] = mondrian_pm4_type7(0x46u, 4);
++				p[n++] = 0x31u | (1u << 27);
++				p[n++] = (uint32_t)fen;
++				p[n++] = (uint32_t)(fen >> 32);
++				p[n++] = 0x100u + k;
++				mondrian_gpu_mem_flush(&mondrian_cp_ib,
++				    mondrian_cp_ib.bytes);
++			}
++			(void)mondrian_gpu_uc_submit(mondrian_cp_ib.iova, 9, &f[0]);
++			(void)mondrian_gpu_uc_submit(mondrian_cp_ib.iova + 256, 9,
++			    &f[1]);
++			w[0] = (uint32_t)mondrian_gpu_uc_wait(f[0], 5000);
++			w[1] = (uint32_t)mondrian_gpu_uc_wait(f[1], 5000);
++			printf("MONDRIAN GPU: cp uc submit %u/%u wait %u/%u canary 0x%x/0x%x fence 0x%x/0x%x\n",
++			    f[0], f[1], w[0], w[1],
++			    mv ? mv[0x900 / 4] : 0, mv ? mv[0x904 / 4] : 0,
++			    mv ? mv[0x910 / 4] : 0, mv ? mv[0x914 / 4] : 0);
++			mondrian_log_flush_now();
++		}
 +	}
 +	printf("MONDRIAN GPU: cp state sqe_cntl 0x%x rptr 0x%x wptr 0x%x\n",
 +	    CPR(GEN7_CP_SQE_CNTL), CPR(GEN7_CP_RB_RPTR),
