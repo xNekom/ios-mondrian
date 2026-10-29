@@ -193,10 +193,24 @@ them has Metal. That is the path this port follows.
   `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With
   `CP_SQE_CNTL=0` the boot reaches SpringBoard and resets cleanly;
   `gpustart=1` runs the whole sequence above.
-- **Next**: indirect buffers (`CP_INDIRECT_BUFFER_PFE`), the ring/fence pair
-  the user client will submit through, then IRQ 332 and the msm DRM user
-  client that Mesa's `msm` KMD talks to. The firmware blocks, the GMU context
-  bank and the CM3 start are in `mondrian_gpu.c` under `gmustart=1`.
+- **The user client is `MondrianGPU`** (`0182`, `iokit/Kernel/arm`). Mesa's
+  freedreno speaks Linux msm DRM, not IOAccelerator: `IOServiceOpen` on
+  `MondrianGPU` and then one `IOConnectCallStructMethod` per request, with
+  the selector equal to the low byte of the ioctl code and Linux's
+  `msm_drm.h` structures unchanged (GET_PARAM 0x40, GEM_NEW 0x42, GEM_INFO
+  0x43, CPU_PREP/FINI 0x44/0x45, GEM_SUBMIT 0x46, WAIT_FENCE 0x47, GEM_CLOSE
+  0x09). A buffer is mapped in user space by its handle
+  (`clientMemoryForType`), so the Darwin libdrm stands in for `mmap`.
+  Relocations are refused; Mesa's msm backend uses softpin (`MSM_INFO_SET_IOVA`
+  and `GET_IOVA`), which works.
+- **Fences are CP-written dwords**: a submission is `CP_INDIRECT_BUFFER_PFE`
+  plus `CP_EVENT_WRITE` into a slot of the memptr page, waited on through the
+  write-combined alias of that page. No IRQ is needed for correctness; IRQ 332
+  is only needed for the timestamp path Mesa uses on real hardware.
+- **Next**: build Mesa for the device (`FD_MESA_DEBUG=sysmem`, a730/FD725),
+  the `mondrian-drm` libdrm shim, and then the CoreAnimation EAGL hooks. The
+  firmware blocks, the GMU context bank and the CM3 start are in
+  `mondrian_gpu.c` under `gmustart=1`.
 
 ## Android capture (2026-10-28)
 

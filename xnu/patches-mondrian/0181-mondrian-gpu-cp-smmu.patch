@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..7244515
+index 0000000..4f9ed77
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,2818 @@
+@@ -0,0 +1,3047 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -72,6 +72,22 @@ index 0000000..7244515
 +#define MONDRIAN_ZAP_FW 1
 +#endif
 +#include <pexpert/pexpert.h>
++
++#include <dev/mondrian_gpu_api.h>
++
++/* iokit/Kernel/arm/MondrianGPU.cpp: published once the CP is running. */
++extern void MondrianGPUStart(void);
++
++/* State the user client shares with the bring-up (mondrian_gpu_api.h). */
++#define MONDRIAN_UC_IOVA_BASE	0x10000000ull
++#define MONDRIAN_UC_IOVA_END	0x80000000ull
++
++static int mondrian_uc_up;
++static vm_offset_t mondrian_uc_gpu;
++static uint32_t mondrian_uc_at;
++static uint32_t mondrian_uc_fence;
++static uint32_t mondrian_uc_table_next = 1;
++static uint64_t mondrian_uc_iova = MONDRIAN_UC_IOVA_BASE;
 +
 +#define MONDRIAN_GCC_BASE	0x00100000UL
 +#define MONDRIAN_GCC_SIZE	0x00200000UL	/* the block is 0x1f4200, 0x62000 is inside */
@@ -1762,6 +1778,7 @@ index 0000000..7244515
 +			printf("MONDRIAN GPU: cp map failed\n");
 +			return -1;
 +		}
++		mondrian_uc_table_next = next;
 +		flush_dcache64((addr64_t)mondrian_cp_tables.pa,
 +		    mondrian_cp_tables.bytes, TRUE);
 +		mondrian_cp_scratch_view = ml_io_map_unmappable(mondrian_cp_scratch.pa,
@@ -2608,6 +2625,11 @@ index 0000000..7244515
 +				mondrian_log_flush_now();
 +			}
 +		}
++		/* From here the ring belongs to the user client, which
++		 * continues at this dword. */
++		mondrian_uc_gpu = gpu;
++		mondrian_uc_at = at;
++		mondrian_uc_up = 1;
 +	}
 +	printf("MONDRIAN GPU: cp state sqe_cntl 0x%x rptr 0x%x wptr 0x%x\n",
 +	    CPR(GEN7_CP_SQE_CNTL), CPR(GEN7_CP_RB_RPTR),
@@ -2659,6 +2681,211 @@ index 0000000..7244515
 +#undef CPR
 +#undef CPW64
 +	return rptr == 10 ? 0 : -1;
++}
++
++/* ------------------------------------------------------------------ */
++/*
++ * The user client's half of the GPU (bsd/dev/mondrian_gpu_api.h, used by
++ * iokit/Kernel/arm/MondrianGPU.cpp): GPU addresses, stage-1 mappings, one
++ * submission path and its fences. Nothing here decodes requests.
++ */
++#define MONDRIAN_UC_RING_DWORDS	(mondrian_cp_ring.bytes / 4)
++#define MONDRIAN_UC_FENCE_BASE	0x800u
++#define MONDRIAN_UC_FENCE_SLOTS	64u
++
++static uint32_t
++mondrian_uc_fence_word(uint32_t seq)
++{
++	return (MONDRIAN_UC_FENCE_BASE >> 2) +
++	    (seq % MONDRIAN_UC_FENCE_SLOTS);
++}
++
++int
++mondrian_gpu_uc_ready(void)
++{
++	return mondrian_uc_up;
++}
++
++int
++mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
++{
++	uint64_t lo, hi;
++
++	if (value == NULL) {
++		return -1;
++	}
++	switch (param) {
++	case 0x01:			/* MSM_PARAM_GPU_ID */
++		*value = 730;
++		return 0;
++	case 0x02:			/* MSM_PARAM_GMEM_SIZE */
++		*value = 0x200000;
++		return 0;
++	case 0x03:			/* MSM_PARAM_CHIP_ID */
++		*value = 0x07030002;
++		return 0;
++	case 0x04:			/* MSM_PARAM_MAX_FREQ */
++		*value = 862000000;
++		return 0;
++	case 0x05:			/* MSM_PARAM_TIMESTAMP */
++		if (mondrian_uc_gpu == 0) {
++			return -1;
++		}
++		lo = mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_ALWAYS_ON_COUNTER_LO * 4u);
++		hi = mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_ALWAYS_ON_COUNTER_HI * 4u);
++		*value = lo | (hi << 32);
++		return 0;
++	case 0x06:			/* MSM_PARAM_GMEM_BASE */
++		*value = 0;
++		return 0;
++	case 0x07:			/* MSM_PARAM_PRIORITIES */
++		*value = 1;
++		return 0;
++	case 0x0e:			/* MSM_PARAM_VA_START */
++		*value = MONDRIAN_UC_IOVA_BASE;
++		return 0;
++	case 0x0f:			/* MSM_PARAM_VA_SIZE */
++		*value = MONDRIAN_UC_IOVA_END - MONDRIAN_UC_IOVA_BASE;
++		return 0;
++	default:
++		return -1;
++	}
++}
++
++uint64_t
++mondrian_gpu_uc_iova_alloc(uint64_t bytes)
++{
++	uint64_t iova;
++
++	bytes = (bytes + 0xfffull) & ~0xfffull;
++	if (bytes == 0 || mondrian_uc_iova + bytes > MONDRIAN_UC_IOVA_END) {
++		return 0;
++	}
++	iova = mondrian_uc_iova;
++	mondrian_uc_iova += bytes;
++	return iova;
++}
++
++int
++mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions)
++{
++	if (mondrian_cp_tables.va == 0 || (iova & 0xfffull) != 0 ||
++	    (pa & 0xfffull) != 0) {
++		return -1;
++	}
++	mondrian_gpu_smmu_map((uint64_t *)mondrian_cp_tables.va,
++	    mondrian_cp_tables.pa, 32, iova, pa, 4096, permissions,
++	    &mondrian_uc_table_next);
++	return 0;
++}
++
++int
++mondrian_gpu_uc_unmap_page(uint64_t iova)
++{
++	uint64_t *t = (uint64_t *)mondrian_cp_tables.va;
++	uint64_t entry;
++	uint32_t l2, l3;
++
++	if (t == NULL || (iova & 0xfffull) != 0) {
++		return -1;
++	}
++	entry = t[(iova >> 30) & 3u];
++	if ((entry & 3ull) != 3ull) {
++		return -1;
++	}
++	l2 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	entry = t[l2 * 512 + ((iova >> 21) & 0x1ffu)];
++	if ((entry & 3ull) != 3ull) {
++		return -1;
++	}
++	l3 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	t[l3 * 512 + ((iova >> 12) & 0x1ffu)] = 0;
++	return 0;
++}
++
++int
++mondrian_gpu_uc_tables_sync(void)
++{
++	if (mondrian_cp_tables.va == 0) {
++		return -1;
++	}
++	flush_dcache64((addr64_t)mondrian_cp_tables.pa,
++	    mondrian_cp_tables.bytes, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++int
++mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
++{
++	uint32_t *ring;
++	uint32_t at, seq;
++	uint64_t slot;
++
++	if (fence == NULL) {
++		return -1;
++	}
++	*fence = 0;
++	if (!mondrian_uc_up || mondrian_cp_ring.va == 0 || dwords == 0 ||
++	    (ib & 3ull) != 0) {
++		return -1;
++	}
++	ring = (uint32_t *)mondrian_cp_ring.va;
++	at = mondrian_uc_at;
++	if (at + 9 > MONDRIAN_UC_RING_DWORDS) {
++		if (mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_RB_RPTR * 4u) != at) {
++			return -1;	/* the ring still holds work */
++		}
++		at = 0;
++	}
++	seq = mondrian_uc_fence + 1;
++	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
++	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
++	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
++	ring[at++] = (uint32_t)ib;
++	ring[at++] = (uint32_t)(ib >> 32);
++	ring[at++] = dwords;
++	ring[at++] = mondrian_pm4_type7(0x46u, 4);	/* EVENT_WRITE */
++	ring[at++] = 0x31u | (1u << 27);		/* cache clean */
++	ring[at++] = (uint32_t)slot;
++	ring[at++] = (uint32_t)(slot >> 32);
++	ring[at++] = seq;
++	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_uc_fence = seq;
++	mondrian_uc_at = at;
++	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++	*fence = seq;
++	return 0;
++}
++
++int
++mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
++{
++	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
++	uint32_t waited = 0, limit, value;
++
++	if (view == NULL || fence == 0 || fence > mondrian_uc_fence) {
++		return -1;
++	}
++	limit = timeout_ms != 0 ? timeout_ms : 5000u;
++	for (;;) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		value = view[mondrian_uc_fence_word(fence)];
++		if ((int32_t)(value - fence) >= 0) {
++			return 0;
++		}
++		if (waited >= limit) {
++			return -1;
++		}
++		delay(1000);
++		waited++;
++	}
 +}
 +#endif
 +
@@ -2760,7 +2987,9 @@ index 0000000..7244515
 +#ifdef MONDRIAN_CP_PROFILE
 +			if (submit != 0) {
 +				(void)mondrian_gpu_cp_start(gpu, smmu, gpucc, gmu);
-+
++				if (mondrian_gpu_uc_ready()) {
++					MondrianGPUStart();
++				}
 +			}
 +#endif
 +			mondrian_log_flush_now();
@@ -2849,3 +3078,56 @@ index 0000000..7244515
 +	printf("MONDRIAN GPU: probe done\n");
 +	return 0;
 +}
+diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
+new file mode 100644
+index 0000000..426ad17
+--- /dev/null
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -0,0 +1,47 @@
++/*
++ * What the IOKit driver (iokit/Kernel/arm/MondrianGPU.cpp) asks of the GPU
++ * bring-up in mondrian_gpu.c. The C side owns the SMMU page tables, the IOVA
++ * arena, the ring and the fences; the IOKit side owns the buffers, the
++ * user/client mapping and the request decoding, so the two halves never
++ * touch each other's state directly.
++ */
++#ifndef _BSD_DEV_MONDRIAN_GPU_API_H_
++#define _BSD_DEV_MONDRIAN_GPU_API_H_
++
++#include <sys/types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Nonzero once the CP is running and submissions are accepted. */
++int mondrian_gpu_uc_ready(void);
++
++/* MSM_PARAM_x of Linux's msm_drm.h, filled from the live device. */
++int mondrian_gpu_uc_param(uint32_t param, uint64_t *value);
++
++/* A block of GPU addresses for buffers. Zero when the arena is exhausted. */
++uint64_t mondrian_gpu_uc_iova_alloc(uint64_t bytes);
++
++/*
++ * Stage-1 map/unmap of one 4 KiB page. Buffers a submission touches must be
++ * user accessible (permissions 3 or 7): packets executed from an indirect
++ * buffer run unprivileged and a privileged-only mapping faults them.
++ */
++int mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions);
++int mondrian_gpu_uc_unmap_page(uint64_t iova);
++
++/* Make table changes visible to the SMMU walker. */
++int mondrian_gpu_uc_tables_sync(void);
++
++/* One indirect command stream, fenced. Returns the fence to wait on. */
++int mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence);
++
++/* Wait for a fence; timeout 0 means the default patience. */
++int mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _BSD_DEV_MONDRIAN_GPU_API_H_ */

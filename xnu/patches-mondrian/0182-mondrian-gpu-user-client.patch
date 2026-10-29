@@ -1,0 +1,664 @@
+xnu 0182: MondrianGPU, the IOKit face Mesa's msm backend talks to
+
+Mesa's freedreno does not speak IOAccelerator: it opens a service and sends
+Linux msm DRM requests as IOConnectCallStructMethod calls whose selector is
+the low byte of the ioctl code, with Linux's include/uapi/drm/msm_drm.h
+structures unchanged, both ways. This adds that service and its user client:
+GET_PARAM (chip 0x07030002, gmem, va range), GEM_NEW, GEM_INFO (GET/SET_IOVA,
+GET_FLAGS), GEM_CLOSE, CPU_PREP/FINI, GEM_SUBMIT (one indirect buffer per
+command, copied in from the caller), WAIT_FENCE, madvise and the submit
+queues. A buffer's memory is the client memory of the type that is its
+handle, so the Darwin back end maps it with IOConnectMapMemory64.
+
+Buffers are IOBufferMemoryDescriptors mapped page by page into the CP's
+stage-1 context with user-accessible permissions (packets executed from an
+indirect buffer run unprivileged), and one submission is an
+CP_INDIRECT_BUFFER_PFE plus a CP_EVENT_WRITE fence into the ring that
+bsd/dev/mondrian_gpu.c owns; fences are the dwords the CP writes into the
+memptr page and are waited on through its write-combined alias. Visible as
+`MondrianGPU: service published` and reachable with IOServiceMatching.
+
+Registers the file in iokit/conf/files.arm64. Relocations
+(MSM_SUBMIT_CMD_BUF with nr_relocs != 0) are refused for now: Mesa's msm
+backend uses softpin, which is what GEM_INFO implements.
+diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
+new file mode 100644
+index 0000000..915081c
+--- /dev/null
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -0,0 +1,585 @@
++/*
++ * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
++ * See MondrianGPU.h for the shape of the interface.
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOUserClient.h>
++#include <sys/systm.h>
++
++#include "MondrianGPU.h"
++
++/* The IOKit build has no top-level include for bsd/; the relative path is
++ * stable in the tree and in the patch. */
++extern "C" {
++#include "../../../bsd/dev/mondrian_gpu_api.h"
++}
++
++/*
++ * Linux's include/uapi/drm/msm_drm.h (v6.6): the request numbers are the low
++ * byte of DRM_IOCTL_MSM_* (DRM_COMMAND_BASE is 0x40) and the structures are
++ * Linux's, so the same user space works on both systems.
++ */
++enum {
++	kDrmGemClose         = 0x09,
++	kMsmGetParam         = 0x40,
++	kMsmSetParam         = 0x41,
++	kMsmGemNew           = 0x42,
++	kMsmGemInfo          = 0x43,
++	kMsmGemCpuPrep       = 0x44,
++	kMsmGemCpuFini       = 0x45,
++	kMsmGemSubmit        = 0x46,
++	kMsmWaitFence        = 0x47,
++	kMsmGemMadvise       = 0x48,
++	kMsmSubmitQueueNew   = 0x4a,
++	kMsmSubmitQueueClose = 0x4b,
++	kMsmSubmitQueueQuery = 0x4c,
++};
++
++struct msm_timespec {
++	int64_t tv_sec, tv_nsec;
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_cpu_fini {
++	uint32_t handle;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++#define MSM_INFO_GET_IOVA	0x01
++#define MSM_INFO_SET_IOVA	0x04
++#define MSM_INFO_GET_FLAGS	0x05
++#define MSM_SUBMIT_CMD_BUF	1
++#define MSM_PREP_NOSYNC		0x04
++
++#define kMondrianBufferMax	(256u << 20)
++#define kMondrianBuffers	1024
++#define kMondrianSubmits	64
++#define kMondrianPatienceMs	5000
++/* Packets executed from an indirect buffer run unprivileged, so every buffer
++ * a submission touches must be user accessible (the ring and the memptr page
++ * are mapped the same way in the C half). Write lets the CPU fill it. */
++#define kMondrianBufferPerms	3u
++
++struct mondrian_buffer {
++	uint32_t handle;
++	uint64_t size;
++	uint64_t iova;
++	IOBufferMemoryDescriptor *memory;
++};
++
++class MondrianGPU;
++
++class MondrianGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(MondrianGPUUserClient);
++
++public:
++	virtual bool initWithTask(task_t owningTask, void *securityToken,
++	    UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
++	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector,
++	    IOExternalMethodArguments *arguments,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++
++private:
++	IOReturn gemNew(struct msm_gem_new *request);
++	IOReturn gemInfo(struct msm_gem_info *request);
++	IOReturn submit(struct msm_gem_submit *request);
++	mondrian_buffer *bufferForType(uint32_t type);
++	mondrian_buffer *bufferNew(uint64_t size);
++	void bufferFree(mondrian_buffer *buffer);
++	void freeAll(void);
++
++	IOLock *fLock;
++	mondrian_buffer *fBuffers[kMondrianBuffers];
++	uint32_t fBufferCount;
++	uint32_t fNextHandle;
++	uint32_t fNextQueue;
++	uint32_t fLastFence;
++};
++
++class MondrianGPU : public IOService
++{
++	OSDeclareDefaultStructors(MondrianGPU);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn newUserClient(task_t owningTask, void *securityToken,
++	    UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(MondrianGPU, IOService);
++
++bool
++MondrianGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty("IOUserClientClass", "MondrianGPUUserClient");
++	setName("MondrianGPU");
++	registerService();
++	IOLog("MondrianGPU: service published (chip 0x07030002)\n");
++	return true;
++}
++
++IOReturn
++MondrianGPU::newUserClient(task_t owningTask, void *securityToken, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	MondrianGPUUserClient *client;
++
++	(void)type;
++	(void)properties;
++	if (handler == NULL) {
++		return kIOReturnBadArgument;
++	}
++	client = OSTypeAlloc(MondrianGPUUserClient);
++	if (client == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (!client->initWithTask(owningTask, securityToken, type, properties) ||
++	    !client->attach(this) || !client->start(this)) {
++		client->detach(this);
++		client->release();
++		return kIOReturnError;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++void
++MondrianGPUStart(void)
++{
++	IOService *provider = (IOService *)IOService::getPlatform();
++	MondrianGPU *gpu;
++
++	if (!mondrian_gpu_uc_ready()) {
++		IOLog("MondrianGPU: the CP is not running, no service\n");
++		return;
++	}
++	gpu = OSTypeAlloc(MondrianGPU);
++	if (gpu == NULL || provider == NULL || !gpu->init() ||
++	    !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("MondrianGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("MondrianGPU: the service did not start\n");
++	}
++	gpu->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++#define super IOUserClient
++OSDefineMetaClassAndStructors(MondrianGPUUserClient, IOUserClient);
++
++bool
++MondrianGPUUserClient::initWithTask(task_t owningTask, void *securityToken,
++    UInt32 type, OSDictionary *properties)
++{
++	if (!super::initWithTask(owningTask, securityToken, type, properties)) {
++		return false;
++	}
++	fLock = IOLockAlloc();
++	fBufferCount = 0;
++	fNextHandle = 1;
++	fNextQueue = 0;
++	fLastFence = 0;
++	if (fLock == NULL) {
++		return false;
++	}
++	bzero(fBuffers, sizeof(fBuffers));
++	return true;
++}
++
++void
++MondrianGPUUserClient::freeAll(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < fBufferCount; i++) {
++		bufferFree(fBuffers[i]);
++	}
++	fBufferCount = 0;
++}
++
++IOReturn
++MondrianGPUUserClient::clientClose(void)
++{
++	if (fLock != NULL) {
++		IOLockLock(fLock);
++		freeAll();
++		IOLockUnlock(fLock);
++	}
++	return kIOReturnSuccess;
++}
++
++mondrian_buffer *
++MondrianGPUUserClient::bufferForType(uint32_t type)
++{
++	uint32_t i;
++
++	for (i = 0; i < fBufferCount; i++) {
++		if (fBuffers[i] != NULL && fBuffers[i]->handle == type) {
++			return fBuffers[i];
++		}
++	}
++	return NULL;
++}
++
++mondrian_buffer *
++MondrianGPUUserClient::bufferNew(uint64_t size)
++{
++	mondrian_buffer *buffer;
++	IOBufferMemoryDescriptor *memory;
++	uint64_t iova, off;
++
++	size = (size + 0xfffu) & ~0xfffull;
++	if (size == 0 || size > kMondrianBufferMax ||
++	    fBufferCount >= kMondrianBuffers) {
++		return NULL;
++	}
++	iova = mondrian_gpu_uc_iova_alloc(size);
++	if (iova == 0) {
++		return NULL;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size,
++	    0x00000000fffff000ull);
++	if (memory == NULL) {
++		return NULL;
++	}
++	for (off = 0; off < size; off += 0x1000) {
++		IOByteCount length = 0;
++		addr64_t pa = memory->getPhysicalSegment(off, &length);
++
++		if (pa == 0 || length == 0 ||
++		    mondrian_gpu_uc_map_page(iova + off, pa,
++		    kMondrianBufferPerms) != 0) {
++			memory->release();
++			return NULL;
++		}
++	}
++	(void)mondrian_gpu_uc_tables_sync();
++	buffer = (mondrian_buffer *)IOMalloc(sizeof(mondrian_buffer));
++	if (buffer == NULL) {
++		memory->release();
++		return NULL;
++	}
++	buffer->handle = fNextHandle++;
++	buffer->size = size;
++	buffer->iova = iova;
++	buffer->memory = memory;
++	fBuffers[fBufferCount++] = buffer;
++	return buffer;
++}
++
++void
++MondrianGPUUserClient::bufferFree(mondrian_buffer *buffer)
++{
++	uint64_t off;
++	uint32_t i;
++
++	if (buffer == NULL) {
++		return;
++	}
++	for (off = 0; off < buffer->size; off += 0x1000) {
++		(void)mondrian_gpu_uc_unmap_page(buffer->iova + off);
++	}
++	(void)mondrian_gpu_uc_tables_sync();
++	if (buffer->memory != NULL) {
++		buffer->memory->release();
++	}
++	for (i = 0; i < fBufferCount; i++) {
++		if (fBuffers[i] == buffer) {
++			fBuffers[i] = fBuffers[--fBufferCount];
++			fBuffers[fBufferCount] = NULL;
++			break;
++		}
++	}
++	IOFree(buffer, sizeof(mondrian_buffer));
++}
++
++IOReturn
++MondrianGPUUserClient::gemNew(struct msm_gem_new *request)
++{
++	mondrian_buffer *buffer;
++
++	IOLockLock(fLock);
++	buffer = bufferNew(request->size);
++	if (buffer == NULL) {
++		IOLockUnlock(fLock);
++		IOLog("MondrianGPU: gem_new 0x%llx refused\n",
++		    (unsigned long long)request->size);
++		return kIOReturnNoMemory;
++	}
++	request->handle = buffer->handle;
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++MondrianGPUUserClient::gemInfo(struct msm_gem_info *request)
++{
++	mondrian_buffer *buffer;
++	IOReturn result = kIOReturnSuccess;
++
++	IOLockLock(fLock);
++	buffer = bufferForType(request->handle);
++	if (buffer == NULL) {
++		IOLockUnlock(fLock);
++		return kIOReturnBadArgument;
++	}
++	switch (request->info) {
++	case MSM_INFO_GET_IOVA:
++		request->value = buffer->iova;
++		break;
++	case MSM_INFO_SET_IOVA:
++		if (request->value != 0 && request->value != buffer->iova) {
++			result = kIOReturnUnsupported;
++		}
++		break;
++	case MSM_INFO_GET_FLAGS:
++		request->value = 0;
++		break;
++	default:
++		result = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(fLock);
++	return result;
++}
++
++IOReturn
++MondrianGPUUserClient::submit(struct msm_gem_submit *request)
++{
++	struct msm_gem_submit_cmd cmds[kMondrianSubmits];
++	struct msm_gem_submit_bo bos[kMondrianSubmits];
++	uint32_t fence = 0, i;
++	IOReturn result = kIOReturnSuccess;
++
++	if (request->nr_bos > kMondrianSubmits || request->nr_cmds == 0 ||
++	    request->nr_cmds > kMondrianSubmits || request->bos == 0 ||
++	    request->cmds == 0) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)request->bos, bos,
++	    request->nr_bos * sizeof(bos[0])) != 0 ||
++	    copyin((user_addr_t)request->cmds, cmds,
++	    request->nr_cmds * sizeof(cmds[0])) != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	for (i = 0; i < request->nr_cmds; i++) {
++		mondrian_buffer *buffer;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF || cmds[i].nr_relocs != 0 ||
++		    cmds[i].size == 0 || cmds[i].submit_idx >= request->nr_bos) {
++			result = kIOReturnUnsupported;
++			break;
++		}
++		buffer = bufferForType(bos[cmds[i].submit_idx].handle);
++		if (buffer == NULL) {
++			result = kIOReturnBadArgument;
++			break;
++		}
++		if (mondrian_gpu_uc_submit(buffer->iova + cmds[i].submit_offset,
++		    cmds[i].size / 4, &fence) != 0) {
++			result = kIOReturnError;
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (result == kIOReturnSuccess) {
++		request->fence = fence;
++		fLastFence = fence;
++	}
++	return result;
++}
++
++IOReturn
++MondrianGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
++    IOMemoryDescriptor **memory)
++{
++	mondrian_buffer *buffer;
++	IOReturn result = kIOReturnBadArgument;
++
++	if (options == NULL || memory == NULL) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	buffer = bufferForType(type);
++	if (buffer != NULL) {
++		buffer->memory->retain();
++		*memory = buffer->memory;
++		*options = 0;
++		result = kIOReturnSuccess;
++	}
++	IOLockUnlock(fLock);
++	return result;
++}
++
++IOReturn
++MondrianGPUUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++	} request;
++	size_t size = arguments->structureInputSize;
++	IOReturn result = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (arguments->structureInput == NULL || size > sizeof(request)) {
++		return kIOReturnBadArgument;
++	}
++	bzero(&request, sizeof(request));
++	memcpy(&request, arguments->structureInput, size);
++	if (!mondrian_gpu_uc_ready()) {
++		return kIOReturnNotReady;
++	}
++	switch (selector) {
++	case kMsmGetParam:
++		result = mondrian_gpu_uc_param(request.param.param,
++		    &request.param.value) == 0 ? kIOReturnSuccess :
++		    kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		result = gemNew(&request.gemNew);
++		break;
++	case kMsmGemInfo:
++		result = gemInfo(&request.gemInfo);
++		break;
++	case kMsmGemCpuPrep:
++		/* The CPU is about to touch a buffer: it is done when every
++		 * submission this client made is done, because there is one
++		 * ring and submissions run in order. */
++		if (!(request.cpuPrep.op & MSM_PREP_NOSYNC) && fLastFence != 0) {
++			IOLockLock(fLock);
++			if (mondrian_gpu_uc_wait(fLastFence,
++			    kMondrianPatienceMs) != 0) {
++				result = kIOReturnBusy;
++			}
++			IOLockUnlock(fLock);
++		}
++		break;
++	case kMsmGemSubmit:
++		result = submit(&request.submit);
++		break;
++	case kMsmWaitFence:
++		result = mondrian_gpu_uc_wait(request.waitFence.fence,
++		    kMondrianPatienceMs) == 0 ? kIOReturnSuccess :
++		    kIOReturnTimeout;
++		break;
++	case kMsmGemMadvise:
++		request.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		request.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:
++		break;
++	case kDrmGemClose:
++		IOLockLock(fLock);
++		{
++			mondrian_buffer *buffer =
++			    bufferForType(request.close.handle);
++
++			if (buffer == NULL) {
++				result = kIOReturnBadArgument;
++			} else {
++				bufferFree(buffer);
++			}
++		}
++		IOLockUnlock(fLock);
++		break;
++	default:
++		IOLog("MondrianGPU: request %#x (%zu bytes) is not known\n",
++		    selector, size);
++		result = kIOReturnUnsupported;
++		break;
++	}
++	if (result == kIOReturnSuccess && arguments->structureOutput != NULL) {
++		if (arguments->structureOutputSize > size) {
++			arguments->structureOutputSize = (uint32_t)size;
++		}
++		memcpy(arguments->structureOutput, &request,
++		    arguments->structureOutputSize);
++	}
++	return result;
++}
+diff --git a/iokit/Kernel/arm/MondrianGPU.h b/iokit/Kernel/arm/MondrianGPU.h
+new file mode 100644
+index 0000000..a90231d
+--- /dev/null
++++ b/iokit/Kernel/arm/MondrianGPU.h
+@@ -0,0 +1,32 @@
++/*
++ * MondrianGPU: the GPU's IOKit face for mondrian (Adreno 730, SM8475).
++ *
++ * Mesa's freedreno speaks Linux msm DRM, not IOAccelerator: it opens this
++ * service and every request is one IOConnectCallStructMethod whose selector
++ * is the low byte of the ioctl code (DRM_COMMAND_BASE + 0x02 and friends),
++ * with Linux's structures from include/uapi/drm/msm_drm.h unchanged, both
++ * ways. A buffer's memory is the client memory of the type that is its
++ * handle (freedreno's Darwin back end maps it with IOConnectMapMemory64).
++ *
++ * The bring-up (power, GMU, ZAP, CP, SMMU, ring, fences) stays in
++ * bsd/dev/mondrian_gpu.c behind bsd/dev/mondrian_gpu_api.h; this file owns
++ * what is per connection: buffers, their GPU addresses, the user mapping and
++ * the request decoding.
++ */
++#ifndef _IOKIT_ARM_MONDRIANGPU_H
++#define _IOKIT_ARM_MONDRIANGPU_H
++
++#include <IOKit/IOService.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Publishes the service once the CP is running (mondrian_gpu.c). */
++void MondrianGPUStart(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _IOKIT_ARM_MONDRIANGPU_H */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index cada9db..1a812fd 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -10,6 +10,7 @@ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ iokit/Kernel/arm/MondrianPlatformExpert.cpp                         optional iokitcpp
+ iokit/Kernel/arm/MondrianSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/MondrianFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/MondrianGPU.cpp                                   optional iokitcpp
+ 
+ iokit/Kernel/arm/MondrianCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/MondrianEntitlements.cpp                           optional iokitcpp
