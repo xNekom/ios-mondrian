@@ -2,6 +2,7 @@
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
   sudo ios-root-tweaks.py MOUNTED_ROOT [--ui-hook DYLIB] [--gpu-test DYLIB]
+                                 [--mesa STAGE_DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -36,7 +37,9 @@ screen (image versions v8-v14 in NOTES.md):
                   containermanagerd/backboardd/SpringBoard when the boot
                   argument mondrian_ui_hook selects them. --gpu-test copies
                   /usr/libexec/mondrian-gpu-test.dylib, which the UI hook
-                  dlopens when it is there.
+                  dlopens when it is there. --mesa copies libOSMesa.8.dylib
+                  from the directory tools/mk-mesa-ios.sh stages into
+                  /usr/lib, where its install name points.
 """
 import glob, hashlib, os, plistlib, shutil, sys
 
@@ -185,13 +188,32 @@ def install_dylib(root, source, name, what):
     print('installed', os.path.relpath(destination, root))
 
 
+# --mesa takes the stage directory tools/mk-mesa-ios.sh prints; its library
+# goes to /usr/lib because that is its install name.
+MESA_OPTION = '--mesa'
+MESA_LIBRARY = 'libOSMesa.8.dylib'
+
+
+def install_mesa(root, source):
+    """Copy Mesa's libOSMesa from a staged tree into /usr/lib."""
+    library = os.path.join(source, MESA_LIBRARY)
+    directory = os.path.join(root, 'usr/lib')
+    os.makedirs(directory, exist_ok=True)
+    destination = os.path.join(directory, MESA_LIBRARY)
+    shutil.copyfile(library, destination)
+    os.chown(destination, 0, 0)
+    os.chmod(destination, 0o755)
+    print('installed', os.path.relpath(destination, root))
+
+
 def parse_args(argv):
     """MOUNTED_ROOT, then each --option DYLIB at most once, in any order."""
     if not argv or argv[0].startswith('-'):
         sys.exit(__doc__)
     root, rest, options = argv[0], argv[1:], {}
     while rest:
-        if rest[0] not in DYLIB_OPTIONS or rest[0] in options or len(rest) < 2:
+        known = rest[0] in DYLIB_OPTIONS or rest[0] == MESA_OPTION
+        if not known or rest[0] in options or len(rest) < 2:
             sys.exit(__doc__)
         options[rest[0]] = rest[1]
         rest = rest[2:]
@@ -203,7 +225,10 @@ def main():
     if not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
         sys.exit(__doc__)
     for option, source in options.items():
-        if not os.path.isfile(source):
+        if option == MESA_OPTION:
+            if not os.path.isfile(os.path.join(source, MESA_LIBRARY)):
+                sys.exit(f'error: Mesa library not found: {source}')
+        elif not os.path.isfile(source):
             sys.exit(f'error: {DYLIB_OPTIONS[option][1]} not found: {source}')
     launchd(root)
     containers(root)
@@ -214,6 +239,8 @@ def main():
     for option, (name, what) in DYLIB_OPTIONS.items():
         if option in options:
             install_dylib(root, options[option], name, what)
+    if MESA_OPTION in options:
+        install_mesa(root, options[MESA_OPTION])
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

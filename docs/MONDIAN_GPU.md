@@ -234,6 +234,13 @@ them has Metal. That is the path this port follows.
   and reads both back. Build it with `tools/build-mondrian-gpu-test.sh` and
   load it in a process that runs after the GPU is up; it prints
   `MONDRIAN GPU TEST: PASSED` to the kernel log.
+- **Installing the userland into the root image is one pass.** Mesa's
+  `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
+  the GPU test to `/usr/libexec`:
+  `sudo tools/install-userland.sh IMAGE --ui-hook HOOK --gpu-test TEST
+  --mesa out/mesa/stage`, then `tools/mk-simg.py` and
+  `tools/flash-root.sh`. The kernel only injects the UI hook
+  (`mondrian_ui_hook`), so everything else hangs off it.
 - **Next**: build Mesa for the device (`FD_MESA_DEBUG=sysmem`, a730/FD725),
   the `mondrian-drm` libdrm shim, and then the CoreAnimation EAGL hooks. The
   firmware blocks, the GMU context bank and the CM3 start are in
