@@ -228,12 +228,21 @@ them has Metal. That is the path this port follows.
   user client write-backs the command stream with `flush_dcache64` before the
   ring publishes it. A cached user mapping shows the CPU's own writes back to
   itself and hides the GPU's.
-- **`tools/mondrian-gpu-test.c`** exercises the whole path without Mesa: it
-  waits for the service, reads the chip id, allocates and maps a buffer,
-  writes a `CP_MEM_WRITE` canary plus a fence, submits, waits on the fence
-  and reads both back. Build it with `tools/build-mondrian-gpu-test.sh` and
-  load it in a process that runs after the GPU is up; it prints
-  `MONDRIAN GPU TEST: PASSED` to the kernel log.
+- **The whole path works from user space, measured.** `tools/mondrian-gpu-test.c`
+  waits for `MondrianGPU`, reads the chip id, allocates and maps a buffer,
+  submits a `CP_MEM_WRITE` canary plus a fence through `GEM_SUBMIT`, waits on
+  `WAIT_FENCE` and reads both values back through the mapping. It passes in
+  every process the UI hook is injected into (containermanagerd,
+  backboardd, SpringBoard): chip `0x07030002`, buffers at successive
+  `0x10000000`/`0x10010000`/`0x10020000` (one arena per connection), fences
+  continuing from the kernel's own submissions, and the canary and fence
+  exactly the values the stream wrote. Build with
+  `tools/build-mondrian-gpu-test.sh`; it is dlopened by
+  `mondrian-ui-hook.dylib`.
+- **What user space still cannot do**: import an IOSurface (`0x7e` is
+  implemented and compiled but has no caller until the CoreAnimation hooks
+  are wired), relocations (Mesa uses softpin), and prime/syncobj file
+  descriptors (stubs that return `ENOSYS`).
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
