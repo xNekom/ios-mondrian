@@ -1,7 +1,8 @@
 # GPU and boot time
 
-The UI is CPU-rendered at 9-11 fps (111 ms/frame, copy 2.4 ms; `0114`, the
-software CoreAnimation renderer). The other ios-sweet ports render through
+The UI is CPU-rendered at about 6 fps (3-12 measured with `mondrianfb_fps=1`
+at 1440x3200, copy ~2.3 ms per swap; `0114`, the software CoreAnimation
+renderer). The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
 
@@ -46,41 +47,61 @@ them has Metal. That is the path this port follows.
 
 ## Measured bring-up state
 
-- **CX**: `gpupower=1` clears `SW_COLLAPSE` at `0x9108` and the hardware
-  status at `0x953c` goes to `0x80001fe0`: CX is on. The kgsl-SMMU answers
-  `idr0 0x2f0406`. A normal boot is untouched (`gpu=0`).
-- **Clocks**: the GCC GPU gates are on (`0x62000` bits 15/16, `0x81010`,
-  `0x81018`), the GMU RCG reads `0x505`, the HUB RCG `0x507` with
-  `CMD_ROOT_EN` set, but the GPUCC AHB branch (`0x911c`) still reads 0 and
-  every GMU register reads **`0xdeafbead`**: the block is not clocked.
-  `GENERAL_9`/`GENERAL_10` reads hang. Root cause: the vendor's
-  `gpu_cc_hub_clk_src` carries `HW_CLK_CTRL_MODE`, so the **hardware
-  (AO/RPMh) owns the hub clock**. `0170`-`0172` now vote `mx.lvl`/`cx.lvl` in
-  RPMh and put the hub/gmu RCGs in `HW_CLK_CTRL_MODE`: the CPU-side sequence
-  matches the vendor's, and the AO still does not enable the hub. The live
-  Android capture (below) names the missing parent: the GX rail is PM8350C
-  **S2** (`pm8350c_s2_gfx_voter_level`), whose cmd-db resource is
-  **`mxc.lvl`** (`0x300a0`), not `s2`. Voting `mx`/`cx`/`mxc`/`gfx` as one
-  batch and sending the VRM voltage/enable/mode per rail
-  (`mondrian_rpmh_rail`) makes the `+4` enable read 1, but the ARC level
-  (`+0`) still reads 0 and the GX domain write (`0x99504`) hangs: the rail is
-  not physically on. The missing piece is the vendor `rpmh-regulator-arc`
-  command (or the AOP GPU state), not another clock write. Never read or
-  write the GX domain/ACD/IROOT registers while GX is off; the access hangs
-  the interconnect.
-- **GMU gen7 map** (`gen7_reg.h`, not the a6xx one): `CM3_SYSRESET 0x1f800`,
-  `FW_INIT_RESULT 0x1f81c`, `HFI_CTRL_STATUS 0x1f980`, `HFI_CTRL_INIT
-  0x1f986`, `QTBL_ADDR/INFO 0x1f985/0x1f984`, `CM3_CFG 0x1f82d`,
-  `GENERAL_8/9/10 0x1f9cd/0x1f9ce/0x1f9cf`, `ITCM 0x1b400`, `DTCM 0x1c400`.
-- **Firmware**: Android's `/vendor/firmware` carries `gmu_gen70000.bin`
-  (57 KiB), `a730_sqe.fw` (74 KiB) and `a730_zap.mdt/b00/b01/b02` (the ZAP
-  shader); the iOS root has only the first. Add the rest to the root image
-  before the GMU load. Android's direct load fails with `-2` and falls back to
-  the sysfs helper, which is why the vendor UI still works.
-- **Next**: enable PM8350C S2 (the GX parent) and the GX domain, then the GMU
-  firmware blocks (`{addr,size,type,value,data}` into ITCM/DTCM),
-  `CM3_SYSRESET=0` + poll `FW_INIT_RESULT` bit 8, `HFI_CTRL_INIT`, and the GMU
-  SMMU context (CB5) for the HFI queue and the VRB.
+- **CX**: `gpupower=1` follows the vendor `PongAdrenoClocks.c` sequence:
+  `CLK_DIS_WAIT=8` with `SW_COLLAPSE`/`HW_CONTROL`/`SW_OVERRIDE` cleared at
+  `0x9108`, poll `0x953c` for `PWR_ON`, then `RETAIN_FF`. A normal boot is
+  untouched (`gpu=0`).
+- **Clocks**: GCC GPU gates (`0x62000` bits 15/16, `0x81010`, `0x81018`) and
+  the GPUCC PLL0/PLL1 (LUCID_OLE) are programmed. The GMU RCG final value is
+  `0x100602`, HUB `0x100603`, XO `0x100001`; the force-enable must be held
+  until the branches are on (`0x9004`, `0x9144`, `0x93e8`, `0x913c`,
+  `0x9148`, `0x911c` delayed, `0x7000`). The AHB branch `0x911c` reads 0 by
+  design: the vendor marks it delayed and never checks it, so that readback
+  is not the failure signal it was taken for.
+- **GMU addressing**: the `gen7_reg.h` numbers are dword offsets from the
+  GPU regmap base (`kgsl_regmap_region.offset`), so in the GMU window
+  (`0x3d68000`) the byte offset is `word*4 - 0x68000`: `CM3_SYSRESET`
+  `0x16000`, `FW_INIT_RESULT` `0x16070`, `HFI_CTRL_STATUS` `0x16600`, ITCM
+  `0x5000`, DTCM `0x9000`. Reading `gmu+0x1f800` returns `0xdeafbead`; the
+  real register reads 1.
+- **GBIF and TCM**: `GEN7_GBIF_HALT` is GPU core word `0x3c45` (offset
+  `0xf114`); the bootloader leaves `0x8` and writing 0 clears it. The TCM
+  firmware blocks load and read back (ITCM first word `0x10007f80`), and
+  `CM3_SYSRESET` reads 1. Do not write `SYSRESET=0` before the firmware is
+  in place: an empty ITCM wedges the bus.
+- **Firmware layout**: `gmu_gen70000.bin` is a list of
+  `{addr,len,type,value}` blocks: ITCM `0x0` (`0x1dc`), the main 57 KiB code
+  at `0x4000`, DTCM `0x10007f98` (`0x28`) and `0x10007fdc` (`0x18`). The
+  `0x4000` block is not TCM: it needs the GPU SMMU and the external GMU
+  memory at IOVA `0x4000`.
+- **GMU SMMU**: the bootloader leaves `sCR0=0x2f0406` (global enabled, fault
+  reporting on). The GMU node uses `iommus = <&gpu_smmu 5 0x400>`, so SIDs
+  5/0x405. `UniXNU/Adreno740` `NativeAdrenoGmuMemory.h` gives the qualified
+  layout: icache `0xffc000` at `0x4000`, dummy `0x4000` at `0x60000000`, log
+  `0x4000` at `0x60004000`, HFI `0x4000` at `0x60008000`, debug `0x7000` at
+  `0x60400000`, 4 KiB tables. Context: CBAR `0x1f300`, CBA2R 1, TCR2
+  `0x38072`, TCR `0x80802020`, MAIR0 `0xff44`, SCTLR `0x127`, ASID 1,
+  TTBR0 `(1<<48)|root`; stream SMR `(1<<31)|5`, S2CR = bank.
+- **GMU boot**: the GMU needs **two** SMMU streams, SIDs 5 and 0x405 (the DT
+  `iommus` mask 0x400 expands to both). With only SID 5 the CM3 start hangs
+  the AHB; with both it reaches `FW_INIT_RESULT=0x100` in ~1.8 ms and
+  `HFI_CTRL_STATUS=0x1`. The kernel then boots the UI normally. Pong's
+  RSCC/PDC and TCM-retention writes are in the tree behind `gpurscc=1`; the
+  successful boot did not use them.
+- **Local firmware build**: `tools/gen-gmu-fw.py <gmu_gen70000.bin>
+  <build>/bsd/dev/mondrian_gmu_fw.h` before building with `gmustart=1`. The
+  header is generated from the device dump and is not committed; without it
+  the kernel builds and prints `no gmu firmware built in`.
+- **GX**: enabling the GX GDSC after the GMU/HFI are up still leaves
+  `PWR_ON=0` (`gx hw 0x0 gdscr 0x6822f000`). The vendor does not power GX from
+  the host votes alone: the GMU firmware votes the gfx/cx/mx rails from the
+  **HFI PERF_TBL/BW_TBL** tables (`adreno_gen7_rpmh.c` `build_dcvs_table`).
+  Sending HFI ids 4 (perf, 58 words), 3 (bw, 159), 14 (core start) and 30
+  (default vote) plus `oob_gpu`, as `PongAdrenoGmuStartPower` does, is the
+  next step before GX.
+- **Next**: HFI power tables, GX clocks, SQE/ZAP and CP initialization; the firmware
+  blocks, the GMU context bank and the CM3 start are in `mondrian_gpu.c`
+  under `gmustart=1`.
 
 ## Android capture (2026-10-28)
 
@@ -92,19 +113,21 @@ the vendor GPU modules `gpucc-waipio.ko`, `gdsc-regulator.ko`,
 - kgsl `Adreno730v3`, idle 285 MHz, OPPs 220-900 MHz, `gmu_ab 0x0a30`.
 - `gpu_cc_gx_gdsc` is supplied by `pm8350c_s2_gfx_voter_level` (PM8350C S2,
   an ARC regulator); `gpu_cc_cx_gdsc` by `pm8350c_s6_level`.
-- The GX GDSC has `domain-addr 0x99504`, `sw-reset 0x99058/0x99358/0x9958c`
-  and `clamp 0x9060`; the vendor `gdsc-regulator` asserts/deasserts reset and
-  clamp, writes 0 to the domain register and only then clears `SW_COLLAPSE`.
-  The earlier domain write hung because S2 was off.
+- The GX GDSC syscons are `0x3d99058`, `0x3d99358`, `0x3d9958c` and
+  `0x3d99504`; the last is GPUCC offset **`0x9504`**, not `0x99504`. The
+  vendor `gdsc-regulator` sequence is: assert/deassert the three sw-resets,
+  pulse `GMEM_RESET` (bit 4) in `0x9504`, clear `GMEM_CLAMP_IO` (bit 0)
+  there, then clear `SW_COLLAPSE` in `0x905c`. `0x9060` is `CFG_GDSCR`, not
+  a clamp register.
 - The kernel has no `debugfs` and recovery has no `/dev/mem`, so the GPUCC
   registers cannot be read from Android; the sequence above is the reference.
 
-The first XNU attempt after the capture votes `mx`/`cx`/`mxc`/`gfx`
-(`0x1c0`/`0x1a0`/`0x1c0`/`0x1a0`) and sends the VRM voltage/enable/mode for
-`mxc.lvl` and `gfx.lvl`: the TCS returns done and `+4` reads 1, but `+0`
-(the ARC level) reads 0 and the `0x99504` domain write still hangs. The GX
-rail is not physically on, so the next step is the vendor
-`rpmh-regulator-arc` command or the AOP GPU state, not another read.
+The first XNU attempt after the capture voted `mx`/`cx`/`mxc`/`gfx` at
+`0x1a0` and sent the VRM voltage/enable/mode commands to the ARC resources;
+the ARC resources only accept the level at `+0`, so those extra commands are
+not valid. The earlier `0x99504` write was outside the GPUCC mapping and
+hung the bus. GX remains off; the vendor `gdsc-regulator` order above is the
+reference for the next attempt.
 
 ## Port steps
 
@@ -138,10 +161,10 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
   frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
 - **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
   CoreAnimation into a smaller surface and scales it to the panel in
-  `swap()`; the 900x2000 boot accepted it (`AppleCLCD panel 1440x3200
-  canvas 900x2000`) but a forced HFS fsck ate the 45 s window before the
-  first swap. Retest with `mondrianreset=240` and `mondrianfb_fps=1`;
-  `tools/mondrian-boot-log.sh` collects the log.
+  `swap()`; 900x2000 measures 9.3 fps average (1-19) against 6.4 at the
+  full panel (1-23), but the CPU scale in `swap()` costs 30-40 ms per swap,
+  so the gain is smaller than the pixel count suggests. Use
+  `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
 - **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
   (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
   the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships

@@ -49,16 +49,17 @@ needs, and where the numbers come from. The boot history and the traps are in
 userland IOSurface swaps on the framebuffer and the lock screen renders
 on-device.
 
-UI probe `0106` injects a diagnostic dylib into the UI daemons selected by the
-bitmask `mondrian_ui_hook` (`0112`): 1 `containermanagerd`, 2 `backboardd`,
-4 `SpringBoard`, OR-ed (5 = containermanagerd + SpringBoard, 7 = all three),
-0 off. It disables personas after signature validation and dynamically wraps
-`CAWindowServer._detectDisplays`; dyld needs the `AMFI` policy answer to
-`__mac_syscall` 0x5a (`0108`), or it drops `DYLD_INSERT_LIBRARIES`. Build with
-`tools/build-mondrian-ui-hook.sh`, then install with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`. `0110`/`0111` expose and
-correct the virtual timer mask; `0173` arms `CNTV_TVAL` before clearing IMASK,
-which the clean shim needs (the full shim used to arm it by accident).
+UI probe `0106` injects a diagnostic dylib into the UI daemons selected by
+`mondrian_ui_hook` (`0112`, 7 = all three). It wraps
+`CAWindowServer._detectDisplays`; dyld needs the `AMFI` answer to
+`__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. Build with
+`tools/build-mondrian-ui-hook.sh`, install with
+`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`; it logs uncaught exceptions.
+`/product` needs `research/ipsw-x/d22ap.adt`; `disp0` `canvas-width`/
+`canvas-height` must be 4-byte data (`u32` ADT, `OSData` driver), because
+`getEDTProperty` reads them with `getBytes:range:` and an OSNumber or
+OSString aborts backboardd. `0110`/`0111` expose and correct the virtual timer
+mask; `0173` arms `CNTV_TVAL` before clearing IMASK for the clean shim.
 
 ### Exporting the full console ring
 

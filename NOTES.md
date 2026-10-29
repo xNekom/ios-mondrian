@@ -280,15 +280,15 @@ bounds the entry table with `nent * esz > BOUNCE_SIZE`, a 32-bit product that
 a corrupt table can wrap; guard with `nent > BOUNCE_SIZE / esz` before
 multiplying, in the same patch that enables writes.
 
-**A failed mount can zero an HFS+ B-tree node.** `hfs_swap_BTNode: offset #0
-invalid` followed by `BTOpenPath returned (5) getting extentoverflow BT` means
-the extents file's first node read as zeros. Read that block from recovery
-before blaming the driver (for this root, volume block 2178, byte offset
-`0x882000`): if it is zeros on disk, restore the volume from a verified 16 GiB
-`gzip` image (`dd bs=1M count=16384` over `userdata`) and set the volume header
-attributes to `0x80000100` — journaled bit clear, unmounted bit set — or the
-next mount may replay the same transaction. The live GPT is the original single
-`userdata` (223.6 GiB); the 64 GiB `iosroot` split was temporary and undone.
+**HFS+ corruption shows as `hfs_mark_inconsistent` on every metadata access.**
+`fsck_hfs` on the 16 GiB root names the damage: overlapped extents, a bad
+volume bitmap and a wrong free-block count. Attach the image
+(`hdiutil attach -nomount -readwrite ROOT.img`), run `fsck_hfs -fy /dev/diskN`
+then `-fn` until it says `appears to be OK`, and reflash the first 16 GiB
+(`dd bs=1M count=16384`). The volume is non-journaled (`0x80000100`), so a hard
+reset dirties it again: repair before blaming a B-tree, and do not hand-write
+the header unless fsck cannot. A zeroed extents node (block 2178, `0x882000`)
+still means restoring the gzip image; the live GPT is the single `userdata`.
 
 ## Display
 

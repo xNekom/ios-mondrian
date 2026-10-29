@@ -2,6 +2,8 @@
 #import <objc/objc.h>
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
+#import <Foundation/Foundation.h>
+#import <execinfo.h>
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/thread_state.h>
@@ -33,6 +35,78 @@ say(const char *message)
 	(void)write(STDERR_FILENO, message, len);
 	if (console_fd >= 0) {
 		(void)write(console_fd, message, len);
+	}
+}
+
+/*
+ * Log-only uncaught-exception handler: the daemons' stderr is discarded and
+ * an exception otherwise leaves no symbol behind. It names the exception and
+ * the call chain; it does not change behaviour.
+ */
+static void
+mondrian_uncaught(NSException *e)
+{
+	void *frames[16];
+	int n, i;
+
+	say("MONDRIAN UI: uncaught ");
+	say([[e name] UTF8String] ?: "?");
+	say(": ");
+	say([[e reason] UTF8String] ?: "?");
+	say("\n");
+	n = backtrace(frames, 16);
+	for (i = 0; i < n; i++) {
+		Dl_info info;
+		char buf[256];
+
+		if (dladdr(frames[i], &info)) {
+			snprintf(buf, sizeof(buf), "  #%d %p %s +%ld\n", i, frames[i],
+			    info.dli_sname ?: "?",
+			    (long)((char *)frames[i] - (char *)info.dli_saddr));
+			say(buf);
+		}
+	}
+}
+
+/*
+ * CA's display path sends -length to what should be a string but is an
+ * NSNumber. The uncaught handler only sees the throw site; this interposer
+ * logs the caller's stack at the call site and then preserves the original
+ * doesNotRecognizeSelector crash.
+ */
+static NSUInteger
+mondrian_number_length(id self, SEL _cmd)
+{
+	void *frames[16];
+	int n, i;
+
+	say("MONDRIAN UI: __NSCFNumber length called\n");
+	n = backtrace(frames, 16);
+	for (i = 0; i < n; i++) {
+		Dl_info info;
+		char buf[192];
+
+		if (dladdr(frames[i], &info)) {
+			snprintf(buf, sizeof(buf), "  L#%d %p %s +%ld\n", i, frames[i],
+			    info.dli_sname ?: "?",
+			    (long)((char *)frames[i] - (char *)info.dli_saddr));
+			say(buf);
+		}
+	}
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+static void
+install_number_length_hook(void)
+{
+	Class cls = NSClassFromString(@"__NSCFNumber");
+
+	if (cls != Nil && class_addMethod(cls, @selector(length),
+	    (IMP)mondrian_number_length, "Q@:")) {
+		say("MONDRIAN UI: __NSCFNumber length hook installed\n");
+	} else {
+		say("MONDRIAN UI: __NSCFNumber length hook failed\n");
 	}
 }
 
@@ -735,6 +809,8 @@ static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	NSSetUncaughtExceptionHandler(mondrian_uncaught);
+	install_number_length_hook();
 	say_pid("UI: dylib loaded");
 	install_personas_hook();
 	install_display_diagnostic();

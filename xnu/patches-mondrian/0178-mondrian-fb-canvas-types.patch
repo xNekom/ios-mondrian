@@ -1,0 +1,48 @@
+xnu 0178: publish the framebuffer canvas as 4-byte data
+
+IOMobileFramebufferOpen's getEDTProperty reads disp0 canvas-width and
+canvas-height as 4-byte CFData and calls getBytes:range:. An OSNumber
+crashes backboardd with -[__NSCFNumber length]; an OSString crashes with
+-[NSTaggedPointerString getBytes:range:]. Publish raw u32 bytes from the
+driver and keep the ADT properties u32. The timing/color elements describe
+the render target (canvas), not the panel scanout, so a smaller canvas
+publishes a matching mode.
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index f9e3874..778e4f9 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -321,10 +321,30 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+-	/* The framework reads the canvas size from the provider. */
+-	provider->setProperty("canvas-width", fCanvasWidth, 32);
+-	provider->setProperty("canvas-height", fCanvasHeight, 32);
+-	mondrian_publish_modes(this, fWidth, fHeight);
++	/*
++	 * IOMobileFramebufferOpen's getEDTProperty() reads these as 4-byte
++	 * CFData (getBytes:range:). An OSNumber crashes on -length and an
++	 * OSString on -getBytes:range:, so publish raw u32 bytes.
++	 */
++	{
++		uint32_t canvas;
++		OSData *data;
++
++		canvas = fCanvasWidth;
++		data = OSData::withBytes(&canvas, sizeof(canvas));
++		if (data != NULL) {
++			provider->setProperty("canvas-width", data);
++			data->release();
++		}
++		canvas = fCanvasHeight;
++		data = OSData::withBytes(&canvas, sizeof(canvas));
++		if (data != NULL) {
++			provider->setProperty("canvas-height", data);
++			data->release();
++		}
++	}
++	/* The mode is the render target (canvas), not the panel scanout. */
++	mondrian_publish_modes(this, fCanvasWidth, fCanvasHeight);
+ 	registerService();
+ 	/*
+ 	 * mondrianfb_noscreen=1: leave the panel to the liveness marker. The

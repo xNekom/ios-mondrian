@@ -202,6 +202,8 @@ def build(board, seed=None, qemu=False, altmem=False):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr(board.dt_prefix + ',display')),
+            # IOMobileFramebuffer's getEDTProperty() reads these as 4-byte
+            # CFData (getBytes:range:); keep them u32, not a number object.
             ('canvas-width', u32(board.fb_w)),
             ('canvas-height', u32(board.fb_h)),
         ])])
@@ -248,6 +250,9 @@ def build(board, seed=None, qemu=False, altmem=False):
     ])
 
     product_props = d22ap_product()
+    if product_props is None and not qemu and os.environ.get('ADT_ALLOW_NO_PRODUCT') != '1':
+        raise SystemExit('mkadt.py: research/ipsw-x/d22ap.adt missing; /product would be '
+                         'absent (set ADT_ALLOW_NO_PRODUCT=1 to override)')
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
