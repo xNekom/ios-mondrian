@@ -188,11 +188,14 @@ them has Metal. That is the path this port follows.
   lo/hi and the size in dwords) pointing at a 9-dword IB runs the whole
   stream: the canary and the fence inside it land, `rptr` reaches `wptr`, no
   interrupt. That is the submission shape Mesa uses.
-- **The GPU baseline works with the SQE stopped.** Probe powers CX/GX, boots
-  the GMU, sends the HFI power tables and the hold, hardware init reads back
-  `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With
-  `CP_SQE_CNTL=0` the boot reaches SpringBoard and resets cleanly;
-  `gpustart=1` runs the whole sequence above.
+- **The GPU is on by default.** `tools/boards.py` passes
+  `gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1`; the probe powers
+  CX/GX, boots the GMU, sends the HFI power tables and the hold, hardware init
+  reads back `rbbm 0x1`, authenticates the ZAP, starts the CP, proves an
+  indirect buffer and publishes `MondrianGPU`. The boot still reaches
+  SpringBoard, so the two do not compete. `gpustart=0` stops the SQE and
+  `gpu=0` skips the block, which is what to boot if the GPU path is being
+  changed and the rest of the port has to stay usable.
 - **The user client is `MondrianGPU`** (`0182`, `iokit/Kernel/arm`). Mesa's
   freedreno speaks Linux msm DRM, not IOAccelerator: `IOServiceOpen` on
   `MondrianGPU` and then one `IOConnectCallStructMethod` per request, with

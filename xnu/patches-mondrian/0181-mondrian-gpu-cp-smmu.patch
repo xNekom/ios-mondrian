@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..4f9ed77
+index 0000000..762df24
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3047 @@
+@@ -0,0 +1,3049 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -1668,7 +1668,9 @@ index 0000000..4f9ed77
 +
 +static int mondrian_cp_blind;
 +static int mondrian_cp_zap = 1;
-+static int mondrian_cp_run;	/* gpustart=1: start the SQE (bus wedges) */
++/* gpustart: start the SQE. On by default now that the whole path works
++ * (the parity fix and the four streams); gpustart=0 leaves it stopped. */
++static int mondrian_cp_run = 1;
 +static uint64_t mondrian_cp_ttbr0;
 +static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
 +static vm_offset_t mondrian_cp_scratch_view;
@@ -2434,9 +2436,9 @@ index 0000000..4f9ed77
 +	printf("MONDRIAN GPU: cp sqe on\n");
 +	mondrian_log_flush_now();
 +	/*
-+	 * Measured: writing 1 (vendor's "clear the SQE_HALT") wedges the GPU's
-+	 * register port and the boot dies at that write; 0 is harmless. Keep
-+	 * the SQE stopped unless gpustart=1 asks for the experiment.
++	 * The vendor's "clear the SQE_HALT". The earlier wedge at this store
++	 * was the missing parity in the first packet's header: the SQE fetched
++	 * it and stopped. gpustart=0 leaves the engine stopped.
 +	 */
 +	*(volatile uint32_t *)(gpu + GEN7_CP_SQE_CNTL * 4u) =
 +	    mondrian_cp_run ? 1u : 0u;
