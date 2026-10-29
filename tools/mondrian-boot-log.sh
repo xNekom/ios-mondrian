@@ -93,11 +93,11 @@ fb_dev || { echo "no volvio a fastboot; pasalo a mano" >&2; exit 1; }
 
 echo "== arrancando recovery"
 fb boot "$RECOVERY" >/dev/null 2>&1 || { echo "fastboot boot recovery fallo" >&2; exit 1; }
+# One server restart before the wait: doing it inside the loop resets the
+# recovery adbd before it can answer.
+adb kill-server 2>/dev/null; adb start-server 2>/dev/null; sleep 5
 for i in $(seq 1 50); do
 	adb shell echo ok 2>/dev/null | grep -q ok && break
-	if [ $((i % 5)) -eq 0 ]; then
-		adb kill-server 2>/dev/null; adb start-server 2>/dev/null
-	fi
 	sleep 3
 done
 adb_dev || { echo "el recovery no responde por adb" >&2; exit 1; }
