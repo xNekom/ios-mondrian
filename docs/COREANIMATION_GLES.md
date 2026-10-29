@@ -87,26 +87,21 @@ when the root changes or the log says "slot holds ..., expected ...".
 
 Step 2 reads QuartzCore's symbol table, finds `__ZTV...GLESContextE` and the two
 `GLContext::function_*` methods, and *measures* which vtable entry holds each (they move when the
-class layout does), writing the vtable address, both slot offsets and both function addresses;
-`ipsw dyld symaddr <cache> <address>` names one address by hand (what `tools/ios-crash.py` does for
-crash PCs) when an image has no local symbols. Step 3 is the only reliable source for the function
-table: iOS's GLES builds it at run time, so the dump is the definition. `mkeagl.py --check` lists
-slot entries the headers cannot type.
+class layout does). Step 3 is the only source for the function table: iOS's GLES builds it at run
+time, so the dump is the definition, and `mkeagl.py --check` lists entries the headers cannot type.
 
 One pair the tool does not derive: `MONDIAN_CA_CONTEXT_STATE` / `MONDIAN_CA_FUNCTION_FIELD`, where a
-GLESContext keeps the function it is drawing with. They match the a6xx port. If the console shows
-`CoreAnimation's GL renderer has no function N` with N >= 90, this pair is wrong for the build;
-find it by disassembling the first instructions of `function_supported`.
+GLESContext keeps the function it is drawing with. They match the a6xx port; `CoreAnimation's GL
+renderer has no function N` with N >= 90 on the console means this pair is wrong for the build.
 
 ## What is untested
 
-- Every part of it: no dylib has been loaded on the phone and no Mesa context has been created
-  there. `build.sh` compiles and signs; that is all that has run. Whether `IOAcceleratorES` (`0114`)
-  is enough for CoreAnimation to choose GLES, and whether it then presents through `0085`, is open.
+- Every part of it: no dylib has run on the phone. `build.sh` compiles and signs; that is all.
+  Whether `IOAcceleratorES` (`0114`) is enough for CoreAnimation to choose GLES is open.
 - The 30 table offsets in `eagl_slots.txt`: every other call CoreAnimation makes is "CALLED AND NOT
   THERE" until step 3 above fills the list in, so a first boot with it as it is draws nothing.
-- Request `0x7e` is absent, so frames are copied: the cost of an 11 MB BGRA readback each way is
-  unmeasured, and so is Mesa's a730 driver here (`docs/MONDIAN_GPU.md`).
+- Request `0x7e` exists in the kernel but nothing calls it yet (Mesa's `osmesa_surface_resource`
+  hook is missing), so frames are copied: the 11 MB BGRA readback each way is unmeasured.
 
 ## First pixels, in order
 
@@ -121,6 +116,5 @@ find it by disassembling the first instructions of `function_supported`.
 5. Read three log lines: `an OpenGL ES 3 context for CoreAnimation, by Mesa` (renderer chosen),
    `-attachImage: texture N is IOSurface M` (a frame goes into a surface), and `CALLED AND NOT
    THERE` (table entries still missing).
-6. Expect the copy path to be slow. Then schedule request `0x7e` and the display's
-   `MondrianWaitsForGPU` property (the frame is waited for in the dylib today, `glwait=1`), and
+6. Expect the copy path to be slow. Then hook `osmesa_surface_resource` so 0x7e is used, and
    compare against the 6.4 fps baseline.
