@@ -46,7 +46,7 @@ command -v adb >/dev/null || { echo "falta adb" >&2; exit 1; }
 
 fb() { if [ -n "$SERIAL" ]; then fastboot -s "$SERIAL" "$@"; else fastboot "$@"; fi; }
 fb_dev() { fastboot devices 2>/dev/null | grep -q .; }
-adb_dev() { adb devices 2>/dev/null | grep -qE '[[:space:]]device$'; }
+adb_dev() { adb devices 2>/dev/null | grep -qE '[[:space:]](device|recovery)$'; }
 
 # Put the phone in the bootloader whatever it is running now.
 if adb_dev; then
