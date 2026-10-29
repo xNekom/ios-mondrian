@@ -210,6 +210,17 @@ them has Metal. That is the path this port follows.
   plus `CP_EVENT_WRITE` into a slot of the memptr page, waited on through the
   write-combined alias of that page. No IRQ is needed for correctness; IRQ 332
   is only needed for the timestamp path Mesa uses on real hardware.
+- **Buffers are coherent by construction**: the user mapping is handed out
+  with `kIOMapInhibitCache` (the GPU reads and writes DRAM directly), and the
+  user client write-backs the command stream with `flush_dcache64` before the
+  ring publishes it. A cached user mapping shows the CPU's own writes back to
+  itself and hides the GPU's.
+- **`tools/mondrian-gpu-test.c`** exercises the whole path without Mesa: it
+  waits for the service, reads the chip id, allocates and maps a buffer,
+  writes a `CP_MEM_WRITE` canary plus a fence, submits, waits on the fence
+  and reads both back. Build it with `tools/build-mondrian-gpu-test.sh` and
+  load it in a process that runs after the GPU is up; it prints
+  `MONDRIAN GPU TEST: PASSED` to the kernel log.
 - **Next**: build Mesa for the device (`FD_MESA_DEBUG=sysmem`, a730/FD725),
   the `mondrian-drm` libdrm shim, and then the CoreAnimation EAGL hooks. The
   firmware blocks, the GMU context bank and the CM3 start are in

@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..762df24
+index 0000000..91bab62
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3049 @@
+@@ -0,0 +1,3060 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2822,6 +2822,17 @@ index 0000000..762df24
 +}
 +
 +int
++mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes)
++{
++	if (bytes == 0) {
++		return -1;
++	}
++	flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++int
 +mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
 +{
 +	uint32_t *ring;
@@ -3082,10 +3093,10 @@ index 0000000..762df24
 +}
 diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
 new file mode 100644
-index 0000000..426ad17
+index 0000000..606ff0e
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu_api.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,50 @@
 +/*
 + * What the IOKit driver (iokit/Kernel/arm/MondrianGPU.cpp) asks of the GPU
 + * bring-up in mondrian_gpu.c. The C side owns the SMMU page tables, the IOVA
@@ -3121,6 +3132,9 @@ index 0000000..426ad17
 +
 +/* Make table changes visible to the SMMU walker. */
 +int mondrian_gpu_uc_tables_sync(void);
++
++/* Write back the CPU's view of a buffer before the GPU reads it. */
++int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
 +
 +/* One indirect command stream, fenced. Returns the fence to wait on. */
 +int mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence);

@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..915081c
+index 0000000..2744ef0
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,585 @@
+@@ -0,0 +1,603 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -471,6 +471,21 @@ index 0000000..915081c
 +			result = kIOReturnBadArgument;
 +			break;
 +		}
++		{
++			uint64_t off = cmds[i].submit_offset;
++
++			for (; off < cmds[i].submit_offset + cmds[i].size;
++			    off += 0x1000) {
++				IOByteCount length = 0;
++				addr64_t pa = buffer->memory->getPhysicalSegment(
++				    off, &length);
++
++				if (pa != 0 && length != 0) {
++					(void)mondrian_gpu_uc_flush(pa,
++					    length);
++				}
++			}
++		}
 +		if (mondrian_gpu_uc_submit(buffer->iova + cmds[i].submit_offset,
 +		    cmds[i].size / 4, &fence) != 0) {
 +			result = kIOReturnError;
@@ -500,7 +515,10 @@ index 0000000..915081c
 +	if (buffer != NULL) {
 +		buffer->memory->retain();
 +		*memory = buffer->memory;
-+		*options = 0;
++		/* The GPU reads and writes DRAM directly; a cached user
++		 * mapping would both hide the CPU's writes from it and keep
++		 * stale lines from its writes. */
++		*options = kIOMapInhibitCache;
 +		result = kIOReturnSuccess;
 +	}
 +	IOLockUnlock(fLock);
