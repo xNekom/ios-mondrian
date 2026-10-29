@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..0e3ead9
+index 0000000..461d36a
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3102 @@
+@@ -0,0 +1,3133 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2633,45 +2633,44 @@ index 0000000..0e3ead9
 +		mondrian_uc_at = at;
 +		mondrian_uc_up = 1;
 +		if (rptr >= at) {
-+			/* Two submissions through the call the user client
-+			 * uses, back to back: ring advance, fence slots and
-+			 * the publish/wait pair, in the order Mesa's msm
-+			 * backend produces them. */
++			/* Submissions through the call the user client uses,
++			 * back to back. 2000 of them wrap the 32 KiB ring
++			 * twice, reuse every fence slot and prove the order:
++			 * the last canary and the last fence have to be the
++			 * ones the last submission asked for. */
 +			uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
 +			volatile uint32_t *mv =
 +			    (volatile uint32_t *)mondrian_cp_memptr_view;
-+			uint32_t f[2] = { 0, 0 };
-+			uint32_t k, w[2];
++			const uint32_t rounds = 2000;
++			const uint64_t dst = mondrian_cp_memptr.iova + 0x900u;
++			const uint64_t fen = mondrian_cp_memptr.iova + 0x910u;
++			uint32_t f = 0, last = 0, refused = 0, w, k, n = 0;
 +
-+			for (k = 0; k < 2; k++) {
-+				uint32_t *p = ib + k * 64;
-+				uint64_t dst = mondrian_cp_memptr.iova +
-+				    0x900u + 4u * k;
-+				uint64_t fen = mondrian_cp_memptr.iova +
-+				    0x910u + 4u * k;
-+				uint32_t n = 0;
-+
-+				p[n++] = mondrian_pm4_type7(0x3du, 3);
-+				p[n++] = (uint32_t)dst;
-+				p[n++] = (uint32_t)(dst >> 32);
-+				p[n++] = 0x600d0001u + k;
-+				p[n++] = mondrian_pm4_type7(0x46u, 4);
-+				p[n++] = 0x31u | (1u << 27);
-+				p[n++] = (uint32_t)fen;
-+				p[n++] = (uint32_t)(fen >> 32);
-+				p[n++] = 0x100u + k;
++			ib[n++] = mondrian_pm4_type7(0x3du, 3);
++			ib[n++] = (uint32_t)dst;
++			ib[n++] = (uint32_t)(dst >> 32);
++			ib[n++] = 0;			/* value, per round */
++			ib[n++] = mondrian_pm4_type7(0x46u, 4);
++			ib[n++] = 0x31u | (1u << 27);
++			ib[n++] = (uint32_t)fen;
++			ib[n++] = (uint32_t)(fen >> 32);
++			ib[n++] = 0;			/* fence, per round */
++			for (k = 1; k <= rounds; k++) {
++				ib[3] = 0x600d0000u | (k & 0xfffu);
++				ib[8] = k;
 +				mondrian_gpu_mem_flush(&mondrian_cp_ib,
 +				    mondrian_cp_ib.bytes);
++				__asm__ volatile("dsb sy" ::: "memory");
++				if (mondrian_gpu_uc_submit(mondrian_cp_ib.iova,
++				    n, &f) != 0) {
++					refused++;
++				}
++				last = f;
 +			}
-+			(void)mondrian_gpu_uc_submit(mondrian_cp_ib.iova, 9, &f[0]);
-+			(void)mondrian_gpu_uc_submit(mondrian_cp_ib.iova + 256, 9,
-+			    &f[1]);
-+			w[0] = (uint32_t)mondrian_gpu_uc_wait(f[0], 5000);
-+			w[1] = (uint32_t)mondrian_gpu_uc_wait(f[1], 5000);
-+			printf("MONDRIAN GPU: cp uc submit %u/%u wait %u/%u canary 0x%x/0x%x fence 0x%x/0x%x\n",
-+			    f[0], f[1], w[0], w[1],
-+			    mv ? mv[0x900 / 4] : 0, mv ? mv[0x904 / 4] : 0,
-+			    mv ? mv[0x910 / 4] : 0, mv ? mv[0x914 / 4] : 0);
++			w = (uint32_t)mondrian_gpu_uc_wait(last, 5000);
++			printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x\n",
++			    rounds, refused, w, mv ? mv[0x900 / 4] : 0,
++			    mv ? mv[0x910 / 4] : 0);
 +			mondrian_log_flush_now();
 +		}
 +	}
@@ -2874,6 +2873,39 @@ index 0000000..0e3ead9
 +	return 0;
 +}
 +
++/*
++ * Close the ring. The CP fetches from the read pointer towards the write
++ * pointer and wraps at the end of the buffer, so a write pointer that jumps
++ * back to zero leaves it fetching the dwords it never saw. Fill the tail with
++ * one CP_NOP that covers it, publish the wrap and wait for the read pointer
++ * to come back to zero before anything is written at the start again.
++ */
++static int
++mondrian_uc_wrap(uint32_t *ring)
++{
++	uint32_t pad = MONDRIAN_UC_RING_DWORDS - mondrian_uc_at;
++	uint32_t i, waited;
++
++	if (pad != 0) {
++		ring[mondrian_uc_at] = mondrian_pm4_type7(0x10u, pad - 1);
++		for (i = 1; i < pad; i++) {
++			ring[mondrian_uc_at + i] = 0;
++		}
++		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, 0);
++	for (waited = 0; waited < 50; waited++) {
++		if (mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_RB_RPTR * 4u) == 0) {
++			mondrian_uc_at = 0;
++			return 0;
++		}
++		delay(1000);
++	}
++	return -1;
++}
++
 +int
 +mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
 +{
@@ -2892,9 +2924,8 @@ index 0000000..0e3ead9
 +	ring = (uint32_t *)mondrian_cp_ring.va;
 +	at = mondrian_uc_at;
 +	if (at + 9 > MONDRIAN_UC_RING_DWORDS) {
-+		if (mondrian_gpu_read(mondrian_uc_gpu,
-+		    GEN7_CP_RB_RPTR * 4u) != at) {
-+			return -1;	/* the ring still holds work */
++		if (mondrian_uc_wrap(ring) != 0) {
++			return -1;
 +		}
 +		at = 0;
 +	}

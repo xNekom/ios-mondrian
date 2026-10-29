@@ -184,6 +184,14 @@ them has Metal. That is the path this port follows.
   touches therefore needs `AP[1]=1` (user accessible), which is pong's
   `perms 3` for the ring, memptr, power-up list and scratch, and the vendor's
   `IOMMU_READ`-without-`IOMMU_PRIV` for user buffers. The SQE stays `perms 5`.
+- **The ring is closed with a `CP_NOP` when it wraps.** The CP fetches from
+  the read pointer towards the write pointer, so a write pointer that jumps
+  back to zero leaves it fetching dwords nobody wrote (the ring starts zeroed,
+  so they decode as type-0 register writes). Fill the tail with one
+  `CP_NOP` covering it, publish the wrap, and wait for `CP_RB_RPTR` to read 0
+  before writing at the start. Measured with 2000 back-to-back submissions:
+  183 refused before the fix, 0 after it, with the last canary and fence
+  exactly the ones the last submission asked for.
 - **Back-to-back submissions work.** Two `mondrian_gpu_uc_submit` calls in a
   row (the exact call the user client makes) return fences 1 and 2, both
   waits complete, both canaries and both fence dwords land: ring advance,
