@@ -58,9 +58,9 @@ Current blockers, in order:
    19.2 MHz timer; keep the bring-up before `launchd`, a thread raced the
    RPMh iovdd vote). The report thread is ticked from the vsync (`0161`): its
    tsleep deadline never fires, so it polled at 0.5 Hz; now it reads the part
-   at 120 Hz. The wall is the CPU rasterizer: 6.4 fps full panel (max 23,
-   copy 2.4 ms), 9.3 at 900x2000; the GMU HFI tables and GX on change nothing
-   (8.1 active, max 35). The GPU driver is next (MONDIAN_GPU.md); first frame 43 s.
+   at 120 Hz. The wall is the CPU rasterizer: 6.4 fps full panel, 9.3 at
+   900x2000. The GPU runs and user space submits to it (`0181`, `0182`;
+   `docs/MONDIAN_GPU.md`), but the UI does not draw with it yet. First frame 43 s.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
