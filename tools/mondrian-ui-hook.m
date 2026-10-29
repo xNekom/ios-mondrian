@@ -804,6 +804,27 @@ install_activation_hooks(void)
 	}
 }
 
+/*
+ * The GPU smoke test (tools/mondrian-gpu-test.c) is a second dylib, installed
+ * as /usr/libexec/mondrian-gpu-test.dylib by tools/install-gpu-test.sh. Load
+ * it here instead of adding a kernel boot argument: this hook runs in every
+ * daemon the kernel injects it into, which is after MondrianGPU is published,
+ * and the test logs its own verdict. A missing file is not an error; the test
+ * is opt-in.
+ */
+static void
+load_gpu_test(void)
+{
+	void *handle;
+
+	if (access("/usr/libexec/mondrian-gpu-test.dylib", R_OK) != 0) {
+		return;
+	}
+	handle = dlopen("/usr/libexec/mondrian-gpu-test.dylib", RTLD_NOW);
+	say(handle != NULL ? "MONDRIAN UI: gpu test loaded\n"
+	    : "MONDRIAN UI: gpu test dlopen failed\n");
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -816,4 +837,5 @@ mondrian_install_ui_hooks(void)
 	install_display_diagnostic();
 	install_activation_hooks();
 	start_heartbeat();
+	load_gpu_test();
 }

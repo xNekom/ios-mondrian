@@ -226,6 +226,19 @@ them has Metal. That is the path this port follows.
   firmware blocks, the GMU context bank and the CM3 start are in
   `mondrian_gpu.c` under `gmustart=1`.
 
+### Running the GPU test from the UI hook
+
+The UI hook dlopens it in every daemon the kernel injects it into, so there is
+no new boot argument; the ring log then holds a `MONDRIAN GPU TEST:` verdict.
+
+```sh
+tools/build-mondrian-gpu-test.sh /tmp/mondrian-gpu-test.dylib
+sudo tools/install-gpu-test.sh ios16-root.img /tmp/mondrian-gpu-test.dylib
+python3 tools/mk-simg.py ios16-root.img ios16-root.simg
+tools/flash-root.sh ios16-root.simg
+tools/mondrian-boot-log.sh --reset 150
+```
+
 ## Android capture (2026-10-28)
 
 A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug

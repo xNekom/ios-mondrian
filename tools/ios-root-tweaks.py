@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo ios-root-tweaks.py MOUNTED_ROOT
+  sudo ios-root-tweaks.py MOUNTED_ROOT [--ui-hook DYLIB] [--gpu-test DYLIB]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -30,6 +30,13 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+  dylibs          --ui-hook copies a dylib to the image as
+                  /usr/libexec/mondrian-ui-hook.dylib: the kernel appends
+                  DYLD_INSERT_LIBRARIES for it to
+                  containermanagerd/backboardd/SpringBoard when the boot
+                  argument mondrian_ui_hook selects them. --gpu-test copies
+                  /usr/libexec/mondrian-gpu-test.dylib, which the UI hook
+                  dlopens when it is there.
 """
 import glob, hashlib, os, plistlib, shutil, sys
 
@@ -159,35 +166,54 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
-def install_ui_hook(root, source):
-    if not os.path.isfile(source):
-        sys.exit(f'error: personas hook not found: {source}')
+# --option: (file name in /usr/libexec, what the messages call it). The UI hook
+# is the one the kernel injects; the GPU test is dlopened by the UI hook.
+DYLIB_OPTIONS = {
+    '--ui-hook': ('mondrian-ui-hook.dylib', 'UI hook'),
+    '--gpu-test': ('mondrian-gpu-test.dylib', 'GPU test'),
+}
+
+
+def install_dylib(root, source, name, what):
+    """Copy one dylib into /usr/libexec, owned by root, mode 0755."""
     directory = os.path.join(root, 'usr/libexec')
     os.makedirs(directory, exist_ok=True)
-    destination = os.path.join(directory, 'mondrian-ui-hook.dylib')
+    destination = os.path.join(directory, name)
     shutil.copyfile(source, destination)
     os.chown(destination, 0, 0)
     os.chmod(destination, 0o755)
-    print('installed opt-in containermanagerd/backboardd UI hook')
+    print('installed', os.path.relpath(destination, root))
+
+
+def parse_args(argv):
+    """MOUNTED_ROOT, then each --option DYLIB at most once, in any order."""
+    if not argv or argv[0].startswith('-'):
+        sys.exit(__doc__)
+    root, rest, options = argv[0], argv[1:], {}
+    while rest:
+        if rest[0] not in DYLIB_OPTIONS or rest[0] in options or len(rest) < 2:
+            sys.exit(__doc__)
+        options[rest[0]] = rest[1]
+        rest = rest[2:]
+    return root, options
 
 
 def main():
-    if len(sys.argv) not in (2, 4) or (len(sys.argv) == 4 and sys.argv[2] != '--ui-hook'):
-        sys.exit(__doc__)
-    root = sys.argv[1]
-    hook = sys.argv[3] if len(sys.argv) == 4 else None
+    root, options = parse_args(sys.argv[1:])
     if not os.path.isdir(os.path.join(root, 'System/Library/xpc')):
         sys.exit(__doc__)
-    if hook and not os.path.isfile(hook):
-        sys.exit(f'error: personas hook not found: {hook}')
+    for option, source in options.items():
+        if not os.path.isfile(source):
+            sys.exit(f'error: {DYLIB_OPTIONS[option][1]} not found: {source}')
     launchd(root)
     containers(root)
     preboot(root)
     swapdir(root)
     activation(root)
     audio(root)
-    if hook:
-        install_ui_hook(root, hook)
+    for option, (name, what) in DYLIB_OPTIONS.items():
+        if option in options:
+            install_dylib(root, options[option], name, what)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
