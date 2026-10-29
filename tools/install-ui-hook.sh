@@ -21,9 +21,20 @@ dylib=${2:?usage: install-ui-hook.sh ROOT.img DYLIB}
 
 here=$(cd "$(dirname "$0")" && pwd)
 
-# The image is normally attached read-only so the dyld shared cache can be
-# read from it; detach that first.
-hdiutil detach /Volumes/iOSRO >/dev/null 2>&1 || true
+# The image is normally attached read-only, at /Volumes/iOSRoot or under a
+# numbered name, so the dyld shared cache can be read from it; hdiutil refuses
+# to attach an image that is already attached. Find the device by image path:
+# the volume name is not part of the contract.
+detach_image() {
+	device=$(hdiutil info | awk -v image="$1" '
+		$1 == "image-path" { current = $3 }
+		$1 ~ /^\/dev\/disk/ && current == image { print $1; exit }')
+	if [ -n "$device" ]; then
+		hdiutil detach "$device" >/dev/null 2>&1 || true
+	fi
+}
+
+detach_image "$image"
 
 echo "== attaching $image (read/write)"
 attach=$(hdiutil attach -readwrite -nobrowse "$image")
