@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..7bca3c8
+index 0000000..7244515
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,2762 @@
+@@ -0,0 +1,2818 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -1645,6 +1645,7 @@ index 0000000..7bca3c8
 +static struct mondrian_gpu_mem mondrian_cp_sqe;
 +static struct mondrian_gpu_mem mondrian_cp_ring;
 +static struct mondrian_gpu_mem mondrian_cp_memptr;
++static struct mondrian_gpu_mem mondrian_cp_ib;
 +static struct mondrian_gpu_mem mondrian_cp_pwrup;
 +static struct mondrian_gpu_mem mondrian_cp_scratch;
 +static uint32_t mondrian_cp_sctlr;
@@ -1720,7 +1721,8 @@ index 0000000..7bca3c8
 +		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x8000, 0x200000) != 0 ||
 +		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
 +		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
-+		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0) {
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ib, 0x4000, 0x400000) != 0) {
 +			printf("MONDRIAN GPU: cp memory allocation failed\n");
 +			return -1;
 +		}
@@ -1741,16 +1743,22 @@ index 0000000..7bca3c8
 +		    mondrian_cp_sqe.va, mondrian_cp_sqe.bytes, 5, &next) != 0 ||
 +		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_ring.iova,
-+		    mondrian_cp_ring.va, mondrian_cp_ring.bytes, 11, &next) != 0 ||
++		    mondrian_cp_ring.va, mondrian_cp_ring.bytes, 3, &next) != 0 ||
 +		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_memptr.iova,
-+		    mondrian_cp_memptr.va, mondrian_cp_memptr.bytes, 11, &next) != 0 ||
++		    mondrian_cp_memptr.va, mondrian_cp_memptr.bytes, 3, &next) != 0 ||
 +		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_pwrup.iova,
-+		    mondrian_cp_pwrup.va, mondrian_cp_pwrup.bytes, 11, &next) != 0 ||
++		    mondrian_cp_pwrup.va, mondrian_cp_pwrup.bytes, 3, &next) != 0 ||
 +		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_scratch.iova,
-+		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 11, &next) != 0) {
++		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 3, &next) != 0 ||
++		    /* The command stream is fetched by the non-privileged CP
++		     * path: user-accessible, and executable so neither fetch
++		     * flavour can permission-fault. */
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_ib.iova,
++		    mondrian_cp_ib.va, mondrian_cp_ib.bytes, 7, &next) != 0) {
 +			printf("MONDRIAN GPU: cp map failed\n");
 +			return -1;
 +		}
@@ -2551,6 +2559,54 @@ index 0000000..7bca3c8
 +			    CPR(GEN7_RBBM_INT_0_STATUS), CPR(GEN7_RBBM_STATUS),
 +			    CPR(GEN7_RBBM_STATUS3), CPR(GEN7_CP_HW_FAULT));
 +			mondrian_log_flush_now();
++
++			/*
++			 * Indirect buffer: the shape every Mesa submission
++			 * uses. The IB carries its own memory write and its
++			 * own fence, so a single ring packet proves the CP
++			 * dispatches into fetched command streams.
++			 */
++			if (rptr >= at) {
++				uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
++				uint32_t n = 0;
++				const uint64_t dst2 =
++				    mondrian_cp_memptr.iova + 0x820u;
++				const uint64_t fen2 =
++				    mondrian_cp_memptr.iova + 0x830u;
++
++				ib[n++] = mondrian_pm4_type7(0x3du, 3);
++				ib[n++] = (uint32_t)dst2;
++				ib[n++] = (uint32_t)(dst2 >> 32);
++				ib[n++] = 0x1b00deadu;
++				ib[n++] = mondrian_pm4_type7(0x46u, 4);
++				ib[n++] = 0x31u | (1u << 27);
++				ib[n++] = (uint32_t)fen2;
++				ib[n++] = (uint32_t)(fen2 >> 32);
++				ib[n++] = 0x1b00deaeu;
++				mondrian_gpu_mem_flush(&mondrian_cp_ib,
++				    mondrian_cp_ib.bytes);
++				ring[at++] = mondrian_pm4_type7(0x3fu, 3);
++				ring[at++] = (uint32_t)mondrian_cp_ib.iova;
++				ring[at++] = (uint32_t)(mondrian_cp_ib.iova >> 32);
++				ring[at++] = n;
++				mondrian_gpu_mem_flush(&mondrian_cp_ring,
++				    mondrian_cp_ring.bytes);
++				__asm__ volatile("dsb sy" ::: "memory");
++				CPW(GEN7_CP_RB_WPTR, at);
++				for (i = 0; i < 2000; i++) {
++					rptr = CPR(GEN7_CP_RB_RPTR);
++					if (rptr >= at) {
++						break;
++					}
++					delay(1000);
++				}
++				__asm__ volatile("dsb sy" ::: "memory");
++				printf("MONDRIAN GPU: cp ib rptr %u wptr %u canary 0x%x fence 0x%x int 0x%x\n",
++				    rptr, at, mv ? mv[0x820 / 4] : 0,
++				    mv ? mv[0x830 / 4] : 0,
++				    CPR(GEN7_CP_INTERRUPT_STATUS));
++				mondrian_log_flush_now();
++			}
 +		}
 +	}
 +	printf("MONDRIAN GPU: cp state sqe_cntl 0x%x rptr 0x%x wptr 0x%x\n",

@@ -176,7 +176,18 @@ them has Metal. That is the path this port follows.
   `wptr` end equal (21), the RPTR shadow follows, `CP_INTERRUPT_STATUS` 0.
 - **SMMU context**: pong's qualified image for this chip, `sctlr` 0x127 and a
   write-back inner-shareable walk (`0x3500`); the earlier `0x1027` kept
-  ASIDPNE and had fault reporting off.
+  ASIDPNE and had fault reporting off, which is why the faults below were
+  invisible.
+- **Packets from an indirect buffer run unprivileged.** A `CP_MEM_WRITE` in
+  the ring reaches a `AP[1]=0` (privileged-only) page; the same packet inside
+  an IB faults with `FSR 0x408` at the destination. Every buffer a submission
+  touches therefore needs `AP[1]=1` (user accessible), which is pong's
+  `perms 3` for the ring, memptr, power-up list and scratch, and the vendor's
+  `IOMMU_READ`-without-`IOMMU_PRIV` for user buffers. The SQE stays `perms 5`.
+- **Indirect buffers work.** `CP_INDIRECT_BUFFER_PFE` (0x3f, payload addr
+  lo/hi and the size in dwords) pointing at a 9-dword IB runs the whole
+  stream: the canary and the fence inside it land, `rptr` reaches `wptr`, no
+  interrupt. That is the submission shape Mesa uses.
 - **The GPU baseline works with the SQE stopped.** Probe powers CX/GX, boots
   the GMU, sends the HFI power tables and the hold, hardware init reads back
   `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With
