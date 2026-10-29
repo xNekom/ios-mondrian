@@ -151,6 +151,15 @@ them has Metal. That is the path this port follows.
   the OOB/hold command, and the CP start hangs on its first register access.
   With the match fixed the probe reports accepted `hfi perf/bw/vote` and the
   `hold`.
+- **The CP runs; the four SIDs matter.** The SMMU loop programmed only two
+  of the four stream slots it had reserved, so SID 1 (BV) and 0x401 (LPAC)
+  were unmatched. The SQE starts both engines on its first packet, their
+  fetch hit an unmatched stream and the CP wedged at the start (the register
+  port stopped answering). With all four SMR/S2CR pairs written the CP drains
+  `CP_ME_INIT` (`CP_RB_RPTR` reads 10), the ZAP authenticates, and
+  `CP_SET_SECURE_MODE(0)` drains as well (`rptr 12`). The vendor submission
+  preamble (`CP_THREAD_CONTROL` both threads, `CP_SET_MARKER` 0x101 to disable
+  IFPC, `CP_THREAD_CONTROL` BR) goes before a `CP_MEM_WRITE`.
 - **The GPU baseline works with the SQE stopped.** Probe powers CX/GX, boots
   the GMU, sends the HFI power tables and the hold, hardware init reads back
   `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With

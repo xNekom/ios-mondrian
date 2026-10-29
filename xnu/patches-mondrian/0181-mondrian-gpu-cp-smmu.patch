@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..34d481f
+index 0000000..418f435
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,2697 @@
+@@ -0,0 +1,2706 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -1737,7 +1737,7 @@ index 0000000..34d481f
 +		mondrian_log_flush_now();
 +		if (mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_sqe.iova,
-+		    mondrian_cp_sqe.va, mondrian_cp_sqe.bytes, 15, &next) != 0 ||
++		    mondrian_cp_sqe.va, mondrian_cp_sqe.bytes, 5, &next) != 0 ||
 +		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
 +		    mondrian_cp_tables.pa, mondrian_cp_ring.iova,
 +		    mondrian_cp_ring.va, mondrian_cp_ring.bytes, 11, &next) != 0 ||
@@ -1790,7 +1790,7 @@ index 0000000..34d481f
 +	    slots[0], slots[1], slots[2], slots[3],
 +	    (unsigned long long)smmu);
 +	mondrian_log_flush_now();
-+	for (i = 0; i < 2; i++) {
++	for (i = 0; i < 4; i++) {
 +		printf("MONDRIAN GPU: cp smmu slot %u smr 0x%x s2cr 0x%x\n", i,
 +		    SMMU_SMR(slots[i]), SMMU_S2CR(slots[i]));
 +		mondrian_log_flush_now();
@@ -2224,11 +2224,11 @@ index 0000000..34d481f
 +	}
 +	printf("MONDRIAN GPU: cp hw protect ok\n");
 +	mondrian_log_flush_now();
-+	/* Bit 0 marks instruction-cache fetches privileged. Redwood (a660)
-+	 * leaves it clear; keep the same so the fetch matches the mapping. */
-+	CPW(GEN7_CP_APRIV_CNTL, 0x6eu);
-+	CPW(GEN7_CP_BV_APRIV_CNTL, 0xeu);
-+	CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xeu);
++	/* Vendor value: bit 0 marks instruction-cache fetches privileged, and
++	 * the SQE is mapped read-only privileged (perms 5), as pong does. */
++	CPW(GEN7_CP_APRIV_CNTL, 0x6fu);
++	CPW(GEN7_CP_BV_APRIV_CNTL, 0xfu);
++	CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xfu);
 +	CPW(GEN7_CP_CHICKEN_DBG, 1);
 +	CPW(GEN7_CP_BV_CHICKEN_DBG, 1);
 +	CPW(GEN7_CP_LPAC_CHICKEN_DBG, 1);
@@ -2468,6 +2468,15 @@ index 0000000..34d481f
 +		mondrian_log_flush_now();
 +
 +		if (rptr >= at && view != 0) {
++			/* The vendor preamble for a submission: both threads
++			 * on, IFPC disabled (otherwise the CP collapses while
++			 * it idles on the write), then run on BR. */
++			ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
++			ring[at++] = 3u;		/* CP_SET_THREAD_BOTH */
++			ring[at++] = 0x78e50001u;	/* CP_SET_MARKER, 1 */
++			ring[at++] = 0x101u;		/* IFPC disable */
++			ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
++			ring[at++] = 1u;		/* CP_SET_THREAD_BR */
 +			ring[at++] = 0x703d0003u;	/* CP_MEM_WRITE, 3 words */
 +			ring[at++] = (uint32_t)mondrian_cp_scratch.iova;
 +			ring[at++] = (uint32_t)(mondrian_cp_scratch.iova >> 32);
