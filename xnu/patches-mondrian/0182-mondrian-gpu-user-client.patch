@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..2744ef0
+index 0000000..185cc29
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,603 @@
+@@ -0,0 +1,685 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -38,6 +38,7 @@ index 0000000..2744ef0
 +#include <sys/systm.h>
 +
 +#include "MondrianGPU.h"
++#include "MondrianSurface.h"
 +
 +/* The IOKit build has no top-level include for bsd/; the relative path is
 + * stable in the tree and in the patch. */
@@ -64,7 +65,10 @@ index 0000000..2744ef0
 +	kMsmSubmitQueueNew   = 0x4a,
 +	kMsmSubmitQueueClose = 0x4b,
 +	kMsmSubmitQueueQuery = 0x4c,
++	kMondrianSurface     = 0x7e,
 +};
++
++#define kMondrianDescribe	0xffffffffu
 +
 +struct msm_timespec {
 +	int64_t tv_sec, tv_nsec;
@@ -125,6 +129,19 @@ index 0000000..2744ef0
 +	uint32_t handle, pad;
 +};
 +
++/*
++ * The port's own request (0x7e): an IOSurface's memory as a GPU buffer. The
++ * numbering and the shape are topaz's kRedwoodSurface, which is what the
++ * CoreAnimation side (tools/gpu/gl_osmesa.c) documents and expects.
++ */
++struct mondrian_surface {
++	uint32_t surface;		/* in: IOSurfaceGetID() */
++	uint32_t handle;		/* 0xffffffff: describe only, else the GEM handle */
++	uint64_t size;			/* back: the buffer's size */
++	uint32_t offset, rowBytes;	/* where the pixels start, how long a row is */
++	uint32_t width, height, pixelFormat, planes;	/* and what they are */
++};
++
 +#define MSM_INFO_GET_IOVA	0x01
 +#define MSM_INFO_SET_IOVA	0x04
 +#define MSM_INFO_GET_FLAGS	0x05
@@ -144,7 +161,7 @@ index 0000000..2744ef0
 +	uint32_t handle;
 +	uint64_t size;
 +	uint64_t iova;
-+	IOBufferMemoryDescriptor *memory;
++	IOMemoryDescriptor *memory;
 +};
 +
 +class MondrianGPU;
@@ -167,9 +184,11 @@ index 0000000..2744ef0
 +private:
 +	IOReturn gemNew(struct msm_gem_new *request);
 +	IOReturn gemInfo(struct msm_gem_info *request);
++	IOReturn surfaceBuffer(struct mondrian_surface *request);
 +	IOReturn submit(struct msm_gem_submit *request);
 +	mondrian_buffer *bufferForType(uint32_t type);
 +	mondrian_buffer *bufferNew(uint64_t size);
++	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
 +	void bufferFree(mondrian_buffer *buffer);
 +	void freeAll(void);
 +
@@ -316,14 +335,14 @@ index 0000000..2744ef0
 +}
 +
 +mondrian_buffer *
-+MondrianGPUUserClient::bufferNew(uint64_t size)
++MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
 +{
 +	mondrian_buffer *buffer;
-+	IOBufferMemoryDescriptor *memory;
 +	uint64_t iova, off;
++	uint32_t i;
 +
 +	size = (size + 0xfffu) & ~0xfffull;
-+	if (size == 0 || size > kMondrianBufferMax ||
++	if (memory == NULL || size == 0 || size > kMondrianBufferMax ||
 +	    fBufferCount >= kMondrianBuffers) {
 +		return NULL;
 +	}
@@ -331,34 +350,56 @@ index 0000000..2744ef0
 +	if (iova == 0) {
 +		return NULL;
 +	}
-+	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-+	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size,
-+	    0x00000000fffff000ull);
-+	if (memory == NULL) {
-+		return NULL;
-+	}
 +	for (off = 0; off < size; off += 0x1000) {
 +		IOByteCount length = 0;
 +		addr64_t pa = memory->getPhysicalSegment(off, &length);
 +
-+		if (pa == 0 || length == 0 ||
-+		    mondrian_gpu_uc_map_page(iova + off, pa,
++		if (pa == 0 || length == 0) {
++			for (i = 0; i < off; i += 0x1000) {
++				(void)mondrian_gpu_uc_unmap_page(iova + i);
++			}
++			return NULL;
++		}
++		if (mondrian_gpu_uc_map_page(iova + off, pa,
 +		    kMondrianBufferPerms) != 0) {
-+			memory->release();
++			for (i = 0; i <= off; i += 0x1000) {
++				(void)mondrian_gpu_uc_unmap_page(iova + i);
++			}
 +			return NULL;
 +		}
 +	}
 +	(void)mondrian_gpu_uc_tables_sync();
 +	buffer = (mondrian_buffer *)IOMalloc(sizeof(mondrian_buffer));
 +	if (buffer == NULL) {
-+		memory->release();
 +		return NULL;
 +	}
++	memory->retain();
 +	buffer->handle = fNextHandle++;
 +	buffer->size = size;
 +	buffer->iova = iova;
 +	buffer->memory = memory;
 +	fBuffers[fBufferCount++] = buffer;
++	return buffer;
++}
++
++mondrian_buffer *
++MondrianGPUUserClient::bufferNew(uint64_t size)
++{
++	IOBufferMemoryDescriptor *memory;
++	mondrian_buffer *buffer;
++
++	if (size == 0 || size > kMondrianBufferMax || fBufferCount >=
++	    kMondrianBuffers) {
++		return NULL;
++	}
++	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous,
++	    (size + 0xfffu) & ~0xfffull, 0x00000000fffff000ull);
++	if (memory == NULL) {
++		return NULL;
++	}
++	buffer = bufferAdopt(memory, size);
++	memory->release();
 +	return buffer;
 +}
 +
@@ -436,6 +477,43 @@ index 0000000..2744ef0
 +	}
 +	IOLockUnlock(fLock);
 +	return result;
++}
++
++IOReturn
++MondrianGPUUserClient::surfaceBuffer(struct mondrian_surface *request)
++{
++	MondrianSurface *surface;
++	mondrian_buffer *buffer;
++	uint32_t planes;
++
++	surface = mondrian_surface_copy(request->surface);
++	if (surface == NULL) {
++		return kIOReturnNotFound;
++	}
++	planes = surface->planeCount;
++	if (planes == 0) {
++		planes = 1;
++	}
++	request->size = surface->allocSize;
++	request->offset = surface->offset;
++	request->rowBytes = surface->bytesPerRow;
++	request->width = surface->width;
++	request->height = surface->height;
++	request->pixelFormat = surface->pixelFormat;
++	request->planes = planes;
++	if (request->handle == kMondrianDescribe) {
++		surface->release();
++		return kIOReturnSuccess;
++	}
++	IOLockLock(fLock);
++	buffer = bufferAdopt(surface->memory, surface->allocSize);
++	IOLockUnlock(fLock);
++	surface->release();
++	if (buffer == NULL) {
++		return kIOReturnNoMemory;
++	}
++	request->handle = buffer->handle;
++	return kIOReturnSuccess;
 +}
 +
 +IOReturn
@@ -541,6 +619,7 @@ index 0000000..2744ef0
 +		struct msm_submitqueue queue;
 +		struct msm_submitqueue_query query;
 +		struct drm_gem_close close;
++		struct mondrian_surface surface;
 +	} request;
 +	size_t size = arguments->structureInputSize;
 +	IOReturn result = kIOReturnSuccess;
@@ -600,6 +679,9 @@ index 0000000..2744ef0
 +		request.queue.id = ++fNextQueue;
 +		break;
 +	case kMsmSubmitQueueQuery:
++		break;
++	case kMondrianSurface:
++		result = surfaceBuffer(&request.surface);
 +		break;
 +	case kDrmGemClose:
 +		IOLockLock(fLock);
