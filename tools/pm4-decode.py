@@ -15,6 +15,15 @@ import sys
 import xml.etree.ElementTree as ET
 
 
+def rank(variants):
+    """Prefer a name that covers A7XX: several generations reuse a number."""
+    if not variants:
+        return 3
+    if variants.startswith(('A7XX', 'A6XX-', 'A5XX-')):
+        return 0
+    return 2
+
+
 def load_names(path):
     """Only the packet-opcode enum: the same numbers mean other things in the
     register-field enums, and they would shadow the names that matter."""
@@ -32,10 +41,13 @@ def load_names(path):
             if name is None or number is None:
                 continue
             try:
-                names.setdefault(int(number, 0), name)
+                opcode = int(number, 0)
             except ValueError:
                 continue
-    return names
+            cost = rank(value.get('variants'))
+            if opcode not in names or cost < names[opcode][1]:
+                names[opcode] = (name, cost)
+    return {opcode: name for opcode, (name, _cost) in names.items()}
 
 
 def main():
