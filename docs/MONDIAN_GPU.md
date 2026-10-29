@@ -151,35 +151,41 @@ them has Metal. That is the path this port follows.
   the OOB/hold command, and the CP start hangs on its first register access.
   With the match fixed the probe reports accepted `hfi perf/bw/vote` and the
   `hold`.
-- **The CP runs; the four SIDs matter.** The SMMU loop programmed only two
-  of the four stream slots it had reserved, so SID 1 (BV) and 0x401 (LPAC)
-  were unmatched. The SQE starts both engines on its first packet, their
-  fetch hit an unmatched stream and the CP wedged at the start (the register
-  port stopped answering). With all four SMR/S2CR pairs written the CP drains
-  `CP_ME_INIT` (`CP_RB_RPTR` reads 10), the ZAP authenticates, and
-  `CP_SET_SECURE_MODE(0)` drains as well (`rptr 12`). The vendor submission
-  preamble (`CP_THREAD_CONTROL` both threads, `CP_SET_MARKER` 0x101 to disable
-  IFPC, `CP_THREAD_CONTROL` BR) goes before a `CP_MEM_WRITE`.
+- **The CP runs.** The SMMU loop programmed only two of the four stream slots
+  it had reserved, so SID 1 (BV) and 0x401 (LPAC) were unmatched: the SQE
+  starts both engines on its first packet, their fetch hit an unmatched
+  stream and the CP wedged at `CP_SQE_CNTL=1` with the register port dead.
+  With all four SMR/S2CR pairs the CP drains `CP_ME_INIT` (`CP_RB_RPTR` 10),
+  authenticates the ZAP and drains `CP_SET_SECURE_MODE(0)` (12).
+- **a7xx PM4 headers carry odd parity.** Bit 15 is the parity of the payload
+  count, bit 23 the parity of the opcode, bits `[27:24]` are zero (vendor
+  `cp_type7_packet`, checked by `pkt_is_type7`). A header with the wrong
+  parity is an opcode error: the CP consumes the header, stops at the same
+  ucode PC with `rbbm` idle, `CP_INTERRUPT_STATUS` 0 and no SMMU fault, which
+  looks exactly like a hang inside the packet. Build every packet through
+  `mondrian_pm4_type7`: `CP_MEM_WRITE` (0x3d, count 3) is `0x703d8003`, not
+  `0x703d0003`.
+- **`CP_THREAD_CONTROL` with `SYNC_THREADS|BOTH` stalls this ring.** The sync
+  waits for BV, which is not running until a user submission starts it; the
+  CP stops at the packet and never consumes the next one. `SET_SECURE_MODE(0)`
+  goes in alone, and `CP_ME_INIT`'s preamble carries `BIT(27)` (concurrent
+  binning disabled), not the both-threads bit.
+- **Measured end to end**: after the switch a `CP_MEM_WRITE` writes
+  `0x600dc0de` into the memptr page and a `CP_EVENT_WRITE` (0x46,
+  `CACHE_CLEAN|BIT(27)`) fences `0x600dc0df` into the next dword; `rptr` and
+  `wptr` end equal (21), the RPTR shadow follows, `CP_INTERRUPT_STATUS` 0.
+- **SMMU context**: pong's qualified image for this chip, `sctlr` 0x127 and a
+  write-back inner-shareable walk (`0x3500`); the earlier `0x1027` kept
+  ASIDPNE and had fault reporting off.
 - **The GPU baseline works with the SQE stopped.** Probe powers CX/GX, boots
   the GMU, sends the HFI power tables and the hold, hardware init reads back
   `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With
-  `CP_SQE_CNTL=0` the boot reaches SpringBoard and resets cleanly.
-- **The CP start is the wall.** Writing 1 to `CP_SQE_CNTL` (the vendor's
-  "clear the SQE_HALT") never completes and the next GPU access hangs, so the
-  boot dies there; writing 0 is harmless and the drain then reads
-  `rptr 0`. Measured negatives, each a separate boot: HFI hold repeated right
-  before the start, no ZAP, ZAP after the start (pong's order), `CP_PROTECT`
-  off, `CP_AHB_CNTL=0`, `CP_ME_INIT` without the power-up list, a
-  `RBBM_SW_RESET_CMD` reset first, read-only and read-write SQE pages,
-  write-back and non-cacheable attributes, and both the low (`0x100000`) and
-  the bootloader's tagged SQE address. `gpustart=1` keeps the experiment one
-  flag away; the default leaves the SQE stopped so the phone stays usable.
-- **Next**: settle the CP start (the trusted-state or GMU handshake above);
-  when `CP_RB_RPTR` reads 10 the ME_INIT drained, and the fenced write to the
-  scratch page (already in `mondrian_gpu_cp_start`) proves the GPU executes
-  commands. Then the ring/fences/IRQ and the Mesa `FD730`/`RedwoodGPU` port.
-  The firmware blocks, the GMU context bank and the CM3 start are in
-  `mondrian_gpu.c` under `gmustart=1`.
+  `CP_SQE_CNTL=0` the boot reaches SpringBoard and resets cleanly;
+  `gpustart=1` runs the whole sequence above.
+- **Next**: indirect buffers (`CP_INDIRECT_BUFFER_PFE`), the ring/fence pair
+  the user client will submit through, then IRQ 332 and the msm DRM user
+  client that Mesa's `msm` KMD talks to. The firmware blocks, the GMU context
+  bank and the CM3 start are in `mondrian_gpu.c` under `gmustart=1`.
 
 ## Android capture (2026-10-28)
 

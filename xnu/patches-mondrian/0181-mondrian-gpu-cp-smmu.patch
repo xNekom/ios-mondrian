@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..fa97d17
+index 0000000..7bca3c8
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,2711 @@
+@@ -0,0 +1,2762 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -1777,11 +1777,13 @@ index 0000000..fa97d17
 +#endif
 +	}
 +
-+	tcr = (2u << 30) | 0x2000u | (64u - 32u) | (1u << 23);
++	/* Pong's qualified image for this chip: walk writes back and is inner
++	 * shareable, faults are reported instead of left unconfigurable. */
++	tcr = (2u << 30) | 0x3500u | (64u - 32u) | (1u << 23);
 +	tcr2 = (7u << 15) | (1u << 4) | ((id2 >> 4) & 0xfu) | 0x60u;
-+	/* Redwood's working value: M|A|CFRE|bit5|ASIDPNE, no stall and no
-+	 * continue-after-fault. */
-+	sctlr = 0x1027u;
++	/* M|A|CFRE|bit5: continue-after-fault set, stall and ASIDPNE clear
++	 * (0x1067 with polled faults and a private ASID, as pong programs it). */
++	sctlr = 0x127u;
 +	/*
 +	 * The GMU bank uses ASID 1; the SMMU TLB is tagged by ASID, not by
 +	 * context bank, so the CP must use a different one or it can hit the
@@ -2115,6 +2117,41 @@ index 0000000..fa97d17
 + * ZAP yet: this starts the SQE and drains ME_INIT in protected mode, which is
 + * the first packet the CP must consume.
 + */
++/*
++ * PM4 headers on a6xx/a7xx carry odd parity: bit 15 over the payload count
++ * and bit 23 over the opcode (vendor cp_type7_packet, validated by
++ * pkt_is_type7). A header whose parity is wrong is an opcode error: the CP
++ * consumes the header, stops at the same ucode PC and latches nothing in the
++ * SMMU or CP_HW_FAULT, which is the shape the first post-switch packets hit.
++ * Every packet this driver submits goes through these two builders.
++ */
++static uint32_t
++mondrian_pm4_parity(uint32_t value)
++{
++	value ^= value >> 16;
++	value ^= value >> 8;
++	value ^= value >> 4;
++	return (0x9669u >> (value & 0xfu)) & 1u;
++}
++
++static uint32_t
++mondrian_pm4_type7(uint32_t opcode, uint32_t count)
++{
++	return 0x70000000u | (count & 0x3fffu) |
++	    (mondrian_pm4_parity(count) << 15) |
++	    ((opcode & 0x7fu) << 16) |
++	    (mondrian_pm4_parity(opcode) << 23);
++}
++
++static uint32_t
++mondrian_pm4_type4(uint32_t reg, uint32_t count)
++{
++	return 0x40000000u | (count & 0x7fu) |
++	    (mondrian_pm4_parity(count) << 7) |
++	    ((reg & 0x3ffffu) << 8) |
++	    (mondrian_pm4_parity(reg) << 27);
++}
++
 +static int
 +mondrian_gpu_cp_start(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t gpucc,
 +    vm_offset_t gmu)
@@ -2342,9 +2379,9 @@ index 0000000..fa97d17
 +			mondrian_log_flush_now();
 +		}
 +	}
-+	init[0] = 0x78970001u;		/* type7 CP_THREAD_CONTROL(0x17), 1 word */
++	init[0] = mondrian_pm4_type7(0x17u, 1);	/* CP_THREAD_CONTROL */
 +	init[1] = 1u << 27;
-+	init[2] = 0x78c80007u;		/* type7 CP_ME_INIT(0x48), 7 words */
++	init[2] = mondrian_pm4_type7(0x48u, 7);	/* CP_ME_INIT */
 +	init[3] = 0x14bu | (1u << 11);
 +	init[4] = 3;
 +	init[5] = 0x20000000u;
@@ -2395,7 +2432,6 @@ index 0000000..fa97d17
 +	    CPR(GEN7_CP_HW_FAULT));
 +	if (rptr == 10) {
 +		uint32_t at = 10;
-+		volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_scratch_view;
 +#ifdef MONDRIAN_ZAP_FW
 +	printf("MONDRIAN GPU: cp start zap enter\n");
 +	mondrian_log_flush_now();
@@ -2453,15 +2489,14 @@ index 0000000..fa97d17
 +	mondrian_log_flush_now();
 +
 +
-+		/* The vendor precedes a secure transition with a synchronized
-+		 * thread control (SYNC_THREADS | CONCURRENT_BIN_DISABLE);
-+		 * without it the CP consumes the switch and then executes
-+		 * nothing else. */
-+		ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
-+		ring[at++] = 0x88000000u;	/* SYNC | CONC_BIN_DISABLE */
-+		ring[at++] = 0x78e60001u;
++		/*
++		 * Take the CP out of secure mode. The switch goes in alone:
++		 * a THREAD_CONTROL that syncs both threads stalls here,
++		 * because BV is not running yet on this ring.
++		 */
++		ring[at++] = mondrian_pm4_type7(0x66u, 1);	/* SET_SECURE_MODE */
 +		ring[at++] = 0;
-+		mondrian_gpu_mem_flush(&mondrian_cp_ring, at * 4);
++		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
 +		__asm__ volatile("dsb sy" ::: "memory");
 +		CPW(GEN7_CP_RB_WPTR, at);
 +		for (i = 0; i < 2000; i++) {
@@ -2474,15 +2509,30 @@ index 0000000..fa97d17
 +		printf("MONDRIAN GPU: cp secmode rptr %u wptr %u\n", rptr, at);
 +		mondrian_log_flush_now();
 +
-+		if (rptr >= at && view != 0) {
-+			/* Fence only: does any packet after the secure switch
-+			 * execute? CP_EVENT_WRITE7 (0x46), event 0x31, writes
-+			 * the value to the scratch page. */
-+			ring[at++] = 0x70460004u;	/* CP_EVENT_WRITE7, 4 */
-+			ring[at++] = 0x31u | (1u << 27) | (1u << 31);
-+			ring[at++] = (uint32_t)mondrian_cp_scratch.iova;
-+			ring[at++] = (uint32_t)(mondrian_cp_scratch.iova >> 32);
++		if (rptr >= at) {
++			/*
++			 * First memory packet after the switch: a canary into
++			 * the memptr page (the CP already writes its RPTR
++			 * shadow there, so the mapping is known to take GPU
++			 * writes) and a fence into the next dword. Both
++			 * headers carry the a7xx parity bits.
++			 */
++			const uint64_t dst = mondrian_cp_memptr.iova + 0x800u;
++			const uint64_t fen = mondrian_cp_memptr.iova + 0x810u;
++			volatile uint32_t *mv =
++			    (volatile uint32_t *)mondrian_cp_memptr_view;
++
++			ring[at++] = mondrian_pm4_type7(0x3du, 3);  /* MEM_WRITE */
++			ring[at++] = (uint32_t)dst;
++			ring[at++] = (uint32_t)(dst >> 32);
 +			ring[at++] = 0x600dc0deu;
++			ring[at++] = mondrian_pm4_type7(0x46u, 4);  /* EVENT_WRITE */
++			ring[at++] = 0x31u | (1u << 27);	/* CACHE_CLEAN */
++			ring[at++] = (uint32_t)fen;
++			ring[at++] = (uint32_t)(fen >> 32);
++			ring[at++] = 0x600dc0dfu;
++			mondrian_gpu_mem_flush(&mondrian_cp_ring,
++			    mondrian_cp_ring.bytes);
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			CPW(GEN7_CP_RB_WPTR, at);
 +			for (i = 0; i < 2000; i++) {
@@ -2493,12 +2543,13 @@ index 0000000..fa97d17
 +				delay(1000);
 +			}
 +			__asm__ volatile("dsb sy" ::: "memory");
-+			printf("MONDRIAN GPU: cp memwrite rptr %u wptr %u word 0x%x shadow 0x%x\n",
-+			    rptr, at,
-+			    mondrian_cp_memptr_view ?
-+			    ((volatile uint32_t *)mondrian_cp_memptr_view)[0x800 / 4] : 0,
-+			    mondrian_cp_memptr_view ?
-+			    ((volatile uint32_t *)mondrian_cp_memptr_view)[0] : 0);
++			printf("MONDRIAN GPU: cp memwrite rptr %u wptr %u canary 0x%x fence 0x%x shadow 0x%x\n",
++			    rptr, at, mv ? mv[0x800 / 4] : 0,
++			    mv ? mv[0x810 / 4] : 0, mv ? mv[0] : 0);
++			printf("MONDRIAN GPU: cp int 0x%x int0 0x%x rbbm 0x%x/0x%x fault 0x%x\n",
++			    CPR(GEN7_CP_INTERRUPT_STATUS),
++			    CPR(GEN7_RBBM_INT_0_STATUS), CPR(GEN7_RBBM_STATUS),
++			    CPR(GEN7_RBBM_STATUS3), CPR(GEN7_CP_HW_FAULT));
 +			mondrian_log_flush_now();
 +		}
 +	}
