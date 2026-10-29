@@ -68,7 +68,15 @@ fb_dev || { echo "el movil no esta en fastboot" >&2; exit 1; }
 [ -n "$SERIAL" ] || SERIAL=$(fastboot devices | awk 'NR==1{print $1}')
 
 echo "== arrancando $(basename "$IMAGE") (fastboot boot)"
-fbt 60 boot "$IMAGE" >/dev/null 2>&1 || { echo "fastboot boot fallo" >&2; exit 1; }
+if ! fbt 60 boot "$IMAGE" >/dev/null 2>&1; then
+	# "Unrecognized command boot" means fastbootd (the reset leaves the BCB
+	# at boot-fastboot). Ask it for the real bootloader and retry once.
+	echo "== fastbootd: pidiendo el bootloader y reintentando"
+	fbt 20 reboot bootloader >/dev/null 2>&1 || true
+	sleep 8
+	for _ in $(seq 1 20); do fb_dev && break; sleep 2; done
+	fbt 60 boot "$IMAGE" >/dev/null 2>&1 || { echo "fastboot boot fallo" >&2; exit 1; }
+fi
 # The bootloader stays visible for a moment after fastboot boot returns;
 # wait until the image takes the USB away before starting the clock.
 gone=0
@@ -96,7 +104,11 @@ done
 fb_dev || { echo "no volvio a fastboot; pasalo a mano" >&2; exit 1; }
 
 echo "== arrancando recovery"
-fbt 60 boot "$RECOVERY" >/dev/null 2>&1 || { echo "fastboot boot recovery fallo" >&2; exit 1; }
+if ! fbt 60 boot "$RECOVERY" >/dev/null 2>&1; then
+	echo "== fastbootd: reboot recovery"
+	fbt 30 reboot recovery >/dev/null 2>&1 || true
+	sleep 5
+fi
 # One server restart before the wait: doing it inside the loop resets the
 # recovery adbd before it can answer.
 adb kill-server 2>/dev/null; adb start-server 2>/dev/null; sleep 5

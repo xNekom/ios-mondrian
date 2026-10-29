@@ -16,6 +16,15 @@ Pro, SM8475) is the port being done here.
 - The board table lives in `tools/boards.py`; the shim has its own copy in
   `shim/board.h`. Change both together, and prefer reading the live device
   tree (the shim prints it) over guessing a number.
+- **Search before experimenting blind (policy, 2026-10-29).** When a register
+  value, a sequence or a fault does not match the references, read mainline
+  (`drm/msm` a6xx/a7xx, Mesa freedreno), the vendor kernel and the XNU drivers
+  in the local research trees, and search the web, before changing the driver
+  again. Most of the traps here are already documented somewhere: the 64-bit
+  `CP_SQE_INSTR_BASE` write, `a7xx_hw_init` running `CP_ME_INIT` before the
+  secure-mode switch, and `CP_SET_SECURE_MODE` for the trusted→nonsecure
+  transition all came from a patch or a driver that already solved them. A
+  boot cycle costs minutes; the answer is often one search away.
 - **Hardware safety outranks persistence (policy, 2026-10-25).** This phone is
   a dedicated test unit: the high-level partitions may be erased and flashed
   freely — including `userdata`, which holds the iOS root — without a

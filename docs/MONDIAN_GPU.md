@@ -106,9 +106,71 @@ them has Metal. That is the path this port follows.
   still the software renderer.
   The 8 MiB `io_submap` is the trap: `ml_io_map()` has no unmap and the touch
   command DB/RSC windows were re-mapped per lookup; `0179` caches both.
-- **Next**: CP/SQE/ZAP and the ring (`PongAdrenoCp.cpp`), then the Mesa
-  `FD730`/`RedwoodGPU` port; the firmware blocks, the GMU context bank and the
-  CM3 start are in `mondrian_gpu.c` under `gmustart=1`.
+- **CP and its SMMU**: the bootloader leaves the CP at zero. `0181` (local
+  `gpusubmit=1`) takes SMMU bank 0 for the user/lpac streams (SID 0/0x400,
+  1/0x401), maps the 128 KiB SQE at 0x100000, the 32 KiB ring at 0x200000,
+  the memptr at 0x300000 and the CP power-up list at 0x301000, loads
+  `a730_sqe.fw`, runs the CP hardware init, starts the SQE and submits
+  `CP_ME_INIT`. Three traps measured on the way: the first next-level table
+  started at page 0, so the L1 entry pointed at the root (the GMU only
+  worked because its leaf landed in the root's L3 slot; the CP's 0x100000
+  faulted); the CP bank first shared ASID 1 with the GMU (the TLB is tagged
+  by ASID); and `kmem_alloc_contig` returned a VA at a 4 KiB offset even with
+  a 16 KiB mask and a 4 KiB physical run let the 16 KiB pmap round the PA, so
+  the CP tables memset aborted (`far 0xfffffe0008026b000`,
+  `esr 0x92000010`). The allocator now reserves the slack, aligns the VA by
+  hand and asks for 16 KiB physical pages (`pnum_mask=3`).
+- **The GPU boots trusted and the CP bases need one 64-bit store.**
+  `RBBM_SECVID_TRUST_CNTL` reads 1, and writing 0 aborts the CPU (the secure
+  monitor owns the register). `CP_SQE_INSTR_BASE` and `CP_RB_BASE` are 64-bit
+  registers: two 32-bit stores leave the bootloader's `0xe000` in the high
+  word (a read there is not an error, but the address then becomes
+  `0xE000_0000_0000 + low`), while a single 64-bit store latches the whole
+  value and the high word reads 0. Write them with `mondrian_gpu_write64`, as
+  `a7xx_hw_init` does, and the CP fetches the low window (`0x100000`).
+  The earlier `0xe000` read came from 32-bit stores, not from a fixed tag.
+- **Decode the SMMU fault before changing anything.** `FSR=0x402` is a
+  translation fault, `0x408` is a **permission fault** (`FSR_PF` is bit 3;
+  `FSR_UUT` is bit 8, so UUT would read `0x500`) and `FAR` is the input
+  address. `FSYNR0` bits 5/6 mark the fetch privileged and an instruction
+  fetch (`0x1c0063` / `0x1e0063` seen here), which tells the privilege level
+  the page permissions must allow: with the ICACHE fetch left unprivileged
+  (APRIV bit 0 clear, as a660 does) the PTEs must set `AP[1]=0`.
+- **The ZAP resets the GPU.** After `zap auth` the CP register block is back
+  at the bootloader's values, so the ring and SQE bases have to be published
+  again *after* the ZAP, before `CP_SQE_CNTL=1` (redwood's order: ZAP, then CP
+  registers). The SMMU context survives the ZAP.
+- **PM4 headers**: `CP_THREAD_CONTROL` and `CP_ME_INIT` need real type-7
+  headers (`7<<28 | count | parity | opcode<<16`); a `0x80000000` header makes
+  the SQE drop the packet.
+- **HFI replies carry the sequence in the payload, not the header.** The GMU
+  answers with type 1 in `header[19:16]` and echoes the request's sequence in
+  the first payload word's `[31:20]`. Matching the sequence in
+  `header[31:20]` (the first implementation) discards every response, so every
+  HFI command looks like a timeout, the GMU never receives the power tables or
+  the OOB/hold command, and the CP start hangs on its first register access.
+  With the match fixed the probe reports accepted `hfi perf/bw/vote` and the
+  `hold`.
+- **The GPU baseline works with the SQE stopped.** Probe powers CX/GX, boots
+  the GMU, sends the HFI power tables and the hold, hardware init reads back
+  `rbbm 0x1`, and the ZAP authenticates (`zap init/mem/auth 0/0/0`). With
+  `CP_SQE_CNTL=0` the boot reaches SpringBoard and resets cleanly.
+- **The CP start is the wall.** Writing 1 to `CP_SQE_CNTL` (the vendor's
+  "clear the SQE_HALT") never completes and the next GPU access hangs, so the
+  boot dies there; writing 0 is harmless and the drain then reads
+  `rptr 0`. Measured negatives, each a separate boot: HFI hold repeated right
+  before the start, no ZAP, ZAP after the start (pong's order), `CP_PROTECT`
+  off, `CP_AHB_CNTL=0`, `CP_ME_INIT` without the power-up list, a
+  `RBBM_SW_RESET_CMD` reset first, read-only and read-write SQE pages,
+  write-back and non-cacheable attributes, and both the low (`0x100000`) and
+  the bootloader's tagged SQE address. `gpustart=1` keeps the experiment one
+  flag away; the default leaves the SQE stopped so the phone stays usable.
+- **Next**: settle the CP start (the trusted-state or GMU handshake above);
+  when `CP_RB_RPTR` reads 10 the ME_INIT drained, and the fenced write to the
+  scratch page (already in `mondrian_gpu_cp_start`) proves the GPU executes
+  commands. Then the ring/fences/IRQ and the Mesa `FD730`/`RedwoodGPU` port.
+  The firmware blocks, the GMU context bank and the CM3 start are in
+  `mondrian_gpu.c` under `gmustart=1`.
 
 ## Android capture (2026-10-28)
 
@@ -172,6 +234,9 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
   full panel (1-23), but the CPU scale in `swap()` costs 30-40 ms per swap,
   so the gain is smaller than the pixel count suggests. Use
   `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
+  The CP tests hard-reset a non-journaled HFS; after several resets the next
+  mount can take longer than 60 s (the ring stops at the UFS GPT with one
+  process), so use 300 s or run `fsck_hfs` on the root image.
 - **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
   (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
   the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships
