@@ -1,0 +1,56 @@
+# The calls CoreAnimation makes through -[EAGLContext getMacroContextPrivate], as offsets into
+# the table iOS's own OpenGL ES hands it. tools/gpu/mkeagl.py reads this file and emits
+# eagl_gen.h: one forwarder per entry, the table they are placed in, and their names for the log.
+#
+#   OFFSET  NAME  [hand [MACRO]]     (fourth column: the name mondrian_offsets.h gives the offset;
+#                                    mkeagl.py refuses a file where the two disagree)
+#
+# `hand`: eagl.c defines that entry itself (my_gl<Name>, where it has work to do beyond passing
+# the call on). Every other entry gets a generated forwarder, provided a prototype for it is in
+# the OpenGL ES headers mkeagl.py parses. An offset NOT listed here is a call that is logged as
+# "CALLED AND NOT THERE" with its offset, which is how the rest of this file is found.
+#
+# The 30 entries below are the ones eagl.c names. CoreAnimation uses more than a hundred others
+# -- glEnable, glBlendFunc, glViewport, glBindBuffer, glBufferData, glUniform*, the texture
+# parameters -- and a build whose file stops here draws nothing until they are added. They are
+# added from the device, not from a guess:
+#
+#   1. install the library with `glslots=1` in the boot-args (see docs/COREANIMATION_GLES.md);
+#   2. mondrian_inject.c prints the whole table iOS's GLES builds: "mondrian-gl: slot 0x0030
+#      glBindTexture" for every entry it can name, "... (not named)" for the rest;
+#   3. tools/gpu/mkeagl.py --from-log <log> --write-slots eagl_slots.txt rewrites this file;
+#   4. generate eagl_gen.h again and install the library without glslots=1.
+#
+# The offsets are properties of the build (iPhone X 16.7.16, 20H392). A different userland
+# renumbers them: derive this file again rather than editing it by hand.
+
+0x0030  glBindTexture                          hand  MONDIAN_GL_BIND_TEXTURE
+0x0058  glClear                                hand  MONDIAN_GL_CLEAR
+0x01c8  glCopyTexSubImage2D                    hand  MONDIAN_GL_COPY_TEX_SUB_IMAGE_2D
+0x01e0  glDeleteTextures                       hand  MONDIAN_GL_DELETE_TEXTURES
+0x0210  glDrawArrays                           hand  MONDIAN_GL_DRAW_ARRAYS
+0x0220  glDrawElements                         hand  MONDIAN_GL_DRAW_ELEMENTS
+0x02d0  glFinish                               hand  MONDIAN_GL_FINISH
+0x02d8  glFlush                                hand  MONDIAN_GL_FLUSH
+0x0348  glGetIntegerv                          hand  MONDIAN_GL_GET_INTEGERV
+0x03b0  glGetString                            hand  MONDIAN_GL_GET_STRING
+0x0970  glTexImage2D                           hand  MONDIAN_GL_TEX_IMAGE_2D
+0x09a0  glTexSubImage2D                        hand  MONDIAN_GL_TEX_SUB_IMAGE_2D
+0x0ab8  glActiveTexture                        hand  MONDIAN_GL_ACTIVE_TEXTURE
+0x0be8  glCompressedTexImage2D                 hand  MONDIAN_GL_COMPRESSED_TEX_IMAGE_2D
+0x0eb8  glFinishObjectAPPLE                    hand  MONDIAN_GL_FINISH_OBJECT_APPLE
+0x1000  glVertexAttribPointer                  hand  MONDIAN_GL_VERTEX_ATTRIB_POINTER
+0x1280  glDeleteProgram                        hand  MONDIAN_GL_DELETE_PROGRAM
+0x1298  glCreateShader                         hand  MONDIAN_GL_CREATE_SHADER
+0x12a0  glShaderSource                         hand  MONDIAN_GL_SHADER_SOURCE
+0x12a8  glCompileShader                        hand  MONDIAN_GL_COMPILE_SHADER
+0x12c0  glLinkProgram                          hand  MONDIAN_GL_LINK_PROGRAM
+0x12c8  glUseProgram                           hand  MONDIAN_GL_USE_PROGRAM
+0x1368  glUniformMatrix4fv                     hand  MONDIAN_GL_UNIFORM_MATRIX_4FV
+0x1988  glInsertEventMarkerEXT                  hand  MONDIAN_GL_INSERT_EVENT_MARKER_EXT
+0x1990  glPushGroupMarkerEXT                    hand  MONDIAN_GL_PUSH_GROUP_MARKER_EXT
+0x1998  glPopGroupMarkerEXT                     hand  MONDIAN_GL_POP_GROUP_MARKER_EXT
+0x1508  glBindFramebuffer                      hand  MONDIAN_GL_BIND_FRAMEBUFFER
+0x1510  glDeleteFramebuffers                   hand  MONDIAN_GL_DELETE_FRAMEBUFFERS
+0x1530  glFramebufferTexture2D                 hand  MONDIAN_GL_FRAMEBUFFER_TEXTURE_2D
+0x2008  glFramebufferParameteriAPPLE           hand  MONDIAN_GL_FRAMEBUFFER_PARAMETERI_APPLE

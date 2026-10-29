@@ -1,0 +1,3 @@
+# mkeagl.py's output: generated from eagl_slots.txt and the SDK's GL headers at build time.
+eagl_gen.h
+__pycache__/
