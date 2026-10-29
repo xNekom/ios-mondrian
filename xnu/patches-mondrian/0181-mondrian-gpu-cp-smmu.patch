@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..418f435
+index 0000000..fa97d17
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,2706 @@
+@@ -0,0 +1,2711 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -1655,6 +1655,7 @@ index 0000000..418f435
 +static uint64_t mondrian_cp_ttbr0;
 +static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
 +static vm_offset_t mondrian_cp_scratch_view;
++static vm_offset_t mondrian_cp_memptr_view;
 +
 +static int
 +mondrian_gpu_cp_smmu(vm_offset_t smmu)
@@ -1756,6 +1757,8 @@ index 0000000..418f435
 +		flush_dcache64((addr64_t)mondrian_cp_tables.pa,
 +		    mondrian_cp_tables.bytes, TRUE);
 +		mondrian_cp_scratch_view = ml_io_map_unmappable(mondrian_cp_scratch.pa,
++		    0x1000, VM_WIMG_WCOMB);
++		mondrian_cp_memptr_view = ml_io_map_unmappable(mondrian_cp_memptr.pa,
 +		    0x1000, VM_WIMG_WCOMB);
 +		mondrian_gpu_mem_flush(&mondrian_cp_scratch, 0x1000);
 +		printf("MONDRIAN GPU: cp map done\n");
@@ -2450,8 +2453,12 @@ index 0000000..418f435
 +	mondrian_log_flush_now();
 +
 +
-+		/* CP_SET_SECURE_MODE(0): same packet the vendor and redwood send
-+		 * after the ZAP; only then may the CP write normal memory. */
++		/* The vendor precedes a secure transition with a synchronized
++		 * thread control (SYNC_THREADS | CONCURRENT_BIN_DISABLE);
++		 * without it the CP consumes the switch and then executes
++		 * nothing else. */
++		ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
++		ring[at++] = 0x88000000u;	/* SYNC | CONC_BIN_DISABLE */
 +		ring[at++] = 0x78e60001u;
 +		ring[at++] = 0;
 +		mondrian_gpu_mem_flush(&mondrian_cp_ring, at * 4);
@@ -2468,20 +2475,14 @@ index 0000000..418f435
 +		mondrian_log_flush_now();
 +
 +		if (rptr >= at && view != 0) {
-+			/* The vendor preamble for a submission: both threads
-+			 * on, IFPC disabled (otherwise the CP collapses while
-+			 * it idles on the write), then run on BR. */
-+			ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
-+			ring[at++] = 3u;		/* CP_SET_THREAD_BOTH */
-+			ring[at++] = 0x78e50001u;	/* CP_SET_MARKER, 1 */
-+			ring[at++] = 0x101u;		/* IFPC disable */
-+			ring[at++] = 0x78970001u;	/* CP_THREAD_CONTROL, 1 */
-+			ring[at++] = 1u;		/* CP_SET_THREAD_BR */
-+			ring[at++] = 0x703d0003u;	/* CP_MEM_WRITE, 3 words */
++			/* Fence only: does any packet after the secure switch
++			 * execute? CP_EVENT_WRITE7 (0x46), event 0x31, writes
++			 * the value to the scratch page. */
++			ring[at++] = 0x70460004u;	/* CP_EVENT_WRITE7, 4 */
++			ring[at++] = 0x31u | (1u << 27) | (1u << 31);
 +			ring[at++] = (uint32_t)mondrian_cp_scratch.iova;
 +			ring[at++] = (uint32_t)(mondrian_cp_scratch.iova >> 32);
 +			ring[at++] = 0x600dc0deu;
-+			mondrian_gpu_mem_flush(&mondrian_cp_ring, at * 4);
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			CPW(GEN7_CP_RB_WPTR, at);
 +			for (i = 0; i < 2000; i++) {
@@ -2492,8 +2493,12 @@ index 0000000..418f435
 +				delay(1000);
 +			}
 +			__asm__ volatile("dsb sy" ::: "memory");
-+			printf("MONDRIAN GPU: cp memwrite rptr %u wptr %u word 0x%x\n",
-+			    rptr, at, view[0]);
++			printf("MONDRIAN GPU: cp memwrite rptr %u wptr %u word 0x%x shadow 0x%x\n",
++			    rptr, at,
++			    mondrian_cp_memptr_view ?
++			    ((volatile uint32_t *)mondrian_cp_memptr_view)[0x800 / 4] : 0,
++			    mondrian_cp_memptr_view ?
++			    ((volatile uint32_t *)mondrian_cp_memptr_view)[0] : 0);
 +			mondrian_log_flush_now();
 +		}
 +	}
