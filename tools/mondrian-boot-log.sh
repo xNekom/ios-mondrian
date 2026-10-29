@@ -45,6 +45,10 @@ command -v adb >/dev/null || { echo "falta adb" >&2; exit 1; }
 [ -f "$RECOVERY" ] || { echo "no hay recovery en $RECOVERY (RECOVERY=...)" >&2; exit 1; }
 
 fb() { if [ -n "$SERIAL" ]; then fastboot -s "$SERIAL" "$@"; else fastboot "$@"; fi; }
+# A userspace fastbootd can wedge and never answer reboot-bootloader; bound
+# every command so one stuck USB transaction does not hold the pull for ever.
+bounded() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+fbt() { local t=$1; shift; if [ -n "$SERIAL" ]; then bounded "$t" fastboot -s "$SERIAL" "$@"; else bounded "$t" fastboot "$@"; fi; }
 fb_dev() { fastboot devices 2>/dev/null | grep -q .; }
 adb_dev() { adb devices 2>/dev/null | grep -qE '[[:space:]](device|recovery)$'; }
 
@@ -54,9 +58,9 @@ if adb_dev; then
 	adb reboot bootloader >/dev/null 2>&1 || true
 	sleep 5
 fi
-if fb_dev && fb getvar is-userspace 2>&1 | grep -q yes; then
+if fb_dev && fbt 10 getvar is-userspace 2>&1 | grep -q yes; then
 	echo "== fastbootd: volviendo al bootloader"
-	fb reboot bootloader >/dev/null 2>&1 || true
+	fbt 20 reboot bootloader >/dev/null 2>&1 || true
 	sleep 8
 fi
 for _ in $(seq 1 30); do fb_dev && break; sleep 2; done
@@ -64,7 +68,7 @@ fb_dev || { echo "el movil no esta en fastboot" >&2; exit 1; }
 [ -n "$SERIAL" ] || SERIAL=$(fastboot devices | awk 'NR==1{print $1}')
 
 echo "== arrancando $(basename "$IMAGE") (fastboot boot)"
-fb boot "$IMAGE" >/dev/null 2>&1 || { echo "fastboot boot fallo" >&2; exit 1; }
+fbt 60 boot "$IMAGE" >/dev/null 2>&1 || { echo "fastboot boot fallo" >&2; exit 1; }
 # The bootloader stays visible for a moment after fastboot boot returns;
 # wait until the image takes the USB away before starting the clock.
 gone=0
@@ -78,9 +82,9 @@ echo "== esperando el reset automatico (max $((RESET + 120))s)"
 deadline=$((start + RESET + 120))
 while [ "$(date +%s)" -lt "$deadline" ]; do
 	if fb_dev; then
-		if fb getvar is-userspace 2>&1 | grep -q yes; then
-			echo "== fastbootd: volviendo al bootloader"
-			fb reboot bootloader >/dev/null 2>&1 || true
+		if fbt 10 getvar is-userspace 2>&1 | grep -q yes; then
+			echo "== fastbootd: volviendo al bootloader (si se cuelga, power+vol abajo)"
+			fbt 20 reboot bootloader >/dev/null 2>&1 || true
 			sleep 8
 			continue
 		fi
@@ -92,7 +96,7 @@ done
 fb_dev || { echo "no volvio a fastboot; pasalo a mano" >&2; exit 1; }
 
 echo "== arrancando recovery"
-fb boot "$RECOVERY" >/dev/null 2>&1 || { echo "fastboot boot recovery fallo" >&2; exit 1; }
+fbt 60 boot "$RECOVERY" >/dev/null 2>&1 || { echo "fastboot boot recovery fallo" >&2; exit 1; }
 # One server restart before the wait: doing it inside the loop resets the
 # recovery adbd before it can answer.
 adb kill-server 2>/dev/null; adb start-server 2>/dev/null; sleep 5
@@ -102,8 +106,16 @@ for i in $(seq 1 50); do
 done
 adb_dev || { echo "el recovery no responde por adb" >&2; exit 1; }
 
-dev=$(adb shell "for d in /dev/block/by-name/$ROOT_PART /dev/block/bootdevice/by-name/$ROOT_PART; do [ -e \$d ] && readlink -f \$d && break; done" 2>/dev/null | tr -d '\r')
-[ -n "$dev" ] || { echo "no encuentro /dev/block/by-name/$ROOT_PART" >&2; exit 1; }
+# The recovery's ueventd can answer adb before it has created the by-name
+# links; retry, and fall back to the userdata block device that this phone
+# always exposes as sda37.
+dev=""
+for _ in $(seq 1 10); do
+	dev=$(adb shell "for d in /dev/block/by-name/$ROOT_PART /dev/block/bootdevice/by-name/$ROOT_PART /dev/block/sda37; do [ -e \$d ] && readlink -f \$d && break; done" 2>/dev/null | tr -d '\r')
+	[ -n "$dev" ] && break
+	sleep 2
+done
+[ -n "$dev" ] || { echo "no encuentro $ROOT_PART (ni /dev/block/sda37)" >&2; exit 1; }
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 skip=$(( bytes / 4096 - 1025 ))
 echo "== $dev: $bytes bytes, leyendo los bloques $skip.."

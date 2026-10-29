@@ -96,7 +96,9 @@ them has Metal. That is the path this port follows.
 - **HFI power and GX**: the GMU ACKs PERF (id 4, 58 words), BW (id 3, 159),
   CORE_FW_START (14), the default vote (30, `gpu 2 bus 2`) and START10 with
   `err 0`; `oob_gpu` is held and GX reads `PWR_ON=1` (`gdscr 0xf8222800`,
-  `gx hw 0x0`). The tables come from the live cmd-db (`gfx/mx/cx`,
+  `gx hw 0x0`). `GEN7_GMU_GFX_PWR_CLK_STATUS` reads 0x0 (GX power and clock
+  on) and the `gpu_cc_gx_gfx3d` branch 0x221 after START10.
+  The tables come from the live cmd-db (`gfx/mx/cx`,
   SH0/MC0/ACV) and the 13 mondrian OPPs, the same data as Pong's
   `PongAdrenoPower.c`. A full boot with the tables and GX on reaches
   SpringBoard and the touch report thread; one 150 s boot measured 8.1 active
