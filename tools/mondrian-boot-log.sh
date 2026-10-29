@@ -65,6 +65,14 @@ fb_dev || { echo "el movil no esta en fastboot" >&2; exit 1; }
 
 echo "== arrancando $(basename "$IMAGE") (fastboot boot)"
 fb boot "$IMAGE" >/dev/null 2>&1 || { echo "fastboot boot fallo" >&2; exit 1; }
+# The bootloader stays visible for a moment after fastboot boot returns;
+# wait until the image takes the USB away before starting the clock.
+gone=0
+for _ in $(seq 1 30); do
+	if ! fb_dev; then gone=1; break; fi
+	sleep 1
+done
+[ "$gone" = 1 ] || echo "aviso: el bootloader no desaparecio" >&2
 start=$(date +%s)
 echo "== esperando el reset automatico (max $((RESET + 120))s)"
 deadline=$((start + RESET + 120))
