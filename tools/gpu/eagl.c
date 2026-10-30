@@ -68,6 +68,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
+#include <pthread.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -155,7 +156,7 @@ static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1,
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
 static void eagl_leave(struct eagl *e, unsigned offset);
-static long eagl_missing(void *context, unsigned offset);
+static long eagl_missing(void *context, unsigned offset, const uint64_t *arguments);
 #define EAGL_ENTER(context, offset)     eagl_enter(context, offset)
 #define EAGL_LEAVE(context, offset)     eagl_leave(context, offset)
 
@@ -390,6 +391,9 @@ static void clear_now(struct eagl *e);
 static void
 eagl_enter(struct eagl *e, unsigned offset)
 {
+	if (e == NULL || e->gl == NULL) {
+		return;
+	}
 	if (current != e) {
 		if (!mondrian_gl_make_current(e->gl)) {
 			say("mondrian-gl: the context cannot be made this thread's\n");
@@ -434,13 +438,17 @@ eagl_leave(struct eagl *e, unsigned offset)
 
 /* An entry the library has no function for: say so, once an entry. */
 static long
-eagl_missing(void *context, unsigned offset)
+eagl_missing(void *context, unsigned offset, const uint64_t *arguments)
 {
 	struct eagl *e = context;
 
 	eagl_enter(e, offset);
 	if (slot_calls[offset / 8] == 1) {
-		say("mondrian-gl: CALLED AND NOT THERE: entry %#x, %s\n", offset, eagl_slot_name(offset));
+		say("mondrian-gl: CALLED AND NOT THERE: entry %#x, %s:"
+		    " %#x %#x %#x %#x %#x %#x\n", offset, eagl_slot_name(offset),
+		    (unsigned)arguments[0], (unsigned)arguments[1],
+		    (unsigned)arguments[2], (unsigned)arguments[3],
+		    (unsigned)arguments[4], (unsigned)arguments[5]);
 	}
 	return 0;
 }
@@ -3311,6 +3319,27 @@ my_glCreateShader(void *context, GLenum type)
 
 	EAGL_ENTER(e, MONDIAN_GL_CREATE_SHADER);
 	shader = glCreateShader(type);
+	if (shader == 0) {
+		/*
+		 * A zero here with no GL error is Mesa's no-op dispatch: the
+		 * context is not what this thread has current. Say what the
+		 * thread sees, then make it current again and retry once.
+		 */
+		const GLubyte *version = glGetString(0x1f02);
+
+		say("mondrian-gl: createShader[%p] e %p gl %p current %p"
+		    " version %s -> retry\n", (void *)pthread_self(), (void *)e,
+		    (void *)e->gl, (void *)current,
+		    version != NULL ? (const char *)version : "(none)");
+		mondrian_gl_make_current(e->gl);
+		shader = glCreateShader(type);
+		say("mondrian-gl: retry glCreateShader(%#x) -> %u, error %#x\n",
+		    type, shader, glGetError());
+	}
+	if (e->shaders < 6 && shader != 0) {
+		say("mondrian-gl: glCreateShader(%#x) -> %u, error %#x\n",
+		    type, shader, glGetError());
+	}
 	e->fragment[shader % 64] = type == GL_FRAGMENT_SHADER;
 	EAGL_LEAVE(e, MONDIAN_GL_CREATE_SHADER);
 	return shader;
@@ -3331,6 +3360,10 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	char *text, *line, *head;
 
 	EAGL_ENTER(e, MONDIAN_GL_SHADER_SOURCE);
+	if (e->shaders < 6) {
+		say("mondrian-gl: glShaderSource(%u, %d strings, first %u bytes)\n",
+		    shader, count, count > 0 ? (unsigned)strlen(strings[0]) : 0u);
+	}
 	for (GLsizei i = 0; i < count; i++) {
 		size += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
 	}
@@ -3385,6 +3418,10 @@ my_glCompileShader(void *context, GLuint shader)
 	EAGL_ENTER(e, MONDIAN_GL_COMPILE_SHADER);
 	glCompileShader(shader);
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &good);
+	if (e->shaders < 6) {
+		say("mondrian-gl: glCompileShader(%u) -> good %d, error %#x\n",
+		    shader, (int)good, glGetError());
+	}
 	e->shaders++;
 	if (!good) {
 		glGetShaderInfoLog(shader, sizeof(said), NULL, said);
@@ -3631,8 +3668,17 @@ my_dealloc(id self, SEL selector)
 			mondrian_gl_make_current(NULL);
 			current = NULL;
 		}
-		mondrian_gl_destroy(e->gl);
-		free(e);
+		/*
+		 * The struct is not freed. CoreAnimation keeps the function table
+		 * it was given and can call through it after the context goes; a
+		 * freed struct then reads as pointers and the window server dies
+		 * in mondrian_gl_make_current (measured: signal 11 at
+		 * 0xff0000ffff0000ff). One kilobyte per context, never reused.
+		 */
+		if (e->gl != NULL) {
+			mondrian_gl_destroy(e->gl);
+			e->gl = NULL;
+		}
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
 }

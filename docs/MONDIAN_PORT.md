@@ -225,11 +225,10 @@ Live-tree values and the milestone order: `docs/MONDIAN_TOUCH.md`.
 
 ### 5. The buttons, the battery and the menu
 
-The shim already reads the keys over SPMI (see `NOTES.md` for the arbiter v7
-layout and the key map) and drives the boot menu. What remains is the kernel
-side: a HID button service like sweet `0060`, and the dual-boot phases —
-kernel reset, then the A/B slot switch through `misc`. The battery can keep
-sweet's static `IOPMPowerSource` stub for the first bring-up.
+The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`) and
+drives the boot menu; the kernel still needs a HID button service (`0060`) and
+the dual-boot phases. The battery and the heat are their own work list:
+`docs/MONDIAN_POWER.md`.
 
 ### 6. USB
 
