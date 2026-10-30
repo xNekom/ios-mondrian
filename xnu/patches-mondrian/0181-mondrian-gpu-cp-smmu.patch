@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..b10a88b
+index 0000000..1404d4e
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3254 @@
+@@ -0,0 +1,3269 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -89,6 +89,7 @@ index 0000000..b10a88b
 +static uint32_t mondrian_uc_nop_opcode;
 +static uint32_t mondrian_uc_set_mode = 0xffffffffu;
 +static uint32_t mondrian_uc_draw_state;
++static uint32_t mondrian_uc_ds_addr;
 +static vm_offset_t mondrian_uc_gpu;
 +static vm_offset_t mondrian_uc_smmu;
 +static uint32_t mondrian_uc_at;
@@ -2788,6 +2789,18 @@ index 0000000..b10a88b
 +	return mondrian_uc_draw_state;
 +}
 +
++uint32_t
++mondrian_gpu_uc_ds_addr(void)
++{
++	return mondrian_uc_ds_addr;
++}
++
++uint64_t
++mondrian_gpu_uc_memptr_iova(void)
++{
++	return mondrian_cp_memptr.iova;
++}
++
 +int
 +mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
 +{
@@ -3120,6 +3133,8 @@ index 0000000..b10a88b
 +	    sizeof(mondrian_uc_set_mode));
 +	(void)PE_parse_boot_argn("gpudstate", &mondrian_uc_draw_state,
 +	    sizeof(mondrian_uc_draw_state));
++	(void)PE_parse_boot_argn("gpudsaddr", &mondrian_uc_ds_addr,
++	    sizeof(mondrian_uc_ds_addr));
 +	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
 +	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
 +	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
@@ -3287,10 +3302,10 @@ index 0000000..b10a88b
 +}
 diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
 new file mode 100644
-index 0000000..8117573
+index 0000000..702c53e
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu_api.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,76 @@
 +/*
 + * What the IOKit driver (iokit/Kernel/arm/MondrianGPU.cpp) asks of the GPU
 + * bring-up in mondrian_gpu.c. The C side owns the SMMU page tables, the IOVA
@@ -3354,6 +3369,13 @@ index 0000000..8117573
 +/* gpudstate=N keeps only the first N groups of a CP_SET_DRAW_STATE, padding
 + * the rest of the packet with a CP_NOP. Zero leaves it alone. */
 +uint32_t mondrian_gpu_uc_draw_state(void);
++
++/* gpudsaddr=1 points the first draw-state group at the memptr page. */
++uint32_t mondrian_gpu_uc_ds_addr(void);
++
++/* A GPU address the CP already writes to (the memptr page), for the
++ * draw-state address experiment. */
++uint64_t mondrian_gpu_uc_memptr_iova(void);
 +
 +#ifdef __cplusplus
 +}

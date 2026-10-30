@@ -256,6 +256,15 @@ them has Metal. That is the path this port follows.
   submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
   fails, so the draw path is refused too, which points at the packet set the
   SQE firmware accepts rather than at one packet.
+- **The vendor SQE firmware cannot load draw-state groups; the upstream one
+  can.** The blob captured from the phone's vendor partition (`a730_sqe.fw`,
+  74 672 bytes, payload starting `58 01 73 01`) accepts `CP_SET_DRAW_STATE`
+  with `COUNT 0` and `DISABLE_ALL_GROUPS` and refuses every packet that loads
+  a real group, whatever its address or count. The linux-firmware blob
+  (`a730_sqe.fw`, 75 920 bytes, payload starting `81 01 73 01`) boots the
+  same way (ME_INIT drains, the ZAP authenticates, the fences land) and lets
+  the group through: the driver's whole 178-dword draw stream completes
+  (`done 1`, `CP_INTERRUPT_STATUS` 0) where the vendor blob stopped the CP.
 - **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
   carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
   completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw
