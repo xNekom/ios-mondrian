@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..9067a39
+index 0000000..4b49fea
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3280 @@
+@@ -0,0 +1,3282 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2997,7 +2997,9 @@ index 0000000..9067a39
 +	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
 +	/* kgsl brackets a submission with CP_SET_PROTECTED_MODE(0) … (1) when
 +	 * the caller asks for an unprotected one; without the exit the state
-+	 * stream's type-4 register writes are refused. */
++	 * stream's type-4 register writes are refused. The CCU invalidates and
++	 * the IFPC marker that kgsl and pong also emit around a submission
++	 * change nothing here (measured). */
 +	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
 +	ring[at++] = 0;
 +	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */

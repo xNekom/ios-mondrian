@@ -271,9 +271,9 @@ them has Metal. That is the path this port follows.
   a draw that completes the following submission stalls at ucode PC 0x654 in
   `waitin`, waiting for packet data. The ring pointers are equal before the
   first submission (`at` = rptr = wptr) and diverge on the failure
-  (`at 0x5e4 rptr 0x5d0`), so something in the framing the KMD puts around a
-  submission (kgsl's thread control, IFPC markers and protected-mode pair) is
-  still missing or in the wrong order.
+  (`at 0x5e4 rptr 0x5d0`). The CCU invalidates and the `CP_SET_MARKER` IFPC
+  pair that kgsl and pong put around a submission were tried and change
+  nothing.
 - **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
   carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
   completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw
