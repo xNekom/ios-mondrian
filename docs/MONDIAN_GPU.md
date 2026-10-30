@@ -256,6 +256,14 @@ them has Metal. That is the path this port follows.
   submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
   fails, so the draw path is refused too, which points at the packet set the
   SQE firmware accepts rather than at one packet.
+- **Protected mode matters.** With `CP_PROTECT_CNTL` enabled (the vendor's
+  0xb) and no way out of protected mode, Mesa's state stream fails on its
+  type-4 register writes; kgsl brackets a submission with
+  `CP_SET_PROTECTED_MODE(0)` … `(1)` for exactly that reason, and with the
+  same frame here the state stream completes again. The draw path is still
+  refused, so the next question is what the draw packets need (they run on the
+  BV thread, and a `CP_THREAD_CONTROL` that syncs both threads hangs on this
+  ring because BV has never been started).
 - **The packet-level tools** are `tools/pm4-decode.py` (names every packet from
   Mesa's `adreno_pm4.xml`, honouring the a7xx variants of a number),
   `gpupm4=N` (truncate a submitted stream to N dwords) and `gpunoblit=1`

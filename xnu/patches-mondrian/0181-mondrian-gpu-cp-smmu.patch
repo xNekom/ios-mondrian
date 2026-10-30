@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..7ca6fbb
+index 0000000..a34a51f
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3219 @@
+@@ -0,0 +1,3226 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2283,7 +2283,7 @@ index 0000000..7ca6fbb
 +	    CPR(GEN7_RB_CMP_DBG_ECO_CNTL) | (1u << 11));
 +	printf("MONDRIAN GPU: cp hw uche ok\n");
 +	mondrian_log_flush_now();
-+	CPW(GEN7_CP_PROTECT_CNTL, 0);	/* the table is a740's: leave it off */
++	CPW(GEN7_CP_PROTECT_CNTL, 0xbu);	/* vendor: enable, then the table */
 +	for (i = 1; i <= 2; i++) {
 +		CPW(GEN7_CP_APERTURE_CNTL_HOST, i << 12);
 +		CPW(GEN7_GRAS_NC_MODE_CNTL, bank << 5);
@@ -2940,7 +2940,7 @@ index 0000000..7ca6fbb
 +	}
 +	ring = (uint32_t *)mondrian_cp_ring.va;
 +	at = mondrian_uc_at;
-+	if (at + 9 > MONDRIAN_UC_RING_DWORDS) {
++	if (at + 13 > MONDRIAN_UC_RING_DWORDS) {
 +		if (mondrian_uc_wrap(ring) != 0) {
 +			return -1;
 +		}
@@ -2949,6 +2949,11 @@ index 0000000..7ca6fbb
 +	seq = mondrian_uc_fence + 1;
 +	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
 +	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
++	/* kgsl leaves protected mode around a submission when the caller asks
++	 * for an unprotected one; without the exit some packets (CP_BLIT) are
++	 * refused. */
++	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++	ring[at++] = 0;
 +	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
 +	ring[at++] = (uint32_t)ib;
 +	ring[at++] = (uint32_t)(ib >> 32);
@@ -2958,6 +2963,8 @@ index 0000000..7ca6fbb
 +	ring[at++] = (uint32_t)slot;
 +	ring[at++] = (uint32_t)(slot >> 32);
 +	ring[at++] = seq;
++	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++	ring[at++] = 1;
 +	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	mondrian_uc_fence = seq;
