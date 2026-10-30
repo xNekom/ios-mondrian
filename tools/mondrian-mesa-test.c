@@ -2,10 +2,11 @@
  * Mesa on the Adreno 730, without CoreAnimation.
  *
  * Creates an OSMesa context on freedreno's msm backend (this port's
- * MondrianGPU service through tools/mesa/mondrian-drm), clears to a known
- * colour, reads it back and logs the renderer string, so one boot says
- * whether the GPU draws and whether Mesa is using it at all or has fallen
- * back to softpipe.
+ * MondrianGPU service through tools/mesa/mondrian-drm), draws one full-screen
+ * triangle through a vertex buffer and a pair of shaders, reads the centre
+ * pixel back and logs the renderer string. No clear anywhere: the clear path
+ * is the one that ends in CP_BLIT, the packet this board's CP refuses, while
+ * drawing is what CoreAnimation needs.
  *
  * Built as a dylib (tools/build-mondrian-mesa-test.sh) and dlopened by
  * mondrian-ui-hook.dylib. Everything is resolved with dlopen/dlsym so a
@@ -15,9 +16,9 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -27,13 +28,18 @@
 #define kWidth		256
 #define kHeight		256
 
-/* GL enums, so this file needs no GL headers to build against the SDK. */
-#define GL_RGBA			0x1908
+/* The few GL constants this file needs, so it builds against the SDK alone. */
 #define GL_UNSIGNED_BYTE	0x1401
+#define GL_FLOAT		0x1406
+#define GL_RGBA			0x1908
+#define GL_VENDOR		0x1F00
 #define GL_RENDERER		0x1F01
 #define GL_VERSION		0x1F02
-#define GL_VENDOR		0x1F00
-#define GL_COLOR_BUFFER_BIT	0x00004000
+#define GL_VERTEX_SHADER	0x8B31
+#define GL_FRAGMENT_SHADER	0x8B30
+#define GL_ARRAY_BUFFER		0x8892
+#define GL_STATIC_DRAW		0x88E4
+#define GL_TRIANGLES		0x0004
 #define GL_NO_ERROR		0
 
 struct osmesa_context;
@@ -62,6 +68,101 @@ say(const char *format, ...)
 	}
 }
 
+struct gl {
+	void (*viewport)(int, int, int, int);
+	const unsigned char *(*get_string)(unsigned);
+	void (*finish)(void);
+	unsigned (*get_error)(void);
+	void (*read_pixels)(int, int, int, int, unsigned, unsigned, void *);
+	unsigned (*create_shader)(unsigned);
+	void (*shader_source)(unsigned, int, const char **, const int *);
+	void (*compile_shader)(unsigned);
+	unsigned (*create_program)(void);
+	void (*attach_shader)(unsigned, unsigned);
+	void (*link_program)(unsigned);
+	void (*use_program)(unsigned);
+	void (*gen_buffers)(int, unsigned *);
+	void (*bind_buffer)(unsigned, unsigned);
+	void (*buffer_data)(unsigned, long, const void *, unsigned);
+	void (*enable_vertex_attrib_array)(unsigned);
+	void (*vertex_attrib_pointer)(unsigned, int, unsigned, unsigned char,
+	    int, const void *);
+	void (*draw_arrays)(unsigned, int, int);
+};
+
+#define RESOLVE(field, name)						\
+	do {								\
+		*(void **)(&gl->field) = dlsym(library, name);		\
+		if (gl->field == NULL) {				\
+			say("MONDRIAN MESA TEST: no %s\n", name);	\
+			return NULL;					\
+		}							\
+	} while (0)
+
+static struct gl *
+resolve(void *library)
+{
+	static struct gl table;
+	struct gl *gl = &table;
+
+	RESOLVE(viewport, "glViewport");
+	RESOLVE(get_string, "glGetString");
+	RESOLVE(finish, "glFinish");
+	RESOLVE(get_error, "glGetError");
+	RESOLVE(read_pixels, "glReadPixels");
+	RESOLVE(create_shader, "glCreateShader");
+	RESOLVE(shader_source, "glShaderSource");
+	RESOLVE(compile_shader, "glCompileShader");
+	RESOLVE(create_program, "glCreateProgram");
+	RESOLVE(attach_shader, "glAttachShader");
+	RESOLVE(link_program, "glLinkProgram");
+	RESOLVE(use_program, "glUseProgram");
+	RESOLVE(gen_buffers, "glGenBuffers");
+	RESOLVE(bind_buffer, "glBindBuffer");
+	RESOLVE(buffer_data, "glBufferData");
+	RESOLVE(enable_vertex_attrib_array, "glEnableVertexAttribArray");
+	RESOLVE(vertex_attrib_pointer, "glVertexAttribPointer");
+	RESOLVE(draw_arrays, "glDrawArrays");
+	return gl;
+}
+
+/* A full-screen triangle through a VBO and two trivial shaders. */
+static int
+draw_triangle(struct gl *gl)
+{
+	const float vertices[] = {
+		-1.0f, -1.0f, 0.0f,
+		 3.0f, -1.0f, 0.0f,
+		-1.0f,  3.0f, 0.0f,
+	};
+	const char *vertex_source =
+	    "#version 120\nvoid main(void) { gl_Position = gl_Vertex; }\n";
+	const char *fragment_source =
+	    "#version 120\nvoid main(void) { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+	unsigned vertex, fragment, program, buffer;
+
+	vertex = gl->create_shader(GL_VERTEX_SHADER);
+	gl->shader_source(vertex, 1, &vertex_source, NULL);
+	gl->compile_shader(vertex);
+	fragment = gl->create_shader(GL_FRAGMENT_SHADER);
+	gl->shader_source(fragment, 1, &fragment_source, NULL);
+	gl->compile_shader(fragment);
+	program = gl->create_program();
+	gl->attach_shader(program, vertex);
+	gl->attach_shader(program, fragment);
+	gl->link_program(program);
+	gl->use_program(program);
+
+	gl->gen_buffers(1, &buffer);
+	gl->bind_buffer(GL_ARRAY_BUFFER, buffer);
+	gl->buffer_data(GL_ARRAY_BUFFER, (long)sizeof(vertices), vertices,
+	    GL_STATIC_DRAW);
+	gl->enable_vertex_attrib_array(0);
+	gl->vertex_attrib_pointer(0, 3, GL_FLOAT, 0, 0, NULL);
+	gl->draw_arrays(GL_TRIANGLES, 0, 3);
+	return 0;
+}
+
 __attribute__((constructor))
 static void
 mondrian_mesa_test(void)
@@ -70,13 +171,7 @@ mondrian_mesa_test(void)
 	struct osmesa_context *(*create)(unsigned, int, int, int, void *);
 	unsigned char (*make_current)(struct osmesa_context *, void *, unsigned,
 	    int, int);
-	const unsigned char *(*get_string)(unsigned);
-	void (*clear_color)(float, float, float, float);
-	void (*clear)(unsigned);
-	void (*finish)(void);
-	void (*read_pixels)(int, int, int, int, unsigned, unsigned, void *);
-	unsigned (*get_error)(void);
-	void (*viewport)(int, int, int, int);
+	struct gl *gl;
 	unsigned char *pixels;
 	unsigned char pixel[4];
 	const unsigned char *renderer, *version, *vendor;
@@ -86,7 +181,6 @@ mondrian_mesa_test(void)
 	console_fd = open("/dev/console", O_WRONLY);
 	say("MONDRIAN MESA TEST: start\n");
 
-	/* The GPU has to be up: Mesa's msm backend opens this service. */
 	for (i = 0; i < 150 && service == 0; i++) {
 		service = IOServiceGetMatchingService(0,
 		    IOServiceMatching("MondrianGPU"));
@@ -101,12 +195,10 @@ mondrian_mesa_test(void)
 	IOObjectRelease(service);
 
 	/*
-	 * sysmem keeps every resource in plain memory, where a wrong tiling
-	 * shows up as wrong pixels instead of a GPU fault. noblit keeps the
-	 * driver off CP_BLIT, which this board's SQE firmware answers with an
-	 * opcode error (measured: tools/mondrian-gpu-test ... see
-	 * docs/MONDIAN_GPU.md), and sends clears through the generic draw
-	 * path instead.
+	 * sysmem keeps resources in plain memory; noblit is what makes the
+	 * driver skip the CP_BLIT surface clear (patched in tools/mesa to be a
+	 * no-op under that flag), because this board's CP answers CP_BLIT with
+	 * an opcode error.
 	 */
 	setenv("FD_MESA_DEBUG", "sysmem,noblit", 1);
 
@@ -119,20 +211,12 @@ mondrian_mesa_test(void)
 	    dlsym(library, "OSMesaCreateContextExt");
 	make_current = (unsigned char (*)(struct osmesa_context *, void *,
 	    unsigned, int, int))dlsym(library, "OSMesaMakeCurrent");
-	get_string = (const unsigned char *(*)(unsigned))
-	    dlsym(library, "glGetString");
-	clear_color = (void (*)(float, float, float, float))
-	    dlsym(library, "glClearColor");
-	clear = (void (*)(unsigned))dlsym(library, "glClear");
-	finish = (void (*)(void))dlsym(library, "glFinish");
-	read_pixels = (void (*)(int, int, int, int, unsigned, unsigned, void *))
-	    dlsym(library, "glReadPixels");
-	get_error = (unsigned (*)(void))dlsym(library, "glGetError");
-	viewport = (void (*)(int, int, int, int))dlsym(library, "glViewport");
-	if (create == NULL || make_current == NULL || get_string == NULL ||
-	    clear_color == NULL || clear == NULL || finish == NULL ||
-	    read_pixels == NULL || get_error == NULL || viewport == NULL) {
+	if (create == NULL || make_current == NULL) {
 		say("MONDRIAN MESA TEST: the library has no OSMesa entry points\n");
+		goto out;
+	}
+	gl = resolve(library);
+	if (gl == NULL) {
 		goto out;
 	}
 
@@ -142,8 +226,7 @@ mondrian_mesa_test(void)
 		goto out;
 	}
 	{
-		struct osmesa_context *context =
-		    create(GL_RGBA, 24, 8, 0, NULL);
+		struct osmesa_context *context = create(GL_RGBA, 24, 8, 0, NULL);
 
 		if (context == NULL) {
 			say("MONDRIAN MESA TEST: OSMesaCreateContextExt failed\n");
@@ -157,9 +240,9 @@ mondrian_mesa_test(void)
 			goto out;
 		}
 	}
-	vendor = get_string(GL_VENDOR);
-	renderer = get_string(GL_RENDERER);
-	version = get_string(GL_VERSION);
+	vendor = gl->get_string(GL_VENDOR);
+	renderer = gl->get_string(GL_RENDERER);
+	version = gl->get_string(GL_VERSION);
 	say("MONDRIAN MESA TEST: vendor %s\n",
 	    vendor != NULL ? (const char *)vendor : "(null)");
 	say("MONDRIAN MESA TEST: renderer %s\n",
@@ -167,20 +250,23 @@ mondrian_mesa_test(void)
 	say("MONDRIAN MESA TEST: version %s\n",
 	    version != NULL ? (const char *)version : "(null)");
 
-	viewport(0, 0, kWidth, kHeight);
-	clear_color(0.25f, 0.5f, 0.75f, 1.0f);
-	clear(GL_COLOR_BUFFER_BIT);
-	finish();
-	if (get_error() != GL_NO_ERROR) {
-		say("MONDRIAN MESA TEST: GL error 0x%x after the clear\n",
-		    get_error());
+	gl->viewport(0, 0, kWidth, kHeight);
+	if (draw_triangle(gl) != 0) {
+		say("MONDRIAN MESA TEST: the draw path did not run\n");
+		free(pixels);
+		goto out;
+	}
+	gl->finish();
+	if (gl->get_error() != GL_NO_ERROR) {
+		say("MONDRIAN MESA TEST: GL error 0x%x after the draw\n",
+		    gl->get_error());
 	}
 	memset(pixel, 0, sizeof(pixel));
-	read_pixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+	gl->read_pixels(kWidth / 2, kHeight / 2, 1, 1, GL_RGBA,
+	    GL_UNSIGNED_BYTE, pixel);
 	say("MONDRIAN MESA TEST: pixel %u %u %u %u\n", pixel[0], pixel[1],
 	    pixel[2], pixel[3]);
-	if (pixel[0] < 60 || pixel[0] > 68 || pixel[1] < 124 || pixel[1] > 132 ||
-	    pixel[2] < 187 || pixel[2] > 195) {
+	if (pixel[0] < 250 || pixel[1] > 6 || pixel[2] > 6) {
 		say("MONDRIAN MESA TEST: FAILED (wrong pixels)\n");
 		free(pixels);
 		goto out;
@@ -188,7 +274,7 @@ mondrian_mesa_test(void)
 	if (renderer != NULL && (strstr((const char *)renderer, "FD") != NULL ||
 	    strstr((const char *)renderer, "freedreno") != NULL ||
 	    strstr((const char *)renderer, "Adreno") != NULL)) {
-		say("MONDRIAN MESA TEST: PASSED (the GPU drew it)\n");
+		say("MONDRIAN MESA TEST: PASSED (the GPU drew a triangle)\n");
 	} else {
 		say("MONDRIAN MESA TEST: SOFTWARE (Mesa fell back, no GPU screen)\n");
 	}

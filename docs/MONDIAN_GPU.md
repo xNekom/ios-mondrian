@@ -256,6 +256,23 @@ them has Metal. That is the path this port follows.
   submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
   fails, so the draw path is refused too, which points at the packet set the
   SQE firmware accepts rather than at one packet.
+- **BV is not running, measured.** After 2000 submissions `br_rptr` has
+  advanced and `bv_rptr` (the shadow at memptr+8) is still 0; a
+  `CP_THREAD_CONTROL(SYNC|BOTH)` never completes, and switching the current
+  thread to BV (`CP_SET_THREAD_BV`) stops the ring outright. BV and BR read
+  the same stream and concurrent binning needs driver support, so this is not
+  what blocks drawing (Mesa runs on BR), but nothing may sync the two threads
+  until BV is started.
+- **`CP_PROTECT` is not the problem.** The packed table in the driver is
+  exactly the vendor's `gen7_0_0_protected_regs` (`start | count << 18 |
+  noaccess << 31`, e.g. `0x13fc0000` is start 0 count 0x4ff and `0x0160050b`
+  is start 0x50b count 0x58, ending at 0x563), and `CP_PROTECT_CNTL` is the
+  vendor's 0xb.
+- **PC 0x222 is the microcode's error table.** With `afuc-disasm` (Mesa's
+  disassembler, built from `src/freedreno/afuc`) the instruction at that PC is
+  a `jump` inside a run of `mov $19, 0xbad4` / `0xbad5` entries, i.e. the
+  handler the SQE jumps to when it refuses a packet. That is the general shape
+  of every failure above, not a memory fault.
 - **Protected mode matters.** With `CP_PROTECT_CNTL` enabled (the vendor's
   0xb) and no way out of protected mode, Mesa's state stream fails on its
   type-4 register writes; kgsl brackets a submission with
