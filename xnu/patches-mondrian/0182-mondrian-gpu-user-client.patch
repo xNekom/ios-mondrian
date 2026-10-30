@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..ffcef31
+index 0000000..77483cf
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,959 @@
+@@ -0,0 +1,886 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -658,79 +658,6 @@ index 0000000..ffcef31
 +		 * CP_INDIRECT_BUFFER; that target is where a real driver's
 +		 * packets live, so dump it too, once.
 +		 */
-+		/*
-+		 * The SQE executes a draw-state group's fragment at draw time,
-+		 * so the group's memory is a command stream of its own. Dump
-+		 * the first real group of the first CP_SET_DRAW_STATE.
-+		 */
-+		/*
-+		 * The SQE executes a draw-state group's fragment at draw time,
-+		 * so that memory is a command stream of its own. The group is
-+		 * referenced from inside the nested draw stream, so scan every
-+		 * buffer of the submission for the packet and dump its first
-+		 * group once.
-+		 */
-+		if (fStateGroup < 1) {
-+			uint32_t words[8];
-+			uint32_t b;
-+
-+			for (b = 0; b < request->nr_bos && fStateGroup < 1; b++) {
-+				mondrian_buffer *bo = bufferForType(bos[b].handle);
-+				uint64_t at = 0;
-+
-+				if (bo == NULL || bo->size > 0x10000) {
-+					continue;
-+				}
-+				while (at + 4 <= bo->size) {
-+					if (bo->memory->readBytes(at, words, 16) != 16) {
-+						break;
-+					}
-+					if ((words[0] >> 28) == 7 &&
-+					    ((words[0] >> 16) & 0x7f) == 0x43 &&
-+					    (words[0] & 0x3fff) >= 3) {
-+						uint32_t count = words[1] & 0xffff;
-+						uint64_t addr = words[2] |
-+						    ((uint64_t)words[3] << 32);
-+						uint32_t b2;
-+
-+						fStateGroup++;
-+						IOLog("MondrianGPU: state group count %u addr 0x%llx\n",
-+						    count, (unsigned long long)addr);
-+						for (b2 = 0; b2 < request->nr_bos; b2++) {
-+							mondrian_buffer *t =
-+							    bufferForType(bos[b2].handle);
-+							uint32_t q;
-+
-+							if (t == NULL || addr < t->iova ||
-+							    addr + 4ull * count >
-+							    t->iova + t->size) {
-+								continue;
-+							}
-+							for (q = 0; q < count; q += 8) {
-+								bzero(words, sizeof(words));
-+								if (t->memory->readBytes(
-+								    addr - t->iova + q * 4,
-+								    words, sizeof(words)) !=
-+								    sizeof(words)) {
-+									break;
-+								}
-+								IOLog("MondrianGPU: pm4 %u %08x %08x %08x %08x %08x %08x %08x %08x\n",
-+								    q * 4, words[0], words[1],
-+								    words[2], words[3], words[4],
-+								    words[5], words[6], words[7]);
-+							}
-+							break;
-+						}
-+						break;
-+					}
-+					if ((words[0] >> 28) == 7) {
-+						at += 4 * (1 + (words[0] & 0x3fff));
-+					} else {
-+						at += 4;
-+					}
-+				}
-+			}
-+		}
 +		if (fNested < 4 && cmds[i].size > 64) {
 +			uint32_t words[8];
 +			uint32_t at = 0;
