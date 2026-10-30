@@ -265,6 +265,15 @@ them has Metal. That is the path this port follows.
   same way (ME_INIT drains, the ZAP authenticates, the fences land) and lets
   the group through: the driver's whole 178-dword draw stream completes
   (`done 1`, `CP_INTERRUPT_STATUS` 0) where the vendor blob stopped the CP.
+- **A draw is not repeatable yet.** With the upstream SQE firmware the same
+  178-dword draw stream completes in one boot and stops with an opcode error in
+  the next (`uc big 178 dwords … done 1` against `done 0 … int 0x1`), and after
+  a draw that completes the following submission stalls at ucode PC 0x654 in
+  `waitin`, waiting for packet data. The ring pointers are equal before the
+  first submission (`at` = rptr = wptr) and diverge on the failure
+  (`at 0x5e4 rptr 0x5d0`), so something in the framing the KMD puts around a
+  submission (kgsl's thread control, IFPC markers and protected-mode pair) is
+  still missing or in the wrong order.
 - **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
   carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
   completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw

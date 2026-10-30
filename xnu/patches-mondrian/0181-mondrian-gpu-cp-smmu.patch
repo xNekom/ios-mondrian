@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..1404d4e
+index 0000000..9067a39
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3269 @@
+@@ -0,0 +1,3280 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -2974,6 +2974,17 @@ index 0000000..1404d4e
 +		return -1;
 +	}
 +	ring = (uint32_t *)mondrian_cp_ring.va;
++	if (dwords > 16 && mondrian_uc_logged < 8) {
++		mondrian_uc_logged++;
++		printf("MONDRIAN GPU: uc pre %u at 0x%x rptr 0x%x wptr 0x%x int 0x%x bv 0x%x\n",
++		    dwords, mondrian_uc_at,
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_INTERRUPT_STATUS * 4u),
++		    ((volatile uint32_t *)mondrian_cp_memptr_view)[2]);
++		mondrian_log_flush_now();
++	}
 +	at = mondrian_uc_at;
 +	if (at + 13 > MONDRIAN_UC_RING_DWORDS) {
 +		if (mondrian_uc_wrap(ring) != 0) {
