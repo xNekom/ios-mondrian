@@ -38,16 +38,21 @@ subclass-aware, so no `AppleSmartBattery` is needed) with
 `xnu/patches/0062-sweet-touch-power-battery.patch` (`SweetBattery.cpp`
 618-938 and `sweet_spmi.c` 472-599).
 
-Order of work:
+Order of work. The first draft of step 1 (`MondrianBattery.cpp`, an
+`IOPMPowerSource` subclass publishing 100 %/external before `registerService`,
+registered from `KernelConfigTables`) **compiled but did not boot**: with it
+the kernel returned to fastboot after 24 s, while the same kernel without it
+boots (A/B, same image, same blob). `IOPMPowerSource::init()` does create its
+dictionary, so the cause is not the obvious one and needs its own boot cycle;
+the patch was withdrawn from the series rather than shipped (a kernel that
+does not boot is worse than a missing battery). The code is in the history of
+this file's commit.
 
-1. `0183`: `iokit/Kernel/arm/MondrianBattery.cpp`, a `IOPMPowerSource`
-   subclass that publishes a static 100 %/external/not-charging set before
-   `registerService()`, one line in `iokit/conf/files.arm64`, and the
-   personality next to `MondrianHIDButtons` in `iokit/KernelConfigTables.cpp`.
-   Proof: `MONDRIAN BATTERY: static, 100% 4200mV external=1 charging=0` and
-   powerd's `Battery percentage last %d now %d`.
-2. `0184`: `bsd/dev/mondrian_spmi.c` with an observer for the three VADC
-   channels above; then the percentage replaces the static value.
+1. Re-do step 1 with the failing path understood: match `IOResources` the way
+   `MondrianHIDButtons` does, publish after `registerService()` instead of
+   inside `start()`, and log at every step so the 24 s failure names itself.
+2. `bsd/dev/mondrian_spmi.c` with an observer for the three VADC channels
+   above; then the percentage replaces the static value.
 3. A read-only probe first prints `SPMI adc ppid apid type sub chsel st1 d0
    d1` for SID 0 peripheral `0x31` (ADC5 user registers: STATUS1 `0x08`,
    CH_SEL `0x0a`, DATA0/1) to see whether ABL left a `vbat_sns` conversion
