@@ -62,6 +62,11 @@
 #include <sys/sysctl.h>
 #include <sys/ucontext.h>
 #include <syslog.h>
+
+/* The kernel rewrites this one at boot (glblob=1); the root itself is mounted
+ * read-only, /private/var is not. */
+#define MONDIAN_GL_LIBRARY_WRITABLE "/private/var/vm/mondrian-gl.dylib"
+
 #include <unistd.h>
 
 #include "mondrian_offsets.h"
@@ -337,7 +342,8 @@ mondrian_inject(void)
 		dump_slots();
 		return;
 	}
-	if (access(MONDIAN_GL_LIBRARY, R_OK) != 0) {
+	if (access(MONDIAN_GL_LIBRARY, R_OK) != 0 &&
+	    access(MONDIAN_GL_LIBRARY_WRITABLE, R_OK) != 0) {
 		say("mondrian-gl: no %s: the window server keeps its renderer\n", MONDIAN_GL_LIBRARY);
 		return;
 	}
@@ -355,7 +361,8 @@ mondrian_inject(void)
 	}
 	IOObjectRelease(gpu);
 	crash_handlers();
-	library = dlopen(MONDIAN_GL_LIBRARY, RTLD_NOW);
+	library = dlopen(access(MONDIAN_GL_LIBRARY_WRITABLE, R_OK) == 0 ?
+	    MONDIAN_GL_LIBRARY_WRITABLE : MONDIAN_GL_LIBRARY, RTLD_NOW);
 	gl_hooks(library);
 	say("mondrian-crash: handlers set, GL %s\n", library != NULL ? "loaded" : dlerror());
 	syslog(LOG_NOTICE, "mondrian: %s %s", MONDIAN_GL_LIBRARY, library != NULL ? "loaded" : dlerror());

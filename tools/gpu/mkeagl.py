@@ -312,7 +312,7 @@ def emit_stub(offset, name, prototype):
         "static " + ret,
         f"eagl_slot_{offset:#06x}(void *context{''.join(', ' + a for a in arguments)})",
         "{",
-        "\tstruct eagl *e = context;",
+        "\tstruct eagl *e = eagl_resolve(context);",
     ]
     if ret != "void":
         lines.append(f"\t{ret} value;")

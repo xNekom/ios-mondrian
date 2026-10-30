@@ -157,6 +157,7 @@ static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
 static void eagl_leave(struct eagl *e, unsigned offset);
 static long eagl_missing(void *context, unsigned offset, const uint64_t *arguments);
+static struct eagl *eagl_resolve(void *context);
 #define EAGL_ENTER(context, offset)     eagl_enter(context, offset)
 #define EAGL_LEAVE(context, offset)     eagl_leave(context, offset)
 
@@ -340,6 +341,7 @@ static int trace_listed;                        /* the draw at hand is one of th
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
+static bool said_fallback;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* mondrian: time spent in each entry */
@@ -440,7 +442,7 @@ eagl_leave(struct eagl *e, unsigned offset)
 static long
 eagl_missing(void *context, unsigned offset, const uint64_t *arguments)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	eagl_enter(e, offset);
 	if (slot_calls[offset / 8] == 1) {
@@ -451,6 +453,37 @@ eagl_missing(void *context, unsigned offset, const uint64_t *arguments)
 		    (unsigned)arguments[4], (unsigned)arguments[5]);
 	}
 	return 0;
+}
+
+/*
+ * The context a call belongs to. CoreAnimation normally passes table[0], which
+ * is the struct itself, but it also calls entries with its own macro-context
+ * pointer (measured: a call whose argument was not one of ours, so every field
+ * read as zero and glCreateShader went to Mesa's no-op dispatch). Match what
+ * we were given; if it is not a context we know, use the most recent live one
+ * and say so once.
+ */
+static struct eagl *
+eagl_resolve(void *context)
+{
+	struct eagl *fallback = NULL;
+
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL &&
+		    (contexts[i] == (struct eagl *)context ||
+		    contexts[i]->object == (id)context)) {
+			return contexts[i];
+		}
+		if (contexts[i] != NULL && contexts[i]->gl != NULL) {
+			fallback = contexts[i];
+		}
+	}
+	if (fallback != NULL && !said_fallback) {
+		said_fallback = true;
+		say("mondrian-gl: entry called with %p, not a context: using %p\n",
+		    context, (void *)fallback);
+	}
+	return fallback;
 }
 
 static struct eagl *
@@ -1166,7 +1199,7 @@ drawing(struct eagl *e)
 static void
 my_glBindTexture(void *context, GLenum target, GLuint texture)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	struct image *image;
 
 	EAGL_ENTER(e, MONDIAN_GL_BIND_TEXTURE);
@@ -1188,7 +1221,7 @@ my_glBindTexture(void *context, GLenum target, GLuint texture)
 static void
 my_glClear(void *context, GLbitfield mask)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_CLEAR);
 	drawing(e);
@@ -1455,7 +1488,7 @@ triangles_of(GLenum mode, GLsizei count)
 #define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
 
 static const char plain_vertex[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform highp mat4 vertex_matrix;\n"
     "in highp vec4 vertex_position;\n"
     "in lowp vec4 vertex_color;\n"
@@ -1468,7 +1501,7 @@ static const char plain_vertex[] =
     "  texcoord = vertex_texcoord0;\n"
     "}\n";
 static const char plain_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform lowp float textured;\n"
     "in lowp vec4 color;\n"
@@ -1494,7 +1527,7 @@ static const char plain_fragment[] =
  * for its "thin" bar would be 0.373, 0.31 and 0.4, and give neither.)
  */
 static const char table_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform lowp sampler2D table;\n"
     "in lowp vec4 color;\n"
@@ -1542,7 +1575,7 @@ static const char table_fragment[] =
 #define FUNCTION_VIBRANT_MATRIX         45
 
 static const char vibrant_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform mediump vec4 colours[5];\n"
@@ -1559,7 +1592,7 @@ static const char vibrant_fragment[] =
     "  result = mix(behind, s, layer.a);\n"
     "}\n";
 static const char masking_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform mediump vec4 colours[5];\n"
     "in lowp vec4 color;\n"
@@ -1580,7 +1613,7 @@ static const char masking_fragment[] =
  *   what is blurred after that shimmers when it moves.
  */
 static const char box_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform highp vec2 places[4];\n"
     "in lowp vec4 color;\n"
@@ -1670,13 +1703,13 @@ static int vblur_on = 1;
  * makes a chain of such levels look blurred rather than coarse when it is read back enlarged.
  */
 static const char vblur_vertex[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "void main() {\n"
     "  vec2 corner = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n"
     "  gl_Position = vec4(corner, 0.0, 1.0);\n"
     "}\n";
 static const char halve_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform highp sampler2D source;\n"
     "uniform highp vec2 texel;\n"
     "out highp vec4 result;\n"
@@ -1704,7 +1737,7 @@ static const char halve_fragment[] =
  * (the dark strip in Search, rc.jobs.strip).
  */
 static const char vblur_draw_vertex[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform highp mat4 vertex_matrix;\n"
     "in highp vec4 vertex_position;\n"
     "in lowp vec4 vertex_color;\n"
@@ -1720,7 +1753,7 @@ static const char vblur_draw_vertex[] =
     "  maskcoord = vertex_texcoord1;\n"
     "}\n";
 static const char vblur_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform highp sampler2D level0;\n"
     "uniform highp sampler2D mask;\n"
     "uniform highp sampler2D level1;\n"
@@ -2288,7 +2321,7 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
  */
 
 static const char group_cover_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform highp vec4 texmat;\n"
     "in lowp vec4 color;\n"
@@ -2298,7 +2331,7 @@ static const char group_cover_fragment[] =
     "  result = color * texture(texture0, texcoord * texmat.xy + texmat.zw);\n"
     "}\n";
 static const char group_over_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
     "uniform lowp sampler2D texture0;\n"
     "uniform highp vec4 texmat;\n"
@@ -2316,7 +2349,7 @@ static const char group_over_fragment[] =
     "  result = mix(behind, s, layer.a);\n"
     "}\n";
 static const char group_flat_fragment[] =
-    "#version 300 es\n"
+    "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
     "uniform mediump vec4 flat_colour;\n"
     "layout(location = 0) inout highp vec4 result;\n"
@@ -2800,7 +2833,7 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 static void
 my_glUseProgram(void *context, GLuint program)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_USE_PROGRAM);
 	if (eagl_tracing) {
@@ -2814,7 +2847,7 @@ my_glUseProgram(void *context, GLuint program)
 static void
 my_glActiveTexture(void *context, GLenum unit)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_ACTIVE_TEXTURE);
 	if (eagl_tracing) {
@@ -2828,7 +2861,7 @@ my_glActiveTexture(void *context, GLenum unit)
 static void
 my_glUniformMatrix4fv(void *context, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_UNIFORM_MATRIX_4FV);
 	if (eagl_tracing) {
@@ -2844,7 +2877,7 @@ static void
 my_glVertexAttribPointer(void *context, GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride,
     const void *pointer)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_VERTEX_ATTRIB_POINTER);
 	if (eagl_tracing) {
@@ -2863,7 +2896,7 @@ my_glVertexAttribPointer(void *context, GLuint index, GLint size, GLenum type, G
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
 
@@ -2901,7 +2934,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	GLint enabled[4] = { 1, 1, 1, 1 };
 	bool plain;
 
@@ -2939,7 +2972,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 static void
 my_glFinish(void *context)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_FINISH);
 	if (eagl_tracing) {
@@ -2954,7 +2987,7 @@ my_glFinish(void *context)
 static void
 my_glFlush(void *context)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	uint64_t began;
 
 	EAGL_ENTER(e, MONDIAN_GL_FLUSH);
@@ -2973,7 +3006,7 @@ my_glFlush(void *context)
 static void
 my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	(void)object;
 	(void)name;
@@ -2987,7 +3020,7 @@ my_glFinishObjectAPPLE(void *context, GLenum object, GLint name)
 static void
 my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_DELETE_TEXTURES);
 	clear_now(e);
@@ -3006,7 +3039,7 @@ my_glDeleteTextures(void *context, GLsizei n, const GLuint *textures)
 static const GLubyte *
 my_glGetString(void *context, GLenum name)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	const GLubyte *string;
 
 	EAGL_ENTER(e, MONDIAN_GL_GET_STRING);
@@ -3037,7 +3070,7 @@ my_glGetString(void *context, GLenum name)
 static void
 my_glGetIntegerv(void *context, GLenum name, GLint *values)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	static unsigned said;
 
 	EAGL_ENTER(e, MONDIAN_GL_GET_INTEGERV);
@@ -3053,7 +3086,7 @@ static void
 my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei width, GLsizei height, GLint border,
     GLenum format, GLenum type, const void *pixels)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_TEX_IMAGE_2D);
 	if (level == 0) {
@@ -3088,7 +3121,7 @@ static void
 my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
     GLenum type, const void *pixels)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_TEX_SUB_IMAGE_2D);
 	if (eagl_tracing) {
@@ -3109,7 +3142,7 @@ static void
 my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLint y0, GLint x, GLint y, GLsizei width,
     GLsizei height)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_COPY_TEX_SUB_IMAGE_2D);
 	if (eagl_tracing) {
@@ -3131,7 +3164,7 @@ static void
 my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum internal, GLsizei width, GLsizei height,
     GLint border, GLsizei size, const void *data)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_COMPRESSED_TEX_IMAGE_2D);
 	if (level == 0) {
@@ -3144,7 +3177,7 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 static void
 my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_BIND_FRAMEBUFFER);
 	if (eagl_tracing) {
@@ -3181,7 +3214,7 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 static void
 my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenum to, GLuint texture, GLint level)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_FRAMEBUFFER_TEXTURE_2D);
 	clear_now(e);
@@ -3198,7 +3231,7 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 static void
 my_glDeleteFramebuffers(void *context, GLsizei n, const GLuint *framebuffers)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_DELETE_FRAMEBUFFERS);
 	clear_now(e);
@@ -3215,7 +3248,7 @@ my_glDeleteFramebuffers(void *context, GLsizei n, const GLuint *framebuffers)
 static void
 my_glFramebufferParameteriAPPLE(void *context, GLenum target, GLenum name, GLint value)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_FRAMEBUFFER_PARAMETERI_APPLE);
 	if (slot_calls[MONDIAN_GL_FRAMEBUFFER_PARAMETERI_APPLE / 8] <= 4) {
@@ -3266,55 +3299,36 @@ my_glPopGroupMarkerEXT(void *context)
  * Boot-arg glprecision=0: as the shaders say.
  */
 static int full_precision = 1;
+/* GLSL 120 has no precision qualifiers: they are words the compiler drops. */
 static const char all_highp[] =
-    "#define lowp highp\n"
-    "#define mediump highp\n";
+    "#define highp\n"
+    "#define lowp\n"
+    "#define mediump\n";
 
-static const char fragment_start[] =
-    "#define varying in\n"
-    "#define texture2D texture\n"
-    "#define texture2DProj textureProj\n"
-    "#define texture2DLod textureLod\n"
-    "#define textureCube texture\n"
-    "#define sampler2DRect sampler2D\n"
-    "#define texture2DRect(s, c) texture(s, (c) / vec2(textureSize(s, 0)))\n"
-    "highp vec4 mondrian_data[1];\n"
-    "#define gl_FragData mondrian_data\n"
-    "#define gl_FragColor mondrian_data[0]\n";
 /*
- * What a fragment shader of the first version writes to (gl_FragData), and with the extension a
- * GPU's driver offers and CoreAnimation then uses (EXT_shader_framebuffer_fetch) reads what is
- * there already from (gl_LastFragData), are in 3.00 one variable of the shader's own, declared
- * "out" or "inout". The shader's main() is given another name and called from one that reads
- * that variable before and writes it after.
+ * GLSL 120 (the compatibility profile the Mesa test draws with): attribute,
+ * varying, texture2D and gl_FragData are the language itself, so the ES 3
+ * rewrites above are not needed. The precision words are dropped by all_highp.
+ */
+static const char fragment_start[] =
+    "#line 1\n";
+/*
+ * The ES path renamed main() to fill an out variable (there is no gl_FragData
+ * in 3.00). In 120 the shader writes gl_FragData itself, so the wrapper is a
+ * pass-through.
  */
 static const char fragment_plain[] =
-    "layout(location = 0) out highp vec4 mondrian_colour;\n"
-    "#define main mondrian_main\n"
     "#line 1\n";
-static const char fragment_plain_end[] =
-    "\n#undef main\n"
-    "void main() { mondrian_main(); mondrian_colour = mondrian_data[0]; }\n";
-static const char fragment_fetch[] =
-    "layout(location = 0) inout highp vec4 mondrian_colour;\n"
-    "highp vec4 mondrian_last[1];\n"
-    "#define gl_LastFragData mondrian_last\n"
-    "#define main mondrian_main\n"
-    "#line 1\n";
-static const char fragment_fetch_end[] =
-    "\n#undef main\n"
-    "void main() { mondrian_last[0] = mondrian_colour; mondrian_main(); mondrian_colour = mondrian_data[0]; }\n";
+static const char fragment_plain_end[] = "\n";
+static const char fragment_fetch[] = "#line 1\n";
+static const char fragment_fetch_end[] = "\n";
 static const char vertex_start[] =
-    "#define attribute in\n"
-    "#define varying out\n"
-    "#define texture2D texture\n"
-    "#define texture2DLod textureLod\n"
     "#line 1\n";
 
 static GLuint
 my_glCreateShader(void *context, GLenum type)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	GLuint shader;
 
 	EAGL_ENTER(e, MONDIAN_GL_CREATE_SHADER);
@@ -3352,9 +3366,9 @@ my_glCreateShader(void *context, GLenum type)
 static void
 my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *const *strings, const GLint *lengths)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	bool fragment = e->fragment[shader % 64], fetch;
-	const GLchar *parts[6] = { "#version 300 es\n", fragment ? fragment_start : vertex_start, "", NULL, "",
+	const GLchar *parts[6] = { "#version 120\n", fragment ? fragment_start : vertex_start, "", NULL, "",
 		                   full_precision ? all_highp : "" };
 	size_t size = 1, extensions = 0;
 	char *text, *line, *head;
@@ -3411,7 +3425,7 @@ say_long(const char *what, const char *text)
 static void
 my_glCompileShader(void *context, GLuint shader)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	GLint good = 0;
 	char said[1024] = "";
 
@@ -3439,7 +3453,7 @@ my_glCompileShader(void *context, GLuint shader)
 static void
 my_glLinkProgram(void *context, GLuint program)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 	GLint good = 0;
 	char said[1024] = "";
 
@@ -3458,7 +3472,7 @@ my_glLinkProgram(void *context, GLuint program)
 static void
 my_glDeleteProgram(void *context, GLuint name)
 {
-	struct eagl *e = context;
+	struct eagl *e = eagl_resolve(context);
 
 	EAGL_ENTER(e, MONDIAN_GL_DELETE_PROGRAM);
 	if (glIsProgram(name)) {
@@ -3491,7 +3505,23 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 		say("mondrian-gl: no context of API %lu\n", api);
 		return nil;
 	}
-	if ((e->gl = mondrian_gl_create((int)api)) == NULL || !mondrian_gl_make_current(e->gl)) {
+	/*
+	 * One OSMesa context for every EAGLContext. CoreAnimation makes three,
+	 * and a second OSMesa context's framebuffer validation in the same
+	 * process crashed inside OSMesaMakeCurrent (measured: SIGBUS in
+	 * _platform_memmove through OSMesaMakeCurrent, from this init). The
+	 * window server has one renderer, so sharing is what it wants anyway.
+	 */
+	for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+		if (contexts[i] != NULL && contexts[i]->gl != NULL) {
+			e->gl = contexts[i]->gl;
+			break;
+		}
+	}
+	if (e->gl == NULL) {
+		e->gl = mondrian_gl_create((int)api);
+	}
+	if (e->gl == NULL || !mondrian_gl_make_current(e->gl)) {
 		say("mondrian-gl: %s gives no OpenGL ES %lu context\n", mondrian_gl_library(), api);
 		free(e);
 		return nil;

@@ -82,6 +82,7 @@
 #define OSMESA_CONTEXT_MAJOR_VERSION    0x36
 #define OSMESA_CONTEXT_MINOR_VERSION    0x37
 #define OSMESA_ES_PROFILE               0x38
+#define OSMESA_COMPAT_PROFILE           0x35
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_RENDERER                     0x1f01
@@ -90,6 +91,8 @@ typedef struct osmesa_context *OSMesaContext;
 extern OSMesaContext OSMesaCreateContextAttribs(const int *attributes, OSMesaContext share);
 extern unsigned char OSMesaMakeCurrent(OSMesaContext context, void *buffer, unsigned type, int width, int height);
 extern void OSMesaDestroyContext(OSMesaContext context);
+extern OSMesaContext OSMesaGetCurrentContext(void);
+extern OSMesaContext OSMesaCreateContextExt(unsigned format, int depthBits, int stencilBits, int accumBits, void *share);
 extern void (*OSMesaGetProcAddress(const char *name))(void);
 extern const unsigned char *glGetString(unsigned name);
 extern unsigned glGetError(void);
@@ -100,26 +103,55 @@ extern unsigned glGetError(void);
  */
 #define WINDOW  16
 
+/*
+ * The window is a mapping of its own, not an array inside the struct: OSMesa
+ * writes width * height * 4 bytes into it when the framebuffer is validated
+ * and a fixed inline array next to the context is one overflow away from a
+ * SIGBUS (measured: _platform_memmove inside OSMesaMakeCurrent).
+ */
+#define WINDOW_BYTES (1024u * 1024u)
+
 struct mondrian_gl {
 	OSMesaContext context;
-	unsigned char window[WINDOW * WINDOW * 4];
+	unsigned char *window;
 };
 
 struct mondrian_gl *
 mondrian_gl_create(int version)
 {
-	const int attributes[] = {
-		OSMESA_FORMAT, OSMESA_RGBA, OSMESA_DEPTH_BITS, 24, OSMESA_STENCIL_BITS, 8,
-		OSMESA_PROFILE, OSMESA_ES_PROFILE, OSMESA_CONTEXT_MAJOR_VERSION, version, OSMESA_CONTEXT_MINOR_VERSION, 0,
-		0
-	};
-	struct mondrian_gl *gl = calloc(1, sizeof(*gl));
+	/*
+	 * Exactly the call the Mesa test that draws on this phone uses
+	 * (OSMesaCreateContextExt: RGBA, depth 24, stencil 8, no profile
+	 * attributes). The profile-attribute path with the ES profile faulted in
+	 * OSMesaMakeCurrent, and the compatibility context this one gives is what
+	 * the shaders are rewritten to (GLSL 120, eagl.c).
+	 */
+	struct mondrian_gl *gl;
+	(void)version;
 
-	if (gl != NULL && (gl->context = OSMesaCreateContextAttribs(attributes, NULL)) == NULL) {
+	gl = calloc(1, sizeof(*gl));
+	if (gl == NULL) {
+		return NULL;
+	}
+	gl->window = calloc(1, WINDOW_BYTES);
+	if (gl->window == NULL ||
+	    (gl->context = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL)) == NULL) {
+		free(gl->window);
 		free(gl);
-		gl = NULL;
+		return NULL;
 	}
 	return gl;
+}
+
+/*
+ * Whether this thread already has the context: what Mesa answers, not what we
+ * remember setting. CoreAnimation calls GL from more than one thread and a
+ * context made current in one of them is not current in the others.
+ */
+int
+mondrian_gl_is_current(struct mondrian_gl *gl)
+{
+	return gl != NULL && OSMesaGetCurrentContext() == gl->context;
 }
 
 int
@@ -134,8 +166,13 @@ mondrian_gl_make_current(struct mondrian_gl *gl)
 void
 mondrian_gl_destroy(struct mondrian_gl *gl)
 {
-	OSMesaDestroyContext(gl->context);
-	free(gl);
+	if (gl == NULL) {
+		return;
+	}
+	/* Never destroyed while the window server runs: CoreAnimation makes
+	 * more than one EAGLContext and they share this one (eagl.c), so a
+	 * free here would leave the others drawing into a dead context. */
+	(void)gl;
 }
 
 const char *

@@ -1,12 +1,28 @@
 # CoreAnimation on the GPU (OpenGL ES)
 
 **Running on hardware, not yet drawing.** In `backboardd` the injector loads, all seven
-`-[EAGLContext ...]` methods are replaced and both `CA::OGL::GLESContext` hooks install
-("7 of 7 methods of EAGLContext are ours", "function_supported on, function_uniform on"). What
-stopped it was Mesa: OSMesa rejects the ES profile (`OSMesaCreateContextAttribs` returned NULL,
-"no OpenGL ES 2/3 context"), so `tools/mesa/mondrian-darwin.patch` now maps
-`OSMESA_ES_PROFILE` (0x38) to `API_OPENGLES2`. That build has not been booted yet. The rest of
-this file is the design; the UI is still the CPU rasterizer (`0114`) until it is.
+`-[EAGLContext ...]` methods are replaced, both `CA::OGL::GLESContext` hooks install, and a
+context is created. Three measured traps, in the order they were paid for:
+
+- **The ES profile of OSMesa faults on this driver.** `OSMesaCreateContextAttribs` with the ES
+  profile (mapped to `API_OPENGLES2` by `tools/mesa/mondrian-darwin.patch`) creates a context
+  whose first `OSMesaMakeCurrent` dies with SIGBUS in `_platform_memmove` inside
+  `OSMesaMakeCurrent`, killing `backboardd`. The Mesa test draws with the compatibility profile,
+  so that is what the window server uses now (`OSMesaCreateContextExt(GL_RGBA, 24, 8, 0)`), with
+  the shaders rewritten to GLSL 120 (`#version 120`, no precision words, `gl_FragData` native).
+- **The kernel writes the dylibs into `/private/var/vm`, not `/usr/libexec`.** The root is
+  mounted `MNT_RDONLY` (`rootfs mount flags 0x400d001`, and `vnode_open` there answers EROFS);
+  `/private/var` is a later mount and is writable (the pager makes its swap file in
+  `/private/var/vm`). The write retries until that mount exists (12 s measured), and the injector
+  prefers `/private/var/vm/mondrian-gl.dylib` over `/usr/libexec/mondrian-gl.dylib`, which only a
+  flash can change. A userland change is therefore one `fastboot boot`, not a 14 GB flash.
+- **CoreAnimation does not always pass `table[0]`.** A call arrived with an argument that is not
+  one of our contexts, so every field read as zero and `glCreateShader` went to Mesa's no-op
+  dispatch (0, no GL error). `eagl_resolve()` matches the argument against the live contexts and
+  falls back to the most recent one, saying so once.
+
+The rest of this file is the design. The UI is still the CPU rasterizer (`0114`) until a frame is
+presented by the GPU.
 
 ## Who loads what
 

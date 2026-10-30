@@ -10,7 +10,8 @@
 struct mondrian_gl;
 
 struct mondrian_gl *mondrian_gl_create(int version);            /* a context of OpenGL ES 2 or 3; NULL: none to be had */
-int mondrian_gl_make_current(struct mondrian_gl *gl);           /* ... the calling thread's (NULL: none); 0 on failure */
+int mondrian_gl_make_current(struct mondrian_gl *gl);
+int mondrian_gl_is_current(struct mondrian_gl *gl);           /* ... the calling thread's (NULL: none); 0 on failure */
 void mondrian_gl_destroy(struct mondrian_gl *gl);
 const char *mondrian_gl_library(void);                          /* for the log */
 
