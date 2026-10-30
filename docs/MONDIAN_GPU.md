@@ -265,6 +265,13 @@ them has Metal. That is the path this port follows.
   same way (ME_INIT drains, the ZAP authenticates, the fences land) and lets
   the group through: the driver's whole 178-dword draw stream completes
   (`done 1`, `CP_INTERRUPT_STATUS` 0) where the vendor blob stopped the CP.
+- **The stall is inside the indirect buffer, not in the ring.** Serialising
+  submissions (waiting for `CP_RB_RPTR` to reach the write pointer before
+  writing again) shows the CP consuming the prologue and the indirect buffer
+  packet and stopping exactly at the fence that follows it (`rptr 0x5dd`
+  against `at 0x5e4`), so the ring is fine and the draw stream's execution is
+  what never finishes. That serialisation is not kept (it makes every later
+  submission wait on a stream that will not finish).
 - **A draw is not repeatable yet.** With the upstream SQE firmware the same
   178-dword draw stream completes in one boot and stops with an opcode error in
   the next (`uc big 178 dwords … done 1` against `done 0 … int 0x1`), and after
