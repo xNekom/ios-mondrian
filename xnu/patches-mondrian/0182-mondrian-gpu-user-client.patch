@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..048dacb
+index 0000000..4e6c704
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,830 @@
+@@ -0,0 +1,843 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -554,10 +554,14 @@ index 0000000..048dacb
 +		    request->nr_cmds, cmds[0].type, cmds[0].size,
 +		    cmds[0].nr_relocs, cmds[0].submit_idx);
 +	}
-+	if (mondrian_gpu_uc_noblit()) {
++	{
++		uint32_t opcode = mondrian_gpu_uc_nop_opcode();
 +		uint32_t b;
 +
-+		for (b = 0; b < request->nr_bos; b++) {
++		if (mondrian_gpu_uc_noblit()) {
++			opcode = 0x2c;		/* CP_BLIT */
++		}
++		for (b = 0; opcode != 0 && b < request->nr_bos; b++) {
 +			mondrian_buffer *bo = bufferForType(bos[b].handle);
 +			uint64_t at = 0;
 +			uint32_t word;
@@ -565,15 +569,24 @@ index 0000000..048dacb
 +			if (bo == NULL || bo->size > 0x10000) {
 +				continue;
 +			}
++			uint32_t mode = mondrian_gpu_uc_set_mode();
++
 +			while (at + 4 <= bo->size) {
 +				if (bo->memory->readBytes(at, &word, 4) != 4) {
 +					break;
 +				}
-+				if ((word >> 28) == 7 && ((word >> 16) & 0x7f) == 0x2c) {
++				if ((word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == opcode) {
 +					uint32_t nop = 0x70000000u |
 +					    (word & 0x3fff);
 +
 +					bo->memory->writeBytes(at, &nop, 4);
++				}
++				/* gpumode=N: rewrite a CP_SET_MODE payload. */
++				if (mode != 0xffffffffu && (word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == 0x63 &&
++				    (word & 0x3fff) >= 1) {
++					bo->memory->writeBytes(at + 4, &mode, 4);
 +				}
 +				at += 4;
 +			}
@@ -602,7 +615,7 @@ index 0000000..048dacb
 +		 * CP_INDIRECT_BUFFER; that target is where a real driver's
 +		 * packets live, so dump it too, once.
 +		 */
-+		if (fNested < 1 && cmds[i].size > 64) {
++		if (fNested < 4 && cmds[i].size > 64) {
 +			uint32_t words[8];
 +			uint32_t at = 0;
 +

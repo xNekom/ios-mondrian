@@ -256,6 +256,16 @@ them has Metal. That is the path this port follows.
   submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
   fails, so the draw path is refused too, which points at the packet set the
   SQE firmware accepts rather than at one packet.
+- **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
+  carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
+  completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw
+  (`CP_DRAW_INDX_OFFSET`, 0x38) changes nothing. The state stream's
+  `CP_SET_DRAW_STATE` (count 3: COUNT 0, DISABLE_ALL_GROUPS, no address)
+  executes, while the draw stream's (count 81: 27 groups, real addresses)
+  stops the CP in its error table. `CP_SET_MODE` 0 or 1, protected mode on or
+  off, and the group contents themselves (counts, BINNING/GMEM/SYSMEM bits,
+  GROUP_ID 0..29) are all plausible; the open difference is the packet's size
+  (81 dwords) against the one that works (3).
 - **BV is not running, measured.** After 2000 submissions `br_rptr` has
   advanced and `bv_rptr` (the shadow at memptr+8) is still 0; a
   `CP_THREAD_CONTROL(SYNC|BOTH)` never completes, and switching the current

@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..a34a51f
+index 0000000..0ad2f50
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3226 @@
+@@ -0,0 +1,3245 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -86,6 +86,8 @@ index 0000000..a34a51f
 +static int mondrian_uc_logged;
 +static uint32_t mondrian_uc_pm4;
 +static int mondrian_uc_noblit;
++static uint32_t mondrian_uc_nop_opcode;
++static uint32_t mondrian_uc_set_mode = 0xffffffffu;
 +static vm_offset_t mondrian_uc_gpu;
 +static vm_offset_t mondrian_uc_smmu;
 +static uint32_t mondrian_uc_at;
@@ -2673,9 +2675,10 @@ index 0000000..a34a51f
 +				last = f;
 +			}
 +			w = (uint32_t)mondrian_gpu_uc_wait(last, 5000);
-+			printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x\n",
++			printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x br_rptr 0x%x bv_rptr 0x%x\n",
 +			    rounds, refused, w, mv ? mv[0x900 / 4] : 0,
-+			    mv ? mv[0x910 / 4] : 0);
++			    mv ? mv[0x910 / 4] : 0,
++			    mv ? mv[0] : 0, mv ? mv[2] : 0);
 +			mondrian_log_flush_now();
 +		}
 +	}
@@ -2764,6 +2767,18 @@ index 0000000..a34a51f
 +mondrian_gpu_uc_noblit(void)
 +{
 +	return mondrian_uc_noblit;
++}
++
++uint32_t
++mondrian_gpu_uc_nop_opcode(void)
++{
++	return mondrian_uc_nop_opcode;
++}
++
++uint32_t
++mondrian_gpu_uc_set_mode(void)
++{
++	return mondrian_uc_set_mode;
 +}
 +
 +int
@@ -2949,9 +2964,9 @@ index 0000000..a34a51f
 +	seq = mondrian_uc_fence + 1;
 +	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
 +	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
-+	/* kgsl leaves protected mode around a submission when the caller asks
-+	 * for an unprotected one; without the exit some packets (CP_BLIT) are
-+	 * refused. */
++	/* kgsl brackets a submission with CP_SET_PROTECTED_MODE(0) … (1) when
++	 * the caller asks for an unprotected one; without the exit the state
++	 * stream's type-4 register writes are refused. */
 +	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
 +	ring[at++] = 0;
 +	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
@@ -3092,6 +3107,10 @@ index 0000000..a34a51f
 +	    sizeof(mondrian_uc_pm4));
 +	(void)PE_parse_boot_argn("gpunoblit", &mondrian_uc_noblit,
 +	    sizeof(mondrian_uc_noblit));
++	(void)PE_parse_boot_argn("gpunop", &mondrian_uc_nop_opcode,
++	    sizeof(mondrian_uc_nop_opcode));
++	(void)PE_parse_boot_argn("gpumode", &mondrian_uc_set_mode,
++	    sizeof(mondrian_uc_set_mode));
 +	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
 +	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
 +	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
@@ -3259,10 +3278,10 @@ index 0000000..a34a51f
 +}
 diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
 new file mode 100644
-index 0000000..881511f
+index 0000000..1c99a41
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu_api.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,65 @@
 +/*
 + * What the IOKit driver (iokit/Kernel/arm/MondrianGPU.cpp) asks of the GPU
 + * bring-up in mondrian_gpu.c. The C side owns the SMMU page tables, the IOVA
@@ -3315,6 +3334,13 @@ index 0000000..881511f
 +/* gpunoblit=1 turns every CP_BLIT in a submission into a CP_NOP, to tell a
 + * packet the CP will not take from the state around it. */
 +int mondrian_gpu_uc_noblit(void);
++
++/* gpunop=0xNN turns every type-7 packet with that opcode into a CP_NOP, one
++ * opcode at a time, to find the one a stream's CP will not take. */
++uint32_t mondrian_gpu_uc_nop_opcode(void);
++
++/* gpumode=N rewrites every CP_SET_MODE payload to N. */
++uint32_t mondrian_gpu_uc_set_mode(void);
 +
 +#ifdef __cplusplus
 +}
