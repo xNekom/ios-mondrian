@@ -264,8 +264,11 @@ them has Metal. That is the path this port follows.
   executes, while the draw stream's (count 81: 27 groups, real addresses)
   stops the CP in its error table. `CP_SET_MODE` 0 or 1, protected mode on or
   off, and the group contents themselves (counts, BINNING/GMEM/SYSMEM bits,
-  GROUP_ID 0..29) are all plausible; the open difference is the packet's size
-  (81 dwords) against the one that works (3).
+  GROUP_ID 0..29) are all plausible, and even keeping one real group
+  (`gpudstate=1`: GROUP_ID 0, count 24, address 0x11048740) is refused, while
+  the same packet with COUNT 0 and DISABLE_ALL_GROUPS goes through. So it is
+  the group's contents (address and register count), not the packet's size or
+  its group ids.
 - **BV is not running, measured.** After 2000 submissions `br_rptr` has
   advanced and `bv_rptr` (the shadow at memptr+8) is still 0; a
   `CP_THREAD_CONTROL(SYNC|BOTH)` never completes, and switching the current
