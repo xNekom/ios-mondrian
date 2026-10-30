@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..4e6c704
+index 0000000..8631096
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,863 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -581,6 +581,26 @@ index 0000000..4e6c704
 +					    (word & 0x3fff);
 +
 +					bo->memory->writeBytes(at, &nop, 4);
++				}
++				/* gpudstate=N: keep the first N groups. */
++				if (mondrian_gpu_uc_draw_state() != 0 &&
++				    (word >> 28) == 7 &&
++				    ((word >> 16) & 0x7f) == 0x43 &&
++				    (word & 0x3fff) > 3 *
++				    mondrian_gpu_uc_draw_state()) {
++					uint32_t keep = 3 *
++					    mondrian_gpu_uc_draw_state();
++					uint32_t count = word & 0x3fff;
++					uint32_t header = 0x70000000u |
++					    keep | (1u << 15) | (0x10u << 16);
++					uint32_t pad = count - keep;
++					uint32_t pad_header = 0x70000000u |
++					    (pad - 1) | (1u << 15) |
++					    (0x10u << 16);
++
++					bo->memory->writeBytes(at, &header, 4);
++					bo->memory->writeBytes(at + 4 + keep,
++					    &pad_header, 4);
 +				}
 +				/* gpumode=N: rewrite a CP_SET_MODE payload. */
 +				if (mode != 0xffffffffu && (word >> 28) == 7 &&
