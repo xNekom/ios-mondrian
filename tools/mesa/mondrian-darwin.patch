@@ -223,3 +223,43 @@ index 25985dd..eef4fa2 100644
     /* We use a null software winsys since we always just render to ordinary
      * driver resources.
      */
+diff --git a/include/GL/osmesa.h b/include/GL/osmesa.h
+--- a/include/GL/osmesa.h
++++ b/include/GL/osmesa.h
+@@ -103,6 +103,7 @@
+ #define OSMESA_ACCUM_BITS            0x32
+ #define OSMESA_PROFILE               0x33
+ #define OSMESA_CORE_PROFILE          0x34
++#define OSMESA_ES_PROFILE            0x38
+ #define OSMESA_COMPAT_PROFILE        0x35
+ #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
+ #define OSMESA_CONTEXT_MINOR_VERSION 0x37
+diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmesa/osmesa.c
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -614,8 +614,11 @@
+          break;
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
++         /* Mondrian: the ES profile, so CoreAnimation's window server can
++          * have an OpenGL ES context from an off-screen OSMesa one. */
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != OSMESA_ES_PROFILE)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
+@@ -662,8 +665,10 @@
+     * Create the rendering context
+     */
+    memset(&attribs, 0, sizeof(attribs));
+-   attribs.profile = (profile == OSMESA_CORE_PROFILE)
+-      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   attribs.profile = (profile == OSMESA_ES_PROFILE)
++      ? API_OPENGLES2
++      : (profile == OSMESA_CORE_PROFILE)
++        ? API_OPENGL_CORE : API_OPENGL_COMPAT;
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */

@@ -1,8 +1,12 @@
 # CoreAnimation on the GPU (OpenGL ES)
 
-**Not yet run on hardware.** The UI is still the CPU rasterizer (`0114`) at 6.4 fps. This is the
-userland half of step 4 in `docs/MONDIAN_GPU.md`; the kernel half is the `MondrianGPU` user client
-(`0181`/`0182`). Everything here compiles for iOS 16 arm64 and nothing has been loaded on the phone.
+**Running on hardware, not yet drawing.** In `backboardd` the injector loads, all seven
+`-[EAGLContext ...]` methods are replaced and both `CA::OGL::GLESContext` hooks install
+("7 of 7 methods of EAGLContext are ours", "function_supported on, function_uniform on"). What
+stopped it was Mesa: OSMesa rejects the ES profile (`OSMesaCreateContextAttribs` returned NULL,
+"no OpenGL ES 2/3 context"), so `tools/mesa/mondrian-darwin.patch` now maps
+`OSMESA_ES_PROFILE` (0x38) to `API_OPENGLES2`. That build has not been booted yet. The rest of
+this file is the design; the UI is still the CPU rasterizer (`0114`) until it is.
 
 ## Who loads what
 

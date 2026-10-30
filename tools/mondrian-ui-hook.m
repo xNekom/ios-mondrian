@@ -817,6 +817,19 @@ load_gpu_test(void)
 {
 	void *handle;
 
+	/*
+	 * The CoreAnimation-on-GLES path (docs/COREANIMATION_GLES.md). The
+	 * injector's constructor does nothing outside backboardd, so loading it
+	 * from every daemon the hook lands in is harmless: it waits for
+	 * MondrianGPU, then loads mondrian-gl.dylib, which replaces the EAGL
+	 * context and patches CA::OGL::GLESContext.
+	 */
+	if (access("/usr/libexec/mondrian-inject.dylib", R_OK) == 0) {
+		handle = dlopen("/usr/libexec/mondrian-inject.dylib",
+		    RTLD_NOW);
+		say(handle != NULL ? "MONDRIAN UI: CA GLES injector loaded\n"
+		    : "MONDRIAN UI: CA GLES injector dlopen failed\n");
+	}
 	if (access("/usr/libexec/mondrian-gpu-test.dylib", R_OK) != 0) {
 		return;
 	}
