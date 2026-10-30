@@ -23,10 +23,10 @@ Registers the file in iokit/conf/files.arm64. Relocations
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..77483cf
+index 0000000..b2d1a66
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,910 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -556,25 +556,45 @@ index 0000000..77483cf
 +		    request->nr_cmds, cmds[0].type, cmds[0].size,
 +		    cmds[0].nr_relocs, cmds[0].submit_idx);
 +	}
++	/*
++	 * Rewrite knobs (gpunop/gpumode/gpudstate/gpudsaddr). Scan only the
++	 * range each command actually submits: the stream lives inside a BO
++	 * that is usually far larger, so a whole-BO walk both misses the
++	 * packet (it is not at offset zero) and reads enough dwords to wedge
++	 * the boot.
++	 */
 +	{
 +		uint32_t opcode = mondrian_gpu_uc_nop_opcode();
-+		uint32_t b;
++		uint32_t mode = mondrian_gpu_uc_set_mode();
++		uint32_t ds = mondrian_gpu_uc_draw_state();
++		uint32_t dsaddr = mondrian_gpu_uc_ds_addr();
++		uint32_t i;
 +
 +		if (mondrian_gpu_uc_noblit()) {
 +			opcode = 0x2c;		/* CP_BLIT */
 +		}
-+		for (b = 0; opcode != 0 && b < request->nr_bos; b++) {
-+			mondrian_buffer *bo = bufferForType(bos[b].handle);
++		for (i = 0; (opcode != 0 || mode != 0xffffffffu || ds != 0 ||
++		    dsaddr != 0) && i < request->nr_cmds; i++) {
++			mondrian_buffer *bo;
 +			uint64_t at = 0;
-+			uint32_t word;
 +
-+			if (bo == NULL || bo->size > 0x10000) {
++			if (cmds[i].type != MSM_SUBMIT_CMD_BUF ||
++			    cmds[i].size == 0 || cmds[i].size > 0x100000 ||
++			    cmds[i].submit_idx >= request->nr_bos) {
 +				continue;
 +			}
-+			uint32_t mode = mondrian_gpu_uc_set_mode();
++			bo = bufferForType(bos[cmds[i].submit_idx].handle);
++			if (bo == NULL) {
++				continue;
++			}
++			while (at + 4 <= cmds[i].size) {
++				uint64_t off = cmds[i].submit_offset + at;
++				uint32_t word;
 +
-+			while (at + 4 <= bo->size) {
-+				if (bo->memory->readBytes(at, &word, 4) != 4) {
++				if (off + 4 > bo->size) {
++					break;
++				}
++				if (bo->memory->readBytes(off, &word, 4) != 4) {
 +					break;
 +				}
 +				if ((word >> 28) == 7 &&
@@ -582,16 +602,13 @@ index 0000000..77483cf
 +					uint32_t nop = 0x70000000u |
 +					    (word & 0x3fff);
 +
-+					bo->memory->writeBytes(at, &nop, 4);
++					bo->memory->writeBytes(off, &nop, 4);
 +				}
 +				/* gpudstate=N: keep the first N groups. */
-+				if (mondrian_gpu_uc_draw_state() != 0 &&
-+				    (word >> 28) == 7 &&
++				if (ds != 0 && (word >> 28) == 7 &&
 +				    ((word >> 16) & 0x7f) == 0x43 &&
-+				    (word & 0x3fff) > 3 *
-+				    mondrian_gpu_uc_draw_state()) {
-+					uint32_t keep = 3 *
-+					    mondrian_gpu_uc_draw_state();
++				    (word & 0x3fff) > 3 * ds) {
++					uint32_t keep = 3 * ds;
 +					uint32_t count = word & 0x3fff;
 +					uint32_t header = 0x70000000u |
 +					    keep | (1u << 15) | (0x10u << 16);
@@ -600,38 +617,60 @@ index 0000000..77483cf
 +					    (pad - 1) | (1u << 15) |
 +					    (0x10u << 16);
 +
-+					bo->memory->writeBytes(at, &header, 4);
-+					bo->memory->writeBytes(at + 4 + keep,
++					bo->memory->writeBytes(off, &header, 4);
++					bo->memory->writeBytes(off + 4 + keep,
 +					    &pad_header, 4);
 +				}
 +				/* gpudsaddr=1: point the first group at the
 +				 * memptr page, which the CP already writes,
 +				 * with a two-register count. */
-+				if (mondrian_gpu_uc_ds_addr() != 0 &&
-+				    (word >> 28) == 7 &&
++				if (dsaddr != 0 && (word >> 28) == 7 &&
 +				    ((word >> 16) & 0x7f) == 0x43 &&
 +				    (word & 0x3fff) >= 3) {
-+					uint32_t first = (2u << 0) | (word & 0xff000000u) |
++					uint32_t first = (2u << 0) |
++					    (word & 0xff000000u) |
 +					    (word & 0x00f00000u) | (1u << 15);
 +					uint32_t addr = (uint32_t)
 +					    (mondrian_gpu_uc_memptr_iova() +
 +					    0x800u);
++					uint32_t zero = 0;
 +
-+					bo->memory->writeBytes(at + 4, &first, 4);
-+					bo->memory->writeBytes(at + 8, &addr, 4);
-+					{
-+						uint32_t zero = 0;
-+
-+						bo->memory->writeBytes(at + 12, &zero, 4);
-+					}
++					bo->memory->writeBytes(off + 4, &first, 4);
++					bo->memory->writeBytes(off + 8, &addr, 4);
++					bo->memory->writeBytes(off + 12, &zero, 4);
 +				}
 +				/* gpumode=N: rewrite a CP_SET_MODE payload. */
 +				if (mode != 0xffffffffu && (word >> 28) == 7 &&
 +				    ((word >> 16) & 0x7f) == 0x63 &&
 +				    (word & 0x3fff) >= 1) {
-+					bo->memory->writeBytes(at + 4, &mode, 4);
++					bo->memory->writeBytes(off + 4, &mode, 4);
 +				}
 +				at += 4;
++			}
++		}
++	}
++	/*
++	 * Write back every buffer the submission touches, not just the command
++	 * stream. Mesa fills VBOs, shader consts and the draw-state fragments
++	 * through the CPU; the CP fetches them with its own (unprivileged)
++	 * access, and a state fragment it reads as zeros is an unknown-opcode
++	 * halt. Flushing only the command buffers left that to cache
++	 * eviction, which is exactly the boot-to-boot nondeterminism.
++	 */
++	for (i = 0; i < request->nr_bos; i++) {
++		mondrian_buffer *bo = bufferForType(bos[i].handle);
++		uint64_t off;
++
++		if (bo == NULL) {
++			continue;
++		}
++		for (off = 0; off < bo->size; off += 0x1000) {
++			IOByteCount length = 0;
++			addr64_t pa = bo->memory->getPhysicalSegment(off,
++			    &length);
++
++			if (pa != 0 && length != 0) {
++				(void)mondrian_gpu_uc_flush(pa, length);
 +			}
 +		}
 +	}
@@ -740,21 +779,6 @@ index 0000000..77483cf
 +				    words[1], words[2], words[3], words[4],
 +				    words[5], words[6], words[7]);
 +				at += chunk;
-+			}
-+		}
-+		{
-+			uint64_t off = cmds[i].submit_offset;
-+
-+			for (; off < cmds[i].submit_offset + cmds[i].size;
-+			    off += 0x1000) {
-+				IOByteCount length = 0;
-+				addr64_t pa = buffer->memory->getPhysicalSegment(
-+				    off, &length);
-+
-+				if (pa != 0 && length != 0) {
-+					(void)mondrian_gpu_uc_flush(pa,
-+					    length);
-+				}
 +			}
 +		}
 +		{

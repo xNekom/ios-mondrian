@@ -256,71 +256,43 @@ them has Metal. That is the path this port follows.
   submissions complete. `FD_MESA_DEBUG=noblit` (the generic blit path) still
   fails, so the draw path is refused too, which points at the packet set the
   SQE firmware accepts rather than at one packet.
-- **The vendor SQE firmware cannot load draw-state groups; the upstream one
-  can.** The blob captured from the phone's vendor partition (`a730_sqe.fw`,
-  74 672 bytes, payload starting `58 01 73 01`) accepts `CP_SET_DRAW_STATE`
-  with `COUNT 0` and `DISABLE_ALL_GROUPS` and refuses every packet that loads
-  a real group, whatever its address or count. The linux-firmware blob
-  (`a730_sqe.fw`, 75 920 bytes, payload starting `81 01 73 01`) boots the
-  same way (ME_INIT drains, the ZAP authenticates, the fences land) and lets
-  the group through: the driver's whole 178-dword draw stream completes
-  (`done 1`, `CP_INTERRUPT_STATUS` 0) where the vendor blob stopped the CP.
-- **The stall is inside the indirect buffer, not in the ring.** Serialising
-  submissions (waiting for `CP_RB_RPTR` to reach the write pointer before
-  writing again) shows the CP consuming the prologue and the indirect buffer
-  packet and stopping exactly at the fence that follows it (`rptr 0x5dd`
-  against `at 0x5e4`), so the ring is fine and the draw stream's execution is
-  what never finishes. That serialisation is not kept (it makes every later
-  submission wait on a stream that will not finish).
-- **A draw is not repeatable yet.** With the upstream SQE firmware the same
-  178-dword draw stream completes in one boot and stops with an opcode error in
-  the next (`uc big 178 dwords … done 1` against `done 0 … int 0x1`), and after
-  a draw that completes the following submission stalls at ucode PC 0x654 in
-  `waitin`, waiting for packet data. The ring pointers are equal before the
-  first submission (`at` = rptr = wptr) and diverge on the failure
-  (`at 0x5e4 rptr 0x5d0`). The CCU invalidates and the `CP_SET_MARKER` IFPC
-  pair that kgsl and pong put around a submission were tried and change
-  nothing, and neither does toggling the GMU keepalive around every submission
-  the way kgsl does, nor reading the write pointer back so the posted write is
-  committed before the next register access.
-- **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
-  carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
-  completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw
-  (`CP_DRAW_INDX_OFFSET`, 0x38) changes nothing. The state stream's
-  `CP_SET_DRAW_STATE` (count 3: COUNT 0, DISABLE_ALL_GROUPS, no address)
-  executes, while the draw stream's (count 81: 27 groups, real addresses)
-  stops the CP in its error table. `CP_SET_MODE` 0 or 1, protected mode on or
-  off, and the group contents themselves (counts, BINNING/GMEM/SYSMEM bits,
-  GROUP_ID 0..29) are all plausible, and even keeping one real group
-  (`gpudstate=1`: GROUP_ID 0, count 24, address 0x11048740) is refused, while
-  the same packet with COUNT 0 and DISABLE_ALL_GROUPS goes through. So it is
-  the group's contents (address and register count), not the packet's size or
-  its group ids.
-- **BV is not running, measured.** After 2000 submissions `br_rptr` has
-  advanced and `bv_rptr` (the shadow at memptr+8) is still 0; a
-  `CP_THREAD_CONTROL(SYNC|BOTH)` never completes, and switching the current
-  thread to BV (`CP_SET_THREAD_BV`) stops the ring outright. BV and BR read
-  the same stream and concurrent binning needs driver support, so this is not
-  what blocks drawing (Mesa runs on BR), but nothing may sync the two threads
-  until BV is started.
+- **The SQE was halting on an unknown opcode, and the cause was cache, not
+  packets.** `CP_SQE_STAT` reads `pc 0x224`, which `afuc-disasm` identifies as
+  the microcode's halt loop (`l548`); the error table above it writes 1 (or 2)
+  to control register 0x064 before jumping there. The dword it rejected was
+  zero: a `CP_SET_DRAW_STATE` fragment, a VBO or a const buffer that Mesa had
+  filled through the CPU but that had not reached DRAM. The driver only wrote
+  back the command buffers, so whether the CP saw the fragment depended on
+  cache eviction — the same stream completed in one boot and halted in the
+  next. Writing back every buffer of the submission, the way
+  `msm_gem_submit` does (`getPhysicalSegment` + `flush_dcache64` per page),
+  fixes it: `MONDRIAN MESA TEST: PASSED`, pixel `255 0 0 255`.
+- **The microcode refuses `CP_SET_DRAW_STATE` while `$14[29]` is set, and
+  `CP_SET_MODE(0)` sets it.** `CP_SET_MODE(1)` clears it (unless the SQE is
+  inside its draw-state setup); with MODE 0 the packet takes the error-2 path
+  to the same halt loop, and the draw handler also skips applying groups. That
+  is why an earlier `gpunop=0x43` looked like a fix: it removed the packet. Not
+  needed once the buffers are coherent; `gpumode=1` stays as a bisect knob.
+- **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
+  BV (visibility) share the ring. Mesa GL emits
+  `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
+  does the same (`gputhread=1`, the default), Turnip's single-threaded
+  configuration. BV never advances (`bv_rptr` stays 0) and
+  `CP_THREAD_CONTROL(SYNC|BOTH)` stalls while BV is not started, so nothing may
+  sync the threads. `gputhread=2` reproduces kgsl's `BOTH` + IFPC marker frame.
+- **The vendor SQE blob cannot load draw-state groups.** The blob from the
+  vendor partition (74 672 bytes, payload `58 01 73 01`) refuses
+  `CP_SET_DRAW_STATE` with a real group whatever its address or count; the
+  linux-firmware one (75 920 bytes, payload `81 01 73 01`) boots identically
+  and takes them. The driver ships the upstream blob.
 - **`CP_PROTECT` is not the problem.** The packed table in the driver is
   exactly the vendor's `gen7_0_0_protected_regs` (`start | count << 18 |
   noaccess << 31`, e.g. `0x13fc0000` is start 0 count 0x4ff and `0x0160050b`
   is start 0x50b count 0x58, ending at 0x563), and `CP_PROTECT_CNTL` is the
   vendor's 0xb.
-- **PC 0x222 is the microcode's error table.** With `afuc-disasm` (Mesa's
-  disassembler, built from `src/freedreno/afuc`) the instruction at that PC is
-  a `jump` inside a run of `mov $19, 0xbad4` / `0xbad5` entries, i.e. the
-  handler the SQE jumps to when it refuses a packet. That is the general shape
-  of every failure above, not a memory fault.
-- **Protected mode matters.** With `CP_PROTECT_CNTL` enabled (the vendor's
-  0xb) and no way out of protected mode, Mesa's state stream fails on its
-  type-4 register writes; kgsl brackets a submission with
-  `CP_SET_PROTECTED_MODE(0)` … `(1)` for exactly that reason, and with the
-  same frame here the state stream completes again. The draw path is still
-  refused, so the next question is what the draw packets need (they run on the
-  BV thread, and a `CP_THREAD_CONTROL` that syncs both threads hangs on this
-  ring because BV has never been started).
+- **Protected mode matters.** With `CP_PROTECT_CNTL` enabled and no way out,
+  Mesa's type-4 register writes are refused; kgsl brackets a submission with
+  `CP_SET_PROTECTED_MODE(0)` … `(1)` for that reason and our frame does too.
 - **The packet-level tools** are `tools/pm4-decode.py` (names every packet from
   Mesa's `adreno_pm4.xml`, honouring the a7xx variants of a number),
   `gpupm4=N` (truncate a submitted stream to N dwords) and `gpunoblit=1`
@@ -334,10 +306,10 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **Next**: build Mesa for the device (`FD_MESA_DEBUG=sysmem`, a730/FD725),
-  the `mondrian-drm` libdrm shim, and then the CoreAnimation EAGL hooks. The
-  firmware blocks, the GMU context bank and the CM3 start are in
-  `mondrian_gpu.c` under `gmustart=1`.
+- **Next**: the CoreAnimation EAGL hooks. Mesa (`FD_MESA_DEBUG=sysmem`, a730 /
+  FD725) and the `mondrian-drm` shim already submit and draw; what is left is
+  the UI path itself. The firmware blocks, the GMU context bank and the CM3
+  start are in `mondrian_gpu.c` under `gmustart=1`.
 
 ### Running the GPU test from the UI hook
 
