@@ -24,33 +24,345 @@
 # The offsets are properties of the build (iPhone X 16.7.16, 20H392). A different userland
 # renumbers them: derive this file again rather than editing it by hand.
 
+# 409 entries: the 30 named by eagl.c plus every entry the OpenGL ES renderer of
+# Darwin userland 16.5/16.7 is seen to call (the table is the same in both).
+0x0010  glAlphaFunc
 0x0030  glBindTexture                          hand  MONDIAN_GL_BIND_TEXTURE
+0x0040  glBlendFunc
 0x0058  glClear                                hand  MONDIAN_GL_CLEAR
+0x0068  glClearColor
+0x0080  glClearStencil
+0x0130  glColor4f
+0x0160  glColor4ub
+0x0190  glColorMask
+0x01a0  glColorPointer
+0x01b8  glCopyTexImage2D
 0x01c8  glCopyTexSubImage2D                    hand  MONDIAN_GL_COPY_TEX_SUB_IMAGE_2D
+0x01d0  glCullFace
 0x01e0  glDeleteTextures                       hand  MONDIAN_GL_DELETE_TEXTURES
+0x01e8  glDepthFunc
+0x01f0  glDepthMask
+0x0200  glDisable
+0x0208  glDisableClientState
 0x0210  glDrawArrays                           hand  MONDIAN_GL_DRAW_ARRAYS
 0x0220  glDrawElements                         hand  MONDIAN_GL_DRAW_ELEMENTS
+0x0248  glEnable
+0x0250  glEnableClientState
 0x02d0  glFinish                               hand  MONDIAN_GL_FINISH
 0x02d8  glFlush                                hand  MONDIAN_GL_FLUSH
+0x02e0  glFogf
+0x02e8  glFogfv
+0x0300  glFrontFace
+0x0318  glGenTextures
+0x0320  glGetBooleanv
+0x0338  glGetError
+0x0340  glGetFloatv
 0x0348  glGetIntegerv                          hand  MONDIAN_GL_GET_INTEGERV
+0x0350  glGetLightfv
+0x0378  glGetMaterialfv
+0x03a0  glGetPointerv
 0x03b0  glGetString                            hand  MONDIAN_GL_GET_STRING
+0x03b8  glGetTexEnvfv
+0x03c0  glGetTexEnviv
+0x03e0  glGetTexImage
+0x03e8  glGetTexLevelParameterfv
+0x03f0  glGetTexLevelParameteriv
+0x03f8  glGetTexParameterfv
+0x0400  glGetTexParameteriv
+0x0408  glHint
+0x0480  glIsEnabled
+0x0490  glIsTexture
+0x0498  glLightModelf
+0x04a0  glLightModelfv
+0x04b8  glLightf
+0x04c0  glLightfv
+0x04e0  glLineWidth
+0x04f0  glLoadIdentity
+0x0500  glLoadMatrixf
+0x0510  glLogicOp
+0x0558  glMaterialf
+0x0560  glMaterialfv
+0x0578  glMatrixMode
+0x0588  glMultMatrixf
+0x05b8  glNormal3f
+0x05e8  glNormalPointer
+0x0620  glPixelStorei
+0x0640  glPointSize
+0x0650  glPolygonOffset
+0x0670  glPopMatrix
+0x0698  glPushMatrix
+0x0768  glReadBuffer
+0x0770  glReadPixels
+0x07c8  glRotatef
+0x07d8  glScalef
+0x07e0  glScissor
+0x07f0  glShadeModel
+0x07f8  glStencilFunc
+0x0800  glStencilMask
+0x0808  glStencilOp
+0x0910  glTexCoordPointer
+0x0918  glTexEnvf
+0x0920  glTexEnvfv
+0x0928  glTexEnvi
+0x0930  glTexEnviv
 0x0970  glTexImage2D                           hand  MONDIAN_GL_TEX_IMAGE_2D
+0x0978  glTexParameterf
+0x0980  glTexParameterfv
+0x0988  glTexParameteri
+0x0990  glTexParameteriv
 0x09a0  glTexSubImage2D                        hand  MONDIAN_GL_TEX_SUB_IMAGE_2D
+0x09b0  glTranslatef
+0x0a78  glVertexPointer
+0x0a80  glViewport
+0x0a88  glBlendFuncSeparate
+0x0a90  glBlendColor
+0x0a98  glBlendEquation
+0x0ab0  glClientActiveTexture
 0x0ab8  glActiveTexture                        hand  MONDIAN_GL_ACTIVE_TEXTURE
+0x0b90  glMultiTexCoord4f
+0x0be0  glCompressedTexImage3D
 0x0be8  glCompressedTexImage2D                 hand  MONDIAN_GL_COMPRESSED_TEX_IMAGE_2D
+0x0bf8  glCompressedTexSubImage3D
+0x0c00  glCompressedTexSubImage2D
+0x0cb0  glDrawRangeElements
+0x0db8  glTexImage3D
+0x0dc0  glTexSubImage3D
+0x0dc8  glCopyTexSubImage3D
+0x0dd0  glGetUniformIndices
+0x0dd8  glGetActiveUniformsiv
+0x0de8  glGetUniformBlockIndex
+0x0df0  glGetActiveUniformBlockiv
+0x0df8  glGetActiveUniformBlockName
+0x0e00  glUniformBlockBinding
+0x0e58  glBlendEquationSeparate
+0x0e60  glSampleCoverage
 0x0eb8  glFinishObjectAPPLE                    hand  MONDIAN_GL_FINISH_OBJECT_APPLE
+0x0ee8  glVertexAttrib1f
+0x0f00  glVertexAttrib2f
+0x0f18  glVertexAttrib3f
+0x0f30  glVertexAttrib4f
+0x0f50  glVertexAttrib1fv
+0x0f68  glVertexAttrib2fv
+0x0f80  glVertexAttrib3fv
+0x0fc0  glVertexAttrib4fv
 0x1000  glVertexAttribPointer                  hand  MONDIAN_GL_VERTEX_ATTRIB_POINTER
+0x1008  glEnableVertexAttribArray
+0x1010  glDisableVertexAttribArray
+0x1020  glGetVertexAttribfv
+0x1028  glGetVertexAttribiv
+0x1030  glGetVertexAttribPointerv
+0x10e8  glPointParameterf
+0x10f0  glPointParameterfv
+0x1258  glStencilOpSeparate
 0x1280  glDeleteProgram                        hand  MONDIAN_GL_DELETE_PROGRAM
+0x1290  glDetachShader
 0x1298  glCreateShader                         hand  MONDIAN_GL_CREATE_SHADER
 0x12a0  glShaderSource                         hand  MONDIAN_GL_SHADER_SOURCE
 0x12a8  glCompileShader                        hand  MONDIAN_GL_COMPILE_SHADER
+0x12b0  glCreateProgram
+0x12b8  glAttachShader
 0x12c0  glLinkProgram                          hand  MONDIAN_GL_LINK_PROGRAM
 0x12c8  glUseProgram                           hand  MONDIAN_GL_USE_PROGRAM
+0x12d0  glValidateProgram
+0x12d8  glUniform1f
+0x12e0  glUniform2f
+0x12e8  glUniform3f
+0x12f0  glUniform4f
+0x12f8  glUniform1i
+0x1300  glUniform2i
+0x1308  glUniform3i
+0x1310  glUniform4i
+0x1318  glUniform1fv
+0x1320  glUniform2fv
+0x1328  glUniform3fv
+0x1330  glUniform4fv
+0x1338  glUniform1iv
+0x1340  glUniform2iv
+0x1348  glUniform3iv
+0x1350  glUniform4iv
+0x1358  glUniformMatrix2fv
+0x1360  glUniformMatrix3fv
 0x1368  glUniformMatrix4fv                     hand  MONDIAN_GL_UNIFORM_MATRIX_4FV
-0x1988  glInsertEventMarkerEXT                  hand  MONDIAN_GL_INSERT_EVENT_MARKER_EXT
-0x1990  glPushGroupMarkerEXT                    hand  MONDIAN_GL_PUSH_GROUP_MARKER_EXT
-0x1998  glPopGroupMarkerEXT                     hand  MONDIAN_GL_POP_GROUP_MARKER_EXT
+0x1390  glGetUniformLocation
+0x1398  glGetActiveUniform
+0x13a0  glGetUniformfv
+0x13a8  glGetUniformiv
+0x13b0  glGetShaderSource
+0x13b8  glBindAttribLocation
+0x13c0  glGetActiveAttrib
+0x13c8  glGetAttribLocation
+0x13d8  glGenQueries
+0x13e0  glDeleteQueries
+0x13e8  glIsQuery
+0x13f0  glBeginQuery
+0x13f8  glEndQuery
+0x1400  glGetQueryiv
+0x1410  glGetQueryObjectuiv
+0x1418  glBindBuffer
+0x1420  glDeleteBuffers
+0x1428  glGenBuffers
+0x1430  glIsBuffer
+0x1438  glBufferData
+0x1440  glBufferSubData
+0x1458  glUnmapBuffer
+0x1460  glGetBufferParameteriv
+0x1468  glGetBufferPointerv
+0x1478  glDrawBuffers
+0x1480  glIsShader
+0x1488  glIsProgram
+0x1490  glGetShaderiv
+0x1498  glGetProgramiv
+0x14a0  glGetShaderInfoLog
+0x14a8  glGetProgramInfoLog
+0x14b0  glStencilFuncSeparate
+0x14b8  glStencilMaskSeparate
+0x14d0  glIsRenderbuffer
+0x14d8  glBindRenderbuffer
+0x14e0  glDeleteRenderbuffers
+0x14e8  glGenRenderbuffers
+0x14f0  glRenderbufferStorage
+0x14f8  glGetRenderbufferParameteriv
+0x1500  glIsFramebuffer
 0x1508  glBindFramebuffer                      hand  MONDIAN_GL_BIND_FRAMEBUFFER
 0x1510  glDeleteFramebuffers                   hand  MONDIAN_GL_DELETE_FRAMEBUFFERS
+0x1518  glGenFramebuffers
+0x1520  glCheckFramebufferStatus
 0x1530  glFramebufferTexture2D                 hand  MONDIAN_GL_FRAMEBUFFER_TEXTURE_2D
+0x1540  glFramebufferRenderbuffer
+0x1548  glGetFramebufferAttachmentParameteriv
+0x1550  glGenerateMipmap
+0x1590  glProgramParameteri
+0x15a0  glFramebufferTextureLayer
+0x15b0  glBindBufferRange
+0x15c0  glBindBufferBase
+0x15c8  glBeginTransformFeedback
+0x15d0  glEndTransformFeedback
+0x15d8  glTransformFeedbackVaryings
+0x15e0  glGetTransformFeedbackVarying
+0x15e8  glGetIntegeri_v
+0x1658  glVertexAttribI4i
+0x1678  glVertexAttribI4ui
+0x1698  glVertexAttribI4iv
+0x16b8  glVertexAttribI4uiv
+0x16e0  glVertexAttribIPointer
+0x16e8  glGetVertexAttribIiv
+0x16f0  glGetVertexAttribIuiv
+0x16f8  glUniform1ui
+0x1700  glUniform2ui
+0x1708  glUniform3ui
+0x1710  glUniform4ui
+0x1718  glUniform1uiv
+0x1720  glUniform2uiv
+0x1728  glUniform3uiv
+0x1730  glUniform4uiv
+0x1738  glGetUniformuiv
+0x1748  glGetFragDataLocation
+0x1770  glUniformMatrix2x3fv
+0x1778  glUniformMatrix3x2fv
+0x1780  glUniformMatrix2x4fv
+0x1788  glUniformMatrix4x2fv
+0x1790  glUniformMatrix3x4fv
+0x1798  glUniformMatrix4x3fv
+0x17a0  glBlitFramebuffer
+0x17a8  glRenderbufferStorageMultisample
+0x17c0  glGetAttachedShaders
+0x17d8  glDrawArraysInstancedEXT
+0x17e0  glDrawElementsInstancedEXT
+0x1808  glBindVertexArray
+0x1810  glDeleteVertexArrays
+0x1818  glGenVertexArrays
+0x1820  glIsVertexArray
+0x1828  glPointSizePointerOES
+0x1838  glClearBufferiv
+0x1840  glClearBufferuiv
+0x1848  glClearBufferfv
+0x1850  glClearBufferfi
+0x1858  glGetStringi
+0x1860  glFenceSync
+0x1868  glIsSync
+0x1870  glDeleteSync
+0x1878  glClientWaitSync
+0x1880  glWaitSync
+0x1888  glGetInteger64v
+0x1890  glGetSynciv
+0x18c0  glCopyBufferSubData
+0x18e0  glMapBufferRange
+0x18e8  glFlushMappedBufferRange
+0x18f8  glGetInteger64i_v
+0x1900  glGetBufferParameteri64v
+0x1908  glGenSamplers
+0x1910  glDeleteSamplers
+0x1918  glIsSampler
+0x1920  glBindSampler
+0x1928  glSamplerParameteri
+0x1930  glSamplerParameteriv
+0x1938  glSamplerParameterf
+0x1940  glSamplerParameterfv
+0x1958  glGetSamplerParameteriv
+0x1960  glGetSamplerParameterfv
+0x1978  glLabelObjectEXT
+0x1980  glGetObjectLabelEXT
+0x1988  glInsertEventMarkerEXT                 hand  MONDIAN_GL_INSERT_EVENT_MARKER_EXT
+0x1990  glPushGroupMarkerEXT                   hand  MONDIAN_GL_PUSH_GROUP_MARKER_EXT
+0x1998  glPopGroupMarkerEXT                    hand  MONDIAN_GL_POP_GROUP_MARKER_EXT
+0x1b58  glReleaseShaderCompiler
+0x1b60  glShaderBinary
+0x1b68  glGetShaderPrecisionFormat
+0x1b70  glDepthRangef
+0x1b78  glClearDepthf
+0x1bc0  glGetProgramBinary
+0x1bc8  glProgramBinary
+0x1c48  glBindTransformFeedback
+0x1c50  glGenTransformFeedbacks
+0x1c58  glDeleteTransformFeedbacks
+0x1c60  glPauseTransformFeedback
+0x1c68  glResumeTransformFeedback
+0x1c70  glIsTransformFeedback
+0x1e48  glAlphaFuncx
+0x1e50  glClearColorx
+0x1e58  glClearDepthx
+0x1e60  glClipPlanef
+0x1e68  glClipPlanex
+0x1e70  glColor4x
+0x1e78  glDepthRangex
+0x1e80  glFogx
+0x1e88  glFogxv
+0x1e90  glFrustumf
+0x1e98  glFrustumx
+0x1ea0  glGetClipPlanef
+0x1ea8  glGetClipPlanex
+0x1eb0  glGetFixedv
+0x1eb8  glGetLightxv
+0x1ec0  glGetMaterialxv
+0x1ec8  glGetTexEnvxv
+0x1ed0  glGetTexParameterxv
+0x1ed8  glLightModelx
+0x1ee0  glLightModelxv
+0x1ee8  glLightx
+0x1ef0  glLightxv
+0x1ef8  glLineWidthx
+0x1f00  glLoadMatrixx
+0x1f08  glMaterialx
+0x1f10  glMaterialxv
+0x1f18  glMultMatrixx
+0x1f20  glNormal3x
+0x1f28  glOrthof
+0x1f30  glOrthox
+0x1f38  glPointSizex
+0x1f40  glPolygonOffsetx
+0x1f48  glRotatex
+0x1f50  glScalex
+0x1f58  glTexEnvx
+0x1f60  glTexEnvxv
+0x1f68  glTexParameterx
+0x1f70  glTexParameterxv
+0x1f78  glTranslatex
+0x1f80  glMultiTexCoord4x
+0x1f88  glSampleCoveragex
+0x1f90  glPointParameterx
+0x1f98  glPointParameterxv
+0x2000  glInvalidateFramebuffer
 0x2008  glFramebufferParameteriAPPLE           hand  MONDIAN_GL_FRAMEBUFFER_PARAMETERI_APPLE
+0x2028  glInvalidateSubFramebuffer
+0x2040  glTexStorage2D
+0x2048  glTexStorage3D

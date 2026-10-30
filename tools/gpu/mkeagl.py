@@ -294,6 +294,8 @@ def emit_declarations(slots, prototypes):
         ret, params = prototypes[name]
         if not types_known(ret, params):
             continue
+        if ret.strip() == 'GLvoid':
+            ret = 'void'
         arguments = ", ".join(p[0] for p in params) or "void"
         out.append(f"extern {ret} {name}({arguments});")
     return out
@@ -302,6 +304,8 @@ def emit_declarations(slots, prototypes):
 def emit_stub(offset, name, prototype):
     """A forwarder: enter, call, leave, hand back what the call gave (if anything)."""
     ret, params = prototype
+    if ret.strip() == 'GLvoid':
+        ret = 'void'
     arguments, names = [], []
     for index, (kind, identifier) in enumerate(params):
         name_here = identifier or f"a{index + 1}"
@@ -327,7 +331,10 @@ def emit_stub(offset, name, prototype):
 
 
 def emit_table(slots, prototypes, slots_count):
-    named = {offset for offset, _, _ in slots}
+    # An entry with a name but no prototype the headers give cannot be forwarded:
+    # it becomes a "not there" stub like an unnamed one, or the table would
+    # reference a function that was never emitted.
+    named = {offset for offset, name, hand in slots if hand or name in prototypes}
     top = max(named)
     out = ["", "/* ---- the table (EAGL_GEN_TABLE) ---- */", ""]
 
@@ -383,6 +390,8 @@ def emit_table(slots, prototypes, slots_count):
     out.append("\t\ttable[slot] = (void *)eagl_unknown_slots[slot - 1];")
     out.append("\t}")
     for offset, name, hand in slots:
+        if not hand and name not in prototypes:
+            continue        # no prototype: it keeps its "not there" stub
         entry = f"my_{name}" if hand else f"eagl_slot_{offset:#06x}"
         out.append(f"\ttable[{offset:#06x} / 8] = (void *){entry};")
     out.append("}")

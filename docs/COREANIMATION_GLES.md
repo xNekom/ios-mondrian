@@ -16,6 +16,18 @@ context is created. Three measured traps, in the order they were paid for:
   `/private/var/vm`). The write retries until that mount exists (12 s measured), and the injector
   prefers `/private/var/vm/mondrian-gl.dylib` over `/usr/libexec/mondrian-gl.dylib`, which only a
   flash can change. A userland change is therefore one `fastboot boot`, not a 14 GB flash.
+- **`OSMesaMakeCurrent` corrupts the EAGLContext struct.** With the field traced
+  before and after the call, `gl` reads back zero once the call returns
+  (`init e … create -> gl 0x117e197d0` / `after make_current -> gl 0x0`), and the
+  attempts that died did so inside the same call (SIGBUS in `_platform_memmove`).
+  The window buffer now has an aligned-stride's slack and the one OSMesa context
+  is also kept in a file-scope `the_gl`, which `eagl_enter` falls back to, so the
+  server no longer depends on that field.
+- **The function table is now the real one.** HackiOS publishes its
+  `userland/src/eagl_slots.txt` for the same userland (409 entries) and all 30
+  entries this port had agree with it exactly, so the rest was merged: 340 of
+  them are exported by the Mesa build here and every other one becomes a
+  "not there" stub. That is what turned `glCreateShader` from 0 into 1 and 2.
 - **CoreAnimation does not always pass `table[0]`.** A call arrived with an argument that is not
   one of our contexts, so every field read as zero and `glCreateShader` went to Mesa's no-op
   dispatch (0, no GL error). `eagl_resolve()` matches the argument against the live contexts and

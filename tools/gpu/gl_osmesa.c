@@ -69,6 +69,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <string.h>
 
 #include "mondrian_gl.h"
@@ -101,7 +105,8 @@ extern unsigned glGetError(void);
  * OSMesa draws its "window" into memory handed to it. Nothing here draws into a window (the
  * window server draws into textures of its own, see eagl.c): a few pixels will do.
  */
-#define WINDOW  16
+#define WINDOW_W 16
+#define WINDOW_H 16
 
 /*
  * The window is a mapping of its own, not an array inside the struct: OSMesa
@@ -109,12 +114,41 @@ extern unsigned glGetError(void);
  * and a fixed inline array next to the context is one overflow away from a
  * SIGBUS (measured: _platform_memmove inside OSMesaMakeCurrent).
  */
-#define WINDOW_BYTES (1024u * 1024u)
+/*
+ * OSMesa writes the window as stride * height, where the stride is the
+ * driver's pitch (aligned to 64 or 128 bytes), not width * 4. Measured: with
+ * exactly width*height*4 the write ran past the allocation — past an unmapped
+ * page at 16x16 (SIGBUS in _platform_memmove through OSMesaMakeCurrent) and
+ * into the next heap block at 1080x2400, zeroing the EAGLContext's gl field.
+ * The slack is one aligned stride per row plus a megabyte.
+ */
+#define WINDOW_BYTES (WINDOW_W * WINDOW_H * 4u + WINDOW_H * 512u + (1024u * 1024u))
 
 struct mondrian_gl {
 	OSMesaContext context;
 	unsigned char *window;
 };
+
+
+/* The kernel's ring picks up /dev/console; stdout does not reach it. */
+static void
+gl_say(const char *format, ...)
+{
+	char line[256];
+	va_list list;
+	int fd, length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	fd = open("/dev/console", O_WRONLY);
+	if (fd >= 0) {
+		if (length > 0) {
+			(void)write(fd, line, (size_t)length);
+		}
+		close(fd);
+	}
+}
 
 struct mondrian_gl *
 mondrian_gl_create(int version)
@@ -134,8 +168,14 @@ mondrian_gl_create(int version)
 		return NULL;
 	}
 	gl->window = calloc(1, WINDOW_BYTES);
-	if (gl->window == NULL ||
-	    (gl->context = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL)) == NULL) {
+	if (gl->window == NULL) {
+		free(gl);
+		return NULL;
+	}
+	gl_say("MONDRIAN GL: create window %p, context begin\n", (void *)gl->window);
+	gl->context = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL);
+	gl_say("MONDRIAN GL: context %p\n", (void *)gl->context);
+	if (gl->context == NULL) {
 		free(gl->window);
 		free(gl);
 		return NULL;
@@ -157,10 +197,17 @@ mondrian_gl_is_current(struct mondrian_gl *gl)
 int
 mondrian_gl_make_current(struct mondrian_gl *gl)
 {
+	int result;
+
 	if (gl == NULL) {
 		return OSMesaMakeCurrent(NULL, NULL, 0, 0, 0);
 	}
-	return OSMesaMakeCurrent(gl->context, gl->window, GL_UNSIGNED_BYTE, WINDOW, WINDOW);
+	gl_say("MONDRIAN GL: make_current %p ctx %p win %p begin\n",
+	    (void *)gl, (void *)gl->context, (void *)gl->window);
+	result = OSMesaMakeCurrent(gl->context, gl->window, GL_UNSIGNED_BYTE,
+	    WINDOW_W, WINDOW_H);
+	gl_say("MONDRIAN GL: make_current -> %d\n", result);
+	return result;
 }
 
 void

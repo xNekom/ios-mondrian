@@ -342,6 +342,14 @@ static int all_shaders;                         /* boot-arg glshaders=1: the tex
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static bool said_fallback;
+/*
+ * The one OSMesa context, kept outside the EAGLContext struct. Measured: the
+ * struct's gl field reads back zero right after OSMesaMakeCurrent returns, so
+ * something in that call (or in the driver behind it) writes over it. The
+ * server has one context anyway; eagl_enter falls back to this when the field
+ * is gone.
+ */
+static struct mondrian_gl *the_gl;
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* mondrian: time spent in each entry */
@@ -393,11 +401,18 @@ static void clear_now(struct eagl *e);
 static void
 eagl_enter(struct eagl *e, unsigned offset)
 {
-	if (e == NULL || e->gl == NULL) {
+	struct mondrian_gl *gl;
+
+	if (e == NULL) {
 		return;
 	}
-	if (current != e || !mondrian_gl_is_current(e->gl)) {
-		if (!mondrian_gl_make_current(e->gl)) {
+	gl = e->gl != NULL ? e->gl : the_gl;
+	if (gl == NULL) {
+		return;
+	}
+	e->gl = gl;		/* put it back if it was zeroed */
+	if (current != e || !mondrian_gl_is_current(gl)) {
+		if (!mondrian_gl_make_current(gl)) {
 			say("mondrian-gl: the context cannot be made this thread's\n");
 		}
 		current = e;
@@ -472,6 +487,12 @@ eagl_resolve(void *context)
 		if (contexts[i] != NULL &&
 		    (contexts[i] == (struct eagl *)context ||
 		    contexts[i]->object == (id)context)) {
+			if (contexts[i]->gl == NULL && !said_fallback) {
+				said_fallback = true;
+				say("mondrian-gl: argument %p matched context %u (%p, object %p) with no library\n",
+				    context, i, (void *)contexts[i],
+				    (void *)contexts[i]->object);
+			}
 			return contexts[i];
 		}
 		if (contexts[i] != NULL && contexts[i]->gl != NULL) {
@@ -3521,17 +3542,26 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	if (e->gl == NULL) {
 		e->gl = mondrian_gl_create((int)api);
 	}
+	if (e->gl != NULL) {
+		the_gl = e->gl;
+	}
+	say("mondrian-gl: init e %p create -> gl %p (the_gl %p)\n",
+	    (void *)e, (void *)e->gl, (void *)the_gl);
 	if (e->gl == NULL || !mondrian_gl_make_current(e->gl)) {
 		say("mondrian-gl: %s gives no OpenGL ES %lu context\n", mondrian_gl_library(), api);
 		free(e);
 		return nil;
 	}
+	say("mondrian-gl: init e %p after make_current -> gl %p\n",
+	    (void *)e, (void *)e->gl);
 	current = e;
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
 	eagl_fill_table(e->table);
 	contexts[place] = e;
+	say("mondrian-gl: context %p (object %p, gl %p) at slot %u\n",
+	    (void *)e, (void *)self, (void *)e->gl, place);
 	say("mondrian-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, mondrian_gl_library(),
 	    (const char *)glGetString(GL_VERSION), (const char *)glGetString(GL_RENDERER),
 	    (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
@@ -3687,7 +3717,8 @@ my_dealloc(id self, SEL selector)
 	struct eagl *e = context_of(self);
 
 	if (e != NULL) {
-		say("mondrian-gl: the context goes\n");
+		say("mondrian-gl: the context goes (%p, object %p, gl %p)\n",
+		    (void *)e, (void *)self, (void *)e->gl);
 		summary(e);
 		for (unsigned i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
 			if (contexts[i] == e) {
