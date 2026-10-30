@@ -394,7 +394,7 @@ eagl_enter(struct eagl *e, unsigned offset)
 	if (e == NULL || e->gl == NULL) {
 		return;
 	}
-	if (current != e) {
+	if (current != e || !mondrian_gl_is_current(e->gl)) {
 		if (!mondrian_gl_make_current(e->gl)) {
 			say("mondrian-gl: the context cannot be made this thread's\n");
 		}
