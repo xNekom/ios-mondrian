@@ -27,10 +27,10 @@ sequence on their silicon, so the difference is this GPU's trusted state or a
 start handshake that is still missing.
 diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
 new file mode 100644
-index 0000000..4b49fea
+index 0000000..6835379
 --- /dev/null
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -0,0 +1,3282 @@
+@@ -0,0 +1,3299 @@
 +/*
 + * MONDRIAN GPU: the first look at the Adreno 730 blocks.
 + *
@@ -92,6 +92,7 @@ index 0000000..4b49fea
 +static uint32_t mondrian_uc_ds_addr;
 +static vm_offset_t mondrian_uc_gpu;
 +static vm_offset_t mondrian_uc_smmu;
++static vm_offset_t mondrian_uc_gmu;
 +static uint32_t mondrian_uc_at;
 +static uint32_t mondrian_uc_fence;
 +static uint32_t mondrian_uc_table_next = 1;
@@ -2639,6 +2640,7 @@ index 0000000..4b49fea
 +		 * continues at this dword. */
 +		mondrian_uc_gpu = gpu;
 +		mondrian_uc_smmu = smmu;
++		mondrian_uc_gmu = gmu;
 +		mondrian_uc_at = at;
 +		mondrian_uc_up = 1;
 +		if (rptr >= at) {
@@ -3013,11 +3015,26 @@ index 0000000..4b49fea
 +	ring[at++] = seq;
 +	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
 +	ring[at++] = 1;
++	/* kgsl toggles the GMU keepalive around every submission
++	 * (gen7_gpu_keepalive true/false); holding it on forever leaves the
++	 * power state machine in a different place and the same stream then
++	 * completes in one boot and stalls in the next. */
++	if (mondrian_uc_gmu != 0) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
++	}
 +	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	mondrian_uc_fence = seq;
 +	mondrian_uc_at = at;
 +	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++	/* Read it back so the posted write is committed to the interconnect
++	 * before anything else happens: a write pointer the CP has not seen
++	 * leaves it in the ucode's waitin state, waiting for packet data. */
++	__asm__ volatile("dsb sy" ::: "memory");
++	(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
++	if (mondrian_uc_gmu != 0) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
++	}
 +	*fence = seq;
 +	if (dwords > 16 && mondrian_uc_logged < 8) {
 +		/* A command stream from a real driver, not the bring-up probe:

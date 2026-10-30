@@ -273,7 +273,9 @@ them has Metal. That is the path this port follows.
   first submission (`at` = rptr = wptr) and diverge on the failure
   (`at 0x5e4 rptr 0x5d0`). The CCU invalidates and the `CP_SET_MARKER` IFPC
   pair that kgsl and pong put around a submission were tried and change
-  nothing.
+  nothing, and neither does toggling the GMU keepalive around every submission
+  the way kgsl does, nor reading the write pointer back so the posted write is
+  committed before the next register access.
 - **The packet the CP refuses is `CP_SET_DRAW_STATE` (0x43), and only when it
   carries real groups.** With `gpunop=0x43` every one of Mesa's submissions
   completes (`done 1`, `CP_INTERRUPT_STATUS` 0); NOPing the draw
