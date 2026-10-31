@@ -350,6 +350,21 @@ static bool said_fallback;
  * is gone.
  */
 static struct mondrian_gl *the_gl;
+
+/* The one OSMesa context. The field in the EAGLContext struct is measured to
+ * come back zeroed or poisoned (0xff0000ffff0000ff), so it is never trusted:
+ * the server has one context and this is it. */
+static struct mondrian_gl *
+context_gl(struct eagl *e)
+{
+	if (the_gl != NULL) {
+		return the_gl;
+	}
+	if (e != NULL && (uintptr_t)e->gl > 0x10000) {
+		return e->gl;
+	}
+	return NULL;
+}
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* mondrian: time spent in each entry */
@@ -406,7 +421,7 @@ eagl_enter(struct eagl *e, unsigned offset)
 	if (e == NULL) {
 		return;
 	}
-	gl = e->gl != NULL ? e->gl : the_gl;
+	gl = context_gl(e);
 	if (gl == NULL) {
 		return;
 	}
@@ -495,7 +510,7 @@ eagl_resolve(void *context)
 			}
 			return contexts[i];
 		}
-		if (contexts[i] != NULL && contexts[i]->gl != NULL) {
+		if (contexts[i] != NULL && context_gl(contexts[i]) != NULL) {
 			fallback = contexts[i];
 		}
 	}
@@ -703,7 +718,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 	glGenTextures(1, &image->mirror);
 	glBindTexture(GL_TEXTURE_2D, image->mirror);
-	if (!mondrian_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	if (!mondrian_gl_surface_texture(context_gl(e), IOSurfaceGetID(surface))) {
 		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 		glDeleteTextures(1, &image->mirror);
 		image->mirror = 0;
@@ -726,7 +741,7 @@ surface_shared(struct eagl *e, struct image *image)
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
-	    !mondrian_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	    !mondrian_gl_surface_texture(context_gl(e), IOSurfaceGetID(surface))) {
 		e->refused++;
 		return false;
 	}

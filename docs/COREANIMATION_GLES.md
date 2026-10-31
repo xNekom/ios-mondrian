@@ -21,8 +21,10 @@ context is created. Three measured traps, in the order they were paid for:
   (`init e … create -> gl 0x117e197d0` / `after make_current -> gl 0x0`), and the
   attempts that died did so inside the same call (SIGBUS in `_platform_memmove`).
   The window buffer now has an aligned-stride's slack and the one OSMesa context
-  is also kept in a file-scope `the_gl`, which `eagl_enter` falls back to, so the
-  server no longer depends on that field.
+  is also kept in a file-scope `the_gl`, and every use goes through
+  `context_gl()`, which prefers it and only trusts the struct's field when it is
+  a plausible pointer (measured: the field also came back as the poison value
+  `0xff0000ffff0000ff`, which a NULL check does not catch).
 - **The function table is now the real one.** HackiOS publishes its
   `userland/src/eagl_slots.txt` for the same userland (409 entries) and all 30
   entries this port had agree with it exactly, so the rest was merged: 340 of
