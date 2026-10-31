@@ -293,6 +293,13 @@ them has Metal. That is the path this port follows.
 - **Protected mode matters.** With `CP_PROTECT_CNTL` enabled and no way out,
   Mesa's type-4 register writes are refused; kgsl brackets a submission with
   `CP_SET_PROTECTED_MODE(0)` … `(1)` for that reason and our frame does too.
+- **An Xcode update silently breaks both build trees.** The Mesa cross file
+  (`out/mesa/cross.ini`) bakes the absolute SDK path, so once Xcode replaces
+  `iPhoneOS27.1.sdk` with `27.2` every compile fails with "`time.h` not found";
+  point it at `iPhoneOS.sdk` (the symlink) and reconfigure. The kernel build
+  uses Xcode's `iig`, and a newer `iig` emits `.iig.cpp` that expects an
+  `IORPC` with `kernelContent`, which this XNU does not have; with the same
+  Xcode version it compiles. Both failures look like source errors and are not.
 - **The packet-level tools** are `tools/pm4-decode.py` (names every packet from
   Mesa's `adreno_pm4.xml`, honouring the a7xx variants of a number),
   `gpupm4=N` (truncate a submitted stream to N dwords) and `gpunoblit=1`
