@@ -57,7 +57,10 @@ if [ "$(wc -c < "$image")" -gt "$max" ] && [ "${image##*.}" != simg ]; then
 fi
 
 # -S 512M: the big write needs the extra buffer, or the transfer stalls.
-fastboot -S 512M flash "$partition" "$image"
+# Chunk size of the sparse transfer. A smaller one survives a marginal USB
+# link better: each chunk is a separate request, so a stall costs a retry and
+# not the whole partition. FASTBOOT_CHUNK=64M for a link that keeps dropping.
+fastboot -S "${FASTBOOT_CHUNK:-512M}" flash "$partition" "$image"
 
 echo
 echo "The $partition partition now holds the iOS root."
