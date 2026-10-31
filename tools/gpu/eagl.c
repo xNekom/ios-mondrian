@@ -998,11 +998,23 @@ target_to_surface(struct eagl *e, struct image *image)
 	{
 		size_t surface_height = IOSurfaceGetHeight(surface);
 		size_t surface_columns = row / 4;
+		size_t alloc = IOSurfaceGetAllocSize(surface);
+		size_t max_rows = row != 0 ? alloc / row : 0;
 		GLsizei rows = image->height;
 		GLsizei columns = image->width;
 
+		/*
+		 * Three limits, not one: the surface's height, its stride and
+		 * what it actually has allocated. CoreAnimation's surfaces have
+		 * been seen with a stride and height that do not describe the
+		 * allocation, and the write past it lands on the heap next door
+		 * (measured: two red pixels on the EAGLContext's fields).
+		 */
 		if ((size_t)rows > surface_height) {
 			rows = (GLsizei)surface_height;
+		}
+		if ((size_t)rows > max_rows) {
+			rows = (GLsizei)max_rows;
 		}
 		if ((size_t)columns > surface_columns) {
 			columns = (GLsizei)surface_columns;
@@ -1011,11 +1023,11 @@ target_to_surface(struct eagl *e, struct image *image)
 			base = IOSurfaceGetBaseAddress(surface);
 			if (base != NULL && surface_copies < 6) {
 				surface_copies++;
-				say("mondrian-gl: surface %ux%u row %zu base %p"
-				    " ..%p, context %p\n", (unsigned)columns,
-				    (unsigned)rows, row, (void *)base,
-				    (void *)(base + row * surface_height),
-				    (void *)e);
+				say("mondrian-gl: surface %ux%u row %zu alloc %zu"
+				    " need %zu, base %p ..%p, context %p\n",
+				    (unsigned)columns, (unsigned)rows, row, alloc,
+				    row * surface_height, (void *)base,
+				    (void *)(base + alloc), (void *)e);
 			}
 			if (base != NULL && rows > 0 && columns > 0) {
 				glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)surface_columns);
@@ -1066,10 +1078,17 @@ show_texture(struct eagl *e, struct image *image)
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 	if (glGetError() == 0 && IOSurfaceLock(image->surface, 0, NULL) == 0) {
+		size_t alloc = IOSurfaceGetAllocSize(image->surface);
+
 		base = IOSurfaceGetBaseAddress(image->surface);
 		for (GLint y = 0; y < height && y < image->height; y++) {
+			size_t columns = (size_t)(width < image->width ? width : image->width);
+
+			if (row * (size_t)y + columns * 4 > alloc) {
+				break;
+			}
 			memcpy(base + row * (size_t)y, pixels + (size_t)y * (size_t)width * 4,
-			    (size_t)(width < image->width ? width : image->width) * 4);
+			    columns * 4);
 		}
 		IOSurfaceUnlock(image->surface, 0, NULL);
 	}
