@@ -14,6 +14,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <fcntl.h>
 
 #include <IOKit/IOKitLib.h>
 
@@ -172,6 +175,28 @@ drmGetCap(int fd, uint64_t capability, uint64_t *value)
 	return 0;
 }
 
+
+/* The kernel's ring picks up /dev/console; this is how a mapping gets a name
+ * in a boot log when something later writes past its end. */
+static void
+drm_say(const char *format, ...)
+{
+	char line[192];
+	va_list list;
+	int fd, length;
+
+	va_start(list, format);
+	length = vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	fd = open("/dev/console", O_WRONLY);
+	if (fd >= 0) {
+		if (length > 0) {
+			(void)write(fd, line, (size_t)length);
+		}
+		close(fd);
+	}
+}
+
 void *
 mondrian_drm_map(int fd, uint32_t handle, uint64_t size)
 {
@@ -192,6 +217,10 @@ mondrian_drm_map(int fd, uint32_t handle, uint64_t size)
 	    &address, &mapped, kIOMapAnywhere) != 0) {
 		return (void *)-1;		/* mmap()'s MAP_FAILED */
 	}
+	drm_say("MONDRIAN DRM: map handle %u asked %llu mapped %llu at %p..%p\n",
+	    handle, (unsigned long long)size, (unsigned long long)mapped,
+	    (void *)(uintptr_t)address,
+	    (void *)(uintptr_t)(address + mapped));
 	return (void *)(uintptr_t)address;
 }
 
