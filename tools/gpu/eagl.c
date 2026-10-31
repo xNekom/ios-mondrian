@@ -3652,13 +3652,15 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	say("mondrian-gl: init e %p after make_current -> gl %p\n",
 	    (void *)e, (void *)e->gl);
 	current = e;
-	shadow_copy = *e;
-	have_shadow = true;
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
 	eagl_fill_table(e->table);
 	contexts[place] = e;
+	/* After every field is in place, so the reporter does not report our
+	 * own initialisation. */
+	shadow_copy = *e;
+	have_shadow = true;
 	say("mondrian-gl: context %p (object %p, gl %p) at slot %u\n",
 	    (void *)e, (void *)self, (void *)e->gl, place);
 	say("mondrian-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, mondrian_gl_library(),
