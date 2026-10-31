@@ -437,10 +437,22 @@ eagl_enter(struct eagl *e, unsigned offset)
 	}
 }
 
+static bool said_gl_corrupt;
+
 static void
 eagl_leave(struct eagl *e, unsigned offset)
 {
 	GLenum error;
+
+	if (the_gl != NULL && e != NULL && e->gl != the_gl) {
+		if (!said_gl_corrupt) {
+			said_gl_corrupt = true;
+			say("mondrian-gl: %s left gl %p (should be %p)\n",
+			    eagl_slot_name(offset), (void *)e->gl,
+			    (void *)the_gl);
+		}
+		e->gl = the_gl;
+	}
 
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (e->errors++ < 60) {
@@ -3464,8 +3476,18 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
 		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
 	}
-	free((void *)e->sources[shader % 64]);
-	e->sources[shader % 64] = text;
+	{
+		const char *previous = e->sources[shader % 64];
+
+		if (previous != NULL && (uintptr_t)previous > 0x10000 &&
+		    (uintptr_t)previous < 0x800000000000ull) {
+			free((void *)previous);
+		} else if (previous != NULL) {
+			say("mondrian-gl: source for shader %u was %p, not freed\n",
+			    shader, (void *)previous);
+		}
+		e->sources[shader % 64] = text;
+	}
 	glShaderSource(shader, 6, (const GLchar *const[6]){ parts[0], parts[5], parts[1], parts[2], parts[3], parts[4] }, NULL);
 	EAGL_LEAVE(e, MONDIAN_GL_SHADER_SOURCE);
 }
