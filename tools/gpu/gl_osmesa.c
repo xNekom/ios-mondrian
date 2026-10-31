@@ -173,7 +173,14 @@ mondrian_gl_create(int version)
 		return NULL;
 	}
 	gl_say("MONDRIAN GL: create window %p, context begin\n", (void *)gl->window);
-	gl->context = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL);
+	/*
+	 * No depth, no stencil: CoreAnimation draws into its own textures and
+	 * the window here is a dummy. The 24/8 buffers are what
+	 * OSMesaMakeCurrent validates and allocates on this driver, and the
+	 * SIGBUS lands in an allocation made there (measured: a write 1 KiB
+	 * before a page boundary, in none of the DRM mappings).
+	 */
+	gl->context = OSMesaCreateContextExt(OSMESA_RGBA, 0, 0, 0, NULL);
 	gl_say("MONDRIAN GL: context %p\n", (void *)gl->context);
 	if (gl->context == NULL) {
 		free(gl->window);
