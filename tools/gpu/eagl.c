@@ -350,6 +350,10 @@ static bool said_fallback;
  * is gone.
  */
 static struct mondrian_gl *the_gl;
+static struct eagl shadow_copy;         /* the struct as it was when it was made */
+static bool have_shadow;
+static bool said_struct_changed;
+static unsigned surface_copies;
 
 /* The one OSMesa context. The field in the EAGLContext struct is measured to
  * come back zeroed or poisoned (0xff0000ffff0000ff), so it is never trusted:
@@ -452,6 +456,32 @@ eagl_leave(struct eagl *e, unsigned offset)
 			    (void *)the_gl);
 		}
 		e->gl = the_gl;
+	}
+	/*
+	 * The struct is compared with a copy taken when it was made, while
+	 * nothing has been reported yet: the corruption shows up as eight or
+	 * sixteen bytes of red pixels in a field, and this names the call that
+	 * left them there and where they landed.
+	 */
+	if (e != NULL && have_shadow && !said_struct_changed) {
+		const uint8_t *now = (const uint8_t *)e;
+		const uint8_t *was = (const uint8_t *)&shadow_copy;
+		size_t at = 0;
+
+		while (at < sizeof(*e) && now[at] == was[at]) {
+			at++;
+		}
+		if (at < sizeof(*e)) {
+			said_struct_changed = true;
+			say("mondrian-gl: %s changed the context at +0x%zx:"
+			    " %02x %02x %02x %02x %02x %02x %02x %02x"
+			    " (was %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+			    eagl_slot_name(offset), at,
+			    now[at], now[at + 1], now[at + 2], now[at + 3],
+			    now[at + 4], now[at + 5], now[at + 6], now[at + 7],
+			    was[at], was[at + 1], was[at + 2], was[at + 3],
+			    was[at + 4], was[at + 5], was[at + 6], was[at + 7]);
+		}
 	}
 
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
@@ -979,6 +1009,14 @@ target_to_surface(struct eagl *e, struct image *image)
 		}
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
 			base = IOSurfaceGetBaseAddress(surface);
+			if (base != NULL && surface_copies < 6) {
+				surface_copies++;
+				say("mondrian-gl: surface %ux%u row %zu base %p"
+				    " ..%p, context %p\n", (unsigned)columns,
+				    (unsigned)rows, row, (void *)base,
+				    (void *)(base + row * surface_height),
+				    (void *)e);
+			}
 			if (base != NULL && rows > 0 && columns > 0) {
 				glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)surface_columns);
 				glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -3614,6 +3652,8 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	say("mondrian-gl: init e %p after make_current -> gl %p\n",
 	    (void *)e, (void *)e->gl);
 	current = e;
+	shadow_copy = *e;
+	have_shadow = true;
 	e->object = self;
 	e->api = api;
 	e->table[0] = e;
