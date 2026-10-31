@@ -16,24 +16,17 @@ context is created. Three measured traps, in the order they were paid for:
   `/private/var/vm`). The write retries until that mount exists (12 s measured), and the injector
   prefers `/private/var/vm/mondrian-gl.dylib` over `/usr/libexec/mondrian-gl.dylib`, which only a
   flash can change. A userland change is therefore one `fastboot boot`, not a 14 GB flash.
-- **`OSMesaMakeCurrent` corrupts the EAGLContext struct.** With the field traced
-  before and after the call, `gl` reads back zero once the call returns
-  (`init e … create -> gl 0x117e197d0` / `after make_current -> gl 0x0`), and the
-  attempts that died did so inside the same call (SIGBUS in `_platform_memmove`).
-  The window buffer now has an aligned-stride's slack and the one OSMesa context
-  is also kept in a file-scope `the_gl`, and every use goes through
-  `context_gl()`, which prefers it and only trusts the struct's field when it is
-  a plausible pointer (measured: the field also came back as the poison value
-  `0xff0000ffff0000ff`, which a NULL check does not catch).
-- **Something writes pixels over the EAGLContext struct.** The `gl` field comes
-  back as `0xff0000ffff0000ff` — two red RGBA pixels — or as zero, and the
-  latest boot aborts inside `malloc` from `my_glShaderSource` (heap corruption).
-  The write is eight bytes wide at that field, so it is a render target or a
-  readback landing on the struct's memory rather than a wild pointer; the
-  surface copy path (`attachImage:` returns "not done", then
-  `target_to_surface()` reads pixels back into the IOSurface) is the place to
-  look next. Everything now goes through `context_gl()` so the corruption does
-  not decide whether GL works, but it still decides whether the heap survives.
+- **`OSMesaMakeCurrent` overwrote the EAGLContext with the smoke test's red triangle.**
+  The Mesa smoke test (`tools/mondrian-mesa-test.c`) freed its 256 KiB window but left its
+  OSMesa context current on that memory. The next `calloc` — the 31408-byte `struct eagl` — was
+  served the same block, and Mesa flushed the stale context's triangle over it when the window
+  server made its own context current: `gl` read back `0xff0000ffff0000ff` (two red pixels),
+  `sources[]` held the same, and `glLinkProgram` called through it (`pc 0xffff0000ff`). The test
+  now detaches with `OSMesaMakeCurrent(NULL, …)` and destroys the context before freeing the
+  window; the UI hook runs both smoke tests only with `gltest=1`. A second Mesa context in the
+  process that renders the UI is what the `gltest=1` gate keeps out, and `context_gl()` still
+  keeps the one context in a file-scope `the_gl` so a damaged field cannot decide whether GL
+  works.
 - **The function table is now the real one.** HackiOS publishes its
   `userland/src/eagl_slots.txt` for the same userland (409 entries) and all 30
   entries this port had agree with it exactly, so the rest was merged: 340 of
