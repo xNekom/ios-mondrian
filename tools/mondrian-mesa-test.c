@@ -171,8 +171,10 @@ mondrian_mesa_test(void)
 	struct osmesa_context *(*create)(unsigned, int, int, int, void *);
 	unsigned char (*make_current)(struct osmesa_context *, void *, unsigned,
 	    int, int);
+	void (*destroy)(struct osmesa_context *);
+	struct osmesa_context *context = NULL;
 	struct gl *gl;
-	unsigned char *pixels;
+	unsigned char *pixels = NULL;
 	unsigned char pixel[4];
 	const unsigned char *renderer, *version, *vendor;
 	io_service_t service = 0;
@@ -211,6 +213,8 @@ mondrian_mesa_test(void)
 	    dlsym(library, "OSMesaCreateContextExt");
 	make_current = (unsigned char (*)(struct osmesa_context *, void *,
 	    unsigned, int, int))dlsym(library, "OSMesaMakeCurrent");
+	destroy = (void (*)(struct osmesa_context *))
+	    dlsym(library, "OSMesaDestroyContext");
 	if (create == NULL || make_current == NULL) {
 		say("MONDRIAN MESA TEST: the library has no OSMesa entry points\n");
 		goto out;
@@ -225,20 +229,14 @@ mondrian_mesa_test(void)
 		say("MONDRIAN MESA TEST: out of memory\n");
 		goto out;
 	}
-	{
-		struct osmesa_context *context = create(GL_RGBA, 24, 8, 0, NULL);
-
-		if (context == NULL) {
-			say("MONDRIAN MESA TEST: OSMesaCreateContextExt failed\n");
-			free(pixels);
-			goto out;
-		}
-		if (make_current(context, pixels, GL_UNSIGNED_BYTE, kWidth,
-		    kHeight) == 0) {
-			say("MONDRIAN MESA TEST: OSMesaMakeCurrent failed\n");
-			free(pixels);
-			goto out;
-		}
+	context = create(GL_RGBA, 24, 8, 0, NULL);
+	if (context == NULL) {
+		say("MONDRIAN MESA TEST: OSMesaCreateContextExt failed\n");
+		goto out;
+	}
+	if (make_current(context, pixels, GL_UNSIGNED_BYTE, kWidth, kHeight) == 0) {
+		say("MONDRIAN MESA TEST: OSMesaMakeCurrent failed\n");
+		goto out;
 	}
 	vendor = gl->get_string(GL_VENDOR);
 	renderer = gl->get_string(GL_RENDERER);
@@ -253,7 +251,6 @@ mondrian_mesa_test(void)
 	gl->viewport(0, 0, kWidth, kHeight);
 	if (draw_triangle(gl) != 0) {
 		say("MONDRIAN MESA TEST: the draw path did not run\n");
-		free(pixels);
 		goto out;
 	}
 	gl->finish();
@@ -268,7 +265,6 @@ mondrian_mesa_test(void)
 	    pixel[2], pixel[3]);
 	if (pixel[0] < 250 || pixel[1] > 6 || pixel[2] > 6) {
 		say("MONDRIAN MESA TEST: FAILED (wrong pixels)\n");
-		free(pixels);
 		goto out;
 	}
 	if (renderer != NULL && (strstr((const char *)renderer, "FD") != NULL ||
@@ -278,9 +274,24 @@ mondrian_mesa_test(void)
 	} else {
 		say("MONDRIAN MESA TEST: SOFTWARE (Mesa fell back, no GPU screen)\n");
 	}
-	free(pixels);
 
 out:
+	/*
+	 * Give the context back before its window's memory is freed. Without
+	 * this the context stayed current with a drawable that pointed at the
+	 * freed buffer; Mesa then flushed it when the next context was made
+	 * current, which wrote the red triangle over whatever malloc had put
+	 * there. Measured: the EAGLContext (calloc of 31408 bytes, served the
+	 * same 256 KiB block) came back holding 0xff0000ffff0000ff, and the
+	 * window server died in glLinkProgram on the poisoned pointers.
+	 */
+	if (context != NULL) {
+		(void)make_current(NULL, NULL, 0, 0, 0);
+		if (destroy != NULL) {
+			destroy(context);
+		}
+	}
+	free(pixels);
 	if (console_fd >= 0) {
 		close(console_fd);
 	}

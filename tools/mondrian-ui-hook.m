@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/sysctl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -812,6 +813,21 @@ install_activation_hooks(void)
  * and the test logs its own verdict. A missing file is not an error; the test
  * is opt-in.
  */
+/* Is name (for example "gltest=1") in the kernel's boot arguments? */
+static int
+boot_arg_set(const char *name)
+{
+	char args[2048];
+	size_t size = sizeof(args);
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 ||
+	    size == 0) {
+		return 0;
+	}
+	args[sizeof(args) - 1] = 0;
+	return strstr(args, name) != NULL;
+}
+
 static void
 load_gpu_test(void)
 {
@@ -829,6 +845,18 @@ load_gpu_test(void)
 		    RTLD_NOW);
 		say(handle != NULL ? "MONDRIAN UI: CA GLES injector loaded\n"
 		    : "MONDRIAN UI: CA GLES injector dlopen failed\n");
+	}
+	/*
+	 * The smoke tests are opt-in (gltest=1). Both create Mesa contexts of
+	 * their own in the process that will later render the UI; the Mesa test
+	 * used to leave its 256 KiB context current with a freed window, and
+	 * the next calloc served the freed block to the EAGLContext, which the
+	 * old context then flushed its red triangle over. That corruption is
+	 * fixed at the source, but a second context in backboardd is still not
+	 * what the UI path wants.
+	 */
+	if (!boot_arg_set("gltest=1")) {
+		return;
 	}
 	if (access("/usr/libexec/mondrian-gpu-test.dylib", R_OK) != 0) {
 		return;
