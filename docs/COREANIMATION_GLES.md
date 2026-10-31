@@ -25,6 +25,15 @@ context is created. Three measured traps, in the order they were paid for:
   `context_gl()`, which prefers it and only trusts the struct's field when it is
   a plausible pointer (measured: the field also came back as the poison value
   `0xff0000ffff0000ff`, which a NULL check does not catch).
+- **Something writes pixels over the EAGLContext struct.** The `gl` field comes
+  back as `0xff0000ffff0000ff` — two red RGBA pixels — or as zero, and the
+  latest boot aborts inside `malloc` from `my_glShaderSource` (heap corruption).
+  The write is eight bytes wide at that field, so it is a render target or a
+  readback landing on the struct's memory rather than a wild pointer; the
+  surface copy path (`attachImage:` returns "not done", then
+  `target_to_surface()` reads pixels back into the IOSurface) is the place to
+  look next. Everything now goes through `context_gl()` so the corruption does
+  not decide whether GL works, but it still decides whether the heap survives.
 - **The function table is now the real one.** HackiOS publishes its
   `userland/src/eagl_slots.txt` for the same userland (409 entries) and all 30
   entries this port had agree with it exactly, so the rest was merged: 340 of
