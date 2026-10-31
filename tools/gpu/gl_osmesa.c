@@ -237,29 +237,20 @@ mondrian_gl_library(void)
 
 /*
  * OES_EGL_image, with the IOSurface's ID as the image (the comment at the top of the file says
- * what has to happen behind it). The drivers that draw in memory of their own with this
- * processor are not asked: they refuse every time, and the answer being "not done" is what
- * makes eagl.c copy.
+ * what has to happen behind it). Answer "not done" until both halves exist.
+ *
+ * This OSMesa build exports glEGLImageTargetTexture2DOES, but its front end has no
+ * osmesa_st_get_egl_image(): the call goes through a null hook and takes the process with it
+ * (measured: pc 0x0, lr in libOSMesa's glEGLImageTargetTexture2DOES, backtrace my_attachImage ->
+ * mondrian_gl_surface_texture -> crash; backboardd, 19 times). The Mesa half is not in
+ * mondrian-darwin.patch and the kernel request 0x7e is not implemented, so eagl.c has to copy
+ * the surface, which is the path the port runs today. Re-enable the call only when the Mesa hook
+ * and 0x7e land.
  */
 int
 mondrian_gl_surface_texture(struct mondrian_gl *gl, uint32_t surface)
 {
-	static void (*image_target)(unsigned target, void *image);
-	static int asked, software;
-
 	(void)gl;
-	if (!asked) {
-		const char *renderer = (const char *)glGetString(GL_RENDERER);
-
-		asked = 1;
-		image_target = (void (*)(unsigned, void *))OSMesaGetProcAddress("glEGLImageTargetTexture2DOES");
-		software = renderer == NULL || strstr(renderer, "softpipe") != NULL || strstr(renderer, "llvmpipe") != NULL;
-	}
-	if (image_target == NULL || software) {
-		return 0;
-	}
-	while (glGetError() != 0) {
-	}
-	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
-	return glGetError() == 0;
+	(void)surface;
+	return 0;
 }

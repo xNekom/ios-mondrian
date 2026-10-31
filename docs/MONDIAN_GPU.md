@@ -396,12 +396,14 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
   The CP tests hard-reset a non-journaled HFS; after several resets the next
   mount can take longer than 60 s (the ring stops at the UFS GPT with one
   process), so use 300 s or run `fsck_hfs` on the root image.
-- **Release kernel**: `KERNEL_CONFIG=RELEASE` currently dies on the `iig` trap
-  (`DriverKit/OSObject.iig.cpp: no member named 'kernelContent' in 'IORPC'`):
-  the new `OBJROOT` regenerates the stubs with the modern `iig`. HackiOS ships
-  `xnu-deps/` with a pregenerated `OSObject.iig.cpp`, `gen-iig-stubs.py` and a
-  host `iig`; use those (or copy the generated `DEVELOPMENT_ARM64_MONDRIAN`
-  `iokit` stubs) instead of the SDK's `iig`.
+- **Modern `iig` (Xcode 16+)**: it emits `IORPC.kernelContent`, which xnu-8796
+  does not have, so a build that reruns it dies in `DriverKit/*.iig.cpp` while
+  the kernel objects are fine. `tools/build-kernel-local.sh` seeds both
+  `iokit/DriverKit` and `iokit/<CONFIG>/DriverKit` from the other variant's
+  generated stubs after the checkout reset, so the kernel relinks without the
+  SDK `iig`; if neither variant has stubs yet, use the pregenerated ones
+  HackiOS ships in `xnu-deps/`. A `make install` that fails in `config_all`
+  after the link still leaves a usable `kernel.<config>.mondrian`.
 - **Debug I/O**: `serial=0`, no `debug=0xc`, no `-enable_kprintf_spam` for
   normal boots; the `FB: swap`/HID/sampler logs go to the ring.
 - **First boot**: a freshly flashed data volume needs one long first boot to

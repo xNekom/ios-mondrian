@@ -94,24 +94,34 @@ fi
 
 # Xcode 16 and newer ship an iig that emits IORPC.kernelContent, a field this
 # xnu (8796) does not have: the CI pins Xcode 15 for that reason. The generated
-# DriverKit stubs do not depend on the kernel config, so a RELEASE build reuses
-# the ones a DEVELOPMENT build already generated instead of re-running iig.
+# DriverKit stubs do not depend on the kernel config, so reuse the ones an
+# earlier build generated instead of re-running iig. Both output directories
+# exist (iokit/DriverKit and iokit/<CONFIG>/DriverKit): seeding only one leaves
+# the other to the SDK iig, which is why a relink after the checkout reset used
+# to fail on kernelContent even though the kernel objects were current.
+seed_stubs() {
+	_src=$1 _dst_config=$2
+	[ -d "$_src" ] && ! grep -rq kernelContent "$_src" 2>/dev/null || return 1
+	for _dst in \
+		"$DXB_DIR/build/xnu.obj/${_dst_config}_ARM64_${MACHINE}/iokit/${_dst_config}/DriverKit" \
+		"$DXB_DIR/build/xnu.obj/${_dst_config}_ARM64_${MACHINE}/iokit/DriverKit"; do
+		mkdir -p "$_dst"
+		cp "$_src"/*.h "$_src"/*.iig.cpp "$_dst"/
+		touch "$_dst"/*	# newer than the .iig sources: make does not rerun iig
+	done
+}
 if [ "$KERNEL_CONFIG" = RELEASE ]; then
-	DEV="$DXB_DIR/build/xnu.obj/DEVELOPMENT_ARM64_${MACHINE}/iokit/DEVELOPMENT/DriverKit"
-	if [ -d "$DEV" ]; then
-		for REL in \
-			"$DXB_DIR/build/xnu.obj/RELEASE_ARM64_${MACHINE}/iokit/RELEASE/DriverKit" \
-			"$DXB_DIR/build/xnu.obj/RELEASE_ARM64_${MACHINE}/iokit/DriverKit"; do
-			mkdir -p "$REL"
-			cp "$DEV"/*.h "$DEV"/*.iig.cpp "$REL"/
-			touch "$REL"/*	# newer than the .iig sources: make does not rerun iig
-		done
+	if seed_stubs "$DXB_DIR/build/xnu.obj/DEVELOPMENT_ARM64_${MACHINE}/iokit/DEVELOPMENT/DriverKit" RELEASE; then
 		echo "== seeded the RELEASE DriverKit stubs from DEVELOPMENT"
 	else
-		echo "error: a RELEASE build needs the iig stubs from a DEVELOPMENT" >&2
-		echo "       build first (Xcode 16+ iig does not match xnu-8796)" >&2
+		echo "error: a RELEASE build needs iig stubs from a DEVELOPMENT build" >&2
+		echo "       (Xcode 16+ iig does not match xnu-8796)" >&2
 		exit 1
 	fi
+elif seed_stubs "$DXB_DIR/build/xnu.obj/RELEASE_ARM64_${MACHINE}/iokit/RELEASE/DriverKit" DEVELOPMENT; then
+	echo "== seeded the DEVELOPMENT DriverKit stubs from RELEASE"
+else
+	echo "warning: no usable RELEASE stubs; the build may rerun the SDK iig" >&2
 fi
 
 # build.sh skips the kernel when this marker exists (it only asks whether the
