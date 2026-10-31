@@ -426,7 +426,11 @@ eagl_enter(struct eagl *e, unsigned offset)
 	if (gl == NULL) {
 		return;
 	}
-	e->gl = gl;		/* put it back if it was zeroed */
+	/*
+	 * The field is not repaired here: writing it would hide the corruption
+	 * from the reporter in eagl_leave(), which is what names the call that
+	 * causes it. Nothing reads it any more (context_gl() returns the global).
+	 */
 	if (current != e || !mondrian_gl_is_current(gl)) {
 		if (!mondrian_gl_make_current(gl)) {
 			say("mondrian-gl: the context cannot be made this thread's\n");
