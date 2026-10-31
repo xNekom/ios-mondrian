@@ -461,33 +461,6 @@ eagl_leave(struct eagl *e, unsigned offset)
 		}
 		e->gl = the_gl;
 	}
-	/*
-	 * The struct is compared with a copy taken when it was made, while
-	 * nothing has been reported yet: the corruption shows up as eight or
-	 * sixteen bytes of red pixels in a field, and this names the call that
-	 * left them there and where they landed.
-	 */
-	if (e != NULL && have_shadow && !said_struct_changed) {
-		const uint8_t *now = (const uint8_t *)e;
-		const uint8_t *was = (const uint8_t *)&shadow_copy;
-		size_t at = 0;
-
-		while (at < sizeof(*e) && now[at] == was[at]) {
-			at++;
-		}
-		if (at < sizeof(*e)) {
-			said_struct_changed = true;
-			say("mondrian-gl: %s changed the context at +0x%zx:"
-			    " %02x %02x %02x %02x %02x %02x %02x %02x"
-			    " (was %02x %02x %02x %02x %02x %02x %02x %02x)\n",
-			    eagl_slot_name(offset), at,
-			    now[at], now[at + 1], now[at + 2], now[at + 3],
-			    now[at + 4], now[at + 5], now[at + 6], now[at + 7],
-			    was[at], was[at + 1], was[at + 2], was[at + 3],
-			    was[at + 4], was[at + 5], was[at + 6], was[at + 7]);
-		}
-	}
-
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (e->errors++ < 60) {
 			say("mondrian-gl: %s: error %#x\n", eagl_slot_name(offset), error);
@@ -3680,10 +3653,6 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	e->table[0] = e;
 	eagl_fill_table(e->table);
 	contexts[place] = e;
-	/* After every field is in place, so the reporter does not report our
-	 * own initialisation. */
-	shadow_copy = *e;
-	have_shadow = true;
 	say("mondrian-gl: context %p (object %p, gl %p) at slot %u\n",
 	    (void *)e, (void *)self, (void *)e->gl, place);
 	say("mondrian-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, mondrian_gl_library(),
@@ -3787,8 +3756,8 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+	if (target != GL_TEXTURE_2D || texture == 0 ||
+	    IOSurfaceGetBytesPerElement(surface) != 4 ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("mondrian-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
@@ -3797,8 +3766,21 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	image->target = true;
 	image->to = GL_TEXTURE_2D;
 	image->invert = inverted;
-	image->width = (GLsizei)IOSurfaceGetWidth(surface);
-	image->height = (GLsizei)IOSurfaceGetHeight(surface);
+	image->plane = 0;
+	/*
+	 * CoreAnimation's render target is not always a plain BGRA surface:
+	 * measured, the display surface is 1440x3200 with pixel format 0x38613362
+	 * ('b3a8') and two planes. Its plane 0 is the picture, and the draw only
+	 * needs four bytes per element. Refusing it left the framebuffer
+	 * incomplete and every glDrawElements answered 0x506.
+	 */
+	if (IOSurfaceGetPlaneCount(surface) > 0) {
+		image->width = (GLsizei)IOSurfaceGetWidthOfPlane(surface, 0);
+		image->height = (GLsizei)IOSurfaceGetHeightOfPlane(surface, 0);
+	} else {
+		image->width = (GLsizei)IOSurfaceGetWidth(surface);
+		image->height = (GLsizei)IOSurfaceGetHeight(surface);
+	}
 	image->internal = image->format = GL_BGRA;
 	image->type = GL_UNSIGNED_BYTE;
 	/*
@@ -3825,9 +3807,11 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	}
 	e->attaching += now_us() - began;
 	if (attached++ < 24) {
-		say("mondrian-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
+		say("mondrian-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row,"
+		    " %zu planes, alloc %zu)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
-		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
+		    IOSurfaceGetBytesPerRow(surface), IOSurfaceGetPlaneCount(surface), IOSurfaceGetAllocSize(surface),
+		    inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
 		    image->mirror != 0 ? ": a texture, copied into its memory by the GPU" : ": a copy");
 	}
 	eagl_leave(e, MONDIAN_GL_TEX_IMAGE_2D);

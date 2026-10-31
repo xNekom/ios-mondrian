@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/MondrianSurface.cpp b/iokit/Kernel/arm/MondrianSurface.cpp
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -805,6 +805,19 @@
+ 		mondrian_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:		/* WrapClientImage */
++	case 7:		/* WrapClientMemory */
++		/*
++		 * These answer with a new surface whose base and shared page are
++		 * the client's. Answering success with a zeroed result leaves
++		 * IOSurface.framework believing it has a client whose shared page
++		 * is NULL, and the next IOSurfaceClientGetBulkAttachments() does
++		 * memmove(shared + 0x30) and dies at 0x30 (measured: backboardd,
++		 * signal 11, pc _platform_memmove, lr IOSurfaceClientGetBulkAttachments).
++		 * HackiOS answers unsupported here for the same reason.
++		 */
++		mondrian_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
