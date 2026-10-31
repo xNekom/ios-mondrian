@@ -357,13 +357,10 @@ static struct mondrian_gl *the_gl;
 static struct mondrian_gl *
 context_gl(struct eagl *e)
 {
-	if (the_gl != NULL) {
-		return the_gl;
-	}
-	if (e != NULL && (uintptr_t)e->gl > 0x10000) {
-		return e->gl;
-	}
-	return NULL;
+	/* The field is never consulted: it has been seen zeroed and holding two
+	 * red pixels (0xff0000ffff0000ff), which passes any pointer test. */
+	(void)e;
+	return the_gl;
 }
 static struct eagl *contexts[8];
 static uint32_t slot_calls[SLOTS];
@@ -949,19 +946,44 @@ target_to_surface(struct eagl *e, struct image *image)
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
-	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
-		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
-		glPixelStorei(GL_PACK_ALIGNMENT, 4);
-		if (!image->invert) {
-			glReadPixels(0, 0, image->width, image->height, GL_BGRA, GL_UNSIGNED_BYTE, base);
-		} else {
-			for (GLsizei y = 0; y < image->height; y++) {
-				glReadPixels(0, y, image->width, 1, GL_BGRA, GL_UNSIGNED_BYTE, base + row * (size_t)(image->height - 1 - y));
-			}
+	/*
+	 * Never write more rows or columns than the surface has: the texture
+	 * CoreAnimation attaches is not always the surface's size, and a
+	 * readback past the base address writes over whatever follows it in
+	 * the heap (measured: two red pixels landed on the EAGLContext's gl
+	 * field and the next shader source aborted in malloc).
+	 */
+	{
+		size_t surface_height = IOSurfaceGetHeight(surface);
+		size_t surface_columns = row / 4;
+		GLsizei rows = image->height;
+		GLsizei columns = image->width;
+
+		if ((size_t)rows > surface_height) {
+			rows = (GLsizei)surface_height;
 		}
-		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-		IOSurfaceUnlock(surface, 0, NULL);
+		if ((size_t)columns > surface_columns) {
+			columns = (GLsizei)surface_columns;
+		}
+		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+			base = IOSurfaceGetBaseAddress(surface);
+			if (base != NULL && rows > 0 && columns > 0) {
+				glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)surface_columns);
+				glPixelStorei(GL_PACK_ALIGNMENT, 4);
+				if (!image->invert) {
+					glReadPixels(0, 0, columns, rows,
+					    GL_BGRA, GL_UNSIGNED_BYTE, base);
+				} else {
+					for (GLsizei y = 0; y < rows; y++) {
+						glReadPixels(0, y, columns, 1,
+						    GL_BGRA, GL_UNSIGNED_BYTE,
+						    base + row * (size_t)(rows - 1 - y));
+					}
+				}
+				glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+			}
+			IOSurfaceUnlock(surface, 0, NULL);
+		}
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 }
