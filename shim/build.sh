@@ -21,6 +21,12 @@ if [ -n "$PAYLOAD_IN" ]; then
 	PAYLOAD_IN=$(cd "$(dirname "$PAYLOAD_IN")" && pwd)/$(basename "$PAYLOAD_IN")
 	[ -f "$PAYLOAD_IN" ] || { echo "error: no payload at $PAYLOAD_IN" >&2; exit 1; }
 fi
+# same for an explicitly given DTB: the script runs from shim/
+case "${DTB:-}" in
+'') ;;
+/*) ;;
+*) DTB=$(cd "$(dirname "$DTB")" && pwd)/$(basename "$DTB") ;;
+esac
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
 case "$BOARD" in
