@@ -18,15 +18,24 @@ bsd/dev/mondrian_gpu.c owns; fences are the dwords the CP writes into the
 memptr page and are waited on through its write-combined alias. Visible as
 `MondrianGPU: service published` and reachable with IOServiceMatching.
 
+The client's mapping of a buffer is cacheable, not inhibited: an uncached
+mapping turns the 18 MB readback of one 1440x3200 surface into 5.7 s
+(measured), because every byte is a separate bus read. Coherency is explicit
+instead, the way msm does it: every buffer of a submission is written back
+before the CP fetches it (flush_dcache64 by physical address, the
+dma_buf_end_cpu_access half) and dropped again on CPU_PREP, before the CPU
+reads what the CP wrote. The first eight CPU_PREP calls log their wait and
+sync cost in microseconds.
+
 Registers the file in iokit/conf/files.arm64. Relocations
 (MSM_SUBMIT_CMD_BUF with nr_relocs != 0) are refused for now: Mesa's msm
 backend uses softpin, which is what GEM_INFO implements.
 diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
 new file mode 100644
-index 0000000..b2d1a66
+index 0000000..d492b41
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianGPU.cpp
-@@ -0,0 +1,910 @@
+@@ -0,0 +1,952 @@
 +/*
 + * MondrianGPU: the GPU's IOKit driver for mondrian (Adreno 730, SM8475).
 + * See MondrianGPU.h for the shape of the interface.
@@ -35,6 +44,7 @@ index 0000000..b2d1a66
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOLocks.h>
 +#include <IOKit/IOUserClient.h>
++#include <kern/clock.h>
 +#include <sys/systm.h>
 +
 +#include "MondrianGPU.h"
@@ -190,6 +200,7 @@ index 0000000..b2d1a66
 +	mondrian_buffer *bufferNew(uint64_t size);
 +	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
 +	void bufferFree(mondrian_buffer *buffer);
++	void bufferSync(mondrian_buffer *buffer);
 +	void freeAll(void);
 +
 +	IOLock *fLock;
@@ -202,6 +213,7 @@ index 0000000..b2d1a66
 +	uint32_t fDumped;
 +	uint32_t fNested;
 +	uint32_t fStateGroup;
++	uint32_t fPrepLogged;
 +};
 +
 +class MondrianGPU : public IOService
@@ -300,6 +312,7 @@ index 0000000..b2d1a66
 +	fDumped = 0;
 +	fNested = 0;
 +	fStateGroup = 0;
++	fPrepLogged = 0;
 +	if (fLock == NULL) {
 +		return false;
 +	}
@@ -340,6 +353,29 @@ index 0000000..b2d1a66
 +		}
 +	}
 +	return NULL;
++}
++
++/*
++ * Hand a buffer's memory back to whoever reads it next. The GPU is not
++ * coherent with the CPU's caches: the CP writes DRAM behind them, so the CPU
++ * has to drop its lines before it reads what the CP wrote, and write its own
++ * lines back before the CP fetches them. flush_dcache64 takes a physical
++ * address and the physmap alias covers DRAM, which is the operation
++ * msm_gem_submit performs for dma_buf_end_cpu_access.
++ */
++void
++MondrianGPUUserClient::bufferSync(mondrian_buffer *buffer)
++{
++	uint64_t off;
++
++	for (off = 0; off < buffer->size; off += 0x1000) {
++		IOByteCount length = 0;
++		addr64_t pa = buffer->memory->getPhysicalSegment(off, &length);
++
++		if (pa != 0 && length != 0) {
++			(void)mondrian_gpu_uc_flush(pa, length);
++		}
++	}
 +}
 +
 +mondrian_buffer *
@@ -659,19 +695,9 @@ index 0000000..b2d1a66
 +	 */
 +	for (i = 0; i < request->nr_bos; i++) {
 +		mondrian_buffer *bo = bufferForType(bos[i].handle);
-+		uint64_t off;
 +
-+		if (bo == NULL) {
-+			continue;
-+		}
-+		for (off = 0; off < bo->size; off += 0x1000) {
-+			IOByteCount length = 0;
-+			addr64_t pa = bo->memory->getPhysicalSegment(off,
-+			    &length);
-+
-+			if (pa != 0 && length != 0) {
-+				(void)mondrian_gpu_uc_flush(pa, length);
-+			}
++		if (bo != NULL) {
++			bufferSync(bo);
 +		}
 +	}
 +	IOLockLock(fLock);
@@ -818,10 +844,12 @@ index 0000000..b2d1a66
 +	if (buffer != NULL) {
 +		buffer->memory->retain();
 +		*memory = buffer->memory;
-+		/* The GPU reads and writes DRAM directly; a cached user
-+		 * mapping would both hide the CPU's writes from it and keep
-+		 * stale lines from its writes. */
-+		*options = kIOMapInhibitCache;
++		/* The GPU writes DRAM behind the CPU's caches, but an uncached
++		 * user mapping is not the answer: reading one 1440x3200
++		 * surface back (18 MB) then costs seconds. The mapping stays
++		 * cacheable and the driver keeps it coherent explicitly,
++		 * bufferSync() on both hand-offs. */
++		*options = kIOMapDefaultCache;
 +		result = kIOReturnSuccess;
 +	}
 +	IOLockUnlock(fLock);
@@ -876,19 +904,42 @@ index 0000000..b2d1a66
 +	case kMsmGemInfo:
 +		result = gemInfo(&request.gemInfo);
 +		break;
-+	case kMsmGemCpuPrep:
++	case kMsmGemCpuPrep: {
++		uint64_t start = mach_absolute_time();
++		uint64_t afterWait;
++		mondrian_buffer *buffer;
++
 +		/* The CPU is about to touch a buffer: it is done when every
 +		 * submission this client made is done, because there is one
-+		 * ring and submissions run in order. */
++		 * ring and submissions run in order. Then drop the lines it
++		 * may still hold: the CP wrote DRAM behind them. */
++		IOLockLock(fLock);
 +		if (!(request.cpuPrep.op & MSM_PREP_NOSYNC) && fLastFence != 0) {
-+			IOLockLock(fLock);
 +			if (mondrian_gpu_uc_wait(fLastFence,
 +			    kMondrianPatienceMs) != 0) {
 +				result = kIOReturnBusy;
 +			}
-+			IOLockUnlock(fLock);
++		}
++		afterWait = mach_absolute_time();
++		buffer = bufferForType(request.cpuPrep.handle);
++		if (buffer != NULL) {
++			bufferSync(buffer);
++		}
++		IOLockUnlock(fLock);
++		if (fPrepLogged < 8) {
++			uint64_t waited = 0, synced = 0;
++
++			fPrepLogged++;
++			absolutetime_to_nanoseconds(afterWait - start,
++			    &waited);
++			absolutetime_to_nanoseconds(
++			    mach_absolute_time() - afterWait, &synced);
++			IOLog("MondrianGPU: prep %u wait %llu us sync %llu us\n",
++			    request.cpuPrep.handle,
++			    waited / 1000, synced / 1000);
 +		}
 +		break;
++	}
 +	case kMsmGemSubmit:
 +		result = submit(&request.submit);
 +		break;

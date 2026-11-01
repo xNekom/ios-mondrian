@@ -1,30 +1,2030 @@
-xnu 0181: power the GPU, authenticate the ZAP and start the CP
+xnu 0181: the CP path, the SMMU context, the ZAP and the uc_ surface
 
-The GPU block needs its rails, clocks and the GMU before any register reads
-back: GPUCC/GCC votes through RPMh, the GMU firmware over TCM/HFI, the GX
-domain and its clock (gpupower/gmustart/gpugx). The probe ends with
-`gpucc cx ... on`, `gmu hfi 0x1` and `probe done`.
-
-The CP path (gpucp/gpusubmit): SMMU bank 0 takes SIDs 0/0x400/1/0x401 and
-maps the SQE at 0x100000, the ring at 0x200000, the RPTR shadow at 0x300000
-and the CP power-up list at 0x301000 with a 48-bit stage-1 context. The SQE
-firmware (a730_sqe.fw, a generated local input) is copied and flushed; the
-hardware init programs the GBIF, UCHE, NC_MODE, CP_PROTECT, APRIV and hwcg
-sets. The ZAP is authenticated through PAS13, and the CP bases are published
-again after it because the authentication resets the GPU. CP_RB_BASE and
+The ring needs its own translation: SMMU bank 0 takes SIDs 0/0x400/1/0x401
+and maps the SQE at 0x100000, the ring at 0x200000, the RPTR shadow at
+0x300000 and the CP power-up list at 0x301000 through one 48-bit stage-1
+context. The SQE firmware (a730_sqe.fw, a generated local input) is copied
+and flushed, and the hardware init programs the GBIF, UCHE, NC_MODE,
+CP_PROTECT, APRIV and hwcg sets. The CP bases are published again after the
+ZAP because PAS13 authentication resets the GPU. CP_RB_BASE and
 CP_SQE_INSTR_BASE are 64-bit registers and need one 64-bit store: two 32-bit
-stores leave the bootloader's 0xe000 in the high word. The PM4 headers are
-real type-7 headers and CP_ME_INIT carries the power-up list.
+stores leave the bootloader's 0xe000 in the high word.
 
-What still does not work, measured: writing 1 to CP_SQE_CNTL never completes
-and the next GPU access hangs, while writing 0 is harmless and the boot
-reaches SpringBoard with the SQE stopped. ZAP before or after the start, no
-ZAP, CP_PROTECT off, an AHB default response of OKAY, CP_ME_INIT without the
-list, a software reset first, read-only or read-write SQE pages, write-back
-or non-cacheable attributes and both SQE address windows were each tried and
-do not change it. The a740 driver in drivers/ and mainline both run the same
-sequence on their silicon, so the difference is this GPU's trusted state or a
-start handshake that is still missing.
+mondrian_gpu_uc_* is what the user client of 0182 drives: map a page of a
+buffer's IOVA, submit one indirect buffer as CP_INDIRECT_BUFFER_PFE plus a
+CP_EVENT_WRITE fence, wait on that fence through the write-combined memptr
+alias, and write back a buffer's clean lines before the CP reads it
+(flush_dcache64 by physical address, the same call msm_gem_submit makes for
+dma_buf_end_cpu_access). The goto knobs stay: gpupm4 truncates a stream,
+gpunoblit, gpunop and gpumode rewrite single packets, gpudstate and gpudsaddr
+dump a draw-state fragment.
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -26,8 +26,45 @@
+ #include "mondrian_gmu_fw.h"
+ #define MONDRIAN_GMU_FW 1
+ #endif
++#if __has_include("mondrian_sqe_fw.h")
++#include "mondrian_sqe_fw.h"
++#define MONDRIAN_SQE_FW 1
++#endif
++#if __has_include("mondrian_cp_profile.h")
++#include "mondrian_cp_profile.h"
++#define MONDRIAN_CP_PROFILE 1
++#endif
++#if __has_include("mondrian_zap_fw.h")
++#include "mondrian_zap_fw.h"
++#define MONDRIAN_ZAP_FW 1
++#endif
+ #include <pexpert/pexpert.h>
+ 
++#include <dev/mondrian_gpu_api.h>
++
++/* iokit/Kernel/arm/MondrianGPU.cpp: published once the CP is running. */
++extern void MondrianGPUStart(void);
++
++/* State the user client shares with the bring-up (mondrian_gpu_api.h). */
++#define MONDRIAN_UC_IOVA_BASE	0x10000000ull
++#define MONDRIAN_UC_IOVA_END	0x80000000ull
++
++static int mondrian_uc_up;
++static int mondrian_uc_logged;
++static uint32_t mondrian_uc_pm4;
++static int mondrian_uc_noblit;
++static uint32_t mondrian_uc_nop_opcode;
++static uint32_t mondrian_uc_set_mode = 0xffffffffu;
++static uint32_t mondrian_uc_draw_state;
++static uint32_t mondrian_uc_ds_addr;
++static vm_offset_t mondrian_uc_gpu;
++static vm_offset_t mondrian_uc_smmu;
++static vm_offset_t mondrian_uc_gmu;
++static uint32_t mondrian_uc_at;
++static uint32_t mondrian_uc_fence;
++static uint32_t mondrian_uc_table_next = 1;
++static uint64_t mondrian_uc_iova = MONDRIAN_UC_IOVA_BASE;
++
+ #define MONDRIAN_GCC_BASE	0x00100000UL
+ #define MONDRIAN_GCC_SIZE	0x00200000UL	/* the block is 0x1f4200, 0x62000 is inside */
+ #define MONDRIAN_GPUCC_BASE	0x03d90000UL
+@@ -124,6 +161,7 @@
+ 
+ /* <machine/machine_routines.h> is the generic one in a bsd file. */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ 
+ static uint32_t
+ mondrian_gpu_read(vm_offset_t base, uint32_t off)
+@@ -139,6 +177,18 @@
+ }
+ 
+ /*
++ * CP_RB_BASE and CP_SQE_INSTR_BASE are 64-bit registers (a6xx.xml
++ * reg64): the high word only latches as part of one 64-bit store. Two
++ * 32-bit stores leave the bootloader's 0xe000 in place.
++ */
++static void
++mondrian_gpu_write64(vm_offset_t base, uint32_t off, uint64_t value)
++{
++	*(volatile uint64_t *)(base + off) = value;
++	__builtin_arm_dsb(0xf);
++}
++
++/*
+  * gpupower=1: power the GPUCC CX domain, the first write of the port. The
+  * sequence is the Linux gdsc one: enable the GPUCC AHB/CXO/APB branches,
+  * clear SW_COLLAPSE in the CX GDSCR, wait 1 us and poll the hardware
+@@ -272,6 +322,9 @@
+ extern int mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on);
+ extern void mondrian_log_flush_now(void);
+ 
++static vm_offset_t mondrian_hfi_va;
++static uint64_t mondrian_hfi_pa, mondrian_hfi_iova;
++static uint32_t mondrian_hfi_seq = 2;
+ static int mondrian_gpu_gx;   /* gpugx=1: power the GX domain */
+ static int mondrian_gpu_rscc; /* gpurscc=1: Pong RSCC/PDC setup */
+ 
+@@ -413,19 +466,29 @@
+ static void
+ mondrian_gpu_power(vm_offset_t gpucc)
+ {
+-	vm_offset_t gcc = ml_io_map(MONDRIAN_GCC_BASE, MONDRIAN_GCC_SIZE);
++	vm_offset_t gcc;
+ 	uint32_t gdscr, hw, v;
+ 
+-	mondrian_gpu_vote_rails();
+-	delay(10);
++	printf("MONDRIAN GPU: power enter gpucc 0x%lx\n", (unsigned long)gpucc);
++	mondrian_log_flush_now();
++	gcc = ml_io_map(MONDRIAN_GCC_BASE, MONDRIAN_GCC_SIZE);
++	printf("MONDRIAN GPU: power gcc 0x%lx\n", (unsigned long)gcc);
++	mondrian_log_flush_now();
+ 
+ 	gdscr = mondrian_gpu_read(gpucc, GPUCC_CX_GDSCR);
+ 	hw = mondrian_gpu_read(gpucc, GPUCC_CX_HW_CTRL);
+ 	printf("MONDRIAN GPU: power cx gdscr 0x%x hw 0x%x\n", gdscr, hw);
+ 	if ((hw & GDSC_PWR_ON) != 0) {
++		/* The probe already voted this rail up; a second RPMh vote
++		 * hangs the RSC on this port. */
+ 		printf("MONDRIAN GPU: power cx already on\n");
++		mondrian_log_flush_now();
+ 		return;
+ 	}
++	mondrian_gpu_vote_rails();
++	printf("MONDRIAN GPU: power vote done\n");
++	mondrian_log_flush_now();
++	delay(10);
+ 
+ 	/*
+ 	 * Pong's working SM8475 sequence (drivers/PongAdreno/PongAdrenoClocks.c):
+@@ -584,9 +647,18 @@
+ 	vm_offset_t va;
+ 	uint64_t pa;
+ 	uint32_t bytes;
+-	uint32_t iova;
++	uint64_t iova;
+ };
+ 
++/*
++ * The bootloader keeps RBBM_SECVID_TRUST_CNTL=1 and the high words of
++ * CP_SQE_INSTR_BASE/CP_RB_BASE at 0xe000, which the non-secure kernel cannot
++ * rewrite (the high-word write is ignored and a write to TRUST_CNTL aborts).
++ * The pair therefore addresses 0xE000_0000_0000 + the low word, so the CP
++ * tables map the tagged window as well as the low one.
++ */
++#define MONDRIAN_CP_TAG		0xe00000000000ull
++
+ static uint64_t
+ mondrian_smmu_read64(vm_offset_t smmu, uint32_t off)
+ {
+@@ -604,15 +676,48 @@
+ }
+ 
+ static int
+-mondrian_gpu_mem_alloc(struct mondrian_gpu_mem *m, uint32_t bytes, uint32_t iova)
++mondrian_gpu_mem_alloc(struct mondrian_gpu_mem *m, uint32_t bytes, uint64_t iova)
+ {
+-	vm_offset_t va = 0;
++	vm_offset_t va = 0, aligned;
+ 	ppnum_t pn;
+ 
+-	if (kmem_alloc_contig(kernel_map, &va, bytes, PAGE_MASK, 0, 0,
++	/*
++	 * The kernel page is 16 KiB. kmem_alloc_contig() returned a VA at a
++	 * 4 KiB offset inside the pmap page even with a 16 KiB mask, so
++	 * pmap_find_phys() gave the SMMU the page base while the CPU buffer
++	 * started at an offset; a full memset then aborted at
++	 * 0xfffffe0008026b000 (esr 0x92000010) in the CP tables. Allocate the
++	 * slack and align the VA (and therefore the PA) by hand.
++	 */
++	if (kmem_alloc_contig(kernel_map, &va, bytes + 0x3fffu, 0x3fffull, 0, 3u,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return -1;
+ 	}
++	aligned = (va + 0x3fffu) & ~(vm_offset_t)0x3fffu;
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)aligned);
++	if (pn == 0) {
++		return -1;
++	}
++	m->va = aligned;
++	m->pa = ptoa_64(pn);
++	m->bytes = bytes;
++	m->iova = iova;
++	return 0;
++}
++
++/* SQE/ring/memptr do not need physically contiguous pages: the SMMU maps
++ * each page separately. kmem_alloc returns ordinary, fully-backed pages,
++ * unlike the contiguous manager's runs (whose 4th 4 KiB aborted). */
++static int
++mondrian_gpu_mem_alloc_va(struct mondrian_gpu_mem *m, uint32_t bytes, uint64_t iova)
++{
++	vm_offset_t va = 0;
++	ppnum_t pn;
++
++	if (kmem_alloc(kernel_map, &va, bytes, KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return -1;
++	}
+ 	pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
+ 	if (pn == 0) {
+ 		return -1;
+@@ -662,7 +767,11 @@
+ 			    (uint32_t)((va >> shift) & ((1u << width) - 1));
+ 
+ 			if (tables[slot] == 0) {
+-				tables[slot] = (table_pa + 4096ull * (*next)++) | 3ull;
++				/* Page 0 is the root; the first next-level table is
++				 * page 1. Starting at 0 made the L1 entry point at the
++				 * root itself and the walk faulted (the GMU only worked
++				 * because its leaf landed in the root's L3 slot). */
++				tables[slot] = (table_pa + 4096ull * (++(*next))) | 3ull;
+ 			}
+ 			table = (uint32_t)(((tables[slot] & 0x0000fffffffff000ull) -
+ 			    table_pa) / 4096);
+@@ -671,6 +780,42 @@
+ 	}
+ }
+ 
++static int
++mondrian_gpu_smmu_map_va(uint64_t *tables, uint64_t table_pa, uint64_t iova,
++    vm_offset_t va, uint32_t bytes, uint32_t perms, uint32_t *next)
++{
++	uint32_t off;
++
++	for (off = 0; off < bytes; off += 4096) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(va + off));
++		uint64_t pa;
++
++		if (pn == 0) {
++			return -1;
++		}
++		pa = ptoa_64(pn) + ((va + off) & 0x3fffu);
++		mondrian_gpu_smmu_map(tables, table_pa, 32, iova + off, pa,
++		    4096, perms, next);
++	}
++	return 0;
++}
++
++static void
++mondrian_gpu_mem_flush(struct mondrian_gpu_mem *m, uint32_t bytes)
++{
++	uint32_t off;
++
++	for (off = 0; off < bytes; off += 4096) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(m->va + off));
++		uint32_t len = bytes - off < 4096 ? bytes - off : 4096;
++
++		if (pn != 0) {
++			flush_dcache64((addr64_t)(ptoa_64(pn) +
++			    ((m->va + off) & 0x3fffu)), len, TRUE);
++		}
++	}
++}
++
+ /*
+  * HFI transport: queue 0 (host to GMU) and queue 1 (GMU to host) in the 16 KiB
+  * HFI buffer whose table was written before the CM3 start. Header is
+@@ -711,24 +856,40 @@
+ 	uint32_t write = q[11];
+ 	uint32_t header, count, i;
+ 
+-	if (read == write) {
+-		return 0;
+-	}
+-	header = data[read];
+-	count = (header >> 8) & 255u;
+-	if (count == 0 || count > 19) {
+-		q[10] = (read + 1) & 1023;
+-		return -1;
+-	}
+-	for (i = 0; i < count && i < 16; i++) {
+-		out[i] = data[(read + i) & 1023];
+-	}
+-	*countp = count;
+-	q[10] = (read + ((count + 3) & ~3u)) & 1023;
+-	if ((header >> 20) != (seq & 0xfffu)) {
+-		return -1;
++	for (i = 0; i < 256; i++) {
++		uint32_t padded;
++
++		if (read == write) {
++			return 0;
++		}
++		header = data[read];
++		count = (header >> 8) & 255u;
++		if (count == 0 || count > 19) {
++			q[10] = (read + 1) & 1023;
++			return -1;
++		}
++		/* The GMU answers with type 1 in header[19:16] and echoes the
++		 * request sequence in the first payload word's [31:20]. The
++		 * sequence is not in the header; matching it there discarded
++		 * every response and made all HFI commands look like timeouts. */
++		if (((header >> 16) & 15u) == 1u && count >= 3 &&
++		    (((data[(read + 1) & 1023] >> 20) & 0xfffu) ==
++		    (seq & 0xfffu))) {
++			for (i = 0; i < count && i < 16; i++) {
++				out[i] = data[(read + i) & 1023];
++			}
++			*countp = count;
++			padded = (count + 3) & ~3u;
++			q[10] = (read + padded) & 1023;
++			__builtin_arm_dsb(0xf);
++			return 1;
++		}
++		padded = (count + 3) & ~3u;
++		read = (read + padded) & 1023;
++		q[10] = read;
++		__builtin_arm_dsb(0xf);
+ 	}
+-	return 1;
++	return 0;
+ }
+ 
+ 
+@@ -936,7 +1097,7 @@
+ 	bw[2] = 3;
+ 	bw[3] = 1;
+ 	bw[5] = cn0.address;
+-	for (i = 0; i < 2; i++) {
++	for (i = 0; i < 4; i++) {
+ 		if (mondrian_power_bcm(&cn0, i ? 100 : 0, 4, 0, 1, &bw[11 + 6 * i])) {
+ 			return -1;
+ 		}
+@@ -990,7 +1151,7 @@
+ {
+ 	uint32_t perf[58] = { 0 }, bw[159] = { 0 };
+ 	uint32_t gpu_idx = 0, bus_idx = 0, count, err, vote[3];
+-	uint32_t seq = 2, s, out[16];
++	uint32_t s, out[16];
+ 	int r, i;
+ 
+ 	(void)hfi_iova;
+@@ -1000,12 +1161,12 @@
+ 	}
+ 	printf("MONDRIAN GPU: hfi power gpu %u bus %u\n", gpu_idx, bus_idx);
+ 
+-	s = seq++;
++	s = mondrian_hfi_seq++;
+ 	mondrian_gpu_hfi_send(gmu, hfi, 4, perf, 58, s);
+ 	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
+ 	printf("MONDRIAN GPU: hfi perf r %d cnt %u err 0x%x\n", r, count, err);
+ 
+-	s = seq++;
++	s = mondrian_hfi_seq++;
+ 	mondrian_gpu_hfi_send(gmu, hfi, 3, bw, 159, s);
+ 	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
+ 	printf("MONDRIAN GPU: hfi bw r %d cnt %u err 0x%x\n", r, count, err);
+@@ -1013,7 +1174,7 @@
+ 	{
+ 		uint32_t core_start = 0;
+ 
+-		s = seq++;
++		s = mondrian_hfi_seq++;
+ 		mondrian_gpu_hfi_send(gmu, hfi, 14, &core_start, 1, s);
+ 		r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
+ 		printf("MONDRIAN GPU: hfi core r %d cnt %u err 0x%x\n", r, count, err);
+@@ -1021,7 +1182,7 @@
+ 	vote[0] = 1;
+ 	vote[1] = gpu_idx;
+ 	vote[2] = bus_idx;
+-	s = seq++;
++	s = mondrian_hfi_seq++;
+ 	mondrian_gpu_hfi_send(gmu, hfi, 30, vote, 3, s);
+ 	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
+ 	printf("MONDRIAN GPU: hfi vote r %d cnt %u err 0x%x\n", r, count, err);
+@@ -1038,7 +1199,7 @@
+ 	printf("MONDRIAN GPU: hfi oob info 0x%x\n",
+ 	    mondrian_gpu_read(gmu, GMU_OFF(0x1f992u)));
+ 	mondrian_gpu_write(gmu, GMU_OFF(0x1f991u), 1u << 31);
+-	s = seq++;
++	s = mondrian_hfi_seq++;
+ 	mondrian_gpu_hfi_send(gmu, hfi, 10, NULL, 0, s);
+ 	r = mondrian_gpu_hfi_wait(gmu, hfi, hfi_pa, s, &count, &err);
+ 	printf("MONDRIAN GPU: hfi hold r %d cnt %u err 0x%x\n", r, count, err);
+@@ -1053,6 +1214,40 @@
+  * 0x4000, dummy at 0x60000000, log at 0x60004000, HFI at 0x60008000 and
+  * debug at 0x60400000; GMU SIDs 5/0x405 with TTBR0.
+  */
++/*
++ * Pong's PongAdrenoGmuHoldGpu: OOB interrupt bit 30 asks the GMU to hand
++ * the GPU to the CPU, then HFI command 10 confirms the hold. Pong issues
++ * this immediately before it starts the CP, not when the power tables go
++ * out, so it is repeated at cp_start.
++ */
++static void
++mondrian_gpu_gmu_hold(vm_offset_t gmu)
++{
++	uint32_t count = 0, err = 0, s;
++	int r, i;
++
++	if (mondrian_hfi_va == 0) {
++		return;
++	}
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f991u), 1u << 31);
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f994u), 1u << 30);
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_gpu_read(gmu, GMU_OFF(0x1f992u)) & (1u << 31)) != 0) {
++			break;
++		}
++		delay(10);
++	}
++	printf("MONDRIAN GPU: hold oob info 0x%x\n",
++	    mondrian_gpu_read(gmu, GMU_OFF(0x1f992u)));
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f991u), 1u << 31);
++	s = mondrian_hfi_seq++;
++	mondrian_gpu_hfi_send(gmu, mondrian_hfi_va, 10, NULL, 0, s);
++	r = mondrian_gpu_hfi_wait(gmu, mondrian_hfi_va, mondrian_hfi_pa, s,
++	    &count, &err);
++	printf("MONDRIAN GPU: hold hfi r %d cnt %u err 0x%x\n", r, count, err);
++	mondrian_log_flush_now();
++}
++
+ static void
+ mondrian_gpu_gmu_bringup(vm_offset_t gpucc, vm_offset_t gpu, vm_offset_t gmu,
+     vm_offset_t smmu)
+@@ -1084,6 +1279,7 @@
+ 	    icache.pa, icache.bytes, dummy.pa, hfi.pa, tables.pa);
+ 
+ 	tab = (uint64_t *)tables.va;
++	memset((void *)tables.va, 0, tables.bytes);
+ 	mondrian_gpu_smmu_map(tab, tables.pa, 32, icache.iova, icache.pa,
+ 	    icache.bytes, 15, &next);
+ 	mondrian_gpu_smmu_map(tab, tables.pa, 32, dummy.iova, dummy.pa,
+@@ -1152,6 +1348,9 @@
+ 
+ 	tcr = (2u << 30) | 0x2000u | (64u - 32u) | (1u << 23);
+ 	tcr2 = (7u << 15) | (1u << 4) | ((id2 >> 4) & 0xfu) | 0x60u;
++	/* Redwood's working value: M|A|CFRE|bit5|ASIDPNE, no stall and no
++	 * continue-after-fault. 0x127 (bit 12 clear, bit 8 set) left the SMMU
++	 * retrying a faulting fetch and hung the GPU at SQE start. */
+ 	sctlr = 0x1067u | 0x100u;
+ 	sctlr &= ~0x40u;
+ 	sctlr &= ~0x1000u;
+@@ -1163,6 +1362,9 @@
+ 	mondrian_gpu_write(smmu, SMMU_S2CR(slot2), 0x20000u);
+ 	mondrian_gpu_write(smmu, SMMU_SMR(slot2), (exids ? 0u : 0x80000000u) | 0x405u);
+ 	mondrian_gpu_write(smmu, SMMU_S2CR(slot2), 0x20000u | (exids ? 0x400u : 0u));
++	/* No SMMU fault handler is attached yet: keep faults polled in FSR
++	 * instead of an unexpected SPI that the GIC has no owner for. */
++	mondrian_gpu_write(smmu, 0x50u, 0);
+ 	mondrian_gpu_write(smmu, ctx, 0);
+ 	mondrian_gpu_write(smmu, gr1 + 0x800u + bank * 4u, 1u);
+ 	mondrian_gpu_write(smmu, gr1 + bank * 4u, 0x1f300u);
+@@ -1360,6 +1562,9 @@
+ 		mondrian_log_flush_now();
+ 	}
+ 	if ((v & 1u) != 0) {
++		mondrian_hfi_va = hfi.va;
++		mondrian_hfi_pa = hfi.pa;
++		mondrian_hfi_iova = hfi.iova;
+ 		mondrian_gpu_hfi_power(gmu, hfi.va, hfi.pa, hfi.iova);
+ 	}}
+ 
+@@ -1420,12 +1625,1481 @@
+ 		    mondrian_gpu_read(gpucc, GPUCC_GX_GDSCR));
+ 		mondrian_log_flush_now();
+ 	
++}
++
++/*
++ * The CP and the ring live in the GPU's own SMMU address space, separate from
++ * the GMU's bank. The bootloader leaves every CP register at zero, so build
++ * the context, map the SQE/ring/memptr buffers and load the SQE microcode
++ * before the first CP write. No CP register is touched here.
++ */
++static struct mondrian_gpu_mem mondrian_cp_tables;
++static struct mondrian_gpu_mem mondrian_cp_sqe;
++static struct mondrian_gpu_mem mondrian_cp_ring;
++static struct mondrian_gpu_mem mondrian_cp_memptr;
++static struct mondrian_gpu_mem mondrian_cp_ib;
++static struct mondrian_gpu_mem mondrian_cp_pwrup;
++static struct mondrian_gpu_mem mondrian_cp_scratch;
++static uint32_t mondrian_cp_sctlr;
++
++static int mondrian_cp_blind;
++static int mondrian_cp_zap = 1;
++/* gpustart: start the SQE. On by default now that the whole path works
++ * (the parity fix and the four streams); gpustart=0 leaves it stopped. */
++static int mondrian_cp_run = 1;
++static uint64_t mondrian_cp_ttbr0;
++static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
++static vm_offset_t mondrian_cp_scratch_view;
++static vm_offset_t mondrian_cp_memptr_view;
++
++static int
++mondrian_gpu_cp_smmu(vm_offset_t smmu)
++{
++	static const uint16_t sids[4] = { 0, 0x400, 1, 0x401 };
++	uint32_t id0, id1, id2, stride, pages, exids, nslots;
++	uint32_t bank = 0xffffffffu, ctx = 0, tcr, tcr2, sctlr;
++	uint32_t slots[4] = { 0xffffffffu, 0xffffffffu, 0xffffffffu,
++	    0xffffffffu };
++	uint64_t ttbr0;
++	unsigned i, j, next = 0;
++
++	id0 = mondrian_gpu_read(smmu, SMMU_SID0);
++	id1 = mondrian_gpu_read(smmu, SMMU_SID1);
++	id2 = mondrian_gpu_read(smmu, SMMU_SID2);
++	printf("MONDRIAN GPU: cp smmu idr 0x%x 0x%x 0x%x\n", id0, id1, id2);
++	stride = (id1 & 0x80000000u) ? 0x10000u : 0x1000u;
++	pages = 1u << (((id1 >> 28) & 7) + 1);
++	exids = (id0 >> 8) & 1u;
++	nslots = id0 & 0xffu;
++
++	/*
++	 * The bootloader leaves every context bank with a non-zero SCTLR (it
++	 * pre-programs the GPU SMMU), but no SMR points at the GPU streams.
++	 * Bank 0 is the GPU's bank and the GMU took bank 1, so reuse bank 0:
++	 * disable it, install our tables, then enable it. SIDS 0/0x400/1/0x401
++	 * stay disabled until the four SMR/S2CR slots are written below.
++	 */
++	bank = 0;
++	ctx = pages * stride;
++	if (ctx + 0x800 > MONDRIAN_SMMU_SIZE) {
++		printf("MONDRIAN GPU: cp SMMU bank 0 out of range 0x%x\n", ctx);
++		return -1;
++	}
++
++	/*
++	 * The low slots belong to the bootloader (the GMU's streams); writing
++	 * them aborts. The GPU streams go in free slots instead.
++	 */
++	for (i = 0, j = 0; i < nslots && j < 4; i++) {
++		uint32_t smr = mondrian_gpu_read(smmu, SMMU_SMR(i));
++		uint32_t s2cr = mondrian_gpu_read(smmu, SMMU_S2CR(i));
++
++		if (exids ? !(s2cr & (1u << 10)) : !(smr & (1u << 31))) {
++			slots[j++] = i;
++		}
++	}
++	if (j != 4) {
++		printf("MONDRIAN GPU: cp needs four free SMMU slots (got %u)\n", j);
++		return -1;
++	}
++
++	if (mondrian_cp_tables.va == 0) {
++		printf("MONDRIAN GPU: cp alloc begin\n");
++		mondrian_log_flush_now();
++		if (mondrian_gpu_mem_alloc(&mondrian_cp_tables, 0x20000, 0) != 0 ||
++		    /* 1 MiB, not the firmware's 0x13000: the CP's icache
++		     * prefetch (and any jump the ucode makes) runs past the
++		     * last byte of the ucode, and a faulting fetch storm
++		     * stalls the GPU's bus. */
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_sqe, 0x100000, 0x100000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x8000, 0x200000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ib, 0x4000, 0x400000) != 0) {
++			printf("MONDRIAN GPU: cp memory allocation failed\n");
++			return -1;
++		}
++		printf("MONDRIAN GPU: cp alloc ok tables 0x%llx/0x%llx sqe 0x%llx/0x%llx ring 0x%llx/0x%llx memptr 0x%llx pwrup 0x%llx\n",
++		    (unsigned long long)mondrian_cp_tables.va,
++		    (unsigned long long)mondrian_cp_tables.pa,
++		    (unsigned long long)mondrian_cp_sqe.va,
++		    (unsigned long long)mondrian_cp_sqe.pa,
++		    (unsigned long long)mondrian_cp_ring.va,
++		    (unsigned long long)mondrian_cp_ring.pa,
++		    (unsigned long long)mondrian_cp_memptr.pa,
++		    (unsigned long long)mondrian_cp_pwrup.pa);
++		mondrian_log_flush_now();
++		printf("MONDRIAN GPU: cp map begin\n");
++		mondrian_log_flush_now();
++		if (mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_sqe.iova,
++		    mondrian_cp_sqe.va, mondrian_cp_sqe.bytes, 5, &next) != 0 ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_ring.iova,
++		    mondrian_cp_ring.va, mondrian_cp_ring.bytes, 3, &next) != 0 ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_memptr.iova,
++		    mondrian_cp_memptr.va, mondrian_cp_memptr.bytes, 3, &next) != 0 ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_pwrup.iova,
++		    mondrian_cp_pwrup.va, mondrian_cp_pwrup.bytes, 3, &next) != 0 ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_scratch.iova,
++		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 3, &next) != 0 ||
++		    /* The command stream is fetched by the non-privileged CP
++		     * path: user-accessible, and executable so neither fetch
++		     * flavour can permission-fault. */
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_ib.iova,
++		    mondrian_cp_ib.va, mondrian_cp_ib.bytes, 7, &next) != 0) {
++			printf("MONDRIAN GPU: cp map failed\n");
++			return -1;
++		}
++		mondrian_uc_table_next = next;
++		flush_dcache64((addr64_t)mondrian_cp_tables.pa,
++		    mondrian_cp_tables.bytes, TRUE);
++		mondrian_cp_scratch_view = ml_io_map_unmappable(mondrian_cp_scratch.pa,
++		    0x1000, VM_WIMG_WCOMB);
++		mondrian_cp_memptr_view = ml_io_map_unmappable(mondrian_cp_memptr.pa,
++		    0x1000, VM_WIMG_WCOMB);
++		mondrian_gpu_mem_flush(&mondrian_cp_scratch, 0x1000);
++		printf("MONDRIAN GPU: cp map done\n");
++		mondrian_log_flush_now();
++#ifdef MONDRIAN_SQE_FW
++		if (mondrian_sqe_fw_len > mondrian_cp_sqe.bytes) {
++			printf("MONDRIAN GPU: cp SQE firmware too large (%u)\n",
++			    mondrian_sqe_fw_len);
++			return -1;
++		}
++		memcpy((void *)mondrian_cp_sqe.va, mondrian_sqe_fw,
++		    mondrian_sqe_fw_len);
++		mondrian_gpu_mem_flush(&mondrian_cp_sqe, mondrian_cp_sqe.bytes);
++		printf("MONDRIAN GPU: cp sqe copy done\n");
++		mondrian_log_flush_now();
++#endif
++	}
++
++	/* Pong's qualified image for this chip: walk writes back and is inner
++	 * shareable, faults are reported instead of left unconfigurable. */
++	tcr = (2u << 30) | 0x3500u | (64u - 32u) | (1u << 23);
++	tcr2 = (7u << 15) | (1u << 4) | ((id2 >> 4) & 0xfu) | 0x60u;
++	/* M|A|CFRE|bit5: continue-after-fault set, stall and ASIDPNE clear
++	 * (0x1067 with polled faults and a private ASID, as pong programs it). */
++	sctlr = 0x127u;
++	/*
++	 * The GMU bank uses ASID 1; the SMMU TLB is tagged by ASID, not by
++	 * context bank, so the CP must use a different one or it can hit the
++	 * GMU's stale translations for the same L1/L2 indices.
++	 */
++	ttbr0 = ((uint64_t)2 << 48) | mondrian_cp_tables.pa;
++
++	printf("MONDRIAN GPU: cp smmu slots %u/%u/%u/%u smmu 0x%llx\n",
++	    slots[0], slots[1], slots[2], slots[3],
++	    (unsigned long long)smmu);
++	mondrian_log_flush_now();
++	for (i = 0; i < 4; i++) {
++		printf("MONDRIAN GPU: cp smmu slot %u smr 0x%x s2cr 0x%x\n", i,
++		    SMMU_SMR(slots[i]), SMMU_S2CR(slots[i]));
++		mondrian_log_flush_now();
++		mondrian_gpu_write(smmu, SMMU_S2CR(slots[i]), 0x20000u);
++		printf("MONDRIAN GPU: cp smmu slot %u s2cr off ok\n", i);
++		mondrian_log_flush_now();
++		mondrian_gpu_write(smmu, SMMU_SMR(slots[i]),
++		    (exids ? 0u : 0x80000000u) | sids[i]);
++		printf("MONDRIAN GPU: cp smmu slot %u smr ok\n", i);
++		mondrian_log_flush_now();
++		mondrian_gpu_write(smmu, SMMU_S2CR(slots[i]),
++		    bank | (exids ? 0x400u : 0u));
++		printf("MONDRIAN GPU: cp smmu slot %u s2cr on ok\n", i);
++		mondrian_log_flush_now();
++	}
++	printf("MONDRIAN GPU: cp smmu ctx begin 0x%x\n", ctx);
++	mondrian_log_flush_now();
++	mondrian_gpu_write(smmu, ctx, 0);
++	/* dt: qcom,actlr = <0 0x7ff 0x32b> on this SMMU; pong refuses a bank
++	 * whose ACTLR does not read back. */
++	mondrian_gpu_write(smmu, ctx + 4u, 0x32bu);
++	mondrian_gpu_write(smmu, stride + 0x800u + bank * 4u, 1u);
++	mondrian_gpu_write(smmu, stride + bank * 4u, 0x1f300u);
++	mondrian_gpu_write(smmu, ctx + SMMU_TCR2, tcr2);
++	mondrian_gpu_write(smmu, ctx + SMMU_TCR, tcr);
++	mondrian_smmu_write64(smmu, ctx + SMMU_TTBR0, ttbr0);
++	mondrian_smmu_write64(smmu, ctx + SMMU_TTBR1, 0);
++	mondrian_gpu_write(smmu, ctx + SMMU_MAIR0, 0xff44u);
++	mondrian_gpu_write(smmu, ctx + SMMU_MAIR1, 0);
++	mondrian_gpu_write(smmu, ctx + SMMU_FSR, 0xffffffffu);
++	mondrian_gpu_write(smmu, ctx + SMMU_TLBIASID, 2u);
++	mondrian_gpu_write(smmu, ctx + SMMU_TLBSYNC, 0xffffffffu);
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_gpu_read(smmu, ctx + SMMU_TLBSTATUS) & 1u) == 0) {
++			break;
++		}
++		delay(1);
++	}
++	mondrian_cp_sctlr = sctlr;
++	printf("MONDRIAN GPU: cp smmu ctx done sctlr 0x%x (deferred)\n", sctlr);
++	mondrian_log_flush_now();
++
++	printf("MONDRIAN GPU: cp smmu pages %u stride 0x%x ctx 0x%x\n",
++	    pages, stride, ctx);
++	for (i = 0; i < 8; i++) {
++		printf("MONDRIAN GPU: cp smmu s%u smr 0x%x s2cr 0x%x\n", i,
++		    mondrian_gpu_read(smmu, SMMU_SMR(i)),
++		    mondrian_gpu_read(smmu, SMMU_S2CR(i)));
++	}
++	printf("MONDRIAN GPU: cp smmu actlr 0x%x sid0 0x%x\n",
++	    mondrian_gpu_read(smmu, ctx + 4u),
++	    mondrian_gpu_read(smmu, stride + 0x400u));
++	mondrian_log_flush_now();
++	printf("MONDRIAN GPU: cp smmu bank %u ctx 0x%x slots %u/%u/%u/%u tables 0x%llx\n",
++	    bank, ctx, slots[0], slots[1], slots[2], slots[3],
++	    (unsigned long long)mondrian_cp_tables.pa);
++	printf("MONDRIAN GPU: cp mem sqe 0x%llx/0x%x ring 0x%llx/0x%x memptr 0x%llx/0x%x\n",
++	    (unsigned long long)mondrian_cp_sqe.pa, mondrian_cp_sqe.bytes,
++	    (unsigned long long)mondrian_cp_ring.pa, mondrian_cp_ring.bytes,
++	    (unsigned long long)mondrian_cp_memptr.pa, mondrian_cp_memptr.bytes);
++#ifdef MONDRIAN_SQE_FW
++	printf("MONDRIAN GPU: cp sqe fw %u bytes first 0x%x\n",
++	    mondrian_sqe_fw_len, *(volatile uint32_t *)mondrian_cp_sqe.va);
++#else
++	printf("MONDRIAN GPU: cp sqe firmware not built in\n");
++#endif
++	printf("MONDRIAN GPU: cp smmu smr 0x%x/0x%x/0x%x/0x%x s2cr 0x%x/0x%x/0x%x/0x%x\n",
++	    mondrian_gpu_read(smmu, SMMU_SMR(slots[0])),
++	    mondrian_gpu_read(smmu, SMMU_SMR(slots[1])),
++	    mondrian_gpu_read(smmu, SMMU_SMR(slots[2])),
++	    mondrian_gpu_read(smmu, SMMU_SMR(slots[3])),
++	    mondrian_gpu_read(smmu, SMMU_S2CR(slots[0])),
++	    mondrian_gpu_read(smmu, SMMU_S2CR(slots[1])),
++	    mondrian_gpu_read(smmu, SMMU_S2CR(slots[2])),
++	    mondrian_gpu_read(smmu, SMMU_S2CR(slots[3])));
++	mondrian_log_flush_now();
++	return 0;
++}
++
++#ifdef MONDRIAN_ZAP_FW
++/*
++ * ZAP/PAS13, ported from PongAdrenoZap.c + the scm() in PongAdrenoCp.cpp.
++ * The GPU's protected CP fetch uses the secure SID 0x60, which the host
++ * cannot program in the SMMU; PAS13 loads and authenticates the a730 ZAP
++ * shader and moves the CP to nonsecure mode, where the 0/1 streams already
++ * mapped in the 4-SID context are used.
++ */
++struct mondrian_zap_plan {
++	uint32_t load_index, sig_index;
++	uint32_t seg_bytes, seg_mem, base, image_span;
++	uint32_t header_bytes, sig_bytes, meta_bytes;
++};
++
++static int
++mondrian_zap_plan_parse(const uint8_t *d, uint32_t n, struct mondrian_zap_plan *p)
++{
++	uint32_t count, first, sig = 0, loads = 0, sigs = 0, i;
++
++	if (n < 52 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F' ||
++	    d[4] != 1 || d[5] != 1 || d[6] != 1) {
++		return -1;
++	}
++	if (mondrian_le16(d + 16) != 2 || mondrian_le16(d + 18) != 164 ||
++	    mondrian_le32(d + 20) != 1 || mondrian_le16(d + 40) != 52 ||
++	    mondrian_le32(d + 28) != 52 || mondrian_le16(d + 42) != 32) {
++		return -1;
++	}
++	count = mondrian_le16(d + 44);
++	if (count < 2 || count > 16 || n < 52 + 32 * count) {
++		return -1;
++	}
++	/*
++	 * The vendor a730 mdt starts with a PT_NULL program header, so the
++	 * header is the ELF header plus the full program header table (the
++	 * load and signature entries are found among all of them).
++	 */
++	first = 52 + 32 * count;
++	if (first > n) {
++		return -1;
++	}
++	for (i = 0; i < count; i++) {
++		const uint8_t *ph = d + 52 + 32 * i;
++		uint32_t type = mondrian_le32(ph);
++		uint32_t flags = mondrian_le32(ph + 24);
++
++		if ((flags & 0x07000000u) == 0x02000000u) {
++			uint32_t sz = mondrian_le32(ph + 16);
++			if (type == 1 || sz == 0) {
++				return -1;
++			}
++			sig = sz;
++			p->sig_index = i;
++			sigs++;
++		} else if (type == 1 && mondrian_le32(ph + 20) != 0) {
++			uint32_t file = mondrian_le32(ph + 16);
++			uint32_t mem = mondrian_le32(ph + 20);
++			uint32_t base = mondrian_le32(ph + 12);
++			uint64_t end;
++
++			if (!(flags & 0x08000000u) || file == 0 || file > mem ||
++			    mem > 0x2000 || (base & 4095u) != 0) {
++				return -1;
++			}
++			end = (uint64_t)base + mem;
++			if (end > 0xffffffffu || end + 4095 > 0xffffffffu) {
++				return -1;
++			}
++			p->load_index = i;
++			p->seg_bytes = file;
++			p->seg_mem = mem;
++			p->base = base;
++			p->image_span = (uint32_t)(((end + 4095) & ~(uint64_t)4095) - base);
++			loads++;
++		} else if (type == 1) {
++			return -1;
++		}
++	}
++	if (loads != 1 || sigs != 1 || first > 4096 || sig > 4096 - first ||
++	    p->image_span > 0x2000) {
++		return -1;
++	}
++	p->header_bytes = first;
++	p->sig_bytes = sig;
++	p->meta_bytes = first + sig;
++	return 0;
++}
++
++static int
++mondrian_scm(uint32_t fn, uint32_t info, const uint64_t args[3],
++    int32_t *transport, int64_t *result)
++{
++	uint64_t first = fn, a6 = 0;
++	uint32_t busy = 0;
++	unsigned resumes;
++
++	for (resumes = 0; resumes < 10000; resumes++) {
++		register uint64_t x0 asm("x0") = first;
++		register uint64_t x1 asm("x1") = info;
++		register uint64_t x2 asm("x2") = args[0];
++		register uint64_t x3 asm("x3") = args[1];
++		register uint64_t x4 asm("x4") = args[2];
++		register uint64_t x5 asm("x5") = 0;
++		register uint64_t x6 asm("x6") = a6;
++		register uint64_t x7 asm("x7") = 0;
++
++		asm volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
++		    "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7) ::
++		    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++		    "x16", "x17", "memory");
++		if (x0 == 1) {
++			first = 1;
++			a6 = x6;
++			continue;
++		}
++		if ((int64_t)x0 == -12 && busy++ < 20) {
++			first = fn;
++			a6 = 0;
++			delay(30000);
++			continue;
++		}
++		*transport = (int32_t)x0;
++		*result = (int64_t)x1;
++		return 0;
++	}
++	return 1;
++}
++
++static int
++mondrian_gpu_zap(void)
++{
++	static struct mondrian_gpu_mem meta;
++	struct mondrian_zap_plan plan;
++	vm_offset_t reserved;
++	uint64_t args[3];
++	int32_t transport;
++	int64_t result;
++	uint32_t fn, info;
++	int ret;
++
++	if (mondrian_zap_plan_parse(mondrian_zap_mdt, mondrian_zap_mdt_len,
++	    &plan) != 0) {
++		printf("MONDRIAN GPU: zap plan failed\n");
++		return -1;
++	}
++	printf("MONDRIAN GPU: zap plan hdr %u sig %u code %u span 0x%x\n",
++	    plan.header_bytes, plan.sig_bytes, plan.seg_bytes, plan.image_span);
++	mondrian_log_flush_now();
++	if (mondrian_gpu_mem_alloc(&meta, 4096, 0) != 0) {
++		printf("MONDRIAN GPU: zap meta failed\n");
++		return -1;
++	}
++	memset((void *)meta.va, 0, 4096);
++	memcpy((void *)meta.va, mondrian_zap_mdt, plan.header_bytes);
++	memcpy((void *)(meta.va + plan.header_bytes), mondrian_zap_sig,
++	    plan.sig_bytes);
++	flush_dcache64((addr64_t)meta.pa, 4096, TRUE);
++	printf("MONDRIAN GPU: zap meta ok\n");
++	mondrian_log_flush_now();
++	/*
++	 * The ZAP carve-out is not device memory for the CPU: pong maps it
++	 * through IOMemoryDescriptor with write-combine. The C equivalent is
++	 * ml_io_map_unmappable(..., VM_WIMG_WCOMB), which puts it in kernel_map
++	 * instead of the device io_submap; ml_io_map() aborted on the copy.
++	 */
++	reserved = ml_io_map_unmappable(0x8b91a000UL, 0x2000, VM_WIMG_WCOMB);
++	if (reserved == 0) {
++		printf("MONDRIAN GPU: zap reserved map failed\n");
++		return -1;
++	}
++	printf("MONDRIAN GPU: zap map ok\n");
++	mondrian_log_flush_now();
++
++	/* PAS first: the carve-out stays XPU-protected until mem_setup. */
++	transport = -1;
++	result = -1;
++	args[0] = 13;
++	args[1] = meta.pa;
++	args[2] = 0;
++	fn = 0x02000200u | 1u | 0x40000000u;
++	info = 2u | (2u << 6);
++	printf("MONDRIAN GPU: zap scm init fn 0x%x info 0x%x pa 0x%llx\n", fn, info,
++	    (unsigned long long)meta.pa);
++	mondrian_log_flush_now();
++	ret = mondrian_scm(fn, info, args, &transport, &result);
++	printf("MONDRIAN GPU: zap init r %d t %d e %lld\n", ret, transport,
++	    (long long)result);
++	mondrian_log_flush_now();
++	if (ret != 0 || transport != 0 || result != 0) {
++		return -1;
++	}
++
++	transport = -1;
++	result = -1;
++	args[1] = 0x8b91a000ull;
++	args[2] = plan.image_span;
++	fn = 0x02000200u | 2u | 0x40000000u;
++	info = 3;
++	ret = mondrian_scm(fn, info, args, &transport, &result);
++	printf("MONDRIAN GPU: zap mem r %d t %d e %lld\n", ret, transport,
++	    (long long)result);
++	mondrian_log_flush_now();
++	if (ret != 0 || transport != 0 || result != 0) {
++		return -1;
++	}
++
++	/* The PAS owns the carve-out now: copy the relocatable code. */
++	memset((void *)reserved, 0, 0x2000);
++	memcpy((void *)reserved, mondrian_zap_code, plan.seg_bytes);
++	printf("MONDRIAN GPU: zap copy ok\n");
++	mondrian_log_flush_now();
++	/* The carve-out is write-combine mapped; pong's zap_publish only
++	 * issues a dsb, it never runs cache maintenance on this PA. */
++	printf("MONDRIAN GPU: zap flush ok\n");
++	mondrian_log_flush_now();
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("MONDRIAN GPU: zap reserved ok\n");
++	mondrian_log_flush_now();
++
++	transport = -1;
++	result = -1;
++	args[1] = 0;
++	args[2] = 0;
++	fn = 0x02000200u | 5u | 0x40000000u;
++	info = 1;
++	ret = mondrian_scm(fn, info, args, &transport, &result);
++	printf("MONDRIAN GPU: zap auth r %d t %d e %lld\n", ret, transport,
++	    (long long)result);
++	mondrian_log_flush_now();
++	return (ret == 0 && transport == 0 && result == 0) ? 0 : -1;
++}
++#endif /* MONDRIAN_ZAP_FW */
++
++#ifdef MONDRIAN_CP_PROFILE
++/*
++ * CP bring-up, following PongAdrenoCp.cpp hardware_init + ME_INIT. The
++ * profile registers are dword indices; the GPU window is a byte map. The
++ * three GPU_GMU_AO CGC registers in Pong's list live outside this 0x40000
++ * window and are clock-gating only, so they are skipped. No IRQ owner and no
++ * ZAP yet: this starts the SQE and drains ME_INIT in protected mode, which is
++ * the first packet the CP must consume.
++ */
++/*
++ * PM4 headers on a6xx/a7xx carry odd parity: bit 15 over the payload count
++ * and bit 23 over the opcode (vendor cp_type7_packet, validated by
++ * pkt_is_type7). A header whose parity is wrong is an opcode error: the CP
++ * consumes the header, stops at the same ucode PC and latches nothing in the
++ * SMMU or CP_HW_FAULT, which is the shape the first post-switch packets hit.
++ * Every packet this driver submits goes through these two builders.
++ */
++static uint32_t
++mondrian_pm4_parity(uint32_t value)
++{
++	value ^= value >> 16;
++	value ^= value >> 8;
++	value ^= value >> 4;
++	return (0x9669u >> (value & 0xfu)) & 1u;
++}
++
++static uint32_t
++mondrian_pm4_type7(uint32_t opcode, uint32_t count)
++{
++	return 0x70000000u | (count & 0x3fffu) |
++	    (mondrian_pm4_parity(count) << 15) |
++	    ((opcode & 0x7fu) << 16) |
++	    (mondrian_pm4_parity(opcode) << 23);
++}
++
++static uint32_t
++mondrian_pm4_type4(uint32_t reg, uint32_t count)
++{
++	return 0x40000000u | (count & 0x7fu) |
++	    (mondrian_pm4_parity(count) << 7) |
++	    ((reg & 0x3ffffu) << 8) |
++	    (mondrian_pm4_parity(reg) << 27);
++}
++
++static int
++mondrian_gpu_cp_start(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t gpucc,
++    vm_offset_t gmu)
++{
++	uint32_t i, rptr = 0;
++	uint32_t *ring;
++	uint8_t *list;
++	uint32_t init[10];
++	const uint32_t bank = (16u - 13u) & 3u;
++
++	printf("MONDRIAN GPU: cp start enter\n");
++	mondrian_log_flush_now();
++	mondrian_gpu_gmu_hold(gmu);
++	/* Pong holds the GPU through the GMU and then only waits for GX;
++	 * re-driving the GDSC here undoes that grant and the CP start hangs. */
++	printf("MONDRIAN GPU: cp start gx status 0x%x\n",
++	    mondrian_gpu_read(gpucc, GPUCC_GX_GDSCR));
++	mondrian_log_flush_now();
++	/* Vendor gen7_gpu_keepalive(true): keep the GMU from collapsing GX
++	 * while the CP idles, which wedges the register port. */
++	printf("MONDRIAN GPU: cp keepalive 0x%x\n",
++	    mondrian_gpu_read(gmu, GMU_OFF(0x1f8c3u)));
++	mondrian_gpu_write(gmu, GMU_OFF(0x1f8c3u), 1);
++	printf("MONDRIAN GPU: cp keepalive now 0x%x\n",
++	    mondrian_gpu_read(gmu, GMU_OFF(0x1f8c3u)));
++	mondrian_log_flush_now();
++	if (mondrian_gpu_cp_smmu(smmu) != 0) {
++		printf("MONDRIAN GPU: cp smmu setup failed\n");
++		mondrian_log_flush_now();
++		return -1;
++	}
++	mondrian_gpu_write(smmu, 0x20000u, mondrian_cp_sctlr);
++	printf("MONDRIAN GPU: cp smmu on sctlr 0x%x\n",
++	    mondrian_gpu_read(smmu, 0x20000u));
++	mondrian_log_flush_now();
++
++#define CPW(reg, value) mondrian_gpu_write(gpu, (reg) * 4u, (value))
++#define CPR(reg) mondrian_gpu_read(gpu, (reg) * 4u)
++#define CPW64(lo, value) do { \
++	CPW((lo), (uint32_t)(value)); \
++	CPW((lo) + 1, (uint32_t)((value) >> 32)); \
++} while (0)
++
++	if (mondrian_cp_sqe.va == 0 || mondrian_cp_ring.va == 0 ||
++	    mondrian_cp_memptr.va == 0 || mondrian_cp_pwrup.va == 0) {
++		printf("MONDRIAN GPU: cp start without buffers\n");
++		return -1;
++	}
++#ifndef MONDRIAN_SQE_FW
++	printf("MONDRIAN GPU: cp start without SQE firmware\n");
++	return -1;
++#endif
++
++	printf("MONDRIAN GPU: cp start hw begin\n");
++	mondrian_log_flush_now();
++	/* mainline a6xx/a7xx hw_init resets the GPU before programming it:
++	 * without this the CP keeps the bootloader's state. */
++	CPW(GEN7_RBBM_SW_RESET_CMD, 1);
++	(void)CPR(GEN7_RBBM_SW_RESET_CMD);
++	CPW(GEN7_RBBM_SW_RESET_CMD, 0);
++	delay(1);
++	printf("MONDRIAN GPU: cp hw sw reset done\n");
++	mondrian_log_flush_now();
++
++	/* The tagged window now translates, so the bootloader's trusted CP
++	 * would run our microcode the moment GBIF is released. Keep the SQE
++	 * halted until cp_start publishes its own base. */
++	CPW(GEN7_CP_SQE_CNTL, 0);
++	printf("MONDRIAN GPU: cp hw sqe halt 0x%x\n", CPR(GEN7_CP_SQE_CNTL));
++	mondrian_log_flush_now();
++	CPW(GEN7_GBIF_HALT, 0);
++	CPW(GEN7_RBBM_GBIF_HALT, 0);
++	CPW(GEN7_RBBM_SECVID_TSB_CNTL, 0);
++	CPW(GEN7_RBBM_SECVID_TSB_TRUSTED_BASE_LO, 0);
++	CPW(GEN7_RBBM_SECVID_TSB_TRUSTED_BASE_HI, 0);
++	CPW(GEN7_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	for (i = 0; i < mondrian_cp_gbif_count; i++) {
++		CPW(mondrian_cp_gbif[i][0], mondrian_cp_gbif[i][1]);
++	}
++	printf("MONDRIAN GPU: cp hw gbif ok\n");
++	mondrian_log_flush_now();
++	CPW(GEN7_RBBM_INT_0_MASK, 0);
++	CPW(GEN7_UCHE_GBIF_GX_CONFIG, 0x10240e0u);
++	CPW(GEN7_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
++	CPW64(GEN7_UCHE_TRAP_BASE_LO, 0x1fffffffff000ULL);
++	CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, 0x1fffffffff000ULL);
++	CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
++	CPW(GEN7_UCHE_CMDQ_CONFIG, 0x6690eu);
++	CPW(GEN7_CP_AHB_CNTL, 1);
++	CPW(GEN7_RBBM_PERFCTR_CNTL, 1);
++	CPW(GEN7_RB_NC_MODE_CNTL, (1u << 11) | (1u << 4) | (bank << 1));
++	CPW(GEN7_TPL1_NC_MODE_CNTL, bank << 1);
++	CPW(GEN7_SP_NC_MODE_CNTL, (2u << 4) | (bank << 1));
++	CPW(GEN7_UCHE_MODE_CNTL, bank << 21);
++	CPW(GEN7_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0xcfffffu);
++	CPW(GEN7_UCHE_CLIENT_PF, 0x81u);
++	CPW(GEN7_RB_CMP_DBG_ECO_CNTL,
++	    CPR(GEN7_RB_CMP_DBG_ECO_CNTL) | (1u << 11));
++	printf("MONDRIAN GPU: cp hw uche ok\n");
++	mondrian_log_flush_now();
++	CPW(GEN7_CP_PROTECT_CNTL, 0xbu);	/* vendor: enable, then the table */
++	for (i = 1; i <= 2; i++) {
++		CPW(GEN7_CP_APERTURE_CNTL_HOST, i << 12);
++		CPW(GEN7_GRAS_NC_MODE_CNTL, bank << 5);
++	}
++	CPW(GEN7_CP_APERTURE_CNTL_HOST, 0);
++	CPW(GEN7_RBBM_NC_MODE_CNTL, 1);
++	for (i = 0; i < mondrian_cp_protect_count; i++) {
++		CPW(mondrian_cp_protect[i][0], mondrian_cp_protect[i][1]);
++	}
++	printf("MONDRIAN GPU: cp hw protect ok\n");
++	mondrian_log_flush_now();
++	/* Vendor value: bit 0 marks instruction-cache fetches privileged, and
++	 * the SQE is mapped read-only privileged (perms 5), as pong does. */
++	CPW(GEN7_CP_APRIV_CNTL, 0x6fu);	/* icache fetches privileged */
++	CPW(GEN7_CP_BV_APRIV_CNTL, 0xfu);
++	CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xfu);
++	CPW(GEN7_CP_CHICKEN_DBG, 1);
++	CPW(GEN7_CP_BV_CHICKEN_DBG, 1);
++	CPW(GEN7_CP_LPAC_CHICKEN_DBG, 1);
++	printf("MONDRIAN GPU: cp hw apriv ok\n");
++	mondrian_log_flush_now();
++	for (i = 0; i < mondrian_cp_hwcg_count; i++) {
++		CPW(mondrian_cp_hwcg[i][0], mondrian_cp_hwcg[i][1]);
++	}
++	printf("MONDRIAN GPU: cp hw hwcg ok\n");
++	mondrian_log_flush_now();
++	CPW(GEN7_RBBM_CLOCK_CNTL, 0x8aa8aa82u);
++	printf("MONDRIAN GPU: cp hw clock cntl 0x%x\n",
++	    CPR(GEN7_RBBM_CLOCK_CNTL));
++	mondrian_log_flush_now();
++	if (CPR(GEN7_RBBM_CLOCK_CNTL) != 0x8aa8aa82u) {
++		printf("MONDRIAN GPU: cp clock cntl readback 0x%x\n",
++		    CPR(GEN7_RBBM_CLOCK_CNTL));
++		return -1;
++	}
++	printf("MONDRIAN GPU: cp hw init rbbm 0x%x status1 0x%x fault 0x%x\n",
++	    CPR(GEN7_RBBM_STATUS), CPR(GEN7_CP_STATUS_1),
++	    CPR(GEN7_CP_HW_FAULT));
++	mondrian_log_flush_now();
++
++	list = (uint8_t *)mondrian_cp_pwrup.va;
++	memset(list, 0, 16 + mondrian_cp_restore_count * 8 + 12);
++	list[12] = 0;
++	list[13] = (uint8_t)mondrian_cp_restore_count;
++	list[14] = 1;
++	list[15] = 0;
++	{
++		uint32_t *p = (uint32_t *)(list + 16);
++
++		for (i = 0; i < mondrian_cp_restore_count; i++) {
++			p[2 * i] = mondrian_cp_restore[i];
++			p[2 * i + 1] = CPR(mondrian_cp_restore[i]);
++		}
++		p[2 * mondrian_cp_restore_count] = 0;
++		p[2 * mondrian_cp_restore_count + 1] = GEN7_RBBM_PERFCTR_CNTL;
++		p[2 * mondrian_cp_restore_count + 2] = 1;
++	}
++	printf("MONDRIAN GPU: cp pwrup list built, flushing\n");
++	mondrian_log_flush_now();
++	flush_dcache64((addr64_t)mondrian_cp_pwrup.pa, 0x1000, TRUE);
++	printf("MONDRIAN GPU: cp pwrup %u pairs + 1 dynamic\n",
++	    mondrian_cp_restore_count);
++	mondrian_log_flush_now();
++
++	mondrian_gpu_write64(gpu, GEN7_CP_RB_BASE * 4u, mondrian_cp_ring.iova);
++	CPW(GEN7_CP_RB_CNTL, 12u | (2u << 8));	/* rptr shadow on (kgsl/mainline) */
++	mondrian_gpu_write64(gpu, GEN7_CP_RB_RPTR_ADDR_LO * 4u,
++	    mondrian_cp_memptr.iova);
++	CPW(GEN7_CP_RB_WPTR, 0);
++	CPW(0x885u, 0);
++	mondrian_gpu_write64(gpu, GEN7_CP_BV_RB_RPTR_ADDR_LO * 4u,
++	    mondrian_cp_memptr.iova + 8);
++	mondrian_gpu_write64(gpu, GEN7_CP_SQE_INSTR_BASE_LO * 4u,
++	    mondrian_cp_sqe.iova);
++	printf("MONDRIAN GPU: cp ring 0x%llx sqe 0x%llx pwrup 0x%llx cntl 0x%x\n",
++	    (unsigned long long)mondrian_cp_ring.iova,
++	    (unsigned long long)mondrian_cp_sqe.iova,
++	    (unsigned long long)mondrian_cp_pwrup.iova,
++	    CPR(GEN7_CP_RB_CNTL));
++	mondrian_log_flush_now();
++	/* Clear any bank-0 fault left by an earlier fetch: the FSR/FAR read
++	 * after the drain must describe this attempt, not a stale one. */
++	mondrian_gpu_write(smmu, 0x20000u + SMMU_FSR, 0xffffffffu);
++	printf("MONDRIAN GPU: cp smmu pre-start fsr 0x%x far 0x%llx cbndx 0x%x sid 0x%x\n",
++	    mondrian_gpu_read(smmu, 0x20058u),
++	    (unsigned long long)mondrian_smmu_read64(smmu, 0x20060u),
++	    mondrian_gpu_read(smmu, 0x20068u),
++	    mondrian_gpu_read(smmu, 0x1400u));
++	mondrian_gpu_write(smmu, 0x20000u, mondrian_cp_sctlr);
++	printf("MONDRIAN GPU: cp smmu on sctlr 0x%x tcr 0x%x\n",
++	    mondrian_gpu_read(smmu, 0x20000u),
++	    mondrian_gpu_read(smmu, 0x20000u + SMMU_TCR));
++	mondrian_log_flush_now();
++	if (mondrian_cp_blind) {
++		/* gpublind=1: a VA with no mapping (does a fault stall?).
++		 * gpublind=2: a mapped, zeroed page (does a successful fetch of
++		 * something that is not the ucode stall?). */
++		uint64_t base = mondrian_cp_blind == 2 ?
++		    (MONDRIAN_CP_TAG | mondrian_cp_scratch.iova) :
++		    (MONDRIAN_CP_TAG | 0x7f000000u);
++
++		CPW(GEN7_CP_SQE_INSTR_BASE_LO, (uint32_t)base);
++		CPW(GEN7_CP_SQE_INSTR_BASE_HI, (uint32_t)(base >> 32));
++		printf("MONDRIAN GPU: cp blind base 0x%llx\n",
++		    (unsigned long long)base);
++		mondrian_log_flush_now();
++	}
++	/*
++	 * The GPU's own line (dt: interrupts 0x12c -> INTID 332, level high)
++	 * has no handler in this kernel yet. An asserted line at SQE start
++	 * panics the boot; mask it in the distributor (SPI 300, ICENABLER9
++	 * bit 12) before the CP can raise anything.
++	 */
++	{
++		vm_offset_t gic = ml_io_map(0x17100000UL, 0x10000);
++
++		if (gic != 0) {
++			mondrian_gpu_write(gic, 0x1a4u, 1u << 12);
++			printf("MONDRIAN GPU: cp gic icenabler9 0x%x\n",
++			    mondrian_gpu_read(gic, 0x1a4u));
++			mondrian_log_flush_now();
++		} else {
++			printf("MONDRIAN GPU: cp gic map failed\n");
++			mondrian_log_flush_now();
++		}
++	}
++	init[0] = mondrian_pm4_type7(0x17u, 1);	/* CP_THREAD_CONTROL */
++	init[1] = 1u << 27;
++	init[2] = mondrian_pm4_type7(0x48u, 7);	/* CP_ME_INIT */
++	init[3] = 0x14bu | (1u << 11);
++	init[4] = 3;
++	init[5] = 0x20000000u;
++	init[6] = 2;
++	init[7] = (uint32_t)mondrian_cp_pwrup.iova;
++	init[8] = (uint32_t)(mondrian_cp_pwrup.iova >> 32);
++	init[9] = 1u << 31;
++	ring = (uint32_t *)mondrian_cp_ring.va;
++	for (i = 0; i < 10; i++) {
++		ring[i] = init[i];
++	}
++	flush_dcache64((addr64_t)mondrian_cp_ring.pa, 10 * 4, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("MONDRIAN GPU: cp ring written\n");
++	mondrian_log_flush_now();
++	CPW(GEN7_CP_RB_WPTR, 10);
++	printf("MONDRIAN GPU: cp me init wptr 10\n");
++	mondrian_log_flush_now();
++
++	/*
++	 * Start the SQE last and without a barrier: the dsb after the enable
++	 * waits for a device write that the CP's own first fetch can hold up.
++	 * Nothing else touches the GPU between this store and the rptr read.
++	 */
++	printf("MONDRIAN GPU: cp sqe on\n");
++	mondrian_log_flush_now();
++	/*
++	 * The vendor's "clear the SQE_HALT". The earlier wedge at this store
++	 * was the missing parity in the first packet's header: the SQE fetched
++	 * it and stopped. gpustart=0 leaves the engine stopped.
++	 */
++	*(volatile uint32_t *)(gpu + GEN7_CP_SQE_CNTL * 4u) =
++	    mondrian_cp_run ? 1u : 0u;
++	delay(20);
++
++	printf("MONDRIAN GPU: cp started\n");
++	mondrian_log_flush_now();
++
++	for (i = 0; i < 2000; i++) {
++		rptr = CPR(GEN7_CP_RB_RPTR);
++		if (rptr == 10) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("MONDRIAN GPU: cp drain rptr %u wptr 10 rbbm 0x%x status1 0x%x fault 0x%x\n",
++	    rptr, CPR(GEN7_RBBM_STATUS), CPR(GEN7_CP_STATUS_1),
++	    CPR(GEN7_CP_HW_FAULT));
++	if (rptr == 10) {
++		uint32_t at = 10;
++#ifdef MONDRIAN_ZAP_FW
++	printf("MONDRIAN GPU: cp start zap enter\n");
++	mondrian_log_flush_now();
++	if (mondrian_cp_zap == 0) {
++		printf("MONDRIAN GPU: cp zap skipped (gpuzap=0)\n");
++		mondrian_log_flush_now();
++		goto zap_done;
++	}
++	mondrian_log_flush_now();
++	printf("MONDRIAN GPU: cp zap begin\n");
++	mondrian_log_flush_now();
++	if (mondrian_gpu_zap() != 0) {
++		printf("MONDRIAN GPU: cp zap failed\n");
++	} else {
++		printf("MONDRIAN GPU: cp zap ok\n");
++	}
++	mondrian_log_flush_now();
++zap_done:
++#endif
++	/*
++	 * The GPU can come out of reset "trusted": the bootloader then keeps a
++	 * secure SQE base and the CP fetches from it (measured: FAR
++	 * 0xe00000100000 while the nonsecure base is 0x100000). The vendor's
++	 * direct switch, used when no ZAP switches the CP by packet, is a zero
++	 * here. Read it first so the log says which state this boot had.
++	 */
++	printf("MONDRIAN GPU: cp trust 0x%x sqebase 0x%x/0x%x rbbase 0x%x/0x%x\n",
++	    CPR(GEN7_RBBM_SECVID_TRUST_CNTL), CPR(GEN7_CP_SQE_INSTR_BASE_LO),
++	    CPR(GEN7_CP_SQE_INSTR_BASE_HI), CPR(GEN7_CP_RB_BASE),
++	    CPR(GEN7_CP_RB_BASE_HI));
++	mondrian_log_flush_now();
++	/* Writing 0 here aborts (the secure monitor owns this register); the
++	 * tagged window the high words select is how the CP is reached. */
++
++	/*
++	 * The ZAP authentication resets the GPU, so the CP register block is
++	 * back to the bootloader's defaults (measured: the SQE base reads
++	 * 0xe00000100000, the secure one, after the ZAP). Publish the ring and
++	 * the SQE again now, in redwood's order: ZAP first, CP registers after.
++	 */
++	mondrian_gpu_write64(gpu, GEN7_CP_RB_BASE * 4u, mondrian_cp_ring.iova);
++	CPW(GEN7_CP_RB_CNTL, 12u | (2u << 8));	/* rptr shadow on (kgsl/mainline) */
++	mondrian_gpu_write64(gpu, GEN7_CP_RB_RPTR_ADDR_LO * 4u,
++	    mondrian_cp_memptr.iova);
++	CPW(GEN7_CP_RB_WPTR, 0);
++	CPW(0x885u, 0);
++	mondrian_gpu_write64(gpu, GEN7_CP_BV_RB_RPTR_ADDR_LO * 4u,
++	    mondrian_cp_memptr.iova + 8);
++	mondrian_gpu_write64(gpu, GEN7_CP_SQE_INSTR_BASE_LO * 4u,
++	    mondrian_cp_sqe.iova);
++	printf("MONDRIAN GPU: cp rearm trust 0x%x rbbase 0x%x/0x%x sqebase 0x%x/0x%x cntl 0x%x\n",
++	    CPR(GEN7_RBBM_SECVID_TRUST_CNTL), CPR(GEN7_CP_RB_BASE),
++	    CPR(GEN7_CP_RB_BASE_HI), CPR(GEN7_CP_SQE_INSTR_BASE_LO),
++	    CPR(GEN7_CP_SQE_INSTR_BASE_HI), CPR(GEN7_CP_RB_CNTL));
++	mondrian_log_flush_now();
++
++
++		/*
++		 * Take the CP out of secure mode. The switch goes in alone:
++		 * a THREAD_CONTROL that syncs both threads stalls here,
++		 * because BV is not running yet on this ring.
++		 */
++		ring[at++] = mondrian_pm4_type7(0x66u, 1);	/* SET_SECURE_MODE */
++		ring[at++] = 0;
++		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++		__asm__ volatile("dsb sy" ::: "memory");
++		CPW(GEN7_CP_RB_WPTR, at);
++		for (i = 0; i < 2000; i++) {
++			rptr = CPR(GEN7_CP_RB_RPTR);
++			if (rptr >= at) {
++				break;
++			}
++			delay(1000);
++		}
++		printf("MONDRIAN GPU: cp secmode rptr %u wptr %u\n", rptr, at);
++		mondrian_log_flush_now();
++
++		if (rptr >= at) {
++			/*
++			 * First memory packet after the switch: a canary into
++			 * the memptr page (the CP already writes its RPTR
++			 * shadow there, so the mapping is known to take GPU
++			 * writes) and a fence into the next dword. Both
++			 * headers carry the a7xx parity bits.
++			 */
++			const uint64_t dst = mondrian_cp_memptr.iova + 0x800u;
++			const uint64_t fen = mondrian_cp_memptr.iova + 0x810u;
++			volatile uint32_t *mv =
++			    (volatile uint32_t *)mondrian_cp_memptr_view;
++
++			ring[at++] = mondrian_pm4_type7(0x3du, 3);  /* MEM_WRITE */
++			ring[at++] = (uint32_t)dst;
++			ring[at++] = (uint32_t)(dst >> 32);
++			ring[at++] = 0x600dc0deu;
++			ring[at++] = mondrian_pm4_type7(0x46u, 4);  /* EVENT_WRITE */
++			ring[at++] = 0x31u | (1u << 27);	/* CACHE_CLEAN */
++			ring[at++] = (uint32_t)fen;
++			ring[at++] = (uint32_t)(fen >> 32);
++			ring[at++] = 0x600dc0dfu;
++			mondrian_gpu_mem_flush(&mondrian_cp_ring,
++			    mondrian_cp_ring.bytes);
++			__asm__ volatile("dsb sy" ::: "memory");
++			CPW(GEN7_CP_RB_WPTR, at);
++			for (i = 0; i < 2000; i++) {
++				rptr = CPR(GEN7_CP_RB_RPTR);
++				if (rptr >= at) {
++					break;
++				}
++				delay(1000);
++			}
++			__asm__ volatile("dsb sy" ::: "memory");
++			printf("MONDRIAN GPU: cp memwrite rptr %u wptr %u canary 0x%x fence 0x%x shadow 0x%x\n",
++			    rptr, at, mv ? mv[0x800 / 4] : 0,
++			    mv ? mv[0x810 / 4] : 0, mv ? mv[0] : 0);
++			printf("MONDRIAN GPU: cp int 0x%x int0 0x%x rbbm 0x%x/0x%x fault 0x%x\n",
++			    CPR(GEN7_CP_INTERRUPT_STATUS),
++			    CPR(GEN7_RBBM_INT_0_STATUS), CPR(GEN7_RBBM_STATUS),
++			    CPR(GEN7_RBBM_STATUS3), CPR(GEN7_CP_HW_FAULT));
++			mondrian_log_flush_now();
++
++			/*
++			 * Indirect buffer: the shape every Mesa submission
++			 * uses. The IB carries its own memory write and its
++			 * own fence, so a single ring packet proves the CP
++			 * dispatches into fetched command streams.
++			 */
++			if (rptr >= at) {
++				uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
++				uint32_t n = 0;
++				const uint64_t dst2 =
++				    mondrian_cp_memptr.iova + 0x820u;
++				const uint64_t fen2 =
++				    mondrian_cp_memptr.iova + 0x830u;
++
++				ib[n++] = mondrian_pm4_type7(0x3du, 3);
++				ib[n++] = (uint32_t)dst2;
++				ib[n++] = (uint32_t)(dst2 >> 32);
++				ib[n++] = 0x1b00deadu;
++				ib[n++] = mondrian_pm4_type7(0x46u, 4);
++				ib[n++] = 0x31u | (1u << 27);
++				ib[n++] = (uint32_t)fen2;
++				ib[n++] = (uint32_t)(fen2 >> 32);
++				ib[n++] = 0x1b00deaeu;
++				mondrian_gpu_mem_flush(&mondrian_cp_ib,
++				    mondrian_cp_ib.bytes);
++				ring[at++] = mondrian_pm4_type7(0x3fu, 3);
++				ring[at++] = (uint32_t)mondrian_cp_ib.iova;
++				ring[at++] = (uint32_t)(mondrian_cp_ib.iova >> 32);
++				ring[at++] = n;
++				mondrian_gpu_mem_flush(&mondrian_cp_ring,
++				    mondrian_cp_ring.bytes);
++				__asm__ volatile("dsb sy" ::: "memory");
++				CPW(GEN7_CP_RB_WPTR, at);
++				for (i = 0; i < 2000; i++) {
++					rptr = CPR(GEN7_CP_RB_RPTR);
++					if (rptr >= at) {
++						break;
++					}
++					delay(1000);
++				}
++				__asm__ volatile("dsb sy" ::: "memory");
++				printf("MONDRIAN GPU: cp ib rptr %u wptr %u canary 0x%x fence 0x%x int 0x%x\n",
++				    rptr, at, mv ? mv[0x820 / 4] : 0,
++				    mv ? mv[0x830 / 4] : 0,
++				    CPR(GEN7_CP_INTERRUPT_STATUS));
++				mondrian_log_flush_now();
++			}
++		}
++		/* From here the ring belongs to the user client, which
++		 * continues at this dword. */
++		mondrian_uc_gpu = gpu;
++		mondrian_uc_smmu = smmu;
++		mondrian_uc_gmu = gmu;
++		mondrian_uc_at = at;
++		mondrian_uc_up = 1;
++		if (rptr >= at) {
++			/* Submissions through the call the user client uses,
++			 * back to back. 2000 of them wrap the 32 KiB ring
++			 * twice, reuse every fence slot and prove the order:
++			 * the last canary and the last fence have to be the
++			 * ones the last submission asked for. */
++			uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
++			volatile uint32_t *mv =
++			    (volatile uint32_t *)mondrian_cp_memptr_view;
++			const uint32_t rounds = 2000;
++			const uint64_t dst = mondrian_cp_memptr.iova + 0x900u;
++			const uint64_t fen = mondrian_cp_memptr.iova + 0x910u;
++			uint32_t f = 0, last = 0, refused = 0, w, k, n = 0;
++
++			ib[n++] = mondrian_pm4_type7(0x3du, 3);
++			ib[n++] = (uint32_t)dst;
++			ib[n++] = (uint32_t)(dst >> 32);
++			ib[n++] = 0;			/* value, per round */
++			ib[n++] = mondrian_pm4_type7(0x46u, 4);
++			ib[n++] = 0x31u | (1u << 27);
++			ib[n++] = (uint32_t)fen;
++			ib[n++] = (uint32_t)(fen >> 32);
++			ib[n++] = 0;			/* fence, per round */
++			for (k = 1; k <= rounds; k++) {
++				ib[3] = 0x600d0000u | (k & 0xfffu);
++				ib[8] = k;
++				mondrian_gpu_mem_flush(&mondrian_cp_ib,
++				    mondrian_cp_ib.bytes);
++				__asm__ volatile("dsb sy" ::: "memory");
++				if (mondrian_gpu_uc_submit(mondrian_cp_ib.iova,
++				    n, &f) != 0) {
++					refused++;
++				}
++				last = f;
++			}
++			w = (uint32_t)mondrian_gpu_uc_wait(last, 5000);
++			printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x br_rptr 0x%x bv_rptr 0x%x\n",
++			    rounds, refused, w, mv ? mv[0x900 / 4] : 0,
++			    mv ? mv[0x910 / 4] : 0,
++			    mv ? mv[0] : 0, mv ? mv[2] : 0);
++			mondrian_log_flush_now();
++		}
++	}
++	printf("MONDRIAN GPU: cp state sqe_cntl 0x%x rptr 0x%x wptr 0x%x\n",
++	    CPR(GEN7_CP_SQE_CNTL), CPR(GEN7_CP_RB_RPTR),
++	    CPR(GEN7_CP_RB_WPTR));
++	printf("MONDRIAN GPU: cp smmu fsr 0x%x gfsr 0x%x syn0 0x%x far 0x%x fsynr0 0x%x fsynr1 0x%x\n",
++	    mondrian_gpu_read(smmu, 0x20058), mondrian_gpu_read(smmu, 0x48),
++	    mondrian_gpu_read(smmu, 0x50), mondrian_gpu_read(smmu, 0x20060),
++	    mondrian_gpu_read(smmu, 0x20068), mondrian_gpu_read(smmu, 0x2006c));
++	printf("MONDRIAN GPU: cp smmu ctx sctlr 0x%x tcr 0x%x ttbr0 0x%llx cbar 0x%x cba2r 0x%x\n",
++	    mondrian_gpu_read(smmu, 0x20000), mondrian_gpu_read(smmu, 0x20030),
++	    ((uint64_t)mondrian_gpu_read(smmu, 0x20024) << 32) |
++	    mondrian_gpu_read(smmu, 0x20020),
++	    mondrian_gpu_read(smmu, 0x1000), mondrian_gpu_read(smmu, 0x1800));
++	{
++		uint64_t *t = (uint64_t *)mondrian_cp_tables.va;
++
++		{
++		uint32_t cbi;
++
++		for (cbi = 0; cbi < 8; cbi++) {
++			uint32_t cbase = 0x20000u + cbi * 0x1000u;
++			uint32_t fsr = mondrian_gpu_read(smmu, cbase + SMMU_FSR);
++
++			if ((fsr & 0xc00001feu) != 0) {
++				printf("MONDRIAN GPU: cp cbfault %u fsr 0x%x far 0x%llx fsynr 0x%x sid 0x%x sctlr 0x%x ttbr0 0x%llx\n",
++				    cbi, fsr,
++				    (unsigned long long)mondrian_smmu_read64(smmu, cbase + 0x60),
++				    mondrian_gpu_read(smmu, cbase + 0x68),
++				    mondrian_gpu_read(smmu, 0x1000u + 0x400u + 4u * cbi),
++				    mondrian_gpu_read(smmu, cbase),
++				    (unsigned long long)mondrian_smmu_read64(smmu, cbase + SMMU_TTBR0));
++			}
++		}
++		mondrian_log_flush_now();
++	}
++	printf("MONDRIAN GPU: cp table l1 0x%llx l2 0x%llx l3 0x%llx/0x%llx/0x%llx\n",
++		    (unsigned long long)t[0], (unsigned long long)t[512],
++		    (unsigned long long)t[1024 + 0x100],
++		    (unsigned long long)t[1024 + 0x200],
++		    (unsigned long long)t[1024 + 0x300]);
++	}
++	CPW(GEN7_CP_SQE_STAT_ADDR, 0);
++	printf("MONDRIAN GPU: cp sqe stat 0x%x 0x%x lpac 0x%x bv 0x%x protect 0x%x\n",
++	    CPR(GEN7_CP_SQE_STAT_DATA), CPR(GEN7_CP_SQE_STAT_DATA),
++	    CPR(GEN7_CP_LPAC_RB_RPTR), CPR(GEN7_CP_BV_HW_FAULT),
++	    CPR(GEN7_CP_PROTECT_STATUS));
++	mondrian_log_flush_now();
++#undef CPW
++#undef CPR
++#undef CPW64
++	return rptr == 10 ? 0 : -1;
++}
++
++/* ------------------------------------------------------------------ */
++/*
++ * The user client's half of the GPU (bsd/dev/mondrian_gpu_api.h, used by
++ * iokit/Kernel/arm/MondrianGPU.cpp): GPU addresses, stage-1 mappings, one
++ * submission path and its fences. Nothing here decodes requests.
++ */
++#define MONDRIAN_UC_RING_DWORDS	(mondrian_cp_ring.bytes / 4)
++#define MONDRIAN_UC_FENCE_BASE	0x800u
++#define MONDRIAN_UC_FENCE_SLOTS	64u
++
++static uint32_t
++mondrian_uc_fence_word(uint32_t seq)
++{
++	return (MONDRIAN_UC_FENCE_BASE >> 2) +
++	    (seq % MONDRIAN_UC_FENCE_SLOTS);
++}
++
++int
++mondrian_gpu_uc_ready(void)
++{
++	return mondrian_uc_up;
++}
++
++uint32_t
++mondrian_gpu_uc_pm4_limit(void)
++{
++	return mondrian_uc_pm4;
++}
++
++int
++mondrian_gpu_uc_noblit(void)
++{
++	return mondrian_uc_noblit;
++}
++
++uint32_t
++mondrian_gpu_uc_nop_opcode(void)
++{
++	return mondrian_uc_nop_opcode;
++}
++
++uint32_t
++mondrian_gpu_uc_set_mode(void)
++{
++	return mondrian_uc_set_mode;
++}
++
++uint32_t
++mondrian_gpu_uc_draw_state(void)
++{
++	return mondrian_uc_draw_state;
++}
++
++uint32_t
++mondrian_gpu_uc_ds_addr(void)
++{
++	return mondrian_uc_ds_addr;
++}
++
++uint64_t
++mondrian_gpu_uc_memptr_iova(void)
++{
++	return mondrian_cp_memptr.iova;
++}
++
++int
++mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
++{
++	uint64_t lo, hi;
++
++	if (value == NULL) {
++		return -1;
++	}
++	switch (param) {
++	case 0x01:			/* MSM_PARAM_GPU_ID */
++		*value = 730;
++		return 0;
++	case 0x02:			/* MSM_PARAM_GMEM_SIZE */
++		*value = 0x200000;
++		return 0;
++	case 0x03:			/* MSM_PARAM_CHIP_ID */
++		*value = 0x07030002;
++		return 0;
++	case 0x04:			/* MSM_PARAM_MAX_FREQ */
++		*value = 862000000;
++		return 0;
++	case 0x05:			/* MSM_PARAM_TIMESTAMP */
++		if (mondrian_uc_gpu == 0) {
++			return -1;
++		}
++		lo = mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_ALWAYS_ON_COUNTER_LO * 4u);
++		hi = mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_ALWAYS_ON_COUNTER_HI * 4u);
++		*value = lo | (hi << 32);
++		return 0;
++	case 0x06:			/* MSM_PARAM_GMEM_BASE */
++		*value = 0;
++		return 0;
++	case 0x07:			/* MSM_PARAM_PRIORITIES */
++		*value = 1;
++		return 0;
++	case 0x0e:			/* MSM_PARAM_VA_START */
++		*value = MONDRIAN_UC_IOVA_BASE;
++		return 0;
++	case 0x0f:			/* MSM_PARAM_VA_SIZE */
++		*value = MONDRIAN_UC_IOVA_END - MONDRIAN_UC_IOVA_BASE;
++		return 0;
++	default:
++		return -1;
++	}
++}
++
++uint64_t
++mondrian_gpu_uc_iova_alloc(uint64_t bytes)
++{
++	uint64_t iova;
++
++	bytes = (bytes + 0xfffull) & ~0xfffull;
++	if (bytes == 0 || mondrian_uc_iova + bytes > MONDRIAN_UC_IOVA_END) {
++		return 0;
++	}
++	iova = mondrian_uc_iova;
++	mondrian_uc_iova += bytes;
++	return iova;
++}
++
++int
++mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions)
++{
++	if (mondrian_cp_tables.va == 0 || (iova & 0xfffull) != 0 ||
++	    (pa & 0xfffull) != 0) {
++		return -1;
++	}
++	mondrian_gpu_smmu_map((uint64_t *)mondrian_cp_tables.va,
++	    mondrian_cp_tables.pa, 32, iova, pa, 4096, permissions,
++	    &mondrian_uc_table_next);
++	return 0;
++}
++
++int
++mondrian_gpu_uc_unmap_page(uint64_t iova)
++{
++	uint64_t *t = (uint64_t *)mondrian_cp_tables.va;
++	uint64_t entry;
++	uint32_t l2, l3;
++
++	if (t == NULL || (iova & 0xfffull) != 0) {
++		return -1;
++	}
++	entry = t[(iova >> 30) & 3u];
++	if ((entry & 3ull) != 3ull) {
++		return -1;
++	}
++	l2 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	entry = t[l2 * 512 + ((iova >> 21) & 0x1ffu)];
++	if ((entry & 3ull) != 3ull) {
++		return -1;
++	}
++	l3 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	t[l3 * 512 + ((iova >> 12) & 0x1ffu)] = 0;
++	return 0;
++}
++
++int
++mondrian_gpu_uc_tables_sync(void)
++{
++	if (mondrian_cp_tables.va == 0) {
++		return -1;
++	}
++	flush_dcache64((addr64_t)mondrian_cp_tables.pa,
++	    mondrian_cp_tables.bytes, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++int
++mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes)
++{
++	if (bytes == 0) {
++		return -1;
++	}
++	flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++/*
++ * Close the ring. The CP fetches from the read pointer towards the write
++ * pointer and wraps at the end of the buffer, so a write pointer that jumps
++ * back to zero leaves it fetching the dwords it never saw. Fill the tail with
++ * one CP_NOP that covers it, publish the wrap and wait for the read pointer
++ * to come back to zero before anything is written at the start again.
++ */
++static int
++mondrian_uc_wrap(uint32_t *ring)
++{
++	uint32_t pad = MONDRIAN_UC_RING_DWORDS - mondrian_uc_at;
++	uint32_t i, waited;
++
++	if (pad != 0) {
++		ring[mondrian_uc_at] = mondrian_pm4_type7(0x10u, pad - 1);
++		for (i = 1; i < pad; i++) {
++			ring[mondrian_uc_at + i] = 0;
++		}
++		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, 0);
++	for (waited = 0; waited < 50; waited++) {
++		if (mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_RB_RPTR * 4u) == 0) {
++			mondrian_uc_at = 0;
++			return 0;
++		}
++		delay(1000);
++	}
++	return -1;
++}
++
++int
++mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
++{
++	uint32_t *ring;
++	uint32_t at, seq;
++	uint64_t slot;
++
++	if (fence == NULL) {
++		return -1;
++	}
++	*fence = 0;
++	if (!mondrian_uc_up || mondrian_cp_ring.va == 0 || dwords == 0 ||
++	    (ib & 3ull) != 0) {
++		return -1;
++	}
++	ring = (uint32_t *)mondrian_cp_ring.va;
++	if (dwords > 16 && mondrian_uc_logged < 8) {
++		mondrian_uc_logged++;
++		printf("MONDRIAN GPU: uc pre %u at 0x%x rptr 0x%x wptr 0x%x int 0x%x bv 0x%x\n",
++		    dwords, mondrian_uc_at,
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_INTERRUPT_STATUS * 4u),
++		    ((volatile uint32_t *)mondrian_cp_memptr_view)[2]);
++		mondrian_log_flush_now();
++	}
++	at = mondrian_uc_at;
++	if (at + 13 > MONDRIAN_UC_RING_DWORDS) {
++		if (mondrian_uc_wrap(ring) != 0) {
++			return -1;
++		}
++		at = 0;
++	}
++	seq = mondrian_uc_fence + 1;
++	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
++	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
++	/* kgsl brackets a submission with CP_SET_PROTECTED_MODE(0) … (1) when
++	 * the caller asks for an unprotected one; without the exit the state
++	 * stream's type-4 register writes are refused. The CCU invalidates and
++	 * the IFPC marker that kgsl and pong also emit around a submission
++	 * change nothing here (measured). */
++	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++	ring[at++] = 0;
++	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
++	ring[at++] = (uint32_t)ib;
++	ring[at++] = (uint32_t)(ib >> 32);
++	ring[at++] = dwords;
++	ring[at++] = mondrian_pm4_type7(0x46u, 4);	/* EVENT_WRITE */
++	ring[at++] = 0x31u | (1u << 27);		/* cache clean */
++	ring[at++] = (uint32_t)slot;
++	ring[at++] = (uint32_t)(slot >> 32);
++	ring[at++] = seq;
++	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++	ring[at++] = 1;
++	/* kgsl toggles the GMU keepalive around every submission
++	 * (gen7_gpu_keepalive true/false); holding it on forever leaves the
++	 * power state machine in a different place and the same stream then
++	 * completes in one boot and stalls in the next. */
++	if (mondrian_uc_gmu != 0) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
++	}
++	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_uc_fence = seq;
++	mondrian_uc_at = at;
++	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++	/* Read it back so the posted write is committed to the interconnect
++	 * before anything else happens: a write pointer the CP has not seen
++	 * leaves it in the ucode's waitin state, waiting for packet data. */
++	__asm__ volatile("dsb sy" ::: "memory");
++	(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
++	if (mondrian_uc_gmu != 0) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
++	}
++	*fence = seq;
++	if (dwords > 16 && mondrian_uc_logged < 8) {
++		/* A command stream from a real driver, not the bring-up probe:
++		 * wait for its own fence here and say what the CP did with it. */
++		volatile uint32_t *view =
++		    (volatile uint32_t *)mondrian_cp_memptr_view;
++		uint32_t waited, value = 0;
++
++		for (waited = 0; waited < 300; waited++) {
++			__asm__ volatile("dsb sy" ::: "memory");
++			value = view[mondrian_uc_fence_word(seq)];
++			if ((int32_t)(value - seq) >= 0) {
++				break;
++			}
++			delay(1000);
++		}
++		mondrian_uc_logged++;
++		/* An opcode error names the packet the ucode would not take:
++		 * SQE_STAT index 0 is the ucode PC, index 1 the packet. */
++		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_SQE_STAT_ADDR * 4u, 0);
++		{
++			uint32_t pc = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_SQE_STAT_DATA * 4u);
++			uint32_t packet = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_SQE_STAT_DATA * 4u);
++
++			uint32_t base = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB1_BASE * 4u);
++			uint32_t rem = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB1_REM_SIZE * 4u);
++
++			printf("MONDRIAN GPU: uc sqe pc 0x%x packet 0x%08x ib1 0x%x rem 0x%x ib2 0x%x rem2 0x%x\n",
++			    pc, packet, base, rem,
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB2_BASE * 4u),
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_IB2_REM_SIZE * 4u));
++			printf("MONDRIAN GPU: uc ib1 stopped at %u dwords\n",
++			    rem >= dwords ? 0u : dwords - rem);
++		}
++		printf("MONDRIAN GPU: uc big %u dwords fence %u done %u in %u ms int 0x%x fault 0x%x protect 0x%x fsr 0x%x\n",
++		    dwords, seq, (int32_t)(value - seq) >= 0, waited,
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_INTERRUPT_STATUS * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_HW_FAULT * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_PROTECT_STATUS * 4u),
++		    mondrian_gpu_read(mondrian_uc_smmu, 0x20058u));
++		mondrian_log_flush_now();
++	}
++	return 0;
+ }
+ 
+ int
++mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
++{
++	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
++	uint32_t waited = 0, limit, value;
++
++	if (view == NULL || fence == 0 || fence > mondrian_uc_fence) {
++		return -1;
++	}
++	limit = timeout_ms != 0 ? timeout_ms : 5000u;
++	for (;;) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		value = view[mondrian_uc_fence_word(fence)];
++		if ((int32_t)(value - fence) >= 0) {
++			if (mondrian_uc_logged < 10) {
++				mondrian_uc_logged++;
++				printf("MONDRIAN GPU: uc fence %u int 0x%x fault 0x%x fsr 0x%x rptr 0x%x wptr 0x%x\n",
++				    fence,
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_INTERRUPT_STATUS * 4u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_HW_FAULT * 4u),
++				    mondrian_gpu_read(mondrian_uc_smmu,
++				    0x20058u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_RB_RPTR * 4u),
++				    mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_CP_RB_WPTR * 4u));
++				mondrian_log_flush_now();
++			}
++			return 0;
++		}
++		if (waited >= limit) {
++			return -1;
++		}
++		delay(1000);
++		waited++;
++	}
++}
++#endif
++
++int
+ mondrian_gpu_probe(void)
+ {
+-	int on = 0, power = 0, gmuread = 0, zapread = 0, gmustart = 0;
++	int on = 0, power = 0, gmuread = 0, zapread = 0, gmustart = 0, cp = 0, submit = 0;
+ 	vm_offset_t gpucc, gpu, gmu, smmu;
+ 	uint32_t cx, gx, ahb, cxo;
+ 
+@@ -1438,6 +3112,26 @@
+ 	(void)PE_parse_boot_argn("gmustart", &gmustart, sizeof(gmustart));
+ 	(void)PE_parse_boot_argn("gpurscc", &mondrian_gpu_rscc, sizeof(mondrian_gpu_rscc));
+ 	(void)PE_parse_boot_argn("gpugx", &mondrian_gpu_gx, sizeof(mondrian_gpu_gx));
++	(void)PE_parse_boot_argn("gpucp", &cp, sizeof(cp));
++	(void)PE_parse_boot_argn("gpusubmit", &submit, sizeof(submit));
++	(void)PE_parse_boot_argn("gpublind", &mondrian_cp_blind,
++	    sizeof(mondrian_cp_blind));
++	(void)PE_parse_boot_argn("gpuzap", &mondrian_cp_zap,
++	    sizeof(mondrian_cp_zap));
++	(void)PE_parse_boot_argn("gpustart", &mondrian_cp_run,
++	    sizeof(mondrian_cp_run));
++	(void)PE_parse_boot_argn("gpupm4", &mondrian_uc_pm4,
++	    sizeof(mondrian_uc_pm4));
++	(void)PE_parse_boot_argn("gpunoblit", &mondrian_uc_noblit,
++	    sizeof(mondrian_uc_noblit));
++	(void)PE_parse_boot_argn("gpunop", &mondrian_uc_nop_opcode,
++	    sizeof(mondrian_uc_nop_opcode));
++	(void)PE_parse_boot_argn("gpumode", &mondrian_uc_set_mode,
++	    sizeof(mondrian_uc_set_mode));
++	(void)PE_parse_boot_argn("gpudstate", &mondrian_uc_draw_state,
++	    sizeof(mondrian_uc_draw_state));
++	(void)PE_parse_boot_argn("gpudsaddr", &mondrian_uc_ds_addr,
++	    sizeof(mondrian_uc_ds_addr));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
+@@ -1473,6 +3167,52 @@
+ 			    mondrian_gpu_read(gpucc, 0x90c8));
+ 			mondrian_log_flush_now();
+ 		}
++		if (cp != 0) {
++			/* The streams are taken over in cp_start, with the GPU
++			 * powered and the CP halted, not here: a stream that
++			 * points at a disabled context stalls the bus when GX
++			 * is re-powered. */
++
++			/*
++			 * Read-only CP snapshot. With GX power and clock on the
++			 * registers are live; the byte offsets are word*4 from
++			 * PongAdrenoCpProfile.h (RBBM_STATUS 0x210, CP_RB 0x800,
++			 * CP_SQE_CNTL 0x808, CP_HW_FAULT 0x821, CP_STATUS_1 0x825,
++			 * CP_PROTECT_CNTL 0x84f, RBBM_SECVID_TSB_CNTL 0xf803).
++			 */
++			printf("MONDRIAN GPU: cp rbbm 0x%x/0x%x status1 0x%x fault 0x%x\n",
++			    mondrian_gpu_read(gpu, 0x840), mondrian_gpu_read(gpu, 0x84c),
++			    mondrian_gpu_read(gpu, 0x2094), mondrian_gpu_read(gpu, 0x2084));
++			mondrian_log_flush_now();
++			printf("MONDRIAN GPU: cp rb base 0x%x/0x%x cntl 0x%x rptr 0x%x wptr 0x%x\n",
++			    mondrian_gpu_read(gpu, 0x2000), mondrian_gpu_read(gpu, 0x2004),
++			    mondrian_gpu_read(gpu, 0x2008), mondrian_gpu_read(gpu, 0x2018),
++			    mondrian_gpu_read(gpu, 0x201c));
++			mondrian_log_flush_now();
++			printf("MONDRIAN GPU: cp sqe 0x%x protect 0x%x secvid 0x%x\n",
++			    mondrian_gpu_read(gpu, 0x2020), mondrian_gpu_read(gpu, 0x213c),
++			    mondrian_gpu_read(gpu, 0x3e00c));
++			mondrian_log_flush_now();
++			for (unsigned i = 0; i < 24; i++) {
++				uint32_t smr = mondrian_gpu_read(smmu, SMMU_SMR(i));
++				uint32_t s2cr = mondrian_gpu_read(smmu, SMMU_S2CR(i));
++				if (smr != 0 || s2cr != 0) {
++					printf("MONDRIAN GPU: smmu slot %u smr 0x%x s2cr 0x%x\n",
++					    i, smr, s2cr);
++				}
++			}
++			printf("MONDRIAN GPU: cp probe snapshot done\n");
++			mondrian_log_flush_now();
++#ifdef MONDRIAN_CP_PROFILE
++			if (submit != 0) {
++				(void)mondrian_gpu_cp_start(gpu, smmu, gpucc, gmu);
++				if (mondrian_gpu_uc_ready()) {
++					MondrianGPUStart();
++				}
++			}
++#endif
++			mondrian_log_flush_now();
++		}
+ 		/*
+ 		 * Pong releases the CX GBIF halt before any GMU access: GDSC
+ 		 * retention can preserve the boot firmware's halt, and every
 diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
 new file mode 100644
 index 0000000..702c53e
