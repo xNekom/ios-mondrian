@@ -76,6 +76,11 @@ series: CI skips a patch that does not apply and still builds, which is how
 build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the user-client
 surface without the CP profile (`docs/BUILD_LINUX.md`).
 
+**Apple's clang builtins are load-bearing.** Without `__builtin_xnu_type_*`
+(`tools/wsl/patches/0002` stubs them) every kalloc_type view is a data view, none
+is kept, the iterator that follows asserts (`kalloc.c:1264`) inside
+`kernel_bootstrap` (black panel, no ring), and `0008` returns when none was kept.
+
 Build artifacts and the KDK cache live outside `/private/tmp` (emptied on
 reboot); `DXB_DIR` must not contain a space, `build.sh` uses it unquoted.
 
@@ -97,8 +102,7 @@ ring; `0174` arms persistence at the end of the UFS probe, before
 a frame from an earlier boot, and the ring is the only truth. Inspect a
 previous boot by running the real kernel, then a dump kernel with
 `mondriandump=1` and `mondriandumpmatch=SMP,CRASH,swap,memorystatus` (`0099`
-splits the list). The dump reads the prior ring before starting its own
-writer; the shim `logview` is unreliable on this UFS host.
+splits the list); the dump reads the prior ring before starting its own writer.
 
 **Host-side testing.** `tools/qemu-ios.py` boots the payload; `--kernel` only
 feeds its decoder (`docs/QEMU_TESTING.md`), so rebuild the payload.
@@ -234,12 +238,10 @@ the kernel has to arm the timer itself (`0173`) and wake the UFS from the state
 ABL leaves. If the panel shows IRQ lines and no `MONDRIAN EARLY`, check the
 shim before the kernel (`nm shim/out/shim.elf | grep test_gic`).
 
-**fastboot serves 768 MiB per download and cannot split a raw image.** The
-bootloader reports `max-download-size: 805306368`; a bigger raw file is
-resparsed, and reading the partition back fails with `Failed reading from
-userdata` (the partition name). Flash a sparse image instead (`tools/mk-simg.py`
-or `tools/flash-root.sh`): fastboot sends it in `-S` chunks and the zero tail
-costs nothing.
+**fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
+raw file is resparsed, and reading the partition back then fails (`Failed
+reading from userdata`). Flash a sparse image instead (`tools/mk-simg.py`,
+`tools/flash-root.sh`), which fastboot sends in `-S` chunks.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again (2026-10-25: the sampler printed one
@@ -330,9 +332,8 @@ When the probe refuses it prints `spmi code N ver XXXXXXXX` (1 no arbiter,
 9 no gpios, 10 gpio ppid, 11 gpio apid, 12 vol_up phandle), so one photo names
 the defect.
 
-**Phases.** v0–v0.4 (draw, keys) are done. Next: reboot from the kernel, then
-the A/B switch through the `misc` BCB; `boot_a` stays untouched and
-`fastboot boot` is the rescue path.
+**Phases.** v0–v0.4 (draw, keys) are done; the kernel reboot and the A/B switch
+through the `misc` BCB are in `docs/MONDIAN_PORT.md`.
 
 ## Other ports worth reading
 
@@ -340,10 +341,9 @@ the A/B switch through the `misc` BCB; `boot_a` stays untouched and
   bootstrap-capacity patch is in `0001` and it documents the UFS LU wake.
 - **Bergamota / Chlorophyll / HackiOS** — CPU fallback, Adreno 630, and the
   iOS 16.5 persona hook that `0106` redoes for 20H392.
-- **`palazik/ios-dodge`** — patch-per-lesson: local TLB flush, timer quiesce,
-  *do not touch* `CNTP_CTL_EL0` at handover, framebuffer alignment.
-- **`mytiantian001/iPadOS-nabu`** — same CPU generation; `cpus=1` as the safe
-  default and the persistent ring at the end of `userdata`.
+- **`palazik/ios-dodge`**, **`mytiantian001/iPadOS-nabu`** — local TLB flush,
+  timer quiesce, *no* `CNTP_CTL_EL0` write at handover; `cpus=1` as the safe
+  default and the ring at the end of `userdata`.
 - **`MakrSas/ios-topaz`** — home screen on SM6225; walls: SGI/timer and the
   ARMv8.0 LSE/RCpc emulation.
 - **`Gsjsjzhznsz/ios-raphael`**, **`Log1nYT/ios-sweet`** — lock screen; CPU

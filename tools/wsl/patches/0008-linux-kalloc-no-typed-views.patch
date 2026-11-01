@@ -1,0 +1,33 @@
+diff --git a/osfmk/kern/kalloc.c b/osfmk/kern/kalloc.c
+index 06fc2a2..b99a248 100644
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -1784,6 +1784,17 @@ kalloc_type_view_init_fixed(void)
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_FIXED);
+ 	assert(kt_count < KALLOC_TYPE_SIZE_MASK);
++	/*
++	 * Without __builtin_xnu_type_signature every view is a data view, and
++	 * kalloc_type_view_copy() keeps none of them: all of them go to
++	 * KHEAP_DATA_BUFFERS. There is then nothing to sort and no typed zone to
++	 * create, and the iterator below assumes at least one view (its
++	 * assert(c_idx == p_idx) fails when the loop never runs; measured as a
++	 * panic in kernel_bootstrap, before the console ring is armed).
++	 */
++	if (kt_count == 0) {
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint16_t);
+@@ -1904,6 +1915,10 @@ kalloc_type_view_init_var(void)
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_VAR);
+ 	assert(kt_count < UINT32_MAX);
++	/* The same for the variable-size views: none was kept. */
++	if (kt_count == 0) {
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint32_t);
