@@ -182,6 +182,36 @@ sudo tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 needs the phone's own device tree (`dtb/boot_unpacked/dtb`, or `DTB=`): without
 one it builds a v3 image and the payload is not found at boot.
 
+## The iOS userland (dylibs and Mesa)
+
+`mondrian-gl.dylib`, `mondrian-inject.dylib` and `libOSMesa.8.dylib` are iOS
+dylibs built against the iPhoneOS SDK, not the kernel toolchain:
+
+```sh
+tools/wsl/bootstrap-ios-toolchain.sh   # libtapi, cctools' ld64 with TAPI, the SDK
+source tools/wsl/env-ios.sh            # in a shell that is NOT using env.sh
+tools/gpu/build.sh out/gpu
+tools/mk-mesa-ios.sh
+```
+
+The SDK is a sparse checkout of `theos/sdks` (`iPhoneOS16.5.sdk`): headers plus
+`.tbd` stubs, which is why ld64 needs libtapi. Keep the two prefixes apart —
+`tools/wsl/env.sh` and `tools/wsl/env-ios.sh` both put an `xcrun` first in
+`PATH` and answer for different SDKs.
+
+## Editing the root image without HFS+
+
+WSL's kernel is built without `hfsplus`, so the iOS root cannot be mounted here
+(and `mkiosroot.sh` stops at its `mount -t hfsplus`). `tools/wsl/hfs-tool.sh`
+boots a stock Ubuntu kernel in qemu, which has the module, and copies through an
+ext4 payload image built with `mke2fs -d`:
+
+```sh
+tools/wsl/hfs-tool.sh setup                                  # once, ~120 MB of .debs
+tools/wsl/hfs-tool.sh put ROOT.img /usr/libexec out/gpu      # dylibs into the image
+tools/wsl/hfs-tool.sh get ROOT.img /private/var/vm/some.log logs/
+```
+
 ## Known gaps
 
 - The `iig` shim generates the DriverKit macros and forwarders, but its

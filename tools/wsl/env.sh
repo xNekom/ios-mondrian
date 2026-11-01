@@ -36,4 +36,7 @@ export JOBS=${JOBS:-$(nproc)}
 # warnings are not errors here and no per-diagnostic downgrade list is needed
 
 [ -n "${_restore:-}" ] && set -u && unset _restore
+# bash caches where a command was found; without this a shell that already ran
+# ld/clang keeps using the system ones after the PATH change above
+hash -r 2>/dev/null || true
 return 0 2>/dev/null || true
