@@ -1,0 +1,83 @@
+xnu 0185: invalidate the CP's SMMU TLB when a buffer is mapped
+
+mondrian_gpu_uc_tables_sync() flushed the page tables to memory but never
+invalidated the SMMU's translation cache, so the CP kept the "not present"
+translation it had walked for a page before that buffer existed. The first
+frame that touched such a buffer wedged the CP: the stream consumed its whole
+IB (CP_IB1_REM_SIZE 0) and never wrote its event-write fence, and the smaller
+streams of the same boot still passed. Measured fsr 0x80000402 (stage-1
+translation fault) and a frame that waited the whole 5.7 s.
+
+Invalidate the CP's ASID (2, the one the context is programmed with) and wait
+for TLBSTATUS to say the walk is done, the same pair cp_smmu_init uses.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -59,6 +59,8 @@
+ static uint32_t mondrian_uc_ds_addr;
+ static vm_offset_t mondrian_uc_gpu;
+ static vm_offset_t mondrian_uc_smmu;
++/* the CP's context bank, so a mapping change can invalidate its TLB */
++static uint32_t mondrian_uc_tlb_ctx;
+ static vm_offset_t mondrian_uc_gmu;
+ static uint32_t mondrian_uc_at;
+ static uint32_t mondrian_uc_fence;
+@@ -1681,6 +1683,7 @@
+ 	 */
+ 	bank = 0;
+ 	ctx = pages * stride;
++	mondrian_uc_tlb_ctx = ctx;
+ 	if (ctx + 0x800 > MONDRIAN_SMMU_SIZE) {
+ 		printf("MONDRIAN GPU: cp SMMU bank 0 out of range 0x%x\n", ctx);
+ 		return -1;
+@@ -2871,6 +2874,34 @@
+ 	return 0;
+ }
+ 
++static void
++mondrian_gpu_uc_tlb_flush(void)
++{
++	unsigned i;
++
++	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
++		return;
++	}
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_gpu_read(mondrian_uc_smmu,
++		    mondrian_uc_tlb_ctx + SMMU_TLBSTATUS) & 1u) == 0) {
++			break;
++		}
++		delay(1);
++	}
++	mondrian_gpu_write(mondrian_uc_smmu,
++	    mondrian_uc_tlb_ctx + SMMU_TLBIASID, 2u);
++	mondrian_gpu_write(mondrian_uc_smmu,
++	    mondrian_uc_tlb_ctx + SMMU_TLBSYNC, 0xffffffffu);
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_gpu_read(mondrian_uc_smmu,
++		    mondrian_uc_tlb_ctx + SMMU_TLBSTATUS) & 1u) == 0) {
++			break;
++		}
++		delay(1);
++	}
++}
++
+ int
+ mondrian_gpu_uc_tables_sync(void)
+ {
+@@ -2879,6 +2910,15 @@
+ 	flush_dcache64((addr64_t)mondrian_cp_tables.pa,
+ 	    mondrian_cp_tables.bytes, TRUE);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	/*
++	 * Writing the tables is not enough: the SMMU keeps the translation it
++	 * walked for a page, so a buffer mapped after the CP first touched its
++	 * range still resolves to "not present" (measured: the frame that
++	 * first used such a buffer faulted on its event write, fsr 0x80000402,
++	 * and the fence never completed while the smaller streams passed).
++	 * Invalidate the CP's ASID and wait until the walk is done.
++	 */
++	mondrian_gpu_uc_tlb_flush();
+ 	return 0;
+ }
+ 
