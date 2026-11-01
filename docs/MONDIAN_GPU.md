@@ -331,6 +331,15 @@ them has Metal. That is the path this port follows.
   CPU_PREP, both `flush_dcache64` by physical address, the pair
   `msm_gem_submit` performs around `dma_buf_end_cpu_access`. The first eight
   CPU_PREP calls log their wait and sync cost in microseconds.
+- **The no-copy path works, and the frame now waits on the CP.** With the CP
+  started (`MondrianGPU` published) and `mondrian-gl.dylib` loaded, a frame is
+  `1 drawn in place, 0 pictures copied out` and the copy costs 39 µs, so the
+  5.7 s readback is gone. What replaces it is the wait for the frame: the user
+  client's submissions do not all complete — `uc big 71 dwords fence 2001 done 1
+  in 13 ms` but `168 dwords` never finishes (`done 0` after 300 ms) and the SMMU
+  keeps `fsr 0x80000402` (a translation fault) latched. That fault is the next
+  thing to decode; `gpupm4=N` truncates the stream and `tools/pm4-decode.py`
+  names its packets.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
