@@ -354,6 +354,7 @@ static struct eagl shadow_copy;         /* the struct as it was when it was made
 static bool have_shadow;
 static bool said_struct_changed;
 static unsigned surface_copies;
+static unsigned readback_lines;
 
 /* The one OSMesa context. The field in the EAGLContext struct is measured to
  * come back zeroed or poisoned (0xff0000ffff0000ff), so it is never trusted:
@@ -1007,17 +1008,66 @@ target_to_surface(struct eagl *e, struct image *image)
 				    (void *)(base + alloc), (void *)e);
 			}
 			if (base != NULL && rows > 0 && columns > 0) {
+				/*
+				 * Ask for the pixels in the texture's own
+				 * format: Mesa's RGBA8-to-BGRA pack is a
+				 * per-pixel conversion. The surface wants
+				 * BGRA, so the red and blue bytes are
+				 * swapped here, together with the flip when
+				 * the image is drawn inverted. The
+				 * readback and the copy are timed apart:
+				 * "copying out" covered both and a slow
+				 * one has to say which it is.
+				 */
+				bool rgba_texture = image->internal == 0x1908 || image->format == 0x1908;
+				bool needs_scratch = image->invert || rgba_texture;
+				GLenum pack = rgba_texture ? GL_RGBA : GL_BGRA;
+				uint8_t *scratch = needs_scratch ? malloc(row * (size_t)rows) : NULL;
+				uint64_t began = now_us(), read_done, took;
+				unsigned read_us = 0, copy_us = 0;
+
 				glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)surface_columns);
 				glPixelStorei(GL_PACK_ALIGNMENT, 4);
-				if (!image->invert) {
+				if (scratch == NULL) {
 					glReadPixels(0, 0, columns, rows,
 					    GL_BGRA, GL_UNSIGNED_BYTE, base);
 				} else {
+					glReadPixels(0, 0, columns, rows,
+					    pack, GL_UNSIGNED_BYTE, scratch);
+				}
+				read_done = now_us();
+				if (scratch != NULL) {
 					for (GLsizei y = 0; y < rows; y++) {
-						glReadPixels(0, y, columns, 1,
-						    GL_BGRA, GL_UNSIGNED_BYTE,
-						    base + row * (size_t)(rows - 1 - y));
+						uint8_t *to = base + row * (size_t)(image->invert ? rows - 1 - y : y);
+						const uint8_t *from = scratch + row * (size_t)y;
+
+						if (!rgba_texture) {
+							memcpy(to, from, (size_t)columns * 4);
+						} else {
+							uint32_t *d = (uint32_t *)to;
+							const uint32_t *s = (const uint32_t *)from;
+
+							for (GLsizei x = 0; x < columns; x++) {
+								uint32_t p = s[x];
+
+								d[x] = (p & 0xff00ff00u) |
+								    ((p & 0x00ff0000u) >> 16) |
+								    ((p & 0x000000ffu) << 16);
+							}
+						}
 					}
+					free(scratch);
+				}
+				took = now_us() - began;
+				read_us = (unsigned)(read_done - began);
+				copy_us = (unsigned)(took - (read_done - began));
+				if (readback_lines < 8) {
+					readback_lines++;
+					say("mondrian-gl: readback %ux%u %s invert %d shared %d mirror %u:"
+					    " read %u us, copy %u us, total %llu us\n",
+					    (unsigned)columns, (unsigned)rows,
+					    rgba_texture ? "rgba" : "bgra", image->invert,
+					    image->shared, image->mirror, read_us, copy_us, took);
 				}
 				glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 			}
@@ -1590,6 +1640,15 @@ triangles_of(GLenum mode, GLsizei count)
  */
 #define GL_VERTEX_SHADER                0x8b31
 #define GL_VERTEX_ATTRIB_ARRAY_ENABLED  0x8622
+#define GL_CURRENT_PROGRAM              0x8b8d
+#define GL_MAX_VERTEX_ATTRIBS           0x8869
+#define GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING 0x889f
+#define GL_VERTEX_ATTRIB_ARRAY_SIZE     0x8623
+#define GL_VERTEX_ATTRIB_ARRAY_STRIDE   0x8624
+#define GL_VERTEX_ATTRIB_ARRAY_TYPE     0x8625
+#define GL_VERTEX_ATTRIB_ARRAY_NORMALIZED 0x886a
+#define GL_VERTEX_ATTRIB_ARRAY_POINTER  0x8645
+extern void glGetVertexAttribPointerv(GLuint index, GLenum pname, void **pointer);
 
 static const char plain_vertex[] =
     "#version 120\n"
@@ -3035,6 +3094,39 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	}
 }
 
+/* What the draw is made of, before Mesa's state tracker trips over it (first four draws only). */
+static void
+dump_draw_state(void)
+{
+	static unsigned dumps;
+	GLint program = 0, max = 0;
+
+	if (dumps >= 4) {
+		return;
+	}
+	dumps++;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &max);
+	say("mondrian-gl: draw state %u: program %d, %d attribs\n", dumps, program, max);
+	for (GLint i = 0; i < max; i++) {
+		GLint enabled = 0, buffer = 0, size = 0, kind = 0, stride = 0, normalized = 0;
+		void *pointer = NULL;
+
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+		if (enabled == 0) {
+			continue;
+		}
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &kind);
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+		glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &normalized);
+		glGetVertexAttribPointerv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+		say("mondrian-gl:   attrib %d: buffer %d, size %d, type %#x, stride %d, normalized %d, pointer %p\n",
+		    i, buffer, size, kind, stride, normalized, pointer);
+	}
+}
+
 static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
@@ -3043,6 +3135,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	bool plain;
 
 	EAGL_ENTER(e, MONDIAN_GL_DRAW_ELEMENTS);
+	dump_draw_state();
 	drawing(e);
 	count_spans(e, mode, count);
 	e->draws++;
