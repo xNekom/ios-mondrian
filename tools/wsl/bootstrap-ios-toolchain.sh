@@ -108,7 +108,8 @@ fi
 say "shims -> $PREFIX/bin"
 cat >"$PREFIX/bin/xcrun" <<'SHIM'
 #!/usr/bin/env bash
-# xcrun for the iOS SDK on Linux: every query the build scripts make.
+# xcrun for the iOS SDK on Linux: every query the build scripts make, and the
+# plain `xcrun --sdk iphoneos clang ...` form that runs a tool.
 set -u
 PREFIX="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK="$PREFIX/sdk"
@@ -123,17 +124,29 @@ while [ $# -gt 0 ]; do
 	*) tool="$1"; shift; break ;;
 	esac
 done
-case "$tool" in
-clang) echo "$PREFIX/bin/clang" ;;
-clang++ | clangxx) echo "$PREFIX/bin/clang++" ;;
-ld) echo "$PREFIX/cctools/bin/ld" ;;
-ar | ranlib | strip | nm | lipo | otool | libtool | nmedit | install_name_tool | codesign_allocate | as)
-	echo "$PREFIX/cctools/bin/$tool" ;;
-codesign) echo "$PREFIX/bin/codesign" ;;
-dsymutil) command -v dsymutil || echo /usr/bin/dsymutil-18 ;;
-*) command -v "$tool" 2>/dev/null || exit 1 ;;
-esac
-exit 0
+
+resolve() {
+	case "$1" in
+	clang) echo "$PREFIX/bin/clang" ;;
+	clang++ | clangxx) echo "$PREFIX/bin/clang++" ;;
+	ld) echo "$PREFIX/cctools/bin/ld" ;;
+	ar | ranlib | strip | nm | lipo | otool | libtool | nmedit | install_name_tool | codesign_allocate | as)
+		echo "$PREFIX/cctools/bin/$1" ;;
+	codesign) echo "$PREFIX/bin/codesign" ;;
+	dsymutil) command -v dsymutil || echo /usr/bin/dsymutil-18 ;;
+	*) command -v "$1" 2>/dev/null ;;
+	esac
+}
+
+path=$(resolve "$tool") || {
+	echo "xcrun: unable to find utility \"$tool\"" >&2
+	exit 1
+}
+if [ "$find" = 1 ]; then
+	echo "$path"
+	exit 0
+fi
+exec "$path" "$@"
 SHIM
 chmod 755 "$PREFIX/bin/xcrun"
 

@@ -238,7 +238,7 @@
    soversion : host_machine.system() == 'windows' ? '' : '8',
 --- a/src/gallium/targets/osmesa/osmesa_target.c
 +++ b/src/gallium/targets/osmesa/osmesa_target.c
-@@ -26,6 +26,90 @@
+@@ -26,6 +26,93 @@
  
  #include "sw/null/null_sw_winsys.h"
  
@@ -286,6 +286,9 @@
 +}
 +#endif
 +
++
++extern struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
 +
 +/*
 + * The memory of an IOSurface as a texture, to draw into and to draw with: the
