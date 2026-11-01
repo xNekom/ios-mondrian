@@ -33,9 +33,12 @@ cmdline=$(python3 - "$extra" <<'PY'
 import sys
 sys.path.insert(0, 'tools')
 import boards
-line = boards.get_board('mondrian').cmdline
-extra = sys.argv[1].strip()
-print((line + ' ' + extra).strip() if extra else line)
+line = boards.get_board('mondrian').cmdline.split()
+# the kernel takes the FIRST occurrence of a boot argument, so an extra one
+# must replace the board's instead of being appended after it
+drop = {a.split('=')[0] for a in sys.argv[1].split()}
+line = [a for a in line if a.split('=')[0] not in drop]
+print(' '.join(line + sys.argv[1].split()))
 PY
 ) || exit 1
 echo "== cmdline: $cmdline"
