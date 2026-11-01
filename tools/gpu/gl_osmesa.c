@@ -9,8 +9,8 @@
  * thread's, a context taken away again, and a name for the log. A library with another way to
  * its contexts gets another file like this one.
  *
- * NOT YET RUN ON HARDWARE. It compiles against the iPhoneOS SDK and the Mesa build; nothing here
- * has created a context on the phone.
+ * Measured on the phone: backboardd creates the Mesa context and CoreAnimation draws through it.
+ * The copy path is what runs until the no-copy surface path below is built and tested.
  *
  * ---------------------------------------------------------------------------------------------
  * Where an IOSurface's number goes (the part that needs the kernel)
@@ -23,21 +23,22 @@
  *
  *     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void *)(uintptr_t)surface_id)
  *
- * Mesa's OSMesa front end has to resolve the image in osmesa_st_get_egl_image()
+ * Mesa's OSMesa front end resolves the image in osmesa_st_get_egl_image()
  * (src/gallium/frontends/osmesa/osmesa.c), by calling osmesa_surface_resource(screen, surface)
  * with the same number (src/gallium/targets/osmesa/osmesa_target.c), which asks the Darwin libdrm
- * shim, tools/mesa/mondrian-drm/. Neither hook is in tools/mesa/mondrian-darwin.patch yet (nor
- * the OSMesa ES profile mondrian_gl_create() needs) -- they are the Mesa half of this dependency:
+ * shim, tools/mesa/mondrian-drm/. Both hooks are in tools/mesa/mondrian-darwin.patch; the OSMesa
+ * ES profile is there too, although this shim still creates the compatibility context because the
+ * ES profile faulted (see mondrian_gl_create):
  *
  *     struct mondrian_drm_surface s = { .surface = surface };
  *     mondrian_drm_surface(gpu_fd, &s);              -> request 0x7e, below
  *     screen->resource_from_handle(..., handle.handle = surface,
  *                                  handle.stride = s.row_bytes, handle.offset = s.offset)
  *
- * and the shim's drmPrimeFDToHandle() (ENOSYS today) would issue the same request with the number
- * as the "file descriptor", because freedreno imports every foreign buffer by descriptor.
+ * and the shim's drmPrimeFDToHandle() issues the same request with the number as the "file
+ * descriptor", because freedreno imports every foreign buffer by descriptor.
  *
- * REQUEST 0x7e (NOT IMPLEMENTED IN THE KERNEL YET -- a dependency of this file):
+ * REQUEST 0x7e (implemented in xnu/patches-mondrian/0182):
  * MondrianGPU's user client (xnu/patches-mondrian/0182) answers Linux's msm_drm requests
  * 0x40..0x4c. 0x7e is the port's own, modelled on topaz's kRedwoodSurface (patch 0901 there),
  * with the structure
@@ -50,20 +51,18 @@
  *             uint32_t width, height, pixel_format, planes;   // and what they are
  *     };
  *
- * It has to do three things the kernel does not do today: find the surface by ID (the display
- * driver's IOSurface table, iokit/Kernel/arm/MondrianSurface), make a GPU buffer of the
- * surface's memory descriptor (an IOBufferMemoryDescriptor the CP can address, wired, with the
- * 16 KiB alignment and the user-accessible permissions 0181 uses for user buffers), and map it
- * into the GPU's stage-1 context (its IOVA, like GEM_NEW/GEM_INFO does for fresh memory). The
- * first half is why this path is optional here: while 0x7e answers an error, the call above
- * fails, mondrian_gl_surface_texture() returns 0, and eagl.c falls back to filling a texture of
- * its own from the surface and reading the frame back -- correct pixels, at the cost of two
- * copies a frame (the renderer the port runs today, only through Mesa's rasteriser instead of
- * CoreAnimation's).
+ * The kernel finds the surface by ID (the display driver's IOSurface table,
+ * iokit/Kernel/arm/MondrianSurface), makes a GPU buffer of the surface's memory descriptor (an
+ * IOBufferMemoryDescriptor the CP can address, wired, with the 16 KiB alignment and the
+ * user-accessible permissions 0181 uses for user buffers), and maps it into the GPU's stage-1
+ * context (its IOVA, like GEM_NEW/GEM_INFO does for fresh memory). While 0x7e answers an error
+ * (an older kernel), the call above fails, mondrian_gl_surface_texture() returns 0, and eagl.c
+ * falls back to filling a texture of its own from the surface and reading the frame back --
+ * correct pixels, at the cost of two copies a frame.
  *
- * A surface that reaches the GPU this way must be one plane of 32-bit pixels, blue first, in
- * rows the GPU can address. CoreAnimation's surfaces are; the flag `plane != 0` and a pixel
- * format other than 'BGRA' in eagl.c keep the rest away.
+ * CoreAnimation's plain surfaces are one plane of 32-bit pixels, blue first, in rows the GPU can
+ * address. The display surface is the two-plane 'b3a8' format: plane 0 is the picture and the
+ * Mesa hook accepts it. The flag `plane != 0` in eagl.c keeps the rest away.
  * ---------------------------------------------------------------------------------------------
  */
 #include <stddef.h>
@@ -236,21 +235,32 @@ mondrian_gl_library(void)
 }
 
 /*
- * OES_EGL_image, with the IOSurface's ID as the image (the comment at the top of the file says
- * what has to happen behind it). Answer "not done" until both halves exist.
- *
- * This OSMesa build exports glEGLImageTargetTexture2DOES, but its front end has no
- * osmesa_st_get_egl_image(): the call goes through a null hook and takes the process with it
- * (measured: pc 0x0, lr in libOSMesa's glEGLImageTargetTexture2DOES, backtrace my_attachImage ->
- * mondrian_gl_surface_texture -> crash; backboardd, 19 times). The Mesa half is not in
- * mondrian-darwin.patch and the kernel request 0x7e is not implemented, so eagl.c has to copy
- * the surface, which is the path the port runs today. Re-enable the call only when the Mesa hook
- * and 0x7e land.
+ * OES_EGL_image, with the IOSurface's ID as the image. The kernel answers request 0x7e with a
+ * buffer of the surface's memory (0182), and the Mesa hooks in tools/mesa/mondrian-darwin.patch
+ * turn that into a texture. The software rasteriser has no EGL image; eagl.c then takes its
+ * copy path.
  */
 int
 mondrian_gl_surface_texture(struct mondrian_gl *gl, uint32_t surface)
 {
+	static void (*image_target)(unsigned target, void *image);
+	static int asked, software;
+
 	(void)gl;
-	(void)surface;
-	return 0;
+	if (!asked) {
+		const char *renderer = (const char *)glGetString(GL_RENDERER);
+
+		asked = 1;
+		image_target = (void (*)(unsigned, void *))OSMesaGetProcAddress(
+		    "glEGLImageTargetTexture2DOES");
+		software = renderer == NULL || strstr(renderer, "softpipe") != NULL ||
+		    strstr(renderer, "llvmpipe") != NULL;
+	}
+	if (image_target == NULL || software) {
+		return 0;
+	}
+	while (glGetError() != 0) {
+	}
+	image_target(GL_TEXTURE_2D, (void *)(uintptr_t)surface);
+	return glGetError() == 0;
 }

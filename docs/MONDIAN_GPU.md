@@ -91,8 +91,10 @@ them has Metal. That is the path this port follows.
   successful boot did not use them.
 - **Local firmware build**: `tools/gen-gmu-fw.py <gmu_gen70000.bin>
   <build>/bsd/dev/mondrian_gmu_fw.h` before building with `gmustart=1`. The
-  header is generated from the device dump and is not committed; without it
-  the kernel builds and prints `no gmu firmware built in`.
+  header is a local input, not committed; without it `mondrian_gpu.c` does not
+  compile (`docs/BUILD_LINUX.md` has a public source for the blob). The CP
+  path below also needs a local `mondrian_cp_profile.h`; without it `0184`
+  leaves the user client inert.
 - **HFI power and GX**: the GMU ACKs PERF (id 4, 58 words), BW (id 3, 159),
   CORE_FW_START (14), the default vote (30, `gpu 2 bus 2`) and START10 with
   `err 0`; `oob_gpu` is held and GX reads `PWR_ON=1` (`gdscr 0xf8222800`,

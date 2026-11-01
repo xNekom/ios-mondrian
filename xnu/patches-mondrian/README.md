@@ -24,6 +24,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0083`–`0085` | panel memory reservation, colour-bar self-test, IOSurface/IOMobileFramebuffer presentation |
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 | `0117`–`0180` | the hardware bring-up after the display: the Goodix touch (TLMM, GENI SPI, 220 KB firmware, vsync reports), the GPU probe (GMU SMMU and firmware, HFI power tables, GX, the ARC votes), the `0173` timer arm, the boot bisect marks, the canvas CFData types, and the cmd-db/RSC mapping cache |
+| `0181`–`0184` | the CP path and its SMMU context (`0181`), the `MondrianGPU` user client (`0182`), the surface wrap refusal (`0183`) and the inert `mondrian_gpu_uc_*` fallback when the local CP profile is absent (`0184`) |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`.

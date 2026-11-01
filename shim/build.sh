@@ -13,6 +13,14 @@
 # The cross compiler defaults to aarch64-linux-gnu-; with the Homebrew
 # toolchain use CROSS=aarch64-elf-.
 set -euo pipefail
+# The payload path is recorded before the cd: the rest of the script runs from
+# shim/, so a path given from the repository root would otherwise be resolved
+# there (shim/shim/out/payload.bin).
+PAYLOAD_IN=${1:-}
+if [ -n "$PAYLOAD_IN" ]; then
+	PAYLOAD_IN=$(cd "$(dirname "$PAYLOAD_IN")" && pwd)/$(basename "$PAYLOAD_IN")
+	[ -f "$PAYLOAD_IN" ] || { echo "error: no payload at $PAYLOAD_IN" >&2; exit 1; }
+fi
 cd "$(dirname "$0")"
 BOARD=${BOARD:-sweet}
 case "$BOARD" in
@@ -79,10 +87,10 @@ truncate -s "$size" out/Image
 # It is compressed with LZ4: the payload is 15MB and the USB link of this
 # phone drops in the middle of a transfer that long (the 5MB image goes
 # through, the 16MB one does not). The shim unpacks it (shim/lz4.c).
-if [ -n "${1:-}" ]; then
+if [ -n "${PAYLOAD_IN:-}" ]; then
 	LZ4=${LZ4:-$(command -v lz4 || echo /opt/homebrew/bin/lz4)}
-	"$LZ4" -BI -9 -f "$1" out/payload.lz4
-	python3 - "$1" out/payload.lz4 out/payload.bin <<-'EOF'
+	"$LZ4" -BI -9 -f "$PAYLOAD_IN" out/payload.lz4
+	python3 - "$PAYLOAD_IN" out/payload.lz4 out/payload.bin <<-'EOF'
 	import os, struct, sys
 	raw, comp, out = sys.argv[1], sys.argv[2], sys.argv[3]
 	data = open(comp, 'rb').read()

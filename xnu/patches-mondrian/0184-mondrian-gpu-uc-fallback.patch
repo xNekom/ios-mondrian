@@ -1,0 +1,137 @@
+xnu 0184: the uc surface without the CP profile
+
+bsd/dev/mondrian_gpu.c compiles the whole CP path, including the
+mondrian_gpu_uc_* surface added by 0181, only when a local
+mondrian_cp_profile.h exists. iokit/Kernel/arm/MondrianGPU.cpp (0182)
+references that surface unconditionally, so a tree without the profile (the
+CI, and any local build that has only the GMU firmware) fails at the kernel
+link with undefined _mondrian_gpu_uc_* symbols instead of taking the
+"profile not built in" path the generator documents.
+
+Answer the surface with the fallback: not ready, no IOVA, map/submit refuse.
+The GPU user client stays inert; with a profile present nothing changes.
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3094,6 +3094,121 @@
+ 		waited++;
+ 	}
+ }
++#else /* !MONDRIAN_CP_PROFILE */
++/*
++ * No profile: the CP path above is not built, but MondrianGPU.cpp still
++ * links against this surface. Keep the user client inert instead of
++ * leaving the kernel with undefined symbols.
++ */
++int
++mondrian_gpu_uc_ready(void)
++{
++	return 0;
++}
++
++int
++mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
++{
++	(void)param;
++	(void)value;
++	return -1;
++}
++
++uint64_t
++mondrian_gpu_uc_iova_alloc(uint64_t bytes)
++{
++	(void)bytes;
++	return 0;
++}
++
++int
++mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions)
++{
++	(void)iova;
++	(void)pa;
++	(void)permissions;
++	return -1;
++}
++
++int
++mondrian_gpu_uc_unmap_page(uint64_t iova)
++{
++	(void)iova;
++	return -1;
++}
++
++int
++mondrian_gpu_uc_tables_sync(void)
++{
++	return -1;
++}
++
++int
++mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes)
++{
++	(void)pa;
++	(void)bytes;
++	return -1;
++}
++
++int
++mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
++{
++	(void)ib;
++	(void)dwords;
++	(void)fence;
++	return -1;
++}
++
++int
++mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
++{
++	(void)fence;
++	(void)timeout_ms;
++	return -1;
++}
++
++uint32_t
++mondrian_gpu_uc_pm4_limit(void)
++{
++	return 0;
++}
++
++int
++mondrian_gpu_uc_noblit(void)
++{
++	return 0;
++}
++
++uint32_t
++mondrian_gpu_uc_nop_opcode(void)
++{
++	return 0;
++}
++
++uint32_t
++mondrian_gpu_uc_set_mode(void)
++{
++	return 0;
++}
++
++uint32_t
++mondrian_gpu_uc_draw_state(void)
++{
++	return 0;
++}
++
++uint32_t
++mondrian_gpu_uc_ds_addr(void)
++{
++	return 0;
++}
++
++uint64_t
++mondrian_gpu_uc_memptr_iova(void)
++{
++	return 0;
++}
+ #endif
+ 
+ int

@@ -67,21 +67,16 @@ Current blockers, in order:
 
 ## Building and booting
 
-**Kernel.** `.github/workflows/xnu.yml` fetches xnu-8796.141.3, applies
-`xnu/patches-mondrian/` in order and uploads `kernel.development.mondrian`.
-Two local builds do the same: `tools/build-kernel-local.sh` on the Mac (pinned
-`blacktop/darwin-xnu-build` tree, cached KDK 13.5) and `tools/wsl/build-kernel.sh`
-on Windows/WSL2 with cctools-port's ld64 and a fakeroot instead of Xcode
-(`docs/BUILD_LINUX.md`). Both reset the checkout and fail if a numbered patch
-is skipped. `tools/apply-series.py` applies the series to a fresh tree in
-seconds and names what does not apply, and `tools/check-patches.sh` does the
-same against the cached tree in `research/`. Run it after touching the series:
-CI skips a patch that does not apply and still builds, which is how `0161` was
-missing from every CI kernel until 2026-10-28 (`0157` already carried its first
-hunk). Now 182/182. A mondrian build also needs `bsd/dev/mondrian_gmu_fw.h`:
-`bsd/dev/mondrian_gpu.c` uses `mondrian_gmu_blocks` unguarded, and the array
-only exists in the header `tools/gen-gmu-fw.py` generates from the vendor GMU
-blob, so a clean tree does not compile without it.
+**Kernel.** `.github/workflows/xnu.yml` and both local builds
+(`tools/build-kernel-local.sh` on the Mac, `tools/wsl/build-kernel.sh` on
+Windows/WSL2, `docs/BUILD_LINUX.md`) fetch xnu-8796.141.3, reset the checkout
+and apply `xnu/patches-mondrian/`; a skipped patch fails the build. Run
+`tools/apply-series.py` (or `tools/check-patches.sh`) after touching the
+series: CI skips a patch that does not apply and still builds, which is how
+`0161` was missing until 2026-10-28 (`0157` carried its first hunk). Now
+183/183. A mondrian build also needs the local `mondrian_gmu_fw.h`; `0184`
+stubs the user-client surface without the CP profile
+(`docs/BUILD_LINUX.md`).
 
 Build artifacts and the KDK cache live outside `/private/tmp` (emptied on
 reboot); `DXB_DIR` must not contain a space, `build.sh` uses it unquoted.

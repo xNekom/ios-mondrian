@@ -1,8 +1,12 @@
 # CoreAnimation on the GPU (OpenGL ES)
 
-**Running on hardware, not yet drawing.** In `backboardd` the injector loads, all seven
-`-[EAGLContext ...]` methods are replaced, both `CA::OGL::GLESContext` hooks install, and a
-context is created. Three measured traps, in the order they were paid for:
+**Running on hardware and drawing through Mesa, but every frame is copied out on the CPU.**
+In `backboardd` the injector loads, all seven `-[EAGLContext ...]` methods are replaced, both
+`CA::OGL::GLESContext` hooks install, and a Mesa `FD725` context is created. CoreAnimation's
+frames reach the GPU, but `attachImage` takes the copy path: a measured frame is 5.7 s of
+`glReadPixels`/copy-out at 1440x3200, so the UI runs at 1-2 fps (`1 picture copied out, 0 drawn
+in place` in the ring). Removing that copy is the next step. Three measured traps, in the order
+they were paid for:
 
 - **The ES profile of OSMesa faults on this driver.** `OSMesaCreateContextAttribs` with the ES
   profile (mapped to `API_OPENGLES2` by `tools/mesa/mondrian-darwin.patch`) creates a context
@@ -37,8 +41,8 @@ context is created. Three measured traps, in the order they were paid for:
   dispatch (0, no GL error). `eagl_resolve()` matches the argument against the live contexts and
   falls back to the most recent one, saying so once.
 
-The rest of this file is the design. The UI is still the CPU rasterizer (`0114`) until a frame is
-presented by the GPU.
+The rest of this file is the design. CoreAnimation already draws through Mesa; the CPU copy-out
+of every frame is what keeps the UI at 1-2 fps. The no-copy path below is written in this tree.
 
 ## Who loads what
 
@@ -59,7 +63,9 @@ process is changed. One change outside `tools/gpu/`: `load_gpu_test()` must also
 Two dylibs, because they fail differently: `mondrian-inject` needs only IOKit and the shared cache
 and is the thing that can break a boot; `mondrian-gl` pulls in Mesa (`@rpath/libOSMesa.8.dylib`) and
 loads only after the GPU service exists. If either refuses, backboardd keeps its renderer and the
-port works as it does today (`mondrian-gl:` says so in the console).
+port works as it does today (`mondrian-gl:` says so in the console). `tools/gpu/build.sh out/gpu`
+builds both; `tools/install-userland.sh ROOT.img --gl out/gpu/mondrian-gl.dylib --inject
+out/gpu/mondrian-inject.dylib` puts them in the image's `/usr/libexec`.
 
 CoreAnimation picks its renderer once per process: Metal, else OpenGL ES, else software. The kernel
 publishes an empty `IOAcceleratorES` (`0114`) with no `MetalPluginName`, as the working a6xx port
@@ -75,17 +81,17 @@ shows whatever surface a swap names (by copying its layers into the panel's memo
 - **No copy** (`surface_shared()`), the GPU path: `mondrian_gl_surface_texture(gl, IOSurfaceGetID)`
   -> `glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, id)` -> Mesa's `osmesa_st_get_egl_image` ->
   `osmesa_surface_resource` -> the Darwin libdrm shim -> **request `0x7e`** on `MondrianGPU`, which
-  must answer with a GEM handle, an IOVA and the surface's size/offset/row-bytes. `0x7e` is not in
-  the kernel yet (0x40-0x4c only, `0182`), so it returns an error and the copy path below runs.
-- **Copy** (`surface_to_texture()` / `target_to_surface()`), which works against Mesa alone: the
-  surface is uploaded with `glTexImage2D`/`glTexSubImage2D` and the frame is read back with
-  `glReadPixels` at `glFlush`/`glFinish`. Correct pixels, two copies a frame; `glcopy=1` forces it.
+  answers with a GEM handle, an IOVA and the surface's size/offset/row-bytes. The kernel side is in
+  `0182`; the Mesa hooks and the `glEGLImageTargetTexture2DOES` call are in this tree. They have
+  not been built or run on the phone yet.
+- **Copy** (`surface_to_texture()` / `target_to_surface()`), the measured path: the surface is
+  uploaded with `glTexImage2D`/`glTexSubImage2D` and the frame is read back with `glReadPixels` at
+  `glFlush`/`glFinish`. Correct pixels, 5.7 s a frame at 1440x3200; `glcopy=1` forces it.
 
-`tools/gpu/gl_osmesa.c` documents the request and the three things the kernel has to do for it:
-find the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context. Mesa's
-half is missing too: the no-copy path's two hooks and the OSMesa ES profile `mondrian_gl_create()`
-asks for (without it there is no context at all) are not in `tools/mesa/mondrian-darwin.patch`.
-Both are dependencies to schedule, not userland problems.
+`tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
+the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.
+`osmesa_surface_resource` accepts both CoreAnimation's plain `'BGRA'` surface and the two-plane
+`'b3a8'` display surface (plane 0 is the picture).
 
 ## Files
 
@@ -132,12 +138,13 @@ renderer has no function N` with N >= 90 on the console means this pair is wrong
 
 ## What is untested
 
-- Every part of it: no dylib has run on the phone. `build.sh` compiles and signs; that is all.
-  Whether `IOAcceleratorES` (`0114`) is enough for CoreAnimation to choose GLES is open.
+- The dylibs run on the phone (`MONDRIAN GL:`/`MONDRIAN DRM:` in the ring); the no-copy surface
+  path is the part that has not been built or run. CoreAnimation already chooses GLES.
 - The 30 table offsets in `eagl_slots.txt`: every other call CoreAnimation makes is "CALLED AND NOT
   THERE" until step 3 above fills the list in, so a first boot with it as it is draws nothing.
-- Request `0x7e` exists in the kernel but nothing calls it yet (Mesa's `osmesa_surface_resource`
-  hook is missing), so frames are copied: the 11 MB BGRA readback each way is unmeasured.
+- Request `0x7e`, the Mesa hooks and `glEGLImageTargetTexture2DOES` are in this tree; the no-copy
+  path has not been built or run yet, so the measured frames are still the CPU copy path (5.7 s a
+  frame).
 
 ## First pixels, in order
 
@@ -152,5 +159,6 @@ renderer has no function N` with N >= 90 on the console means this pair is wrong
 5. Read three log lines: `an OpenGL ES 3 context for CoreAnimation, by Mesa` (renderer chosen),
    `-attachImage: texture N is IOSurface M` (a frame goes into a surface), and `CALLED AND NOT
    THERE` (table entries still missing).
-6. Expect the copy path to be slow. Then hook `osmesa_surface_resource` so 0x7e is used, and
-   compare against the 6.4 fps baseline.
+6. Expect the copy path to be slow (5.7 s/frame measured). The hooks in this tree make 0x7e usable;
+   after installing, the frame line should say `0 copied out, 1 drawn in place` or `... by the GPU`,
+   and the `MONDRIAN FB: fps` line finally moves off 1-2. Compare against the 6.4 fps CPU baseline.

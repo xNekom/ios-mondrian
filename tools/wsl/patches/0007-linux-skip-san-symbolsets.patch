@@ -1,0 +1,35 @@
+0006 skips the kext symbol sets from config/Makefile, but the Kcov and Kasan
+rules live in san/coverage and san/memory and run from config_all. They need
+config/allsymbols, which is produced by the kernel link, so a clean build
+stops there before the kernel exists. Take the same xnu_libraries branch:
+these sets only feed kext linking, which the kernel-only build never does.
+diff --git a/san/coverage/Makefile b/san/coverage/Makefile
+--- a/san/coverage/Makefile
++++ b/san/coverage/Makefile
+@@ -48,7 +48,10 @@
+ # Kcov System.kext plugin
+ #
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The kernel-only Linux build has no allsymbols when config_all runs,
++# and kext symbol sets only feed kext linking, which it never does.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ #
+ # Primary build will always install kext without exported runtime.
+diff --git a/san/memory/Makefile b/san/memory/Makefile
+--- a/san/memory/Makefile
++++ b/san/memory/Makefile
+@@ -46,7 +46,10 @@
+ # Kasan System.kext plugin
+ #
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The kernel-only Linux build has no allsymbols when config_all runs,
++# and kext symbol sets only feed kext linking, which it never does.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ #
+ # Primary build will always install kext without exported runtime.

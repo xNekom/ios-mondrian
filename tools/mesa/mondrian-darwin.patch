@@ -1,8 +1,16 @@
-diff --git a/meson.build b/meson.build
-index 095aec5..18f18ed 100644
+--- a/include/GL/osmesa.h
++++ b/include/GL/osmesa.h
+@@ -103,6 +103,7 @@
+ #define OSMESA_ACCUM_BITS            0x32
+ #define OSMESA_PROFILE               0x33
+ #define OSMESA_CORE_PROFILE          0x34
++#define OSMESA_ES_PROFILE            0x38
+ #define OSMESA_COMPAT_PROFILE        0x35
+ #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
+ #define OSMESA_CONTEXT_MINOR_VERSION 0x37
 --- a/meson.build
 +++ b/meson.build
-@@ -1716,7 +1716,16 @@ else
+@@ -1716,7 +1716,16 @@
    # dependencies (such as vk-runtime) linking to it
    dep_libdrm = null_dep
  endif
@@ -20,11 +28,9 @@ index 095aec5..18f18ed 100644
    pre_args += '-DHAVE_LIBDRM'
    if with_dri_platform == 'drm' and with_dri
      with_gallium_drisw_kms = true
-diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
-index 1f99f36..9ff6624 100644
 --- a/src/freedreno/drm/freedreno_bo.c
 +++ b/src/freedreno/drm/freedreno_bo.c
-@@ -474,7 +474,11 @@ fd_bo_fini_common(struct fd_bo *bo)
+@@ -474,7 +474,11 @@
     fd_bo_fini_fences(bo);
  
     if (bo->map)
@@ -36,7 +42,7 @@ index 1f99f36..9ff6624 100644
  
     if (handle) {
        simple_mtx_lock(&table_lock);
-@@ -612,6 +616,13 @@ fd_bo_get_metadata(struct fd_bo *bo, void *metadata, uint32_t metadata_size)
+@@ -612,6 +616,13 @@
  void *
  fd_bo_map_os_mmap(struct fd_bo *bo)
  {
@@ -50,7 +56,7 @@ index 1f99f36..9ff6624 100644
     uint64_t offset;
     int ret;
     ret = bo->funcs->offset(bo, &offset);
-@@ -620,6 +631,7 @@ fd_bo_map_os_mmap(struct fd_bo *bo)
+@@ -620,6 +631,7 @@
     }
     return os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
                    bo->dev->fd, offset);
@@ -58,11 +64,9 @@ index 1f99f36..9ff6624 100644
  }
  
  /* For internal use only, does not check FD_BO_NOMAP: */
-diff --git a/src/freedreno/drm/meson.build b/src/freedreno/drm/meson.build
-index ffaf6c9..315dbc5 100644
 --- a/src/freedreno/drm/meson.build
 +++ b/src/freedreno/drm/meson.build
-@@ -45,6 +45,9 @@ libfreedreno_drm_msm_files = files(
+@@ -45,6 +45,9 @@
    'msm/msm_ringbuffer_sp.c',
  )
  libfreedreno_drm_files += libfreedreno_drm_msm_files
@@ -72,7 +76,7 @@ index ffaf6c9..315dbc5 100644
  
  libfreedreno_drm_virtio_files = files(
    'virtio/virtio_bo.c',
-@@ -72,8 +75,7 @@ libfreedreno_drm = static_library(
+@@ -72,8 +75,7 @@
    c_args : [no_override_init_args, libfreedreno_drm_flags],
    gnu_symbol_visibility : 'hidden',
    dependencies : libfreedreno_drm_deps,
@@ -82,11 +86,9 @@ index ffaf6c9..315dbc5 100644
    build_by_default : false,
  )
  
-diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
-index 1d35b43..67fa421 100644
 --- a/src/freedreno/ir3/ir3_disk_cache.c
 +++ b/src/freedreno/ir3/ir3_disk_cache.c
-@@ -33,6 +33,12 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+@@ -33,6 +33,12 @@
     if (ir3_shader_debug & IR3_DBG_NOCACHE)
        return;
  
@@ -99,7 +101,7 @@ index 1d35b43..67fa421 100644
     const char *renderer = fd_dev_name(compiler->dev_id);
     const struct build_id_note *note =
        build_id_find_nhdr_for_addr(ir3_disk_cache_init);
-@@ -46,6 +52,7 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+@@ -46,6 +52,7 @@
  
     uint64_t driver_flags = ir3_shader_debug_hash_key();
     compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
@@ -107,11 +109,9 @@ index 1d35b43..67fa421 100644
  }
  
  void
-diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
-index 29e1bc4..29e780d 100644
 --- a/src/freedreno/meson.build
 +++ b/src/freedreno/meson.build
-@@ -22,7 +22,7 @@ subdir('ir2')
+@@ -22,7 +22,7 @@
  subdir('ir3')
  subdir('fdl')
  
@@ -120,8 +120,6 @@ index 29e1bc4..29e780d 100644
    subdir('drm')
  endif
  
-diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
-index e41699a..06f3bf1 100644
 --- a/src/gallium/drivers/freedreno/freedreno_screen.c
 +++ b/src/gallium/drivers/freedreno/freedreno_screen.c
 @@ -25,7 +25,9 @@
@@ -134,7 +132,7 @@ index e41699a..06f3bf1 100644
  
  #include "freedreno_fence.h"
  #include "freedreno_perfetto.h"
-@@ -1004,9 +1006,15 @@ fd_screen_create(int fd,
+@@ -1004,9 +1006,15 @@
     screen->driconf.dual_color_blend_by_location =
           driQueryOptionb(config->options, "dual_color_blend_by_location");
  
@@ -150,11 +148,87 @@ index e41699a..06f3bf1 100644
  
     DBG("Pipe Info:");
     DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
-diff --git a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
-index 3c37161..dde1938 100644
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -86,6 +86,9 @@
+ extern struct pipe_screen *
+ osmesa_create_screen(void);
+ 
++extern struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++
+ 
+ 
+ struct osmesa_buffer
+@@ -152,6 +155,29 @@
+    }
+ }
+ 
++/*
++ * There is no EGL here. What glEGLImageTargetTexture2DOES is given as an image
++ * is the ID of an IOSurface, whose memory becomes the texture's where the
++ * driver can do that (MondrianGPU request 0x7e).
++ */
++static bool
++osmesa_st_get_egl_image(struct pipe_frontend_screen *fscreen, void *image,
++                        struct st_egl_image *out)
++{
++   out->texture = osmesa_surface_resource(fscreen->screen,
++                                          (uint32_t)(uintptr_t)image);
++   if (!out->texture)
++      return false;
++   out->format = out->texture->format;
++   return true;
++}
++
++static bool
++osmesa_st_validate_egl_image(struct pipe_frontend_screen *fscreen, void *image)
++{
++   return true;
++}
++
+ static void
+ create_st_manager(void)
+ {
+@@ -162,7 +188,8 @@
+    if (global_fscreen) {
+       global_fscreen->screen = osmesa_create_screen();
+       global_fscreen->get_param = osmesa_st_get_param;
+-      global_fscreen->get_egl_image = NULL;
++      global_fscreen->get_egl_image = osmesa_st_get_egl_image;
++      global_fscreen->validate_egl_image = osmesa_st_validate_egl_image;
+    }
+ }
+ 
+@@ -614,8 +641,11 @@
+          break;
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
++         /* Mondrian: the ES profile, so CoreAnimation's window server can
++          * have an OpenGL ES context from an off-screen OSMesa one. */
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != OSMESA_ES_PROFILE)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
+@@ -662,8 +692,10 @@
+     * Create the rendering context
+     */
+    memset(&attribs, 0, sizeof(attribs));
+-   attribs.profile = (profile == OSMESA_CORE_PROFILE)
+-      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   attribs.profile = (profile == OSMESA_ES_PROFILE)
++      ? API_OPENGLES2
++      : (profile == OSMESA_CORE_PROFILE)
++        ? API_OPENGL_CORE : API_OPENGL_COMPAT;
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
 --- a/src/gallium/targets/osmesa/meson.build
 +++ b/src/gallium/targets/osmesa/meson.build
-@@ -39,6 +39,7 @@ libosmesa = shared_library(
+@@ -39,6 +39,7 @@
    ],
    dependencies : [
      dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
@@ -162,11 +236,9 @@ index 3c37161..dde1938 100644
    ],
    name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
    soversion : host_machine.system() == 'windows' ? '' : '8',
-diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
-index 25985dd..eef4fa2 100644
 --- a/src/gallium/targets/osmesa/osmesa_target.c
 +++ b/src/gallium/targets/osmesa/osmesa_target.c
-@@ -26,6 +26,43 @@
+@@ -26,6 +26,90 @@
  
  #include "sw/null/null_sw_winsys.h"
  
@@ -175,6 +247,11 @@ index 25985dd..eef4fa2 100644
 +#include "util/driconf.h"
 +#include "util/xmlconfig.h"
 +#include <xf86drm.h>
++#include "frontend/winsys_handle.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++
++static int gpu_fd = -1;
 +
 +static const driOptionDescription freedreno_options[] = {
 +#include "freedreno/driinfo_freedreno.h"
@@ -203,14 +280,56 @@ index 25985dd..eef4fa2 100644
 +   config.options = &cache;
 +   config.options_info = &info;
 +   screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
++   if (screen)
++      gpu_fd = fd;
 +   return screen ? debug_screen_wrap(screen) : NULL;
 +}
 +#endif
 +
++
++/*
++ * The memory of an IOSurface as a texture, to draw into and to draw with: the
++ * kernel's GPU driver (MondrianGPU, request 0x7e) makes a buffer of it. NULL:
++ * the screen is not the GPU's, or the surface cannot be a BGRA texture.
++ */
++struct pipe_resource *
++osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
++{
++#ifdef GALLIUM_FREEDRENO
++   struct mondrian_drm_surface s = { .surface = surface };
++   struct pipe_resource templ = {
++      .target = PIPE_TEXTURE_2D,
++      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
++      .depth0 = 1,
++      .array_size = 1,
++      .bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET,
++   };
++   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
++
++   if (gpu_fd < 0 || mondrian_drm_surface(gpu_fd, &s) != 0)
++      return NULL;
++   /*
++    * 'BGRA' is a plain surface. 'b3a8' is CoreAnimation's display surface:
++    * plane 0 is 32-bit BGRA and the second plane is not the picture.
++    */
++   if ((s.pixel_format != 0x42475241 /* 'BGRA' */ &&
++        s.pixel_format != 0x62336138 /* 'b3a8' */) || s.planes > 2)
++      return NULL;
++   templ.width0 = s.width;
++   templ.height0 = s.height;
++   handle.handle = surface;
++   handle.stride = s.row_bytes;
++   handle.offset = s.offset;
++   handle.size = s.size;
++   return screen->resource_from_handle(screen, &templ, &handle, 0);
++#else
++   return NULL;
++#endif
++}
  
  struct pipe_screen *
  osmesa_create_screen(void);
-@@ -37,6 +74,12 @@ osmesa_create_screen(void)
+@@ -37,6 +121,12 @@
     struct sw_winsys *winsys;
     struct pipe_screen *screen;
  
@@ -223,47 +342,6 @@ index 25985dd..eef4fa2 100644
     /* We use a null software winsys since we always just render to ordinary
      * driver resources.
      */
-diff --git a/include/GL/osmesa.h b/include/GL/osmesa.h
---- a/include/GL/osmesa.h
-+++ b/include/GL/osmesa.h
-@@ -103,6 +103,7 @@
- #define OSMESA_ACCUM_BITS            0x32
- #define OSMESA_PROFILE               0x33
- #define OSMESA_CORE_PROFILE          0x34
-+#define OSMESA_ES_PROFILE            0x38
- #define OSMESA_COMPAT_PROFILE        0x35
- #define OSMESA_CONTEXT_MAJOR_VERSION 0x36
- #define OSMESA_CONTEXT_MINOR_VERSION 0x37
-diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmesa/osmesa.c
---- a/src/gallium/frontends/osmesa/osmesa.c
-+++ b/src/gallium/frontends/osmesa/osmesa.c
-@@ -614,8 +614,11 @@
-          break;
-       case OSMESA_PROFILE:
-          profile = attribList[i+1];
-+         /* Mondrian: the ES profile, so CoreAnimation's window server can
-+          * have an OpenGL ES context from an off-screen OSMesa one. */
-          if (profile != OSMESA_CORE_PROFILE &&
--             profile != OSMESA_COMPAT_PROFILE)
-+             profile != OSMESA_COMPAT_PROFILE &&
-+             profile != OSMESA_ES_PROFILE)
-             return NULL;
-          break;
-       case OSMESA_CONTEXT_MAJOR_VERSION:
-@@ -662,8 +665,10 @@
-     * Create the rendering context
-     */
-    memset(&attribs, 0, sizeof(attribs));
--   attribs.profile = (profile == OSMESA_CORE_PROFILE)
--      ? API_OPENGL_CORE : API_OPENGL_COMPAT;
-+   attribs.profile = (profile == OSMESA_ES_PROFILE)
-+      ? API_OPENGLES2
-+      : (profile == OSMESA_CORE_PROFILE)
-+        ? API_OPENGL_CORE : API_OPENGL_COMPAT;
-    attribs.major = version_major;
-    attribs.minor = version_minor;
-    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
-diff --git a/src/mesa/state_tracker/st_atom_array.cpp b/src/mesa/state_tracker/st_atom_array.cpp
 --- a/src/mesa/state_tracker/st_atom_array.cpp
 +++ b/src/mesa/state_tracker/st_atom_array.cpp
 @@ -146,9 +146,15 @@
@@ -285,11 +363,10 @@ diff --git a/src/mesa/state_tracker/st_atom_array.cpp b/src/mesa/state_tracker/s
              struct pipe_resource *buf =
                 _mesa_get_bufferobj_reference(ctx, binding->BufferObj);
              vbuffer[bufidx].buffer.resource = buf;
-@@ -588,7 +594,31 @@
-    const GLbitfield enabled_arrays = _mesa_get_enabled_vertex_arrays(ctx);
+@@ -589,6 +595,30 @@
     GLbitfield enabled_user_arrays;
     GLbitfield nonzero_divisor_arrays;
-+
+ 
 +   /* Keep the VBO bits of the mask in step with the bindings. The two can
 +    * disagree on the mondrian port (measured with CoreAnimation's client
 +    * arrays: buffer 0 and a client pointer, yet the mask bit set), and the
@@ -300,7 +377,7 @@ diff --git a/src/mesa/state_tracker/st_atom_array.cpp b/src/mesa/state_tracker/s
 +      const GLbitfield enabled = vao->Enabled;
 +      GLbitfield vbo_mask = 0;
 +      GLbitfield scan = enabled;
- 
++
 +      while (scan) {
 +         const gl_vert_attrib i = (gl_vert_attrib)u_bit_scan(&scan);
 +         if (vao->BufferBinding[vao->VertexAttrib[i].BufferBindingIndex].BufferObj)

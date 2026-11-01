@@ -2,7 +2,8 @@
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
   sudo ios-root-tweaks.py MOUNTED_ROOT [--ui-hook DYLIB] [--gpu-test DYLIB]
-                                 [--mesa-test DYLIB] [--mesa STAGE_DIR]
+                                [--gl DYLIB] [--inject DYLIB]
+                                [--mesa-test DYLIB] [--mesa STAGE_DIR]
 
 MONDRIAN_INSTALL_ONLY=1 copies the dylibs and Mesa and skips the rest of the
 bring-up, which is already in the image; that works on a noowners mount
@@ -180,6 +181,8 @@ DYLIB_OPTIONS = {
     '--ui-hook': ('mondrian-ui-hook.dylib', 'UI hook'),
     '--gpu-test': ('mondrian-gpu-test.dylib', 'GPU test'),
     '--mesa-test': ('mondrian-mesa-test.dylib', 'Mesa test'),
+    '--gl': ('mondrian-gl.dylib', 'GL library'),
+    '--inject': ('mondrian-inject.dylib', 'GPU injector'),
 }
 
 

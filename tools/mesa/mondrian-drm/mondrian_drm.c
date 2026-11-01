@@ -23,6 +23,8 @@
 #include "xf86drm.h"
 
 #define MONDIAN_GPU_SERVICE	"MondrianGPU"
+#define MONDIAN_GPU_SURFACE	0x7e		/* the request that is not Linux's */
+#define MONDIAN_GPU_DESCRIBE	0xffffffffu	/* ... asked only what the buffer would be like */
 
 static io_connect_t connection;
 static int connection_fd = -1;
@@ -233,15 +235,41 @@ mondrian_drm_unmap(int fd, uint32_t handle, void *address)
 }
 
 /*
- * The IOSurface request is not here yet: the kernel's user client has no
- * request 0x7e, and this port presents nothing to a window server yet. When it
- * does, it is one more request number whose structure describes a surface (its
- * IOSurface ID in, size/offset/row bytes/format out; topaz's redwood-drm is
- * the model) and it goes here, because freedreno hands the ID of a surface
- * around where Linux hands around the file descriptor of a buffer:
- * drmPrimeFDToHandle() and drmPrimeHandleToFD() are the two calls it replaces.
- * Until then nothing imports a buffer it did not allocate itself.
+ * The surface path: the kernel finds the IOSurface by ID, wires its memory as
+ * a GPU buffer and maps it into the CP's stage-1 context (0182's request 0x7e).
+ * freedreno hands the ID of a surface around where Linux hands around the file
+ * descriptor of a buffer, so drmPrimeFDToHandle() is the import and this
+ * describe call supplies the layout Mesa's resource_from_handle() needs.
  */
+int
+mondrian_drm_surface(int fd, struct mondrian_drm_surface *surface)
+{
+	int error;
+
+	(void)fd;
+	surface->handle = MONDIAN_GPU_DESCRIBE;
+	error = call(MONDIAN_GPU_SURFACE, surface, sizeof(*surface));
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	return 0;
+}
+
+int
+drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
+{
+	struct mondrian_drm_surface request = { .surface = (uint32_t)surface };
+	int error = call(MONDIAN_GPU_SURFACE, &request, sizeof(request));
+
+	(void)fd;
+	if (error != 0) {
+		errno = error;
+		return -1;
+	}
+	*handle = request.handle;
+	return 0;
+}
 
 static int
 none(void)
@@ -255,8 +283,6 @@ none(void)
 NONE(drmPrimeHandleToFD, __attribute__((unused)) int fd,
     __attribute__((unused)) uint32_t handle, __attribute__((unused)) uint32_t flags,
     __attribute__((unused)) int *prime_fd)
-NONE(drmPrimeFDToHandle, __attribute__((unused)) int fd,
-    __attribute__((unused)) int prime_fd, __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjCreate, __attribute__((unused)) int fd,
     __attribute__((unused)) uint32_t flags, __attribute__((unused)) uint32_t *handle)
 NONE(drmSyncobjDestroy, __attribute__((unused)) int fd,

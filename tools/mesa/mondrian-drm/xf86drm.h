@@ -6,8 +6,8 @@
  * iokit/Kernel/arm/MondrianGPU.cpp) as one IOConnectCallStructMethod whose
  * selector is the low byte of the ioctl code. tools/mk-mesa-ios.sh puts both
  * into Mesa's tree, at src/mondrian-drm, where they stand in for dep_libdrm.
- * The request numbers and their structures are Linux's, unmodified (Mesa's
- * include/drm-uapi/msm_drm.h).
+ * The Linux requests and their structures are unmodified (Mesa's
+ * include/drm-uapi/msm_drm.h); request 0x7e is the port's own surface import.
  */
 #ifndef MONDIAN_XF86DRM_H
 #define MONDIAN_XF86DRM_H
@@ -45,15 +45,14 @@ void drmFreeVersion(drmVersionPtr version);
 int drmGetCap(int fd, uint64_t capability, uint64_t *value);
 
 /*
- * Buffers and fences as file descriptors: there are none here, so these
- * return ENOSYS. A buffer is made by DRM_MSM_GEM_NEW and unmade by
- * DRM_IOCTL_GEM_CLOSE; nothing in this port shares one with another process.
- * The IOSurface request (0x7e) that would put a surface's memory here in place
- * of a prime file descriptor is not in the kernel yet; mondrian_drm.c marks
- * where it goes.
+ * Buffers and fences as file descriptors: there are none here, so the syncobj
+ * calls return ENOSYS. A buffer is made by DRM_MSM_GEM_NEW and unmade by
+ * DRM_IOCTL_GEM_CLOSE. Memory that somebody else made does come in, the way
+ * Linux's comes in by file descriptor: an IOSurface, by its ID, where freedreno
+ * expects the descriptor (see mondrian_drm_surface() below).
  */
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
-int drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle);
+int drmPrimeFDToHandle(int fd, int surface, uint32_t *handle);
 int drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle);
 int drmSyncobjDestroy(int fd, uint32_t handle);
 int drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count);
@@ -70,5 +69,22 @@ int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
  */
 void *mondrian_drm_map(int fd, uint32_t handle, uint64_t size);
 void mondrian_drm_unmap(int fd, uint32_t handle, void *address);
+
+/*
+ * Not libdrm's either: what the memory of an IOSurface is like as a GPU buffer
+ * (the kernel's request 0x7e and its answer: struct mondrian_surface in
+ * iokit/Kernel/arm/MondrianGPU.cpp). 0, or -1 with errno. The buffer itself is
+ * made by drmPrimeFDToHandle(), which freedreno calls with its table of buffers
+ * locked, so a buffer on its way out and the same surface on its way in cannot
+ * pass each other.
+ */
+struct mondrian_drm_surface {
+	uint32_t surface;			/* the IOSurface's ID */
+	uint32_t handle;			/* in: 0xffffffff asks only what it would be */
+	uint64_t size;				/* back: how big the buffer is, */
+	uint32_t offset, row_bytes;		/* where the pixels start and how long a row is, */
+	uint32_t width, height, pixel_format, planes;	/* and what they are */
+};
+int mondrian_drm_surface(int fd, struct mondrian_drm_surface *surface);
 
 #endif /* MONDIAN_XF86DRM_H */

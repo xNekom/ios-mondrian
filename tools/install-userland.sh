@@ -19,10 +19,12 @@
 #               (boot argument mondrian_ui_hook)
 #   --gpu-test  /usr/libexec/mondrian-gpu-test.dylib, dlopened by the UI hook;
 #               its verdict is a "MONDRIAN GPU TEST:" line in the ring log
+#   --gl        /usr/libexec/mondrian-gl.dylib, the EAGLContext+OSMesa library
+#   --inject    /usr/libexec/mondrian-inject.dylib, the GPU-service waiter
 #   --mesa      /usr/lib/libOSMesa.8.dylib from the staged Mesa tree
 set -euo pipefail
 
-image=${1:?usage: install-userland.sh ROOT.img [--ui-hook DYLIB] [--gpu-test DYLIB] [--mesa STAGE_DIR]}
+image=${1:?usage: install-userland.sh ROOT.img [--ui-hook DYLIB] [--gpu-test DYLIB] [--gl DYLIB] [--inject DYLIB] [--mesa STAGE_DIR]}
 shift
 
 [ -f "$image" ] || { echo "error: $image not found" >&2; exit 1; }
@@ -42,7 +44,7 @@ while [ "$index" -lt "${#scan[@]}" ]; do
 	fi
 	value=${scan[$((index + 1))]}
 	case "$option" in
-	--ui-hook|--gpu-test)
+	--ui-hook|--gpu-test|--gl|--inject)
 		[ -f "$value" ] || { echo "error: $option not found: $value" >&2; exit 1; }
 		;;
 	--mesa)

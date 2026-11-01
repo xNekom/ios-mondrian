@@ -83,7 +83,7 @@ export SDKVERSION="$MACOS_VERSION" HOST_OS_VERSION="$MACOS_VERSION" PLATFORM=Mac
 
 
 # ------------------------------------------------------------------ 1. the tree
-# Re-applying 182 patches rewrites the mtime of every file they touch and makes
+# Re-applying the series rewrites the mtime of every file they touch and makes
 # the next build a full rebuild, so the tree is only reset when the series (or
 # the tree itself) changed since the last run.
 SERIES_STATE=$WORK/.series-state
@@ -153,6 +153,24 @@ if [ "${SKIP_SERIES:-0}" != 1 ]; then
 		done
 	fi
 	printf '%s\n' "$SERIES_HASH" >"$SERIES_STATE"
+fi
+
+# Local inputs that are not in git (the GMU blob, the SQE/ZAP firmware, the CP
+# profile) generate *_fw.h / *_profile.h. A series change resets the tree, so
+# install them after it; $WORK/local survives resets and holds the headers
+# between builds.
+if [ -d "$WORK/local" ]; then
+	for h in "$WORK/local"/*.h; do
+		[ -e "$h" ] || continue
+		say "installing local header $(basename "$h")"
+		cp -f "$h" "$XNU/bsd/dev/"
+	done
+fi
+if [ "$BOARD" = mondrian ] && [ ! -f "$XNU/bsd/dev/mondrian_gmu_fw.h" ]; then
+	die "no mondrian_gmu_fw.h; generate it from gmu_gen70000.bin (tools/gen-gmu-fw.py) and put it in $WORK/local"
+fi
+if [ "$BOARD" = mondrian ] && [ ! -f "$XNU/bsd/dev/mondrian_cp_profile.h" ]; then
+	say "no mondrian_cp_profile.h: the CP path and the GPU user client stay inert"
 fi
 
 # ----------------------------------------------------------------- 3. the fakeroot

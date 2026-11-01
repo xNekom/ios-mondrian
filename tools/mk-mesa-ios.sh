@@ -155,8 +155,9 @@ cat <<'NOTE'
 
 libOSMesa.8.dylib is the OSMesa of the mondrian-drm patch: it creates the
 freedreno screen from the MondrianGPU service and falls back to softpipe when
-that fails (OSMESA_SOFTWARE=1 forces the fallback). Untested on hardware, and
-these are missing: relocations (the kernel refuses nr_relocs != 0, freedreno
-uses softpin), prime file descriptors and syncobjs (ENOSYS), and the IOSurface
-path that would present frames (request 0x7e, not in the kernel yet).
+that fails (OSMESA_SOFTWARE=1 forces the fallback). The IOSurface path is in
+this build: request 0x7e is in the kernel (0182) and the OSMesa hooks turn a
+surface ID into its texture, so CoreAnimation can draw in place. Still missing:
+relocations (the kernel refuses nr_relocs != 0, freedreno uses softpin) and
+syncobjs (ENOSYS).
 NOTE
