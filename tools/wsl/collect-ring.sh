@@ -30,20 +30,21 @@ state() {
 
 echo "== waiting up to ${max_wait}s for fastboot or recovery"
 waited=0
+why=running
 while [ "$waited" -lt "$max_wait" ]; do
-	s=$(state)
-	if [ "$s" != running ]; then
-		echo "== $s after ${waited}s"
+	why=$(state)
+	if [ "$why" != running ]; then
+		echo "== $why after ${waited}s"
 		break
 	fi
 	sleep 10
 	waited=$((waited + 10))
 done
-if [ "$(state)" = running ]; then
+if [ "$why" = running ]; then
 	echo "== still running (the kernel has not reset); no ring yet" >&2
 	exit 1
 fi
-if [ "$(state)" = fastboot ]; then
+if [ "$why" = fastboot ]; then
 	echo "== booting recovery"
 	"$FASTBOOT" reboot recovery >/dev/null 2>&1
 fi

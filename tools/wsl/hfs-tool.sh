@@ -5,6 +5,11 @@
 #   tools/wsl/hfs-tool.sh put IMAGE DESTDIR SRCDIR     # copy SRCDIR/* to IMAGE:DESTDIR
 #   tools/wsl/hfs-tool.sh get IMAGE PATH OUTDIR        # copy IMAGE:PATH to OUTDIR/
 #
+# put copies the *contents* of SRCDIR into DESTDIR, so a stage that already
+# mirrors the root (`stage/private/var/vm/...`) goes in with DESTDIR=/ —
+# passing both DESTDIR and the staged path nests it one level deeper, which
+# leaves the file the caller meant to replace untouched.
+#
 # The iOS root is HFS+, and the Linux kernel WSL2 runs is built without
 # hfsplus, so it cannot be mounted here. This boots a stock Ubuntu kernel in
 # qemu (it has hfsplus.ko), attaches the image as a virtio disk, and does the
