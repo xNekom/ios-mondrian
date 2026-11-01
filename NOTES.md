@@ -53,13 +53,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **UI performance.** The touch works (`0153`) and its 220 KB firmware is
-   8 s of bit-bang SPI (`0156`: `ml_get_timebase()` is 609 MHz here, not the
-   19.2 MHz timer; keep the bring-up before `launchd`, a thread raced the
-   RPMh iovdd vote). The report thread is ticked from the vsync (`0161`): its
-   tsleep deadline never fires, so it polled at 0.5 Hz; now it reads the part
+1. **UI performance.** Touch works (`0153`) and its 220 KB firmware is 8 s of
+   bit-bang SPI (`0156`: `ml_get_timebase()` is 609 MHz here, not the 19.2 MHz
+   timer; keep the bring-up before `launchd`, a thread raced the RPMh iovdd
+   vote). The report thread is ticked from the vsync (`0161`) and reads the part
    at 120 Hz. The wall is the CPU rasterizer: 6.4 fps full panel, 9.3 at
-   900x2000. The GPU draws (Mesa: a red triangle, `docs/MONDIAN_GPU.md`); the
+   900x2000; the GPU draws (Mesa: a red triangle, `docs/MONDIAN_GPU.md`) but the
    UI still uses the rasterizer (`docs/COREANIMATION_GLES.md`). First frame 43 s.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
@@ -73,10 +72,9 @@ Windows/WSL2, `docs/BUILD_LINUX.md`) fetch xnu-8796.141.3, reset the checkout
 and apply `xnu/patches-mondrian/`; a skipped patch fails the build. Run
 `tools/apply-series.py` (or `tools/check-patches.sh`) after touching the
 series: CI skips a patch that does not apply and still builds, which is how
-`0161` was missing until 2026-10-28 (`0157` carried its first hunk). Now
-183/183. A mondrian build also needs the local `mondrian_gmu_fw.h`; `0184`
-stubs the user-client surface without the CP profile
-(`docs/BUILD_LINUX.md`).
+`0161` was missing until 2026-10-28 (`0157` carried its first hunk). A mondrian
+build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the user-client
+surface without the CP profile (`docs/BUILD_LINUX.md`).
 
 Build artifacts and the KDK cache live outside `/private/tmp` (emptied on
 reboot); `DXB_DIR` must not contain a space, `build.sh` uses it unquoted.
@@ -218,14 +216,12 @@ UFS host asks for 144 KiB (nine 16 KiB pages) and gets it.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels
-**appended to the shim image**, which is the one segment copied raw. A 16 MB
-image drops on the fastboot USB link, so the payload is LZ4-compressed
-(15.4 → 6.6 MB, `shim/out/payload.lz4p`) and unpacked by `shim/lz4.c`. The blob
-must not be written over its own input: `shim/out/payload.bin` is the raw
-payload, and a build that overwrote it produced a header promising 0 bytes
-(the shim then says `LOADER cannot unpack the payload`) and compressed the
-previous blob on the next run. `tools/check-shim-blob.py IMAGE` reads the
-appended header back.
+**appended to the shim image** as an LZ4 blob (`shim/out/payload.lz4p`,
+15.4 → 6.6 MB, unpacked by `shim/lz4.c`): a 16 MB image drops on the fastboot
+USB link. The blob must not be written over `shim/out/payload.bin`, the raw
+payload: that truncates it to a header promising 0 bytes and the shim answers
+`LOADER cannot unpack the payload`. `tools/check-shim-blob.py IMAGE` reads the
+header back.
 
 **Booting from UFS is not the same as booting from fastboot.** The ABL leaves
 the UFS powered when it boots the normal way and powers it down in fastboot;
@@ -251,9 +247,11 @@ line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
 e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 
 **The console is a ring with a cursor block.** The newest line is the one above
-the cursor marker; reading then continues downward and wraps to the top. The
-shim `LOGVIEW` currently faults synchronously at `STAGE ufs`; extract the ring
-through a compatible recovery and ADB instead.
+the cursor marker; reading then continues downward and wraps to the top. Read it
+through recovery and ADB (`tools/wsl/pull-ring.sh`). The shim's `test_ufs()`
+faults (`PANIC SYNC`, `STAGE ufs`) on any boot that came from fastboot, which
+leaves the host powered down: build that image with `SHIM_NO_UFS` (`LOGVIEW`
+implies it).
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
@@ -286,20 +284,18 @@ delivered when this was written, and a wait that never completes has to be
 non-fatal and dump `hcs/is/dbr` plus the UTRD.
 
 The driver is read-only (`mondrian_ufs_write()` returns `EROFS`) and its
-commands do not touch the medium. **Known debt:** `ufs_find_partition()`
-bounds the entry table with `nent * esz > BOUNCE_SIZE`, a 32-bit product that
-a corrupt table can wrap; guard with `nent > BOUNCE_SIZE / esz` before
-multiplying, in the same patch that enables writes.
+commands do not touch the medium. **Known debt:** `ufs_find_partition()` bounds
+the entry table with `nent * esz > BOUNCE_SIZE`, a 32-bit product a corrupt table
+can wrap; guard with `nent > BOUNCE_SIZE / esz` in the patch that enables writes.
 
 **HFS+ corruption shows as `hfs_mark_inconsistent` on every metadata access.**
-`fsck_hfs` on the 16 GiB root names the damage: overlapped extents, a bad
-volume bitmap and a wrong free-block count. Attach the image
-(`hdiutil attach -nomount -readwrite ROOT.img`), run `fsck_hfs -fy /dev/diskN`
-then `-fn` until it says `appears to be OK`, and reflash the first 16 GiB
-(`dd bs=1M count=16384`). The volume is non-journaled (`0x80000100`), so a hard
-reset dirties it again: repair before blaming a B-tree, and do not hand-write
-the header unless fsck cannot. A zeroed extents node (block 2178, `0x882000`)
-still means restoring the gzip image; the live GPT is the single `userdata`.
+`fsck.hfsplus -fy` on a copy of the 16 GiB root names the damage: overlapped
+extents, a bad volume bitmap and a wrong free-block count; repeat `-fn` until it
+says `appears to be OK`, then push the changed blocks back. The volume is
+non-journaled (`0x80000100`), so a hard reset dirties it again and the kernel then
+mounts it read-only: repair before blaming a B-tree, and do not hand-write the
+header unless fsck cannot. A zeroed extents node (block 2178, `0x882000`) still
+means restoring the gzip image; the live GPT is the single `userdata`.
 
 ## Display
 
@@ -313,8 +309,7 @@ userland runs at 60, so `mondrianfb_hz=60` is the target.
   `/arm-io/disp0`; backboardd swaps are observed and the lock screen renders.
 - Sweet's `0056` (present at most every few vsyncs) and `0079`
   (`RequestPowerChange`) have to be rebased when the power button needs them.
-
-A fallback MDSS/DSI driver is only needed if the scanout ever stops.
+  A fallback MDSS/DSI driver is only needed if the scanout ever stops.
 
 ## Boot menu and dual boot
 

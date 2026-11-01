@@ -174,21 +174,18 @@ python3 tools/mkpayload.py xnu/out/kernel.development.mondrian \
     shim/out/mondrian.adt shim/out/payload.bin --board mondrian
 BOARD=mondrian SMALL_SHIM=1 DTB=dtb/mondrian-live.dtb \
     shim/build.sh shim/out/payload.bin        # -> shim/out/shim-boot.img
-python3 tools/check-shim-blob.py shim/out/shim-boot.img   # raw size, not 0
 sudo tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 ```
 
-Build the shim in a shell that has **not** sourced `tools/wsl/env.sh`: that puts
-cctools' Mach-O `as` first in `PATH`, and `aarch64-linux-gnu-gcc` then fails with
-`as: unknown host architecture`. Fold `mondrianfb_fps=1` into the board's
-`cmdline` in `tools/boards.py` (it is there now) to get the swap rate in the
-ring.
+Build the shim in a shell that has **not** sourced `tools/wsl/env.sh`: its
+cctools Mach-O `as` makes `aarch64-linux-gnu-gcc` fail with
+`as: unknown host architecture`. `mondrianfb_fps=1` is in the board cmdline.
 
 `apfs-fuse` is not packaged on Ubuntu 24.04: build
 <https://github.com/sgan81/apfs-fuse> (needs `libfuse3-dev`). `lzfse` (for
-`tools/adt.py unwrap`) and `hfsprogs`/`img2simg` are packages. The shim still
-needs the phone's own device tree (`dtb/boot_unpacked/dtb`, or `DTB=`): without
-one it builds a v3 image and the payload is not found at boot.
+`tools/adt.py unwrap`) and `hfsprogs`/`img2simg` are packages. The shim needs the
+phone's own device tree (`DTB=`), or it builds a v3 image and the payload is not
+found at boot.
 
 ## The iOS userland (dylibs and Mesa)
 
@@ -203,16 +200,15 @@ tools/mk-mesa-ios.sh
 ```
 
 The SDK is a sparse checkout of `theos/sdks` (`iPhoneOS16.5.sdk`): headers plus
-`.tbd` stubs, which is why ld64 needs libtapi. Keep the two prefixes apart —
-`tools/wsl/env.sh` and `tools/wsl/env-ios.sh` both put an `xcrun` first in
-`PATH` and answer for different SDKs.
+`.tbd` stubs, which is why ld64 needs libtapi. Keep the prefixes apart: `env.sh`
+and `env-ios.sh` both put an `xcrun` first in `PATH`, for different SDKs, and a
+shim build wants neither.
 
 ## Editing the root image without HFS+
 
-WSL's kernel is built without `hfsplus`, so the iOS root cannot be mounted here
-(and `mkiosroot.sh` stops at its `mount -t hfsplus`). `tools/wsl/hfs-tool.sh`
-boots a stock Ubuntu kernel in qemu, which has the module, and copies through an
-ext4 payload image built with `mke2fs -d`:
+WSL's kernel has no `hfsplus`, so the iOS root cannot be mounted here (and
+`mkiosroot.sh` stops at its `mount -t hfsplus`). `tools/wsl/hfs-tool.sh` boots a
+stock Ubuntu kernel in qemu and copies through an ext4 image (`mke2fs -d`):
 
 ```sh
 tools/wsl/hfs-tool.sh setup                                  # once, ~120 MB of .debs
