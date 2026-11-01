@@ -18,7 +18,7 @@ shift
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/ios-dylibs.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/usr/libexec" "$stage/usr/lib"
+mkdir -p "$stage/usr/libexec" "$stage/usr/lib" "$stage/private/var/vm"
 
 n=0
 while [ $# -gt 0 ]; do
@@ -27,7 +27,11 @@ while [ $# -gt 0 ]; do
 	[ -n "$value" ] || { echo "error: $option needs a value" >&2; exit 1; }
 	case "$option" in
 	--gl) [ -f "$value" ] || { echo "error: no $value" >&2; exit 1; }
-		cp "$value" "$stage/usr/libexec/mondrian-gl.dylib" ;;
+		cp "$value" "$stage/usr/libexec/mondrian-gl.dylib"
+		# The injector prefers this copy (docs/COREANIMATION_GLES.md): the
+		# root is mounted read-only, so the kernel rewrites the dylibs here,
+		# and a stale file at this path silently wins over /usr/libexec.
+		cp "$value" "$stage/private/var/vm/mondrian-gl.dylib" ;;
 	--inject) [ -f "$value" ] || { echo "error: no $value" >&2; exit 1; }
 		cp "$value" "$stage/usr/libexec/mondrian-inject.dylib" ;;
 	--ui-hook) [ -f "$value" ] || { echo "error: no $value" >&2; exit 1; }
