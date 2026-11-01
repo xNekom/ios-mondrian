@@ -61,8 +61,9 @@ int main(int argc, char **argv)
 
 	/* The window the shim picks: the region with the splash. */
 	uint64_t phys_base = 0x80000000UL, mem_size = 0x6a000000UL;
-	/* The unpacked payload goes past the kernel image. */
-	uint64_t scratch = phys_base + 0x2000000UL;
+	/* The loader unpacks at the top of the window (loader.c): a fixed offset
+	 * past the base is where the kernel copy and the boot arguments land. */
+	uint64_t scratch = (phys_base + mem_size - (uint64_t)plen) & ~0xFFFUL;
 
 	uint8_t *out = malloc((size_t)plen);
 	long n = lz4_decompress_frame(comp, clen, out, (size_t)plen);

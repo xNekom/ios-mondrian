@@ -95,16 +95,26 @@ truncate -s "$size" out/Image
 # through, the 16MB one does not). The shim unpacks it (shim/lz4.c).
 if [ -n "${PAYLOAD_IN:-}" ]; then
 	LZ4=${LZ4:-$(command -v lz4 || echo /opt/homebrew/bin/lz4)}
+	# The blob is not written over the payload the caller named: out/payload.bin
+	# is the raw payload, and writing the blob there truncated it before its
+	# size was read (a header that promises 0 bytes, and the shim answers
+	# "cannot unpack the payload") and compressed the previous blob on the
+	# next build.
+	[ "$PAYLOAD_IN" != "$PWD/out/payload.lz4p" ] ||
+		{ echo "error: the payload input is the blob output" >&2; exit 1; }
 	"$LZ4" -BI -9 -f "$PAYLOAD_IN" out/payload.lz4
-	python3 - "$PAYLOAD_IN" out/payload.lz4 out/payload.bin <<-'EOF'
+	python3 - "$PAYLOAD_IN" out/payload.lz4 out/payload.lz4p <<-'EOF'
 	import os, struct, sys
 	raw, comp, out = sys.argv[1], sys.argv[2], sys.argv[3]
+	size = os.path.getsize(raw)
+	if size == 0:
+	    sys.exit("error: the payload is empty")
 	data = open(comp, 'rb').read()
 	with open(out, 'wb') as f:
-	    f.write(b'LZ4P' + struct.pack('<IQQ', 1, os.path.getsize(raw), len(data)))
+	    f.write(b'LZ4P' + struct.pack('<IQQ', 1, size, len(data)))
 	    f.write(data)
 	EOF
-	cat out/payload.bin >> out/Image
+	cat out/payload.lz4p >> out/Image
 fi
 # Ramdisk: an empty newc cpio (ABL dislikes a zero-size ramdisk on some
 # builds) -> diagnostics.

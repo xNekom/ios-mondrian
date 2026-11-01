@@ -14,23 +14,54 @@ for the runs). Writing userdata is in the allowed set; nothing else is touched.
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 
 
 def adb(*args, **kwargs):
-    return subprocess.run(('adb',) + args, check=kwargs.pop('check', True), **kwargs)
+    return subprocess.run((ADB,) + args, check=kwargs.pop('check', True), **kwargs)
 
 
-def shell(command, capture=False, binary=False):
+def find_adb():
+    """adb, or the Windows one from WSL (where USB is only visible to it)."""
+    if os.environ.get('ADB'):
+        return os.environ['ADB']
+    for candidate in ('adb', '/mnt/c/platform-tools/adb.exe'):
+        if os.path.isfile(candidate) or shutil.which(candidate):
+            return candidate
+    return 'adb'
+
+
+ADB = find_adb()
+
+
+def shell(command, binary=False):
     if binary:
-        return subprocess.run(('adb', 'exec-out', command), check=True,
+        return subprocess.run((ADB, 'exec-out', command), check=True,
                               stdout=subprocess.PIPE).stdout
-    result = subprocess.run(('adb', 'shell', command), check=True,
-                            stdout=subprocess.PIPE if capture else None,
-                            text=not capture)
-    return result.stdout.strip() if capture else None
+    return subprocess.run((ADB, 'shell', command), check=True,
+                          stdout=subprocess.PIPE).stdout
+
+
+def write_blocks(device, first, data, block, stage):
+    """dd one run on the phone from a file adb can see.
+
+    A pipe through `adb shell` is not usable here: the Windows adb translates
+    CR/LF on stdin and the data arrives corrupted (measured: the volume header
+    survived, the second run did not). The staging file has to live on a path
+    the Windows adb can open, which is why the caller picks /mnt/c.
+    """
+    path = os.path.join(stage, 'run.bin')
+    with open(path, 'wb') as out:
+        out.write(data)
+    remote = '/tmp/mondrian-run.bin'
+    adb('push', path, remote, stdout=subprocess.DEVNULL)
+    command = (f'dd if={remote} of={device} bs={block} seek={first} '
+               f'count={len(data) // block} conv=notrunc 2>/dev/null')
+    subprocess.run((ADB, 'shell', command), check=True)
+    subprocess.run((ADB, 'shell', f'rm -f {remote}'), check=True)
 
 
 def main():
@@ -41,6 +72,9 @@ def main():
     ap.add_argument('--block', type=int, default=4096)
     ap.add_argument('--runs', type=int, default=512,
                     help='blocks per write (512 x 4 KiB = 2 MiB)')
+    ap.add_argument('--stage', default=os.environ.get('PUSH_STAGE', 'backup/.stage'),
+                    help='directory for the transfer file (must be visible to adb; '
+                         'backup/ is gitignored)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args()
 
@@ -73,27 +107,18 @@ def main():
     if args.dry_run or not runs:
         return 0
 
-    # one temp file per run, pushed and written; /tmp on the phone is tmpfs
-    with tempfile.TemporaryDirectory() as tmp, open(args.new, 'rb') as new:
+    # one run at a time; every run is read back before the next is sent
+    os.makedirs(args.stage, exist_ok=True)
+    with open(args.new, 'rb') as new:
         for index, (first, count) in enumerate(runs):
             new.seek(first * block)
             data = new.read(count * block)
-            path = os.path.join(tmp, 'run.bin')
-            with open(path, 'wb') as out:
-                out.write(data)
-            remote = f'/tmp/mondrian-run-{index}.bin'
-            adb('push', path, remote, check=True, stdout=subprocess.DEVNULL)
-            shell(f'dd if={remote} of={args.device} bs={block} seek={first} '
-                  f'count={count} conv=notrunc 2>/dev/null')
-            # read it back before trusting it
+            write_blocks(args.device, first, data, block, args.stage)
             back = shell(f'dd if={args.device} bs={block} skip={first} count={count} 2>/dev/null',
                          binary=True)
             if back != data:
                 sys.exit(f'error: block {first} (+{count}) did not read back as written')
-            shell(f'rm -f {remote}', capture=True)
-            done = total - (len(runs) - index - 1) * 0  # progress text only
             print(f'  {index + 1}/{len(runs)} ok ({count} blocks at {first})', flush=True)
-    shell('sync', capture=True)
     print('done')
     return 0
 

@@ -220,7 +220,12 @@ UFS host asks for 144 KiB (nine 16 KiB pages) and gets it.
 `/chosen/linux,initrd-start` are not the payload. The payload travels
 **appended to the shim image**, which is the one segment copied raw. A 16 MB
 image drops on the fastboot USB link, so the payload is LZ4-compressed
-(15.3 → 6.7 MB) and unpacked by `shim/lz4.c`.
+(15.4 → 6.6 MB, `shim/out/payload.lz4p`) and unpacked by `shim/lz4.c`. The blob
+must not be written over its own input: `shim/out/payload.bin` is the raw
+payload, and a build that overwrote it produced a header promising 0 bytes
+(the shim then says `LOADER cannot unpack the payload`) and compressed the
+previous blob on the next run. `tools/check-shim-blob.py IMAGE` reads the
+appended header back.
 
 **Booting from UFS is not the same as booting from fastboot.** The ABL leaves
 the UFS powered when it boots the normal way and powers it down in fastboot;

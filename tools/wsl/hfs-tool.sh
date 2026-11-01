@@ -86,15 +86,20 @@ echo "HFS-TOOL: mode=$mode dest=$dest"
 modprobe nls_utf8 || echo "HFS-TOOL: no nls_utf8 module"
 modprobe hfsplus || { echo "HFS-TOOL: no hfsplus module"; poweroff -f; }
 echo "HFS-TOOL: filesystems: $(grep -w hfsplus /proc/filesystems || echo none)"
-# no `force` here: that is a mount(8) option, not a kernel one, and the kernel
-# rejects the whole mount with EINVAL when it sees it.
-if ! mount -t hfsplus -o rw /dev/vda /mnt; then
-	echo "HFS-TOOL: cannot mount the image"
-	dmesg | tail -12
-	poweroff -f
+# `force` is the hfsplus mount option that allows read-write on a journaled
+# volume the kernel would otherwise mount read-only; fall back to plain rw so
+# the failure message says which one it was.
+if ! mount -t hfsplus -o rw,force /dev/vda /mnt; then
+	if ! mount -t hfsplus -o rw /dev/vda /mnt; then
+		echo "HFS-TOOL: cannot mount the image"
+		dmesg | tail -12
+		poweroff -f
+	fi
 fi
 echo "HFS-TOOL: image mounted"
-# The volume's root is where the dylibs live; if it mounted nothing, say so.
+# read-only means the volume is dirty and the kernel refused it (journal); the
+# copy then fails with EROFS and this line is the reason
+grep ' /mnt ' /proc/mounts
 ls /mnt | head -5
 
 case "$mode" in
@@ -104,7 +109,7 @@ put)
 		poweroff -f
 	fi
 	mkdir -p "/mnt$dest" || poweroff -f
-	cp -a /src/. "/mnt$dest"/ || { echo "HFS-TOOL: copy failed"; poweroff -f; }
+	cp -a /src/. "/mnt$dest"/ 2>&1 || { echo "HFS-TOOL: copy failed"; poweroff -f; }
 	sync
 	echo "HFS-TOOL: put done"
 	;;
@@ -136,12 +141,15 @@ run_vm() {  # run_vm IMAGE PAYLOAD MODE DEST
 	# not on the same `local` line: its words are all expanded before any
 	# assignment, so $mode would still be unset under `set -u`
 	log=$CACHE/vm-$mode.log
+	# a qcow2 overlay on the dumped image avoids copying 16 GiB to change a dylib
+	local imagefmt=raw
+	case "$image" in *.qcow2) imagefmt=qcow2 ;; esac
 	set +e
 	timeout 600 qemu-system-x86_64 \
 		-m 1024 -smp 2 -nographic -no-reboot \
 		-kernel "$CACHE/vmlinuz" -initrd "$CACHE/initramfs.gz" \
 		-append "console=ttyS0 panic=1 quiet mode=$mode dest=$dest" \
-		-drive "file=$image,format=raw,if=virtio,cache=writeback" \
+		-drive "file=$image,format=$imagefmt,if=virtio,cache=writeback" \
 		-drive "file=$payload,format=raw,if=virtio,cache=writeback" \
 		>"$log" 2>&1
 	local rc=$?

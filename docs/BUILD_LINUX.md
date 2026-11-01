@@ -172,9 +172,17 @@ python3 tools/adt.py unwrap research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22
 python3 tools/mkadt.py shim/out/mondrian.adt --board mondrian
 python3 tools/mkpayload.py xnu/out/kernel.development.mondrian \
     shim/out/mondrian.adt shim/out/payload.bin --board mondrian
-BOARD=mondrian SMALL_SHIM=1 shim/build.sh shim/out/payload.bin  # -> shim/out/shim-boot.img
+BOARD=mondrian SMALL_SHIM=1 DTB=dtb/mondrian-live.dtb \
+    shim/build.sh shim/out/payload.bin        # -> shim/out/shim-boot.img
+python3 tools/check-shim-blob.py shim/out/shim-boot.img   # raw size, not 0
 sudo tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 ```
+
+Build the shim in a shell that has **not** sourced `tools/wsl/env.sh`: that puts
+cctools' Mach-O `as` first in `PATH`, and `aarch64-linux-gnu-gcc` then fails with
+`as: unknown host architecture`. Fold `mondrianfb_fps=1` into the board's
+`cmdline` in `tools/boards.py` (it is there now) to get the swap rate in the
+ring.
 
 `apfs-fuse` is not packaged on Ubuntu 24.04: build
 <https://github.com/sgan81/apfs-fuse> (needs `libfuse3-dev`). `lzfse` (for
