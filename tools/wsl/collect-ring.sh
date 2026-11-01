@@ -20,8 +20,10 @@ FASTBOOT=${FASTBOOT:-/mnt/c/platform-tools/fastboot.exe}
 state() {
 	if "$FASTBOOT" devices 2>/dev/null | grep -q .; then
 		echo fastboot
-	# the Windows adb ends its lines with CR, so no `$` anchor here
-	elif "$ADB" devices 2>/dev/null | grep -q recovery; then
+	# `adb get-state` answers "recovery" or "device"; parsing `adb devices`
+	# here misfired on a stale entry and reported recovery while the kernel
+	# was still booting.
+	elif [ "$("$ADB" get-state 2>/dev/null)" = recovery ]; then
 		echo recovery
 	else
 		echo running

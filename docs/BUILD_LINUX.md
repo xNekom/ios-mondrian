@@ -164,8 +164,7 @@ every vtable slot off by 2^52, which prelink and kext binding then reject.
 
 ## Boot image and iOS root
 
-The rest of the chain runs here too; the Mac was only needed for `hdiutil`,
-and `tools/mkiosroot.sh` has a Linux path:
+The rest of the chain runs here too; `tools/mkiosroot.sh` has a Linux path:
 
 ```sh
 python3 tools/remotezip.py IPSW_URL Firmware/all_flash/DeviceTree.d22ap.im4p research/ipsw-x/dt
@@ -180,7 +179,7 @@ sudo tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 
 Build the shim in a shell that has **not** sourced `tools/wsl/env.sh`: its
 cctools Mach-O `as` makes `aarch64-linux-gnu-gcc` fail with
-`as: unknown host architecture`. `mondrianfb_fps=1` is in the board cmdline.
+`as: unknown host architecture`.
 
 `apfs-fuse` is not packaged on Ubuntu 24.04: build
 <https://github.com/sgan81/apfs-fuse> (needs `libfuse3-dev`). `lzfse` (for
@@ -201,9 +200,8 @@ tools/mk-mesa-ios.sh
 ```
 
 The SDK is a sparse checkout of `theos/sdks` (`iPhoneOS16.5.sdk`): headers plus
-`.tbd` stubs, which is why ld64 needs libtapi. Keep the prefixes apart: `env.sh`
-and `env-ios.sh` both put an `xcrun` first in `PATH`, for different SDKs, and a
-shim build wants neither.
+`.tbd` stubs, which is why ld64 needs libtapi. `env.sh` and `env-ios.sh` each put
+an `xcrun` first in `PATH` for a different SDK, so keep the prefixes apart.
 
 ## Editing the root image without HFS+
 
@@ -217,22 +215,25 @@ tools/wsl/hfs-tool.sh put ROOT.img /usr/libexec out/gpu      # dylibs into the i
 tools/wsl/hfs-tool.sh get ROOT.img /private/var/vm/some.log logs/
 ```
 
+The kernel mounts the root read-write (`rootrw=1`) and writes to it every boot,
+so a changed-block push must be based on a dump taken *after* the last boot
+(`tools/wsl/refresh-root.sh`: dump, fsck, install, push). Pushing an older base
+lands file data on blocks the volume now uses for metadata: the loader reports
+the dylib as `not a mach-o file` and fsck finds the catalog out of order, so the
+pristine dump plus `fsck.hfsplus -fy` is the way back.
+
 ## Known gaps
 
-- The `iig` shim generates the DriverKit macros and forwarders, but its
-  `*_Invoke` bodies are stubs; the DriverKit RPC path is not used on these
-  boards.
+- The `iig` shim's `*_Invoke` bodies are stubs; the DriverKit RPC path is unused here.
 - No CTF section (DTrace type data), no kext symbol sets and no export/import
   check (`0006`/`0007`), and no kexts: the build produces the monolithic kernel
   only. The link itself still uses `all-kpi.exp` and `all-alias.exp`.
 - The `iig` implementation is fetched at a pinned commit from
-  `Allenwdk/xnu-linux-toolchain` (`tools/wsl/bootstrap-toolchain.sh`); the
-  rest of the toolchain is built from Apple's and Fabian/tpoechtrager's trees.
-- A **mondrian** build needs the local `mondrian_gmu_fw.h`: the `0177` loop in
-  `bsd/dev/mondrian_gpu.c` uses `mondrian_gmu_blocks` without the
-  `#ifdef MONDRIAN_GMU_FW` guard the same patch uses elsewhere, so a tree
-  without the header fails to compile. The procedure is under Building.
-  Nothing about it is Linux-specific: macOS and the CI need the same input.
+  `Allenwdk/xnu-linux-toolchain`; the rest comes from Apple's and
+  Fabian/tpoechtrager's trees.
+- A **mondrian** build needs the local `mondrian_gmu_fw.h`: `0177` uses
+  `mondrian_gmu_blocks` without the `#ifdef MONDRIAN_GMU_FW` guard, so a tree
+  without the header fails to compile. Nothing about it is Linux-specific.
 - The CP profile (`mondrian_cp_profile.h`) is also local and optional. Without
   it `0184` keeps the `mondrian_gpu_uc_*` surface inert; the kernel builds and
   boots, but there is no CP path for `gpusubmit=1` to drive.
