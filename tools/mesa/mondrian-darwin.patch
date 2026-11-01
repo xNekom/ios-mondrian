@@ -263,3 +263,57 @@ diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmes
     attribs.major = version_major;
     attribs.minor = version_minor;
     attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
+diff --git a/src/mesa/state_tracker/st_atom_array.cpp b/src/mesa/state_tracker/st_atom_array.cpp
+--- a/src/mesa/state_tracker/st_atom_array.cpp
++++ b/src/mesa/state_tracker/st_atom_array.cpp
+@@ -146,9 +146,15 @@
+          }
+          const unsigned bufidx = (*num_vbuffers)++;
+ 
+-         /* Set the vertex buffer. */
+-         if (!ALLOW_USER_BUFFERS || binding->BufferObj) {
+-            assert(binding->BufferObj);
++         /* Set the vertex buffer. A binding without a buffer object is a
++          * client array, whatever the template says. CoreAnimation's GLES
++          * draws (compat context, no VBOs) leave vao->VertexAttribBufferMask
++          * out of step with the bindings on the mondrian port: the mask bit
++          * is set, the binding has no buffer, and trusting the mask
++          * dereferences NULL in _mesa_get_bufferobj_reference() (measured:
++          * ldp [x22,#0x18] with x22 = NULL).
++          */
++         if (binding->BufferObj) {
+             struct pipe_resource *buf =
+                _mesa_get_bufferobj_reference(ctx, binding->BufferObj);
+             vbuffer[bufidx].buffer.resource = buf;
+@@ -588,7 +594,31 @@
+    const GLbitfield enabled_arrays = _mesa_get_enabled_vertex_arrays(ctx);
+    GLbitfield enabled_user_arrays;
+    GLbitfield nonzero_divisor_arrays;
++
++   /* Keep the VBO bits of the mask in step with the bindings. The two can
++    * disagree on the mondrian port (measured with CoreAnimation's client
++    * arrays: buffer 0 and a client pointer, yet the mask bit set), and the
++    * variant below is chosen from the mask. Repair it here so a client array
++    * always reaches a user-buffer template.
++    */
++   {
++      const GLbitfield enabled = vao->Enabled;
++      GLbitfield vbo_mask = 0;
++      GLbitfield scan = enabled;
+ 
++      while (scan) {
++         const gl_vert_attrib i = (gl_vert_attrib)u_bit_scan(&scan);
++         if (vao->BufferBinding[vao->VertexAttrib[i].BufferBindingIndex].BufferObj)
++            vbo_mask |= VERT_BIT(i);
++      }
++      if (vbo_mask != (vao->VertexAttribBufferMask & enabled)) {
++         vao->VertexAttribBufferMask =
++            (vao->VertexAttribBufferMask & ~enabled) | vbo_mask;
++         ctx->NewDriverState |= ST_NEW_VERTEX_ARRAYS;
++         ctx->Array.NewVertexElements = true;
++      }
++   }
++
+    assert(vao->_EnabledWithMapMode ==
+           _mesa_vao_enable_to_vp_inputs(vao->_AttributeMapMode, vao->Enabled));
+ 
