@@ -296,4 +296,5 @@ Sources for the numbers above:
   (`osfmk/arm64/proc_reg.h`) and page size selection
   (`osfmk/mach/arm/vm_param.h`)
 
-Other ports worth reading are listed in `NOTES.md`.
+Other ports worth reading are listed in `NOTES.md`; the WiFi/Bluetooth
+hardware and what iOS expects are in `docs/MONDIAN_WIRELESS.md`.

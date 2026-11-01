@@ -295,17 +295,40 @@ them has Metal. That is the path this port follows.
   `CP_SET_PROTECTED_MODE(0)` … `(1)` for that reason and our frame does too.
 - **An Xcode update silently breaks both build trees.** The Mesa cross file
   (`out/mesa/cross.ini`) bakes the absolute SDK path, so once Xcode replaces
-  `iPhoneOS27.1.sdk` with `27.2` every compile fails with "`time.h` not found";
-  point it at `iPhoneOS.sdk` (the symlink) and reconfigure. The kernel build
-  uses Xcode's `iig`, and a newer `iig` emits `.iig.cpp` that expects an
-  `IORPC` with `kernelContent`, which this XNU does not have; with the same
-  Xcode version it compiles. Both failures look like source errors and are not.
+  `iPhoneOS27.1.sdk` with `27.2` every compile fails with "`time.h` not found".
+  Point the file at `iPhoneOS.sdk` (the symlink) and delete
+  `out/mesa/build-softpipe-freedreno` before rerunning `tools/mk-mesa-ios.sh`:
+  reconfiguring the old build directory keeps the cached SDK path and
+  `/usr/bin/bison` (Bison 2.3, which rejects Mesa's `%code`), both measured.
+  The kernel build uses Xcode's `iig`, and a newer `iig` emits `.iig.cpp` that
+  expects an `IORPC` with `kernelContent`, which this XNU does not have; with
+  the same Xcode version it compiles. Both failures look like source errors
+  and are not.
+- **CoreAnimation's client arrays crashed Mesa's state tracker.** CA draws
+  with client arrays on the default VAO (`buffer 0`, client pointer, stride
+  48), but `vao->VertexAttribBufferMask` had the VBO bits set, so the
+  `ALLOW_USER_BUFFERS=0` template called `_mesa_get_bufferobj_reference(NULL)`
+  and died at `0x18` in libOSMesa (`ldp [x22,#0x18]`), from `st_prepare_draw`.
+  `tools/mesa/mondrian-darwin.patch` recomputes the enabled bits of the mask
+  from the bindings before the template is chosen, and `setup_arrays()` uses
+  `attrib->Ptr` whenever the binding has no `BufferObj`. Symptom without the
+  fix: `mondrian-crash: signal 11 at address 0x18` on every CoreAnimation
+  draw, none of the port's own draws.
 - **The packet-level tools** are `tools/pm4-decode.py` (names every packet from
   Mesa's `adreno_pm4.xml`, honouring the a7xx variants of a number),
   `gpupm4=N` (truncate a submitted stream to N dwords) and `gpunoblit=1`
   (rewrite `CP_BLIT` to `CP_NOP`). The user client also dumps the first
   streams, the nested `CP_INDIRECT_BUFFER` target and `CP_IB1/IB2_REM_SIZE` on
   a failure; that is how the offending packet was found.
+- **An uncached client mapping costs seconds per readback.** The user client
+  mapped its buffers with `kIOMapInhibitCache`; reading CoreAnimation's
+  1440x3200 surface back (18 MB, BGRA) then took 5.7 s per frame and the swap
+  rate measured zero, while the CP finished each submission in 1 ms. The
+  mapping is cacheable now and coherency is explicit: `bufferSync()` writes a
+  buffer's lines back before the CP fetches it and drops them again on
+  CPU_PREP, both `flush_dcache64` by physical address, the pair
+  `msm_gem_submit` performs around `dma_buf_end_cpu_access`. The first eight
+  CPU_PREP calls log their wait and sync cost in microseconds.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
@@ -313,10 +336,14 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **Next**: the CoreAnimation EAGL hooks. Mesa (`FD_MESA_DEBUG=sysmem`, a730 /
-  FD725) and the `mondrian-drm` shim already submit and draw; what is left is
-  the UI path itself. The firmware blocks, the GMU context bank and the CM3
-  start are in `mondrian_gpu.c` under `gmustart=1`.
+- **Next**: the presentation path. Mesa and the `mondrian-drm` shim already
+  submit and draw; the UI still goes through CoreAnimation's own EAGL
+  context, and every frame is read back on the CPU and copied into the
+  `IOMobileFramebuffer` canvas (`tools/gpu/eagl.c`). A GPU blit into the
+  canvas, or an EGL image handed to Mesa through the `osmesa_st_get_egl_image`
+  hook and request 0x7e, is what removes that copy. The firmware blocks, the
+  GMU context bank and the CM3 start are in `mondrian_gpu.c` under
+  `gmustart=1`.
 
 ### Running the GPU test from the UI hook
 

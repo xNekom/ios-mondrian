@@ -7,16 +7,21 @@
 #
 # What it does (the steps of .github/workflows/xnu.yml):
 #   1. ensures the blacktop/darwin-xnu-build checkout at the pinned commit
-#      (DXB_DIR, default /private/tmp/dxblocal) and a PATH with jq, cmake,
-#      ninja and stubs for gum/xcodes when they are not installed;
+#      (DXB_DIR, default ~/Library/Caches/ios-mondrian/dxb) and a PATH with
+#      jq, cmake, ninja and
+#      stubs for gum/xcodes when they are not installed;
 #   2. copies this repo's xnu/patches-mondrian/*.patch (and the staging
 #      scripts) into dxb/patches, next to blacktop's own;
 #   3. patches build.sh so libfirehose_kernel is built for plain arm64
 #      (our kernels are not arm64e);
 #   4. resets the xnu checkout so every patch applies to a clean tree;
-#   5. runs build.sh (log in /tmp/kernel-local.log), fails if a numbered
+#   5. runs build.sh (log in xnu/out/kernel-local.log), fails if a numbered
 #      patch was skipped, and copies the kernel to
-#      /tmp/kernel.development.mondrian with its sha256.
+#      xnu/out/kernel.development.mondrian with its sha256.
+#
+# Everything it keeps lives under the repository (gitignored) or the user's
+# cache, never /private/tmp: macOS empties /private/tmp on reboot, and losing
+# the tree there costs a full re-fetch and rebuild.
 #
 # Requires Xcode (its iig must be the one of the xnu generation: Xcode 15
 # for xnu-8796) and Homebrew's jq/cmake/ninja.
@@ -29,15 +34,17 @@ case "$BOARD" in
 	sweet)    SERIES=xnu/patches;          MACHINE=SWEET ;;
 	*) echo "error: unknown BOARD '$BOARD'" >&2; exit 1 ;;
 esac
-DXB_DIR=${DXB_DIR:-/private/tmp/dxblocal}
+DXB_DIR=${DXB_DIR:-$HOME/Library/Caches/ios-mondrian/dxb}
 DXB_REPO=${DXB_REPO:-https://github.com/blacktop/darwin-xnu-build}
 DXB_SHA=${DXB_SHA:-663906528d1cd5ea8fde7de6f16de73db9511549}
 MACOS_VERSION=${MACOS_VERSION:-13.5}
 KERNEL_CONFIG=${KERNEL_CONFIG:-DEVELOPMENT}
-LOG=${LOG:-/tmp/kernel-local.log}
+LOG=${LOG:-xnu/out/kernel-local.log}
 # A KDK already on disk is used as is; that keeps the build from installing
-# one (the installer wants root). tools/get-kdk.sh fetches it.
-KDKROOT=${KDKROOT:-$(ls -d /private/tmp/kdk/root/*.kdk 2>/dev/null | head -1)}
+# one (the installer wants root). The cache path is the one this repo's notes
+# use; pass KDKROOT for anything else. The dmg comes from
+# https://github.com/dortania/KdkSupportPkg (tag = the build, 22G74 for 13.5).
+KDKROOT=${KDKROOT:-$(ls -d "$HOME"/Library/Caches/ios-mondrian/kdk/root/*.kdk 2>/dev/null | head -1)}
 
 for t in jq cmake ninja; do
 	command -v "$t" >/dev/null || {
@@ -151,6 +158,6 @@ if [ ! -f "$KERNEL" ] || [ ! "$KERNEL" -nt "$STAMP" ]; then
 	grep -E "error:" "$LOG" | grep -v "does not apply" | tail -15 >&2
 	exit 1
 fi
-cp "$KERNEL" /tmp/kernel."$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')".mondrian
+cp "$KERNEL" xnu/out/kernel."$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')".mondrian
 echo "== $KERNEL"
-shasum -a 256 /tmp/kernel."$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')".mondrian
+shasum -a 256 xnu/out/kernel."$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]')".mondrian

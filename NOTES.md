@@ -75,22 +75,22 @@ numbered patch is skipped. `tools/apply-series.py` applies the series to a
 fresh tree in seconds and names what does not apply, and
 `tools/check-patches.sh` does the same against the cached tree in `research/`.
 Run it after touching the series: CI skips a patch that does not apply and
-still builds. On 2026-10-28 it caught `0161` (the touch vsync tick) never
-applying — `0157` already carried its first hunk — so that fix had been
-missing from every CI kernel; the series is 179/179.
+still builds, which is how `0161` was missing from every CI kernel until
+2026-10-28 (`0157` already carried its first hunk). Now 182/182.
+
+Build artifacts and the KDK cache live outside `/private/tmp` (emptied on
+reboot); `DXB_DIR` must not contain a space, `build.sh` uses it unquoted.
 
 **Bisecting the early boot.** `mondrianstop=N` halts at early mark N with IRQs
-masked. `0174` extends the marks through `bsd_init` and `vfs_mountroot` and
-keeps marks above 20 visible after the console is switched off, so the last
-line on the panel names the function that hung.
+masked; `0174` keeps marks above 20 visible after the console is off, so the
+last line on the panel names the function that hung.
 
-**`iig` trap.** The build reuses the generated DriverKit stubs under
-`build/xnu.obj/DEVELOPMENT_ARM64_MONDRIAN/`; regenerating them with a newer
-Xcode's `iig` fails, so seed them from an Xcode 15 tree.
+**`iig` trap.** A newer Xcode's `iig` regenerates the DriverKit stubs wrong
+(`docs/MONDIAN_GPU.md`); seed them from a build made with Xcode 15.
 
 **Image and deploy.** `tools/phone-boot.sh` builds if needed and boots
-volatile. `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
-for writes to the boot partition, and refuses `boot_a` unless `BOOT_A=1`.
+volatile; `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
+and refuses `boot_a` unless `BOOT_A=1`.
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring; `0174` arms persistence at the end of the UFS probe, before

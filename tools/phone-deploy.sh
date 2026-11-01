@@ -40,8 +40,9 @@ case "${1:-}" in
 build)
 	need adb
 	if [ -z "$KERNEL" ]; then
-		# The newest kernel the CI produced.
-		KERNEL=$(ls -t /tmp/mk*/kernel.development.mondrian 2>/dev/null | head -1)
+		# The newest kernel this machine or the CI produced.
+		KERNEL=$(ls -t xnu/out/kernel.development.mondrian \
+			/tmp/mk*/kernel.development.mondrian 2>/dev/null | head -1)
 	fi
 	[ -f "$KERNEL" ] || { echo "no hay kernel; baja el artefacto del CI" >&2; exit 1; }
 	[ -f "$RAMDISK" ] || { printf '#!/bin/sh\nexec /bin/sh\n' > "$RAMDISK"; }
