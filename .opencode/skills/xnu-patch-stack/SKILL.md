@@ -29,6 +29,10 @@ The word to look for is the final `NN/NN patches apply`; when the second number
 grows, the first must grow with it. 0085 lives on the `display` branch, so
 `mondrian` legitimately reports 85 while the tree has 86 patch files.
 
+On a machine without macOS, `tools/wsl/build-kernel.sh` applies the same series
+to `xnu-8796.141.3` and stops on the first patch that does not apply; its log is
+`xnu/out/kernel-linux.log` (`docs/BUILD_LINUX.md`).
+
 ## Authoring a patch
 
 Keep a staged tree of the current series state and derive the patch from a

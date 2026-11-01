@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Kernel compiler for a Linux XNU build: clang with a Darwin arm64 target.
+#
+# xnu's SETUP/ host tools (config, kextsymboltool, setsegname, ...) also come
+# through here, because they are built with HOST_CC, which xcrun resolves to
+# this same wrapper. They are told apart by their flags: the kernel is always
+# compiled with -arch (ARCH_FLAGS_ARM64) and the host tools never are.
+#
+# What it changes:
+#   -arch arm64e              -> -target arm64e-apple-macos13.5 (clang refuses
+#                                -arch unless the target is Darwin)
+#   -mmacosx-version-min=N    -> dropped; the version lives in the target
+#   -isysroot DIR             -> dropped; the fakeroot is a header tree, not a
+#                                sysroot, and xnu's own -I flags carry the paths
+#   link steps                -> --ld-path=cctools' ld64 (ld64.lld cannot link
+#                                an XNU kernel, see bootstrap-toolchain.sh)
+set -u
+SHIM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cxx=clang
+case "$(basename "$0")" in *++*) cxx=clang++;; esac
+[ "${TARGET_CXX:-0}" = 1 ] && cxx=clang++
+CLANG=${XNU_LINUX_CLANG:-}
+[ -z "$CLANG" ] && CLANG=$cxx
+VER=${UNIXNU_SDK_VERSION:-13.5}
+
+args=() arch= target= link=1
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-arch) arch=$2; shift 2 ;;
+	-target) target=$2; shift 2 ;;
+	-target=*) target=${1#-target=}; shift ;;
+	-isysroot) shift 2 ;;
+	-isysroot=*) shift ;;
+	-mmacosx-version-min=*) VER=${1#-mmacosx-version-min=}; shift ;;
+	-miphoneos-version-min=* | -mios-version-min=*) shift ;;
+	-c | -E | -S | -M | -MM | -MD | -MMD | -fsyntax-only) link=0; args+=("$1"); shift ;;
+	*) args+=("$1"); shift ;;
+	esac
+done
+
+# no -arch and no -target: a host tool; build it as a normal ELF binary
+if [ -z "$arch" ] && [ -z "$target" ]; then
+	if [ "$cxx" = clang++ ]; then
+		HOST_CXX=1 exec "$SHIM/host-clang" "${args[@]}"
+	fi
+	exec "$SHIM/host-clang" "${args[@]}"
+fi
+
+tgt=${target:-${arch:-arm64}-apple-macos$VER}
+cmd=("$CLANG" -target "$tgt")
+[ "$link" = 1 ] && cmd+=("--ld-path=$SHIM/ld")
+exec "${cmd[@]}" "${args[@]}"

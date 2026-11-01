@@ -10,7 +10,7 @@ backboardd, SpringBoard and the stock apps.
 
 This fork's target is the **POCO F5 Pro / Redmi K60** (`mondrian`, Qualcomm
 SM8475 / Snapdragon 8+ Gen 1). Same idea, different silicon: ARMv9.0 with
-4 KiB pages, a UFS 3.1 host, an AMOLED on DSI D-PHY, a Goodix touch on SPI and
+16 KiB pages, a UFS 3.1 host, an AMOLED on DSI D-PHY, a Goodix touch on SPI and
 a PM8008.
 
 > Experimental bring-up, not a usable phone OS. Many pieces are missing or
@@ -78,7 +78,7 @@ shim, in `shim/board.h` (change both together).
 | board | phone | SoC | page size | kernel series |
 | --- | --- | --- | --- | --- |
 | `sweet` | Redmi Note 10 Pro | SM7150 / Snapdragon 732G | 16 KiB | `xnu/patches/` |
-| `mondrian` | POCO F5 Pro / Redmi K60 | SM8475 / Snapdragon 8+ Gen 1 | 4 KiB | `xnu/patches-mondrian/` |
+| `mondrian` | POCO F5 Pro / Redmi K60 | SM8475 / Snapdragon 8+ Gen 1 | 16 KiB | `xnu/patches-mondrian/` |
 
 The shim prints what the bootloader says about the phone, so the table can be
 corrected from the device instead of from guesswork:
@@ -122,19 +122,15 @@ gh workflow run xnu.yml -R YOU/ios-mondrian -f board=mondrian   # or board=sweet
 gh run download RUN_ID -R YOU/ios-mondrian -n xnu-kernel-mondrian -D xnu/out
 ```
 
-The same build runs on this Mac without the cloud, with the same pinned
-`blacktop/darwin-xnu-build` tree and patch series:
+The same build runs locally without the cloud from a Mac or from Windows/WSL2,
+with the same pinned tree and patch series; both reset the xnu checkout first,
+so the series must apply to a clean tree and a skipped numbered patch fails the
+build instead of producing a kernel that is silently missing it:
 
 ```sh
-bash tools/build-kernel-local.sh            # -> /tmp/kernel.development.mondrian
-KERNEL_CONFIG=RELEASE bash tools/build-kernel-local.sh
+bash tools/build-kernel-local.sh   # macOS: Xcode 15's iig, jq, cmake, ninja, a KDK
+tools/wsl/build-kernel.sh          # Windows/WSL2: no Mac, no Xcode (docs/BUILD_LINUX.md)
 ```
-
-It needs Xcode whose `iig` matches the xnu generation (Xcode 15 for xnu-8796),
-`jq`, `cmake`, `ninja`, and a KDK in `/private/tmp/kdk/root` (or `KDKROOT=`).
-The xnu checkout is reset before every build, so the series must apply to a
-clean tree; a numbered patch that is skipped fails the script instead of
-producing a kernel that is silently missing it.
 
 To check a patch locally before spending a run, `tools/apply-series.py` applies
 the whole series to a fresh xnu tree in seconds and `tools/xnu-cc.py` replays
@@ -218,6 +214,7 @@ fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
 | `xnu/patches-mondrian/` | the XNU patch series for mondrian (see its README for the state of each patch) |
 | `.github/workflows/xnu.yml` | kernel CI build (`board` input) |
 | `tools/build-kernel-local.sh` | the same build on this Mac (same pinned dxb tree and series) |
+| `tools/wsl/` | the same build on Windows/WSL2 without a Mac (`docs/BUILD_LINUX.md`) |
 | `tools/boards.py` | the board table: MMIO, memory, CPU topology, page size, boot args |
 | `tools/mkadt.py`, `mkpayload.py` | generate the Apple Device Tree / pack kernel + ADT + boot args |
 | `tools/apply-series.py`, `check-patches.sh`, `port-series.py` | apply, validate and port patch series |
@@ -228,6 +225,7 @@ fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
 | `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
 | `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
+| `docs/BUILD_LINUX.md` | building the kernel on Windows/WSL2, with no Mac |
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
 
 Not in git: partition backups, live device trees, recovery images, Apple

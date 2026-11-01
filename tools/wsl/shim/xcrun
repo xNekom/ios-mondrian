@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# xcrun for a Linux XNU build.  The only question xnu's makefiles ask is
+# "where is the SDK and where is tool T", so every SDK name resolves to the
+# fakeroot the build assembles (headers are installed into the same DSTROOT).
+#
+#   xcrun -sdk macosx -show-sdk-path      -> $UNIXNU_SDKROOT
+#   xcrun -sdk macosx -show-sdk-version   -> $UNIXNU_SDK_VERSION
+#   xcrun -sdk macosx -find clang         -> target-clang (host tools are
+#                                            detected inside it by their
+#                                            -mmacosx-version-min flag)
+#
+# PLATFORM is deliberately MacOSX, like the CI build on the macOS runner: the
+# series is validated against that platform, and the 16 KiB/4 KiB page code
+# paths are chosen from the board table, not from PLATFORM.
+set -u
+SHIM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SDK="${UNIXNU_SDKROOT:-}"
+
+tool="" find=0 verbose=0
+if [ $# -eq 0 ]; then
+	echo "usage: xcrun [-sdk NAME] [-find TOOL] [-show-sdk-path]" >&2
+	exit 2
+fi
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-verbose) verbose=1; shift ;;
+	--sdk | -sdk) shift 2 ;;
+	--find | -find) find=1; tool="$2"; shift 2 ;;
+	-show-sdk-path | --show-sdk-path) echo "${SDK:?xcrun: UNIXNU_SDKROOT is not set}"; exit 0 ;;
+	-show-sdk-version | --show-sdk-version) echo "${UNIXNU_SDK_VERSION:-13.5}"; exit 0 ;;
+	-show-sdk-build-version | --show-sdk-build-version) echo "${UNIXNU_SDK_BUILD:-22G74}"; exit 0 ;;
+	-show-sdk-platform-path | --show-sdk-platform-path)
+		echo "${SDK:?xcrun: UNIXNU_SDKROOT is not set}/Platforms/MacOSX.platform"
+		exit 0 ;;
+	-show-sdk-platform-version | --show-sdk-platform-version) echo "13.5"; exit 0 ;;
+	-version | --version) exec "${XNU_LINUX_CLANG:-clang}" --version ;;
+	-*) shift ;;
+	*) tool="$1"; shift; break ;;
+	esac
+done
+
+resolve() {
+	case "$1" in
+	clang | cc) echo "$SHIM/target-clang" ;;
+	clang++ | c++) echo "$SHIM/target-clang++" ;;
+	mig) echo "$SHIM/mig" ;;
+	migcom) echo "$SHIM/migcom" ;;
+	iig) echo "$SHIM/iig" ;;
+	strip | lipo | otool | nm | libtool | nmedit | codesign_allocate | ar | ranlib | install)
+		echo "$SHIM/$1" ;;
+	unifdef) echo "$SHIM/unifdef" ;;
+	flex) echo /usr/bin/flex ;;
+	bison) echo /usr/bin/bison ;;
+	gm4) echo /usr/bin/m4 ;;
+	python3) echo /usr/bin/python3 ;;
+	git) echo /usr/bin/git ;;
+	# Ubuntu ships llvm's dsymutil unprefixed (dsymutil, dsymutil-18)
+	dsymutil) command -v dsymutil || command -v llvm-dsymutil || command -v dsymutil-18 ;;
+	codesign) echo "$SHIM/codesign" ;;
+	# Apple's DTrace CTF tools have no open-source Linux port. xnu turns CTF off
+	# when ctfmerge cannot be found (MakeInc.cmd), which is what the CI kernel
+	# links anyway (it consumes the .noctf variant).
+	ctfconvert | ctfmerge | ctfdump | ctf_insert | scan-build | docc) return 1 ;;
+	*) command -v "$1" 2>/dev/null || return 1 ;;
+	esac
+}
+
+path=$(resolve "$tool") || {
+	echo "xcrun: unable to find utility \"$tool\"" >&2
+	exit 1
+}
+if [ "$find" = 1 ]; then
+	echo "$path"
+	exit 0
+fi
+[ "$verbose" = 1 ] && echo "xcrun: $tool -> $path" >&2
+exec "$path" "$@"

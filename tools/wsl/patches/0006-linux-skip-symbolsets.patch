@@ -1,0 +1,19 @@
+diff --git a/config/Makefile b/config/Makefile
+index b4c0ed5..b215b51 100644
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -182,7 +182,13 @@ $(DSTROOT)/$(KRESDIR)/$(MD_SUPPORTED_KPI_FILENAME) $(DSTROOT)/$(KRESDIR)/$(MI_SU
+ 	@$(LOG_INSTALL) "$*"
+ 	$(_v)$(INSTALL) $(INSTALL_FLAGS) $< $@
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The Linux iig emits a different set of DriverKit _Invoke overloads and OSAction
++# subclasses than Apple's iig, so kextsymboltool's export/import check cannot
++# agree with the kernel symbol table. Symbol sets only feed kext linking, which
++# this kernel-only build never does; take the same branch as an xnu_libraries
++# build, which skips them too.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ do_build_all:: build_symbol_set_plists
+ do_config_all:: build_symbol_sets

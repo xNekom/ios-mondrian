@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+index 5d1d922..1257024 100644
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -653,6 +653,17 @@ IOService::SendIOMessageServicePropertyChange_Impl(void)
+ }
+ #endif /* PRIVATE_WIFI_ONLY */
+ 
++/*
++ * Apple's iig emits the DriverKit-facing forwarders and the TYPE(...) OSAction
++ * factories into the generated .iig.cpp. The Linux iig generates the
++ * declarations but not every definition, and the kernel links this one.
++ */
++kern_return_t
++IOUserClient::CreateActionKernelCompletion(size_t referenceSize, OSAction ** action)
++{
++	return OSAction::Create(this, 0, 0, referenceSize, action);
++}
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ kern_return_t

@@ -1,0 +1,18 @@
+# The kernel series, the staging scripts and the tooling are applied and run by
+# POSIX shells and `git apply` on Linux/macOS runners: a CRLF working tree (the
+# Windows default with core.autocrlf=true) makes `set -euo pipefail` fail with
+# "invalid option name" and turns every patch context line into a mismatch.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bin binary
+*.img binary
+*.dmg binary
+*.zip binary
+*.gz binary
+*.lz4 binary
+*.elf binary
+*.kext binary

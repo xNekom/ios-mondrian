@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Host compiler for a Linux XNU build. xnu's SETUP tools are written for macOS
+# and pass flags that mean nothing to an ELF clang: drop them, keep the rest.
+# host-clang++ sets HOST_CXX so this same script can drive clang++.
+#
+# It also supplies what a Linux libc lacks for these tools: hostcompat.h is
+# force-included (getprogname, setmode/getmode), <libc.h>/<copyfile.h>/... come
+# from the compat/ directory, <mach-o/*.h> from cctools, and the two BSD
+# libraries go last so the linker actually resolves them.
+cxx=clang
+case "$(basename "$0")" in *++*) cxx=clang++;; esac
+[ "${HOST_CXX:-0}" = 1 ] && cxx=clang++
+SHIM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INCS=(-include "$SHIM/hostcompat.h" \
+	-isystem "$SHIM/compat" \
+	-isystem "$SHIM/../cctools/include" \
+	-idirafter "$SHIM/../cctools/include/foreign")
+args=() link=1
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-isysroot | -framework) shift 2 ;;
+	-isysroot=* | -F* | -mmacosx-version-min=* | -miphoneos-version-min=* | -mios-version-min=*) shift ;;
+	-arch | -target) shift 2 ;;
+	-target=*) shift ;;
+	-c | -E | -S | -M | -MM | -MD | -MMD | -fsyntax-only) link=0; args+=("$1"); shift ;;
+	*) args+=("$1"); shift ;;
+	esac
+done
+if [ "$link" = 1 ]; then
+	exec "${XNU_LINUX_CLANG:-$cxx}" "${INCS[@]}" "${args[@]}" \
+		-L"$SHIM/../lib" -lhostcompat -lbsd -luuid
+fi
+exec "${XNU_LINUX_CLANG:-$cxx}" "${INCS[@]}" "${args[@]}"

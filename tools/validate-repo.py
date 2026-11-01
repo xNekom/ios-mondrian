@@ -12,10 +12,34 @@ Checks:
   3. Shell script syntax:
      - All tools/*.sh, shim/*.sh, and xnu/patches*/*.sh pass bash -n check.
 """
-import argparse, glob, os, py_compile, re, subprocess, sys
+import argparse, glob, os, py_compile, re, shutil, subprocess, sys
+
+# The checkmarks below are UTF-8; a Windows console defaults to cp1252 and
+# Python then dies with UnicodeEncodeError instead of printing the report.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8')
+    except (AttributeError, ValueError):
+        pass
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATCH_DIRS = ['xnu/patches', 'xnu/patches-mondrian']
+
+
+def bash_exe():
+    """A bash that can read this checkout.
+
+    On Windows `bash` is usually C:\\Windows\\System32\\bash.exe, the WSL
+    launcher, which cannot open a C:/ path; Git for Windows ships one that can.
+    """
+    if sys.platform != 'win32':
+        return 'bash'
+    git = shutil.which('git')
+    if git:
+        candidate = os.path.join(os.path.dirname(os.path.dirname(git)), 'bin', 'bash.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    return 'bash'
 
 
 def green(text): return f"\033[92m{text}\033[0m"
@@ -167,9 +191,12 @@ def validate_shell_scripts(verbose=False):
     )
     errors = []
 
+    bash = bash_exe()
     for path in sh_files:
         rel = os.path.relpath(path, REPO_ROOT)
-        res = subprocess.run(['bash', '-n', path], capture_output=True, text=True)
+        # the Windows bash cannot open backslash paths
+        res = subprocess.run([bash, '-n', path.replace(os.sep, '/')],
+                             capture_output=True, text=True)
         if res.returncode != 0:
             errors.append(f"{rel}: {res.stderr.strip()}")
         elif verbose:

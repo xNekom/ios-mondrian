@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# C++ host compiler: host-clang with HOST_CXX=1 (see host-clang).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST_CXX=1 exec "$here/host-clang" "$@"

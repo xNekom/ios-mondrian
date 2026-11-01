@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# C++ kernel compiler: target-clang with TARGET_CXX=1 (see target-clang).
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_CXX=1 exec "$here/target-clang" "$@"
