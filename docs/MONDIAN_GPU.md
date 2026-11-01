@@ -340,6 +340,19 @@ them has Metal. That is the path this port follows.
   keeps `fsr 0x80000402` (a translation fault) latched. That fault is the next
   thing to decode; `gpupm4=N` truncates the stream and `tools/pm4-decode.py`
   names its packets.
+- **The CP is what kills the boots that show nothing.** With `gpu=0 gpupower=0
+  gmustart=0 gpugx=0 gpucp=0 gpusubmit=0` a boot always reaches userland and
+  arms the console ring (measured: the ring's flush count advanced, 178 s, 119
+  processes); with the CP on, most boots never arm it. The ring is armed at the
+  end of the UFS probe, *after* the GPU bring-up, so a CP wedge is invisible on
+  disk — the panel shows the shim's dark clear and the phone resets into
+  whatever `boot_b` holds (the recovery on this phone, see `README.md`).
+- **A wedged submission has consumed its IB and waits on an event write.**
+  In a boot that did reach userland: `uc big 71 dwords ... done 1 in 13 ms`
+  passed, `168 dwords ... done 0 in 300 ms` did not, with `CP_IB1_REM_SIZE` 0
+  (the SQE read every dword) and the stream's last packet a `CP_EVENT_WRITE7`
+  to `0x10408000`, a buffer first used by that submission. `0185` invalidates
+  the CP's SMMU ASID when the tables change, which is the candidate fix.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
