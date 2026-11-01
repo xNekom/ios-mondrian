@@ -175,15 +175,18 @@ BOARD=mondrian shim/build.sh shim/out/payload.bin   # -> shim/out/shim-boot.img
 ```
 
 `--board sweet` and `BOARD=sweet` do the same for the reference phone. The boot
-arguments default to the board's (`boards.Board.cmdline`); `--cmdline` overrides
-them and `docs/MONDIAN_PORT.md` lists what they do.
+arguments default to the board's (`boards.Board.cmdline`, listed in
+`docs/MONDIAN_PORT.md`); `--cmdline` overrides them.
 
 ### 5. Run, flash, read the log
 
 ```sh
 tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
+fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
+# `boot_b` is also the recovery (OrangeFox) on this phone: this replaces it, and
+# with it the adb the ring is read through. Dump it first, flash it back after.
 tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
 sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
 python3 tools/mk-simg.py ios16-root.img ios16-root.simg
@@ -196,9 +199,8 @@ hand or the phone gets the previous one.
 A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
 (volatile proof of the same image, `fastboot getvar current-slot`, verified
 backup, write, read back). To read the kernel log, boot the viewer shim: it
-reads the ring out of `userdata`, prints the last screenful and stops, and
-writes nothing to the phone. A recovery with adb reads the same area with
-`tools/ios-log-pull.sh`.
+reads the ring out of `userdata`, prints the last screenful and writes nothing.
+With a recovery that has adb, `tools/ios-log-pull.sh` reads the same area.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1
