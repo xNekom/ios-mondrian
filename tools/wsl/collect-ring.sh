@@ -20,7 +20,8 @@ FASTBOOT=${FASTBOOT:-/mnt/c/platform-tools/fastboot.exe}
 state() {
 	if "$FASTBOOT" devices 2>/dev/null | grep -q .; then
 		echo fastboot
-	elif "$ADB" devices 2>/dev/null | grep -q 'recovery$'; then
+	# the Windows adb ends its lines with CR, so no `$` anchor here
+	elif "$ADB" devices 2>/dev/null | grep -q recovery; then
 		echo recovery
 	else
 		echo running
