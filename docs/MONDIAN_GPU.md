@@ -400,6 +400,41 @@ reference for the next attempt.
    CA GLES, and the AMFI/dyld policy.
 5. Boot time: see below.
 
+## Local build inputs
+
+The mailbox-facing headers are generated, not committed: the firmware and the CP
+tables are Qualcomm's and Nothing's, and they come from the phone and from
+Qualcomm's open driver, so a Windows/WSL build needs no Mac for any of them.
+
+| header | source |
+| --- | --- |
+| `mondrian_gmu_fw.h` | `gmu_gen70000.bin` from `/vendor/firmware` (or linux-firmware) |
+| `mondrian_sqe_fw.h` | `a730_sqe.fw` from `/vendor/firmware` |
+| `mondrian_zap_fw.h` | `a730_zap.mdt` + `.b01` (code) + `.b02` (signature) |
+| `mondrian_cp_profile.h` | the CP tables of Qualcomm's open gen7 driver |
+
+```sh
+# the firmware: in recovery the stock vendor is a mapped logical volume
+adb shell mount -t ext4 -o ro /dev/block/mapper/vendor_b /mnt/v
+adb pull /mnt/v/firmware/a730_sqe.fw
+adb pull /mnt/v/firmware/a730_zap.mdt
+adb pull /mnt/v/firmware/a730_zap.b01
+adb pull /mnt/v/firmware/a730_zap.b02
+tools/gen-sqe-fw.py a730_sqe.fw  "$WORK/local/mondrian_sqe_fw.h"
+tools/gen-zap-fw.py a730_zap.mdt a730_zap.b01 a730_zap.b02 \
+    "$WORK/local/mondrian_zap_fw.h"
+
+# the CP profile: the same four tables the vendor header has, taken from the
+# open KGSL driver for this GPU (drivers/gpu/msm of NothingOSS's sm8475 tree)
+tools/gen-cp-profile-open.py VENDOR_DIR "$WORK/local/mondrian_cp_profile.h"
+```
+
+`tools/wsl/build-kernel.sh` copies `$WORK/local/*.h` into the tree on every
+build. Each missing header degrades silently, so check the ring: without the CP
+profile the GPU does its full bring-up but logs `cp start without SQE firmware`
+or publishes no `MondrianGPU` at all, and `mondrian-gl` falls back to the CPU
+renderer.
+
 ## Boot time
 
 The eight cores already start (`cpus=8`, all `PSCI CPU_ON rc=0`). The remaining
