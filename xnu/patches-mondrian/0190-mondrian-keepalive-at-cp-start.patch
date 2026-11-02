@@ -1,0 +1,34 @@
+xnu 0190: hold the GMU keepalive from cp_start, not from the first submission
+
+CoreAnimation's first frame reaches the user client minutes after the CP was
+started. The keepalive is only raised inside a submission, so the GMU has the
+GPU parked when that frame arrives, and the rings show the CP never fetching
+those packets: CP_RB_RPTR stays equal to CP_RB_WPTR right after a submission
+that the CPU then dies in. gpukeep=1 now raises the keepalive once, right after
+the SQE is started, and never drops it.
+
+HackiOS reaches the same place with explicit pauses in its GPU bring-up
+(`adreno_pause`), which is what pointed at the parked GPU rather than at the
+stream.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -2429,6 +2429,18 @@
+ 
+ 	printf("MONDRIAN GPU: cp started\n");
+ 	mondrian_log_flush_now();
++	/*
++	 * CoreAnimation's first frame arrives minutes after this, and the
++	 * GMU parks the GPU while it waits. The keepalive is otherwise only
++	 * raised inside a submission, so the first frame is rung into a parked
++	 * GPU and the CP never fetches it (CP_RB_RPTR stays at CP_RB_WPTR).
++	 * gpukeep=1 keeps it up from here on.
++	 */
++	if (mondrian_uc_gmu != 0 && mondrian_uc_keep == 1) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
++		printf("MONDRIAN GPU: cp keepalive held up\n");
++		mondrian_log_flush_now();
++	}
+ 
+ 	for (i = 0; i < 2000; i++) {
+ 		rptr = CPR(GEN7_CP_RB_RPTR);
