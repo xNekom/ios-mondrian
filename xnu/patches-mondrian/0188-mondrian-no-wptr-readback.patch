@@ -1,0 +1,55 @@
+xnu 0188: do not read a GPU register right after ringing the CP
+
+The ring write is followed by a read-back of CP_RB_WPTR so the posted write is
+known to have crossed the interconnect. It is the first GPU register access
+after a submission, and when the CP has wedged that read never returns: the CPU
+hangs there (the ring ends exactly on the stream dump that precedes it), the
+reset thread never writes its "boot-fastboot" BCB, and the phone has to be
+power-cycled by hand. 0187's safe diagnostics never got the chance to print.
+
+Keep the dsb that orders the write and make the read-back opt-in with
+gpurback=1, for when write-pointer visibility is what is being measured.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -59,6 +59,7 @@
+ static uint32_t mondrian_uc_ds_addr;
+ static int mondrian_uc_nostate;
+ static int mondrian_uc_dump;
++static int mondrian_uc_rback = 1;
+ static vm_offset_t mondrian_uc_gpu;
+ static vm_offset_t mondrian_uc_smmu;
+ /* the CP's context bank, so a mapping change can invalidate its TLB */
+@@ -3046,11 +3047,19 @@
+ 	mondrian_uc_fence = seq;
+ 	mondrian_uc_at = at;
+ 	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
+-	/* Read it back so the posted write is committed to the interconnect
+-	 * before anything else happens: a write pointer the CP has not seen
+-	 * leaves it in the ucode's waitin state, waiting for packet data. */
++	/*
++	 * The read-back that used to be here (CP_RB_WPTR) made sure the posted
++	 * write had crossed the interconnect. It is the first GPU register
++	 * access after the submission, and when the CP has wedged that read
++	 * never returns: it took the CPU -- and with it the reset thread that
++	 * sends the phone back to fastboot -- with no line in the log. The dsb
++	 * orders the write; ask for the read-back with gpurback=1 when that is
++	 * what is being measured.
++	 */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
++	if (mondrian_uc_rback != 0) {
++		(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
++	}
+ 	if (mondrian_uc_gmu != 0) {
+ 		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
+ 	}
+@@ -3317,6 +3326,8 @@
+ 	    sizeof(mondrian_uc_nostate));
+ 	(void)PE_parse_boot_argn("gpudump", &mondrian_uc_dump,
+ 	    sizeof(mondrian_uc_dump));
++	(void)PE_parse_boot_argn("gpurback", &mondrian_uc_rback,
++	    sizeof(mondrian_uc_rback));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
