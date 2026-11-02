@@ -1,0 +1,370 @@
+xnu 0193: expand draw-state groups inside the nested indirect buffers too
+
+0186 rewrote CP_SET_DRAW_STATE only in the stream Mesa hands to the user client,
+but the group that wedges the CP lives in the nested indirect buffer that stream
+chains (0x10434000, a 27-group CP_SET_DRAW_STATE). The rings say it plainly: a
+71-dword stream completes in 13 ms, and the 168-dword one whose nested IB
+carries that group never answers its fence; 0191 then marks the GPU stopped so
+the system survives (measured: the UI kept drawing at 26 fps with the CPU).
+
+Expand both levels: every nested CP_INDIRECT_BUFFER target is expanded into a
+scratch arena and the packet is patched to point at it with its new dword count,
+then the top-level stream is expanded the same way and submitted from the arena.
+A group is a list of register/value pairs in GPU memory and the CP executes
+those as type-4 register writes, which is what the rest of the stream uses.
+
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -160,6 +160,9 @@
+ 	IOReturn submit(struct msm_gem_submit *request);
+ 	IOReturn expandDrawState(mondrian_buffer *src, uint32_t offset,
+ 	    uint32_t size, uint64_t *ib, uint32_t *dwords);
++	uint64_t scratchCarve(uint64_t bytes);
++	uint32_t expandGroups(const uint8_t *in, uint32_t size, uint8_t *out,
++	    uint32_t outMax);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+ 	mondrian_buffer *bufferNew(uint64_t size);
+ 	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
+@@ -169,6 +172,7 @@
+ 
+ 	IOLock *fLock;
+ 	mondrian_buffer *fScratch;
++	uint32_t fScratchUsed;
+ 	uint32_t fExpanded;
+ 	mondrian_buffer *fBuffers[kMondrianBuffers];
+ 	uint32_t fBufferCount;
+@@ -670,6 +674,7 @@
+ 		}
+ 	}
+ 	IOLockLock(fLock);
++	fScratchUsed = 0;
+ 	for (i = 0; i < request->nr_cmds; i++) {
+ 		mondrian_buffer *buffer;
+ 
+@@ -812,36 +817,55 @@
+ /*
+  * The CP never completes a stream that loads a draw-state group. Measured on
+  * the phone: a 71-dword stream without one writes its fence in 12 ms, while a
+- * 168-dword stream carrying a 27-group CP_SET_DRAW_STATE reads its whole IB
+- * (CP_IB1_REM_SIZE 0) and never fences, and that stall then blocks every later
+- * submission as well. A group is a list of register/value pairs in GPU memory,
+- * and the CP does execute those when they arrive as type-4 register writes, so
+- * expand the groups and submit the expanded stream from a scratch buffer.
++ * 168-dword stream carrying a 27-group CP_SET_DRAW_STATE reads its whole IB and
++ * never fences, and that stall then blocks every later submission (0191 marks
++ * the GPU stopped so the system survives it).
++ *
++ * The group in that stream is not in the stream itself: it lives in the nested
++ * indirect buffer the stream chains, which is why rewriting only the top level
++ * (0186) changed nothing. Both levels are expanded here: a group is a list of
++ * register/value pairs in GPU memory, and the CP does execute those as type-4
++ * register writes, exactly what the rest of the stream uses.
+  */
+-IOReturn
+-MondrianGPUUserClient::expandDrawState(mondrian_buffer *src, uint32_t offset,
+-    uint32_t size, uint64_t *ib, uint32_t *dwords)
++
++/* One arena per submission, carved in order. Zero when it is full. */
++uint64_t
++MondrianGPUUserClient::scratchCarve(uint64_t bytes)
+ {
+-	const uint32_t kOut = 1u << 20;
+-	const uint32_t kIn = 1u << 16;
+-	uint8_t *in = NULL, *out = NULL, *group = NULL;
+-	uint32_t at = 0, to = 0;
+-	bool changed = false;
+-	IOReturn result = kIOReturnUnsupported;
++	const uint32_t kArena = 2u << 20;
+ 
+-	if (mondrian_gpu_uc_nostate() || size > kIn) {
+-		return kIOReturnUnsupported;
++	if (bytes == 0 || bytes > kArena) {
++		return 0;
+ 	}
+-	in = (uint8_t *)IOMalloc(size);
+-	out = (uint8_t *)IOMalloc(kOut);
+-	group = (uint8_t *)IOMalloc(kOut);
+-	if (in == NULL || out == NULL || group == NULL) {
+-		result = kIOReturnNoMemory;
+-		goto done;
++	if (fScratch == NULL || fScratch->size < kArena) {
++		fScratch = bufferNew(kArena);
++		if (fScratch == NULL) {
++			return 0;
++		}
+ 	}
+-	if (src->memory->readBytes(offset, in, size) != size) {
+-		goto done;
++	bytes = (bytes + 0x3ffu) & ~0x3ffull;
++	if ((uint64_t)fScratchUsed + bytes > fScratch->size) {
++		return 0;
+ 	}
++	{
++		uint64_t at = fScratch->iova + fScratchUsed;
++
++		fScratchUsed += (uint32_t)bytes;
++		return at;
++	}
++}
++
++/*
++ * Expand every CP_SET_DRAW_STATE group in one stream into type-4 register
++ * writes (ascending registers batched into one packet); everything else is
++ * copied. Returns the produced size, or zero when there was no group.
++ */
++uint32_t
++MondrianGPUUserClient::expandGroups(const uint8_t *in, uint32_t size,
++    uint8_t *out, uint32_t outMax)
++{
++	uint32_t at = 0, to = 0, groups = 0;
++
+ 	while (at + 4 <= size) {
+ 		uint32_t header, type, count, bytes;
+ 
+@@ -850,94 +874,188 @@
+ 		count = (type == 7) ? (header & 0x3fff) : 0;
+ 		bytes = (type == 7) ? 4 * (1 + count) : 4;
+ 		if (at + bytes > size) {
+-			goto done;
++			break;
+ 		}
+ 		if (type == 7 && ((header >> 16) & 0x7f) == 0x43 && count >= 3) {
+-			uint32_t groups = count / 3, g;
++			uint32_t n = count / 3, g;
+ 
+-			for (g = 0; g < groups; g++) {
+-				uint32_t pair[3];
++			for (g = 0; g < n; g++) {
++				const uint8_t *pair = in + at + 4 + 12 * g;
++				uint32_t words[3], cnt, b, i;
+ 				uint64_t addr;
+-				uint32_t n, b, i;
+ 				mondrian_buffer *target = NULL;
++				uint8_t *data;
+ 
+-				memcpy(pair, in + at + 4 + 12 * g, 12);
+-				addr = pair[0] | ((uint64_t)pair[1] << 32);
+-				n = pair[2];
+-				if (n == 0) {
++				memcpy(words, pair, 12);
++				addr = words[0] | ((uint64_t)words[1] << 32);
++				cnt = words[2];
++				if (cnt == 0) {
+ 					continue;
+ 				}
+-				if (4u * n > kOut) {
+-					goto done;
+-				}
+ 				for (b = 0; b < fBufferCount; b++) {
+ 					if (addr >= fBuffers[b]->iova &&
+-					    addr + 4ull * n <= fBuffers[b]->iova +
++					    addr + 4ull * cnt <= fBuffers[b]->iova +
+ 					    fBuffers[b]->size) {
+ 						target = fBuffers[b];
+ 						break;
+ 					}
+ 				}
+-				if (target == NULL ||
+-				    target->memory->readBytes(addr - target->iova,
+-				    group, 4u * n) != 4u * n) {
+-					goto done;
++				if (target == NULL) {
++					return 0;
+ 				}
+-				for (i = 0; i + 1 < n; ) {
++				data = (uint8_t *)IOMalloc(4u * cnt);
++				if (data == NULL) {
++					return 0;
++				}
++				if (target->memory->readBytes(addr - target->iova,
++				    data, 4u * cnt) != 4u * cnt) {
++					IOFree(data, 4u * cnt);
++					return 0;
++				}
++				for (i = 0; i + 1 < cnt; ) {
+ 					uint32_t reg, values = 1, head;
+ 
+-					memcpy(&reg, group + 4 * i, 4);
++					memcpy(&reg, data + 4 * i, 4);
+ 					while (values < 0x7f &&
+-					    i + 2 * (values + 1) <= n) {
++					    i + 2 * (values + 1) <= cnt) {
+ 						uint32_t next;
+ 
+-						memcpy(&next, group + 4 * (i + 2 * values), 4);
++						memcpy(&next,
++						    data + 4 * (i + 2 * values), 4);
+ 						if (next != reg + values) {
+ 							break;
+ 						}
+ 						values++;
+ 					}
+-					if (to + 4 * (1 + values) > kOut) {
+-						goto done;
++					if (to + 4 * (1 + values) > outMax) {
++						IOFree(data, 4u * cnt);
++						return 0;
+ 					}
+ 					head = (4u << 28) | ((reg & 0x3ffff) << 8) |
+ 					    (values & 0x7f);
+ 					memcpy(out + to, &head, 4);
+-					memcpy(out + to + 4, group + 4 * i + 4, 4 * values);
++					memcpy(out + to + 4, data + 4 * i + 4,
++					    4 * values);
+ 					to += 4 * (1 + values);
+ 					i += 2 * values;
+ 				}
++				IOFree(data, 4u * cnt);
+ 			}
+-			changed = true;
++			groups++;
+ 			at += bytes;
+ 			continue;
+ 		}
+-		if (to + bytes > kOut) {
+-			goto done;
++		if (to + bytes > outMax) {
++			return 0;
+ 		}
+ 		memcpy(out + to, in + at, bytes);
+ 		to += bytes;
+ 		at += bytes;
+ 	}
+-	if (!changed || to == 0) {
++	return groups != 0 ? to : 0;
++}
++
++IOReturn
++MondrianGPUUserClient::expandDrawState(mondrian_buffer *src, uint32_t offset,
++    uint32_t size, uint64_t *ib, uint32_t *dwords)
++{
++	const uint32_t kOut = 2u << 20;
++	const uint32_t kIn = 1u << 16;
++	uint8_t *in = NULL, *out = NULL, *sub = NULL, *subOut = NULL;
++	uint32_t at = 0, produced = 0;
++	bool changed = false;
++	IOReturn result = kIOReturnUnsupported;
++
++	if (mondrian_gpu_uc_nostate() || size > kIn) {
++		return kIOReturnUnsupported;
++	}
++	in = (uint8_t *)IOMalloc(size);
++	out = (uint8_t *)IOMalloc(kOut);
++	sub = (uint8_t *)IOMalloc(kIn);
++	subOut = (uint8_t *)IOMalloc(kOut);
++	if (in == NULL || out == NULL || sub == NULL || subOut == NULL) {
++		result = kIOReturnNoMemory;
++		goto done;
++	}
++	if (src->memory->readBytes(offset, in, size) != size) {
+ 		goto done;
+ 	}
+-	{
+-		mondrian_buffer *scratch = fScratch;
+ 
+-		if (scratch == NULL || scratch->size < (uint64_t)to) {
+-			scratch = bufferNew(kOut);
+-			if (scratch == NULL) {
+-				goto done;
++	/* pass 1: expand the nested indirect buffers and point the packets at them */
++	while (at + 4 <= size) {
++		uint32_t header, type, count, bytes;
++
++		memcpy(&header, in + at, 4);
++		type = header >> 28;
++		count = (type == 7) ? (header & 0x3fff) : 0;
++		bytes = (type == 7) ? 4 * (1 + count) : 4;
++		if (at + bytes > size) {
++			goto done;
++		}
++		if (type == 7 && ((header >> 16) & 0x7f) == 0x3f && count == 3) {
++			uint32_t words[3], n, subSize, b;
++			uint64_t addr, iova;
++			mondrian_buffer *target = NULL;
++
++			memcpy(words, in + at + 4, 12);
++			addr = words[0] | ((uint64_t)words[1] << 32);
++			n = words[2];
++			for (b = 0; b < fBufferCount; b++) {
++				if (addr >= fBuffers[b]->iova &&
++				    addr + 4ull * n <= fBuffers[b]->iova +
++				    fBuffers[b]->size) {
++					target = fBuffers[b];
++					break;
++				}
++			}
++			subSize = 4u * n;
++			if (target != NULL && subSize != 0 && subSize <= kIn &&
++			    target->memory->readBytes(addr - target->iova, sub,
++			    subSize) == subSize) {
++				uint32_t expanded = expandGroups(sub, subSize,
++				    subOut, kOut);
++
++				if (expanded != 0) {
++					iova = scratchCarve(expanded);
++					if (iova != 0 && fScratch->memory->
++					    writeBytes(iova - fScratch->iova, subOut,
++					    expanded) == expanded) {
++						words[0] = (uint32_t)iova;
++						words[1] = (uint32_t)(iova >> 32);
++						words[2] = expanded / 4;
++						memcpy(in + at + 4, words, 12);
++						changed = true;
++					}
++				}
+ 			}
+-			fScratch = scratch;
+ 		}
+-		if (scratch->memory->writeBytes(0, out, to) != to) {
++		at += bytes;
++	}
++
++	/* pass 2: the stream itself */
++	produced = expandGroups(in, size, out, kOut);
++	if (produced != 0) {
++		changed = true;
++	} else {
++		memcpy(out, in, size);
++		produced = size;
++	}
++	if (!changed) {
++		goto done;
++	}
++	{
++		uint64_t iova = scratchCarve(produced);
++
++		if (iova == 0) {
+ 			goto done;
+ 		}
+-		bufferSync(scratch);
+-		*ib = scratch->iova;
+-		*dwords = to / 4;
++		if (fScratch->memory->writeBytes(iova - fScratch->iova, out,
++		    produced) != produced) {
++			goto done;
++		}
++		bufferSync(fScratch);
++		*ib = iova;
++		*dwords = produced / 4;
+ 		if (fExpanded < 4) {
+ 			fExpanded++;
+ 			IOLog("MondrianGPU: draw state expanded %u -> %u dwords\n",
+@@ -952,12 +1070,16 @@
+ 	if (out != NULL) {
+ 		IOFree(out, kOut);
+ 	}
+-	if (group != NULL) {
+-		IOFree(group, kOut);
++	if (sub != NULL) {
++		IOFree(sub, kIn);
++	}
++	if (subOut != NULL) {
++		IOFree(subOut, kOut);
+ 	}
+ 	return result;
+ }
+ 
++
+ IOReturn
+ MondrianGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+     IOMemoryDescriptor **memory)
