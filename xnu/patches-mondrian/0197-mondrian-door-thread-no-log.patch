@@ -1,0 +1,54 @@
+xnu 0197: the door thread must not write to the log
+
+ring32 shows the thread working -- 2000 bring-up doors plus the first client
+submission, every one "uc door posted" -- and the system dying right after the
+first client door. The thread flushed the disk on every door: 2000 UFS writes,
+each holding mondrian_ufs_lock across a bounce-buffer write and a cache flush,
+from a thread that is neither the log thread nor the UFS write path the logger
+was written for. The console ring then cannot be flushed either (try_lock) and
+the reset thread blocks in its BCB write, so the boot ends with no further
+lines.
+
+The door thread only touches the register now. The submission logs the pair
+around it, from the caller: "uc door <seq> at <dword>" before waking the thread
+and "uc door posted <seq>" once the memory flag says the write was issued, both
+only for streams from a real driver. The log has one writer again.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3044,13 +3044,9 @@
+ 			continue;
+ 		}
+ 		mondrian_uc_door_at = 0;
+-		printf("MONDRIAN GPU: uc door %u at 0x%x\n", seq, at);
+-		mondrian_log_flush_now();
+ 		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		mondrian_uc_door_posted = seq;
+-		printf("MONDRIAN GPU: uc door posted %u\n", seq);
+-		mondrian_log_flush_now();
+ 	}
+ }
+ 
+@@ -3130,6 +3126,10 @@
+ 	if (mondrian_uc_async != 0 && mondrian_uc_door_started != 0) {
+ 		uint32_t waited;
+ 
++		if (dwords > 16) {
++			printf("MONDRIAN GPU: uc door %u at 0x%x\n", seq, at);
++			mondrian_log_flush_now();
++		}
+ 		mondrian_uc_door_seq = seq;
+ 		mondrian_uc_door_at = at;
+ 		wakeup(&mondrian_uc_door_at);
+@@ -3147,6 +3147,10 @@
+ 			mondrian_uc_up = 0;
+ 			return 0;
+ 		}
++		if (dwords > 16) {
++			printf("MONDRIAN GPU: uc door posted %u\n", seq);
++			mondrian_log_flush_now();
++		}
+ 	} else {
+ 		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
+ 	}

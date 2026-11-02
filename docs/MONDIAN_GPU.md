@@ -372,6 +372,15 @@ them has Metal. That is the path this port follows.
   client's lock is released, and the UI keeps compositing on the CPU path at
   26 fps instead of freezing. The ring then shows `uc door N at X` with no
   `uc door posted N` after it.
+- **The door thread touches one register and nothing else.** A `printf` plus
+  `mondrian_log_flush_now()` from that thread cost a UFS write per door —
+  measured over the 2000-door bring-up loop — and a flush from a thread that is
+  neither the log thread nor the UFS write path held `mondrian_ufs_lock` across
+  a bounce-buffer write and a cache flush, after which the console ring could
+  not be flushed (its store is `try_lock`) and the reset thread blocked in its
+  BCB write: the boot ended one line after the first client door. The caller
+  logs the pair instead, and only for streams from a real driver
+  (`dwords > 16`), so the ring keeps a single writer.
 - **A boot that wedges the first stream is not the same boot twice.** The same
   71-dword stream completes in 13 ms in one boot and stalls at the doorbell in
   the next, with the same firmware, ring and keepalive, which is why every knob
