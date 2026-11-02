@@ -1,0 +1,27 @@
+xnu 0195: the draw-state expansion is opt-in until the rewrite is right
+
+Measured on one kernel: with the expansion off (gpunostate=1) the 71-dword
+stream completes in 13 ms and only the 168-dword one that carries the
+draw-state group wedges; with the expansion on (0193) the 71-dword stream stops
+answering as well, so the rewritten stream or its patched nested packet is
+wrong. Keep the expansion behind gpustate=1 and leave the system in the state
+where the good stream still works and 0191 keeps it alive through the other.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -2787,7 +2787,14 @@
+ mondrian_gpu_uc_nostate(void)
+ {
+ #ifdef MONDRIAN_CP_PROFILE
+-	return mondrian_uc_nostate;
++	/*
++	 * The draw-state expansion (0193) is off unless gpustate=1 asks for it:
++	 * with it on, even the 71-dword stream that completes on its own stops
++	 * answering, so the rewrite is not right yet. Off, that stream keeps
++	 * working and only the one carrying the group wedges (0191 keeps the
++	 * system alive through it).
++	 */
++	return mondrian_uc_nostate == 0 ? 1 : 0;
+ #else
+ 	return 1;
+ #endif
