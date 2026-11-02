@@ -339,7 +339,11 @@ them has Metal. That is the path this port follows.
   in 13 ms` but `168 dwords` never finishes (`done 0` after 300 ms) and the SMMU
   keeps `fsr 0x80000402` (a translation fault) latched. That fault is the next
   thing to decode; `gpupm4=N` truncates the stream and `tools/pm4-decode.py`
-  names its packets.
+  names its packets. The 27-group `CP_SET_DRAW_STATE` in that stream's nested
+  indirect buffer is expanded into plain type-4 writes at both levels now, but
+  the rewritten stream is wrong: with the expansion on, the 71-dword stream that
+  completes on its own stops answering too, so it stays behind `gpunostate=1`
+  until the rewrite is right.
 - **The CP is what kills the boots that show nothing.** With `gpu=0 gpupower=0
   gmustart=0 gpugx=0 gpucp=0 gpusubmit=0` a boot always reaches userland and
   arms the console ring (measured: the ring's flush count advanced, 178 s, 119
@@ -353,16 +357,26 @@ them has Metal. That is the path this port follows.
   (the SQE read every dword) and the stream's last packet a `CP_EVENT_WRITE7`
   to `0x10408000`, a buffer first used by that submission. `0185` invalidates
   the CP's SMMU ASID when the tables change, which is the candidate fix.
-- **A wedged CP takes the CPU with it.** Every ring from a boot with the CP on
-  ends at the first Mesa stream, before the user client can print whether the
-  fence arrived: the stalled CP access hangs the CPU, so the reset thread
+- **A wedged CP takes the CPU with it, and the doorbell is where.** A ring from
+  a CP boot ends in one of two places: at `uc pre N` with no `uc big` line and
+  no timeout, or at `uc big N dwords ... done 0` with the fence unanswered. The
+  first is the worse one — measured with a healthy keepalive (`cp keepalive
+  held up`, `gfx pwr clk 0x0` at `cp started`) and the UI frozen at 0 fps: the
+  `CP_RB_WPTR` write, or the read-back after it, never returns. A stalled
+  register access hangs the CPU that issued it, so the reset thread
   (`mondrianreset`) never reaches its BCB write, the watchdog reboots into
-  `boot_b` and the phone loops into the shim until someone holds
-  power+volume-down. Preserving only the memory-based diagnostics (`0187`) and
-  dropping the `CP_RB_WPTR` read-back (`0188`) was not enough: the ring write
-  itself hangs. Two ways out are left: have the shim set the `boot-fastboot`
-  BCB before it jumps (so a watchdog reset lands in fastboot), or reset the GPU
-  from GPUCC/GMU before touching its own registers.
+  `boot_b`, and the phone loops into the shim until someone holds
+  power+volume-down. Two things keep that survivable: `gpurback=0` drops the
+  read-back (the `dsb` already ordered the write), and `0196` writes the
+  doorbell from a thread of its own — a stall loses that thread, the user
+  client's lock is released, and the UI keeps compositing on the CPU path at
+  26 fps instead of freezing. The ring then shows `uc door N at X` with no
+  `uc door posted N` after it.
+- **A boot that wedges the first stream is not the same boot twice.** The same
+  71-dword stream completes in 13 ms in one boot and stalls at the doorbell in
+  the next, with the same firmware, ring and keepalive, which is why every knob
+  is judged over at least two boots and why the doorbell had to move off the
+  submission path before anything else could be measured.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:

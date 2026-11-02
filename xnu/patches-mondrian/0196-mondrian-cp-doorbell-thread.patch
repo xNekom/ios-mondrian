@@ -1,0 +1,151 @@
+xnu 0196: the CP doorbell moves to its own thread, and the ring says where a
+submission stops
+
+ring31 ends at "uc pre 71": the keepalive is healthy ("cp keepalive held up"),
+there is no "uc big" line and no timeout, and the UI froze at 0 fps. The only
+GPU register touched after that line is CP_RB_WPTR -- the doorbell write and the
+read-back that 0188 describes as opt-in but left initialised to 1. A register
+access to a stopped block never returns, and the submission runs under the user
+client's lock, so the compositor waits on that lock and the whole UI stops.
+
+The doorbell is written by a thread of its own now. If the block stops
+answering, only that thread is lost, the lock is released, and the UI keeps
+compositing on the CPU path (the 26 fps 0191 already gives). The ring names the
+stall instead of leaving it to inference: "uc door <seq> at <dword>" before the
+write, "uc door posted <seq>" after it, and a memory-only timeout that marks the
+GPU stopped when neither appears. gpuasync=0 writes inline the old way.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -17,6 +17,10 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <sys/proc.h>
++#include <sys/kernel.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -59,8 +63,9 @@
+ static uint32_t mondrian_uc_ds_addr;
+ static int mondrian_uc_nostate;
+ static int mondrian_uc_dump;
+-static int mondrian_uc_rback = 1;
++static int mondrian_uc_rback;
+ static int mondrian_uc_keep;
++static int mondrian_uc_async = 1;
+ static vm_offset_t mondrian_uc_gpu;
+ static vm_offset_t mondrian_uc_smmu;
+ /* the CP's context bank, so a mapping change can invalidate its TLB */
+@@ -68,6 +73,19 @@
+ static vm_offset_t mondrian_uc_gmu;
+ static uint32_t mondrian_uc_at;
+ static uint32_t mondrian_uc_fence;
++/*
++ * The CP doorbell. CP_RB_WPTR is the one GPU register a submission has to
++ * touch, and touching it when the block has stopped answering never returns:
++ * measured on the phone, a boot where the ring ends at "uc pre 71" with a
++ * healthy keepalive and the UI frozen at 0 fps. Doing it here keeps that
++ * stall off the submission path and off the user client's lock.
++ */
++static volatile uint32_t mondrian_uc_door_at;
++static volatile uint32_t mondrian_uc_door_seq;
++static volatile uint32_t mondrian_uc_door_posted;
++static int mondrian_uc_door_started;
++
++static void mondrian_uc_door_thread(void *arg, wait_result_t wr);
+ static uint32_t mondrian_uc_table_next = 1;
+ static uint64_t mondrian_uc_iova = MONDRIAN_UC_IOVA_BASE;
+ 
+@@ -2441,6 +2459,19 @@
+ 		printf("MONDRIAN GPU: cp keepalive held up\n");
+ 		mondrian_log_flush_now();
+ 	}
++	if (mondrian_uc_async != 0) {
++		thread_t thread = NULL;
++
++		if (kernel_thread_start(mondrian_uc_door_thread, NULL,
++		    &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++			mondrian_uc_door_started = 1;
++			printf("MONDRIAN GPU: door thread started\n");
++		} else {
++			printf("MONDRIAN GPU: door thread failed, writing inline\n");
++		}
++		mondrian_log_flush_now();
++	}
+ 
+ 	for (i = 0; i < 2000; i++) {
+ 		rptr = CPR(GEN7_CP_RB_RPTR);
+@@ -3000,6 +3031,29 @@
+ 	return -1;
+ }
+ 
++static void
++mondrian_uc_door_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		uint32_t at = mondrian_uc_door_at;
++		uint32_t seq = mondrian_uc_door_seq;
++
++		if (at == 0) {
++			tsleep(&mondrian_uc_door_at, PUSER, "mondriandoor",
++			    hz);
++			continue;
++		}
++		mondrian_uc_door_at = 0;
++		printf("MONDRIAN GPU: uc door %u at 0x%x\n", seq, at);
++		mondrian_log_flush_now();
++		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++		__asm__ volatile("dsb sy" ::: "memory");
++		mondrian_uc_door_posted = seq;
++		printf("MONDRIAN GPU: uc door posted %u\n", seq);
++		mondrian_log_flush_now();
++	}
++}
++
+ int
+ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ {
+@@ -3073,7 +3127,29 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_uc_fence = seq;
+ 	mondrian_uc_at = at;
+-	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++	if (mondrian_uc_async != 0 && mondrian_uc_door_started != 0) {
++		uint32_t waited;
++
++		mondrian_uc_door_seq = seq;
++		mondrian_uc_door_at = at;
++		wakeup(&mondrian_uc_door_at);
++		/* Memory only: the fence word, not a GPU register. */
++		for (waited = 0; waited < 100; waited++) {
++			if (mondrian_uc_door_posted == seq) {
++				break;
++			}
++			delay(1000);
++		}
++		if (mondrian_uc_door_posted != seq) {
++			printf("MONDRIAN GPU: door thread stopped answering at seq %u, submissions refused\n",
++			    seq);
++			mondrian_log_flush_now();
++			mondrian_uc_up = 0;
++			return 0;
++		}
++	} else {
++		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++	}
+ 	/*
+ 	 * The read-back that used to be here (CP_RB_WPTR) made sure the posted
+ 	 * write had crossed the interconnect. It is the first GPU register
+@@ -3369,6 +3445,8 @@
+ 	    sizeof(mondrian_uc_rback));
+ 	(void)PE_parse_boot_argn("gpukeep", &mondrian_uc_keep,
+ 	    sizeof(mondrian_uc_keep));
++	(void)PE_parse_boot_argn("gpuasync", &mondrian_uc_async,
++	    sizeof(mondrian_uc_async));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
