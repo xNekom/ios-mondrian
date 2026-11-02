@@ -25,6 +25,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0087`–`0089` | GIC remap after the VM takes over, `VFS_ROOT` errno before the panic, unsealed root accepted |
 | `0117`–`0180` | the hardware bring-up after the display: the Goodix touch (TLMM, GENI SPI, 220 KB firmware, vsync reports), the GPU probe (GMU SMMU and firmware, HFI power tables, GX, the ARC votes), the `0173` timer arm, the boot bisect marks, the canvas CFData types, and the cmd-db/RSC mapping cache |
 | `0181`–`0184` | the CP path and its SMMU context (`0181`), the `MondrianGPU` user client (`0182`), the surface wrap refusal (`0183`) and the inert `mondrian_gpu_uc_*` fallback when the local CP profile is absent (`0184`) |
+| `0185`–`0198` | the submission path: the CP's SMMU ASID invalidate when the tables change (`0185`), diagnostics that survive a wedged CP (`0186`–`0188`), the GPU left stopped after a missed fence (`0191`), the draw-state expansion behind `gpunostate=1` (`0193`, `0195`), the doorbell written from its own thread and then defaulted back to inline (`0196`, `0197`), and `gen7_start` + `CP_ME_INIT` behind `gpuinit=1`/`gpuinit=2` (`0198`) |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`.
@@ -39,7 +40,7 @@ tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 
 The CI **skips** a patch that does not apply and still reports success, so run
 the command above (or `tools/check-patches.sh`) before pushing. It reports
-179/179 for the current series. Two traps it catches: `git apply` rejects a hunk
+196/196 for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
 ran. A *cancelled* job is reported as `failure` too.

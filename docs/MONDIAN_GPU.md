@@ -336,14 +336,16 @@ them has Metal. That is the path this port follows.
   `1 drawn in place, 0 pictures copied out` and the copy costs 39 µs, so the
   5.7 s readback is gone. What replaces it is the wait for the frame: the user
   client's submissions do not all complete — `uc big 71 dwords fence 2001 done 1
-  in 13 ms` but `168 dwords` never finishes (`done 0` after 300 ms) and the SMMU
-  keeps `fsr 0x80000402` (a translation fault) latched. That fault is the next
-  thing to decode; `gpupm4=N` truncates the stream and `tools/pm4-decode.py`
-  names its packets. The 27-group `CP_SET_DRAW_STATE` in that stream's nested
-  indirect buffer is expanded into plain type-4 writes at both levels now, but
-  the rewritten stream is wrong: with the expansion on, the 71-dword stream that
-  completes on its own stops answering too, so it stays behind `gpunostate=1`
-  until the rewrite is right.
+  in 14 ms` but `168 dwords` never finishes (`done 0` after 300 ms) and the SMMU
+  keeps `fsr 0x80000402` (a translation fault) latched. The 168-dword stream is
+  the first one that draws (`CP_SET_DRAW_STATE` + `CP_DRAW_INDX_OFFSET`), which
+  is why the missing `gen7_start` programming is the suspect: see below.
+  `gpupm4=N` truncates the stream and `tools/pm4-decode.py` names its packets.
+  The 27-group `CP_SET_DRAW_STATE` in that stream's nested indirect buffer is
+  expanded into plain type-4 writes at both levels now, but the rewritten stream
+  is wrong: with the expansion on, the 71-dword stream that completes on its own
+  stops answering too, so it stays behind `gpunostate=1` until the rewrite is
+  right.
 - **The CP is what kills the boots that show nothing.** With `gpu=0 gpupower=0
   gmustart=0 gpugx=0 gpucp=0 gpusubmit=0` a boot always reaches userland and
   arms the console ring (measured: the ring's flush count advanced, 178 s, 119
@@ -358,34 +360,56 @@ them has Metal. That is the path this port follows.
   to `0x10408000`, a buffer first used by that submission. `0185` invalidates
   the CP's SMMU ASID when the tables change, which is the candidate fix.
 - **A wedged CP takes the CPU with it, and the doorbell is where.** A ring from
-  a CP boot ends in one of two places: at `uc pre N` with no `uc big` line and
-  no timeout, or at `uc big N dwords ... done 0` with the fence unanswered. The
-  first is the worse one — measured with a healthy keepalive (`cp keepalive
-  held up`, `gfx pwr clk 0x0` at `cp started`) and the UI frozen at 0 fps: the
-  `CP_RB_WPTR` write, or the read-back after it, never returns. A stalled
-  register access hangs the CPU that issued it, so the reset thread
-  (`mondrianreset`) never reaches its BCB write, the watchdog reboots into
-  `boot_b`, and the phone loops into the shim until someone holds
-  power+volume-down. Two things keep that survivable: `gpurback=0` drops the
-  read-back (the `dsb` already ordered the write), and `0196` writes the
-  doorbell from a thread of its own — a stall loses that thread, the user
-  client's lock is released, and the UI keeps compositing on the CPU path at
-  26 fps instead of freezing. The ring then shows `uc door N at X` with no
-  `uc door posted N` after it.
-- **The door thread touches one register and nothing else.** A `printf` plus
-  `mondrian_log_flush_now()` from that thread cost a UFS write per door —
-  measured over the 2000-door bring-up loop — and a flush from a thread that is
-  neither the log thread nor the UFS write path held `mondrian_ufs_lock` across
-  a bounce-buffer write and a cache flush, after which the console ring could
-  not be flushed (its store is `try_lock`) and the reset thread blocked in its
-  BCB write: the boot ended one line after the first client door. The caller
-  logs the pair instead, and only for streams from a real driver
-  (`dwords > 16`), so the ring keeps a single writer.
-- **A boot that wedges the first stream is not the same boot twice.** The same
-  71-dword stream completes in 13 ms in one boot and stalls at the doorbell in
-  the next, with the same firmware, ring and keepalive, which is why every knob
-  is judged over at least two boots and why the doorbell had to move off the
-  submission path before anything else could be measured.
+  a CP boot ends in one of three places: at `uc pre N` with no `uc big` line and
+  no timeout, at `uc big N dwords ... done 0` with the fence unanswered, or at
+  `uc door posted N` with nothing after it. The first is the worse one —
+  measured with a healthy keepalive (`cp keepalive held up`, `gfx pwr clk 0x0`
+  at `cp started`) and the UI frozen at 0 fps: the `CP_RB_WPTR` write, or the
+  read-back after it, never returns. A stalled register access hangs the CPU
+  that issued it, so the reset thread (`mondrianreset`) never reaches its BCB
+  write, the watchdog reboots into `boot_b`, and the phone loops into the shim
+  until someone holds power+volume-down. `gpurback=0` drops the read-back (the
+  `dsb` already ordered the write) and that is the default.
+- **Writing the doorbell from its own thread is a regression, not a fix.**
+  Measured on one kernel with the same 71-dword stream: written by a thread
+  (`gpuasync=1`) the ring shows `uc door posted 2001` and stops — no fence, 0
+  fps, no frame drawn; written inline (`gpuasync=0`, the default) the same
+  stream finishes in 14 ms and the UI runs at 26 fps. The thread exists for
+  measuring a stall, not for booting, and it must never log: a `printf` plus
+  flush from it cost a UFS write per door over the 2000-door bring-up loop, held
+  `mondrian_ufs_lock` across the bounce-buffer write, and the boot then ended one
+  line after the first client door.
+- **The stream that wedges is the first one that draws.** The 71-dword stream is
+  `CP_SET_MODE`, `CP_THREAD_CONTROL`, `CP_SET_AMBLE`, register-only nested IBs,
+  a `CP_BLIT` and event writes; it completes. The 168-dword stream adds
+  `CP_SET_DRAW_STATE` (81 dwords, three state groups) and `CP_DRAW_INDX_OFFSET`
+  in its nested IB at `0x10434000`, and the CP never comes back from it. A draw
+  is the first thing that puts UCHE/RB/SP/TPL1/GRAS to work at the chip's bank
+  interleave, and none of those blocks is programmed: the shim never ran
+  `gen7_start` and never sent `CP_ME_INIT`. `0198` runs the register half at
+  `gpuinit=1` and adds `CP_ME_INIT` at `gpuinit=2`.
+- **A ring packet goes at the CP's cursor, never at a saved one.** The
+  bring-up stress leaves the CP at `mondrian_uc_at` (`0x5b0`); writing
+  `CP_ME_INIT` at the ring cursor the function started with (25) and then
+  storing that lower value into `CP_RB_WPTR` makes the SQE reinterpret the ring
+  from a point the CP has already passed. Measured as `cp me init rptr 1456
+  wptr 35`, and the next client stream never fences. Any raw block appended to
+  the ring must start at `mondrian_uc_at` and write it back.
+- **An uninitialised CP still fetches, executes and fences.** Measured over the
+  2000-submission bring-up loop: `CP_MEM_WRITE`, `CP_EVENT_WRITE`, IB fetch and
+  fences all work without `CP_ME_INIT`, so none of those is what the draw stream
+  is missing.
+- **While the draw path is dead the panel shows SpringBoard's first frame.** In
+  a boot that reaches userland the compositor swaps `surface N 1440x3200 fmt
+  0x62336138 bpr 5760` with a full-screen `a 0,0 1440x3200` rect, so the display
+  geometry is right; what is on the panel is the content of that surface — a
+  white square (SpringBoard's wallpaper poster, `CollectionsPoster create
+  650x684` / `1326x1326`, drawn at its own size) and an activity indicator, which
+  is the whole of `frame 1: 136 GL calls, 4 draws, 8 triangles`. The lock screen
+  needs many more draws and larger textures, and Mesa's submissions in that boot
+  fail (`submit failed: -35`, `wait-fence failed!`) because `0191` marked the GPU
+  stopped after the first draw stream wedged. Do not read the picture as a
+  geometry bug.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:

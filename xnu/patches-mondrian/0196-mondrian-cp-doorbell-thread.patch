@@ -13,7 +13,10 @@ answering, only that thread is lost, the lock is released, and the UI keeps
 compositing on the CPU path (the 26 fps 0191 already gives). The ring names the
 stall instead of leaving it to inference: "uc door <seq> at <dword>" before the
 write, "uc door posted <seq>" after it, and a memory-only timeout that marks the
-GPU stopped when neither appears. gpuasync=0 writes inline the old way.
+GPU stopped when neither appears. The thread is off by default: measured on one
+kernel, with it on the 71-dword stream never fences and the UI freezes at 0 fps,
+while the inline write lets the same stream complete in 14 ms at 26 fps.
+gpuasync=1 turns it back on.
 
 --- a/bsd/dev/mondrian_gpu.c
 +++ b/bsd/dev/mondrian_gpu.c
@@ -28,18 +31,23 @@ GPU stopped when neither appears. gpuasync=0 writes inline the old way.
  #include <machine/machine_routines.h>
  #include <arm/caches_internal.h>
  #include <vm/pmap.h>
-@@ -59,8 +63,9 @@
+@@ -59,8 +67,14 @@
  static uint32_t mondrian_uc_ds_addr;
  static int mondrian_uc_nostate;
  static int mondrian_uc_dump;
 -static int mondrian_uc_rback = 1;
 +static int mondrian_uc_rback;
  static int mondrian_uc_keep;
-+static int mondrian_uc_async = 1;
++/*
++ * Measured: with the door thread on, the 71-dword stream never fences and the
++ * UI freezes at 0 fps; written inline, it completes in 14 ms. Keep the thread
++ * for measuring with gpuasync=1, default to the write that works.
++ */
++static int mondrian_uc_async;
  static vm_offset_t mondrian_uc_gpu;
  static vm_offset_t mondrian_uc_smmu;
  /* the CP's context bank, so a mapping change can invalidate its TLB */
-@@ -68,6 +73,19 @@
+@@ -68,6 +83,19 @@
  static vm_offset_t mondrian_uc_gmu;
  static uint32_t mondrian_uc_at;
  static uint32_t mondrian_uc_fence;
@@ -59,7 +67,7 @@ GPU stopped when neither appears. gpuasync=0 writes inline the old way.
  static uint32_t mondrian_uc_table_next = 1;
  static uint64_t mondrian_uc_iova = MONDRIAN_UC_IOVA_BASE;
  
-@@ -2441,6 +2459,19 @@
+@@ -2441,6 +2482,19 @@
  		printf("MONDRIAN GPU: cp keepalive held up\n");
  		mondrian_log_flush_now();
  	}
@@ -79,7 +87,7 @@ GPU stopped when neither appears. gpuasync=0 writes inline the old way.
  
  	for (i = 0; i < 2000; i++) {
  		rptr = CPR(GEN7_CP_RB_RPTR);
-@@ -3000,6 +3031,29 @@
+@@ -3000,6 +3067,29 @@
  	return -1;
  }
  
@@ -109,7 +117,7 @@ GPU stopped when neither appears. gpuasync=0 writes inline the old way.
  int
  mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
  {
-@@ -3073,7 +3127,29 @@
+@@ -3073,7 +3186,29 @@
  	__asm__ volatile("dsb sy" ::: "memory");
  	mondrian_uc_fence = seq;
  	mondrian_uc_at = at;
@@ -140,7 +148,7 @@ GPU stopped when neither appears. gpuasync=0 writes inline the old way.
  	/*
  	 * The read-back that used to be here (CP_RB_WPTR) made sure the posted
  	 * write had crossed the interconnect. It is the first GPU register
-@@ -3369,6 +3445,8 @@
+@@ -3369,6 +3526,8 @@
  	    sizeof(mondrian_uc_rback));
  	(void)PE_parse_boot_argn("gpukeep", &mondrian_uc_keep,
  	    sizeof(mondrian_uc_keep));

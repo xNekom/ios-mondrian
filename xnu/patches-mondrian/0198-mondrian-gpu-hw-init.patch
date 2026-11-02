@@ -1,0 +1,169 @@
+xnu 0198: the GPU hardware init kgsl runs and the shim never did
+
+The 71-dword client stream completes in 14 ms. The 168-dword one -- the first
+stream that draws, `CP_SET_DRAW_STATE` then `CP_DRAW_INDX_OFFSET` -- never
+writes its fence, and every submission after it is refused. The shim loads the
+SQE and sets `CP_SQE_CNTL=1`, but never runs the register programming
+`gen7_start` does first and never sends `CP_ME_INIT`; a draw is the first thing
+that puts UCHE/RB/SP/TPL1/GRAS to work at the chip's bank interleave, and all of
+those blocks still hold the bootloader's reset values.
+
+Program what `gen7_start` programs (GBIF QOS, UCHE trap and write-thru base,
+UCHE cache ways and CMDQ config, the `NC_MODE_CNTL` set for highest bank bit 14,
+the hang-detect counter, `CP_APRIV_CNTL`/`CP_BV_APRIV_CNTL`), then, at
+`gpuinit=2`, send `CP_THREAD_CONTROL(BIT(27))` and `CP_ME_INIT` through the ring
+without a power-up reglist and prove the ring still runs with one
+memwrite-plus-fence submission. `gpuinit=1` is the register programming alone,
+because the two halves fail differently on blocks this board has never touched.
+
+The `CP_ME_INIT` packet goes at the ring cursor the 2000-submission stress left
+(`mondrian_uc_at`), not at this function's own `at`: writing behind
+`CP_RB_RPTR` and then lowering `CP_RB_WPTR` makes the SQE reinterpret the ring
+and the next client stream wedges.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -65,6 +65,7 @@
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ static int mondrian_uc_keep;
++static int mondrian_cp_init_hw;
+ /*
+  * Measured: with the door thread on, the 71-dword stream never fences and the
+  * UI freezes at 0 fps; written inline, it completes in 14 ms. Keep the thread
+@@ -2706,6 +2708,126 @@
+ 			    mv ? mv[0x910 / 4] : 0,
+ 			    mv ? mv[0] : 0, mv ? mv[2] : 0);
+ 			mondrian_log_flush_now();
++			if (mondrian_cp_init_hw != 0) {
++				/*
++				 * kgsl's gen7_start, and with gpuinit=2 its
++				 * CP_ME_INIT too. A draw is the first thing
++				 * that puts UCHE/RB/SP/TPL1/GRAS to work at
++				 * the chip's bank interleave, and none of
++				 * those blocks is programmed here: the
++				 * 71-dword stream only writes registers, the
++				 * 168-dword one draws and the CP never comes
++				 * back from it.
++				 *
++				 * The trap base points at a scratch page, so a
++				 * stray UCHE trap lands there instead of in the
++				 * interconnect.
++				 */
++				const uint64_t trap =
++				    mondrian_cp_memptr.iova + 0xf00u;
++
++				printf("MONDRIAN GPU: cp hw init begin at 0x%x\n",
++				    mondrian_uc_at);
++				mondrian_log_flush_now();
++				CPW(GEN7_RBBM_GBIF_CLIENT_QOS_CNTL, 0x02120212u);
++				CPW(GEN7_UCHE_GBIF_GX_CONFIG, 0x010240e0u);
++				CPW(GEN7_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
++				CPW64(GEN7_UCHE_TRAP_BASE_LO, trap);
++				CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, trap);
++				CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
++				CPW(GEN7_UCHE_CMDQ_CONFIG, (6u << 16) | (6u << 12) |
++				    (9u << 8) | (1u << 3) | (1u << 2) | 2u);
++				/* highest bank bit 14, MAL not 64 bit */
++				CPW(GEN7_RB_NC_MODE_CNTL, (1u << 4) | (1u << 1));
++				CPW(GEN7_TPL1_NC_MODE_CNTL, (1u << 1));
++				CPW(GEN7_SP_NC_MODE_CNTL, (2u << 4) | (1u << 1));
++				CPW(GEN7_GRAS_NC_MODE_CNTL, (1u << 5));
++				CPW(GEN7_UCHE_MODE_CNTL, (1u << 21));
++				CPW(GEN7_RBBM_INTERFACE_HANG_INT_CNTL,
++				    (1u << 30) | 0xffffu);
++				CPW(GEN7_CP_APRIV_CNTL, 0x6fu);
++				CPW(GEN7_CP_BV_APRIV_CNTL, 0x0fu);
++				printf("MONDRIAN GPU: cp hw init regs done uche_cfg 0x%x rb 0x%x apriv 0x%x\n",
++				    CPR(GEN7_UCHE_CMDQ_CONFIG),
++				    CPR(GEN7_RB_NC_MODE_CNTL),
++				    CPR(GEN7_CP_APRIV_CNTL));
++				mondrian_log_flush_now();
++				if (mondrian_cp_init_hw >= 2) {
++					uint32_t a;
++
++					/*
++					 * The packet goes where the CP is, not
++					 * where this function's own cursor
++					 * stopped: the stress above already
++					 * moved the ring on to mondrian_uc_at,
++					 * and writing behind CP_RB_RPTR then
++					 * lowering CP_RB_WPTR makes the SQE
++					 * reinterpret the ring (measured:
++					 * "cp me init rptr 1456 wptr 35", and
++					 * the next client stream wedged).
++					 */
++					at = mondrian_uc_at;
++					ring[at++] = mondrian_pm4_type7(0x17u, 1);
++					ring[at++] = 1u << 27;	/* no concurrency */
++					ring[at++] = mondrian_pm4_type7(0x48u, 7);
++					ring[at++] = 0x4bu;	/* ctx|err|reset|perfcnt */
++					ring[at++] = 3u;	/* HW contexts */
++					ring[at++] = 0x20000000u;	/* error detect */
++					ring[at++] = 2u;	/* op mode mask */
++					ring[at++] = 0u;	/* no reg-init list */
++					ring[at++] = 0u;
++					ring[at++] = 0u;
++					mondrian_uc_at = at;
++					mondrian_gpu_mem_flush(&mondrian_cp_ring,
++					    mondrian_cp_ring.bytes);
++					__asm__ volatile("dsb sy" ::: "memory");
++					CPW(GEN7_CP_RB_WPTR, at);
++					for (a = 0; a < 2000; a++) {
++						rptr = CPR(GEN7_CP_RB_RPTR);
++						if (rptr >= at) {
++							break;
++						}
++						delay(1000);
++					}
++					printf("MONDRIAN GPU: cp me init rptr %u wptr %u fault 0x%x rbbm 0x%x sqe 0x%x\n",
++					    rptr, at, CPR(GEN7_CP_HW_FAULT),
++					    CPR(GEN7_RBBM_STATUS),
++					    CPR(GEN7_CP_SQE_CNTL));
++					mondrian_log_flush_now();
++				}
++				{
++					/* Does the CP still run after the init? */
++					uint32_t *ib2 = (uint32_t *)mondrian_cp_ib.va;
++					const uint64_t d3 =
++					    mondrian_cp_memptr.iova + 0x920u;
++					const uint64_t f3 =
++					    mondrian_cp_memptr.iova + 0x930u;
++					uint32_t n2 = 0, f2 = 0, s2, w2 = 0;
++
++					ib2[n2++] = mondrian_pm4_type7(0x3du, 3);
++					ib2[n2++] = (uint32_t)d3;
++					ib2[n2++] = (uint32_t)(d3 >> 32);
++					ib2[n2++] = 0x600d1a11u;
++					ib2[n2++] = mondrian_pm4_type7(0x46u, 4);
++					ib2[n2++] = 0x31u | (1u << 27);
++					ib2[n2++] = (uint32_t)f3;
++					ib2[n2++] = (uint32_t)(f3 >> 32);
++					ib2[n2++] = 0x600d1a12u;
++					mondrian_gpu_mem_flush(&mondrian_cp_ib,
++					    mondrian_cp_ib.bytes);
++					__asm__ volatile("dsb sy" ::: "memory");
++					s2 = (uint32_t)mondrian_gpu_uc_submit(
++					    mondrian_cp_ib.iova, n2, &f2);
++					if (s2 == 0) {
++						w2 = (uint32_t)
++						    mondrian_gpu_uc_wait(f2, 2000);
++					}
++					printf("MONDRIAN GPU: cp init canary submit %u wait %u canary 0x%x fence 0x%x\n",
++					    s2, w2, mv ? mv[0x920 / 4] : 0,
++					    mv ? mv[0x930 / 4] : 0);
++					mondrian_log_flush_now();
++				}
++			}
+ 		}
+ 	}
+ 	printf("MONDRIAN GPU: cp state sqe_cntl 0x%x rptr 0x%x wptr 0x%x\n",
+@@ -3456,6 +3698,8 @@
+ 	    sizeof(mondrian_uc_keep));
+ 	(void)PE_parse_boot_argn("gpuasync", &mondrian_uc_async,
+ 	    sizeof(mondrian_uc_async));
++	(void)PE_parse_boot_argn("gpuinit", &mondrian_cp_init_hw,
++	    sizeof(mondrian_cp_init_hw));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
