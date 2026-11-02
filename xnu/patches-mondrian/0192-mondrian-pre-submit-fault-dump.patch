@@ -1,0 +1,46 @@
+xnu 0192: read the SMMU and GMU state before the access that hangs
+
+The ring shows that reading CP_RB_RPTR, CP_RB_WPTR, CP_INTERRUPT_STATUS and the
+BV word right before a submission answers, and that the access which never
+returns is what follows it (the log ends on that line). The SMMU context bank
+and the GMU are separate blocks, so with gpudump=1 their registers are read
+just before the write: the context's FSR/FAR/SYNR/SCTLR, the global fault
+status, and the GMU's HFI control plus the 3D core power/clock status. That is
+the only fault evidence available when the CP has stopped answering.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3019,6 +3019,33 @@
+ 		    GEN7_CP_INTERRUPT_STATUS * 4u),
+ 		    ((volatile uint32_t *)mondrian_cp_memptr_view)[2]);
+ 		mondrian_log_flush_now();
++		if (mondrian_uc_dump != 0 && mondrian_uc_smmu != 0) {
++			/*
++			 * The SMMU and the GMU are separate blocks from the
++			 * CP: if the write that follows is the access that
++			 * never returns, these reads still answer and say
++			 * whether the context had already faulted.
++			 */
++			uint32_t cbase = 0x20000u + mondrian_uc_tlb_ctx;
++
++			printf("MONDRIAN GPU: uc cb fsr 0x%x far 0x%llx synr 0x%x sctlr 0x%x\n",
++			    mondrian_gpu_read(mondrian_uc_smmu, cbase + 0x58u),
++			    (unsigned long long)mondrian_smmu_read64(
++			    mondrian_uc_smmu, cbase + 0x60u),
++			    mondrian_gpu_read(mondrian_uc_smmu, cbase + 0x68u),
++			    mondrian_gpu_read(mondrian_uc_smmu, cbase));
++			printf("MONDRIAN GPU: uc smmu gfsr 0x%x fsynr1 0x%x\n",
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x48u),
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x2006cu));
++			if (mondrian_uc_gmu != 0) {
++				printf("MONDRIAN GPU: uc gmu hfi 0x%x pwr 0x%x\n",
++				    mondrian_gpu_read(mondrian_uc_gmu,
++				    GMU_OFF(0x1f980u)),
++				    mondrian_gpu_read(mondrian_uc_gmu,
++				    GMU_OFF(0x1f8d0u)));
++			}
++			mondrian_log_flush_now();
++		}
+ 	}
+ 	at = mondrian_uc_at;
+ 	if (at + 13 > MONDRIAN_UC_RING_DWORDS) {
