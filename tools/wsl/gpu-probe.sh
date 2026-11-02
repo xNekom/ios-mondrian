@@ -49,11 +49,11 @@ wait_for() {
 ensure_fastboot() {
 	if [ "$(state)" = fastboot ]; then return 0; fi
 	say "phone is in $(state); moving it to fastboot"
-	for i in $(seq 1 40); do
+	for i in $(seq 1 90); do
 		case "$(state)" in
 		fastboot) return 0 ;;
 		recovery|device) "$ADB" reboot bootloader >/dev/null 2>&1; sleep 6 ;;
-		*) sleep 3 ;;	# a boot is running or the phone is off
+		*) sleep 3 ;;	# a boot is running, or the phone is off
 		esac
 	done
 	return 1
@@ -69,6 +69,10 @@ import boards
 line = boards.get_board('mondrian').cmdline.split()
 drop = {a.split('=')[0] for a in sys.argv[1].split()}
 line = [a for a in line if a.split('=')[0] not in drop]
+# Every experiment has to end by itself: a wedged GPU bring-up leaves the
+# kernel alive but going nowhere, and the reset thread armed at mountroot is
+# what brings the phone back to fastboot (0127/0174).
+line.append('mondrianreset=90')
 print(' '.join(line + sys.argv[1].split()))
 PY
 ) || exit 1
