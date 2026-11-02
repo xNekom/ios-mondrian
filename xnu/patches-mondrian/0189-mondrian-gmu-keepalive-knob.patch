@@ -1,0 +1,56 @@
+xnu 0189: a switch for the GMU keepalive around a submission
+
+The submit path raises the keepalive, rings the CP and drops it again (kgsl
+toggles it the same way). The comment next to it already records that the same
+stream completes in one boot and stalls in the next, and the rings show the CP
+never picking the packets up (CP_RB_RPTR == CP_RB_WPTR right after the
+submission, with the SQE running: the stress test before it drains the ring).
+
+gpukeep=1 holds the keepalive up across the submission and gpukeep=2 never
+raises it; the default keeps the toggle. With the toggle ruled in or out the
+next question is which of the two states the CP needs to fetch from the ring.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -60,6 +60,7 @@
+ static int mondrian_uc_nostate;
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback = 1;
++static int mondrian_uc_keep;
+ static vm_offset_t mondrian_uc_gpu;
+ static vm_offset_t mondrian_uc_smmu;
+ /* the CP's context bank, so a mapping change can invalidate its TLB */
+@@ -3039,7 +3040,14 @@
+ 	 * (gen7_gpu_keepalive true/false); holding it on forever leaves the
+ 	 * power state machine in a different place and the same stream then
+ 	 * completes in one boot and stalls in the next. */
+-	if (mondrian_uc_gmu != 0) {
++	/*
++	 * gpukeep=1 holds the keepalive up across the submission, gpukeep=2
++	 * never raises it; the default is kgsl's toggle. The CP not picking the
++	 * packets up (CP_RB_RPTR == CP_RB_WPTR) is what a wrong keepalive would
++	 * look like, and the same stream is known to complete in one boot and
++	 * stall in the next.
++	 */
++	if (mondrian_uc_gmu != 0 && mondrian_uc_keep != 2) {
+ 		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
+ 	}
+ 	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+@@ -3060,7 +3068,7 @@
+ 	if (mondrian_uc_rback != 0) {
+ 		(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
+ 	}
+-	if (mondrian_uc_gmu != 0) {
++	if (mondrian_uc_gmu != 0 && mondrian_uc_keep == 0) {
+ 		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
+ 	}
+ 	*fence = seq;
+@@ -3328,6 +3336,8 @@
+ 	    sizeof(mondrian_uc_dump));
+ 	(void)PE_parse_boot_argn("gpurback", &mondrian_uc_rback,
+ 	    sizeof(mondrian_uc_rback));
++	(void)PE_parse_boot_argn("gpukeep", &mondrian_uc_keep,
++	    sizeof(mondrian_uc_keep));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
