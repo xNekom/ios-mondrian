@@ -354,15 +354,15 @@ them has Metal. That is the path this port follows.
   to `0x10408000`, a buffer first used by that submission. `0185` invalidates
   the CP's SMMU ASID when the tables change, which is the candidate fix.
 - **A wedged CP takes the CPU with it.** Every ring from a boot with the CP on
-  ends at the first Mesa stream, before the user client can even print whether
-  the fence arrived: the CP's stalled bus access makes the CPU hang inside a
-  GPU register read, so the reset thread (`mondrianreset`) never reaches its
-  BCB write and the phone has to be power-cycled by hand. Stream 1 (71 dwords,
-  no `CP_SET_DRAW_STATE`) completes in 12 ms in some boots and wedges in
-  others, so the trigger is not only the draw-state group; `0186`, which
-  expands those groups into register writes, never got to run in the boot that
-  was measured. Bounding the diagnostic register reads after a fence timeout
-  is what would make a wedge survivable.
+  ends at the first Mesa stream, before the user client can print whether the
+  fence arrived: the stalled CP access hangs the CPU, so the reset thread
+  (`mondrianreset`) never reaches its BCB write, the watchdog reboots into
+  `boot_b` and the phone loops into the shim until someone holds
+  power+volume-down. Preserving only the memory-based diagnostics (`0187`) and
+  dropping the `CP_RB_WPTR` read-back (`0188`) was not enough: the ring write
+  itself hangs. Two ways out are left: have the shim set the `boot-fastboot`
+  BCB before it jumps (so a watchdog reset lands in fastboot), or reset the GPU
+  from GPUCC/GMU before touching its own registers.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
