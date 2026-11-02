@@ -1,0 +1,35 @@
+xnu 0191: a GPU that stops answering is marked stopped and left alone
+
+HackiOS does this in drivers/gpu/hakios.adreno.c: a fence that is not answered
+means the GPU is reported, marked stopped and never touched again, and the
+system keeps running. This port kept submitting, and the next submission writes
+CP_RB_WPTR into a GPU whose bus is stalled -- an access that never returns and
+takes the CPU with it, so the reset thread never runs and the phone has to be
+power-cycled by hand.
+
+The measured sequence is exactly that: the first stream's fence arrives (71
+dwords, 12 ms), the second one does not (168 dwords, done 0), and the boot dies
+shortly after. Refusing submissions once a fence goes unanswered keeps the
+system alive (and the ring readable) when the CP stops.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3112,6 +3112,18 @@
+ 		printf("MONDRIAN GPU: uc big %u dwords fence %u done %u in %u ms\n",
+ 		    dwords, seq, (int32_t)(value - seq) >= 0, waited);
+ 		mondrian_log_flush_now();
++		if ((int32_t)(value - seq) < 0) {
++			/*
++			 * The fence was not answered: the GPU has stopped
++			 * fetching and every later register access is likely
++			 * to hang the CPU with it (that is what killed the
++			 * boots). HackiOS reports the GPU and leaves it
++			 * stopped; refuse submissions instead of touching it.
++			 */
++			printf("MONDRIAN GPU: gpu stopped answering, submissions refused\n");
++			mondrian_log_flush_now();
++			mondrian_uc_up = 0;
++		}
+ 		if (mondrian_uc_dump != 0) {
+ 			/* An opcode error names the packet the ucode would not
+ 			 * take: SQE_STAT index 0 is the ucode PC, index 1 the
