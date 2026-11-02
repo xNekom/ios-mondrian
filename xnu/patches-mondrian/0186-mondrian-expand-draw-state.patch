@@ -1,0 +1,282 @@
+xnu 0186: expand CP_SET_DRAW_STATE groups into register writes
+
+The CP never completes a stream that loads a draw-state group. Measured on the
+phone: a 71-dword stream without one writes its fence in 12 ms, while a
+168-dword stream carrying a 27-group CP_SET_DRAW_STATE reads its whole IB
+(CP_IB1_REM_SIZE 0, CP_IB2_REM_SIZE 0) and never fences, and that stall then
+blocks every later submission too -- the UI runs at 2 fps with each frame
+waiting the full 5.7 s, drawn in place but never presented.
+
+A group is a list of register/value pairs in GPU memory and the CP does execute
+those when they arrive as type-4 register writes (the same submission's other
+packets are exactly that). Expand each group into register-write packets, in a
+scratch buffer, and submit that stream instead; runs of ascending registers are
+batched into one packet. gpunostate=1 keeps the old behaviour for bisection.
+
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -158,6 +158,8 @@
+ 	IOReturn gemInfo(struct msm_gem_info *request);
+ 	IOReturn surfaceBuffer(struct mondrian_surface *request);
+ 	IOReturn submit(struct msm_gem_submit *request);
++	IOReturn expandDrawState(mondrian_buffer *src, uint32_t offset,
++	    uint32_t size, uint64_t *ib, uint32_t *dwords);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+ 	mondrian_buffer *bufferNew(uint64_t size);
+ 	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
+@@ -166,6 +168,8 @@
+ 	void freeAll(void);
+ 
+ 	IOLock *fLock;
++	mondrian_buffer *fScratch;
++	uint32_t fExpanded;
+ 	mondrian_buffer *fBuffers[kMondrianBuffers];
+ 	uint32_t fBufferCount;
+ 	uint32_t fNextHandle;
+@@ -266,6 +270,8 @@
+ 		return false;
+ 	}
+ 	fLock = IOLockAlloc();
++	fScratch = NULL;
++	fExpanded = 0;
+ 	fBufferCount = 0;
+ 	fNextHandle = 1;
+ 	fNextQueue = 0;
+@@ -291,6 +297,7 @@
+ 		bufferFree(fBuffers[i]);
+ 	}
+ 	fBufferCount = 0;
++	fScratch = NULL;
+ }
+ 
+ IOReturn
+@@ -776,10 +783,21 @@
+ 			if (limit != 0 && dwords > limit) {
+ 				dwords = limit;		/* gpupm4=N: bisect */
+ 			}
+-			if (mondrian_gpu_uc_submit(buffer->iova +
+-			    cmds[i].submit_offset, dwords, &fence) != 0) {
+-				result = kIOReturnError;
+-				break;
++			{
++				uint64_t ib = buffer->iova +
++				    cmds[i].submit_offset;
++				uint32_t expanded = dwords;
++
++				if (expandDrawState(buffer,
++				    cmds[i].submit_offset, dwords * 4, &ib,
++				    &expanded) == kIOReturnSuccess) {
++					dwords = expanded;
++				}
++				if (mondrian_gpu_uc_submit(ib, dwords,
++				    &fence) != 0) {
++					result = kIOReturnError;
++					break;
++				}
+ 			}
+ 		}
+ 	}
+@@ -790,6 +808,155 @@
+ 	}
+ 	return result;
+ }
++
++/*
++ * The CP never completes a stream that loads a draw-state group. Measured on
++ * the phone: a 71-dword stream without one writes its fence in 12 ms, while a
++ * 168-dword stream carrying a 27-group CP_SET_DRAW_STATE reads its whole IB
++ * (CP_IB1_REM_SIZE 0) and never fences, and that stall then blocks every later
++ * submission as well. A group is a list of register/value pairs in GPU memory,
++ * and the CP does execute those when they arrive as type-4 register writes, so
++ * expand the groups and submit the expanded stream from a scratch buffer.
++ */
++IOReturn
++MondrianGPUUserClient::expandDrawState(mondrian_buffer *src, uint32_t offset,
++    uint32_t size, uint64_t *ib, uint32_t *dwords)
++{
++	const uint32_t kOut = 1u << 20;
++	const uint32_t kIn = 1u << 16;
++	uint8_t *in = NULL, *out = NULL, *group = NULL;
++	uint32_t at = 0, to = 0;
++	bool changed = false;
++	IOReturn result = kIOReturnUnsupported;
++
++	if (mondrian_gpu_uc_nostate() || size > kIn) {
++		return kIOReturnUnsupported;
++	}
++	in = (uint8_t *)IOMalloc(size);
++	out = (uint8_t *)IOMalloc(kOut);
++	group = (uint8_t *)IOMalloc(kOut);
++	if (in == NULL || out == NULL || group == NULL) {
++		result = kIOReturnNoMemory;
++		goto done;
++	}
++	if (src->memory->readBytes(offset, in, size) != size) {
++		goto done;
++	}
++	while (at + 4 <= size) {
++		uint32_t header, type, count, bytes;
++
++		memcpy(&header, in + at, 4);
++		type = header >> 28;
++		count = (type == 7) ? (header & 0x3fff) : 0;
++		bytes = (type == 7) ? 4 * (1 + count) : 4;
++		if (at + bytes > size) {
++			goto done;
++		}
++		if (type == 7 && ((header >> 16) & 0x7f) == 0x43 && count >= 3) {
++			uint32_t groups = count / 3, g;
++
++			for (g = 0; g < groups; g++) {
++				uint32_t pair[3];
++				uint64_t addr;
++				uint32_t n, b, i;
++				mondrian_buffer *target = NULL;
++
++				memcpy(pair, in + at + 4 + 12 * g, 12);
++				addr = pair[0] | ((uint64_t)pair[1] << 32);
++				n = pair[2];
++				if (n == 0) {
++					continue;
++				}
++				if (4u * n > kOut) {
++					goto done;
++				}
++				for (b = 0; b < fBufferCount; b++) {
++					if (addr >= fBuffers[b]->iova &&
++					    addr + 4ull * n <= fBuffers[b]->iova +
++					    fBuffers[b]->size) {
++						target = fBuffers[b];
++						break;
++					}
++				}
++				if (target == NULL ||
++				    target->memory->readBytes(addr - target->iova,
++				    group, 4u * n) != 4u * n) {
++					goto done;
++				}
++				for (i = 0; i + 1 < n; ) {
++					uint32_t reg, values = 1, head;
++
++					memcpy(&reg, group + 4 * i, 4);
++					while (values < 0x7f &&
++					    i + 2 * (values + 1) <= n) {
++						uint32_t next;
++
++						memcpy(&next, group + 4 * (i + 2 * values), 4);
++						if (next != reg + values) {
++							break;
++						}
++						values++;
++					}
++					if (to + 4 * (1 + values) > kOut) {
++						goto done;
++					}
++					head = (4u << 28) | ((reg & 0x3ffff) << 8) |
++					    (values & 0x7f);
++					memcpy(out + to, &head, 4);
++					memcpy(out + to + 4, group + 4 * i + 4, 4 * values);
++					to += 4 * (1 + values);
++					i += 2 * values;
++				}
++			}
++			changed = true;
++			at += bytes;
++			continue;
++		}
++		if (to + bytes > kOut) {
++			goto done;
++		}
++		memcpy(out + to, in + at, bytes);
++		to += bytes;
++		at += bytes;
++	}
++	if (!changed || to == 0) {
++		goto done;
++	}
++	{
++		mondrian_buffer *scratch = fScratch;
++
++		if (scratch == NULL || scratch->size < (uint64_t)to) {
++			scratch = bufferNew(kOut);
++			if (scratch == NULL) {
++				goto done;
++			}
++			fScratch = scratch;
++		}
++		if (scratch->memory->writeBytes(0, out, to) != to) {
++			goto done;
++		}
++		bufferSync(scratch);
++		*ib = scratch->iova;
++		*dwords = to / 4;
++		if (fExpanded < 4) {
++			fExpanded++;
++			IOLog("MondrianGPU: draw state expanded %u -> %u dwords\n",
++			    size / 4, *dwords);
++		}
++		result = kIOReturnSuccess;
++	}
++done:
++	if (in != NULL) {
++		IOFree(in, size);
++	}
++	if (out != NULL) {
++		IOFree(out, kOut);
++	}
++	if (group != NULL) {
++		IOFree(group, kOut);
++	}
++	return result;
++}
+ 
+ IOReturn
+ MondrianGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -57,6 +57,7 @@
+ static uint32_t mondrian_uc_set_mode = 0xffffffffu;
+ static uint32_t mondrian_uc_draw_state;
+ static uint32_t mondrian_uc_ds_addr;
++static int mondrian_uc_nostate;
+ static vm_offset_t mondrian_uc_gpu;
+ static vm_offset_t mondrian_uc_smmu;
+ /* the CP's context bank, so a mapping change can invalidate its TLB */
+@@ -2767,6 +2768,16 @@
+ 	return mondrian_uc_ds_addr;
+ }
+ 
++int
++mondrian_gpu_uc_nostate(void)
++{
++#ifdef MONDRIAN_CP_PROFILE
++	return mondrian_uc_nostate;
++#else
++	return 1;
++#endif
++}
++
+ uint64_t
+ mondrian_gpu_uc_memptr_iova(void)
+ {
+@@ -3287,6 +3298,8 @@
+ 	    sizeof(mondrian_uc_draw_state));
+ 	(void)PE_parse_boot_argn("gpudsaddr", &mondrian_uc_ds_addr,
+ 	    sizeof(mondrian_uc_ds_addr));
++	(void)PE_parse_boot_argn("gpunostate", &mondrian_uc_nostate,
++	    sizeof(mondrian_uc_nostate));
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -37,6 +37,9 @@
+ /* Write back the CPU's view of a buffer before the GPU reads it. */
+ int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
+ 
++/* gpunostate=1: leave CP_SET_DRAW_STATE groups in the stream. */
++int mondrian_gpu_uc_nostate(void);
++
+ /* One indirect command stream, fenced. Returns the fence to wait on. */
+ int mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence);
+ 

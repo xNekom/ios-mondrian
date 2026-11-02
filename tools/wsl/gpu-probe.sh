@@ -69,9 +69,9 @@ import boards
 line = boards.get_board('mondrian').cmdline.split()
 drop = {a.split('=')[0] for a in sys.argv[1].split()}
 line = [a for a in line if a.split('=')[0] not in drop]
-# Every experiment has to end by itself: a wedged GPU bring-up leaves the
-# kernel alive but going nowhere, and the reset thread armed at mountroot is
-# what brings the phone back to fastboot (0127/0174).
+# Every experiment has to end by itself: the reset thread writes the
+# "boot-fastboot" BCB and resets, so a wedged GPU bring-up still returns the
+# phone to fastboot where the probe can flash the recovery back.
 line.append('mondrianreset=90')
 print(' '.join(line + sys.argv[1].split()))
 PY
