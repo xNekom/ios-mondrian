@@ -1,0 +1,21 @@
+xnu 0194: the keepalive at cp_start must use the local gmu handle
+
+0190 added the keepalive raise next to the "cp started" log, testing
+mondrian_uc_gmu -- which is only assigned ~200 lines later. The block therefore
+never ran: the ring from that boot has no "cp keepalive held up" line, and the
+parked-GPU hypothesis (a GPU idle for minutes before CoreAnimation's first
+frame) is still untested. Use the local handle the function already has.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -2436,8 +2436,8 @@
+ 	 * GPU and the CP never fetches it (CP_RB_RPTR stays at CP_RB_WPTR).
+ 	 * gpukeep=1 keeps it up from here on.
+ 	 */
+-	if (mondrian_uc_gmu != 0 && mondrian_uc_keep == 1) {
+-		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
++	if (gmu != 0 && mondrian_uc_keep == 1) {
++		mondrian_gpu_write(gmu, GMU_OFF(0x1f8c3u), 1);
+ 		printf("MONDRIAN GPU: cp keepalive held up\n");
+ 		mondrian_log_flush_now();
+ 	}
