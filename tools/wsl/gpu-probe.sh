@@ -49,7 +49,7 @@ wait_for() {
 ensure_fastboot() {
 	if [ "$(state)" = fastboot ]; then return 0; fi
 	say "phone is in $(state); moving it to fastboot"
-	for i in $(seq 1 90); do
+	for i in $(seq 1 300); do
 		case "$(state)" in
 		fastboot) return 0 ;;
 		recovery|device) "$ADB" reboot bootloader >/dev/null 2>&1; sleep 6 ;;
