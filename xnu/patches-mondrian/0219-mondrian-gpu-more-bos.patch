@@ -1,0 +1,78 @@
+xnu 0219: a submission may carry more than 64 buffers
+
+Mesa submits one BO per buffer the frame touches. A lock-screen frame carries 95
+(`bos[94]` in its own dump), the client refused anything over 64, and the whole
+submission came back EINVAL: `submit failed: -22` 220 times in one boot. A
+refused submission is a frame whose draws never ran, which is the clock and the
+wallpaper missing and the white rectangles.
+
+1024 entries, and the two arrays move to the heap: at that size they are 56 KiB
+and the kernel stack is 16 KiB.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -122,7 +122,14 @@
+ 
+ #define kMondrianBufferMax	(256u << 20)
+ #define kMondrianBuffers	1024
+-#define kMondrianSubmits	64
++/*
++ * One BO per buffer the frame touches: a lock-screen frame submits 95 of them
++ * (measured: `bos[94]` in Mesa's dump), and the old 64 refused the whole
++ * submission, which Mesa reports as `submit failed: -22` from
++ * flush_submit_list. Every refused submission is a frame whose draws never
++ * ran: the clock, the wallpaper and the white rectangles.
++ */
++#define kMondrianSubmits	1024
+ #define kMondrianPatienceMs	5000
+ /* Packets executed from an indirect buffer run unprivileged, so every buffer
+  * a submission touches must be user accessible (the ring and the memptr page
+@@ -555,20 +562,34 @@
+ IOReturn
+ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ {
+-	struct msm_gem_submit_cmd cmds[kMondrianSubmits];
+-	struct msm_gem_submit_bo bos[kMondrianSubmits];
++	struct msm_gem_submit_cmd *cmds;
++	struct msm_gem_submit_bo *bos;
+ 	uint32_t fence = 0, i;
+ 	IOReturn result = kIOReturnSuccess;
++	uint32_t cmd_bytes, bo_bytes;
+ 
+ 	if (request->nr_bos > kMondrianSubmits || request->nr_cmds == 0 ||
+ 	    request->nr_cmds > kMondrianSubmits || request->bos == 0 ||
+ 	    request->cmds == 0) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	if (copyin((user_addr_t)request->bos, bos,
+-	    request->nr_bos * sizeof(bos[0])) != 0 ||
+-	    copyin((user_addr_t)request->cmds, cmds,
+-	    request->nr_cmds * sizeof(cmds[0])) != 0) {
++	/*
++	 * On the heap: at 1024 entries the two arrays are 56 KiB, and a 16 KiB
++	 * kernel stack cannot hold them.
++	 */
++	cmd_bytes = request->nr_cmds * (uint32_t)sizeof(*cmds);
++	bo_bytes = request->nr_bos * (uint32_t)sizeof(*bos);
++	cmds = (struct msm_gem_submit_cmd *)IOMallocData(cmd_bytes);
++	bos = (struct msm_gem_submit_bo *)IOMallocData(bo_bytes);
++	if (cmds == NULL || bos == NULL ||
++	    copyin((user_addr_t)request->bos, bos, bo_bytes) != 0 ||
++	    copyin((user_addr_t)request->cmds, cmds, cmd_bytes) != 0) {
++		if (cmds != NULL) {
++			IOFreeData(cmds, cmd_bytes);
++		}
++		if (bos != NULL) {
++			IOFreeData(bos, bo_bytes);
++		}
+ 		return kIOReturnBadArgument;
+ 	}
+ 	if (fLogged < 4) {
+@@ -824,6 +845,8 @@
+ 		request->fence = fence;
+ 		fLastFence = fence;
+ 	}
++	IOFreeData(cmds, cmd_bytes);
++	IOFreeData(bos, bo_bytes);
+ 	return result;
+ }
+ 
