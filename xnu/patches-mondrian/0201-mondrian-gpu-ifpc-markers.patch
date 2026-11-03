@@ -1,0 +1,92 @@
+xnu 0201: the IFPC markers kgsl puts around a submission and the shim does not
+
+kgsl's gen7 submit path emits, before the user's stream,
+CP_THREAD_CONTROL(BOTH), CP_SET_MARKER(0x101) and CP_THREAD_CONTROL(BR), wraps
+the indirect buffers in CP_SET_MARKER(0x00d)/(0x00e) (IB1LIST) and closes with
+CP_SET_MARKER(0x100). Mode bit 8 selects the IFPC interpretation of the payload:
+0x101 is IFPC disabled, 0x100 IFPC enabled. Mesa emits none of these; the kernel
+owns them.
+
+IFPC is inter-frame power collapse: the SQE may gate the GPU between frames. If
+it enters that state while the keepalive is held up (gpukeep) it waits for a
+collapse that cannot happen, which is what the wedge looks like -- every
+indirect buffer consumed, `int 0x0 fault 0x0 protect 0x0`, and the fence never
+written. The 71-dword stream does not cross a frame boundary, so it completes.
+
+`0201` emits kgsl's bracket around every submission. `gpunomark=1` leaves it
+out, for measuring the markers themselves.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -62,6 +62,7 @@
+ static uint32_t mondrian_uc_draw_state;
+ static uint32_t mondrian_uc_ds_addr;
+ static int mondrian_uc_nostate;
++static int mondrian_uc_nomark;
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ static int mondrian_uc_keep;
+@@ -3261,7 +3263,7 @@
+ 		mondrian_log_flush_now();
+ 	}
+ 	at = mondrian_uc_at;
+-	if (at + 13 > MONDRIAN_UC_RING_DWORDS) {
++	if (at + 25 > MONDRIAN_UC_RING_DWORDS) {
+ 		if (mondrian_uc_wrap(ring) != 0) {
+ 			return -1;
+ 		}
+@@ -3275,12 +3277,35 @@
+ 	 * stream's type-4 register writes are refused. The CCU invalidates and
+ 	 * the IFPC marker that kgsl and pong also emit around a submission
+ 	 * change nothing here (measured). */
++	/*
++	 * kgsl brackets every submission with these: the two CP threads are
++	 * synchronised, IFPC (inter-frame power collapse) is disabled for the
++	 * duration, the work runs on the BR thread, and the indirect buffer is
++	 * declared inside an IB1LIST. Without the IFPC markers the SQE is free
++	 * to collapse the GPU in the middle of the submission.
++	 */
++	if (mondrian_uc_nomark == 0) {
++		ring[at++] = mondrian_pm4_type7(0x17u, 1);	/* THREAD_CONTROL */
++		ring[at++] = 3;			/* both threads */
++		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
++		ring[at++] = 0x101;		/* IFPC mode: IFPC disabled */
++		ring[at++] = mondrian_pm4_type7(0x17u, 1);	/* THREAD_CONTROL */
++		ring[at++] = 1;			/* BR thread */
++	}
+ 	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
+ 	ring[at++] = 0;
++	if (mondrian_uc_nomark == 0) {
++		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
++		ring[at++] = 0x00du;		/* IB1LIST start */
++	}
+ 	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
+ 	ring[at++] = (uint32_t)ib;
+ 	ring[at++] = (uint32_t)(ib >> 32);
+ 	ring[at++] = dwords;
++	if (mondrian_uc_nomark == 0) {
++		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
++		ring[at++] = 0x00eu;		/* IB1LIST end */
++	}
+ 	ring[at++] = mondrian_pm4_type7(0x46u, 4);	/* EVENT_WRITE */
+ 	ring[at++] = 0x31u | (1u << 27);		/* cache clean */
+ 	ring[at++] = (uint32_t)slot;
+@@ -3288,6 +3336,10 @@
+ 	ring[at++] = seq;
+ 	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
+ 	ring[at++] = 1;
++	if (mondrian_uc_nomark == 0) {
++		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
++		ring[at++] = 0x100;		/* IFPC mode: IFPC enabled */
++	}
+ 	/* kgsl toggles the GMU keepalive around every submission
+ 	 * (gen7_gpu_keepalive true/false); holding it on forever leaves the
+ 	 * power state machine in a different place and the same stream then
+@@ -3656,6 +3712,8 @@
+ 	    sizeof(mondrian_uc_ds_addr));
+ 	(void)PE_parse_boot_argn("gpunostate", &mondrian_uc_nostate,
+ 	    sizeof(mondrian_uc_nostate));
++	(void)PE_parse_boot_argn("gpunomark", &mondrian_uc_nomark,
++	    sizeof(mondrian_uc_nomark));
+ 	(void)PE_parse_boot_argn("gpudump", &mondrian_uc_dump,
+ 	    sizeof(mondrian_uc_dump));
+ 	(void)PE_parse_boot_argn("gpurback", &mondrian_uc_rback,
