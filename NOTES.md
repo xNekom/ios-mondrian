@@ -245,15 +245,15 @@ reading from userdata`). Flash a sparse image instead (`tools/mk-simg.py`,
 line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
 e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 
-**The console paints the kernel log and scrolls.** The early console drew its
-own marks and the kernel's `printf` path only reached the log ring, so the panel
-froze at the last early mark and looked like a dead boot. `0210` paints
-`console_write()` on the panel too, clears it once first (the rows nothing wrote
-kept the bootloader's splash) and scrolls half a screen at the last text row,
-not every line — a pass is 4.6M stores. The shim's `test_ufs()` faults
-(`PANIC SYNC`, `STAGE ufs`) on any boot that came from fastboot, which leaves
-the host powered down: build that image with `SHIM_NO_UFS` (`LOGVIEW` implies
-it).
+**The console paints the kernel log and scrolls.** The early console drew only
+its own marks and the kernel log reached the ring, not the panel, so the boot
+looked frozen. `0210` paints it, clears the panel once first (the rows nothing
+wrote kept the bootloader's splash) and scrolls half a screen at the last text
+row, a pass being 4.6M stores. `0213` moves the painting into the log thread:
+from `console_write()` every line waited for the framebuffer, and two CPUs
+printing at once painted over each other's rows. The shim's `test_ufs()` faults
+on any boot that came from fastboot, which leaves the host powered down: build
+that image with `SHIM_NO_UFS` (`LOGVIEW` implies it).
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;

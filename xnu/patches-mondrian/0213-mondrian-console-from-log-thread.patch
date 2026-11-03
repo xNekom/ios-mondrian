@@ -1,0 +1,118 @@
+xnu 0213: the panel console is a view of the log, not part of the log path
+
+0210 painted the console from console_write(), which is the printf path: every
+line then waited for the framebuffer's write-combining stores, and console_write
+runs on whatever CPU printed, so two painters could be inside the cursor at once
+and wrote over each other's rows (the doubled, half-row-shifted text). Measured
+on the boot that did not finish: 100 s in and launchd had just been loaded,
+while the ring held the whole story.
+
+Paint from the log thread instead, which already drains the ring to the
+partition: it is one thread, it is not on the boot's critical path, and when it
+falls behind it jumps to the newest lines. Until that thread is armed the
+console still paints synchronously, so the first screenful is not lost. The
+beacon would collide with the moving console, so it yields to it: a console that
+advances is the same liveness mark.
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1196,6 +1196,51 @@
+ 	uint64_t total, seq;
+ };
+ 
++/*
++ * The panel follows the ring, painted from the log thread and never from
++ * printf: a console drawn in the printf path made every line wait for the
++ * framebuffer's write-combining stores (measured: the boot stopped reaching the
++ * UI) and, because console_write() runs on several CPUs at once, two painters
++ * wrote over each other's rows. The thread paints what is new; when it falls
++ * behind it jumps to the newest lines, because a console is a view of the tail.
++ */
++#define MONDRIAN_LOG_PAINT_SKIP (8u << 10)
++#define MONDRIAN_LOG_PAINT_CHUNK 256
++
++static uint64_t mondrian_log_painted;
++
++int
++mondrian_log_running(void)
++{
++	return os_atomic_load(&mondrian_log_ready, relaxed);
++}
++
++static void
++mondrian_log_paint_panel(uint64_t total)
++{
++	extern void mondrian_early_paint(const char *c, int size);
++	char chunk[MONDRIAN_LOG_PAINT_CHUNK];
++	uint64_t at = mondrian_log_painted;
++
++	if (total <= at) {
++		return;
++	}
++	if (total - at > MONDRIAN_LOG_PAINT_SKIP) {
++		at = total - MONDRIAN_LOG_PAINT_SKIP / 2;
++		mondrian_log_painted = at;
++	}
++	while (at < total) {
++		int n = 0;
++
++		while (at < total && n < MONDRIAN_LOG_PAINT_CHUNK) {
++			chunk[n++] = mondrian_log_ring[at % MONDRIAN_LOG_SIZE];
++			at++;
++		}
++		mondrian_early_paint(chunk, n);
++		mondrian_log_painted = at;
++	}
++}
++
+ static uint64_t _Atomic mondrian_log_flushed;
+ static uint32_t _Atomic mondrian_log_seq;
+ static uint64_t mondrian_log_base;
+@@ -1405,6 +1450,7 @@
+ 		total = os_atomic_load(&mondrian_log_total, relaxed);
+ 		before = os_atomic_load(&mondrian_log_flushed, relaxed);
+ 		mondrian_log_store(total);
++		mondrian_log_paint_panel(total);
+ 		/*
+ 		 * Every wake, not every eighth: the ring wakes per 8 KiB now
+ 		 * and the tick is rate-limited to once a second anyway.
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -521,8 +521,16 @@
+ 	 */
+ 	extern void mondrian_log_append(const char *c, int size);
+ 	extern void mondrian_early_paint(const char *c, int size);
++	extern int mondrian_log_running(void);
+ 	mondrian_log_append(str, size);
+-	mondrian_early_paint(str, size);
++	/*
++	 * Until the log thread is armed the console paints here, and only here:
++	 * from then on the thread paints the ring, and painting in both places
++	 * would draw the same text twice with two cursors.
++	 */
++	if (!mondrian_log_running()) {
++		mondrian_early_paint(str, size);
++	}
+ #endif
+ 	assert(str != NULL);
+ 
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -938,6 +938,18 @@
+ 	if (fbcon_base == NULL || fbcon_rows < 8 || mondrian_fbcon_quiet) {
+ 		return;
+ 	}
++	/*
++	 * The console is the liveness mark now that the log thread paints it: it
++	 * advances while the CPU runs. A beacon at a fixed row would be written
++	 * over by the next console line and would write over it in turn.
++	 */
++	{
++		extern int mondrian_log_running(void);
++
++		if (mondrian_log_running()) {
++			return;
++		}
++	}
+ 	/* A fixed row: the beacon stays where it is, so a photo shows it
+ 	 * updating in place instead of leaving copies behind. */
+ 	row = fbcon_rows / 2;
