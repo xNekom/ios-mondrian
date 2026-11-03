@@ -138,6 +138,16 @@ them has Metal. That is the path this port follows.
   fetch (`0x1c0063` / `0x1e0063` seen here), which tells the privilege level
   the page permissions must allow: with the ICACHE fetch left unprivileged
   (APRIV bit 0 clear, as a660 does) the PTEs must set `AP[1]=0`.
+- **The SMMU latches its last fault and never clears it.** A dump built from
+  `FSR`/`CB_FAR` proves nothing on its own: the identical
+  `fsr 0x80000402 far 0x13e0d080` appears after a stream that completes in
+  11 ms and after the draw that wedges, because both inherit what bring-up left
+  behind. Clear `FSR` and `GFSR` (write `0xffffffff` to `ctx+0x58` and `0x48`)
+  before the doorbell, and read them after: only then does a non-zero syndrome
+  belong to the submission being measured. `0200` does this behind `gpudump=1`
+  and resolves `CB_FAR` through the CP's own tables (`gpudump` prints
+  `pte present|absent`), which separates a stale TLB entry from a buffer the
+  client never mapped.
 - **The ZAP resets the GPU.** After `zap auth` the CP register block is back
   at the bootloader's values, so the ring and SQE bases have to be published
   again *after* the ZAP, before `CP_SQE_CNTL=1` (redwood's order: ZAP, then CP
@@ -336,10 +346,13 @@ them has Metal. That is the path this port follows.
   `1 drawn in place, 0 pictures copied out` and the copy costs 39 µs, so the
   5.7 s readback is gone. What replaces it is the wait for the frame: the user
   client's submissions do not all complete — `uc big 71 dwords fence 2001 done 1
-  in 14 ms` but `168 dwords` never finishes (`done 0` after 300 ms) and the SMMU
-  keeps `fsr 0x80000402` (a translation fault) latched. The 168-dword stream is
-  the first one that draws (`CP_SET_DRAW_STATE` + `CP_DRAW_INDX_OFFSET`), which
-  is why the missing `gen7_start` programming is the suspect: see below.
+  in 14 ms` but `168 dwords` never finishes (`done 0` after 300 ms). The
+  168-dword stream is the first one that draws (`CP_SET_DRAW_STATE` +
+  `CP_DRAW_INDX_OFFSET`); the dump shows both indirect buffers consumed
+  (`ib1 0x1042c000 rem 0x0`, `ib2 0x10434000 rem2 0x0`) with
+  `int 0x0 fault 0x0 protect 0x0`. Running kgsl's `gen7_start` register set and
+  `CP_ME_INIT` (`gpuinit=1|2`) changes none of that: the init is accepted and the
+  draw still wedges, so hardware init is not what blocks it.
   `gpupm4=N` truncates the stream and `tools/pm4-decode.py` names its packets.
   The 27-group `CP_SET_DRAW_STATE` in that stream's nested indirect buffer is
   expanded into plain type-4 writes at both levels now, but the rewritten stream

@@ -1,0 +1,123 @@
+xnu 0200: the hang dump says whether the fault is fresh and where it points
+
+The dump after the 168-dword draw reports `far 0x13e0d080 fsr 0x80000402`, and
+so does the dump after the 71-dword stream that completes in 11 ms. The SMMU
+latches its last fault and nothing clears it, so both lines carry whatever
+bring-up left behind and neither proves the draw faulted at all.
+
+Clear the record (FSR and GFSR are write-1-to-clear) before the doorbell of
+every logged submission, with gpudump=1. A non-zero fsr in the dump is then a
+fault this submission caused, and a clean one says the wedge is not a Pipe
+translation fault.
+
+Also resolve CB_FAR through the CP's own tables at dump time:
+mondrian_gpu_uc_translate() is the read-only twin of the unmap walk (L1 from
+bits [31:30], L2 from [29:21], L3 from [20:12], 4 KiB pages). The page being
+present means a stale TLB entry survived the ASID invalidate and the fix
+belongs at submit time; an absent page means a buffer the client never mapped,
+and the fix belongs in bufferAdopt/gemInfo.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3038,6 +3038,63 @@
+ 	return 0;
+ }
+ 
++/*
++ * What the CP's page tables say about one address right now: the physical
++ * page plus the entry's low bits, or 0 when the walk stops on an invalid
++ * entry. Read-only, so a hang dump can call it on a stopped GPU.
++ */
++uint64_t
++mondrian_gpu_uc_translate(uint64_t iova, uint32_t *flags)
++{
++	uint64_t *t = (uint64_t *)mondrian_cp_tables.va;
++	uint64_t entry;
++	uint32_t l2, l3;
++
++	if (flags != NULL) {
++		*flags = 0;
++	}
++	if (t == NULL) {
++		return 0;
++	}
++	entry = t[(iova >> 30) & 3u];
++	if ((entry & 3ull) != 3ull) {
++		return 0;
++	}
++	l2 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	entry = t[l2 * 512 + ((iova >> 21) & 0x1ffu)];
++	if ((entry & 3ull) != 3ull) {
++		return 0;
++	}
++	l3 = (uint32_t)(((entry & 0x0000fffffffff000ull) -
++	    mondrian_cp_tables.pa) / 4096);
++	entry = t[l3 * 512 + ((iova >> 12) & 0x1ffu)];
++	if ((entry & 3ull) != 3ull) {
++		return 0;
++	}
++	if (flags != NULL) {
++		*flags = (uint32_t)(entry & 0xfffull);
++	}
++	return (entry & 0x0000fffffffff000ull) | (iova & 0xfffull);
++}
++
++/*
++ * The SMMU latches the last fault and never clears it on its own, so every
++ * dump after bring-up reports the same latched syndrome regardless of what
++ * the submission did. FSR and GFSR are write-1-to-clear.
++ */
++void
++mondrian_gpu_uc_fault_clear(void)
++{
++	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
++		return;
++	}
++	mondrian_gpu_write(mondrian_uc_smmu, mondrian_uc_tlb_ctx + SMMU_FSR,
++	    0xffffffffu);
++	mondrian_gpu_write(mondrian_uc_smmu, 0x48u, 0xffffffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ int
+ mondrian_gpu_uc_unmap_page(uint64_t iova)
+ {
+@@ -3249,6 +3363,13 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_uc_fence = seq;
+ 	mondrian_uc_at = at;
++	if (mondrian_uc_dump != 0) {
++		/*
++		 * Start every logged submission with a clean fault record, or the
++		 * dump below reports whatever the bring-up latched long ago.
++		 */
++		mondrian_gpu_uc_fault_clear();
++	}
+ 	if (mondrian_uc_async != 0 && mondrian_uc_door_started != 0) {
+ 		uint32_t waited;
+ 
+@@ -3375,6 +3503,23 @@
+ 			    mondrian_gpu_read(mondrian_uc_smmu, 0x20068u),
+ 			    mondrian_gpu_read(mondrian_uc_smmu, 0x2006cu),
+ 			    mondrian_gpu_read(mondrian_uc_smmu, 0x20068u));
++			{
++				/*
++				 * A faulting address that is present in the table is a
++				 * stale TLB entry (the fix belongs at submit time); an
++				 * absent one is a buffer the client never mapped.
++				 */
++				uint64_t bad = mondrian_smmu_read64(
++				    mondrian_uc_smmu, 0x20060u);
++				uint32_t pte = 0;
++				uint64_t pa = mondrian_gpu_uc_translate(bad, &pte);
++
++				printf("MONDRIAN GPU: uc far 0x%llx pte %s 0x%x pa 0x%llx\n",
++				    (unsigned long long)bad,
++				    pte != 0 ? "present" : "absent",
++				    pte, (unsigned long long)pa);
++				mondrian_log_flush_now();
++			}
+ 			mondrian_log_flush_now();
+ 		}
+ 	}
