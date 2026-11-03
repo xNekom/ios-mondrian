@@ -216,11 +216,26 @@ tools/wsl/hfs-tool.sh get ROOT.img /private/var/vm/some.log logs/
 ```
 
 The kernel mounts the root read-write (`rootrw=1`) and writes to it every boot,
-so a changed-block push must be based on a dump taken *after* the last boot
-(`tools/wsl/refresh-root.sh`: dump, fsck, install, push). Pushing an older base
-lands file data on blocks the volume now uses for metadata: the loader reports
-the dylib as `not a mach-o file` and fsck finds the catalog out of order, so the
-pristine dump plus `fsck.hfsplus -fy` is the way back.
+so getting the image back onto the phone is the other half of the problem:
+`fastboot flash userdata` rewrites all 15.5 GiB. `tools/wsl/push-root.sh` keeps
+a base image of the partition and sends only the blocks an install changed:
+
+```sh
+tools/wsl/push-root.sh --save-base                        # dump + fsck, base.img
+tools/wsl/push-root.sh --dylib out/gpu/mondrian-gl.dylib  # a few MB over adb
+tools/wsl/push-root.sh --flash                            # whole partition, -S 64M
+```
+
+The base must be what the phone holds *now*. `/root/ios/base.note` records the
+volume header it was taken from, and a push refuses when the live header
+differs, because that means the phone booted and wrote to the volume: a diff
+from an older base lands file data on blocks the volume now uses for metadata,
+the loader reports the dylib as `not a mach-o file` and fsck finds the catalog
+out of order. `--save-base` after every boot; the way back from a bad push is
+the same dump plus `fsck.hfsplus -fy`. A successful push adopts its copy as the
+new base, so repeated pushes need no dump. The diff push needs the phone in
+recovery with adb; `--flash` is the only path when fsck had to repair the dump
+(a diff cannot carry the repairs) and needs fastboot.
 
 ## Known gaps
 
