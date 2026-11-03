@@ -1,0 +1,106 @@
+xnu 0218: the console paints every line again
+
+Measured with the panel's own status line: 512 characters in 119 us, 232 ns a
+character, so the whole 848 KB log of a boot costs 0.2 s. Painting was never the
+limit; the jump-to-the-newest-line that 0214 added to keep the console fresh is
+what made it skip most lines and read as "slow". Paint the backlog again, wake
+the log thread every 256 bytes so the panel follows line by line, and give the
+store its own gate (a whole block, or the once-a-second flush) so waking per line
+does not become a flash write per line.
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1154,7 +1154,11 @@
+ #define MONDRIAN_LOG_TICKS      5
+ 
+ static char mondrian_log_ring[MONDRIAN_LOG_SIZE];
+-#define MONDRIAN_LOG_KICK_BYTES (8u << 10)
++/*
++ * Woken every 256 bytes so the panel follows the log line by line; the store
++ * below has its own gate, so this does not multiply the flash writes.
++ */
++#define MONDRIAN_LOG_KICK_BYTES 256
+ 
+ static uint64_t _Atomic mondrian_log_total;
+ static uint64_t _Atomic mondrian_log_next_wake;
+@@ -1204,7 +1208,12 @@
+  * wrote over each other's rows. The thread paints what is new; when it falls
+  * behind it jumps to the newest lines, because a console is a view of the tail.
+  */
+-#define MONDRIAN_LOG_PAINT_SKIP 1024
++/*
++ * Skipped only when the painter is hopelessly behind: the log is 848 KB in a
++ * boot and the painter costs 232 ns a character (measured), so 64 KiB is
++ * already a tenth of a second of lag and everything below it gets painted.
++ */
++#define MONDRIAN_LOG_PAINT_SKIP (64u << 10)
+ #define MONDRIAN_LOG_PAINT_CHUNK 256
+ 
+ static uint64_t mondrian_log_painted;
+@@ -1293,7 +1302,7 @@
+  * timer. try_lock, never lock: a caller may be in the middle of an I/O.
+  */
+ static void
+-mondrian_log_store(uint64_t total)
++mondrian_log_store(uint64_t total, int force)
+ {
+ 	uint64_t flushed, pos;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+@@ -1307,6 +1316,14 @@
+ 		return;
+ 	}
+ 	/*
++	 * A whole block of new data, or the caller is the once-a-second flush
++	 * that keeps the tail: waking per line to paint must not turn into a
++	 * block write per line.
++	 */
++	if (!force && total - flushed < UFS_BLOCK) {
++		return;
++	}
++	/*
+ 	 * Write whole device blocks, from the first block that holds unflushed
+ 	 * data: a partial block would lose the bytes that follow it, and the
+ 	 * ring is not block aligned.
+@@ -1356,7 +1373,7 @@
+ void
+ mondrian_log_flush_now(void)
+ {
+-	mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed));
++	mondrian_log_store(os_atomic_load(&mondrian_log_total, relaxed), 1);
+ }
+ 
+ /*
+@@ -1470,7 +1487,7 @@
+ 	uint64_t total = os_atomic_load(&mondrian_log_total, relaxed);
+ 
+ 	if (total - os_atomic_load(&mondrian_log_flushed, relaxed) >= MONDRIAN_LOG_KICK_BYTES) {
+-		mondrian_log_store(total);
++		mondrian_log_store(total, 0);
+ 	}
+ 	/*
+ 	 * No sampler tick here: this runs inside the UFS strategy path, and the
+@@ -1489,17 +1506,17 @@
+ 
+ 		total = os_atomic_load(&mondrian_log_total, relaxed);
+ 		before = os_atomic_load(&mondrian_log_flushed, relaxed);
+-		mondrian_log_store(total);
++		mondrian_log_store(total, 0);
+ 		/*
+-		 * Paint until the panel is within a line or two of the newest
+-		 * output, not once per wake: a wake is 8 KiB of log (~130 lines)
+-		 * and painting that in one go would show the console in bursts
+-		 * and always a couple of seconds old. The bound keeps a hot log
+-		 * from starving the writer.
++		 * Paint everything that is new, not just the tail: the cost is
++		 * 232 ns a character, so the whole log of a boot is a fifth of a
++		 * second, and the jump-to-the-end that made the console skip
++		 * most lines is what read as "slow". The bound keeps a burst from
++		 * starving the writer.
+ 		 */
+-		for (int i = 0; i < 64; i++) {
++		for (int i = 0; i < 1024; i++) {
+ 			total = os_atomic_load(&mondrian_log_total, relaxed);
+-			if (total - mondrian_log_painted < MONDRIAN_LOG_PAINT_SKIP) {
++			if (total <= mondrian_log_painted) {
+ 				break;
+ 			}
+ 			mondrian_log_paint_panel(total);

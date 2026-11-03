@@ -1,0 +1,53 @@
+xnu 0217: the CP's page tables cover the IOVA window
+
+Every 2 MiB of mapped address costs one 4 KiB L3 table in the CP's table
+region, and the region was 512 KiB: 128 MiB. The window server maps about that
+much over a boot and nothing gives the pages back when a client dies, so the
+next backboardd found a full region, the first 16 KiB GEM allocation was refused
+inside OSMesaCreateContextExt (`gem_new 0x4000 refused`), that init dereferenced
+its NULL screen at 0x1c, and the compositor died: four `CRASH backboardd ...
+sub 0x1c` in one boot, which is the frozen UI and the swipe that does nothing.
+
+4 MiB covers the whole 1.75 GiB IOVA window (1024 tables of 2 MiB), and a full
+region now says so once instead of failing silently.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1749,14 +1749,17 @@
+ 		printf("MONDRIAN GPU: cp alloc begin\n");
+ 		mondrian_log_flush_now();
+ 		/*
+-		 * 512 KiB of tables. The old 128 KiB was exactly what the
+-		 * bring-up itself used (`cp smmu pages 32`), so the first buffer
+-		 * a client mapped allocated its L2/L3 past the end of the region:
+-		 * tables_sync() flushes only the region, the CPU saw the PTE in
+-		 * its cache and the SMMU read stale DRAM, which is the draw's
+-		 * `fsr 0x80000402` with `pte present`.
++		 * 4 MiB of tables: one 4 KiB L3 table per 2 MiB of mapped
++		 * address, so the old 512 KiB covered 128 MiB and the IOVA window
++		 * is 1.75 GiB. The window server maps about that much over a boot
++		 * (two 23 MB display surfaces, textures, and the next backboardd
++		 * after a crash starts again from zero because the pages are never
++		 * given back), and a full region is a refused 16 KB buffer inside
++		 * OSMesaCreateContextExt, which faults at 0x1c and takes the
++		 * compositor with it: `gem_new 0x4000 refused` next to every
++		 * `CRASH backboardd ... sub 0x1c`.
+ 		 */
+-		if (mondrian_gpu_mem_alloc(&mondrian_cp_tables, 0x80000, 0) != 0 ||
++		if (mondrian_gpu_mem_alloc(&mondrian_cp_tables, 0x400000, 0) != 0 ||
+ 		    /* 1 MiB, not the firmware's 0x13000: the CP's icache
+ 		     * prefetch (and any jump the ucode makes) runs past the
+ 		     * last byte of the ucode, and a faulting fetch storm
+@@ -3154,6 +3157,13 @@
+ 	 */
+ 	if (mondrian_uc_table_next + 4 >=
+ 	    (uint32_t)(mondrian_cp_tables.bytes / 4096)) {
++		static int said;
++
++		if (!said) {
++			said = 1;
++			printf("MONDRIAN GPU: page tables full (%u pages), mapping refused\n",
++			    (unsigned)(mondrian_cp_tables.bytes / 4096));
++		}
+ 		return -1;
+ 	}
+ 	mondrian_gpu_smmu_map((uint64_t *)mondrian_cp_tables.va,
