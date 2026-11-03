@@ -31,7 +31,39 @@ into bsd/dev at build time and never committed, so a kernel built without them
  static uint64_t mondrian_log_paint_chars;
  static uint64_t mondrian_log_paint_us;
  static uint64_t mondrian_log_paint_next_log;
-@@ -1496,6 +1501,30 @@
+@@ -1460,16 +1465,29 @@
+ mondrian_reset_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	int seconds = 0;
++	int reset_to_recovery = 0;
+ 
+ 	if (!PE_parse_boot_argn("mondrianreset", &seconds, sizeof(seconds)) || seconds <= 0) {
+ 		return;
+ 	}
+-	printf("MONDRIAN RESET: fastboot in %d s\n", seconds);
++	/*
++	 * mondrianresetrecovery=1 sends the boot to the recovery partition instead
++	 * of fastboot (the boot control block's "boot-recovery"), which is where
++	 * the adb that reads this log comes from. A boot that resets by itself is
++	 * what makes a test loop unattended.
++	 */
++	{
++		int recovery = 0;
++
++		(void)PE_parse_boot_argn("mondrianresetrecovery", &recovery, sizeof(recovery));
++		reset_to_recovery = recovery != 0;
++	}
++	printf("MONDRIAN RESET: %s in %d s\n", reset_to_recovery ? "recovery" : "fastboot", seconds);
+ 	for (int i = 0; i < seconds; i++) {
+ 		tsleep(&seconds, PUSER, "mondrianrst", hz);
+ 	}
+ 	mondrian_log_flush_now();
+-	(void)mondrian_ufs_bcb_set("boot-fastboot");
++	(void)mondrian_ufs_bcb_set(reset_to_recovery ? "boot-recovery" : "boot-fastboot");
+ 	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader();
+ 	mondrian_log_flush_now();
+@@ -1496,6 +1514,30 @@
  	 */
  }
  
@@ -62,7 +94,7 @@ into bsd/dev at build time and never committed, so a kernel built without them
  static void
  mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
-@@ -1507,6 +1536,7 @@
+@@ -1507,6 +1549,7 @@
  		total = os_atomic_load(&mondrian_log_total, relaxed);
  		before = os_atomic_load(&mondrian_log_flushed, relaxed);
  		mondrian_log_store(total, 0);
@@ -70,7 +102,7 @@ into bsd/dev at build time and never committed, so a kernel built without them
  		/*
  		 * Paint everything that is new, not just the tail: the cost is
  		 * 232 ns a character, so the whole log of a boot is a fifth of a
-@@ -1837,6 +1867,37 @@
+@@ -1837,6 +1880,37 @@
  	return error;
  }
  
@@ -108,7 +140,7 @@ into bsd/dev at build time and never committed, so a kernel built without them
  void
  mondrian_root_fixups(void)
  {
-@@ -1848,10 +1909,26 @@
+@@ -1848,10 +1922,26 @@
  	if (error == 0) {
  		vnode_put(vp);
  		printf("MONDRIAN ROOT: /private/var/vm present\n");
