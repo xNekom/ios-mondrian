@@ -76,6 +76,15 @@ port works as it does today (`mondrian-gl:` says so in the console). `tools/gpu/
 builds both; `tools/install-userland.sh ROOT.img --gl out/gpu/mondrian-gl.dylib --inject
 out/gpu/mondrian-inject.dylib` puts them in the image's `/usr/libexec`.
 
+**The hook and Mesa are one build.** `mondrian_gl_surface_texture()` hands the IOSurface number to
+`glEGLImageTargetTexture2DOES`, and Mesa's `osmesa_st_get_egl_image` resolves it through the
+`mondrian-darwin.patch` hook. A root whose `libOSMesa.8.dylib` predates that patch still exports the
+entry point, so the hook calls it and Mesa jumps through a NULL driver pointer: `backboardd` dies with
+`pc 0x0` in `egl_image_target_texture` as soon as it attaches the display surface, and no frame is
+ever presented (the console keeps painting, so it reads as "never reaches the UI"). Install
+`out/mesa/stage/libOSMesa.8.dylib` (`tools/wsl/install-dylibs.sh --mesa out/mesa/stage`) with the
+hook; the two md5s must match.
+
 CoreAnimation picks its renderer once per process: Metal, else OpenGL ES, else software. The kernel
 publishes an empty `IOAcceleratorES` (`0114`) with no `MetalPluginName`, as the working a6xx port
 does; whether our build then chooses GLES is the first thing to look for in the log. The GLES

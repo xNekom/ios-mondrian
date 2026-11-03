@@ -269,6 +269,7 @@ struct eagl {
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
 	int blended;                    /* blending is off for such a draw, to be put back after it */
 	bool no_vibrant;                /* the first of the two could not be made */
+	bool no_masking, no_plain, no_lookup, no_box;   /* ... and neither could these (plain_program() says so) */
 	GLint vibrant_matrix, vibrant_colours, masking_matrix, masking_colours;
 	GLbitfield unclear;             /* a glClear put off until the next draw (clear_now()), and what it was to be made with */
 	GLint unclear_box[4];
@@ -754,9 +755,20 @@ static bool
 surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
+	/*
+	 * A shared texture is the surface's own memory, so the two have to agree on
+	 * what a pixel is. The lock screen's poster is an L008 surface (one byte a
+	 * pixel) that CoreAnimation asks for as a BGRA texture: sharing it made the
+	 * shader read four bytes a pixel out of rows that hold one, and the whole
+	 * wallpaper came out white (traced: the poster draw leaves 255 255 255 255
+	 * where a tint draw of the same frame leaves 18 127 195 255). Refusing here
+	 * sends it down the copy path, which uploads it as GL_LUMINANCE.
+	 */
+	unsigned surface_pixel = IOSurfaceGetBytesPerElement(surface);
 
 	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
+	    image->plane != 0 || surface_pixel != 4 ||
+	    (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !mondrian_gl_surface_texture(context_gl(e), IOSurfaceGetID(surface))) {
 		e->refused++;
@@ -1676,16 +1688,18 @@ triangles_of(GLenum mode, GLsizei count)
 #define GL_VERTEX_ATTRIB_ARRAY_TYPE     0x8625
 #define GL_VERTEX_ATTRIB_ARRAY_NORMALIZED 0x886a
 #define GL_VERTEX_ATTRIB_ARRAY_POINTER  0x8645
+#define GL_ARRAY_BUFFER                 0x8892
+#define GL_ARRAY_BUFFER_BINDING         0x8894
 extern void glGetVertexAttribPointerv(GLuint index, GLenum pname, void **pointer);
 
 static const char plain_vertex[] =
     "#version 120\n"
-    "uniform highp mat4 vertex_matrix;\n"
-    "in highp vec4 vertex_position;\n"
-    "in lowp vec4 vertex_color;\n"
-    "in highp vec2 vertex_texcoord0;\n"
-    "out lowp vec4 color;\n"
-    "out highp vec2 texcoord;\n"
+    "uniform mat4 vertex_matrix;\n"
+    "attribute vec4 vertex_position;\n"
+    "attribute vec4 vertex_color;\n"
+    "attribute vec2 vertex_texcoord0;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
     "  gl_Position = vertex_matrix * vertex_position;\n"
     "  color = vertex_color;\n"
@@ -1693,13 +1707,13 @@ static const char plain_vertex[] =
     "}\n";
 static const char plain_fragment[] =
     "#version 120\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform lowp float textured;\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "out lowp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform float textured;\n"
+    "uniform vec2 texture_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  result = textured > 0.5 ? color * texture(texture0, texcoord / vec2(textureSize(texture0, 0))) : color;\n"
+    "  gl_FragColor = textured > 0.5 ? color * texture2D(texture0, texcoord / texture_size) : color;\n"
     "}\n";
 
 /*
@@ -1719,23 +1733,23 @@ static const char plain_fragment[] =
  */
 static const char table_fragment[] =
     "#version 120\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform lowp sampler2D table;\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "out lowp vec4 result;\n"
-    "const mediump float white = .284, amount = 1., overlay = .31;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform sampler2D table;\n"
+    "uniform vec2 texture_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
+    "const float white = .284, amount = 1., overlay = .31;\n"
     "void main() {\n"
-    "  mediump vec4 behind = texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
-    "  mediump vec4 entry = texture(table, vec2(dot(behind.rgb, vec3(.2125, .7154, .0721)), .5));\n"
-    "  mediump vec4 bar = clamp(entry + vec4(vec3(white), 1.), 0., 1.) * amount;\n"
-    "  mediump vec4 under = behind * (1. - bar.a) + bar;\n"
-    "  mediump vec4 over = under * overlay;\n"
-    "  mediump vec3 dark = 2. * under.rgb * over.rgb;\n"
-    "  mediump vec3 light = over.a * under.a - 2. * (under.a - under.rgb) * (over.a - over.rgb);\n"
-    "  mediump vec3 both = mix(dark, light, step(under.a * .5, under.rgb));\n"
-    "  mediump float opacity = over.a + under.a * (1. - over.a);\n"
-    "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
+    "  vec4 behind = texture2D(texture0, texcoord / texture_size);\n"
+    "  vec4 entry = texture2D(table, vec2(dot(behind.rgb, vec3(.2125, .7154, .0721)), .5));\n"
+    "  vec4 bar = clamp(entry + vec4(vec3(white), 1.), 0., 1.) * amount;\n"
+    "  vec4 under = behind * (1. - bar.a) + bar;\n"
+    "  vec4 over = under * overlay;\n"
+    "  vec3 dark = 2. * under.rgb * over.rgb;\n"
+    "  vec3 light = over.a * under.a - 2. * (under.a - under.rgb) * (over.a - over.rgb);\n"
+    "  vec3 both = mix(dark, light, step(under.a * .5, under.rgb));\n"
+    "  float opacity = over.a + under.a * (1. - over.a);\n"
+    "  gl_FragColor = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
     "}\n";
 
 /*
@@ -1758,6 +1772,13 @@ static const char table_fragment[] =
  *   (inputPremultipliedValues): the matrix over the layer's pixels as they are. The clock's
  *   digits pass through one that keeps nothing but red as alpha ("colorToAlphaMask") before they
  *   are that mask; drawn as they were, they stayed white.
+ *
+ * What is behind is read with GL_EXT_shader_framebuffer_fetch: gl_LastFragData[0] written out as
+ * gl_FragColor, the only fetch the first version of the language has (layout(location = 0) inout
+ * needs 1.50). Measured on Mesa's software driver: it links, and reads nothing (llvmpipe 25.2:
+ * the same shader as a 1.50 inout fetches what is there, the 1.20 one reads zero), which draws
+ * the colour matrix of nothing rather than leaving the place alone. Boot-arg glfetch=0 turns every
+ * draw that would use it off.
  */
 #define FUNCTION_MATRIX_PREMULTIPLIED   20
 #define FUNCTION_DOWNSAMPLE_8           28
@@ -1768,30 +1789,30 @@ static const char table_fragment[] =
 static const char vibrant_fragment[] =
     "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform mediump vec4 colours[5];\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "layout(location = 0) inout highp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 colours[5];\n"
+    "uniform vec2 texture_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  mediump vec4 layer = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
-    "  mediump vec4 behind = result, s = behind;\n"
+    "  vec4 layer = color * texture2D(texture0, texcoord / texture_size);\n"
+    "  vec4 behind = gl_LastFragData[0], s = behind;\n"
     "  s.rgb = s.rgb / max(s.a, .005);\n"
     "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
     "  s.a = clamp(s.a, 0., 1.);\n"
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
-    "  result = mix(behind, s, layer.a);\n"
+    "  gl_FragColor = mix(behind, s, layer.a);\n"
     "}\n";
 static const char masking_fragment[] =
     "#version 120\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform mediump vec4 colours[5];\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "out lowp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 colours[5];\n"
+    "uniform vec2 texture_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  mediump vec4 s = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
-    "  result = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
+    "  vec4 s = color * texture2D(texture0, texcoord / texture_size);\n"
+    "  gl_FragColor = clamp(s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4], 0., 1.);\n"
     "}\n";
 
 /*
@@ -1805,19 +1826,19 @@ static const char masking_fragment[] =
  */
 static const char box_fragment[] =
     "#version 120\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform highp vec2 places[4];\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "out lowp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec2 places[4];\n"
+    "uniform vec2 texture_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  highp vec2 middle = texcoord / vec2(textureSize(texture0, 0));\n"
-    "  highp vec4 sum = vec4(0.);\n"
+    "  vec2 middle = texcoord / texture_size;\n"
+    "  vec4 sum = vec4(0.);\n"
     "  for (int i = 0; i < 4; i++) {\n"
-    "    sum += texture(texture0, middle + places[i]) + texture(texture0, middle - places[i]);\n"
-    "    sum += texture(texture0, middle + places[i] * vec2(1., -1.)) + texture(texture0, middle + places[i] * vec2(-1., 1.));\n"
+    "    sum += texture2D(texture0, middle + places[i]) + texture2D(texture0, middle - places[i]);\n"
+    "    sum += texture2D(texture0, middle + places[i] * vec2(1., -1.)) + texture2D(texture0, middle + places[i] * vec2(-1., 1.));\n"
     "  }\n"
-    "  result = color * sum * .0625;\n"
+    "  gl_FragColor = color * sum * .0625;\n"
     "}\n";
 
 static void *ca_context;                /* CoreAnimation's GLContext */
@@ -1892,22 +1913,23 @@ static int vblur_on = 1;
  * Halving: a pixel of the level made is the average of the sixteen of the level it is made of
  * around it, by weight (four samples, each the GPU's own average of four pixels), which is what
  * makes a chain of such levels look blurred rather than coarse when it is read back enlarged.
+ * The triangle that covers the level is the three corners of halve_corners[], in the vertex array
+ * CoreAnimation's first attribute had: GLSL 120 has no gl_VertexID to work them out of.
  */
 static const char vblur_vertex[] =
     "#version 120\n"
+    "attribute vec2 vertex_position;\n"
     "void main() {\n"
-    "  vec2 corner = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n"
-    "  gl_Position = vec4(corner, 0.0, 1.0);\n"
+    "  gl_Position = vec4(vertex_position, 0.0, 1.0);\n"
     "}\n";
 static const char halve_fragment[] =
     "#version 120\n"
-    "uniform highp sampler2D source;\n"
-    "uniform highp vec2 texel;\n"
-    "out highp vec4 result;\n"
+    "uniform sampler2D source;\n"
+    "uniform vec2 texel;\n"
     "void main() {\n"
-    "  highp vec2 at = gl_FragCoord.xy * 2.0 * texel;\n"
-    "  result = 0.25 * (texture(source, at + texel * vec2(-1.0, -1.0)) + texture(source, at + texel * vec2(1.0, -1.0)) +\n"
-    "      texture(source, at + texel * vec2(-1.0, 1.0)) + texture(source, at + texel * vec2(1.0, 1.0)));\n"
+    "  vec2 at = gl_FragCoord.xy * 2.0 * texel;\n"
+    "  gl_FragColor = 0.25 * (texture2D(source, at + texel * vec2(-1.0, -1.0)) + texture2D(source, at + texel * vec2(1.0, -1.0)) +\n"
+    "      texture2D(source, at + texel * vec2(-1.0, 1.0)) + texture2D(source, at + texel * vec2(1.0, 1.0)));\n"
     "}\n";
 /*
  * Reading the chain: the mask (its opacity, on the second unit, at CoreAnimation's second texture
@@ -1929,14 +1951,14 @@ static const char halve_fragment[] =
  */
 static const char vblur_draw_vertex[] =
     "#version 120\n"
-    "uniform highp mat4 vertex_matrix;\n"
-    "in highp vec4 vertex_position;\n"
-    "in lowp vec4 vertex_color;\n"
-    "in highp vec2 vertex_texcoord0;\n"
-    "in highp vec2 vertex_texcoord1;\n"
-    "out lowp vec4 color;\n"
-    "out highp vec2 texcoord;\n"
-    "out highp vec2 maskcoord;\n"
+    "uniform mat4 vertex_matrix;\n"
+    "attribute vec4 vertex_position;\n"
+    "attribute vec4 vertex_color;\n"
+    "attribute vec2 vertex_texcoord0;\n"
+    "attribute vec2 vertex_texcoord1;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
+    "varying vec2 maskcoord;\n"
     "void main() {\n"
     "  gl_Position = vertex_matrix * vertex_position;\n"
     "  color = vertex_color;\n"
@@ -1945,47 +1967,47 @@ static const char vblur_draw_vertex[] =
     "}\n";
 static const char vblur_fragment[] =
     "#version 120\n"
-    "uniform highp sampler2D level0;\n"
-    "uniform highp sampler2D mask;\n"
-    "uniform highp sampler2D level1;\n"
-    "uniform highp sampler2D level2;\n"
-    "uniform highp sampler2D level3;\n"
-    "uniform highp sampler2D level4;\n"
-    "uniform highp float radius;\n"
+    "uniform sampler2D level0;\n"
+    "uniform sampler2D mask;\n"
+    "uniform sampler2D level1;\n"
+    "uniform sampler2D level2;\n"
+    "uniform sampler2D level3;\n"
+    "uniform sampler2D level4;\n"
+    "uniform float radius;\n"
     "uniform int levels;\n"
-    "uniform highp float normalize_edges;\n"
+    "uniform float normalize_edges;\n"
     "uniform int paint;\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "in highp vec2 maskcoord;\n"
-    "out highp vec4 result;\n"
-    "highp vec4 level(int k, highp vec2 at) {\n"
-    "  if (k <= 0) return texture(level0, at);\n"
-    "  if (k == 1) return texture(level1, at);\n"
-    "  if (k == 2) return texture(level2, at);\n"
-    "  if (k == 3) return texture(level3, at);\n"
-    "  return texture(level4, at);\n"
+    "uniform vec2 texture_size;\n"
+    "uniform vec2 mask_size;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
+    "varying vec2 maskcoord;\n"
+    "vec4 level(int k, vec2 at) {\n"
+    "  if (k <= 0) return texture2D(level0, at);\n"
+    "  if (k == 1) return texture2D(level1, at);\n"
+    "  if (k == 2) return texture2D(level2, at);\n"
+    "  if (k == 3) return texture2D(level3, at);\n"
+    "  return texture2D(level4, at);\n"
     "}\n"
     "void main() {\n"
-    "  highp vec2 at = texcoord / vec2(textureSize(level0, 0));\n"
-    "  highp vec2 mask_size = vec2(textureSize(mask, 0));\n"
-    "  highp vec2 m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
+    "  vec2 at = texcoord / texture_size;\n"
+    "  vec2 m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
     "  m_at = clamp(m_at, 0.5 / mask_size, 1.0 - 0.5 / mask_size);\n"
-    "  highp float m = texture(mask, m_at).a;\n"
-    "  highp float lod = clamp(log2(max(m * radius, 1.0)), 0.0, float(levels - 1));\n"
+    "  float m = texture2D(mask, m_at).a;\n"
+    "  float lod = clamp(log2(max(m * radius, 1.0)), 0.0, float(levels - 1));\n"
     "  int k = int(floor(lod));\n"
-    "  highp vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
+    "  vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
     "  if (normalize_edges > 0.5) {\n"
     "    c = c.a > 0.004 ? vec4(c.rgb / c.a, 1.0) : vec4(0.0);\n"
-    "    highp vec4 sharp = texture(level0, at);\n"
+    "    vec4 sharp = texture2D(level0, at);\n"
     "    sharp = sharp.a > 0.004 ? vec4(sharp.rgb / sharp.a, 1.0) : c;\n"
-    "    result = vec4(mix(sharp.rgb, c.rgb, color.a), 1.0);\n"
+    "    gl_FragColor = vec4(mix(sharp.rgb, c.rgb, color.a), 1.0);\n"
     "  } else {\n"
-    "    result = color * c;\n"
+    "    gl_FragColor = color * c;\n"
     "  }\n"
     "  if (paint != 0) {\n"
-    "    highp float t = m;\n"
-    "    result = vec4(t, 0.25 * c.g, 1.0 - t, 1.0);\n"
+    "    float t = m;\n"
+    "    gl_FragColor = vec4(t, 0.25 * c.g, 1.0 - t, 1.0);\n"
     "  }\n"
     "}\n";
 
@@ -2055,6 +2077,9 @@ vblur_forget(struct eagl *e, GLuint picture)
 	}
 }
 
+/* The three corners of the triangle that covers a level, for a vertex shader that cannot count vertices. */
+static const GLfloat halve_corners[6] = { -1, -1, 3, -1, -1, 3 };
+
 /*
  * A draw of "vrd" (function 38) that reads level `from`: level from + 1 is made of it, in a
  * texture of ours. Every bit of state touched is put back as CoreAnimation had it.
@@ -2065,7 +2090,9 @@ vblur_level(struct eagl *e, int from)
 	GLuint picture = e->bound[0];
 	struct vblur_chain *chain;
 	GLint view[4], box[4], width = 0, height = 0, to = from + 1;
-	GLboolean scissored, blended;
+	GLint attribute[4] = { 0, 0, 0, 0 }, enabled = 0, buffer = 0;
+	GLboolean scissored, blended, normalized = 0;
+	void *pointer = NULL;
 	GLuint source;
 
 	if (from < 0 || to >= VBLUR_LEVELS || picture == 0) {
@@ -2138,7 +2165,22 @@ vblur_level(struct eagl *e, int from)
 	glBindTexture(GL_TEXTURE_2D, source);
 	glUniform2f(e->halve_texel, 1.0f / (float)(from == 0 ? chain->width : chain->level_width[from]),
 	    1.0f / (float)(from == 0 ? chain->height : chain->level_height[from]));
+	/* the corners, in the vertex array of CoreAnimation's the halve program's vertex_position is bound to */
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &attribute[0]);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &attribute[1]);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &attribute[2]);
+	glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &attribute[3]);
+	glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &buffer);
+	normalized = (GLboolean)(attribute[3] != 0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, halve_corners);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glBindBuffer(GL_ARRAY_BUFFER, (GLuint)buffer);
+	glVertexAttribPointer(0, attribute[0], (GLenum)attribute[1], normalized, attribute[2], pointer);
+	(enabled ? glEnableVertexAttribArray : glDisableVertexAttribArray)(0);
 	chain->made = to + 1;
 	/* back as it was */
 	glBindTexture(GL_TEXTURE_2D, picture);
@@ -2181,13 +2223,61 @@ clear_now(struct eagl *e)
 	glClearColor(colour[0], colour[1], colour[2], colour[3]);
 }
 
+/* The size of a texture's first level, as the uniform of that name in one of our programs. */
+static void
+set_texture_size_named(GLuint program, const char *name, GLuint texture, struct eagl *e)
+{
+	struct image *image = texture != 0 ? image_of(e, texture) : NULL;
+	GLint size[2] = { 0, 0 }, location;
+
+	if (program == 0) {
+		return;
+	}
+	location = glGetUniformLocation(program, name);
+	if (location < 0) {
+		return;                         /* (that program does not divide by it: the group ones take a matrix) */
+	}
+	if (image != NULL) {
+		size[0] = image->width;
+		size[1] = image->height;
+	} else if (texture != 0) {
+		/* glGetTexLevelParameteriv speaks of the texture bound to the unit in use: the one it is bound to is found */
+		unsigned unit = 8;
+
+		for (unsigned i = 0; i < 8; i++) {
+			if (e->bound[i] == texture) {
+				unit = i;
+				break;
+			}
+		}
+		if (unit < 8) {
+			glActiveTexture(GL_TEXTURE0 + unit);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &size[0]);
+			glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &size[1]);
+			glActiveTexture(GL_TEXTURE0 + e->unit);
+		}
+	}
+	if (size[0] <= 0 || size[1] <= 0) {
+		size[0] = size[1] = 1;
+	}
+	glUniform2f(location, (GLfloat)size[0], (GLfloat)size[1]);
+}
+
+/* CoreAnimation gives our programs texture coordinates counted in the texture's pixels (see plain_vertex): from its size. */
+static void
+set_texture_size(GLuint program, GLuint texture, struct eagl *e)
+{
+	set_texture_size_named(program, "texture_size", texture, e);
+}
+
 /* One of our programs, made: CoreAnimation's own vertex arrays go in at the places it has them. */
 static GLuint
 plain_program(const char *fragment, const char *what)
 {
 	GLuint program = glCreateProgram(), shader;
 	const GLchar *text;
-	GLint good = 0;
+	GLint good = 0, compiled = 0;
+	char said[1024] = "";
 
 	shader = glCreateShader(GL_VERTEX_SHADER);
 	text = plain_vertex;
@@ -2198,13 +2288,25 @@ plain_program(const char *fragment, const char *what)
 	text = fragment;
 	glShaderSource(shader, 1, &text, NULL);
 	glCompileShader(shader);
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+	if (!compiled) {
+		glGetShaderInfoLog(shader, sizeof(said) - 1, NULL, said);       /* (the compiler's words, not the linker's) */
+	}
 	glAttachShader(program, shader);
 	glBindAttribLocation(program, 0, "vertex_position");
 	glBindAttribLocation(program, 1, "vertex_color");
 	glBindAttribLocation(program, 2, "vertex_texcoord0");
 	glLinkProgram(program);
 	glGetProgramiv(program, GL_LINK_STATUS, &good);
-	say("mondrian-gl: a program of ours for the draws CoreAnimation makes with none (%s): %s\n", what, good ? "made" : "NOT MADE");
+	if (!good) {
+		if (said[0] == 0) {
+			glGetProgramInfoLog(program, sizeof(said) - 1, NULL, said);
+		}
+		say("mondrian-gl: our program for %s does not link: %s\n", what, said[0] != 0 ? said : "(no log)");
+		glDeleteProgram(program);
+		return 0;
+	}
+	say("mondrian-gl: a program of ours for the draws CoreAnimation makes with none (%s): made\n", what);
 	return program;
 }
 
@@ -2435,6 +2537,8 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 	glUniform1i(e->vblur_levels, levels);
 	glUniform1f(e->vblur_normalize, function_values[FUNCTION_VARIABLE_BLUR][1]);
 	glUniform1i(e->vblur_paint, vblur_on == 2);
+	set_texture_size(e->vblur, e->bound[0], e);                    /* (the first level: its coordinates are pixels) */
+	set_texture_size_named(e->vblur, "mask_size", e->bound[1], e);
 	for (int k = 1; k < 5; k++) {
 		glActiveTexture(GL_TEXTURE0 + k + 1);
 		glBindTexture(GL_TEXTURE_2D, k < chain->made ? chain->level[k] : e->bound[0]);
@@ -2513,39 +2617,36 @@ vblur_draw_begin(struct eagl *e, struct vblur_chain *chain, GLint enabled[4])
 
 static const char group_cover_fragment[] =
     "#version 120\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform highp vec4 texmat;\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "out lowp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 texmat;\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  result = color * texture(texture0, texcoord * texmat.xy + texmat.zw);\n"
+    "  gl_FragColor = color * texture2D(texture0, texcoord * texmat.xy + texmat.zw);\n"
     "}\n";
 static const char group_over_fragment[] =
     "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
-    "uniform lowp sampler2D texture0;\n"
-    "uniform highp vec4 texmat;\n"
-    "uniform mediump vec4 colours[5];\n"
-    "in lowp vec4 color;\n"
-    "in highp vec2 texcoord;\n"
-    "layout(location = 0) inout highp vec4 result;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 texmat;\n"
+    "uniform vec4 colours[5];\n"
+    "varying vec4 color;\n"
+    "varying vec2 texcoord;\n"
     "void main() {\n"
-    "  mediump vec4 layer = color * texture(texture0, texcoord * texmat.xy + texmat.zw);\n"
-    "  mediump vec4 behind = result, s = behind;\n"
+    "  vec4 layer = color * texture2D(texture0, texcoord * texmat.xy + texmat.zw);\n"
+    "  vec4 behind = gl_LastFragData[0], s = behind;\n"
     "  s.rgb = s.rgb / max(s.a, .005);\n"
     "  s = s.r * colours[0] + s.g * colours[1] + s.b * colours[2] + s.a * colours[3] + colours[4];\n"
     "  s.a = clamp(s.a, 0., 1.);\n"
     "  s.rgb = clamp(s.rgb * s.a, 0., 1.);\n"
-    "  result = mix(behind, s, layer.a);\n"
+    "  gl_FragColor = mix(behind, s, layer.a);\n"
     "}\n";
 static const char group_flat_fragment[] =
     "#version 120\n"
     "#extension GL_EXT_shader_framebuffer_fetch : require\n"
-    "uniform mediump vec4 flat_colour;\n"
-    "layout(location = 0) inout highp vec4 result;\n"
+    "uniform vec4 flat_colour;\n"
     "void main() {\n"
-    "  result = flat_colour * result.a;\n"
+    "  gl_FragColor = flat_colour * gl_LastFragData[0].a;\n"
     "}\n";
 
 #ifndef GL_BLEND_SRC_ALPHA
@@ -2578,18 +2679,16 @@ group_of(struct eagl *e, GLuint texture)
 static bool
 group_programs(struct eagl *e)
 {
-	GLint good = 0, good2 = 0, good3 = 0;
-
 	if (e->group_cover != 0 || e->group_failed) {
 		return !e->group_failed;
 	}
 	e->group_cover = plain_program(group_cover_fragment, "a vibrant layer's coverage, in a group");
 	e->group_over = plain_program(group_over_fragment, "a group's vibrant layer over what is behind it");
 	e->group_flat = plain_program(group_flat_fragment, "a group's vibrant layer as it would have been");
-	glGetProgramiv(e->group_cover, GL_LINK_STATUS, &good);
-	glGetProgramiv(e->group_over, GL_LINK_STATUS, &good2);
-	glGetProgramiv(e->group_flat, GL_LINK_STATUS, &good3);
-	e->group_failed = !good || !good2 || !good3;
+	e->group_failed = e->group_cover == 0 || e->group_over == 0 || e->group_flat == 0;
+	if (e->group_failed) {
+		return false;                   /* (plain_program() has said which, and why) */
+	}
 	e->group_cover_matrix = glGetUniformLocation(e->group_cover, "vertex_matrix");
 	e->group_cover_texmat = glGetUniformLocation(e->group_cover, "texmat");
 	e->group_over_matrix = glGetUniformLocation(e->group_over, "vertex_matrix");
@@ -2597,7 +2696,7 @@ group_programs(struct eagl *e)
 	e->group_over_colours = glGetUniformLocation(e->group_over, "colours");
 	e->group_flat_matrix = glGetUniformLocation(e->group_flat, "vertex_matrix");
 	e->group_flat_colour = glGetUniformLocation(e->group_flat, "flat_colour");
-	return !e->group_failed;
+	return true;
 }
 
 /*
@@ -2648,6 +2747,7 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 	} else if (group_programs(e)) {
 		glDisable(GL_BLEND);
 		glUseProgram(e->group_flat);
+		set_texture_size(e->group_flat, texture, e);            /* (no such uniform there: nothing to set) */
 		glUniformMatrix4fv(e->group_flat_matrix, 1, 0, identity);
 		glUniform4fv(e->group_flat_colour, 1, flat);
 		for (GLuint i = 0; i < 3; i++) {
@@ -2778,6 +2878,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 	clear_now(e);
 	if (cover) {
 		glUseProgram(e->group_cover);
+		set_texture_size(e->group_cover, e->bound[0], e);       /* (no such uniform there: nothing to set) */
 		glUniformMatrix4fv(e->group_cover_matrix, 1, 0, matrix);
 		glUniform4fv(e->group_cover_texmat, 1, texmat);
 		e->group_blend = glIsEnabled(GL_BLEND);
@@ -2794,6 +2895,7 @@ group_draw_begin(struct eagl *e, GLint enabled[4])
 		group_covered++;
 	} else {
 		glUseProgram(e->group_over);
+		set_texture_size(e->group_over, e->bound[0], e);        /* (no such uniform there: nothing to set) */
 		glUniformMatrix4fv(e->group_over_matrix, 1, 0, matrix);
 		glUniform4fv(e->group_over_texmat, 1, texmat);
 		glUniform4fv(e->group_over_colours, 5, colours);
@@ -2892,26 +2994,33 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	    function == FUNCTION_MATRIX_PREMULTIPLIED) && function_given[function] == 20) {
 		bool vibrant = function == FUNCTION_VIBRANT_MATRIX;
 
-		if (vibrant && e->vibrant == 0) {
-			GLint good = 0;
-
+		if (vibrant && e->vibrant == 0 && !e->no_vibrant) {
 			e->vibrant = plain_program(vibrant_fragment, "a colour matrix over what is behind");
-			glGetProgramiv(e->vibrant, GL_LINK_STATUS, &good);
-			e->no_vibrant = !good;                  /* (a library without the extension: Mesa's software one) */
-			e->vibrant_matrix = glGetUniformLocation(e->vibrant, "vertex_matrix");
-			e->vibrant_colours = glGetUniformLocation(e->vibrant, "colours");
-		} else if (!vibrant && e->masking == 0) {
+			e->no_vibrant = e->vibrant == 0;        /* (a library without the extension: Mesa's software one) */
+			if (e->vibrant != 0) {
+				e->vibrant_matrix = glGetUniformLocation(e->vibrant, "vertex_matrix");
+				e->vibrant_colours = glGetUniformLocation(e->vibrant, "colours");
+			}
+		} else if (!vibrant && e->masking == 0 && !e->no_masking) {
 			e->masking = plain_program(masking_fragment, "a colour matrix over premultiplied pixels");
-			e->masking_matrix = glGetUniformLocation(e->masking, "vertex_matrix");
-			e->masking_colours = glGetUniformLocation(e->masking, "colours");
+			e->no_masking = e->masking == 0;
+			if (e->masking != 0) {
+				e->masking_matrix = glGetUniformLocation(e->masking, "vertex_matrix");
+				e->masking_colours = glGetUniformLocation(e->masking, "colours");
+			}
 		}
 		if (vibrant && e->no_vibrant) {
 			census_draw(e, function, CENSUS_NOT_DRAWN);     /* better nothing than the mask as a picture */
 			return false;
 		}
-		census_draw(e, function, vibrant ? CENSUS_VIBRANT : CENSUS_MASKING);
 		program = vibrant ? e->vibrant : e->masking;
+		if (program == 0) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);     /* (it could not be made: nothing is drawn rather than with none) */
+			return false;
+		}
+		census_draw(e, function, vibrant ? CENSUS_VIBRANT : CENSUS_MASKING);
 		glUseProgram(program);
+		set_texture_size(program, e->bound[0], e);
 		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 		glUniform4fv(vibrant ? e->vibrant_colours : e->masking_colours, 5, function_values[function]);
 		if (vibrant && glIsEnabled(GL_BLEND)) {
@@ -2935,13 +3044,21 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 	}
 	if (e->bound[0] != 0 && plain_draws != 3 && function == FUNCTION_DOWNSAMPLE_8 && function_given[function] == 8) {
-		if (e->box == 0) {
+		if (e->box == 0 && !e->no_box) {
 			e->box = plain_program(box_fragment, "eight times smaller, sixteen samples");
-			e->box_matrix = glGetUniformLocation(e->box, "vertex_matrix");
-			e->box_places = glGetUniformLocation(e->box, "places");
+			e->no_box = e->box == 0;
+			if (e->box != 0) {
+				e->box_matrix = glGetUniformLocation(e->box, "vertex_matrix");
+				e->box_places = glGetUniformLocation(e->box, "places");
+			}
+		}
+		if (e->box == 0) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);
+			return false;
 		}
 		census_draw(e, function, CENSUS_BOX);
 		glUseProgram(e->box);
+		set_texture_size(e->box, e->bound[0], e);
 		glUniformMatrix4fv(e->box_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 		glUniform2fv(e->box_places, 4, function_values[function]);
 		for (GLuint i = 0; i < 3; i++) {
@@ -2958,23 +3075,34 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		glActiveTexture(GL_TEXTURE0 + e->unit);
 	}
 	if (rows == 1) {
-		if (e->lookup == 0) {
+		if (e->lookup == 0 && !e->no_lookup) {
 			e->lookup = plain_program(table_fragment, "through a table");
-			e->lookup_matrix = glGetUniformLocation(e->lookup, "vertex_matrix");
-			glUseProgram(e->lookup);
-			glUniform1i(glGetUniformLocation(e->lookup, "table"), 1);
+			e->no_lookup = e->lookup == 0;
+			if (e->lookup != 0) {
+				e->lookup_matrix = glGetUniformLocation(e->lookup, "vertex_matrix");
+				glUseProgram(e->lookup);
+				glUniform1i(glGetUniformLocation(e->lookup, "table"), 1);
+			}
 		}
 		program = e->lookup;
 	} else {
-		if (e->plain == 0) {
+		if (e->plain == 0 && !e->no_plain) {
 			e->plain = plain_program(plain_fragment, "as they are");
-			e->plain_matrix = glGetUniformLocation(e->plain, "vertex_matrix");
-			e->plain_textured = glGetUniformLocation(e->plain, "textured");
+			e->no_plain = e->plain == 0;
+			if (e->plain != 0) {
+				e->plain_matrix = glGetUniformLocation(e->plain, "vertex_matrix");
+				e->plain_textured = glGetUniformLocation(e->plain, "textured");
+			}
 		}
 		program = e->plain;
 	}
+	if (program == 0) {
+		census_draw(e, function, CENSUS_NOT_DRAWN);     /* (it could not be made: nothing is drawn rather than with none) */
+		return false;
+	}
 	census_draw(e, function, rows == 1 ? CENSUS_TABLE : CENSUS_PLAIN);
 	glUseProgram(program);
+	set_texture_size(program, e->bound[0], e);
 	glUniformMatrix4fv(program == e->plain ? e->plain_matrix : e->lookup_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 	if (program == e->plain) {
 		glUniform1f(e->plain_textured, e->bound[0] != 0 ? 1 : 0);
@@ -3316,6 +3444,28 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 	EAGL_ENTER(e, MONDIAN_GL_TEX_IMAGE_2D);
 	if (level == 0) {
 		note_format(pixels ? "filled" : "empty", (GLenum)internal, format, type, width, height);
+		/*
+		 * A big picture handed over by the window server: is it a photograph or
+		 * a coverage mask? The lock screen's wallpaper is a 1326x1326 surface
+		 * whose bytes are 0xFF everywhere, and painted as the picture it is,
+		 * that is a white rectangle. Eight bytes and the share of 0xFF in the
+		 * first row say which it is, once per size.
+		 */
+		if (pixels != NULL && (size_t)width * (size_t)height >= (1u << 20) && level == 0 &&
+		    (format == GL_BGRA || format == 0x1908) && type == GL_UNSIGNED_BYTE) {
+			static unsigned said;
+			const uint8_t *bytes = pixels;
+			size_t count = (size_t)width * 4, all = 0;
+
+			for (size_t at = 0; at < count; at++) {
+				all += bytes[at] == 0xff;
+			}
+			if (said++ < 8) {
+				say("mondrian-gl: a %dx%d picture: %02x %02x %02x %02x %02x %02x %02x %02x, %zu of %zu bytes 0xff\n",
+				    width, height, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+				    all, count);
+			}
+		}
 	}
 	if (eagl_tracing) {
 		eagl_trace("glTexImage2D(%#x, %d, %#x, %d, %d, %d, %#x, %#x, %p)\n", target, level, internal, width, height, border,
@@ -3860,6 +4010,19 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 		    height, plane, invert ? ", inverted" : "");
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
+	/*
+	 * A shown surface with no pixel format has the same memory order the
+	 * attached ones do -- opacity first, then blue, green, red (measured; see
+	 * my_attachImage) -- and it matters here too: the home screen's icons come
+	 * as 192x192 surfaces of that kind, uploaded verbatim they were composited
+	 * with alpha taken from the red channel, which is about zero, so every icon
+	 * drew nothing at all. `alpha_first` swaps the two in the copy that already
+	 * flips the image.
+	 */
+	if (image->wrapped && IOSurfaceGetBytesPerElement(surface) == 4 &&
+	    (image->format == GL_BGRA || image->format == 0x1908)) {
+		image->alpha_first = true;
+	}
 	began = now_us();
 	if (!surface_shared(e, image)) {
 		surface_changed(e, image);              /* (what it adds up to now) */

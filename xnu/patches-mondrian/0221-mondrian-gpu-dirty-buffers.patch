@@ -1,0 +1,267 @@
+xnu 0221: a submission writes back only the buffers the CPU can have written
+
+A frame submits ~95 buffers and the driver wrote back every one of them
+(`mondrian-gl: frame 540: ... 34260 us (2963 handing on, 21497 waiting, 1
+copying out)`, 29 fps). The display surface alone is 18 MiB of that, and the
+writeback is a getPhysicalSegment and a flush_dcache64 -- `dc civac` a line at
+a time, dmb and dsb either side -- per 4 KiB page: ~4500 of them, every submit,
+and nothing in this task has written a pixel of that surface (expected; the log
+line below settles it on a device).
+
+The trap that makes this delicate is 0182's: the CP fetches VBOs, shader consts
+and draw-state fragments with its own unprivileged access, so a buffer the CPU
+filled but did not write back is read as zeros and the SQE halts on an unknown
+opcode. So the question a submission must answer is what the CPU *can* have
+written, not what it says it wrote: freedreno returns from fd_bo_cpu_prep
+without an ioctl for a buffer it does not share, so MSM_GEM_CPU_PREP is not a
+per-write signal and a flag set there would miss every VBO in the frame. A
+buffer is written back when
+
+	- the task mapped it (clientMemoryForType). That mapping is the only way
+	  a write from this task reaches the buffer, and it may write at any
+	  time afterwards, so this one is never cleared;
+	- it is dirty: fresh memory (the zero fill sits in the cache) or written
+	  by this driver (the gpu* rewrites); bufferSync clears it;
+	- or it is one of this submission's command streams, which the CP fetches
+	  itself.
+
+Everything else -- the display surface, render targets the GPU only writes,
+textures it only samples -- cannot have been written from this task at all, and
+its one initial writeback covers its lifetime.
+
+gpusyncall=1 restores the old behaviour exactly: one boot argument, for a boot
+where the CP reads a buffer stale. The first four submissions log which policy
+ran and what it moved, next to the frame line's `waiting`:
+`wrote back 46 of 95 buffers (1024 KiB), held 49 back (22120 KiB), 812 us`.
+
+bufferSync also steps by the segment the descriptor returns instead of by page.
+It flushed `length` bytes and then advanced 0x1000, so a run of contiguous pages
+was flushed once for every page in it, each flush paying its own dsb.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -7,6 +7,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOUserClient.h>
+ #include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ 
+ #include "MondrianGPU.h"
+@@ -136,11 +137,49 @@
+  * are mapped the same way in the C half). Write lets the CPU fill it. */
+ #define kMondrianBufferPerms	3u
+ 
++/*
++ * gpusyncall=1: write back every buffer of a submission, which is what this
++ * driver did before 0221. It is the valve for a boot where the CP reads a
++ * buffer stale (its symptom is the unknown-opcode halt of 0182): one boot
++ * argument, no rebuild, and the frame cost comes back with it.
++ */
++static bool
++mondrian_sync_all(void)
++{
++	static int parsed;
++	static int all;
++
++	if (parsed == 0) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("gpusyncall", &all, sizeof(all));
++	}
++	return all != 0;
++}
++
++/*
++ * Whether a submission must write a buffer back depends on who can have
++ * written it since the last writeback:
++ *
++ *	dirty	fresh memory (the zero fill sits in the cache) or the kernel
++ *		wrote it; bufferSync clears it.
++ *	mapped	the task holds a mapping of it, which is the only way its CPU
++ *		writes reach the buffer (clientMemoryForType). It is never
++ *		cleared: the task may write anywhere in it at any time, and
++ *		freedreno does not announce a write -- fd_bo_cpu_prep returns
++ *		without an ioctl for a buffer it does not share, so msm's
++ *		cpu_prep is not a per-write signal here.
++ *
++ * A buffer that is neither mapped nor a command stream therefore cannot have
++ * been written by the task at all, and after its first writeback it never
++ * needs another one.
++ */
+ struct mondrian_buffer {
+ 	uint32_t handle;
+ 	uint64_t size;
+ 	uint64_t iova;
+ 	IOMemoryDescriptor *memory;
++	bool dirty;
++	bool mapped;
+ };
+ 
+ class MondrianGPU;
+@@ -191,6 +230,8 @@
+ 	uint32_t fNested;
+ 	uint32_t fStateGroup;
+ 	uint32_t fPrepLogged;
++	bool fSyncAll;
++	uint32_t fSyncLogged;
+ };
+ 
+ class MondrianGPU : public IOService
+@@ -292,6 +333,8 @@
+ 	fNested = 0;
+ 	fStateGroup = 0;
+ 	fPrepLogged = 0;
++	fSyncLogged = 0;
++	fSyncAll = mondrian_sync_all();
+ 	if (fLock == NULL) {
+ 		return false;
+ 	}
+@@ -342,20 +385,31 @@
+  * lines back before the CP fetches them. flush_dcache64 takes a physical
+  * address and the physmap alias covers DRAM, which is the operation
+  * msm_gem_submit performs for dma_buf_end_cpu_access.
++ *
++ * The step is the segment the descriptor returns, not a page: the flush used
++ * to advance by 0x1000 while flushing `length` bytes, so a run of contiguous
++ * pages was flushed once per page in it, and each call pays two dsb.
+  */
+ void
+ MondrianGPUUserClient::bufferSync(mondrian_buffer *buffer)
+ {
+ 	uint64_t off;
+ 
+-	for (off = 0; off < buffer->size; off += 0x1000) {
++	for (off = 0; off < buffer->size; ) {
+ 		IOByteCount length = 0;
+ 		addr64_t pa = buffer->memory->getPhysicalSegment(off, &length);
+ 
+-		if (pa != 0 && length != 0) {
+-			(void)mondrian_gpu_uc_flush(pa, length);
++		if (pa == 0 || length == 0) {
++			off += 0x1000;		/* nothing behind this page */
++			continue;
++		}
++		if ((uint64_t)length > buffer->size - off) {
++			length = (IOByteCount)(buffer->size - off);
+ 		}
++		(void)mondrian_gpu_uc_flush(pa, length);
++		off += length;
+ 	}
++	buffer->dirty = false;
+ }
+ 
+ mondrian_buffer *
+@@ -402,6 +456,11 @@
+ 	buffer->size = size;
+ 	buffer->iova = iova;
+ 	buffer->memory = memory;
++	/* Fresh memory is zeroed through the caches and an adopted IOSurface
++	 * was filled by somebody else, so the next submission writes it back
++	 * once. After that it is only ever synced if the task maps it. */
++	buffer->dirty = true;
++	buffer->mapped = false;
+ 	fBuffers[fBufferCount++] = buffer;
+ 	return buffer;
+ }
+@@ -567,6 +626,8 @@
+ 	uint32_t fence = 0, i;
+ 	IOReturn result = kIOReturnSuccess;
+ 	uint32_t cmd_bytes, bo_bytes;
++	uint64_t syncStart, syncedBytes = 0, heldBytes = 0;
++	uint32_t synced = 0, held = 0;
+ 
+ 	if (request->nr_bos > kMondrianSubmits || request->nr_cmds == 0 ||
+ 	    request->nr_cmds > kMondrianSubmits || request->bos == 0 ||
+@@ -693,18 +754,67 @@
+ 		}
+ 	}
+ 	/*
+-	 * Write back every buffer the submission touches, not just the command
++	 * Write back the buffers the CPU can have written, not just the command
+ 	 * stream. Mesa fills VBOs, shader consts and the draw-state fragments
+ 	 * through the CPU; the CP fetches them with its own (unprivileged)
+ 	 * access, and a state fragment it reads as zeros is an unknown-opcode
+ 	 * halt. Flushing only the command buffers left that to cache
+ 	 * eviction, which is exactly the boot-to-boot nondeterminism.
++	 *
++	 * That is not a reason to write back all 95 buffers a frame: a frame
++	 * submits the 18 MiB display surface too, 4500 pages of
++	 * getPhysicalSegment and flush_dcache64, and the writes that buffer
++	 * needs are the GPU's. See struct mondrian_buffer for what "the CPU
++	 * can have written" rests on: mapped by the task (a mapping is the
++	 * only channel), dirty (fresh, or written by this driver), or a
++	 * command stream, which the CP fetches itself and the rewrites above
++	 * write into.
+ 	 */
++	syncStart = mach_absolute_time();
+ 	for (i = 0; i < request->nr_bos; i++) {
+ 		mondrian_buffer *bo = bufferForType(bos[i].handle);
++		bool stream = false;
++		uint32_t j;
+ 
+-		if (bo != NULL) {
++		if (bo == NULL) {
++			continue;
++		}
++		for (j = 0; !stream && j < request->nr_cmds; j++) {
++			if (cmds[j].type == MSM_SUBMIT_CMD_BUF &&
++			    cmds[j].submit_idx == i) {
++				stream = true;
++			}
++		}
++		if (fSyncAll || stream || bo->dirty || bo->mapped) {
+ 			bufferSync(bo);
++			synced++;
++			syncedBytes += bo->size;
++		} else {
++			held++;
++			heldBytes += bo->size;
++		}
++	}
++	/*
++	 * Say which policy ran, and what it was worth: the first submissions
++	 * are logged, so a device log answers "did the writeback shrink" (and,
++	 * against the frame line's "waiting", "by how much") without a bisect.
++	 */
++	if (fSyncLogged < 4) {
++		uint64_t used = 0;
++
++		fSyncLogged++;
++		absolutetime_to_nanoseconds(mach_absolute_time() - syncStart,
++		    &used);
++		if (fSyncAll) {
++			IOLog("MondrianGPU: gpusyncall=1: wrote back all %u "
++			    "buffers (%llu KiB) in %llu us\n", synced,
++			    (unsigned long long)(syncedBytes >> 10), used / 1000);
++		} else {
++			IOLog("MondrianGPU: wrote back %u of %u buffers "
++			    "(%llu KiB), held %u back (%llu KiB), %llu us\n",
++			    synced, request->nr_bos,
++			    (unsigned long long)(syncedBytes >> 10), held,
++			    (unsigned long long)(heldBytes >> 10), used / 1000);
+ 		}
+ 	}
+ 	IOLockLock(fLock);
+@@ -1137,6 +1247,12 @@
+ 		 * cacheable and the driver keeps it coherent explicitly,
+ 		 * bufferSync() on both hand-offs. */
+ 		*options = kIOMapDefaultCache;
++		/*
++		 * From here the task can write the buffer at any time without
++		 * telling us (see struct mondrian_buffer), so every submission
++		 * that names it has to write it back.
++		 */
++		buffer->mapped = true;
+ 		result = kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -1211,6 +1327,10 @@
+ 		buffer = bufferForType(request.cpuPrep.handle);
+ 		if (buffer != NULL) {
+ 			bufferSync(buffer);
++			/* The lines are out; the CPU is about to dirty them
++			 * again, and the submission after the write is what
++			 * has to hand them on. */
++			buffer->dirty = true;
+ 		}
+ 		IOLockUnlock(fLock);
+ 		if (fPrepLogged < 8) {

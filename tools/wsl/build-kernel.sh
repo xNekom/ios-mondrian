@@ -246,6 +246,13 @@ mk() {
 
 say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 {
+	# The CoreAnimation dylibs this build carries, so a userland change needs one
+	# `fastboot boot` and not a 16 GiB userdata flash (boot-arg glblob=1). Built
+	# here, never committed: a CI run without them simply leaves the header out.
+	if [ -f out/gpu/mondrian-gl.dylib ] && [ -f out/gpu/mondrian-inject.dylib ]; then
+		python3 tools/gen-glblob.py "$XNU/bsd/dev" \
+			out/gpu/mondrian-gl.dylib out/gpu/mondrian-inject.dylib
+	fi
 	say "make installhdrs"
 	mk installhdrs ARCH_CONFIGS="ARM64" -j"$JOBS"
 	# libfirehose_kernel.a compiles one libdispatch file against the headers

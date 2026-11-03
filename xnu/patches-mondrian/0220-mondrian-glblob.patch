@@ -1,0 +1,141 @@
+xnu 0220: the kernel can install the CoreAnimation dylibs at boot
+
+A userland change is one file, but getting it into the phone has been a 16 GiB
+userdata flash: the iOS root is HFS+, the host cannot mount it, and the only
+write path is a partition image. The kernel can carry the dylibs instead -- it
+already carries the GPU and touch firmware -- and write them into
+/private/var/vm, which is the writable copy the injector prefers over
+/usr/libexec.
+
+Boot argument glblob=1. The blobs are tools/gen-glblob.py's output, generated
+into bsd/dev at build time and never committed, so a kernel built without them
+(for instance in CI) simply does not take this path.
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -44,6 +44,9 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#if __has_include("mondrian_glblob.h")
++#include "mondrian_glblob.h"
++#endif
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -1217,6 +1220,8 @@
+ #define MONDRIAN_LOG_PAINT_CHUNK 256
+ 
+ static uint64_t mondrian_log_painted;
++/* glblob=1: the dylibs still have to be written, once the root is writable. */
++static int mondrian_glblob_pending;
+ static uint64_t mondrian_log_paint_chars;
+ static uint64_t mondrian_log_paint_us;
+ static uint64_t mondrian_log_paint_next_log;
+@@ -1496,6 +1501,30 @@
+ 	 */
+ }
+ 
++#if __has_include("mondrian_glblob.h")
++static int mondrian_glblob_one(const char *path, const unsigned char *data, unsigned len);
++#endif
++
++/*
++ * glblob=1: the two files, once the root is writable. EROFS means "not yet",
++ * any other error means the write itself failed and is worth saying.
++ */
++static void
++mondrian_glblob_try(void)
++{
++#if __has_include("mondrian_glblob.h")
++	if (!mondrian_glblob_pending) {
++		return;
++	}
++	if (mondrian_glblob_one("/private/var/vm/mondrian-gl.dylib",
++	    mondrian_gl_dylib, mondrian_gl_dylib_len) == 0 &&
++	    mondrian_glblob_one("/private/var/vm/mondrian-inject.dylib",
++	    mondrian_inject_dylib, mondrian_inject_dylib_len) == 0) {
++		mondrian_glblob_pending = 0;
++	}
++#endif
++}
++
+ static void
+ mondrian_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -1507,6 +1536,7 @@
+ 		total = os_atomic_load(&mondrian_log_total, relaxed);
+ 		before = os_atomic_load(&mondrian_log_flushed, relaxed);
+ 		mondrian_log_store(total, 0);
++		mondrian_glblob_try();
+ 		/*
+ 		 * Paint everything that is new, not just the tail: the cost is
+ 		 * 232 ns a character, so the whole log of a boot is a fifth of a
+@@ -1837,6 +1867,37 @@
+ 	return error;
+ }
+ 
++/*
++ * Boot argument glblob=1: write the CoreAnimation dylibs that this build of the
++ * kernel carries into /private/var/vm, which is the writable copy the injector
++ * prefers over /usr/libexec (the root is mounted read-only). A userland change
++ * then costs one `fastboot boot` instead of a 16 GiB userdata flash; the blobs
++ * come from tools/gen-glblob.py and are generated into bsd/dev at build time,
++ * so a kernel built without them simply does not take this path.
++ */
++static int
++mondrian_glblob_one(const char *path, const unsigned char *data, unsigned len)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int error;
++
++	if (len == 0) {
++		return EINVAL;
++	}
++	error = vnode_open(path, (O_CREAT | FWRITE | O_TRUNC), 0755, 0, &vp, ctx);
++	if (error == 0) {
++		/* The blob is const data in the kernel image: vn_rdwr reads it. */
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0,
++		    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
++		(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		vnode_close(vp, FWRITE, ctx);
++	}
++	printf("MONDRIAN GLBLOB: %s %u bytes -> %d\n", path, len, error);
++	return error;
++}
++
+ void
+ mondrian_root_fixups(void)
+ {
+@@ -1848,10 +1909,26 @@
+ 	if (error == 0) {
+ 		vnode_put(vp);
+ 		printf("MONDRIAN ROOT: /private/var/vm present\n");
+-		return;
++	} else {
++		printf("MONDRIAN ROOT: /private/var/vm lookup %d, creating it\n", error);
++		error = mondrian_root_mkdir("/private/var/vm", 0755);
++		printf("MONDRIAN ROOT: mkdir /private/var/vm -> %d\n", error);
++	}
++#if __has_include("mondrian_glblob.h")
++	{
++		int blob = 0;
++
++		/*
++		 * Not written here: at this point the root is still mounted read-only
++		 * (the first attempt from this function returned EROFS, 30) and iOS
++		 * remounts it writable a few seconds later. The log thread, which
++		 * starts just after this, retries every wake until both files are in
++		 * place.
++		 */
++		if (PE_parse_boot_argn("glblob", &blob, sizeof(blob)) && blob != 0) {
++			mondrian_glblob_pending = 1;
++		}
+ 	}
+-	printf("MONDRIAN ROOT: /private/var/vm lookup %d, creating it\n", error);
+-	error = mondrian_root_mkdir("/private/var/vm", 0755);
+-	printf("MONDRIAN ROOT: mkdir /private/var/vm -> %d\n", error);
++#endif
+ }
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
