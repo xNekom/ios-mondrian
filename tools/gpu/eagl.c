@@ -152,6 +152,7 @@ static int latency_lines;               /* boot-arg touch_lat=1: when every fram
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
 static uint64_t now_us(void);
+static void bind_nothing(struct eagl *e);
 static void eagl_trace(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static void eagl_trace_floats(const float *values, int count);
 static void eagl_enter(struct eagl *e, unsigned offset);
@@ -265,6 +266,8 @@ struct eagl {
 	GLuint writer;                  /* ... and one to copy a frame into its surface with (blit_targets) */
 	GLuint program;                 /* the one in use, as CoreAnimation has it */
 	GLuint plain, lookup;           /* programs of ours for when that is none (plain_draw_begin()) */
+	GLuint nothing;                 /* a 1x1 transparent black: what a draw that binds no texture reads */
+	unsigned empty_said;
 	GLint plain_matrix, plain_textured, lookup_matrix;
 	GLuint vibrant, masking;        /* two more: what a colour matrix does to what is behind, and to the layer */
 	int blended;                    /* blending is off for such a draw, to be put back after it */
@@ -888,6 +891,31 @@ surface_to_texture(struct eagl *e, struct image *image)
 			}
 		}
 		base = flipped;
+	}
+	/*
+	 * What a shown surface of somebody else's memory actually holds: the home
+	 * screen's icons arrive as 192x192 surfaces with no pixel format, are
+	 * uploaded once and never change, and composited with premultiplied alpha
+	 * they draw nothing. Alpha 0 everywhere with RGB non-zero means the channel
+	 * order is not the one assumed; alpha 0 and RGB 0 means the surface itself
+	 * is empty and the pixels never got there.
+	 */
+	if (image->wrapped && pixel == 4 && image->width > 0 && image->height > 0) {
+		static unsigned told;
+
+		if (told++ < 8) {
+			size_t zero = 0, full = 0, pixels = (size_t)image->width * (size_t)image->height;
+			unsigned rgb = 0;
+
+			for (size_t at = 0; at + 4 <= row * (size_t)image->height; at += 4) {
+				zero += base[at + 3] == 0;
+				full += base[at + 3] == 0xff;
+				rgb |= base[at] | base[at + 1] | base[at + 2];
+			}
+			say("mondrian-gl: %zu x %zu wrapped surface%s: alpha 0 in %zu of %zu, 255 in %zu, rgb or %02x\n",
+			    (size_t)image->width, (size_t)image->height, image->alpha_first ? " (swapped)" : "",
+			    zero, pixels, full, rgb);
+		}
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -3220,6 +3248,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	bool plain;
 
 	EAGL_ENTER(e, MONDIAN_GL_DRAW_ARRAYS);
+	bind_nothing(e);
 	drawing(e);
 	count_spans(e, mode, count);
 	e->draws++;
@@ -3283,6 +3312,20 @@ dump_draw_state(void)
 	}
 }
 
+/* A draw of CoreAnimation's own that has bound no texture reads this instead of white. */
+static void
+bind_nothing(struct eagl *e)
+{
+	if (e->program != 0 && e->bound[0] == 0 && e->nothing != 0) {
+		if (e->empty_said++ < 4) {
+			say("mondrian-gl: a draw with CoreAnimation's program %u and no texture on unit 0 (function %u): drawn as nothing\n",
+			    e->program, ca_context != NULL ? *(*(uint8_t **)((char *)ca_context + 0x10) + 0x10) : 90);
+		}
+		glBindTexture(GL_TEXTURE_2D, e->nothing);
+		e->bound[0] = e->nothing;
+	}
+}
+
 static void
 my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices)
 {
@@ -3291,6 +3334,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	bool plain;
 
 	EAGL_ENTER(e, MONDIAN_GL_DRAW_ELEMENTS);
+	bind_nothing(e);
 	dump_draw_state();
 	drawing(e);
 	count_spans(e, mode, count);
@@ -3936,6 +3980,23 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	e->table[0] = e;
 	eagl_fill_table(e->table);
 	contexts[place] = e;
+	/*
+	 * In a compatibility profile texture object 0 is a 1x1 white texel, and a
+	 * draw of CoreAnimation's own that binds no texture samples it: the lock
+	 * screen's wallpaper area came out as a white rectangle exactly so, because
+	 * the poster behind it is never delivered (CollectionsPoster is killed with
+	 * "extension check-in timeout"). Nothing is what such a draw should read.
+	 */
+	{
+		static const uint8_t none[4] = { 0, 0, 0, 0 };
+
+		glGenTextures(1, &e->nothing);
+		glBindTexture(GL_TEXTURE_2D, e->nothing);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, none);
+		glTexParameteri(GL_TEXTURE_2D, 0x2801 /* GL_TEXTURE_MIN_FILTER */, 0x2600 /* GL_NEAREST */);
+		glTexParameteri(GL_TEXTURE_2D, 0x2800 /* GL_TEXTURE_MAG_FILTER */, 0x2600 /* GL_NEAREST */);
+		glBindTexture(GL_TEXTURE_2D, 0);
+	}
 	say("mondrian-gl: context %p (object %p, gl %p) at slot %u\n",
 	    (void *)e, (void *)self, (void *)e->gl, place);
 	say("mondrian-gl: an OpenGL ES %lu context for CoreAnimation, by %s: %s; %s; shaders %s\n", api, mondrian_gl_library(),

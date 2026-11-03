@@ -1,0 +1,349 @@
+xnu 0222: what a submission cleans and how often it looks at the fence
+
+Three costs the submission path paid on every submission and does not need.
+
+The ring clean. Every doorbell cleaned all 32 KiB of the CP ring -- 512 `dc
+civac` lines, eight `pmap_find_phys` and eight `dsb sy` -- to publish the 104
+bytes a submission writes, and a frame is five submissions. Only this path
+writes the ring and each submission is cleaned when it is written, so the
+range this submission wrote is the range that has to go out:
+`mondrian_gpu_mem_flush_range` takes an offset, and it still splits at a 4 KiB
+boundary because the next physical page is not contiguous with this one.
+`gpuringslow=1` cleans the whole ring again: the valve for a boot where the CP
+reads a ring dword the CPU never flushed, whose symptom is 0182's
+unknown-opcode halt.
+
+The backpressure read. CP_RB_RPTR was read before every submission: an
+uncached round trip to the GPU, five a frame, always to learn that the ring
+was empty. The pointer only moves forward inside a lap, so a value read once
+stays a valid lower bound until the write position is a whole lap past it --
+while (at - seen) mod size is under size - 26, the 26 dwords written next
+cannot reach the CP whatever it does in between. The register is read once a
+lap now (315 submissions of 26 dwords here) and whenever that bound expires;
+the room test and its 2 s patience are unchanged.
+
+The fence wait polled with `delay(1000)`. Nothing can wake it: the GPU's SPI
+is masked in the distributor before the SQE starts (the ICENABLER9 write in
+the bring-up) and no CP handler wakes a waiter, so the poll interval *is* the
+resolution of every wait -- and each frame's glFinish, which waits for the
+last submission's fence, paid up to a millisecond after the GPU was already
+done. It is 100 us now, `gpuwaitpoll=US` (clamped to 10..1000) to move it back
+to 1000, in `mondrian_gpu_uc_wait` and in the two waits inside the submit
+path; every timeout is unchanged in wall time, because the loops count
+microseconds instead of iterations. The old interval was also the measurement
+quantum: every stream that completes on its own reports `uc big 71 dwords ...
+in 1 ms`, which a 1 ms poll cannot resolve finer.
+
+what the next boot's log says
+	MONDRIAN GPU: uc ring 1024 submissions, N ns a clean, 26 of 8192 dwords
+	a submission, M rptr reads
+	    N against the 512 cache lines of the whole ring, and 26 of 8192 with
+	    one read a lap, are the two halves of this change running; the same
+	    boot with gpuringslow=1 says 8192 dwords and one read a submission.
+	MONDRIAN GPU: uc fence N ... in X us, poll 100 us
+	    X under a millisecond is a wait the old poll could not report.
+	mondrian-gl: frame NNN: ... (X handing on, Y waiting, Z copying out)
+	    "waiting" carries the glFinish, so it drops by the poll quantum;
+	    "handing on" carries the submit, so it drops by four of the five
+	    ring cleans and reads of a frame.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -91,6 +91,33 @@
+ static uint32_t mondrian_uc_at;
+ static uint32_t mondrian_uc_fence;
+ /*
++ * The CP's read pointer as the submission path last saw it, and whether it is
++ * still a usable lower bound (see mondrian_gpu_uc_submit).
++ */
++static uint32_t mondrian_uc_rptr;
++static int mondrian_uc_rptr_valid;
++/*
++ * gpuringslow=1 cleans the whole 32 KiB ring before every doorbell, which is
++ * what this path did before 0222: the valve for a boot where the CP reads a
++ * ring dword the CPU never flushed.
++ */
++static int mondrian_uc_ring_slow;
++/* What the ring clean costs, reported every 1024 submissions. */
++static uint32_t mondrian_uc_ring_subs;
++static uint32_t mondrian_uc_ring_dwords;
++static uint32_t mondrian_uc_rptr_reads;
++static uint64_t mondrian_uc_ring_ns;
++/*
++ * How long a CP wait spins between two looks at the fence word, in
++ * microseconds: gpuwaitpoll=US, 100 by default. No interrupt can wake these
++ * waits -- the GPU's line is masked in the distributor before the SQE starts
++ * (see the ICENABLER9 write in the bring-up) -- so this interval is the
++ * resolution of every wait. At the millisecond it used to be, a fence that
++ * landed just after a look was seen a millisecond late: `uc big ... in 1 ms` is
++ * what every small stream measured, and each frame's glFinish paid the rest.
++ */
++static uint32_t mondrian_uc_poll_us = 100u;
++/*
+  * The CP doorbell. CP_RB_WPTR is the one GPU register a submission has to
+  * touch, and touching it when the block has stopped answering never returns:
+  * measured on the phone, a boot where the ring ends at "uc pre 71" with a
+@@ -842,21 +869,36 @@
+ }
+ 
+ static void
+-mondrian_gpu_mem_flush(struct mondrian_gpu_mem *m, uint32_t bytes)
++mondrian_gpu_mem_flush_range(struct mondrian_gpu_mem *m, uint32_t off,
++    uint32_t bytes)
+ {
+-	uint32_t off;
++	uint32_t end = off + bytes;
+ 
+-	for (off = 0; off < bytes; off += 4096) {
++	if (end > m->bytes) {
++		end = m->bytes;
++	}
++	while (off < end) {
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(m->va + off));
+-		uint32_t len = bytes - off < 4096 ? bytes - off : 4096;
++		/* Never across a page: the next one is not contiguous in DRAM. */
++		uint32_t len = 4096u - ((m->va + off) & 0xfffu);
+ 
++		if (len > end - off) {
++			len = end - off;
++		}
+ 		if (pn != 0) {
+ 			flush_dcache64((addr64_t)(ptoa_64(pn) +
+-			    ((m->va + off) & 0x3fffu)), len, TRUE);
++			    ((m->va + off) & 0xfffu)), len, TRUE);
+ 		}
++		off += len;
+ 	}
+ }
+ 
++static void
++mondrian_gpu_mem_flush(struct mondrian_gpu_mem *m, uint32_t bytes)
++{
++	mondrian_gpu_mem_flush_range(m, 0, bytes);
++}
++
+ /*
+  * HFI transport: queue 0 (host to GMU) and queue 1 (GMU to host) in the 16 KiB
+  * HFI buffer whose table was written before the CM3 start. Header is
+@@ -3370,8 +3412,8 @@
+ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ {
+ 	uint32_t *ring;
+-	uint32_t at, seq;
+-	uint64_t slot;
++	uint32_t at, from, seq;
++	uint64_t slot, ringStart;
+ 
+ 	if (fence == NULL) {
+ 		return -1;
+@@ -3405,27 +3447,42 @@
+ 	 * Backpressure: the CP has to have consumed enough of the lap before
+ 	 * this submission overwrites it. The old code never looked at the read
+ 	 * pointer, so the 2000-submission stress could run the ring over.
+-	 */
+-	{
+-		uint32_t waited;
++	 *
++	 * The register read behind that is an uncached round trip to the GPU,
++	 * and the pointer only moves forward inside a lap, so a value read once
++	 * stays a lower bound until the write position is a whole lap past it:
++	 * while (at - seen) mod size is under size - 26, the 26 dwords written
++	 * below cannot reach the CP whatever it does in between. That is one
++	 * read a lap (315 submissions of 26 dwords) instead of one a
++	 * submission; the room test itself is unchanged and still runs
++	 * whenever the bound expires or the CP has to be waited for.
++	 */
++	if (mondrian_uc_rptr_valid == 0 ||
++	    (at + MONDRIAN_UC_RING_DWORDS - mondrian_uc_rptr) %
++	    MONDRIAN_UC_RING_DWORDS > MONDRIAN_UC_RING_DWORDS - 27) {
++		uint32_t spent_us = 0;
+ 
+-		for (waited = 0; waited < 2000; waited++) {
++		for (;;) {
+ 			uint32_t rptr = mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_RB_RPTR * 4u);
+ 			uint32_t room = (rptr + MONDRIAN_UC_RING_DWORDS -
+ 			    at - 1) % MONDRIAN_UC_RING_DWORDS;
+ 
++			mondrian_uc_rptr_reads++;
+ 			if (room >= 26) {
++				mondrian_uc_rptr = rptr;
++				mondrian_uc_rptr_valid = 1;
+ 				break;
+ 			}
+-			delay(1000);
+-		}
+-		if (waited >= 2000) {
+-			if (mondrian_uc_dump != 0) {
+-				printf("MONDRIAN GPU: uc no room at 0x%x\n", at);
+-				mondrian_log_flush_now();
++			if (spent_us >= 2000000u) {
++				if (mondrian_uc_dump != 0) {
++					printf("MONDRIAN GPU: uc no room at 0x%x\n", at);
++					mondrian_log_flush_now();
++				}
++				return -1;
+ 			}
+-			return -1;
++			delay((int)mondrian_uc_poll_us);
++			spent_us += mondrian_uc_poll_us;
+ 		}
+ 	}
+ 	if (at + 26 > MONDRIAN_UC_RING_DWORDS) {
+@@ -3434,6 +3491,7 @@
+ 		}
+ 		at = 0;
+ 	}
++	from = at;
+ 	seq = mondrian_uc_fence + 1;
+ 	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
+ 	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
+@@ -3487,10 +3545,51 @@
+ 		printf("MONDRIAN GPU: uc keepalive written\n");
+ 		mondrian_log_flush_now();
+ 	}
+-	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
++	ringStart = mach_absolute_time();
++	if (mondrian_uc_ring_slow != 0) {
++		mondrian_gpu_mem_flush(&mondrian_cp_ring,
++		    mondrian_cp_ring.bytes);
++	} else {
++		/*
++		 * Only the dwords this submission wrote. The rest of the ring is
++		 * in DRAM already, cleaned by the submission that wrote it, and
++		 * nothing else writes it; the cleaning used to cover all 32 KiB
++		 * -- 512 cache-line ops and a dsb a page -- for the 104 bytes of
++		 * a submission.
++		 */
++		mondrian_gpu_mem_flush_range(&mondrian_cp_ring, from * 4,
++		    (at - from) * 4);
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	{
++		uint64_t took;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - ringStart,
++		    &took);
++		mondrian_uc_ring_ns += took;
++		mondrian_uc_ring_dwords += at - from;
++	}
+ 	mondrian_uc_fence = seq;
+ 	mondrian_uc_at = at;
++	/*
++	 * Every 1024 submissions, what the ring costs and how much of it is
++	 * cleaned: the two numbers this change moves, in the log of the boot
++	 * that runs it.
++	 */
++	if (++mondrian_uc_ring_subs >= 1024) {
++		uint32_t n = mondrian_uc_ring_subs;
++
++		printf("MONDRIAN GPU: uc ring %u submissions, %llu ns a clean, %u of %u dwords a submission, %u rptr reads\n",
++		    n, (unsigned long long)(mondrian_uc_ring_ns / n),
++		    (mondrian_uc_ring_dwords + n - 1) / n,
++		    (uint32_t)MONDRIAN_UC_RING_DWORDS,
++		    mondrian_uc_rptr_reads);
++		mondrian_log_flush_now();
++		mondrian_uc_ring_subs = 0;
++		mondrian_uc_ring_ns = 0;
++		mondrian_uc_ring_dwords = 0;
++		mondrian_uc_rptr_reads = 0;
++	}
+ 	if (mondrian_uc_dump != 0) {
+ 		/*
+ 		 * Start every logged submission with a clean fault record, or the
+@@ -3557,15 +3656,19 @@
+ 		 * wait for its own fence here and say what the CP did with it. */
+ 		volatile uint32_t *view =
+ 		    (volatile uint32_t *)mondrian_cp_memptr_view;
+-		uint32_t waited, value = 0;
++		uint32_t spent_us = 0, value = 0;
+ 
+-		for (waited = 0; waited < 300; waited++) {
++		for (;;) {
+ 			__asm__ volatile("dsb sy" ::: "memory");
+ 			value = view[mondrian_uc_fence_word(seq)];
+ 			if ((int32_t)(value - seq) >= 0) {
+ 				break;
+ 			}
+-			delay(1000);
++			if (spent_us >= 300000u) {
++				break;
++			}
++			delay((int)mondrian_uc_poll_us);
++			spent_us += mondrian_uc_poll_us;
+ 		}
+ 		mondrian_uc_done++;
+ 		/*
+@@ -3578,7 +3681,7 @@
+ 		 * therefore opt-in with gpudump=1.
+ 		 */
+ 		printf("MONDRIAN GPU: uc big %u dwords fence %u done %u in %u ms\n",
+-		    dwords, seq, (int32_t)(value - seq) >= 0, waited);
++		    dwords, seq, (int32_t)(value - seq) >= 0, spent_us / 1000);
+ 		mondrian_log_flush_now();
+ 		if ((int32_t)(value - seq) < 0) {
+ 			/*
+@@ -3664,12 +3767,12 @@
+ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ {
+ 	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
+-	uint32_t waited = 0, limit, value;
++	uint32_t spent_us = 0, limit_us, value;
+ 
+ 	if (view == NULL || fence == 0 || fence > mondrian_uc_fence) {
+ 		return -1;
+ 	}
+-	limit = timeout_ms != 0 ? timeout_ms : 5000u;
++	limit_us = (timeout_ms != 0 ? timeout_ms : 5000u) * 1000u;
+ 	for (;;) {
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		value = view[mondrian_uc_fence_word(fence)];
+@@ -3677,7 +3780,7 @@
+ 			if (mondrian_uc_logged < 10) {
+ 				mondrian_uc_logged++;
+ 				mondrian_uc_keepalive(1);
+-				printf("MONDRIAN GPU: uc fence %u int 0x%x fault 0x%x fsr 0x%x rptr 0x%x wptr 0x%x\n",
++				printf("MONDRIAN GPU: uc fence %u int 0x%x fault 0x%x fsr 0x%x rptr 0x%x wptr 0x%x in %u us, poll %u us\n",
+ 				    fence,
+ 				    mondrian_gpu_read(mondrian_uc_gpu,
+ 				    GEN7_CP_INTERRUPT_STATUS * 4u),
+@@ -3688,17 +3791,18 @@
+ 				    mondrian_gpu_read(mondrian_uc_gpu,
+ 				    GEN7_CP_RB_RPTR * 4u),
+ 				    mondrian_gpu_read(mondrian_uc_gpu,
+-				    GEN7_CP_RB_WPTR * 4u));
++				    GEN7_CP_RB_WPTR * 4u), spent_us,
++				    mondrian_uc_poll_us);
+ 				mondrian_uc_keepalive(0);
+ 				mondrian_log_flush_now();
+ 			}
+ 			return 0;
+ 		}
+-		if (waited >= limit) {
++		if (spent_us >= limit_us) {
+ 			return -1;
+ 		}
+-		delay(1000);
+-		waited++;
++		delay((int)mondrian_uc_poll_us);
++		spent_us += mondrian_uc_poll_us;
+ 	}
+ }
+ #else /* !MONDRIAN_CP_PROFILE */
+@@ -3868,6 +3972,17 @@
+ 	    sizeof(mondrian_uc_async));
+ 	(void)PE_parse_boot_argn("gpuinit", &mondrian_cp_init_hw,
+ 	    sizeof(mondrian_cp_init_hw));
++	(void)PE_parse_boot_argn("gpuringslow", &mondrian_uc_ring_slow,
++	    sizeof(mondrian_uc_ring_slow));
++	{
++		uint32_t poll = 0;
++
++		/* gpuwaitpoll=1000 restores the millisecond wait of 0222. */
++		(void)PE_parse_boot_argn("gpuwaitpoll", &poll, sizeof(poll));
++		if (poll >= 10 && poll <= 1000) {
++			mondrian_uc_poll_us = poll;
++		}
++	}
+ 	gpucc = ml_io_map(MONDRIAN_GPUCC_BASE, MONDRIAN_GPUCC_SIZE);
+ 	gpu = ml_io_map(MONDRIAN_GPU_BASE, MONDRIAN_GPU_SIZE);
+ 	gmu = ml_io_map(MONDRIAN_GMU_BASE, MONDRIAN_GMU_SIZE);
