@@ -230,10 +230,13 @@ this port follows.
   (`clientMemoryForType`), so the Darwin libdrm stands in for `mmap`.
   Relocations are refused; Mesa's msm backend uses softpin (`MSM_INFO_SET_IOVA`
   and `GET_IOVA`), which works. GEM_NEW also refuses (`MondrianGPU: gem_new
-  <size> refused`) when the descriptor or the IOVA comes up short; Mesos's
+  <size> refused`) when the descriptor or the IOVA comes up short; Mesa's
   callers then answer `GL_OUT_OF_MEMORY` (0x505) or crash in Mesa's
   first-context self test. The low 4 GiB is what runs out first while the
   window server runs; `0211` allocates above it when the low pool is spent.
+  GEM_SUBMIT carries one BO per buffer the frame touches — 95 on a lock-screen
+  frame — and `0219` raised the old 64-entry limit that refused them whole
+  (`submit failed: -22` from Mesa's `flush_submit_list`, 220 times a boot).
 - **Fences are CP-written dwords**: a submission is `CP_INDIRECT_BUFFER_PFE`
   plus `CP_EVENT_WRITE` into a slot of the memptr page, waited on through the
   write-combined alias of that page. No IRQ is needed for correctness; IRQ 332

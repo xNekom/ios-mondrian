@@ -96,7 +96,12 @@ shows whatever surface a swap names (by copying its layers into the panel's memo
 - **Copy** (`surface_to_texture()` / `target_to_surface()`), kept as a bisect knob only: the
   surface is uploaded with `glTexImage2D`/`glTexSubImage2D` and the frame is read back with
   `glReadPixels` at `glFlush`/`glFinish`. Correct pixels, 5.7 s a frame at 1440x3200;
-  `glcopy=1` forces it.
+  `glcopy=1` forces it. The upload has to take the *surface's* pixel size, not the format
+  CoreAnimation asked the texture to have: the lock screen's poster is an L008 surface (one byte
+  a pixel, 1536 a row) and uploading it as BGRA made `UNPACK_ROW_LENGTH` 384 pixels a row, four
+  times the surface's, so the wallpaper read as white — the `255 255 255 255` the draw trace finds
+  where the poster is drawn. One byte a pixel uploads as `GL_LUMINANCE`, two as
+  `GL_LUMINANCE_ALPHA`, and GL converts them into the RGBA storage the texture already has.
 
 `tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
 the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.

@@ -820,6 +820,34 @@ surface_to_texture(struct eagl *e, struct image *image)
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
 	bool alpha_first = image->alpha_first && !planar && pixel == 4;
+	/*
+	 * The surface's memory decides how its rows are read, not the format
+	 * CoreAnimation asked the texture to have. The lock screen's poster is an
+	 * L008 surface -- one byte a pixel, 1536 a row -- uploaded as BGRA:
+	 * UNPACK_ROW_LENGTH became 1536/4 = 384 pixels a row, four times the
+	 * surface's, and the wallpaper came out white (traced: the draw into the
+	 * lock screen leaves 255 255 255 255 where the poster is). One byte a
+	 * pixel uploads as GL_LUMINANCE and two as GL_LUMINANCE_ALPHA, which GL
+	 * converts into the RGBA storage the texture already has.
+	 */
+	GLenum up_format = image->format, up_type = image->type;
+	unsigned surface_pixel = planar ?
+	    IOSurfaceGetBytesPerElementOfPlane(surface, image->plane) : IOSurfaceGetBytesPerElement(surface);
+
+	if (surface_pixel != 0 && surface_pixel != pixel && image->type == GL_UNSIGNED_BYTE) {
+		static unsigned told;
+
+		if (surface_pixel == 1) {
+			up_format = 0x1909;             /* GL_LUMINANCE */
+		} else if (surface_pixel == 2) {
+			up_format = 0x190a;             /* GL_LUMINANCE_ALPHA */
+		}
+		up_type = GL_UNSIGNED_BYTE;
+		if (up_format != image->format && told++ < 8) {
+			say("mondrian-gl: a surface of %u bytes a pixel is uploaded as %#x, not %#x\n",
+			    surface_pixel, up_format, image->format);
+		}
+	}
 
 	if (image->shared) {
 		return;
@@ -851,7 +879,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
-	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / bytes_a_pixel(up_format, up_type)));
 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	/*
 	 * Filled again at the same size (BGRA bytes, one plane): into the storage the texture has.
@@ -859,8 +887,8 @@ surface_to_texture(struct eagl *e, struct image *image)
 	 * (The first try did it for every kind and screens came out green.)
 	 */
 	GLint had_width = 0, had_height = 0, had_format = 0;
-	bool simple = !planar && image->format == GL_BGRA && image->type == GL_UNSIGNED_BYTE && image->to == GL_TEXTURE_2D &&
-	    image->sub_ok;
+	bool simple = !planar && up_format == image->format && image->format == GL_BGRA &&
+	    image->type == GL_UNSIGNED_BYTE && image->to == GL_TEXTURE_2D && image->sub_ok;
 	if (simple) {
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &had_width);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &had_height);
@@ -871,7 +899,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 		static unsigned sub_told;
 		while (glGetError() != 0) {
 		}
-		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image->width, image->height, image->format, image->type, base);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, image->width, image->height, up_format, up_type, base);
 		GLenum error = glGetError();
 		if (sub_told++ < 8) {
 			say("mondrian-gl: refill %dx%d into its storage (internal %#x): error %#x\n", image->width, image->height,
@@ -880,11 +908,11 @@ surface_to_texture(struct eagl *e, struct image *image)
 		if (error != 0) {
 			image->sub_ok = false;
 			glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width,
-			    image->height, 0, image->format, image->type, base);
+			    image->height, 0, up_format, up_type, base);
 		}
 	} else {
 		glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height,
-		    0, image->format, image->type, base);
+		    0, up_format, up_type, base);
 	}
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
