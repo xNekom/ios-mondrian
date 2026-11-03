@@ -1,0 +1,56 @@
+xnu 0206: the CP table region is large enough for the client buffers
+
+The draw's dump is `fsr 0x80000402 far 0x14a80000` with `pte present 0xe43
+pa 0xde81c000`: the software walk finds the page and the SMMU does not. Three
+CPU-side TLB probes (ASID invalidate per submission, global `TLBIALLNSNH` in
+the map path, `CB_ATS1PR`) were tried first and all are unusable: their SMMU
+register reads never returned after the GPU had been idle.
+
+The tables themselves were the problem. They live in a 32-page (128 KiB)
+region and the bring-up consumes all 32 (`cp smmu pages 32`), so the first
+buffer a client maps that needs a new L2/L3 table allocates it past the end
+of the region. `mondrian_gpu_uc_tables_sync()` flushes only
+`mondrian_cp_tables.pa .. + bytes`; the new table stays in the CPU cache, the
+software walk (which runs on the CPU) reports the PTE present, and the SMMU,
+reading DRAM, faults. That is why the 71-dword stream, whose buffers land in
+tables the bring-up already wrote, completes, while the 168-dword draw (the
+20 MB surface needs a new table) does not.
+
+Grow the region to 512 KiB and refuse a map that would need a table beyond
+it, instead of writing past the end.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1742,7 +1742,15 @@
+ 	if (mondrian_cp_tables.va == 0) {
+ 		printf("MONDRIAN GPU: cp alloc begin\n");
+ 		mondrian_log_flush_now();
+-		if (mondrian_gpu_mem_alloc(&mondrian_cp_tables, 0x20000, 0) != 0 ||
++		/*
++		 * 512 KiB of tables. The old 128 KiB was exactly what the
++		 * bring-up itself used (`cp smmu pages 32`), so the first buffer
++		 * a client mapped allocated its L2/L3 past the end of the region:
++		 * tables_sync() flushes only the region, the CPU saw the PTE in
++		 * its cache and the SMMU read stale DRAM, which is the draw's
++		 * `fsr 0x80000402` with `pte present`.
++		 */
++		if (mondrian_gpu_mem_alloc(&mondrian_cp_tables, 0x80000, 0) != 0 ||
+ 		    /* 1 MiB, not the firmware's 0x13000: the CP's icache
+ 		     * prefetch (and any jump the ucode makes) runs past the
+ 		     * last byte of the ucode, and a faulting fetch storm
+@@ -3037,6 +3045,16 @@
+ 	    (pa & 0xfffull) != 0) {
+ 		return -1;
+ 	}
++	/*
++	 * A map can allocate an L2 and an L3 table. Refuse it when the
++	 * region cannot hold them: writing past the end produced a table
++	 * the flush below never reaches, and the SMMU then faults on a
++	 * page the software walk reports present.
++	 */
++	if (mondrian_uc_table_next + 4 >=
++	    (uint32_t)(mondrian_cp_tables.bytes / 4096)) {
++		return -1;
++	}
+ 	mondrian_gpu_smmu_map((uint64_t *)mondrian_cp_tables.va,
+ 	    mondrian_cp_tables.pa, 32, iova, pa, 4096, permissions,
+ 	    &mondrian_uc_table_next);

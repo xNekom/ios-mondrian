@@ -1,0 +1,112 @@
+xnu 0207: the IOVA arena reuses what gem_close frees
+
+With 0206's table region the draw completes (`uc big 168 done 1 in 1 ms`,
+`rbbm 0x1`, the UI drawing in place), and the next stop is about twenty
+frames in: `MondrianGPU: gem_new 0x1400000 refused`, then
+`glDrawElements: error 0x502` and `submit failed: -22`. `gem_close` unmaps
+the pages and frees the buffer, but the IOVA allocator is a pure bump
+pointer, so every freed buffer leaves its range behind. The UI allocates and
+frees tens of megabytes per frame and the 1.75 GB arena runs out; every new
+IOVA also takes a new L2/L3 table, so the 128-page table region fills with
+ranges the client will never use again.
+
+Keep the freed ranges (128 of them, coalescing with a neighbour) and
+first-fit from them, falling back to the bump pointer.
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -22,6 +22,7 @@
+ 
+ /* A block of GPU addresses for buffers. Zero when the arena is exhausted. */
+ uint64_t mondrian_gpu_uc_iova_alloc(uint64_t bytes);
++void mondrian_gpu_uc_iova_free(uint64_t iova, uint64_t bytes);
+ 
+ /*
+  * Stage-1 map/unmap of one 4 KiB page. Buffers a submission touches must be
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3024,13 +3024,74 @@
+ 	}
+ }
+ 
++/*
++ * The arena used to be a pure bump allocator: a buffer freed by gem_close
++ * left its IOVA behind, and the UI allocates and frees tens of megabytes per
++ * frame (measured: `gem_new 0x1400000 refused` after about twenty frames).
++ * Every new IOVA also needs a new L2/L3 table, so the exhaustion showed up
++ * twice. Keep the freed ranges and first-fit from them.
++ */
++#define MONDRIAN_UC_IOVA_HOLES	128
++static struct {
++	uint64_t start;
++	uint64_t bytes;
++} mondrian_uc_holes[MONDRIAN_UC_IOVA_HOLES];
++static uint32_t mondrian_uc_hole_count;
++
++void
++mondrian_gpu_uc_iova_free(uint64_t iova, uint64_t bytes)
++{
++	uint32_t i;
++
++	bytes = (bytes + 0xfffull) & ~0xfffull;
++	if (bytes == 0) {
++		return;
++	}
++	for (i = 0; i < mondrian_uc_hole_count; i++) {
++		uint64_t end = iova + bytes;
++
++		if (mondrian_uc_holes[i].start + mondrian_uc_holes[i].bytes ==
++		    iova) {
++			mondrian_uc_holes[i].bytes += bytes;
++			return;
++		}
++		if (end == mondrian_uc_holes[i].start) {
++			mondrian_uc_holes[i].start = iova;
++			mondrian_uc_holes[i].bytes += bytes;
++			return;
++		}
++	}
++	if (mondrian_uc_hole_count < MONDRIAN_UC_IOVA_HOLES) {
++		mondrian_uc_holes[mondrian_uc_hole_count].start = iova;
++		mondrian_uc_holes[mondrian_uc_hole_count].bytes = bytes;
++		mondrian_uc_hole_count++;
++	}
++}
++
+ uint64_t
+ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ {
++	uint32_t i;
+ 	uint64_t iova;
+ 
+ 	bytes = (bytes + 0xfffull) & ~0xfffull;
+-	if (bytes == 0 || mondrian_uc_iova + bytes > MONDRIAN_UC_IOVA_END) {
++	if (bytes == 0) {
++		return 0;
++	}
++	for (i = 0; i < mondrian_uc_hole_count; i++) {
++		if (mondrian_uc_holes[i].bytes < bytes) {
++			continue;
++		}
++		iova = mondrian_uc_holes[i].start;
++		mondrian_uc_holes[i].start += bytes;
++		mondrian_uc_holes[i].bytes -= bytes;
++		if (mondrian_uc_holes[i].bytes == 0) {
++			mondrian_uc_holes[i] =
++			    mondrian_uc_holes[--mondrian_uc_hole_count];
++		}
++		return iova;
++	}
++	if (mondrian_uc_iova + bytes > MONDRIAN_UC_IOVA_END) {
+ 		return 0;
+ 	}
+ 	iova = mondrian_uc_iova;
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -439,6 +439,7 @@
+ 		(void)mondrian_gpu_uc_unmap_page(buffer->iova + off);
+ 	}
+ 	(void)mondrian_gpu_uc_tables_sync();
++	mondrian_gpu_uc_iova_free(buffer->iova, buffer->size);
+ 	if (buffer->memory != NULL) {
+ 		buffer->memory->release();
+ 	}
