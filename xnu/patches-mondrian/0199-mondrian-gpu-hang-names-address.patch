@@ -1,0 +1,37 @@
+xnu 0199: the hang dump names the address that faulted
+
+The 168-dword stream -- the first one that draws -- leaves the CP with nothing
+to report: `ib1 0x1042c000 rem 0x0`, `ib2 0x10434000 rem2 0x0` (both fetched and
+consumed), `int 0x0 fault 0x0 protect 0x0`, and `fsr 0x80000402` on the SMMU.
+A fault with an empty CP means a data access by a pipe, not a fetch, and the
+FSR alone does not say which buffer. Print the fault address with the syndrome
+so the ring names it: `far` is the 64-bit CB_FAR, `syn` the global syndrome,
+`fsynr0/1` the per-fault syndromes and `cbndx` the context bank that took it.
+Behind `gpudump=1`, like the rest of the dump, because reading a stopped block
+can hang the CPU that reads it.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3361,14 +3361,20 @@
+ 			    GEN7_CP_IB2_REM_SIZE * 4u));
+ 			printf("MONDRIAN GPU: uc ib1 stopped at %u dwords\n",
+ 			    rem >= dwords ? 0u : dwords - rem);
+-			printf("MONDRIAN GPU: uc fault int 0x%x fault 0x%x protect 0x%x fsr 0x%x\n",
++			printf("MONDRIAN GPU: uc fault int 0x%x fault 0x%x protect 0x%x fsr 0x%x far 0x%llx syn 0x%x fsynr0 0x%x fsynr1 0x%x cbndx 0x%x\n",
+ 			    mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_INTERRUPT_STATUS * 4u),
+ 			    mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_HW_FAULT * 4u),
+ 			    mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_PROTECT_STATUS * 4u),
+-			    mondrian_gpu_read(mondrian_uc_smmu, 0x20058u));
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x20058u),
++			    (unsigned long long)mondrian_smmu_read64(
++			    mondrian_uc_smmu, 0x20060u),
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x50u),
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x20068u),
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x2006cu),
++			    mondrian_gpu_read(mondrian_uc_smmu, 0x20068u));
+ 			mondrian_log_flush_now();
+ 		}
+ 	}
