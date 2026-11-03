@@ -230,7 +230,11 @@ them has Metal. That is the path this port follows.
   0x09). A buffer is mapped in user space by its handle
   (`clientMemoryForType`), so the Darwin libdrm stands in for `mmap`.
   Relocations are refused; Mesa's msm backend uses softpin (`MSM_INFO_SET_IOVA`
-  and `GET_IOVA`), which works.
+  and `GET_IOVA`), which works. GEM_NEW also refuses (`MondrianGPU: gem_new
+  <size> refused`) when the descriptor or the IOVA comes up short; Mesos's
+  callers then answer `GL_OUT_OF_MEMORY` (0x505) or crash in Mesa's
+  first-context self test. The low 4 GiB is what runs out first while the
+  window server runs; `0211` allocates above it when the low pool is spent.
 - **Fences are CP-written dwords**: a submission is `CP_INDIRECT_BUFFER_PFE`
   plus `CP_EVENT_WRITE` into a slot of the memptr page, waited on through the
   write-combined alias of that page. No IRQ is needed for correctness; IRQ 332

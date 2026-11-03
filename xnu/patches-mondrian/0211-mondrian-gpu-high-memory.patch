@@ -1,0 +1,40 @@
+xnu 0211: GPU buffers may live above the lowest 4 GiB
+
+The window server's texture uploads and Mesa's first-context self test ask for
+GEM buffers late in the boot, when the low pool is spent (`gem_new 0x700000
+refused` and `gem_new 0x4000 refused` from backboardd in the same ring). The GL
+side answers GL_OUT_OF_MEMORY, the self test faults on the NULL buffer, and
+backboardd — the only process that paints — dies with it.
+
+The CP's stage-1 tables carry 44-bit physicals, so a page above 4 GiB maps the
+same as one below; the 32-bit mask had no reason except habit. Try the whole
+machine first and keep the 32-bit half as the fallback for a fragmenting host.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -414,12 +414,24 @@
+ 	 * descriptor page by page, and asking for a contiguous megabyte makes
+ 	 * the VM hunt for one (measured: vm_page_find_contiguous with
+ 	 * num=256, a zone GC and a boot that never finished the allocation).
++	 *
++	 * The 32-bit pool runs out while the window server runs: everything
++	 * below 4 GiB is taken by then (measured: `gem_new 0x700000 refused`
++	 * and `gem_new 0x4000 refused` from backboardd on the same boot, then
++	 * GL_OUT_OF_MEMORY and a fault when Mesa's first-context self test
++	 * hit the NULL buffer). The stage-1 tables carry 44-bit physicals,
++	 * so memory above 4 GiB is fine; the low pool is only the fallback.
+ 	 */
+ 	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut, (size + 0xfffu) & ~0xfffull,
+-	    0x00000000fffff000ull);
++	    0xfffffffffffff000ull);
+ 	if (memory == NULL) {
+-		return NULL;
++		memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++		    kernel_task, kIODirectionInOut, (size + 0xfffu) & ~0xfffull,
++		    0x00000000fffff000ull);
++		if (memory == NULL) {
++			return NULL;
++		}
+ 	}
+ 	buffer = bufferAdopt(memory, size);
+ 	memory->release();

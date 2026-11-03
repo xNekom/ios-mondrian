@@ -1,0 +1,68 @@
+xnu 0212: a console a verbose boot can keep up with
+
+The panel console painted every pixel of every glyph cell (a full row of
+background stores per character) in write-combining Device memory, and cleared
+the row it was about to use: for a 60-character line that is ~35k stores, and
+the boot log outruns it, so the console lags seconds behind and a photo shows
+where it was, not where it is.
+
+Paint only the pixels each glyph sets, as one 64-bit store per pair, skip blank
+font rows, and drop the per-row clear: a written row was cleared once by the
+screen clear or filled with history by the last scroll, and the scroll clears
+the half it is about to write. A shorter line over a longer one leans on that
+contract, and it is the only one.
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -124,9 +124,15 @@
+ 	}
+ 	if (c == '\n' || early_col == EARLY_COLS) {
+ 		early_col = 0;
++		/*
++		 * The row about to be written was cleared when the screen was
++		 * cleared, when the last scroll filled it with history, or by the
++		 * scroll that put history above the cursor: no extra clear per
++		 * line. CAREFUL: a shorter line over a longer one would depend on
++		 * it, so the invariant is the contract.
++		 */
+ 		if (early_row + 1 < EARLY_HUD_ROW0) {
+ 			early_row++;
+-			mondrian_early_clear_row();
+ 		} else {
+ 			mondrian_early_scroll();
+ 		}
+@@ -134,16 +140,30 @@
+ 			return;
+ 		}
+ 	}
++	/*
++	 * Only the pixels the glyph sets, one 64-bit store per pair of
++	 * neighbouring pixels: the framebuffer is write-combining Device-like
++	 * memory and a line's stores are what a verbose boot spends on the
++	 * console. The cell is background by contract, and a blank row of the
++	 * font paints nothing at all.
++	 */
++	_Static_assert(EARLY_SCALE == 2, "the pack below assumes scale 2");
+ 	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+ 	for (unsigned int gy = 0; gy < 16; gy++) {
++		unsigned char bits = glyph[gy];
++
++		if (bits == 0) {
++			continue;
++		}
+ 		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
++			volatile uint64_t *line = (volatile uint64_t *)(EARLY_FB +
+ 			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
++			    early_col * EARLY_CELL_W);
++
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+-				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
++				if (bits & (1u << gx)) {
++					/* pixels gx*2..gx*2+1 are the same u64 */
++					line[gx] = 0xffffffffffffffffull;
+ 				}
+ 			}
+ 		}
