@@ -1,0 +1,79 @@
+xnu 0223: the wallpaper's poster extensions get the UI library too
+
+The lock screen's wallpaper is drawn by iOS app extensions -- CollectionsPoster,
+GradientPosterExtension, PhotosPosterProvider, ... -- each spawned as its own
+process by launchd. 0112 injects the UI hook into containermanagerd, backboardd
+and SpringBoard only, so those extensions render nothing: their 1326x1326 L008
+surfaces reach the compositor entirely zero (measured: "0 of 5304 bytes 0xff"),
+and libxpc's extension check-in watchdog kills each one with "extension check-in
+timeout" (reason ns 7 code 0x3), twice a boot. That is the missing wallpaper.
+
+Bit 8 of mondrian_ui_hook (so 15 = all four) matches any image whose name
+contains "Poster", which is every one of them, and the board cmdline now passes
+15. The host, PosterBoard, matches too: it is where the poster is composited.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5578,6 +5578,16 @@
+ #define MONDRIAN_HOOK_CONTAINERMANAGERD 0x1
+ #define MONDRIAN_HOOK_BACKBOARDD        0x2
+ #define MONDRIAN_HOOK_SPRINGBOARD       0x4
++/*
++ * The wallpaper is drawn by iOS app extensions (CollectionsPoster,
++ * GradientPosterExtension, PhotosPosterProvider, ...), each launched as its own
++ * process and killed by libxpc's extension check-in watchdog when it does not
++ * become ready ("extension check-in timeout", reason ns 7 code 0x3, twice a
++ * boot). Without this library they render nothing at all: their L008 surfaces
++ * reach the compositor entirely zero, which is the missing wallpaper. Every one
++ * of those names carries "Poster".
++ */
++#define MONDRIAN_HOOK_POSTER            0x8
+ 
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5586,14 +5596,21 @@
+ 	uint32_t wanted = 0;
+ 	const char *name;
+ 	const char library[] = "DYLD_INSERT_LIBRARIES=/usr/libexec/mondrian-ui-hook.dylib";
++	/*
++	 * The poster extensions get the injector itself, from /private/var/vm:
++	 * that copy is the one glblob=1 rewrites at boot, while the root is
++	 * read-only. The UI hook in /usr/libexec only dlopens the injector as a
++	 * library, and the injector arms itself for a named set of processes.
++	 */
++	const char poster[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-inject.dylib";
+ 
+-	/* A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard. */
++	/* A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster extensions. */
+ 	if (!PE_parse_boot_argn("mondrian_ui_hook", &targets, sizeof(targets)) ||
+ 	    targets <= 0 || imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+-	if (name == NULL || sizeof(library) > size) {
++	if (name == NULL || sizeof(library) > size || sizeof(poster) > size) {
+ 		return false;
+ 	}
+ 	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
+@@ -5605,10 +5622,22 @@
+ 	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("SpringBoard") - 1 &&
+ 	    strncmp(name, "SpringBoard", sizeof("SpringBoard") - 1) == 0) {
+ 		wanted = MONDRIAN_HOOK_SPRINGBOARD;
++	} else if (strnstr(name, "Poster", (size_t)imgp->ip_ndp->ni_cnd.cn_namelen) != NULL) {
++		wanted = MONDRIAN_HOOK_POSTER;
+ 	}
+ 	if (wanted == 0 || (targets & wanted) == 0) {
+ 		return false;
+ 	}
++	if (wanted == MONDRIAN_HOOK_POSTER) {
++		static unsigned told;
++
++		if (told++ < 12) {
++			printf("MONDRIAN HOOK: poster target \"%.*s\" (mask 0x%x)\n",
++			    (int)imgp->ip_ndp->ni_cnd.cn_namelen, name, targets);
++		}
++		strlcpy(env, poster, size);
++		return true;
++	}
+ 	strlcpy(env, library, size);
+ 	return true;
+ }

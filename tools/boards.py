@@ -302,7 +302,7 @@ MONDRIAN = Board(
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
-             'mondrian_ui_hook=7 '
+             'mondrian_ui_hook=15 '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1'),
 )
 

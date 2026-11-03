@@ -335,9 +335,18 @@ mondrian_inject(void)
 	void *library;
 
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
-	if (name == NULL || strcmp(name, "backboardd") != 0) {
+	/*
+	 * The window server, and the wallpaper's poster extensions: those render
+	 * the lock screen's picture into L008 surfaces of their own, and measured
+	 * without this they stay entirely zero (the compositor then reads 0 of
+	 * 5304 bytes non-zero) and libxpc kills each extension with "extension
+	 * check-in timeout". The kernel hands the extensions this library from its
+	 * writable path (/private/var/vm), so one build covers both.
+	 */
+	if (name == NULL || (strcmp(name, "backboardd") != 0 && strstr(name, "Poster") == NULL)) {
 		return;
 	}
+	say("mondrian-gl: interposer armed in %s\n", name);
 	if (has_boot_argument("glslots=1")) {
 		dump_slots();
 		return;

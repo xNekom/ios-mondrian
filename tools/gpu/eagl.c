@@ -55,8 +55,9 @@
  * left in the middle of itself; glcensus=1 keeps count of the draws CoreAnimation makes with no
  * program and of the functions it asks for in vain (see census_draw()); glshaders=1 writes down
  * the text of every shader, glshow=TEXTURE puts that texture over the corner of the picture, glplain=0 leaves the
- * draws without a program alone, glcopy=1 copies every IOSurface as if the library could not
- * share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
+ * draws without a program alone, glicon=0 reads a shown 32-bit surface with no pixel format as opacity-first instead
+ * of blue-first (see icon_order: the home screen's icons come that way), glcopy=1 copies every IOSurface as if the
+ * library could not share one, glwait=1 waits for the GPU at the end of every frame and glwait=0 never (see
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
@@ -243,6 +244,7 @@ struct image {
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
+	int alpha_at;                   /* ... which byte that is of a shown 32-bit surface: -1 none, 0 first, 3 last, -2 ask (icon_order) */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
@@ -376,6 +378,20 @@ static uint32_t slot_calls[SLOTS];
 static uint64_t slot_us[SLOTS];         /* mondrian: time spent in each entry */
 static int check_errors = 1;            /* ask the library for an error after every call (the first frames) */
 static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
+/*
+ * The order of a shown surface's four bytes when the surface has no pixel format and is 32 bits
+ * a pixel: what CoreAnimation made a surface around, a picture somebody drew (the home screen's
+ * icons arrive as 192 x 192 surfaces, format 0, 4 bytes a pixel). Not in the surface, and getting
+ * it wrong draws nothing at all, because a texture whose alpha is taken from the wrong byte is
+ * transparent to premultiplied blending. glicon=0: opacity, blue, green, red -- the order the
+ * attached surfaces were measured to have (my_attachImage()). glicon=1 (here): blue, green, red,
+ * opacity, premultiplied, what CoreAnimation and ImageIO make of a 32-bit picture; it is read as
+ * such by uploading it as GL_BGRA, so nothing is swapped. glicon=2: whichever the surface's own
+ * bytes say the opacity is (look_at_surface()), decided again while they are all zero. The lines
+ * note_surface() writes say what the bytes were, and draw_reads_icon() what the draws that read
+ * them had.
+ */
+static int icon_order = 1;
 /*
  * A frame is not drawn into its surface's memory but into a texture of the library's own, and the
  * GPU copies it into the surface at the frame's end (one blit; the display's driver waits for that
@@ -675,6 +691,7 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	memset(image, 0, sizeof(*image));
 	image->texture = texture;
 	image->sub_ok = true;
+	image->alpha_at = -1;
 	image->surface = (IOSurfaceRef)CFRetain(surface);
 	return image;
 }
@@ -717,6 +734,148 @@ bytes_a_pixel(GLenum format, GLenum type)
 		return 4;
 	default:
 		return 2;                               /* the packed 16-bit kinds */
+	}
+}
+
+/*
+ * What the bytes of a 32-bit surface are, for the lines and for icon_order=2: of a premultiplied
+ * picture the byte that is 255 most often is its opacity. Sampled, up to 65536 pixels, so that a
+ * 5 MB poster costs no more than a 16 KB icon.
+ */
+struct surface_look {
+	size_t looked;                  /* pixels counted */
+	unsigned zero[4], full[4], other[4];
+	unsigned colour;                /* OR of the first three bytes: 0 means not one pixel has a colour */
+	uint8_t first[8];               /* the surface's first eight bytes, */
+	uint8_t middle[8];              /* ... and eight from its middle */
+};
+
+static void
+look_at_surface(const uint8_t *base, size_t row, unsigned width, unsigned height, struct surface_look *look)
+{
+	size_t pixels = (size_t)width * (size_t)height, every = pixels > 65536 ? pixels / 65536 : 1;
+
+	memset(look, 0, sizeof(*look));
+	if (base == NULL || width < 4 || height == 0) {
+		return;
+	}
+	memcpy(look->first, base, 8);
+	if (height > 1 && row >= 4 * (size_t)width) {
+		memcpy(look->middle, base + row * (size_t)(height / 2) + 4 * (size_t)(width / 2), 8);
+	}
+	for (size_t pixel = 0; pixel < pixels; pixel += every) {
+		const uint8_t *at = base + row * (size_t)(pixel / width) + 4 * (size_t)(pixel % width);
+
+		for (unsigned i = 0; i < 4; i++) {
+			look->zero[i] += at[i] == 0;
+			look->full[i] += at[i] == 255;
+			look->other[i] += at[i] != 0 && at[i] != 255;
+		}
+		look->colour |= (unsigned)at[0] | ((unsigned)at[1] << 8) | ((unsigned)at[2] << 16);
+		look->looked++;
+	}
+}
+
+/* The byte of a picture that is its opacity: the one that is 255 most often (a picture is mostly opaque). -1: no idea. */
+static int
+opacity_byte(const struct surface_look *look)
+{
+	int best = -1;
+
+	for (int i = 0; i < 4; i++) {
+		if (look->full[i] != 0 && (best < 0 || look->full[i] > look->full[best])) {
+			best = i;
+		}
+	}
+	return best;
+}
+
+/*
+ * A shown surface of somebody else's memory, once per size and a few times over: what its bytes
+ * are, and which byte looks like its opacity. The home screen's icons arrive as 192 x 192
+ * surfaces with no pixel format and 4 bytes a pixel, never show, and the same bytes tell three
+ * different stories apart: every byte 0 is a surface nothing has drawn into (the texture is not
+ * the problem, the pixels never got there); 255 in byte 3 of most pixels is blue-first
+ * premultiplied BGRA, what icon_order=1 reads it as; 255 in byte 0 is opacity first (icon_order=0).
+ * Colour 0 with opacity elsewhere is a picture with nothing but an alpha channel.
+ */
+static void
+note_surface(struct image *image, const uint8_t *base, size_t row)
+{
+	static struct {
+		GLsizei width, height;
+		unsigned told;
+	} seen[8];
+	static unsigned lines;
+	struct surface_look look;
+	unsigned slot = sizeof(seen) / sizeof(seen[0]), spare = slot, at;
+
+	/*
+	 * Every surface with no pixel format (whatever its size: the lock screen's poster was one),
+	 * and every shown 32-bit surface of 256 x 256 or less, which is where the icons are. Larger
+	 * shown surfaces that have a pixel format are not asked about: there are many of them.
+	 */
+	if (base == NULL || image->width <= 0 || image->height <= 0 ||
+	    (!image->wrapped && (image->width > 256 || image->height > 256))) {
+		return;
+	}
+	for (at = 0; at < sizeof(seen) / sizeof(seen[0]); at++) {
+		if (seen[at].told != 0 && seen[at].width == image->width && seen[at].height == image->height) {
+			slot = at;
+			break;
+		}
+		if (seen[at].told == 0 && spare == sizeof(seen) / sizeof(seen[0])) {
+			spare = at;
+		}
+	}
+	if (slot == sizeof(seen) / sizeof(seen[0])) {
+		slot = spare;
+	}
+	if (slot == sizeof(seen) / sizeof(seen[0]) || lines >= 24) {
+		return;
+	}
+	if (seen[slot].told == 0) {
+		seen[slot].width = image->width;
+		seen[slot].height = image->height;
+	}
+	/* (three times: a surface can be empty when it is first shown and filled after) */
+	if (++seen[slot].told > 3) {
+		return;
+	}
+	lines++;
+	look_at_surface(base, row, (unsigned)image->width, (unsigned)image->height, &look);
+	say("mondrian-gl: shown surface %u as texture %u, %d x %d, %zu bytes a row, pixel format %#x, asked as %#x/%#x/%#x, "
+	    "opacity byte %d%s: of %zu pixels byte0 0/255/other %u/%u/%u, byte1 %u/%u/%u, byte2 %u/%u/%u, byte3 %u/%u/%u, "
+	    "colour or %#x; first %02x %02x %02x %02x %02x %02x %02x %02x, middle %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	    IOSurfaceGetID(image->surface), image->texture, image->width, image->height, row,
+	    (unsigned)IOSurfaceGetPixelFormat(image->surface), image->internal, image->format, image->type, image->alpha_at,
+	    image->alpha_at == 0 ? " (swapped)" : "", look.looked,
+	    look.zero[0], look.full[0], look.other[0], look.zero[1], look.full[1], look.other[1], look.zero[2], look.full[2],
+	    look.other[2], look.zero[3], look.full[3], look.other[3], look.colour & 0xffffff,
+	    look.first[0], look.first[1], look.first[2], look.first[3], look.first[4], look.first[5], look.first[6],
+	    look.first[7], look.middle[0], look.middle[1], look.middle[2], look.middle[3], look.middle[4], look.middle[5],
+	    look.middle[6], look.middle[7]);
+}
+
+/*
+ * The textures of the small shown surfaces (the icons): the first draw that reads one of them
+ * writes down what it was drawn with (draw_reads_icon()), because a texture that is right and a
+ * draw that is clipped or not blended look the same on the screen.
+ */
+#define ICON_TEXTURES   16
+static GLuint icon_textures[ICON_TEXTURES];
+static unsigned icon_textures_count;
+
+static void
+icon_texture_shown(GLuint texture)
+{
+	for (unsigned i = 0; i < icon_textures_count; i++) {
+		if (icon_textures[i] == texture) {
+			return;
+		}
+	}
+	if (icon_textures_count < ICON_TEXTURES) {
+		icon_textures[icon_textures_count++] = texture;
 	}
 }
 
@@ -766,11 +925,16 @@ surface_shared(struct eagl *e, struct image *image)
 	 * wallpaper came out white (traced: the poster draw leaves 255 255 255 255
 	 * where a tint draw of the same frame leaves 18 127 195 255). Refusing here
 	 * sends it down the copy path, which uploads it as GL_LUMINANCE.
+	 *
+	 * A shown 32-bit surface with no pixel format (alpha_at, an icon) is copied too: which byte
+	 * of it is opacity is decided by the copy (surface_to_texture()), and a texture that is the
+	 * surface's memory cannot be told any order but its own -- and it is worth keeping the two
+	 * questions apart in what a frame's log says.
 	 */
 	unsigned surface_pixel = IOSurfaceGetBytesPerElement(surface);
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
-	    image->plane != 0 || surface_pixel != 4 ||
+	if (!share_surfaces || image->invert || image->alpha_first || image->alpha_at != -1 || image->format != GL_BGRA ||
+	    image->type != GL_UNSIGNED_BYTE || image->plane != 0 || surface_pixel != 4 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !mondrian_gl_surface_texture(context_gl(e), IOSurfaceGetID(surface))) {
@@ -872,6 +1036,30 @@ surface_to_texture(struct eagl *e, struct image *image)
 		return;
 	}
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	/*
+	 * A shown 32-bit surface of somebody else's memory (and any of 256 x 256 or less): which of
+	 * its bytes is the opacity, decided here (it is not in the surface) before the copy and the
+	 * upload, because a texture whose alpha comes from the wrong byte draws nothing at all with
+	 * premultiplied blending. And what the bytes were, written down once per size
+	 * (note_surface()).
+	 */
+	if (!planar && pixel == 4 && image->type == GL_UNSIGNED_BYTE && !image->target &&
+	    (image->wrapped || (image->width <= 256 && image->height <= 256))) {
+		if (image->alpha_at == -2) {
+			struct surface_look look;
+
+			look_at_surface(base, row, (unsigned)image->width, (unsigned)image->height, &look);
+			if (look.colour != 0) {         /* (an empty surface says nothing: asked again when it is filled) */
+				image->alpha_at = opacity_byte(&look) == 0 ? 0 : 3;
+			}
+		}
+		if (image->alpha_at == 0) {
+			alpha_first = true;     /* opacity, blue, green, red: swapped into the order the texture was told */
+		} else if (image->alpha_at == 3) {
+			up_format = GL_BGRA;    /* blue, green, red, opacity: said to the upload instead, nothing to swap */
+		}
+		note_surface(image, base, row);
+	}
 	if ((image->invert || alpha_first) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
 		for (GLsizei y = 0; y < image->height; y++) {
 			const uint8_t *from = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
@@ -891,31 +1079,6 @@ surface_to_texture(struct eagl *e, struct image *image)
 			}
 		}
 		base = flipped;
-	}
-	/*
-	 * What a shown surface of somebody else's memory actually holds: the home
-	 * screen's icons arrive as 192x192 surfaces with no pixel format, are
-	 * uploaded once and never change, and composited with premultiplied alpha
-	 * they draw nothing. Alpha 0 everywhere with RGB non-zero means the channel
-	 * order is not the one assumed; alpha 0 and RGB 0 means the surface itself
-	 * is empty and the pixels never got there.
-	 */
-	if (image->wrapped && pixel == 4 && image->width > 0 && image->height > 0) {
-		static unsigned told;
-
-		if (told++ < 8) {
-			size_t zero = 0, full = 0, pixels = (size_t)image->width * (size_t)image->height;
-			unsigned rgb = 0;
-
-			for (size_t at = 0; at + 4 <= row * (size_t)image->height; at += 4) {
-				zero += base[at + 3] == 0;
-				full += base[at + 3] == 0xff;
-				rgb |= base[at] | base[at + 1] | base[at + 2];
-			}
-			say("mondrian-gl: %zu x %zu wrapped surface%s: alpha 0 in %zu of %zu, 255 in %zu, rgb or %02x\n",
-			    (size_t)image->width, (size_t)image->height, image->alpha_first ? " (swapped)" : "",
-			    zero, pixels, full, rgb);
-		}
 	}
 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
@@ -3240,6 +3403,41 @@ my_glVertexAttribPointer(void *context, GLuint index, GLint size, GLenum type, G
 	EAGL_LEAVE(e, MONDIAN_GL_VERTEX_ATTRIB_POINTER);
 }
 
+/*
+ * The first draw that reads one of those small shown surfaces (icon_texture_shown()) says what it
+ * was made with: a texture that is right and a draw that is clipped, scissored or not blended
+ * look the same on the screen. Once a texture, and only for those, so it costs nothing else.
+ */
+static void
+draw_reads_icon(struct eagl *e)
+{
+	static bool said[ICON_TEXTURES];
+	GLint blend[2] = { 0, 0 }, scissor[4] = { 0, 0, 0, 0 }, view[4] = { 0, 0, 0, 0 };
+	unsigned at;
+
+	if (icon_textures_count == 0) {
+		return;
+	}
+	for (at = 0; at < icon_textures_count; at++) {
+		if (!said[at] && icon_textures[at] == e->bound[0]) {
+			break;
+		}
+	}
+	if (at == icon_textures_count) {
+		return;
+	}
+	said[at] = true;
+	glGetIntegerv(GL_BLEND_SRC_RGB, &blend[0]);
+	glGetIntegerv(GL_BLEND_DST_RGB, &blend[1]);
+	glGetIntegerv(GL_SCISSOR_BOX, scissor);
+	glGetIntegerv(GL_VIEWPORT, view);
+	say("mondrian-gl: a draw reads texture %u, a small shown surface: into framebuffer %u (texture %u), %s %#x %#x, "
+	    "%s %d,%d %dx%d, viewport %d,%d %dx%d, program %u\n", e->bound[0], e->framebuffer, e->colour,
+	    glIsEnabled(GL_BLEND) ? "blend on" : "blend off", blend[0], blend[1],
+	    glIsEnabled(GL_SCISSOR_TEST) ? "scissor on" : "no scissor", scissor[0], scissor[1], scissor[2], scissor[3],
+	    view[0], view[1], view[2], view[3], e->program);
+}
+
 static void
 my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 {
@@ -3249,6 +3447,7 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 
 	EAGL_ENTER(e, MONDIAN_GL_DRAW_ARRAYS);
 	bind_nothing(e);
+	draw_reads_icon(e);
 	drawing(e);
 	count_spans(e, mode, count);
 	e->draws++;
@@ -3335,6 +3534,7 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 
 	EAGL_ENTER(e, MONDIAN_GL_DRAW_ELEMENTS);
 	bind_nothing(e);
+	draw_reads_icon(e);
 	dump_draw_state();
 	drawing(e);
 	count_spans(e, mode, count);
@@ -4072,17 +4272,22 @@ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long 
 	}
 	image->wrapped = IOSurfaceGetPixelFormat(surface) == 0;
 	/*
-	 * A shown surface with no pixel format has the same memory order the
-	 * attached ones do -- opacity first, then blue, green, red (measured; see
-	 * my_attachImage) -- and it matters here too: the home screen's icons come
-	 * as 192x192 surfaces of that kind, uploaded verbatim they were composited
-	 * with alpha taken from the red channel, which is about zero, so every icon
-	 * drew nothing at all. `alpha_first` swaps the two in the copy that already
-	 * flips the image.
+	 * A shown surface with no pixel format is a 32-bit picture CoreAnimation made a surface
+	 * around: the home screen's icons come as 192 x 192 surfaces of that kind, and composited
+	 * with premultiplied alpha a texture whose alpha is taken from the wrong byte draws nothing
+	 * at all. Which byte that is is not in the surface: icon_order says where to look -- blue,
+	 * green, red, opacity by default, the order CoreAnimation and ImageIO make of a 32-bit
+	 * picture (surface_to_texture() uploads it as GL_BGRA), opacity first as the attached ones
+	 * were measured to be, or whichever the bytes say. Those small ones are also kept for
+	 * draw_reads_icon(), which writes down what the draws that read them were made with.
 	 */
-	if (image->wrapped && IOSurfaceGetBytesPerElement(surface) == 4 &&
+	if (image->wrapped && IOSurfaceGetBytesPerElement(surface) == 4 && image->type == GL_UNSIGNED_BYTE &&
 	    (image->format == GL_BGRA || image->format == 0x1908)) {
-		image->alpha_first = true;
+		image->alpha_at = icon_order == 0 ? 0 : icon_order == 1 ? 3 : -2;
+	}
+	if (IOSurfaceGetBytesPerElement(surface) == 4 && image->type == GL_UNSIGNED_BYTE &&
+	    width > 0 && height > 0 && width <= 256 && height <= 256) {
+		icon_texture_shown((GLuint)texture);
 	}
 	began = now_us();
 	if (!surface_shared(e, image)) {
@@ -4298,6 +4503,9 @@ install(void)
 		}
 		if ((argument = strstr(arguments, "glshow=")) != NULL) {
 			shown_texture = (GLuint)strtoul(argument + 7, NULL, 10);
+		}
+		if ((argument = strstr(arguments, "glicon=")) != NULL) {
+			icon_order = (int)strtoul(argument + 7, NULL, 10);
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;

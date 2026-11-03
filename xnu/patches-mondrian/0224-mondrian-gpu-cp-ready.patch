@@ -1,0 +1,208 @@
+xnu 0224: the CP proves it consumed the bring-up before the ring is published
+
+The same kernel brings the CP up two ways. Measured: in the boot that works
+CP_RB_RPTR reaches 12 after the secure-mode switch and the 2000-submission
+stress runs; in the boot that does not it stays at 11, the SQE halts on the
+switch's own header (`cp sqe stat 0x649 0x70e60001`, ucode pc 0x224, its halt
+loop) and no stress line appears at all. The ring was published anyway --
+`mondrian_uc_up = 1` sat after the step's `if (rptr >= at)`, not inside it --
+so MondrianGPU appeared, every later submission waited out its 300 ms, Mesa's
+fd_pipe_new2 failed and the UI silently ran on softpipe: 26 fps, every frame
+copied out. A boot with a dead CP has to say so instead.
+
+The read pointer of every step is now read through one bounded helper
+(`mondrian_cp_wait_rptr`, 2000 x 1 ms, the window the steps already had inline),
+and the ring is published only once the CP has consumed the last bring-up
+packet. A failure after the switch is retried once: the SQE is gated, a CP_NOP
+goes into the dword it stopped on, the switch is re-issued behind it, and the
+SQE is started again through the same raw CP_SQE_CNTL store the start uses,
+after the same delay(20). It reuses the read pointer the SQE kept, writes no
+GPU, GMU, GDSC or SMMU register, and is not a GPU reset: the CP register port
+has just answered the CP_RB_RPTR reads that failed the check. `cpnoretry=1`
+reports instead of retrying. If it still fails the ring stays unpublished and
+`mondrian_gpu_uc_ready()` stays 0, so Mesa fails at pipe creation instead of
+300 ms into the first frame.
+
+What the next boot's log says:
+
+	MONDRIAN GPU: cp secmode rptr 12 wptr 12
+	MONDRIAN GPU: cp ready rptr 25 of 25
+	    the CP consumed every bring-up packet; the healthy boot is unchanged
+	    apart from the new `cp ready` line.
+	MONDRIAN GPU: cp secmode rptr 11 wptr 12
+	MONDRIAN GPU: cp secmode retry rptr 15 of 15
+	    the race happened and the retry recovered it; the ring is published
+	    and submissions fence.
+	MONDRIAN GPU: cp NOT ready rptr 11 of 12, sqe 0x649 0x70e60001, ring not published
+	    the CP is dead: MondrianGPU does not appear, so Mesa's open fails
+	    immediately rather than every frame waiting out a fence.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1730,6 +1730,11 @@
+ /* gpustart: start the SQE. On by default now that the whole path works
+  * (the parity fix and the four streams); gpustart=0 leaves it stopped. */
+ static int mondrian_cp_run = 1;
++/* cpnoretry=1: report a SQE that stopped on the secure-mode switch instead of
++ * re-issuing it once. The retry is the only way back from the measured race
++ * (the same kernel drains the switch in one boot and halts on it in the next),
++ * and it is one SQE restart, not a GPU reset. */
++static int mondrian_cp_noretry;
+ static uint64_t mondrian_cp_ttbr0;
+ static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
+ static vm_offset_t mondrian_cp_scratch_view;
+@@ -2250,6 +2255,29 @@
+ 	    (mondrian_pm4_parity(reg) << 27);
+ }
+ 
++/*
++ * Wait, with a bound, for the CP to consume up to `want` dwords. Every read of
++ * CP_RB_RPTR in the bring-up goes through here: a register access that stalls
++ * hangs the CPU that issued it (docs/MONDIAN_GPU.md), so the loop always ends
++ * and the caller decides from the value it returns. 2000 x 1 ms is the window
++ * each step already used.
++ */
++static uint32_t
++mondrian_cp_wait_rptr(vm_offset_t gpu, uint32_t want)
++{
++	uint32_t rptr = 0;
++	unsigned i;
++
++	for (i = 0; i < 2000; i++) {
++		rptr = mondrian_gpu_read(gpu, GEN7_CP_RB_RPTR * 4u);
++		if (rptr >= want) {
++			return rptr;
++		}
++		delay(1000);
++	}
++	return rptr;
++}
++
+ static int
+ mondrian_gpu_cp_start(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t gpucc,
+     vm_offset_t gmu)
+@@ -2623,16 +2651,54 @@
+ 		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		CPW(GEN7_CP_RB_WPTR, at);
+-		for (i = 0; i < 2000; i++) {
+-			rptr = CPR(GEN7_CP_RB_RPTR);
+-			if (rptr >= at) {
+-				break;
+-			}
+-			delay(1000);
+-		}
++		rptr = mondrian_cp_wait_rptr(gpu, at);
+ 		printf("MONDRIAN GPU: cp secmode rptr %u wptr %u\n", rptr, at);
+ 		mondrian_log_flush_now();
+ 
++		if (rptr < at && mondrian_cp_noretry == 0) {
++			/*
++			 * The SQE stopped on the switch. This boot's rptr is
++			 * where it stopped (measured: 11 of 12), and the SQE
++			 * keeps that read pointer, so restart it from there:
++			 * a CP_NOP in the dword it stopped on, the switch
++			 * again behind it, and the ring published at the end
++			 * of both. Only two things are written that the
++			 * working path does not already write at this point
++			 * -- CP_SQE_CNTL 0 then 1 through the same raw store
++			 * the start above uses, after the same delay(20) --
++			 * and no GPU, GMU, GDSC or SMMU register is touched,
++			 * so a CPU that issued the register access is not at
++			 * risk beyond the access itself: the CP register port
++			 * has just answered the CP_RB_RPTR reads that failed
++			 * this check.
++			 */
++			uint32_t stop = rptr;
++			uint32_t want = stop + 4;
++
++			*(volatile uint32_t *)(gpu + GEN7_CP_SQE_CNTL * 4u) = 0;
++			ring[stop] = mondrian_pm4_type7(0x10u, 1);	/* CP_NOP */
++			ring[stop + 1] = 0;
++			ring[stop + 2] = mondrian_pm4_type7(0x66u, 1);
++			ring[stop + 3] = 0;
++			mondrian_gpu_mem_flush(&mondrian_cp_ring,
++			    mondrian_cp_ring.bytes);
++			__asm__ volatile("dsb sy" ::: "memory");
++			CPW(GEN7_CP_RB_WPTR, want);
++			*(volatile uint32_t *)(gpu + GEN7_CP_SQE_CNTL * 4u) = 1;
++			delay(20);
++			rptr = mondrian_cp_wait_rptr(gpu, want);
++			printf("MONDRIAN GPU: cp secmode retry rptr %u of %u\n",
++			    rptr, want);
++			mondrian_log_flush_now();
++			/*
++			 * The cursor follows what was written, never what was
++			 * consumed: the next packet goes after the retry's, so
++			 * a CP that stopped short of `want` fails the check
++			 * below instead of having that packet overwritten.
++			 */
++			at = want;
++		}
++
+ 		if (rptr >= at) {
+ 			/*
+ 			 * First memory packet after the switch: a canary into
+@@ -2724,14 +2790,38 @@
+ 				mondrian_log_flush_now();
+ 			}
+ 		}
+-		/* From here the ring belongs to the user client, which
+-		 * continues at this dword. */
+-		mondrian_uc_gpu = gpu;
+-		mondrian_uc_smmu = smmu;
+-		mondrian_uc_gmu = gmu;
+-		mondrian_uc_at = at;
+-		mondrian_uc_up = 1;
++		/*
++		 * The ring belongs to the user client only after the CP has
++		 * been seen to consume the last bring-up packet: a SQE that
++		 * stopped on one packet never consumes another, and publishing
++		 * the ring anyway turns every later submission into a 300 ms
++		 * timeout and Mesa into a softpipe fallback (measured: "cp
++		 * secmode rptr 11 wptr 12" with no stress line, then every
++		 * stream "done 0 in 300 ms"). A bounded read because the CP
++		 * may be the wedge: the submit path, not this check, is where
++		 * an unusable ring is now refused.
++		 */
++		rptr = mondrian_cp_wait_rptr(gpu, at);
+ 		if (rptr >= at) {
++			printf("MONDRIAN GPU: cp ready rptr %u of %u\n", rptr, at);
++			/* From here the ring is the user client's, which
++			 * continues at this dword. */
++			mondrian_uc_gpu = gpu;
++			mondrian_uc_smmu = smmu;
++			mondrian_uc_gmu = gmu;
++			mondrian_uc_at = at;
++			mondrian_uc_up = 1;
++		} else {
++			uint32_t s0, s1;
++
++			CPW(GEN7_CP_SQE_STAT_ADDR, 0);
++			s0 = CPR(GEN7_CP_SQE_STAT_DATA);
++			s1 = CPR(GEN7_CP_SQE_STAT_DATA);
++			printf("MONDRIAN GPU: cp NOT ready rptr %u of %u, sqe 0x%x 0x%x, ring not published\n",
++			    rptr, at, s0, s1);
++		}
++		mondrian_log_flush_now();
++		if (mondrian_uc_up) {
+ 			/* Submissions through the call the user client uses,
+ 			 * back to back. 2000 of them wrap the 32 KiB ring
+ 			 * twice, reuse every fence slot and prove the order:
+@@ -2943,7 +3033,7 @@
+ #undef CPW
+ #undef CPR
+ #undef CPW64
+-	return rptr == 10 ? 0 : -1;
++	return mondrian_uc_up ? 0 : -1;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -3946,6 +4036,8 @@
+ 	    sizeof(mondrian_cp_zap));
+ 	(void)PE_parse_boot_argn("gpustart", &mondrian_cp_run,
+ 	    sizeof(mondrian_cp_run));
++	(void)PE_parse_boot_argn("cpnoretry", &mondrian_cp_noretry,
++	    sizeof(mondrian_cp_noretry));
+ 	(void)PE_parse_boot_argn("gpupm4", &mondrian_uc_pm4,
+ 	    sizeof(mondrian_uc_pm4));
+ 	(void)PE_parse_boot_argn("gpunoblit", &mondrian_uc_noblit,
