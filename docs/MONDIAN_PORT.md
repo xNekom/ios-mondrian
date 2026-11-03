@@ -198,25 +198,23 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
 is not on the critical path: `0083` reserves panel memory, `0085` presents
-IOSurface swaps, and the lock screen now comes up. `0084`'s colour bars were a
-one-off packing test; `0208` drops them so they no longer show over the boot
-logo.
+IOSurface swaps, and the lock screen draws. `0084`'s colour bars were a one-off
+packing test, off since `0208`; `0210` puts the kernel log back on the panel
+(until then only the early console painted it) and clears the bootloader's
+splash off the rows nothing wrote.
 Three things had to line up: CoreAnimation waits 30 s for an `IOAcceleratorES`
 service and draws nothing without `TimingElements`/`ColorElements` (`0114`
 publishes one 60 Hz mode and an empty accelerator, leaving the software
-renderer); the panel must be written through the console alias, not through an
-`IOMemoryDescriptor`, whose device pager over managed pages panics
-`pmap_remove_pv`; and the screen console is stopped with
-`disableConsoleOutput`, because `PE_initialize_console(kPEDisableScreen)`
-unmaps that alias and panics the same way (`0115`). SpringBoard then blocks in
+renderer); the panel must be written through the console alias (an
+`IOMemoryDescriptor` puts a device pager on managed pages and panics
+`pmap_remove_pv`), and the console is only stopped with `disableConsoleOutput`
+(`0115`). SpringBoard blocks in
 `-[SBLockdownManager _setupActivationState]` on MobileActivation; the dylib
 forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
-is a real MDSS driver: the `qcom,mdss_mdp@ae00000` node,
-`qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` panel, vendor gamma/DSC tables.
+is a real MDSS driver (`qcom,mdss_mdp@ae00000`, `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`).
 
-The remaining wall is still the CPU rasterizer: 6.4 fps full panel, 9.3 at
-900x2000. The GPU path itself is in (kernel, `MondrianGPU`, Mesa built against
-it); what is left is CoreAnimation's side, `docs/COREANIMATION_GLES.md`.
+The remaining wall is the CPU copy-out of every frame
+(`docs/COREANIMATION_GLES.md`); the GPU path itself is in.
 
 ### 4. The touch
 

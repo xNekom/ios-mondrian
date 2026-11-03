@@ -14,6 +14,15 @@ they were paid for:
   `OSMesaMakeCurrent`, killing `backboardd`. The Mesa test draws with the compatibility profile,
   so that is what the window server uses now (`OSMesaCreateContextExt(GL_RGBA, 24, 8, 0)`), with
   the shaders rewritten to GLSL 120 (`#version 120`, no precision words, `gl_FragData` native).
+- **A second OSMesa context kills the compositor.** `mondrian_gl_destroy()` is a no-op so the
+  one context outlives every `EAGLContext`, but the sharing loop only looked at the live
+  `contexts[]`: once CoreAnimation released its contexts (`_detectDisplays` does), the next
+  `initWithAPI:` found nothing to share and created another OSMesa context. That one asks the
+  GPU for its screen buffers, and when the allocation is refused (`MondrianGPU: gem_new 0x4000
+  refused`) the fault is inside `OSMesaCreateContextAttribs`, at address 0x1c, and takes
+  `backboardd` with it. The whole UI then freezes — no swaps, `backboardd pc=0x0` in the SMP
+  sampler, SpringBoard waiting — which reads like "touch does not work". Reuse the file-scope
+  `the_gl` whenever it exists.
 - **The kernel writes the dylibs into `/private/var/vm`, not `/usr/libexec`.** The root is
   mounted `MNT_RDONLY` (`rootfs mount flags 0x400d001`, and `vnode_open` there answers EROFS);
   `/private/var` is a later mount and is writable (the pager makes its swap file in

@@ -3725,6 +3725,18 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 			break;
 		}
 	}
+	if (e->gl == NULL && the_gl != NULL) {
+		/*
+		 * The one OSMesa context outlives every EAGLContext
+		 * (mondrian_gl_destroy() is a no-op), so reuse it after the last
+		 * EAGLContext has been deallocated. A second one asks the GPU for
+		 * its screen buffers and, when that allocation is refused, faults
+		 * inside OSMesaCreateContextAttribs and takes backboardd with it
+		 * (measured: SIGSEGV at 0x1c after "gem_new 0x4000 refused"; the UI
+		 * then stays frozen because the compositor is gone).
+		 */
+		e->gl = the_gl;
+	}
 	if (e->gl == NULL) {
 		e->gl = mondrian_gl_create((int)api);
 	}

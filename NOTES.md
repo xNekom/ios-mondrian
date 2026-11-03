@@ -37,17 +37,16 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The lock screen is up. CoreAnimation needs
+- **Display and UI.** The lock screen draws. CoreAnimation needs
   `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
   waits 30 s and draws nothing); `0114` publishes them and leaves the software
-  renderer. The panel is written through the console alias, never through an
-  `IOMemoryDescriptor` or `PE_initialize_console(kPEDisableScreen)`: both put a
-  device pager on managed pages and panic in `pmap_remove_pv`. SpringBoard
-  waits on MobileActivation in `_setupActivationState`; the dylib forces
-  activation and skips Setup, including the `SBLockdownManager` and
-  `SBSetupManager` gates. The cmdline in `tools/boards.py` carries
-  `mondrian_ui_hook=7`; the root must have
+  renderer. SpringBoard waits on MobileActivation in `_setupActivationState`;
+  the dylib forces activation and skips Setup, including the
+  `SBLockdownManager` and `SBSetupManager` gates. The cmdline in
+  `tools/boards.py` carries `mondrian_ui_hook=7`; the root must have
   `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
+  The wallpaper and some text are white blocks for now: a texture upload fails
+  (`glDrawElements: 0x502`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
@@ -96,13 +95,11 @@ volatile; `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 and refuses `boot_a` unless `BOOT_A=1`.
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
-ring; `0174` arms persistence at the end of the UFS probe, before
-`vfs_mountroot`, so a failed mount still leaves the log on disk. With
-`mondrianfb_noconsole=1` the kernel never repaints the panel: a photo can show
-a frame from an earlier boot, and the ring is the only truth. Inspect a
-previous boot by running the real kernel, then a dump kernel with
-`mondriandump=1` and `mondriandumpmatch=SMP,CRASH,swap,memorystatus` (`0099`
-splits the list); the dump reads the prior ring before starting its own writer.
+ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
+log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
+CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
+A previous boot is read by running the real kernel, then a dump kernel with
+`mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
 
 **Host-side testing.** `tools/qemu-ios.py` boots the payload; `--kernel` only
 feeds its decoder (`docs/QEMU_TESTING.md`), so rebuild the payload.
@@ -248,12 +245,15 @@ reading from userdata`). Flash a sparse image instead (`tools/mk-simg.py`,
 line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
 e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 
-**The console is a ring with a cursor block.** The newest line is the one above
-the cursor marker; reading then continues downward and wraps to the top. Read it
-through recovery and ADB (`tools/wsl/pull-ring.sh`). The shim's `test_ufs()`
-faults (`PANIC SYNC`, `STAGE ufs`) on any boot that came from fastboot, which
-leaves the host powered down: build that image with `SHIM_NO_UFS` (`LOGVIEW`
-implies it).
+**The console paints the kernel log and scrolls.** The early console drew its
+own marks and the kernel's `printf` path only reached the log ring, so the panel
+froze at the last early mark and looked like a dead boot. `0210` paints
+`console_write()` on the panel too, clears it once first (the rows nothing wrote
+kept the bootloader's splash) and scrolls half a screen at the last text row,
+not every line — a pass is 4.6M stores. The shim's `test_ufs()` faults
+(`PANIC SYNC`, `STAGE ufs`) on any boot that came from fastboot, which leaves
+the host powered down: build that image with `SHIM_NO_UFS` (`LOGVIEW` implies
+it).
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;

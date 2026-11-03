@@ -4,6 +4,7 @@
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U
+#define BLACK	0xff000000U
 #define WHITE	0xffffffffU
 #define YELLOW	0xffffff00U
 #define GREEN	0xff00ff00U

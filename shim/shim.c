@@ -660,7 +660,7 @@ void shim_main(uint64_t dtb)
 	 * goes wrong while reading the device tree, the screen still shows
 	 * where it stopped. */
 	con_enable(FB_BASE, FB_W, FB_H);
-	con_clear(RED);		/* what is on the screen is from this run */
+	con_clear(BLACK);	/* a plain console; the labels carry the colour */
 	con_str("S1", "console on");
 	con_hex("DTB", dtb);
 	con_skip();
