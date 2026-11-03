@@ -301,9 +301,13 @@ no sudo is needed.
    Berlin family answers a memory echo at `0x10000` (write eight `0xAA` bytes,
    read them back), which proves power, reset and framing in one transfer;
    the classic product ID is at `0x8140`.
-6. **HID wiring.** `MondrianHIDTouch` already publishes a digitizer service
-   (`0048`); feed it from the touch thread with `IOHIDEventCreateDigitizerEvent`
-   style collections in the same way `MondrianHIDButtons` feeds keys.
+6. **HID wiring.** `MondrianHIDTouch` publishes a digitizer service (`0048`)
+   and `mondrian_hid_touch()` feeds it one collection per report. The event
+   must carry `kIOHIDEventFieldDigitizerIsDisplayIntegrated` on the collection
+   and on every finger, and each new touch needs a fresh identity (`0209`).
+   Without the field backboardd reads the events — the ring shows
+   `touch 16-22/s` during a swipe — and drops them before they become touches,
+   so nothing on screen reacts.
 
 ## Milestones, each one testable in a single boot
 
@@ -314,7 +318,8 @@ no sudo is needed.
    window.
 3. The pad order and the product ID: a read of `0x00010014` returns "BERLIN".
 4. One touch report into `MondrianHIDTouch`: the lock screen unlocks with a
-   swipe.
+   swipe. Reports alone are not enough: the event also has to say it is
+   display integrated (layer 6).
 5. Multi-touch, then the buttons (power/volume) through the HID button service.
 
 ## Traps
@@ -359,6 +364,13 @@ no sudo is needed.
   prefix length. It is not a register-compatible gt9xx either: the id register
   at `0x8140` does not exist, and the liveness test is the eight-byte echo at
   `0x10000`.
+- **A digitizer event without `IsDisplayIntegrated` reaches backboardd and
+  stops there.** The service property (`DisplayIntegrated`) and the event
+  field (`kIOHIDEventFieldDigitizerIsDisplayIntegrated`) are two different
+  things; an absolute digitizer with the field clear is a pointing device with
+  no display, so the touch never becomes a `UITouch`. The symptom is a
+  working report path (`MONDRIAN HID: touch 0 down at ...` in the ring,
+  `touch 16-22/s` in the fps line) with no reaction on screen.
 - **The TLMM bit layout is the sm8450 one**, not the msm8998 one: mux in bits
   2-4, pull in bits 0-1 (0 none, 1 down, 3 up), drive in bits 6-8, output
   enable in bit 9 (`pinctrl-sm8450.c`'s `PINGROUP`). Inside `IN_OUT`, bit 0 is

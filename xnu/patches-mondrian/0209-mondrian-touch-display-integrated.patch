@@ -1,0 +1,72 @@
+xnu 0209: the digitizer event says it is display integrated
+
+The touch driver reports every finger to backboardd and backboardd reads
+them, but nothing on screen reacts: an absolute digitizer whose events do not
+carry kIOHIDEventFieldDigitizerIsDisplayIntegrated is a pointing device with
+no display, so the events are dropped before they become touches. Every working
+injector sets that field (WebKit's HIDEventGenerator), and so do the vendor
+drivers.
+
+Set it on the collection and on every finger. Also give each new touch a new
+identity (reusing one makes a second tap look like the first one continuing),
+add Identity to the lift mask, and index fingers from 1 (0 is the hand
+collection).
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -362,11 +362,14 @@
+ 	bool fDown[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fX[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fY[MONDRIAN_TOUCH_FINGERS];
++	UInt32 fIdentity[MONDRIAN_TOUCH_FINGERS];
+ };
+ OSDefineMetaClassAndStructors(MondrianHIDTouch, IOHIDEventService);
+ 
+ static MondrianHIDButtons *gSweetButtons;
+ static MondrianHIDTouch *gSweetTouch;
++/* Every touch gets a new identity: a repeated one is the same finger. */
++static UInt32 gSweetTouchIdentity;
+ 
+ bool
+ MondrianHIDButtons::start(IOService *provider)
+@@ -461,6 +464,17 @@
+ 		return;
+ 	}
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
++	/*
++	 * backboardd only delivers a digitizer event to a display when the
++	 * event says it is display integrated; the service property alone is
++	 * not enough, and without this the touch reaches backboardd and is
++	 * dropped there (nothing on screen reacts).
++	 */
++	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, TRUE);
++
++	if (!was && down) {
++		fIdentity[finger] = ++gSweetTouchIdentity;
++	}
+ 
+ 	UInt32 cmask = 0;
+ 	for (int i = 0; i < MONDRIAN_TOUCH_FINGERS; i++) {
+@@ -478,18 +492,17 @@
+ 		UInt32 mask = 0;
+ 		if (i == finger) {
+ 			if (was != down) {
+-				mask |= kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange;
++				mask |= kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange |
++				    kIOHIDDigitizerEventIdentity;
+ 			}
+ 			if (moved) {
+ 				mask |= kIOHIDDigitizerEventPosition;
+ 			}
+-			if (!was && down) {
+-				mask |= kIOHIDDigitizerEventIdentity;
+-			}
+ 		}
+-		child->setIntegerValue(kIOHIDEventFieldDigitizerIndex, i);
+-		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIndex, i + 1);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, fIdentity[i]);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, TRUE);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
+ 		collection->appendChild(child);
+ 		child->release();
