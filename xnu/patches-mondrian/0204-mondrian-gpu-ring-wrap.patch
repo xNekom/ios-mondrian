@@ -1,0 +1,130 @@
+xnu 0204: the ring wraps without re-running the previous lap
+
+Measured with the 0203 kernel: the 2000-submission bring-up stress refused
+1373 of 2000 (`cp uc stress 2000 refused 1373 ... wptr 8186`), and the first
+client submission found `at 0x1ffa rptr 0x19 wptr 0x0` and never moved. The
+old wrap filled the tail with a `CP_NOP` but then published a write pointer
+of zero and waited for the read pointer to come back to zero. With zero
+published while the start still held the previous lap, the CP executed those
+dwords again: its read pointer ran to 25, the wait for zero never matched,
+the wrap returned -1, and every later submission failed (Mesa: `submit
+failed: -5`).
+
+Fill the tail, but publish the write pointer only with the submission that
+is written at the start: the CP crosses the `CP_NOP` and then reads new data,
+so it cannot run ahead into a lap it has already seen. Add the backpressure
+the ring never had as well -- space to the read pointer before a submission
+overwrites it -- because a client that submits faster than the CP consumes
+could otherwise overrun the ring.
+
+The per-submission log gets its own counter: `uc pre` and `uc big` shared
+one, so after eight submissions neither printed and a wedged client stream
+left no completion line at all.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -66,6 +66,7 @@
+  * from fencing while the same stream completes without it. gpunomark=0
+  * turns it back on. */
+ static int mondrian_uc_nomark = 1;
++static int mondrian_uc_done;
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ static int mondrian_uc_keep;
+@@ -3187,16 +3188,19 @@
+ 
+ /*
+  * Close the ring. The CP fetches from the read pointer towards the write
+- * pointer and wraps at the end of the buffer, so a write pointer that jumps
+- * back to zero leaves it fetching the dwords it never saw. Fill the tail with
+- * one CP_NOP that covers it, publish the wrap and wait for the read pointer
+- * to come back to zero before anything is written at the start again.
++ * pointer and wraps at the end of the buffer, so the tail has to decode as
++ * a valid packet. Fill it with one CP_NOP, but do not publish the wrap here:
++ * a write pointer of zero while the start still holds the previous lap lets
++ * the CP execute those dwords again, its read pointer runs to 25 and the
++ * wait for zero never matches (measured: the 2000-submission stress refused
++ * 1373 of them). The write pointer is published with the submission that is
++ * written at the start, so the CP crosses the NOP and then reads new data.
+  */
+ static int
+ mondrian_uc_wrap(uint32_t *ring)
+ {
+ 	uint32_t pad = MONDRIAN_UC_RING_DWORDS - mondrian_uc_at;
+-	uint32_t i, waited;
++	uint32_t i;
+ 
+ 	if (pad != 0) {
+ 		ring[mondrian_uc_at] = mondrian_pm4_type7(0x10u, pad - 1);
+@@ -3206,16 +3210,8 @@
+ 		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+-	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, 0);
+-	for (waited = 0; waited < 50; waited++) {
+-		if (mondrian_gpu_read(mondrian_uc_gpu,
+-		    GEN7_CP_RB_RPTR * 4u) == 0) {
+-			mondrian_uc_at = 0;
+-			return 0;
+-		}
+-		delay(1000);
+-	}
+-	return -1;
++	mondrian_uc_at = 0;
++	return 0;
+ }
+ 
+ static void
+@@ -3265,7 +3261,34 @@
+ 		mondrian_log_flush_now();
+ 	}
+ 	at = mondrian_uc_at;
+-	if (at + 25 > MONDRIAN_UC_RING_DWORDS) {
++	/*
++	 * Backpressure: the CP has to have consumed enough of the lap before
++	 * this submission overwrites it. The old code never looked at the read
++	 * pointer, so the 2000-submission stress could run the ring over.
++	 */
++	{
++		uint32_t waited;
++
++		for (waited = 0; waited < 2000; waited++) {
++			uint32_t rptr = mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_CP_RB_RPTR * 4u);
++			uint32_t room = (rptr + MONDRIAN_UC_RING_DWORDS -
++			    at - 1) % MONDRIAN_UC_RING_DWORDS;
++
++			if (room >= 26) {
++				break;
++			}
++			delay(1000);
++		}
++		if (waited >= 2000) {
++			if (mondrian_uc_dump != 0) {
++				printf("MONDRIAN GPU: uc no room at 0x%x\n", at);
++				mondrian_log_flush_now();
++			}
++			return -1;
++		}
++	}
++	if (at + 26 > MONDRIAN_UC_RING_DWORDS) {
+ 		if (mondrian_uc_wrap(ring) != 0) {
+ 			return -1;
+ 		}
+@@ -3404,7 +3427,7 @@
+ 		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
+ 	}
+ 	*fence = seq;
+-	if (dwords > 16 && mondrian_uc_logged < 8) {
++	if (dwords > 16 && mondrian_uc_done < 8) {
+ 		/* A command stream from a real driver, not the bring-up probe:
+ 		 * wait for its own fence here and say what the CP did with it. */
+ 		volatile uint32_t *view =
+@@ -3419,7 +3442,7 @@
+ 			}
+ 			delay(1000);
+ 		}
+-		mondrian_uc_logged++;
++		mondrian_uc_done++;
+ 		/*
+ 		 * This line has to be able to print whatever happened: it is
+ 		 * built from the fence word in memory and needs no GPU

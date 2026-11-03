@@ -1,0 +1,26 @@
+xnu 0203: the 0201 IFPC bracket stays off by default
+
+Measured on the phone: with the bracket on, the 71-dword stream never
+fences; with `gpunomark=1` the same stream completes in 11 ms and RBBM reads
+idle (`rbbm 0x1`). The SQE firmware's `CP_THREAD_CONTROL` is a no-op, but
+`CP_SET_MARKER` is not: 0x100 and 0x101 reduce to 0 and 1 in the handler, and
+the 0/1 path writes CP_CSQ_IB2_STAT. Our wrapper also emits the IB1LIST pair
+around a single indirect buffer, while kgsl emits it around the user's list of
+indirect buffers, so the shape does not match either.
+
+Leave the bracket off by default and keep it behind `gpunomark=0` for the
+IFPC experiments.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -62,7 +62,10 @@
+ static uint32_t mondrian_uc_draw_state;
+ static uint32_t mondrian_uc_ds_addr;
+ static int mondrian_uc_nostate;
+-static int mondrian_uc_nomark;
++/* Off by default: measured, the 0201 bracket stops the 71-dword stream
++ * from fencing while the same stream completes without it. gpunomark=0
++ * turns it back on. */
++static int mondrian_uc_nomark = 1;
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ static int mondrian_uc_keep;

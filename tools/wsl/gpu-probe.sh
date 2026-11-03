@@ -110,10 +110,18 @@ for try in $(seq 1 "$tries"); do
 	"$FASTBOOT" flash boot_b "$recovery" >/dev/null 2>&1
 	"$FASTBOOT" reboot recovery >/dev/null 2>&1
 	if ! wait_for recovery 240; then say "no recovery; retrying"; continue; fi
-	ADB=$ADB bash tools/wsl/pull-ring.sh "$ring" >/dev/null 2>&1
+	# The ring writer flushes every few seconds; pulling immediately after
+	# recovery can read the previous boot's content (and a fixed file name
+	# then hides the failure). Drop the file and retry until a pull lands.
+	rm -f "$ring"
+	for attempt in 1 2 3 4 5; do
+		sleep 15
+		ADB=$ADB bash tools/wsl/pull-ring.sh "$ring" >/dev/null 2>&1 || true
+		[ -s "$ring" ] && break
+	done
 	after=$(ring_header "$ring")
 	say "ring now: $after"
-	if [ "$after" = "$before" ]; then
+	if [ -z "$after" ]; then
 		say "this boot did not arm the ring"
 		before=$after
 		continue

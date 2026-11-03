@@ -1,0 +1,26 @@
+xnu 0205: the submission logs before it touches the CP
+
+The 0204 boot is healthy up to the first client draw: `cp memwrite canary
+0x600dc0de`, `cp ib canary 0x1b00dead int 0x0` and `cp uc stress 2000
+refused 0` all pass, `MondrianGPU` publishes, and then the ring stops at a
+frame select with no `MondrianGPU: submit flags` and no `uc pre`.
+
+`uc pre` is built from four CPU reads of CP registers. A CP that has wedged
+makes such a read never return, so the line that would name the wedge is
+lost with the read that was going to name it. Print and flush `uc enter`
+before the first read: if it is the last line, the wedge is in those reads;
+if it never appears, the submission stopped before the driver was called.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3251,6 +3251,11 @@
+ 	ring = (uint32_t *)mondrian_cp_ring.va;
+ 	if (dwords > 16 && mondrian_uc_logged < 8) {
+ 		mondrian_uc_logged++;
++		/* Before the first register read: a wedged CP makes that read
++		 * never return, and the line that names it is then lost. */
++		printf("MONDRIAN GPU: uc enter %u at 0x%x\n", dwords,
++		    mondrian_uc_at);
++		mondrian_log_flush_now();
+ 		printf("MONDRIAN GPU: uc pre %u at 0x%x rptr 0x%x wptr 0x%x int 0x%x bv 0x%x\n",
+ 		    dwords, mondrian_uc_at,
+ 		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u),
