@@ -345,19 +345,32 @@ them has Metal. That is the path this port follows.
   CPU_PREP, both `flush_dcache64` by physical address, the pair
   `msm_gem_submit` performs around `dma_buf_end_cpu_access`. The first eight
   CPU_PREP calls log their wait and sync cost in microseconds.
-- **The no-copy path works, and the frame now waits on the CP.** With the CP
-  started (`MondrianGPU` published) and `mondrian-gl.dylib` loaded, a frame is
+- **The no-copy path works, and so does the draw.** With the CP started
+  (`MondrianGPU` published) and `mondrian-gl.dylib` loaded, a frame is
   `1 drawn in place, 0 pictures copied out` and the copy costs 39 µs, so the
-  5.7 s readback is gone. What replaces it is the wait for the frame: the user
-  client's submissions do not all complete — `uc big 71 dwords fence 2001 done 1
-  in 14 ms` but `168 dwords` never finishes (`done 0` after 300 ms). The
-  168-dword stream is the first one that draws (`CP_SET_DRAW_STATE` +
-  `CP_DRAW_INDX_OFFSET`); the dump shows both indirect buffers consumed
-  (`ib1 0x1042c000 rem 0x0`, `ib2 0x10434000 rem2 0x0`) with
-  `int 0x0 fault 0x0 protect 0x0`. Running kgsl's `gen7_start` register set and
-  `CP_ME_INIT` (`gpuinit=1|2`) changes none of that: the init is accepted and the
-  draw still wedges, so hardware init is not what blocks it.
+  5.7 s readback is gone. The first stream that draws (`168 dwords`:
+  `CP_SET_DRAW_STATE` + `CP_DRAW_INDX_OFFSET`) used to eat both indirect buffers
+  (`ib1/ib2 rem 0`) and never fence (`int 0 fault 0 protect 0`), which `0191`
+  turns into a stopped GPU. It completes now, and so does every stream after it:
+  measured `uc big 168 dwords ... done 1 in 1 ms`, then 164/71/67 dwords, 30
+  frames and 18 display swaps in one boot. `gpuinit=1|2` was in place for the
+  boots that wedged, so hardware init was never the blocker.
   `gpupm4=N` truncates the stream and `tools/pm4-decode.py` names its packets.
+- **kgsl's IFPC bracket around a submission is what the draw needed.** `0201`
+  emits `CP_SET_MARKER 0x101` (IFPC off) before the streams, `0x100` after them,
+  the `0x00d`/`0x00e` IB1LIST markers and the BR thread select, as
+  `adreno_gen7_ringbuffer.c` does. With it the draw fences in 1 ms; without it
+  the same stream is consumed whole and the CP stops answering. The fix is not
+  isolated from the keepalive yet — the boot that first drew also ran
+  `gpukeep=1` — so `gpunomark=1` is the A/B to run before calling the bracket
+  the only cause.
+- **A ring that ends without `MONDRIAN RESET: BCB` is a boot that died.** The
+  reset thread flushes the whole ring and prints that line when it fires, so a
+  complete boot ends with `MONDRIAN RESET: fastboot in N s` and the BCB line.
+  The phone still comes back to fastboot without them — the watchdog does it
+  minutes later, from the BCB a previous boot left — and everything in the ring
+  is what the CPU wrote before it stopped. Read the last line as the place it
+  died, not as a slow boot.
   The 27-group `CP_SET_DRAW_STATE` in that stream's nested indirect buffer is
   expanded into plain type-4 writes at both levels now, but the rewritten stream
   is wrong: with the expansion on, the 71-dword stream that completes on its own
@@ -396,15 +409,14 @@ them has Metal. That is the path this port follows.
   flush from it cost a UFS write per door over the 2000-door bring-up loop, held
   `mondrian_ufs_lock` across the bounce-buffer write, and the boot then ended one
   line after the first client door.
-- **The stream that wedges is the first one that draws.** The 71-dword stream is
-  `CP_SET_MODE`, `CP_THREAD_CONTROL`, `CP_SET_AMBLE`, register-only nested IBs,
-  a `CP_BLIT` and event writes; it completes. The 168-dword stream adds
-  `CP_SET_DRAW_STATE` (81 dwords, three state groups) and `CP_DRAW_INDX_OFFSET`
-  in its nested IB at `0x10434000`, and the CP never comes back from it. A draw
-  is the first thing that puts UCHE/RB/SP/TPL1/GRAS to work at the chip's bank
-  interleave, and none of those blocks is programmed: the shim never ran
-  `gen7_start` and never sent `CP_ME_INIT`. `0198` runs the register half at
-  `gpuinit=1` and adds `CP_ME_INIT` at `gpuinit=2`.
+- **The stream that draws is the one that used to wedge.** The 71-dword stream
+  is `CP_SET_MODE`, `CP_THREAD_CONTROL`, `CP_SET_AMBLE`, register-only nested
+  IBs, a `CP_BLIT` and event writes; it always completed. The 168-dword stream
+  adds `CP_SET_DRAW_STATE` (81 dwords, three state groups) and
+  `CP_DRAW_INDX_OFFSET` in its nested IB at `0x10434000`, and without the IFPC
+  bracket the CP never came back from it. A draw is the first thing that puts
+  UCHE/RB/SP/TPL1/GRAS to work at the chip's bank interleave, which is why the
+  packet that stopped the CP was the one after the state groups.
 - **A ring packet goes at the CP's cursor, never at a saved one.** The
   bring-up stress leaves the CP at `mondrian_uc_at` (`0x5b0`); writing
   `CP_ME_INIT` at the ring cursor the function started with (25) and then
@@ -416,17 +428,16 @@ them has Metal. That is the path this port follows.
   2000-submission bring-up loop: `CP_MEM_WRITE`, `CP_EVENT_WRITE`, IB fetch and
   fences all work without `CP_ME_INIT`, so none of those is what the draw stream
   is missing.
-- **While the draw path is dead the panel shows SpringBoard's first frame.** In
-  a boot that reaches userland the compositor swaps `surface N 1440x3200 fmt
-  0x62336138 bpr 5760` with a full-screen `a 0,0 1440x3200` rect, so the display
-  geometry is right; what is on the panel is the content of that surface — a
-  white square (SpringBoard's wallpaper poster, `CollectionsPoster create
-  650x684` / `1326x1326`, drawn at its own size) and an activity indicator, which
-  is the whole of `frame 1: 136 GL calls, 4 draws, 8 triangles`. The lock screen
-  needs many more draws and larger textures, and Mesa's submissions in that boot
-  fail (`submit failed: -35`, `wait-fence failed!`) because `0191` marked the GPU
-  stopped after the first draw stream wedged. Do not read the picture as a
-  geometry bug.
+- **The panel geometry is right; the textures are not.** In a boot that reaches
+  userland the compositor swaps `surface N 1440x3200 fmt 0x62336138 bpr 5760`
+  with a full-screen `a 0,0 1440x3200` rect. What is on the panel is the content
+  of that surface, and the draws that fill it now run on the GPU: the lock
+  screen's first frames are `136 GL calls, 4 draws, 8 triangles` and later
+  `316 GL calls, 44 draws, 228 triangles`. The wallpaper and some text are still
+  white blocks because a texture upload fails (`glDrawElements: 0x502`
+  eighteen times and `glTexImage2D: 0x505` in one boot; `0x502` is
+  `GL_INVALID_OPERATION`, `0x505` is `GL_OUT_OF_MEMORY`). Do not read the
+  picture as a geometry or a GPU bug.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
@@ -434,14 +445,19 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **Next**: the presentation path. Mesa and the `mondrian-drm` shim already
-  submit and draw; the UI still goes through CoreAnimation's own EAGL
-  context, and every frame is read back on the CPU and copied into the
-  `IOMobileFramebuffer` canvas (`tools/gpu/eagl.c`). A GPU blit into the
-  canvas, or an EGL image handed to Mesa through the `osmesa_st_get_egl_image`
-  hook and request 0x7e, is what removes that copy. The firmware blocks, the
-  GMU context bank and the CM3 start are in `mondrian_gpu.c` under
-  `gmustart=1`.
+- **Next: the frame rate.** The draw and the no-copy presentation work; the
+  panel now shows what the GPU drew. A steady-state frame is 9 ms (frames 23–26:
+  182 GL calls, 25 draws, 78 triangles: 0.6 ms handing the commands on, 8 ms
+  waiting, 0 copying) and the display swaps at most 20 times in a second, so the
+  wall is pacing, not rasterisation. Two measured costs: `frame_end()` calls
+  `glFinish()` once per frame because `display_waits()` reports that the display
+  driver does not wait for the submission that named the surface
+  (`tools/gpu/eagl.c`, `glwait=`), which serialises the CPU behind the GPU; and
+  CoreAnimation asks for far fewer frames than the 60 Hz vsync offers. A fence
+  the compositor can wait on at present time is the first one to remove; the
+  texture failures above are the second.
+  The firmware blocks, the GMU context bank and the CM3 start are in
+  `mondrian_gpu.c` under `gmustart=1`.
 
 ### Running the GPU test from the UI hook
 

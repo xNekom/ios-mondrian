@@ -39,26 +39,26 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The lock screen draws. CoreAnimation needs
   `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
-  waits 30 s and draws nothing); `0114` publishes them and leaves the software
-  renderer. SpringBoard waits on MobileActivation in `_setupActivationState`;
+  waits 30 s and draws nothing); `0114` publishes them and it runs. SpringBoard
+  waits on MobileActivation in `_setupActivationState`;
   the dylib forces activation and skips Setup, including the
   `SBLockdownManager` and `SBSetupManager` gates. The cmdline in
   `tools/boards.py` carries `mondrian_ui_hook=7`; the root must have
   `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
-  The wallpaper and some text are white blocks for now: a texture upload fails
-  (`glDrawElements: 0x502`).
+  The UI draws through the GPU; the wallpaper and some text are still white
+  blocks because a texture upload fails (`glDrawElements: 0x502`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **UI performance.** Touch works (`0153`) and its 220 KB firmware is 8 s of
+1. **UI frame rate.** Touch works (`0153`) and its 220 KB firmware is 8 s of
    bit-bang SPI (`0156`: `ml_get_timebase()` is 609 MHz here, not the 19.2 MHz
    timer; keep the bring-up before `launchd`, a thread raced the RPMh iovdd
-   vote). The report thread is ticked from the vsync (`0161`) and reads the part
-   at 120 Hz. The wall is the CPU rasterizer: 6.4 fps full panel, 9.3 at
-   900x2000; the GPU draws (Mesa: a red triangle, `docs/MONDIAN_GPU.md`) but the
-   UI still uses the rasterizer (`docs/COREANIMATION_GLES.md`). First frame 43 s.
+   vote). The UI draws through the GPU now (`docs/MONDIAN_GPU.md`): 9 ms a
+   frame, 20 swaps a second at most, so the wall is pacing — a fence the
+   compositor waits on at present time instead of a per-frame `glFinish()` —
+   and the texture failures that leave the wallpaper white.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
