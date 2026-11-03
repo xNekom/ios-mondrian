@@ -200,21 +200,21 @@ The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
 is not on the critical path: `0083` reserves panel memory, `0085` presents
 IOSurface swaps, and the lock screen draws. `0084`'s colour bars were a one-off
 packing test, off since `0208`; `0210` puts the kernel log back on the panel
-(until then only the early console painted it) and clears the bootloader's
-splash off the rows nothing wrote.
+(until then only the early console painted it) and clears the boot splash.
 Three things had to line up: CoreAnimation waits 30 s for an `IOAcceleratorES`
 service and draws nothing without `TimingElements`/`ColorElements` (`0114`
-publishes one 60 Hz mode and an empty accelerator, leaving the software
-renderer); the panel must be written through the console alias (an
-`IOMemoryDescriptor` puts a device pager on managed pages and panics
-`pmap_remove_pv`), and the console is only stopped with `disableConsoleOutput`
-(`0115`). SpringBoard blocks in
+publishes one 60 Hz mode and an empty accelerator); the panel must be written
+through the console alias (an `IOMemoryDescriptor` puts a device pager on managed
+pages and panics `pmap_remove_pv`), and the console is only stopped with
+`disableConsoleOutput` (`0115`). SpringBoard blocks in
 `-[SBLockdownManager _setupActivationState]` on MobileActivation; the dylib
 forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
-is a real MDSS driver (`qcom,mdss_mdp@ae00000`, `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`).
+is a real MDSS driver (`qcom,mdss_mdp@ae00000`,
+`qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`).
 
-The remaining wall is the CPU copy-out of every frame
-(`docs/COREANIMATION_GLES.md`); the GPU path itself is in.
+The UI draws and presents on the GPU with no CPU copy (`docs/MONDIAN_GPU.md`);
+what is left is pacing (9 ms frames, at most 20 swaps a second, a per-frame
+`glFinish()`) and the texture uploads that leave the wallpaper white.
 
 ### 4. The touch
 
@@ -276,7 +276,7 @@ the less obvious ones do:
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
 | `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn) |
-| `mondrianfb_hz=60` | refresh rate of the CPU copy into the panel |
+| `mondrianfb_hz=60` | vsync rate the display presents at (the panel itself is 120 Hz) |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 
 ## References

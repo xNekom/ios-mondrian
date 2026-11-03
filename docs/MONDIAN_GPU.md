@@ -1,11 +1,12 @@
 # GPU and boot time
 
-The UI is CPU-rendered at 6.4 fps (active seconds, max 23 with
-`mondrianfb_fps=1` at 1440x3200, copy ~2.3 ms per swap; `0114`, the software
-CoreAnimation renderer); a 900x2000 canvas reaches 9.3. The GPU probe and
-GX add no frames yet. The other ios-sweet ports render through
-**Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
-them has Metal. That is the path this port follows.
+The UI renders through the GPU: the draw completes, the frame is drawn in
+place (no readback, no copy) and the display swaps it. A steady frame is 9 ms
+and the display swaps at most 20 times a second, so the wall is now pacing and
+the texture uploads, not rasterisation — see "Measured bring-up state". The
+other ios-sweet ports render through **Mesa/freedreno OpenGL ES behind
+CoreAnimation's OpenGL ES renderer**; none of them has Metal. That is the path
+this port follows.
 
 ## Reference stack
 
@@ -103,9 +104,7 @@ them has Metal. That is the path this port follows.
   The tables come from the live cmd-db (`gfx/mx/cx`,
   SH0/MC0/ACV) and the 13 mondrian OPPs, the same data as Pong's
   `PongAdrenoPower.c`. A full boot with the tables and GX on reaches
-  SpringBoard and the touch report thread; one 150 s boot measured 8.1 active
-  fps (max 35) against the 6.4 (max 23) CPU baseline, so the userland is
-  still the software renderer.
+  SpringBoard and the touch report thread.
   The 8 MiB `io_submap` is the trap: `ml_io_map()` has no unmap and the touch
   command DB/RSC windows were re-mapped per lookup; `0179` caches both.
 - **CP and its SMMU**: the bootloader leaves the CP at zero. `0181` (local
@@ -356,14 +355,23 @@ them has Metal. That is the path this port follows.
   frames and 18 display swaps in one boot. `gpuinit=1|2` was in place for the
   boots that wedged, so hardware init was never the blocker.
   `gpupm4=N` truncates the stream and `tools/pm4-decode.py` names its packets.
-- **kgsl's IFPC bracket around a submission is what the draw needed.** `0201`
-  emits `CP_SET_MARKER 0x101` (IFPC off) before the streams, `0x100` after them,
-  the `0x00d`/`0x00e` IB1LIST markers and the BR thread select, as
-  `adreno_gen7_ringbuffer.c` does. With it the draw fences in 1 ms; without it
-  the same stream is consumed whole and the CP stops answering. The fix is not
-  isolated from the keepalive yet — the boot that first drew also ran
-  `gpukeep=1` — so `gpunomark=1` is the A/B to run before calling the bracket
-  the only cause.
+- **The keepalive decides whether a boot survives.** Same kernel, two boots:
+  with the driver's default (`gpukeep=0`, kgsl's toggle) the boot dies about
+  70 s in, right after `backboardd` loads `mondrian-gl` and before any client
+  submission, and the ring ends without the `MONDRIAN RESET: BCB` line; with
+  `gpukeep=1` (keepalive raised at `cp start` and never dropped) the same kernel
+  draws 30 frames and swaps the display 18 times. A GPU register access while
+  the GMU has the core collapsed hangs the CPU that issued it, which is why
+  kgsl raises the keepalive before the first register read in its IRQ handler
+  (`adreno_gen7.c`, `gen7_irq_handler`). Raising it around a submission only is
+  not enough: it has to be up before every register access the user client and
+  the driver make.
+- **The IFPC bracket is not what the draw needed.** `0203` leaves kgsl's
+  `0x101`/`0x100`/IB1LIST bracket off by default (`mondrian_uc_nomark = 1`), so
+  the boot that first drew ran without it; `gpunomark=0` turns it back on for
+  the A/B. The readiness the patch README credits is the ring wrap with
+  backpressure (`0204`), the 512 KiB CP page-table region (`0206`) and the IOVA
+  range reuse (`0207`).
 - **A ring that ends without `MONDRIAN RESET: BCB` is a boot that died.** The
   reset thread flushes the whole ring and prints that line when it fires, so a
   complete boot ends with `MONDRIAN RESET: fastboot in N s` and the BCB line.
@@ -550,7 +558,7 @@ renderer.
 ## Boot time
 
 The eight cores already start (`cpus=8`, all `PSCI CPU_ON rc=0`). The remaining
-cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
+cost is CPU frequency, the boot CPU and debug I/O:
 
 - **`bootcpu`**: `cpufreq` is in (`0154`: 1804/2496/2995 MHz on the three
   domains); the boot CPU is still 0 (a little core). HackiOS boots with
@@ -565,9 +573,9 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
   frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
 - **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
   CoreAnimation into a smaller surface and scales it to the panel in
-  `swap()`; 900x2000 measures 9.3 fps average (1-19) against 6.4 at the
-  full panel (1-23), but the CPU scale in `swap()` costs 30-40 ms per swap,
-  so the gain is smaller than the pixel count suggests. Use
+  `swap()`. It was a way around the CPU rasterizer (900x2000 measured 9.3 fps
+  against 6.4 at the full panel) and the CPU scale in `swap()` costs 30-40 ms a
+  swap, so do not use it to chase frame rate now that the GPU draws. Use
   `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
   The CP tests hard-reset a non-journaled HFS; after several resets the next
   mount can take longer than 60 s (the ring stops at the UFS GPT with one
@@ -585,16 +593,13 @@ cost is CPU frequency, the boot CPU, the software renderer and debug I/O:
 - **First boot**: a freshly flashed data volume needs one long first boot to
   create the containers and the `mobileactivationd` data ark; later boots reach
   the lock screen. Do not reflash to change a dylib: update it in place.
-- **GPU**: once the CA runs on the GPU, the boot/lock screen drawing moves off
-  the CPU too.
+- **GPU**: CoreAnimation draws on the GPU (see "Milestones"); the CPU renderer
+  is the fallback when `MondrianGPU` is absent (`gpu=0`).
 
 ## Milestones
 
-1. GPU memory, command submission and the Mesa `FD730` context.
-2. A CoreAnimation GLES frame through the GPU.
-3. The MDP/IOSurface presenter and 60 Hz.
-4. GPU clock above 600 MHz with the GX vote.
-5. `bootcpu`/`cpufreq`, the release kernel, and the boot-time measurements.
-
-Until then the CPU path remains the working baseline (home screen, Settings,
-touch).
+Done: GPU memory, command submission and the Mesa `FD730` context; a
+CoreAnimation GLES frame through the GPU; the no-copy IOSurface presenter.
+Open: paced presentation at 60 Hz (today a frame is 9 ms and the display swaps at
+most 20 times a second), the texture uploads, `bootcpu`/`cpufreq`, the release
+kernel and the boot-time measurements.

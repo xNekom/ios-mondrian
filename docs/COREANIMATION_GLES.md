@@ -1,12 +1,12 @@
 # CoreAnimation on the GPU (OpenGL ES)
 
-**Running on hardware and drawing through Mesa, but every frame is copied out on the CPU.**
+**Running on hardware and drawing through Mesa, with no CPU copy.**
 In `backboardd` the injector loads, all seven `-[EAGLContext ...]` methods are replaced, both
 `CA::OGL::GLESContext` hooks install, and a Mesa `FD725` context is created. CoreAnimation's
-frames reach the GPU, but `attachImage` takes the copy path: a measured frame is 5.7 s of
-`glReadPixels`/copy-out at 1440x3200, so the UI runs at 1-2 fps (`1 picture copied out, 0 drawn
-in place` in the ring). Removing that copy is the next step. Three measured traps, in the order
-they were paid for:
+frames reach the GPU and are drawn in place into the display's IOSurface: `1 drawn in place, 0
+pictures copied out`, a steady frame in 9 ms. What is left is pacing (the display swaps at most 20
+times a second) and the texture uploads that fail, both in `docs/MONDIAN_GPU.md`. Three measured
+traps, in the order they were paid for:
 
 - **The ES profile of OSMesa faults on this driver.** `OSMesaCreateContextAttribs` with the ES
   profile (mapped to `API_OPENGLES2` by `tools/mesa/mondrian-darwin.patch`) creates a context
@@ -50,8 +50,8 @@ they were paid for:
   dispatch (0, no GL error). `eagl_resolve()` matches the argument against the live contexts and
   falls back to the most recent one, saying so once.
 
-The rest of this file is the design. CoreAnimation already draws through Mesa; the CPU copy-out
-of every frame is what keeps the UI at 1-2 fps. The no-copy path below is written in this tree.
+The rest of this file is the design. CoreAnimation draws through Mesa into the display's IOSurface
+with no copy; the no-copy path below is what does it.
 
 ## Who loads what
 
@@ -93,9 +93,10 @@ shows whatever surface a swap names (by copying its layers into the panel's memo
   answers with a GEM handle, an IOVA and the surface's size/offset/row-bytes. The kernel side is in
   `0182`; the Mesa hooks and the `glEGLImageTargetTexture2DOES` call are in this tree. They have
   not been built or run on the phone yet.
-- **Copy** (`surface_to_texture()` / `target_to_surface()`), the measured path: the surface is
-  uploaded with `glTexImage2D`/`glTexSubImage2D` and the frame is read back with `glReadPixels` at
-  `glFlush`/`glFinish`. Correct pixels, 5.7 s a frame at 1440x3200; `glcopy=1` forces it.
+- **Copy** (`surface_to_texture()` / `target_to_surface()`), kept as a bisect knob only: the
+  surface is uploaded with `glTexImage2D`/`glTexSubImage2D` and the frame is read back with
+  `glReadPixels` at `glFlush`/`glFinish`. Correct pixels, 5.7 s a frame at 1440x3200;
+  `glcopy=1` forces it.
 
 `tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
 the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.
@@ -147,13 +148,17 @@ renderer has no function N` with N >= 90 on the console means this pair is wrong
 
 ## What is untested
 
-- The dylibs run on the phone (`MONDRIAN GL:`/`MONDRIAN DRM:` in the ring); the no-copy surface
-  path is the part that has not been built or run. CoreAnimation already chooses GLES.
+- The dylibs run on the phone (`MONDRIAN GL:`/`MONDRIAN DRM:` in the ring) and the no-copy
+  surface path is measured: `1 drawn in place, 0 pictures copied out`, a 39 µs copy, 9 ms a frame.
+  CoreAnimation already chooses GLES.
 - The 30 table offsets in `eagl_slots.txt`: every other call CoreAnimation makes is "CALLED AND NOT
   THERE" until step 3 above fills the list in, so a first boot with it as it is draws nothing.
-- Request `0x7e`, the Mesa hooks and `glEGLImageTargetTexture2DOES` are in this tree; the no-copy
-  path has not been built or run yet, so the measured frames are still the CPU copy path (5.7 s a
-  frame).
+- Pacing. `frame_end()` waits for the frame because nothing else does: the display driver does not
+  wait for the submission that named the surface, so a `glFinish()` per frame serialises the CPU
+  behind the GPU and the display swaps at most 20 times a second (`glwait=` in `tools/gpu/eagl.c`;
+  `docs/MONDIAN_GPU.md`). A fence the compositor can wait on at present time is not written yet.
+- The texture uploads fail (`glDrawElements: 0x502`, `glTexImage2D: 0x505`), which is why the
+  wallpaper and some text are white blocks.
 
 ## First pixels, in order
 
@@ -168,6 +173,7 @@ renderer has no function N` with N >= 90 on the console means this pair is wrong
 5. Read three log lines: `an OpenGL ES 3 context for CoreAnimation, by Mesa` (renderer chosen),
    `-attachImage: texture N is IOSurface M` (a frame goes into a surface), and `CALLED AND NOT
    THERE` (table entries still missing).
-6. Expect the copy path to be slow (5.7 s/frame measured). The hooks in this tree make 0x7e usable;
-   after installing, the frame line should say `0 copied out, 1 drawn in place` or `... by the GPU`,
-   and the `MONDRIAN FB: fps` line finally moves off 1-2. Compare against the 6.4 fps CPU baseline.
+6. Expect `0 copied out, 1 drawn in place` in the frame line, which is what the phone reports now;
+   `1 copied out` means the no-copy path did not take and a frame costs 5.7 s (`glcopy=1` also
+   forces it). The `MONDRIAN FB: fps` line only counts display swaps: with `glwait=1` the frame
+   waits on the CPU and the swap count drops even though the GPU is faster.

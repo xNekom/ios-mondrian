@@ -2,9 +2,10 @@
 
 Mesa 25.0.7 for the iOS 16 arm64 userland, with freedreno's msm back end driven
 through the kernel's `MondrianGPU` service instead of Linux's DRM. Measured on
-the phone: CoreAnimation gets a Mesa `FD725` context and draws through it; every
-frame is still copied out on the CPU (5.7 s/frame at 1440x3200). The no-copy
-IOSurface path is implemented in this tree and has not been built or run yet.
+the phone: CoreAnimation gets a Mesa `FD725` context and draws through it into
+the display's IOSurface with no CPU copy (`1 drawn in place, 0 pictures copied
+out`, 9 ms a frame). `glcopy=1` still forces the old readback path, 5.7 s a
+frame at 1440x3200.
 
 - `mondrian-drm/` — the libdrm Mesa's freedreno is built against here.
   `drmOpenWithType("msm")` opens `MondrianGPU` and one request is one
