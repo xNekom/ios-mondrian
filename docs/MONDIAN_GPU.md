@@ -355,17 +355,17 @@ this port follows.
   frames and 18 display swaps in one boot. `gpuinit=1|2` was in place for the
   boots that wedged, so hardware init was never the blocker.
   `gpupm4=N` truncates the stream and `tools/pm4-decode.py` names its packets.
-- **The keepalive decides whether a boot survives.** Same kernel, two boots:
-  with the driver's default (`gpukeep=0`, kgsl's toggle) the boot dies about
-  70 s in, right after `backboardd` loads `mondrian-gl` and before any client
-  submission, and the ring ends without the `MONDRIAN RESET: BCB` line; with
-  `gpukeep=1` (keepalive raised at `cp start` and never dropped) the same kernel
-  draws 30 frames and swaps the display 18 times. A GPU register access while
-  the GMU has the core collapsed hangs the CPU that issued it, which is why
-  kgsl raises the keepalive before the first register read in its IRQ handler
-  (`adreno_gen7.c`, `gen7_irq_handler`). Raising it around a submission only is
-  not enough: it has to be up before every register access the user client and
-  the driver make.
+- **The keepalive decides whether a boot survives, so it is held.** Same
+  kernel, two boots: with the toggle (`gpukeep=0`, kgsl's raise-before and
+  drop-after) the boot dies about 70 s in, right after `backboardd` loads
+  `mondrian-gl` and before any client submission, and the ring ends without the
+  `MONDRIAN RESET: BCB` line; with the keepalive raised at `cp start` and held
+  (`gpukeep=1`, the default since `0215`) the same kernel draws 30 frames and
+  swaps the display 18 times. A GPU register access while the GMU has the core
+  collapsed hangs the CPU that issued it — the user client's first one is
+  `MSM_PARAM_TIMESTAMP`, which Mesa asks for as soon as it opens the device —
+  so `gpukeep=0` also brackets every such access the way kgsl does in
+  `gen7_irq_handler` (`adreno_gen7.c`). `gpukeep=2` never raises it, the A/B.
 - **The IFPC bracket is not what the draw needed.** `0203` leaves kgsl's
   `0x101`/`0x100`/IB1LIST bracket off by default (`mondrian_uc_nomark = 1`), so
   the boot that first drew ran without it; `gpunomark=0` turns it back on for

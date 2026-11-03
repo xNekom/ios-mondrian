@@ -1,0 +1,69 @@
+xnu 0215: the console says how fast it paints, on the screen
+
+The console's cost was being argued about from videos: a line per 128 KiB in the
+ring is useless when the ring can only be read from a recovery, and this phone's
+recovery is not reachable from every state. Put the same number on the row below
+the text area, which the console never writes and which a photo always shows:
+`console <chars/s>, <chars behind>`. The ring line stays for the full-log view.
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -248,6 +248,27 @@
+ }
+ 
+ /*
++ * A status line of its own, on the row the text area never uses. The console
++ * painter is one thread, so saving and restoring the cursor here is enough; the
++ * line is what a photo can show when the point of the photo is a number.
++ */
++void
++mondrian_early_status(const char *s)
++{
++	unsigned int row = early_row;
++	unsigned int col = early_col;
++
++	early_row = EARLY_HUD_ROW0;
++	early_col = 0;
++	mondrian_early_clear_row();
++	while (*s != 0 && early_col < EARLY_COLS) {
++		mondrian_early_putc(*s++);
++	}
++	early_row = row;
++	early_col = col;
++}
++
++/*
+  * Everything the kernel log writes, on the panel. This board has no UART and
+  * no video console: kprintf and the BSD printf path reach the log ring but
+  * never the screen, so the boot looked frozen after the last early mark. The
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1258,12 +1258,26 @@
+ 	 */
+ 	if (mondrian_log_paint_chars >= mondrian_log_paint_next_log &&
+ 	    mondrian_log_paint_us != 0) {
++		unsigned long long rate = mondrian_log_paint_chars * 1000000 /
++		    mondrian_log_paint_us;
++		char line[64];
++
+ 		mondrian_log_paint_next_log = mondrian_log_paint_chars + (128u << 10);
+ 		printf("MONDRIAN CONSOLE: %llu chars in %llu us (%llu chars/s)\n",
+ 		    (unsigned long long)mondrian_log_paint_chars,
+-		    (unsigned long long)mondrian_log_paint_us,
+-		    (unsigned long long)(mondrian_log_paint_chars * 1000000 /
+-		    mondrian_log_paint_us));
++		    (unsigned long long)mondrian_log_paint_us, rate);
++		/*
++		 * The same number where a photo of the panel can always find it:
++		 * the row below the text area, which the console never writes.
++		 */
++		snprintf(line, sizeof(line), "console %llu chars/s, %llu behind",
++		    rate, (unsigned long long)(os_atomic_load(&mondrian_log_total,
++		    relaxed) - at));
++		{
++			extern void mondrian_early_status(const char *s);
++
++			mondrian_early_status(line);
++		}
+ 	}
+ }
+ 

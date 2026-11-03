@@ -1,0 +1,214 @@
+xnu 0215: a default boot survives, and every register read is bracketed
+
+Measured: with `gpukeep=1` (the keepalive raised at cp start and held) one boot
+draws 30 frames and swaps the display 18 times; with the default toggle the
+same kernel died about 70 s in, right after backboardd loaded the GL driver and
+before any submission, and the ring ended without the reset line. Holding the
+keepalive is what a boot needs, and a boot that only works with a magic boot
+argument is a boot that dies for the next person.
+
+Make `gpukeep=1` the default, and give `gpukeep=0` kgsl's bracket anyway: the
+keepalive is raised before the first GPU register read and dropped after the
+last, not just around the doorbell. The user client's first register read is
+`MSM_PARAM_TIMESTAMP`, which Mesa asks for as soon as it opens the device; the
+submission's own diagnostics, the SMMU fault clear and the TLB flush polls read
+registers too. kgsl brackets its accesses the same way in `gen7_irq_handler`.
+
+`gpukeep=2` still never raises it, the A/B that shows the keepalive matters.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -69,7 +69,13 @@
+ static int mondrian_uc_done;
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+-static int mondrian_uc_keep;
++/*
++ * 1 (the default): the keepalive is raised at cp start and held.
++ * Measured, that is the boot that survives; with the toggle (0) a boot died
++ * right after backboardd loaded the GL driver and before it submitted
++ * anything. 2 never raises it, the A/B that shows it is load-bearing.
++ */
++static int mondrian_uc_keep = 1;
+ static int mondrian_cp_init_hw;
+ /*
+  * Measured: with the door thread on, the 71-dword stream never fences and the
+@@ -2221,7 +2227,9 @@
+ 	 * while the CP idles, which wedges the register port. */
+ 	printf("MONDRIAN GPU: cp keepalive 0x%x\n",
+ 	    mondrian_gpu_read(gmu, GMU_OFF(0x1f8c3u)));
+-	mondrian_gpu_write(gmu, GMU_OFF(0x1f8c3u), 1);
++	if (mondrian_uc_keep != 2) {
++		mondrian_gpu_write(gmu, GMU_OFF(0x1f8c3u), 1);
++	}
+ 	printf("MONDRIAN GPU: cp keepalive now 0x%x\n",
+ 	    mondrian_gpu_read(gmu, GMU_OFF(0x1f8c3u)));
+ 	mondrian_log_flush_now();
+@@ -2467,11 +2475,10 @@
+ 	printf("MONDRIAN GPU: cp started\n");
+ 	mondrian_log_flush_now();
+ 	/*
+-	 * CoreAnimation's first frame arrives minutes after this, and the
+-	 * GMU parks the GPU while it waits. The keepalive is otherwise only
+-	 * raised inside a submission, so the first frame is rung into a parked
+-	 * GPU and the CP never fetches it (CP_RB_RPTR stays at CP_RB_WPTR).
+-	 * gpukeep=1 keeps it up from here on.
++	 * CoreAnimation's first frame arrives minutes after this, and the GMU
++	 * parks the GPU while it waits. Raise the keepalive here and hold it
++	 * (the default): a boot that only raised it around submissions died
++	 * before the first one. gpukeep=0 is that toggle for the A/B.
+ 	 */
+ 	if (gmu != 0 && mondrian_uc_keep == 1) {
+ 		mondrian_gpu_write(gmu, GMU_OFF(0x1f8c3u), 1);
+@@ -2976,6 +2983,35 @@
+ 	return mondrian_cp_memptr.iova;
+ }
+ 
++/*
++ * A GPU register access into a core the GMU has collapsed never returns: it
++ * hangs the CPU that issued it. kgsl brackets its accesses the same way
++ * (gen7_irq_handler raises the keepalive before the first register read and
++ * drops it after the last). With the default (gpukeep=1) the keepalive is
++ * already up, so this is a no-op; it exists for gpukeep=0, kgsl's
++ * submit-time toggle and the default until the measured death above.
++ */
++static uint32_t mondrian_uc_keep_depth;
++
++static void
++mondrian_uc_keepalive(int on)
++{
++	if (mondrian_uc_gmu == 0 || mondrian_uc_keep != 0) {
++		return;
++	}
++	if (on != 0) {
++		if (mondrian_uc_keep_depth++ == 0) {
++			mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1u);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++		return;
++	}
++	if (mondrian_uc_keep_depth == 0 || --mondrian_uc_keep_depth != 0) {
++		return;
++	}
++	mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0u);
++}
++
+ int
+ mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
+ {
+@@ -3001,10 +3037,14 @@
+ 		if (mondrian_uc_gpu == 0) {
+ 			return -1;
+ 		}
++		/* Mesa asks for this as soon as the GL driver opens the device:
++		 * it is the user client's first GPU register read. */
++		mondrian_uc_keepalive(1);
+ 		lo = mondrian_gpu_read(mondrian_uc_gpu,
+ 		    GEN7_CP_ALWAYS_ON_COUNTER_LO * 4u);
+ 		hi = mondrian_gpu_read(mondrian_uc_gpu,
+ 		    GEN7_CP_ALWAYS_ON_COUNTER_HI * 4u);
++		mondrian_uc_keepalive(0);
+ 		*value = lo | (hi << 32);
+ 		return 0;
+ 	case 0x06:			/* MSM_PARAM_GMEM_BASE */
+@@ -3173,10 +3213,12 @@
+ 	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
+ 		return;
+ 	}
++	mondrian_uc_keepalive(1);
+ 	mondrian_gpu_write(mondrian_uc_smmu, mondrian_uc_tlb_ctx + SMMU_FSR,
+ 	    0xffffffffu);
+ 	mondrian_gpu_write(mondrian_uc_smmu, 0x48u, 0xffffffffu);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_uc_keepalive(0);
+ }
+ 
+ int
+@@ -3213,6 +3255,7 @@
+ 	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
+ 		return;
+ 	}
++	mondrian_uc_keepalive(1);
+ 	for (i = 0; i < 1000; i++) {
+ 		if ((mondrian_gpu_read(mondrian_uc_smmu,
+ 		    mondrian_uc_tlb_ctx + SMMU_TLBSTATUS) & 1u) == 0) {
+@@ -3231,6 +3274,7 @@
+ 		}
+ 		delay(1);
+ 	}
++	mondrian_uc_keepalive(0);
+ }
+ 
+ int
+@@ -3328,6 +3372,8 @@
+ 		return -1;
+ 	}
+ 	ring = (uint32_t *)mondrian_cp_ring.va;
++	/* Everything from here reads GPU registers, the diagnostics too. */
++	mondrian_uc_keepalive(1);
+ 	if (dwords > 16 && mondrian_uc_logged < 8) {
+ 		mondrian_uc_logged++;
+ 		/* Before the first register read: a wedged CP makes that read
+@@ -3426,20 +3472,7 @@
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x100;		/* IFPC mode: IFPC enabled */
+ 	}
+-	/* kgsl toggles the GMU keepalive around every submission
+-	 * (gen7_gpu_keepalive true/false); holding it on forever leaves the
+-	 * power state machine in a different place and the same stream then
+-	 * completes in one boot and stalls in the next. */
+-	/*
+-	 * gpukeep=1 holds the keepalive up across the submission, gpukeep=2
+-	 * never raises it; the default is kgsl's toggle. The CP not picking the
+-	 * packets up (CP_RB_RPTR == CP_RB_WPTR) is what a wrong keepalive would
+-	 * look like, and the same stream is known to complete in one boot and
+-	 * stall in the next.
+-	 */
+-	if (mondrian_uc_gmu != 0 && mondrian_uc_keep != 2) {
+-		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
+-	}
++	/* The keepalive is up since the top of this function (see there). */
+ 	if (dwords > 16 && mondrian_uc_dump != 0) {
+ 		printf("MONDRIAN GPU: uc keepalive written\n");
+ 		mondrian_log_flush_now();
+@@ -3485,6 +3518,7 @@
+ 			    seq);
+ 			mondrian_log_flush_now();
+ 			mondrian_uc_up = 0;
++			mondrian_uc_keepalive(0);
+ 			return 0;
+ 		}
+ 		if (dwords > 16) {
+@@ -3507,9 +3541,6 @@
+ 	if (mondrian_uc_rback != 0) {
+ 		(void)mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u);
+ 	}
+-	if (mondrian_uc_gmu != 0 && mondrian_uc_keep == 0) {
+-		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0);
+-	}
+ 	*fence = seq;
+ 	if (dwords > 16 && mondrian_uc_done < 8) {
+ 		/* A command stream from a real driver, not the bring-up probe:
+@@ -3615,6 +3646,7 @@
+ 			mondrian_log_flush_now();
+ 		}
+ 	}
++	mondrian_uc_keepalive(0);
+ 	return 0;
+ }
+ 
+@@ -3634,6 +3666,7 @@
+ 		if ((int32_t)(value - fence) >= 0) {
+ 			if (mondrian_uc_logged < 10) {
+ 				mondrian_uc_logged++;
++				mondrian_uc_keepalive(1);
+ 				printf("MONDRIAN GPU: uc fence %u int 0x%x fault 0x%x fsr 0x%x rptr 0x%x wptr 0x%x\n",
+ 				    fence,
+ 				    mondrian_gpu_read(mondrian_uc_gpu,
+@@ -3646,6 +3679,7 @@
+ 				    GEN7_CP_RB_RPTR * 4u),
+ 				    mondrian_gpu_read(mondrian_uc_gpu,
+ 				    GEN7_CP_RB_WPTR * 4u));
++				mondrian_uc_keepalive(0);
+ 				mondrian_log_flush_now();
+ 			}
+ 			return 0;
