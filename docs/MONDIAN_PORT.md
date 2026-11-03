@@ -41,7 +41,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | `xnu/patches-mondrian/0003`–`0055` | the generic half of the sweet series, ported (RAM disk root, AMFI, HFS+, BearSSL, console, crash log, HID, SMP, iPhone identity) |
 | `xnu/patches-mondrian/0056`–`0062` | page-size work (commpage, zone map VA, bootstrap VA, no physical timer, framebuffer alias) and the first UFS root device (`0059`); `0058` is gone with the 4 KiB software page size |
 | `xnu/patches-mondrian/0063`–`0082`, `0086` | the boot diagnostics and the UFS 3.1 root device |
-| `xnu/patches-mondrian/0083`–`0085`, `0087`–`0088` | panel memory reservation, colour-bar self-test, framebuffer presentation, GIC remap after the VM, VFS_ROOT errno |
+| `xnu/patches-mondrian/0083`–`0085`, `0087`–`0088` | panel memory reservation, framebuffer presentation, GIC remap after the VM, VFS_ROOT errno |
 | `tools/apply-series.py`, `tools/check-patches.sh` | apply a series to a fresh xnu tree in seconds and report what does not apply |
 | `tools/port-series.py` | ports a patch of the sweet series, renaming the board identifiers, and lists the hardware patches it skips |
 
@@ -197,8 +197,10 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 ### 3. The display
 
 The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
-is not on the critical path: `0083` reserves panel memory, `0084` tests pixel
-packing, `0085` presents IOSurface swaps, and the lock screen now comes up.
+is not on the critical path: `0083` reserves panel memory, `0085` presents
+IOSurface swaps, and the lock screen now comes up. `0084`'s colour bars were a
+one-off packing test; `0208` drops them so they no longer show over the boot
+logo.
 Three things had to line up: CoreAnimation waits 30 s for an `IOAcceleratorES`
 service and draws nothing without `TimingElements`/`ColorElements` (`0114`
 publishes one 60 Hz mode and an empty accelerator, leaving the software

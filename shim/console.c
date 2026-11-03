@@ -40,15 +40,56 @@ void con_enable(uintptr_t base, int w, int h)
 
 void con_clear(uint32_t bg)
 {
+	uint64_t pair = ((uint64_t)bg << 32) | bg;
+
 	if (!con_fb)
 		return;
+	/* With the MMU off every store is its own Device transaction: one
+	 * 64-bit store per two pixels halves the number of them. */
 	for (int y = 0; y < con_h; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
-		for (int x = 0; x < con_w; x++)
-			line[x] = bg;
+		volatile uint64_t *line = (volatile uint64_t *)(con_fb +
+		    y * (FB_STRIDE / 4));
+		for (int x = 0; x < con_w / 2; x++)
+			line[x] = pair;
 	}
 	con_bg = bg;
 	row = 0;
+}
+
+/*
+ * The screen is a fixed grid; when the next line would fall off the
+ * bottom, move the visible text up one cell and clear the new last row.
+ * It used to drop the line instead, which loses the interesting part of a
+ * boot. The copy is the same kind of Device burst as con_clear().
+ */
+static void con_advance(void)
+{
+	int rows = (con_h - 2 * MARGIN) / CH_H;
+
+	if (row < rows) {
+		row++;
+		return;
+	}
+	if (con_fb) {
+		int keep = con_h - CH_H;
+
+		for (int y = 0; y < keep; y++) {
+			volatile uint64_t *dst = (volatile uint64_t *)(con_fb +
+			    y * (FB_STRIDE / 4));
+			volatile uint64_t *src = (volatile uint64_t *)(con_fb +
+			    (y + CH_H) * (FB_STRIDE / 4));
+			for (int x = 0; x < con_w / 2; x++)
+				dst[x] = src[x];
+		}
+		for (int y = keep; y < con_h; y++) {
+			volatile uint64_t *line = (volatile uint64_t *)(con_fb +
+			    y * (FB_STRIDE / 4));
+			uint64_t pair = ((uint64_t)con_bg << 32) | con_bg;
+			for (int x = 0; x < con_w / 2; x++)
+				line[x] = pair;
+		}
+	}
+	row = rows - 1;
 }
 
 static void put_char(int col, char ch, uint32_t fg)
@@ -61,12 +102,13 @@ static void put_char(int col, char ch, uint32_t fg)
 		return;
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
-			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
+			if (!(g[gy] & (0x80 >> gx)))
+				continue;
 			for (int sy = 0; sy < SCALE; sy++) {
 				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
 						       + x0 + gx * SCALE;
 				for (int sx = 0; sx < SCALE; sx++)
-					p[sx] = c;
+					p[sx] = fg;
 			}
 		}
 }
@@ -90,21 +132,21 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 
 void con_skip(void)
 {
-	row++;
+	con_advance();
 }
 
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);
 	put_str(LABEL_COLS, s, WHITE);
-	row++;
+	con_advance();
 }
 
 /* A raw line, for machine readable output (the dtb dump). */
 void con_line(const char *s)
 {
 	put_str(0, s, WHITE);
-	row++;
+	con_advance();
 }
 
 void con_hex(const char *label, uint64_t v)
@@ -124,7 +166,7 @@ void con_hex64(const char *label, uint64_t v)
 	int col = put_str(0, label, YELLOW);
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
 	put_str(col, buf, WHITE);
-	row++;
+	con_advance();
 }
 
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb)
@@ -140,7 +182,7 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, WHITE);
 	}
-	row++;
+	con_advance();
 }
 
 void con_bytes(const char *label, const void *p, int n)
@@ -161,5 +203,5 @@ void con_bytes(const char *label, const void *p, int n)
 		buf[2] = 0;
 		col = put_str(col, buf, WHITE);
 	}
-	row++;
+	con_advance();
 }

@@ -1,0 +1,62 @@
+xnu 0208: the boot logo is not painted over by the colour-bar self-test
+
+0084 painted four colour bars when the console started, the white one
+covering the right quarter of the panel from the console rows down, to check
+the panel's byte order and stride from a photo. The framebuffer driver has
+since presented CoreAnimation at 1440x3200 with the right order, so the test
+has no reader left: what it does now is sit on top of the Apple logo until
+the first UI swap, which is the white square in the bottom-right quadrant of
+the boot screen.
+
+Remove the bars and their helper. The panel geometry and byte order are
+measured and in `docs/MONDIAN_GPU.md`; if they ever need re-checking, the
+self-test is one revert away.
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -818,38 +818,6 @@
+ 	__builtin_arm_dsb(0xf);
+ }
+ 
+-/*
+- * Colour and geometry self-test, painted once when the console starts.
+- *
+- * A photo of the phone is the only way to know what the panel really shows,
+- * and the two rows the console keeps free at the bottom are the only place
+- * the text never overwrites. Four bars, left to right: red, green, blue,
+- * white. They are written with a zero top byte, so if they appear at all
+- * the panel ignores alpha; if the order is not red-green-blue-white, the
+- * byte order in the ADT is wrong; if a bar is missing or starts short, the
+- * width or the stride is wrong. All of that has to be known before the
+- * userland framebuffer driver starts writing pixels.
+- */
+-static void
+-fbcon_paint_colour_bars(void)
+-{
+-	static const uint32_t bars[4] = {
+-		0x00ff0000u,            /* red */
+-		0x0000ff00u,            /* green */
+-		0x000000ffu,            /* blue */
+-		0x00ffffffu             /* white */
+-	};
+-	uint32_t y0 = fbcon_rows * 16 * FBCON_SCALE;
+-
+-	for (uint32_t y = y0; y < fbcon_height; y++) {
+-		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
+-		for (uint32_t x = 0; x < fbcon_width; x++) {
+-			line[x] = bars[(uint64_t)x * 4 / fbcon_width];
+-		}
+-	}
+-	__builtin_arm_dsb(0xf);
+-}
+-
+ static void
+ fbcon_init(void)
+ {
+@@ -863,7 +831,6 @@
+ 	for (uint32_t r = 0; r < fbcon_rows; r++) {
+ 		fbcon_clear_row(r);
+ 	}
+-	fbcon_paint_colour_bars();
+ }
+ 
+ static unsigned int
