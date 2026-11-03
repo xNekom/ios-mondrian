@@ -1,0 +1,61 @@
+xnu 0202: a boot that dies at the first submission says where
+
+One boot with gpudump=1 ends at `uc pre 71 at 0x5c7` with no `uc big 71` line
+and not one further flush from any other thread: the CPU hung in the window
+between that line and the fence wait. That window holds the GMU keepalive
+write, the ring flush, the SMMU fault clear and the doorbell, and none of them
+logs and none of them is a GPU register read the log can survive.
+
+Print three markers that only touch memory and the log ring -- `uc keepalive
+written` after the keepalive write, `uc fsr cleared` after the fault clear, `uc
+ring door 0x..` before the doorbell -- so the last line in the ring names the
+step that did not return: the mem flush, the GMU, the SMMU write or the
+doorbell itself. They are printed for the logged submissions only, never for
+the bring-up canaries.
+
+The hang dump also gains `uc rbbm 0x.. status1 0x..`. An idle RBBM with an
+unanswered fence and a clean CP is a different fault from a busy one, and that
+distinction has not been available in any dump so far.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3330,6 +3330,10 @@
+ 	if (mondrian_uc_gmu != 0 && mondrian_uc_keep != 2) {
+ 		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1);
+ 	}
++	if (dwords > 16 && mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc keepalive written\n");
++		mondrian_log_flush_now();
++	}
+ 	mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_uc_fence = seq;
+@@ -3339,7 +3347,15 @@
+ 		 * Start every logged submission with a clean fault record, or the
+ 		 * dump below reports whatever the bring-up latched long ago.
+ 		 */
+-		mondrian_gpu_uc_fault_clear();
++		if (dwords > 16) {
++			mondrian_gpu_uc_fault_clear();
++			printf("MONDRIAN GPU: uc fsr cleared\n");
++			mondrian_log_flush_now();
++		}
++	}
++	if (dwords > 16 && mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc ring door 0x%x\n", at);
++		mondrian_log_flush_now();
+ 	}
+ 	if (mondrian_uc_async != 0 && mondrian_uc_door_started != 0) {
+ 		uint32_t waited;
+@@ -3453,6 +3477,12 @@
+ 			    GEN7_CP_IB2_REM_SIZE * 4u));
+ 			printf("MONDRIAN GPU: uc ib1 stopped at %u dwords\n",
+ 			    rem >= dwords ? 0u : dwords - rem);
++			printf("MONDRIAN GPU: uc rbbm 0x%x status1 0x%x\n",
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_RBBM_STATUS * 4u),
++			    mondrian_gpu_read(mondrian_uc_gpu,
++			    GEN7_RBBM_INT_0_STATUS * 4u));
++			mondrian_log_flush_now();
+ 			printf("MONDRIAN GPU: uc fault int 0x%x fault 0x%x protect 0x%x fsr 0x%x far 0x%llx syn 0x%x fsynr0 0x%x fsynr1 0x%x cbndx 0x%x\n",
+ 			    mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_INTERRUPT_STATUS * 4u),
