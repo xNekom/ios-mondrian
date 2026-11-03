@@ -1,0 +1,88 @@
+xnu 0214: the console follows the newest line, and says what it costs
+
+0213 paints the panel from the log thread, but only once per wake (8 KiB of log,
+about 130 lines) and only when the backlog passes 8 KiB: the screen then shows
+the log in bursts and always a couple of seconds old, which reads as "the
+console is slow" even when the painting is not.
+
+Paint until the panel is within a kilobyte of the newest output, re-checking the
+total every chunk (bounded, so a hot log cannot starve the writer): the screen
+shows the tail, skipping lines it cannot keep up with, which is what a console
+on a phone can promise. And count the cost: one line per 128 KiB painted with
+chars and microseconds, so the next change is measured rather than guessed.
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1204,10 +1204,13 @@
+  * wrote over each other's rows. The thread paints what is new; when it falls
+  * behind it jumps to the newest lines, because a console is a view of the tail.
+  */
+-#define MONDRIAN_LOG_PAINT_SKIP (8u << 10)
++#define MONDRIAN_LOG_PAINT_SKIP 1024
+ #define MONDRIAN_LOG_PAINT_CHUNK 256
+ 
+ static uint64_t mondrian_log_painted;
++static uint64_t mondrian_log_paint_chars;
++static uint64_t mondrian_log_paint_us;
++static uint64_t mondrian_log_paint_next_log;
+ 
+ int
+ mondrian_log_running(void)
+@@ -1230,6 +1233,7 @@
+ 		mondrian_log_painted = at;
+ 	}
+ 	while (at < total) {
++		uint64_t began = mach_absolute_time();
+ 		int n = 0;
+ 
+ 		while (at < total && n < MONDRIAN_LOG_PAINT_CHUNK) {
+@@ -1238,6 +1242,28 @@
+ 		}
+ 		mondrian_early_paint(chunk, n);
+ 		mondrian_log_painted = at;
++		mondrian_log_paint_chars += (uint64_t)n;
++		{
++			uint64_t ns = 0;
++
++			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++			mondrian_log_paint_us += ns / 1000;
++		}
++	}
++	/*
++	 * How expensive the panel really is, so that the next change is not a
++	 * guess: one line per 128 KiB painted, with the exchange rate in chars
++	 * per second. printf here only appends to the ring (the painter is
++	 * already running, so console_write() does not paint it again).
++	 */
++	if (mondrian_log_paint_chars >= mondrian_log_paint_next_log &&
++	    mondrian_log_paint_us != 0) {
++		mondrian_log_paint_next_log = mondrian_log_paint_chars + (128u << 10);
++		printf("MONDRIAN CONSOLE: %llu chars in %llu us (%llu chars/s)\n",
++		    (unsigned long long)mondrian_log_paint_chars,
++		    (unsigned long long)mondrian_log_paint_us,
++		    (unsigned long long)(mondrian_log_paint_chars * 1000000 /
++		    mondrian_log_paint_us));
+ 	}
+ }
+ 
+@@ -1450,7 +1476,20 @@
+ 		total = os_atomic_load(&mondrian_log_total, relaxed);
+ 		before = os_atomic_load(&mondrian_log_flushed, relaxed);
+ 		mondrian_log_store(total);
+-		mondrian_log_paint_panel(total);
++		/*
++		 * Paint until the panel is within a line or two of the newest
++		 * output, not once per wake: a wake is 8 KiB of log (~130 lines)
++		 * and painting that in one go would show the console in bursts
++		 * and always a couple of seconds old. The bound keeps a hot log
++		 * from starving the writer.
++		 */
++		for (int i = 0; i < 64; i++) {
++			total = os_atomic_load(&mondrian_log_total, relaxed);
++			if (total - mondrian_log_painted < MONDRIAN_LOG_PAINT_SKIP) {
++				break;
++			}
++			mondrian_log_paint_panel(total);
++		}
+ 		/*
+ 		 * Every wake, not every eighth: the ring wakes per 8 KiB now
+ 		 * and the tick is rate-limited to once a second anyway.
