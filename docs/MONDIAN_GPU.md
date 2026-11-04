@@ -366,6 +366,34 @@ them has Metal. That is the path this port follows.
   `CP_SET_VISIBILITY_OVERRIDE(1)` path that the 71- and 168-dword streams already
   exercised. Binning has nothing to buy here (the compositor renders off-screen),
   and the argument is in `tools/boards.py`.
+- **Nothing on this board is IO-coherent, and XNU's cache helpers are a barrier
+  here.** `__ARM_COHERENT_IO__` is defined for arm64
+  (`pexpert/pexpert/arm64/apple_arm64_common.h:36`), so `flush_dcache()` and
+  `clean_dcache()` compile to a bare `dsb sy` (`osfmk/arm/caches.c:383`). Every
+  flush this port ever asked for was therefore a barrier and not a clean:
+  `0222`'s command-stream writeback, its ring range clean, and `0225`'s page
+  offset fix on top of that clean. `mondrian_gpu_uc_flush()` does the work
+  itself now — `dc civac` a line at a time, the line size from `CTR_EL0`,
+  through the physmap alias of the page, then `dsb sy`. ios-topaz found the
+  same thing and said it plainly (`0111` there: "this kernel is built with the
+  Apple SoC config (`__ARM_COHERENT_IO__`), where clean_dcache/flush_dcache are
+  no-ops").
+- **A surface is mapped with two cache attributes, which is a hazard of its
+  own.** The display's copy reads through `MondrianSurface::kernelAddress()`, a
+  `kIOMapWriteCombineCache` (Normal Non-Cacheable) view, while the process that
+  draws holds a `kIOMapDefaultCache` (cacheable) view of the same pages
+  (`MondrianSurface.cpp:733`). ios-flame names it: "any WC/NC view of a managed
+  page is a mismatched alias: CPU writes through it got lost / reads went
+  stale". What works is to clean and invalidate by physical address before the
+  copy — `MONDRIAN FB: probe N layer a id s ...` says what the surface held and
+  `panel ...` what the copy left (`mondrianfb_probe=N`), and
+  `mondrianfb_nocoh=1` turns the clean off for the A/B.
+- **`glblob=1` lands one boot late.** The kernel writes
+  `/private/var/vm/mondrian-gl.dylib` once the root is remounted writable, and
+  `backboardd` has loaded the dylib by then, so a userland change is in place on
+  the *next* boot, not the one it was built for. The ring shows
+  `MONDRIAN GLBLOB: <path> <bytes> -> 0` after the hook's lines; `-> 30` (EROFS)
+  means the volume is read-only and the copy in the root is what runs.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame

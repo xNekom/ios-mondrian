@@ -347,6 +347,21 @@ mondrian_inject(void)
 		return;
 	}
 	say("mondrian-gl: interposer armed in %s\n", name);
+	/*
+	 * What a poster extension can actually reach in its own address space.
+	 * The interposer only renders for a process that asks for an
+	 * EAGLContext (the class has to be loaded there) and only helps a
+	 * process that renders with CoreAnimation's own renderer (it hooks
+	 * CA::OGL::GLESContext, which lives in QuartzCore). Measured: no
+	 * process other than backboardd has ever created a context, so say
+	 * which of the two is missing instead of arming and hoping.
+	 */
+	if (strstr(name, "Poster") != NULL) {
+		say("mondrian-gl: %s sees EAGLContext %s, CAContext %s, CARenderer %s\n",
+		    name, objc_getClass("EAGLContext") != Nil ? "yes" : "no",
+		    objc_getClass("CAContext") != Nil ? "yes" : "no",
+		    objc_getClass("CARenderer") != Nil ? "yes" : "no");
+	}
 	if (has_boot_argument("glslots=1")) {
 		dump_slots();
 		return;
@@ -356,8 +371,14 @@ mondrian_inject(void)
 		say("mondrian-gl: no %s: the window server keeps its renderer\n", MONDIAN_GL_LIBRARY);
 		return;
 	}
-	/* the kernel publishes the service once the root filesystem is there: give it a moment */
-	for (int i = 0; i < 50; i++) {
+	/*
+	 * The kernel publishes the service once the root filesystem is there:
+	 * give it a moment, but not five seconds. Measured: an extension has
+	 * roughly a second of check-in budget before libxpc kills it with
+	 * "extension check-in timeout", so a constructor that can block for
+	 * 50 x 100 ms eats the budget before it arms anything.
+	 */
+	for (int i = 0; i < 3; i++) {
 		gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(GPU_SERVICE));
 		if (gpu != 0) {
 			break;
@@ -365,7 +386,7 @@ mondrian_inject(void)
 		usleep(100000);
 	}
 	if (gpu == 0) {
-		say("mondrian-gl: no %s: the window server keeps its renderer\n", GPU_SERVICE);
+		say("mondrian-gl: %s: no %s after 300 ms, the renderer stays iOS's\n", name, GPU_SERVICE);
 		return;
 	}
 	IOObjectRelease(gpu);

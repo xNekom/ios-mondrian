@@ -61,8 +61,9 @@
  * wait_for_frames), glfetch=0 keeps EXT_shader_framebuffer_fetch from CoreAnimation (see
  * fetch_offered), glgroup=0 leaves vibrant layers inside groups as they were (see group_draw_begin()), glprecision=0 leaves the shaders' "lowp" and "mediump" as they are (see all_highp), glenv=NAME=VALUE puts that into the environment for the library to find
  * (its own switches: FD_MESA_DEBUG=sysmem, say), vblur=0 blurs nothing whose radius varies and
- * vblur=2 paints such blurs by their masks instead (see vblur_on), glframes=1 writes a line for
- * every frame (see frame_end()).
+ * vblur=2 paints such blurs by their masks instead (see vblur_on), glfunc66=0 and glfunc61=0 leave
+ * CoreAnimation's luma boost and EDR scale undrawn (see luma_boost_fragment), glframes=1 writes a
+ * line for every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -289,6 +290,12 @@ struct eagl {
 	GLint group_blend_func[4];
 	GLuint box;                     /* and one that makes a picture eight times smaller */
 	GLint box_matrix, box_places;
+	GLuint boost, edr;              /* and one for CoreAnimation's luma boost, one for its EDR scale */
+	GLint boost_matrix, boost_numbers, edr_matrix, edr_factors;
+	bool no_boost, no_edr, boost_fetch, edr_fetch;
+	int blended_ours;               /* blending was set aside for one of those (0: not), to be put back after it */
+	GLboolean blended_was;
+	GLint blended_func[4];
 	GLuint halve, vblur;            /* and two for the blur whose radius varies (vblur_level(), vblur_draw_begin()) */
 	GLint halve_texel, vblur_matrix, vblur_radius, vblur_levels, vblur_normalize, vblur_paint;
 	struct vblur_chain {
@@ -1293,12 +1300,24 @@ target_to_surface(struct eagl *e, struct image *image)
 				read_us = (unsigned)(read_done - began);
 				copy_us = (unsigned)(took - (read_done - began));
 				if (readback_lines < 8) {
+					/*
+					 * "base" is read back here, right after
+					 * the frame was written into it: a panel
+					 * that shows nothing while this says the
+					 * pixels are there puts the fault in the
+					 * display's own read of the surface.
+					 */
+					const uint32_t *check = (const uint32_t *)base;
+					size_t middle = (size_t)(rows / 2) * (row / 4);
+
 					readback_lines++;
 					say("mondrian-gl: readback %ux%u %s invert %d shared %d mirror %u:"
-					    " read %u us, copy %u us, total %llu us\n",
+					    " read %u us, copy %u us, total %llu us;"
+					    " base 0x%08x and 0x%08x\n",
 					    (unsigned)columns, (unsigned)rows,
 					    rgba_texture ? "rgba" : "bgra", image->invert,
-					    image->shared, image->mirror, read_us, copy_us, took);
+					    image->shared, image->mirror, read_us, copy_us, took,
+					    check[0], check[middle]);
 				}
 				glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 			}
@@ -1976,6 +1995,8 @@ static const char table_fragment[] =
 #define FUNCTION_VARIABLE_DOWNSAMPLE    38
 #define FUNCTION_VARIABLE_BLUR          39
 #define FUNCTION_VIBRANT_MATRIX         45
+#define FUNCTION_EDR_SCALE              61
+#define FUNCTION_LUMA_BOOST             66
 
 static const char vibrant_fragment[] =
     "#version 120\n"
@@ -2030,6 +2051,88 @@ static const char box_fragment[] =
     "    sum += texture2D(texture0, middle + places[i] * vec2(1., -1.)) + texture2D(texture0, middle + places[i] * vec2(-1., 1.));\n"
     "  }\n"
     "  gl_FragColor = color * sum * .0625;\n"
+    "}\n";
+
+/*
+ * Two more functions of CoreAnimation's that its OpenGL ES renderer has no program for, the last two
+ * draws of a lock-screen frame, each over the whole of the display: "edr" (61) and "lub" (66). Neither
+ * is a layer: each is a pass over the picture already there, which is why it is drawn last and why
+ * nothing of it can be recovered by refusing it. Their semantics are not guessed: the Metal shaders
+ * they stand for are in the root's QuartzCore.framework (default.metallib, edr_scale_lph and
+ * luma_boost_lpf; the same functions appear in the shared cache's OGL shader-name table next to
+ * home_affordance_base). Their AIR is ordinary LLVM bitcode and llvm-dis reads it:
+ *
+ *   luma_boost_lpf(float4 position, float4 color, float2 texcoord, texture2d lut, LumaBoostUniforms
+ *                  u, float4 d0) {                       // d0 is the render target, the picture
+ *     luma = dot(d0.rgb, (0.2125, 0.7154, 0.0721));
+ *     x = luma * 1.984375 * u.inv_edr + 0.00390625;        // one texel of 256
+ *     return float4(d0.rgb + u.edr * u.scale * lut.sample(x, .5).r, d0.a);
+ *   }
+ *
+ *   edr_scale_lph(..., GammaLUTs gamma_luts, half noise_scale, texture2d noise, half4 d0,
+ *                 EDRScaleUniforms u) {                 // u.edr_factors: the display's headroom
+ *     c = d0.rgb / max(d0.a, 1e-4) * u.edr_factors.x;
+ *     c = gamma_to_linear(c) * u.edr_factors.y;           // two 32768-entry half tables
+ *     return half4((linear_to_gamma(c) + noise * noise_scale) * d0.a, d0.a);
+ *   }
+ *
+ * CoreAnimation gives 66 three numbers (the struct's three floats: 0.05, 1, 1 on this phone) and 61
+ * two (edr_factors: inf, 1). What is missing here is the LUT of 66 (a ramp, itself the identity of
+ * the coordinate the shader asks for: com.apple.coreanimation.luma-boost-texture) and the two gamma
+ * tables of 61, which only the Metal renderer's argument buffers carry.
+ *
+ * So: 66 is drawn with what it adds -- u.edr * u.scale * x -- put on with GL_ONE, GL_ONE, which only
+ * ever brightens the picture and leaves its alpha alone; a driver whose gl_LastFragData reads nothing
+ * adds 0.05 * 0.00390625, invisible, rather than painting the picture out. 61 is drawn with the same
+ * arithmetic in 2.2 gamma (there is no table to read) when its factors are finite, and with the
+ * picture left exactly as it is when they are not: the headroom on this display is infinite, so what
+ * it asks for is no change. A driver that will not compile the extension (Mesa's software one) gets
+ * luma_boost_plain_fragment instead, which adds the boost at its greatest, and edr_scale's no-change
+ * path, which is all this display asks of it. Boot-args glfunc66=0 and glfunc61=0 leave each as it
+ * was (not drawn).
+ */
+static const char luma_boost_fragment[] =
+    "#version 120\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform vec3 boost;\n"                  /* LumaBoostUniforms: scale, inv_edr, edr */
+    "varying vec4 color;\n"
+    "void main() {\n"
+    "  float luma = dot(gl_LastFragData[0].rgb, vec3(.2125, .7154, .0721));\n"
+    "  float x = clamp(luma * 1.984375 * boost.y + .00390625, 0., 1.);\n"
+    "  gl_FragColor = vec4(vec3(boost.z * boost.x * x), 0.);\n"
+    "}\n";
+static const char edr_scale_fragment[] =
+    "#version 120\n"
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "uniform vec2 factors;\n"                /* EDRScaleUniforms: edr_factors */
+    "varying vec4 color;\n"
+    "void main() {\n"
+    "  vec4 d = gl_LastFragData[0];\n"
+    "  vec3 c = d.rgb / max(d.a, 1e-4);\n"
+    "  c = pow(max(c * factors.x, 0.), vec3(2.2)) * factors.y;\n"
+    "  gl_FragColor = vec4(pow(max(c, 0.), vec3(1. / 2.2)) * d.a, d.a);\n"
+    "}\n";
+
+/*
+ * The same two for a driver whose compiler has no gl_LastFragData (Mesa's software one: the vibrant
+ * program above is refused there, "extension not supported"). Neither reads the picture: the luma
+ * boost is added at the floor the shader itself gives a black pixel (the .00390625 of its coordinate,
+ * a two-thousandth of full scale), because a pass that cannot weigh itself by the picture must not
+ * lift the whole screen; and the EDR scale writes nothing at all, drawn with GL_ZERO, GL_ONE, which
+ * keeps the picture exactly.
+ */
+static const char luma_boost_plain_fragment[] =
+    "#version 120\n"
+    "uniform vec3 boost;\n"
+    "varying vec4 color;\n"
+    "void main() {\n"
+    "  gl_FragColor = vec4(vec3(boost.z * boost.x * .00390625), 0.);\n"
+    "}\n";
+static const char edr_scale_plain_fragment[] =
+    "#version 120\n"
+    "varying vec4 color;\n"
+    "void main() {\n"
+    "  gl_FragColor = vec4(0.);\n"
     "}\n";
 
 static void *ca_context;                /* CoreAnimation's GLContext */
@@ -2099,6 +2202,9 @@ static int plain_draws = 1;
  * blurred, red where the radius is whole, blue where there is none, and the mask's pixels in the log.
  */
 static int vblur_on = 1;
+
+/* Boot-arg glfunc66=0 / glfunc61=0: CoreAnimation's luma boost and EDR scale (see luma_boost_fragment). */
+static int luma_boost_on = 1, edr_scale_on = 1;
 
 /*
  * Halving: a pixel of the level made is the average of the sixteen of the level it is made of
@@ -2461,6 +2567,19 @@ set_texture_size(GLuint program, GLuint texture, struct eagl *e)
 	set_texture_size_named(program, "texture_size", texture, e);
 }
 
+static bool
+driver_fetches(void)
+{
+	static int fetches = -1;
+
+	if (fetches < 0) {
+		const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+
+		fetches = fetch_offered && extensions != NULL && strstr(extensions, "GL_EXT_shader_framebuffer_fetch") != NULL;
+	}
+	return fetches != 0;
+}
+
 /* One of our programs, made: CoreAnimation's own vertex arrays go in at the places it has them. */
 static GLuint
 plain_program(const char *fragment, const char *what)
@@ -2512,7 +2631,7 @@ plain_program(const char *fragment, const char *what)
  * count of each since the start.
  */
 enum { CENSUS_NOT_DRAWN, CENSUS_PLAIN, CENSUS_TABLE, CENSUS_VIBRANT, CENSUS_MASKING, CENSUS_BOX, CENSUS_LEVEL, CENSUS_VBLUR,
-       CENSUS_KINDS };
+       CENSUS_BOOST, CENSUS_EDR, CENSUS_KINDS };
 static const char *const census_kinds[CENSUS_KINDS] = {
 	"NOT DRAWN (no program, and no texture, or nothing of ours to draw it with, or it would read what it writes)", "drawn as the picture it is given (colour times texture)",
 	"drawn through a table (ours, for the home indicator)", "drawn with our program for a colour matrix over what is behind",
@@ -2520,6 +2639,8 @@ static const char *const census_kinds[CENSUS_KINDS] = {
 	"drawn with our program that makes a picture eight times smaller",
 	"made into a level of ours, half the size of the one before (a blur whose radius varies)",
 	"drawn with our program that reads the levels by the mask (a blur whose radius varies)",
+	"drawn with our program that adds CoreAnimation's luma boost to the picture (and never takes from it)",
+	"drawn with our program for the display's EDR scale (the picture as it was, where there is no headroom to apply)",
 };
 static int census_on;
 static struct census {
@@ -2845,6 +2966,7 @@ static const char group_flat_fragment[] =
 #define GL_BLEND_DST_ALPHA              0x80ca
 #endif
 #define GL_ONE                          1
+#define GL_ZERO                         0
 #define GL_ONE_MINUS_SRC_ALPHA          0x0303
 
 static GLfloat
@@ -3148,6 +3270,116 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 	if (e->program != 0) {
 		return false;
 	}
+	/*
+	 * CoreAnimation's luma boost (66) and EDR scale (61): passes over the picture that is already
+	 * there (luma_boost_fragment has both), drawn last in the frame, with no texture of the
+	 * picture's own. They are drawn before the rule below that leaves a draw with no texture alone,
+	 * since what they add is wanted.
+	 */
+	if (plain_draws != 0 && e->framebuffer != 0 && function == FUNCTION_LUMA_BOOST && luma_boost_on &&
+	    function_given[function] >= 3) {
+		if (e->boost == 0 && !e->no_boost) {
+			if (driver_fetches()) {
+				e->boost = plain_program(luma_boost_fragment, "CoreAnimation's luma boost, by the picture's luma");
+				e->boost_fetch = e->boost != 0;
+			}
+			if (e->boost == 0) {
+				e->boost = plain_program(luma_boost_plain_fragment, "CoreAnimation's luma boost, at the floor of a black picture");
+			}
+			e->no_boost = e->boost == 0;
+			if (e->boost != 0) {
+				e->boost_matrix = glGetUniformLocation(e->boost, "vertex_matrix");
+				e->boost_numbers = glGetUniformLocation(e->boost, "boost");
+			}
+		}
+		program = e->boost;
+		if (program == 0) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);
+			return false;
+		}
+		census_draw(e, function, CENSUS_BOOST);
+		glUseProgram(program);
+		glUniformMatrix4fv(e->boost_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform3fv(e->boost_numbers, 1, function_values[function]);
+		e->blended_ours = 1;            /* (it adds itself: ONE, ONE, and the alpha untouched) */
+		e->blended_was = glIsEnabled(GL_BLEND);
+		glGetIntegerv(GL_BLEND_SRC_RGB, &e->blended_func[0]);
+		glGetIntegerv(GL_BLEND_DST_RGB, &e->blended_func[1]);
+		glGetIntegerv(GL_BLEND_SRC_ALPHA, &e->blended_func[2]);
+		glGetIntegerv(GL_BLEND_DST_ALPHA, &e->blended_func[3]);
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(GL_ONE, GL_ONE, GL_ZERO, GL_ONE);
+		if (!said[function]) {
+			said[function] = 1;
+			say("mondrian-gl: the luma boost of function %u (%s) is added to the picture: scale %g, of headroom %g, "
+			    "amplitude %g%s\n", function, census_name(function), (double)function_values[function][0],
+			    (double)function_values[function][1], (double)function_values[function][2],
+			    e->boost_fetch ? "" : " (at the floor of a black picture: this driver reads no picture)");
+		}
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
+	}
+	if (plain_draws != 0 && e->framebuffer != 0 && function == FUNCTION_EDR_SCALE && edr_scale_on &&
+	    function_given[function] >= 2) {
+		const GLfloat *factors = function_values[function];
+		bool apply;
+
+		if (e->edr == 0 && !e->no_edr) {
+			if (driver_fetches()) {
+				e->edr = plain_program(edr_scale_fragment, "CoreAnimation's EDR scale, over the picture");
+				e->edr_fetch = e->edr != 0;
+			}
+			if (e->edr == 0) {
+				e->edr = plain_program(edr_scale_plain_fragment, "CoreAnimation's EDR scale, with nothing to apply");
+			}
+			e->no_edr = e->edr == 0;
+			if (e->edr != 0) {
+				e->edr_matrix = glGetUniformLocation(e->edr, "vertex_matrix");
+				e->edr_factors = glGetUniformLocation(e->edr, "factors");
+			}
+		}
+		program = e->edr;
+		if (program == 0) {
+			census_draw(e, function, CENSUS_NOT_DRAWN);
+			return false;
+		}
+		apply = e->edr_fetch && factors[0] == factors[0] && factors[1] == factors[1] && factors[0] > 0 &&
+		    factors[1] > 0 && factors[0] < 1e30f && factors[1] < 1e30f;
+		census_draw(e, function, CENSUS_EDR);
+		glUseProgram(program);
+		glUniformMatrix4fv(e->edr_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
+		glUniform2fv(e->edr_factors, 1, factors);
+		e->blended_ours = 1;
+		e->blended_was = glIsEnabled(GL_BLEND);
+		glGetIntegerv(GL_BLEND_SRC_RGB, &e->blended_func[0]);
+		glGetIntegerv(GL_BLEND_DST_RGB, &e->blended_func[1]);
+		glGetIntegerv(GL_BLEND_SRC_ALPHA, &e->blended_func[2]);
+		glGetIntegerv(GL_BLEND_DST_ALPHA, &e->blended_func[3]);
+		if (apply) {
+			glDisable(GL_BLEND);            /* (the program writes the picture it has scaled) */
+		} else {
+			glEnable(GL_BLEND);             /* (no headroom to apply: the picture stays exactly as it is) */
+			glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ZERO, GL_ONE);
+		}
+		if (!said[function]) {
+			said[function] = 1;
+			say("mondrian-gl: the EDR scale of function %u (%s): factors %g and %g, %s\n", function,
+			    census_name(function), (double)factors[0], (double)factors[1],
+			    apply ? "applied in 2.2 gamma" : "no headroom to apply, the picture is left as it is");
+		}
+		for (GLuint i = 0; i < 3; i++) {
+			glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]);
+			if (!enabled[i]) {
+				glEnableVertexAttribArray(i);
+			}
+		}
+		return true;
+	}
 	if (vblur_on && reads_what_it_writes(e) && function_given[FUNCTION_VARIABLE_DOWNSAMPLE] != 0) {
 		static unsigned told;
 
@@ -3337,6 +3569,12 @@ plain_draw_end(struct eagl *e, const GLint enabled[4])
 	if (e->blended) {
 		glEnable(GL_BLEND);
 		e->blended = 0;
+	}
+	if (e->blended_ours) {
+		e->blended_ours = 0;
+		(e->blended_was ? glEnable : glDisable)(GL_BLEND);
+		glBlendFuncSeparate((GLenum)e->blended_func[0], (GLenum)e->blended_func[1], (GLenum)e->blended_func[2],
+		    (GLenum)e->blended_func[3]);
 	}
 }
 
@@ -4120,6 +4358,45 @@ _Static_assert(EAGL_TABLE_SIZE <= SLOTS * 8, "the table has grown");
 
 /* ---- EAGLContext ---------------------------------------------------------------------------------- */
 
+/*
+ * Once, at the first context: clear a texture of the renderer's own to a known
+ * colour and read it back. Everything the compositor draws can be black for
+ * reasons of its own state; this says whether the GPU's pixels reach memory at
+ * all, which no log line of CoreAnimation's can.
+ */
+static void
+gpu_self_test(void)
+{
+	static int done;
+	GLuint texture = 0, fbo = 0;
+	unsigned char pixel[4] = { 0xaa, 0xaa, 0xaa, 0xaa };
+	GLenum status = 0, error;
+
+	if (done) {
+		return;
+	}
+	done = 1;
+	while (glGetError() != 0) {
+	}
+	glGenTextures(1, &texture);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glViewport(0, 0, 64, 64);
+	glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glReadPixels(32, 32, 1, 1, GL_BGRA, GL_UNSIGNED_BYTE, pixel);
+	error = glGetError();
+	say("mondrian-gl: gpu self test: fbo status 0x%x, clear+read %02x %02x %02x %02x, error 0x%x\n",
+	    status, pixel[0], pixel[1], pixel[2], pixel[3], error);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glDeleteFramebuffers(1, &fbo);
+	glDeleteTextures(1, &texture);
+}
+
 static id
 my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 {
@@ -4174,6 +4451,7 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	}
 	say("mondrian-gl: init e %p after make_current -> gl %p\n",
 	    (void *)e, (void *)e->gl);
+	gpu_self_test();
 	current = e;
 	e->object = self;
 	e->api = api;
@@ -4498,6 +4776,8 @@ install(void)
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
+		luma_boost_on = strstr(arguments, "glfunc66=0") == NULL;
+		edr_scale_on = strstr(arguments, "glfunc61=0") == NULL;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
 		}
