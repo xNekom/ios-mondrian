@@ -1,12 +1,12 @@
 # GPU and boot time
 
 The UI renders through the GPU: the draw completes, the frame is drawn in
-place (no readback, no copy) and the display swaps it. A steady frame is 9 ms
-and the display swaps at most 20 times a second, so the wall is now pacing and
-the texture uploads, not rasterisation — see "Measured bring-up state". The
-other ios-sweet ports render through **Mesa/freedreno OpenGL ES behind
-CoreAnimation's OpenGL ES renderer**; none of them has Metal. That is the path
-this port follows.
+place (no readback, no copy) and the display swaps it 57 times in the best
+second measured, against the 60 Hz the panel and the iPhone X mode run at. The
+wall is pacing — a frame reaches the display 8 ms after the vsync it was meant
+for — not rasterisation. The other ios-sweet ports render through
+**Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
+them has Metal. That is the path this port follows.
 
 ## Reference stack
 
@@ -345,6 +345,27 @@ this port follows.
   to the same halt loop, and the draw handler also skips applying groups. That
   is why an earlier `gpunop=0x43` looked like a fix: it removed the packet. Not
   needed once the buffers are coherent; `gpumode=1` stays as a bisect knob.
+- **Mesa's a6xx binning packet parks the a730 SQE.** The first frame with a real
+  draw set stopped the CP 704 dwords into 1785 with `uc sqe pc 0x604 packet
+  0x702f0007 ib1 ... rem 0x439`. `0x702f0007` is `CP_SET_BIN_DATA5` with seven
+  payload dwords, the a6xx layout, which `fd6_gmem.cc:1279`
+  (`OUT_PKT7(ring, CP_SET_BIN_DATA5, 7)`) emits on a7xx too; Turnip writes
+  `CP_SET_PSEUDO_REG` plus the `_OFFSET` variant instead
+  (`tu_cmd_buffer.cc:1095`; in `adreno_pm4.xml` a7xx appends two more addresses
+  and dword 0 grows a `VSC_MASK`). The a730 firmware initialises the length of
+  its memory read (`$09` = `MEM_READ_DWORDS`) only in the ≥8-dword path
+  (`sqe-a730.asm:1765`; vendor blob 01730158 and upstream 01730181 are identical
+  here), so seven dwords leave the read empty, `$memdata` reads 0, and the
+  handler parks in `l1539: jump #l1539` (pc 0x603/0x604). That park is silent:
+  `CP_SQE_STAT` names the packet, while `CP_INTERRUPT_STATUS` stays 0 and
+  `CP_HW_FAULT` 0 — unlike the error halts `l546`/`l548`, which write `0x064` and
+  raise the interrupt. No fence follows, so `0191` marks the GPU stopped and
+  refuses every later submission, and CoreAnimation falls back to softpipe.
+  `glenv=FD_MESA_DEBUG=nobin` removes the packet: `use_hw_binning()`
+  (`fd6_gmem.cc:370`) returns false and the tile stream takes the
+  `CP_SET_VISIBILITY_OVERRIDE(1)` path that the 71- and 168-dword streams already
+  exercised. Binning has nothing to buy here (the compositor renders off-screen),
+  and the argument is in `tools/boards.py`.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
@@ -512,17 +533,18 @@ this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **Next: the frame rate.** The draw and the no-copy presentation work; the
-  panel now shows what the GPU drew. A steady-state frame is 9 ms (frames 23–26:
-  182 GL calls, 25 draws, 78 triangles: 0.6 ms handing the commands on, 8 ms
-  waiting, 0 copying) and the display swaps at most 20 times in a second, so the
-  wall is pacing, not rasterisation. Two measured costs: `frame_end()` calls
-  `glFinish()` once per frame because `display_waits()` reports that the display
-  driver does not wait for the submission that named the surface
-  (`tools/gpu/eagl.c`, `glwait=`), which serialises the CPU behind the GPU; and
-  CoreAnimation asks for far fewer frames than the 60 Hz vsync offers. A fence
-  the compositor can wait on at present time is the first one to remove; the
-  texture failures above are the second.
+- **The GPU presents the UI at 57 swaps a second, and pacing is what is left.**
+  A lock-screen frame is 350 GL calls, 51 draws and 320 triangles drawn in place
+  (`0 pictures copied out`), 3.8 ms handing the commands on and 4.7 ms waiting;
+  the display swaps 57 times in the best second, and the sampler reports frames
+  arriving 8 ms *after* the vsync they were meant for (`late avg 8176 us`), so the
+  panel shows each one a refresh late instead of on time. Two measured costs:
+  `frame_end()` calls `glFinish()` once per frame because `display_waits()`
+  reports that the display driver does not wait for the submission that named the
+  surface (`tools/gpu/eagl.c`, `glwait=`), which serialises the CPU behind the
+  GPU; and CoreAnimation draws only when something changes, so a still screen
+  swaps 1-4 times a second. A fence the compositor can wait on at present time is
+  the first one to remove.
   The firmware blocks, the GMU context bank and the CM3 start are in
   `mondrian_gpu.c` under `gmustart=1`.
 
@@ -657,8 +679,7 @@ cost is CPU frequency, the boot CPU and debug I/O:
 
 ## Milestones
 
-Done: GPU memory, command submission and the Mesa `FD730` context; a
-CoreAnimation GLES frame through the GPU; the no-copy IOSurface presenter.
-Open: paced presentation at 60 Hz (today a frame is 9 ms and the display swaps at
-most 20 times a second), the texture uploads, `bootcpu`/`cpufreq`, the release
-kernel and the boot-time measurements.
+Done: GPU memory, command submission and the Mesa `FD725` context; CoreAnimation
+GLES drawn by the GPU with the no-copy IOSurface presenter, 57 swaps a second.
+Open: paced presentation (frames land 8 ms after their vsync), `bootcpu`/
+`cpufreq`, the release kernel and the boot-time measurements.

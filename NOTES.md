@@ -45,20 +45,20 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `SBLockdownManager` and `SBSetupManager` gates. The cmdline in
   `tools/boards.py` carries `mondrian_ui_hook=7`; the root must have
   `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
-  The UI draws through the GPU; the wallpaper and some text are still white
-  blocks because a texture upload fails (`glDrawElements: 0x502`).
+  The UI draws through the GPU at 57 swaps a second (`docs/MONDIAN_GPU.md`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **UI frame rate.** Touch works (`0153`) and its 220 KB firmware is 8 s of
-   bit-bang SPI (`0156`: `ml_get_timebase()` is 609 MHz here, not the 19.2 MHz
-   timer; keep the bring-up before `launchd`, a thread raced the RPMh iovdd
-   vote). The UI draws through the GPU now (`docs/MONDIAN_GPU.md`): 9 ms a
-   frame, 20 swaps a second at most, so the wall is pacing — a fence the
-   compositor waits on at present time instead of a per-frame `glFinish()` —
-   and the texture failures that leave the wallpaper white.
+1. **UI pacing.** The lock screen is drawn by the GPU and presented at 57 swaps
+   a second (`docs/MONDIAN_GPU.md`); a frame is 3.8 ms of commands and 4.7 ms of
+   `glFinish()`, and it reaches the display 8 ms after the vsync it was meant
+   for, so the panel shows each frame a refresh late — the per-frame wait has to
+   become a fence the compositor waits on at present time. Touch works (`0153`)
+   and its 220 KB firmware is 8 s of bit-bang SPI (`0156`: `ml_get_timebase()`
+   is 609 MHz here, not the 19.2 MHz timer; keep the bring-up before `launchd`,
+   a thread raced the RPMh iovdd vote).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.

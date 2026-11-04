@@ -298,11 +298,15 @@ MONDRIAN = Board(
     # arguments renamed for this board. serial=0 keeps the boot log off the
     # 115200-baud UART (it still goes to the ring, mondrianlog defaults on);
     # all eight cores and the top EPSS row are the normal boot now.
+    # glenv=FD_MESA_DEBUG=nobin: freedreno's GL driver emits the a6xx
+    # 7-dword CP_SET_BIN_DATA5 for a7xx too, and the a730 SQE parks on it
+    # (docs/MONDIAN_GPU.md). The compositor renders off-screen, so binning
+    # buys nothing.
     cmdline=('debug=0xc serial=0 cpus=8 cpufreq=1 keepsyms=1 -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
-             'mondrian_ui_hook=15 '
+             'mondrian_ui_hook=15 glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1'),
 )
 
