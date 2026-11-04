@@ -4359,6 +4359,23 @@ _Static_assert(EAGL_TABLE_SIZE <= SLOTS * 8, "the table has grown");
 /* ---- EAGLContext ---------------------------------------------------------------------------------- */
 
 /*
+ * Whether the kernel's boot arguments name `argument`, for the switches that
+ * change what this library does (the constructor reads the rest once).
+ */
+static int
+boot_argument(const char *argument)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+
+	if (argument == NULL || sysctlbyname("kern.bootargs", arguments, &size,
+	    NULL, 0) != 0) {
+		return 0;
+	}
+	return strstr(arguments, argument) != NULL;
+}
+
+/*
  * Once, at the first context: clear a texture of the renderer's own to a known
  * colour and read it back. Everything the compositor draws can be black for
  * reasons of its own state; this says whether the GPU's pixels reach memory at
@@ -4372,6 +4389,15 @@ gpu_self_test(void)
 	unsigned char pixel[4] = { 0xaa, 0xaa, 0xaa, 0xaa };
 	GLenum status = 0, error;
 
+	/*
+	 * Opt-in (glselftest=1): the test's own submission -- a fresh texture, a
+	 * clear and a readback -- is a stream of its own, and while the event
+	 * writes are being bisected one more stream in front of CoreAnimation's
+	 * is one more thing in the way.
+	 */
+	if (!boot_argument("glselftest=1")) {
+		return;
+	}
 	if (done) {
 		return;
 	}

@@ -41,7 +41,7 @@ for the A/B.
  
  #define super IOUserClient
 +/* Defined next to rewriteEvents(); submit() runs before it in this file. */
-+static int mondrian_uc_events_on(void);
++static bool mondrian_uc_events_on(void);
  OSDefineMetaClassAndStructors(MondrianGPUUserClient, IOUserClient);
  
  bool
@@ -80,7 +80,7 @@ for the A/B.
  				if (expandDrawState(buffer,
  				    cmds[i].submit_offset, dwords * 4, &ib,
  				    &expanded) == kIOReturnSuccess) {
-@@ -1101,6 +1128,102 @@
+@@ -1101,6 +1128,146 @@
  	return groups != 0 ? to : 0;
  }
  
@@ -102,18 +102,61 @@ for the A/B.
 + * in the event dword, which writes its value. This walks the stream, and the
 + * indirect buffers it chains, and sets the bit on every event write.
 + */
-+static int mondrian_uc_events = -1;
++static uint64_t mondrian_uc_events = ~0ull;
++static int mondrian_uc_events_parsed;
 +
-+static int
++/*
++ * gpuevent=<event>[,<event>...] limits the rewrite to those event numbers, in
++ * hex as the packet carries them (1e is FD_BLIT, 31 CACHE_CLEAN); gpuevent=0
++ * turns it off; absent, every event write gets the bit. The CP halts on some
++ * event with WRITE_ENABLED set, so the list is how the one that does it is
++ * found without giving up the others.
++ */
++static bool
++mondrian_uc_event_wanted(uint32_t event)
++{
++	if (!mondrian_uc_events_parsed) {
++		char text[64];
++
++		mondrian_uc_events_parsed = 1;
++		if (PE_parse_boot_argn("gpuevent", text, sizeof(text))) {
++			const char *p = text;
++
++			mondrian_uc_events = 0;
++			while (*p != 0) {
++				uint32_t value = 0, digits = 0;
++
++				while (*p != 0 && *p != ',') {
++					int c = *p++;
++
++					value *= 16;
++					if (c >= '0' && c <= '9') {
++						value += (uint32_t)(c - '0');
++					} else if (c >= 'a' && c <= 'f') {
++						value += (uint32_t)(c - 'a' + 10);
++					} else if (c >= 'A' && c <= 'F') {
++						value += (uint32_t)(c - 'A' + 10);
++					}
++					digits++;
++				}
++				if (*p == ',') {
++					p++;
++				}
++				if (digits != 0 && value < 64) {
++					mondrian_uc_events |= 1ull << value;
++				}
++			}
++		}
++	}
++	return (mondrian_uc_events &
++	    (1ull << (event & 0x3f))) != 0;
++}
++
++static bool
 +mondrian_uc_events_on(void)
 +{
-+	int on = 1;
-+
-+	if (mondrian_uc_events < 0) {
-+		mondrian_uc_events = (PE_parse_boot_argn("gpuevent", &on,
-+		    sizeof(on)) && on == 0) ? 0 : 1;
-+	}
-+	return mondrian_uc_events;
++	(void)mondrian_uc_event_wanted(0);
++	return mondrian_uc_events != 0;
 +}
 +
 +IOReturn
@@ -144,7 +187,8 @@ for the A/B.
 +			uint32_t event = 0;
 +
 +			if (buffer->memory->readBytes(offset + at + 4, &event,
-+			    4) == 4 && (event & (1u << 27)) == 0) {
++			    4) == 4 && (event & (1u << 27)) == 0 &&
++			    mondrian_uc_event_wanted(event & 0xffu)) {
 +				event |= 1u << 27;
 +				if (buffer->memory->writeBytes(offset + at + 4,
 +				    &event, 4) == 4) {

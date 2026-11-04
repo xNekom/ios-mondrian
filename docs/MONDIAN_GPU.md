@@ -405,12 +405,26 @@ them has Metal. That is the path this port follows.
   `FD_CACHE_CLEAN` (`0x31`); this CP refuses event writes with
   `CP_INTERRUPT_STATUS` bit 7, which is the same refusal that forced the ring
   fence to be a `CP_MEM_WRITE` (`cpfence=mem`, `0196`). `cpapriv=0 cpprot=1`
-  does not change it. The one form that was measured to *work* in this port is
-  the fence packet of `0181`: `CP_EVENT_WRITE` with `CACHE_CLEAN|BIT(27)` in the
-  payload, which writes `0x600dc0df` — so the next experiment is a submit
-  rewrite that ORs `BIT(27)` into every event dword the way `gpunop` rewrites an
-  opcode, and the presentation paths above are only worth revisiting after that
-  lands.
+  does not change it.
+- **On a7xx that packet is `CP_EVENT_WRITE7`, and its write is off unless
+  `WRITE_ENABLED` is set.** `adreno_pm4.xml` gives the a7xx form dword 0 as
+  `EVENT[7:0]`, `WRITE_SRC[22:20]`, `WRITE_DST` (24), `WRITE_ENABLED` (27) and
+  `IRQ` (31), with the address in dwords 1-2 and the payload in dwords 3-4 —
+  "writes into `WRITE_DST` from `WRITE_SRC`; `RB_DONE_TS` requires
+  `WRITE_ENABLED`". Mesa's GL path emits the a6xx shape, without the bit, so on
+  this CP an event write is a no-op that also reads as an illegal packet. The
+  port's own fence has always set it (`0x31|BIT(27)`, and `cpevent=4` sends
+  `08000004`), and Mesa does the same for its timestamp — that is why the fence
+  and the timestamp work and the clear does not. `0228` rewrites every event
+  write in a submission to that shape (`gpuevent=` limits it to event numbers,
+  `gpuevent=0` turns it off), and the write does then happen — but the first
+  stream that carries one parks the CP: measured `uc big 253 dwords fence 1 done
+  0`, `uc sqe pc 0x2f8 packet 0x70460001 ib1 ... rem 0x0` (the whole IB
+  consumed), `int 0`, `fault 0`. So the bit alone is not the form this firmware
+  takes: the next thing to try is the full a7xx payload (`WRITE_SRC`/
+  `WRITE_DST` set as Mesa's timestamp packet does, five dwords), and the
+  self test is opt-in (`glselftest=1`) so its own stream is not in front of
+  CoreAnimation's while that is bisected.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
