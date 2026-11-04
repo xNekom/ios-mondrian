@@ -185,16 +185,16 @@ tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
-# `boot_b` is also the recovery (OrangeFox) on this phone: this replaces it, and
-# with it the adb the ring is read through. Dump it first, flash it back after.
+# `boot_b` carries the kernel the kernel-less `recovery` ramdisk (OrangeFox) is
+# paired with: write `backup/boot_b-as-found.img` back before `fastboot reboot
+# recovery`; `fastboot boot` is refused on this phone.
 tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
 sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
 python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 ```
 
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
-existing `.simg` when it is handed the `.img`, so regenerate the sparse file by
-hand or the phone gets the previous one.
+existing `.simg` when handed the `.img`, so make the sparse file again by hand.
 
 A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
 (volatile proof of the same image, `fastboot getvar current-slot`, verified
