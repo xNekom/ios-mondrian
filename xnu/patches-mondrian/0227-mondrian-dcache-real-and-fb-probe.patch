@@ -1,0 +1,236 @@
+xnu 0227: cache maintenance that happens, and a probe for a black panel
+
+XNU is built with __ARM_COHERENT_IO__ on arm64 (pexpert/pexpert/arm64/
+apple_arm64_common.h), and in that build flush_dcache() and clean_dcache() are
+a bare dsb sy (osfmk/arm/caches.c): they order, they never clean. Every flush
+this port asked for was therefore a no-op, including 0222's command-stream
+writeback and the ring range clean whose page offset 0225 then fixed. Nothing
+on this board is IO-coherent -- the panel reads DRAM and the Adreno reads DRAM
+behind the CPU caches -- so mondrian_gpu_uc_flush() does the work itself now:
+dc civac a line at a time, the line size from CTR_EL0, through the physmap
+alias of the page, then a dsb sy. ios-topaz reached the same conclusion twice
+over (0111 there: "this kernel is built with the Apple SoC config
+(__ARM_COHERENT_IO__), where clean_dcache/flush_dcache are no-ops").
+
+The framebuffer reads a surface through its own Normal Non-Cacheable mapping
+while the process that draws holds a cacheable one of the same pages
+(MondrianSurface::kernelAddress() against MondrianSurface.cpp's mapCache), so
+it cleans and drops those lines before it copies: mondrianfb_nocoh=1 turns
+that off for the A/B, and mondrianfb_probe=N says what the surface held and
+what the copy left, which is how a panel that goes black at the first swap is
+told apart from a copy that never ran.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -423,6 +423,8 @@
+ 
+ /* The cmd-db and RPMh helpers live in the touch driver (same TCS/RSC path). */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/pmap/pmap.h is not on this file's include path. */
++extern vm_map_address_t phystokv_range(uint64_t pa, vm_size_t *max_len);
+ extern uint32_t mondrian_cmd_db_addr(const char *id);
+ extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
+ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
+@@ -3889,13 +3891,65 @@
+ 	return 0;
+ }
+ 
++/*
++ * XNU is built with __ARM_COHERENT_IO__ here (pexpert/arm64/
++ * apple_arm64_common.h), and in that build flush_dcache() and clean_dcache()
++ * are a bare dsb: they order, they do not clean. Nothing on this board is
++ * IO-coherent -- the panel reads DRAM and the Adreno reads DRAM behind the CPU
++ * caches -- so the maintenance the driver asks for has to be done by hand.
++ *
++ * Clean and invalidate each line to the point of coherency through the
++ * physmap alias of the pages (a cacheable view of them, so the operation is
++ * unambiguous), keyed on the line size CTR_EL0 reports instead of a guess.
++ */
++static void
++mondrian_dcache_flush_va(uintptr_t va, uint64_t bytes)
++{
++	uint64_t ctr = 0, dmin, line, end;
++
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	dmin = 4ull << ((ctr >> 16) & 0xfull);
++	if (dmin < 16 || dmin > 256) {
++		dmin = 64;
++	}
++	line = va & ~(dmin - 1);
++	end = va + bytes;
++	for (; line < end; line += dmin) {
++		__asm__ volatile("dc civac, %0" :: "r"(line) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++void
++mondrian_dcache_flush_pa(uint64_t pa, uint64_t bytes)
++{
++	while (bytes != 0) {
++		vm_size_t count = (vm_size_t)bytes;
++		vm_offset_t va = phystokv_range((addr64_t)pa, &count);
++
++		if (va == 0 || count == 0) {
++			uint64_t step = bytes < 4096 ? bytes : 4096;
++
++			pa += step;
++			bytes -= step;
++			continue;
++		}
++		if ((uint64_t)count > bytes) {
++			count = (vm_size_t)bytes;
++		}
++		mondrian_dcache_flush_va((uintptr_t)va, count);
++		pa += count;
++		bytes -= count;
++	}
++}
++
+ int
+ mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes)
+ {
+ 	if (bytes == 0) {
+ 		return -1;
+ 	}
+-	flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
++	mondrian_dcache_flush_pa(pa, bytes);
+ 	return 0;
+ }
+ 
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -37,6 +37,7 @@
+ 
+ /* Write back the CPU's view of a buffer before the GPU reads it. */
+ int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
++void mondrian_dcache_flush_pa(uint64_t pa, uint64_t bytes);
+ 
+ /* gpunostate=1: leave CP_SET_DRAW_STATE groups in the stream. */
+ int mondrian_gpu_uc_nostate(void);
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -75,6 +75,20 @@
+ extern "C" uint32_t mondrian_touch_report_count(void);
+ /* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
+ extern "C" uint64_t mondrian_early_fb_va(void);
++extern "C" int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
++
++/*
++ * mondrianfb_probe=N: for the first N layers a swap sends to the panel, say
++ * what the surface holds and what the copy left in the framebuffer. A panel
++ * that goes black the moment the first swap arrives is either a black surface
++ * or a copy that never ran, and on the glass the two are the same picture.
++ */
++static int mondrian_fb_probe;
++/*
++ * mondrianfb_nocoh=1 turns the clean below off, for the boot that shows what
++ * the copy sees without it.
++ */
++static int mondrian_fb_coherent = 1;
+ 
+ #define MONDRIAN_FB_REFRESH_HZ             60
+ #define MONDRIAN_FB_TIMING_ID              1
+@@ -317,6 +331,16 @@
+ 			fFpsLog = true;
+ 		}
+ 	}
++	(void)PE_parse_boot_argn("mondrianfb_probe", &mondrian_fb_probe,
++	    sizeof(mondrian_fb_probe));
++	{
++		int nocoh = 0;
++
++		if (PE_parse_boot_argn("mondrianfb_nocoh", &nocoh, sizeof(nocoh)) &&
++		    nocoh != 0) {
++			mondrian_fb_coherent = 0;
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -547,6 +571,60 @@
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
++		if (mondrian_fb_probe > 0 && src != 0 && s->bytesPerRow != 0 &&
++		    s->height != 0) {
++			uint64_t sum = 0, first = 0;
++			int32_t row;
++
++			for (row = 0; row < 64 && row < (int32_t)s->height; row++) {
++				const uint32_t *p = (const uint32_t *)(src + s->offset +
++				    (uint64_t)row * s->bytesPerRow);
++
++				if (row == 0) {
++					first = p[0];
++				}
++				sum += p[0] + p[1] + p[2] + p[3];
++			}
++			IOLog("MONDRIAN FB: probe %d layer %u id %u %ux%u off %u bpr %u"
++			    " len %llu own %d src 0x%llx first 0x%08x rows 0x%llx\n",
++			    mondrian_fb_probe, layer, id, s->width, s->height,
++			    s->offset, s->bytesPerRow,
++			    s->memory != NULL ? s->memory->getLength() : 0ull,
++			    s == fSurface, (unsigned long long)src, (unsigned)first,
++			    (unsigned long long)sum);
++		}
++		/*
++		 * The panel copies the surface out of DRAM, and the writer left
++		 * lines in a cache this mapping does not look at: it is Normal
++		 * Non-Cacheable (kIOMapWriteCombineCache), while CoreAnimation's
++		 * own mapping of the same pages is cacheable and the readback
++		 * path writes a frame straight into it with glReadPixels.
++		 * Measured without this: `probe 8 layer 0 id 2 ... first
++		 * 0x00000000 rows 0x0` right after an 18 MB readback. Clean and
++		 * drop the lines by physical address before the copy, every
++		 * layer, so what is on the panel is what was drawn.
++		 */
++		if (mondrian_fb_coherent && s->memory != NULL &&
++		    s->bytesPerRow != 0 && s->height != 0) {
++			uint64_t end = (uint64_t)s->offset +
++			    (uint64_t)s->bytesPerRow * s->height;
++			uint64_t off = (uint64_t)s->offset;
++
++			while (off < end) {
++				IOByteCount length = 0;
++				addr64_t pa = s->memory->getPhysicalSegment(off,
++				    &length);
++
++				if (pa == 0 || length == 0) {
++					off += 0x4000;
++					continue;
++				}
++				if (off + length > end) {
++					length = (IOByteCount)(end - off);
++				}
++				(void)mondrian_gpu_uc_flush(pa, length);
++				off += length;
++			}
+ 		}
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		/*
+@@ -608,6 +686,24 @@
+ 				    (size_t)w * 4);
+ 			}
+ 		}
++		if (mondrian_fb_probe > 0) {
++			uint64_t sum = 0, first = 0;
++			int32_t row;
++
++			for (row = 0; row < 64 && row < (int32_t)fHeight; row++) {
++				const uint32_t *p = (const uint32_t *)(fPixels +
++				    (uint64_t)row * fRowBytes);
++
++				if (row == 0) {
++					first = p[0];
++				}
++				sum += p[0] + p[1] + p[2] + p[3];
++			}
++			IOLog("MONDRIAN FB: probe %d panel first 0x%08x rows 0x%llx\n",
++			    mondrian_fb_probe, (unsigned)first,
++			    (unsigned long long)sum);
++			mondrian_fb_probe--;
++		}
+ 		s->release();
+ 	}
+ 
