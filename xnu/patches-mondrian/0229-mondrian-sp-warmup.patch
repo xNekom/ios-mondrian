@@ -1,0 +1,216 @@
+xnu 0229: the SP warm-up kernel every a730 command buffer has to start with
+
+Turnip runs `cmdbuf_start_a725_quirk` at the start of every command buffer on
+a725/a730 silicon: a compute kernel over the whole shader array (a multiply,
+12 groups of 255 waves, 3072 invocations) plus the register writes that aim it
+(HLSQ_INVALIDATE_CMD with all stages and both bindless sets,
+HLSQ_CS_CNTL constlen 4 dword, SP_CS_CONFIG enabled, SP_CS_CTRL_REG0 MULTI +
+THREAD128 + MERGEDREGS, shared size 2k, the NDRANGE 255x1x1, LAST_LOCAL_SIZE,
+SP_CS_CNTL_0/_1 and SP_CS_OBJ first-exec pointing at the shader). Its
+comment says "It is unknown what this workaround is for and what it fixes";
+without it none of the renders reach memory -- every clear, state upload, draw
+and shader output reads back zeros while the submissions complete and fence.
+
+The port builds the stream once (a 1 KiB page in the CP's own address space at
+0x303000, CP-visible with the same perms as the ring), and uc_submit emits a
+CP_INDIRECT_BUFFER to it before the client indirect buffer, the way the
+IFPC bracket was folded. cpuirk=0 leaves the streams alone.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1787,6 +1787,20 @@
+ static struct mondrian_gpu_mem mondrian_cp_memptr;
+ static struct mondrian_gpu_mem mondrian_cp_ib;
+ static struct mondrian_gpu_mem mondrian_cp_pwrup;
++/*
++ * cpuirk=1 (the default): every client submission starts with this stream --
++ * a compute kernel over the whole shader array, 12 groups of 255 waves, plus
++ * the register writes that aim it. Turnip emits the same thing at the start
++ * of every command buffer on a725/a730 (`cmdbuf_start_a725_quirk` in
++ * tu_device.cc, "It is unknown what this workaround is for and what it
++ * fixes"), and its absence is the difference between an a730 whose renders
++ * reach memory and an a730 whose submissions complete and fence while every
++ * clear, state upload, draw and shader output reads back zeros.
++ */
++static struct mondrian_gpu_mem mondrian_uc_quirk;
++static void mondrian_uc_quirk_build(void);
++static uint32_t mondrian_uc_quirk_words;
++static int mondrian_cp_quirk = 1;
+ static struct mondrian_gpu_mem mondrian_cp_scratch;
+ static uint32_t mondrian_cp_sctlr;
+ 
+@@ -1942,6 +1956,7 @@
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x8000, 0x200000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_uc_quirk, 0x1000, 0x303000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ib, 0x4000, 0x400000) != 0) {
+ 			printf("MONDRIAN GPU: cp memory allocation failed\n");
+@@ -1972,6 +1987,9 @@
+ 		    mondrian_cp_tables.pa, mondrian_cp_pwrup.iova,
+ 		    mondrian_cp_pwrup.va, mondrian_cp_pwrup.bytes, 3, &next) != 0 ||
+ 		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_uc_quirk.iova,
++		    mondrian_uc_quirk.va, mondrian_uc_quirk.bytes, 3, &next) ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
+ 		    mondrian_cp_tables.pa, mondrian_cp_scratch.iova,
+ 		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 3, &next) != 0 ||
+ 		    /* The command stream is fetched by the non-privileged CP
+@@ -2487,7 +2505,8 @@
+ static void
+ mondrian_cp_apriv_program(vm_offset_t gpu, int log)
+ {
+-	mondrian_gpu_write(gpu, GEN7_CP_APRIV_CNTL * 4u, 0x4fu);
++	/* kgsl's BR default, and pong's: 0x6f */
++	mondrian_gpu_write(gpu, GEN7_CP_APRIV_CNTL * 4u, 0x6fu);
+ 	mondrian_gpu_write(gpu, GEN7_CP_BV_APRIV_CNTL * 4u, 0x0fu);
+ 	mondrian_gpu_write(gpu, GEN7_CP_LPAC_APRIV_CNTL * 4u, 0x0fu);
+ 	mondrian_gpu_write(gpu, GEN7_CP_LPAC_PROTECT_CNTL * 4u, 0x0bu);
+@@ -2642,9 +2661,10 @@
+ 	CPW64(GEN7_UCHE_TRAP_BASE_LO, 0x1fffffffff000ULL);
+ 	CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, 0x1fffffffff000ULL);
+ 	CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
+-	CPW(GEN7_UCHE_CMDQ_CONFIG, 0x6690eu);
++
+ 	CPW(GEN7_CP_AHB_CNTL, 1);
+ 	CPW(GEN7_RBBM_PERFCTR_CNTL, 1);
++	/* Pong: (1<<11)|(1<<4)|(bank<<1) = 0x812 for bank bit 16 */
+ 	CPW(GEN7_RB_NC_MODE_CNTL, (1u << 11) | (1u << 4) | (bank << 1));
+ 	CPW(GEN7_TPL1_NC_MODE_CNTL, bank << 1);
+ 	CPW(GEN7_SP_NC_MODE_CNTL, (2u << 4) | (bank << 1));
+@@ -4069,6 +4089,78 @@
+ 	}
+ }
+ 
++/*
++ * The command-buffer-start quirk of the 725/730: the shader and the registers
++ * around it, laid out exactly as Turnip's `tu_init_cmdbuf_start_a725_quirk`
++ * (a7xx field offsets from adreno_pm4.xml). The shader is a multiply over the
++ * whole array -- `NGROUPS_X` 12, the SP's waves -- and stops; no state the
++ * callers keep is left modified that CoreAnimation does not re-emit at its
++ * own start.
++ */
++static void
++mondrian_uc_quirk_build(void)
++{
++	uint32_t *p = (uint32_t *)(mondrian_uc_quirk.va + 64);
++	static const uint32_t shader[10] = {
++		0x00040000, 0x40600000,		/* mul.f hr0.x, hr0.x, hr1.x */
++		0x00050001, 0x40600001,		/* mul.f hr0.y, hr0.y, hr1.y */
++		0x00060002, 0x40600002,		/* mul.f hr0.z, hr0.z, hr1.z */
++		0x00070003, 0x40600003,		/* mul.f hr0.w, hr0.w, hr1.w */
++		0x00000000, 0x03000000,		/* end */
++	};
++	const uint64_t shader_iova = mondrian_uc_quirk.iova;
++	const uint32_t one = 1;
++
++	memcpy((void *)mondrian_uc_quirk.va, shader, sizeof(shader));
++
++	*p++ = mondrian_pm4_type4(0xab1fu, 1);		/* HLSQ_INVALIDATE_CMD */
++	*p++ = 0x01ffff9fu;				/* all shader stages, both bindless */
++	*p++ = mondrian_pm4_type4(0xa9cfu, 1);		/* HLSQ_CS_CNTL */
++	*p++ = 0x101u;					/* constlen 4 dwords, enabled */
++	*p++ = mondrian_pm4_type4(0xa9bbu, 1);		/* SP_CS_CONFIG */
++	*p++ = 1;					/* enabled */
++	*p++ = mondrian_pm4_type4(0xa9b0u, 1);		/* SP_CS_CTRL_REG0 */
++	*p++ = 0x80100001u;				/* MULTI, THREAD128, MERGEDREGS */
++	*p++ = mondrian_pm4_type4(0xa9b1u, 1);		/* SP_CS_CTRL_REG1 */
++	*p++ = 1;					/* 2k of shared */
++	*p++ = mondrian_pm4_type4(0xa9dcu, 3);		/* HLSQ_CS_KERNEL_GROUP */
++	*p++ = one; *p++ = one; *p++ = one;
++	*p++ = mondrian_pm4_type4(0xa9bau, 1);		/* SP_CS_TEX_COUNT */
++	*p++ = 0;
++	*p++ = mondrian_pm4_type4(0xa9bcu, 1);		/* SP_CS_INSTRLEN */
++	*p++ = 1;
++	*p++ = mondrian_pm4_type4(0xaa00u, 1);		/* SP_CS_IBO_COUNT */
++	*p++ = 0;
++	*p++ = mondrian_pm4_type4(0xa9dbu, 1);		/* HLSQ_CS_CNTL_1 */
++	*p++ = 0x44400a3fu;				/* LINEARLOCAL 63, THREAD128, ZFIRSTEN, tile 4x17 */
++	*p++ = mondrian_pm4_type4(0xa9c2u, 2);		/* SP_CS_CNTL_0 + _1 */
++	*p++ = 0xfcfcc0cfu;				/* wg/wgsize/wgoffset/local */
++	*p++ = 0x813fu;					/* linear local 63, THREAD128, TILED */
++	*p++ = mondrian_pm4_type4(0xa9beu, 1);		/* SP_CS_UNKNOWN_A9BE */
++	*p++ = 0;
++	*p++ = mondrian_pm4_type4(0xa9d4u, 7);		/* HLSQ_CS_NDRANGE_0..6 */
++	*p++ = 0x3fbu;					/* kerneldim 3, local 255x0x0 */
++	*p++ = 3072;
++	*p++ = 0;
++	*p++ = 1;
++	*p++ = 0;
++	*p++ = 1;
++	*p++ = 0;
++	*p++ = mondrian_pm4_type4(0xa9dfu, 1);		/* HLSQ_CS_LAST_LOCAL_SIZE */
++	*p++ = 0x3f8u;
++	*p++ = mondrian_pm4_type4(0xa9b3u, 3);		/* SP_CS_OBJ_FIRST_EXEC_OFFSET + START */
++	*p++ = 0;
++	*p++ = (uint32_t)shader_iova;
++	*p++ = (uint32_t)(shader_iova >> 32);
++	*p++ = mondrian_pm4_type7(0x03u, 4);		/* CP_EXEC_CS */
++	*p++ = 0;
++	*p++ = 12;					/* NGROUPS_X: 12 * 255 waves */
++	*p++ = 1;
++	*p++ = 1;
++	mondrian_uc_quirk_words =
++	    (uint32_t)((uint8_t *)p - (mondrian_uc_quirk.va + 64)) / 4;
++}
++
+ int
+ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ {
+@@ -4211,7 +4303,7 @@
+ 				mondrian_uc_sh_reg = reg;
+ 			}
+ 			spins++;
+-			if (room >= 26) {
++			if (room >= 26 + mondrian_cp_quirk * 4) {
+ 				mondrian_uc_rptr = rptr;
+ 				mondrian_uc_rptr_valid = 1;
+ 				break;
+@@ -4249,6 +4341,20 @@
+ 		printf("MONDRIAN GPU: uc wrap at 0x%x\n", at);
+ 		mondrian_log_flush_now();
+ 	}
++	/*
++	 * The 725/730 quirk: a compute kernel wakes the shader array before
++	 * anything else runs. Built once, the first time any submission is
++	 * queued; every submission then starts with a CP_INDIRECT_BUFFER to
++	 * it (see the ring below).
++	 */
++	if (mondrian_cp_quirk && mondrian_uc_quirk.va != 0 &&
++	    mondrian_uc_quirk_words == 0) {
++		mondrian_uc_quirk_build();
++		mondrian_gpu_mem_flush(&mondrian_uc_quirk, 0x1000);
++		printf("MONDRIAN GPU: uc quirk %u dwords built\n",
++		    mondrian_uc_quirk_words);
++		mondrian_log_flush_now();
++	}
+ 	from = at;
+ 	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
+ 	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
+@@ -4295,6 +4401,17 @@
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x00du;		/* IB1LIST start */
+ 	}
++	/*
++	 * cpquirk=1 (the default): the 725/730 wakes its shader array before the
++	 * submission's packets run (the same stream Turnip puts at the start of
++	 * every command buffer).
++	 */
++	if (mondrian_cp_quirk && mondrian_uc_quirk.va != 0) {
++		ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
++		ring[at++] = (uint32_t)mondrian_uc_quirk.iova;
++		ring[at++] = (uint32_t)(mondrian_uc_quirk.iova >> 32);
++		ring[at++] = mondrian_uc_quirk_words;
++	}
+ 	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
+ 	ring[at++] = (uint32_t)ib;
+ 	ring[at++] = (uint32_t)(ib >> 32);
+@@ -4774,6 +4891,8 @@
+ 	    sizeof(mondrian_cp_noretry));
+ 	(void)PE_parse_boot_argn("cporder", &mondrian_cp_order,
+ 	    sizeof(mondrian_cp_order));
++	(void)PE_parse_boot_argn("cpuirk", &mondrian_cp_quirk,
++	    sizeof(mondrian_cp_quirk));
+ 	(void)PE_parse_boot_argn("cpapriv", &mondrian_cp_apriv,
+ 	    sizeof(mondrian_cp_apriv));
+ 	(void)PE_parse_boot_argn("gpureset", &mondrian_cp_reset,
