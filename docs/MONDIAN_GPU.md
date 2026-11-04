@@ -472,15 +472,18 @@ them has Metal. That is the path this port follows.
   passes it — the streams execute. `CP_ME_INIT` already carries kgsl's DMS bit
   (`0x14b | BIT(11)`) and the four stream slots are leased in one bank. What is
   left to prove, in this order:
-  1. **Can this CP do a 2D copy at all?** A bring-up probe like the
-     `CP_MEM_WRITE` canary: fill a small linear buffer, run `CP_BLIT`
-     (`BLIT_OP_COPY`, 1:1 rects) into another and read it back. If bytes move,
-     the engine runs and only Mesa's event-based trigger is missing, which is a
-     Mesa patch in `emit_blit()` (`fd6_gmem.cc`): for `CHIP >= A7XX` emit
-     `CP_BLIT` + `CP_SET_RENDER_MODE(END2D)` instead of `FD_BLIT`.
-  2. If `CP_BLIT` moves nothing, the 2D engine is not running on this CP and the
-     next place to look is the per-engine state (`CP_MODE`, `RB_MODE`, the
-     restore list, `CP_SET_AMBLE`), not the packets.
+  1. **Can this CP move pixels out of the 2D engine at all?** `CP_BLIT` writes
+     into the CCU, not into memory (`fd6_blitter.cc:1185`: "CP_BLIT writes to
+     the CCU, unlike CP_EVENT_WRITE::BLIT which writes to [memory]"), so the
+     probe is `CP_BLIT` (`BLIT_OP_COPY`, 1:1 rects) into a small linear buffer
+     followed by `CCU_CLEAN_COLOR` (a `needs_seqno` event, which this CP does
+     accept with `WRITE_ENABLED`), then read the destination back. Bytes there
+     mean the engine and the clean both work and only the `BLIT` event's
+     memory write is missing; that is a Mesa question in `emit_blit()`
+     (`fd6_gmem.cc`), not a bring-up one.
+  2. If nothing moves, the engine is not running on this CP and the next place
+     to look is per-engine state (`CP_MODE`, `RB_MODE`, the restore list,
+     `CP_SET_AMBLE`), not the packet encodings.
   3. The proven path for a fluid UI on this exact silicon is Turnip
      (`pong-adreno`, Nothing Phone 2, "desktop rendering"), which for a
      CoreAnimation GLES client means GL on top of it (zink) or metal2vulkan as
