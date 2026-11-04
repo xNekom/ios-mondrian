@@ -425,6 +425,22 @@ them has Metal. That is the path this port follows.
   `WRITE_DST` set as Mesa's timestamp packet does, five dwords), and the
   self test is opt-in (`glselftest=1`) so its own stream is not in front of
   CoreAnimation's while that is bisected.
+- **Neither a730 firmware has a BLIT event; `CP_BLIT` drives the 2D engine.**
+  The SQE's `CP_EVENT_WRITE7` handler (`sqe-a730.asm:810`, identical in the
+  vendor 01730158 and upstream 01730181 blobs) compares the event number
+  against `0x31, 0x32, 0x16, 0x20, 0x21, 0x1a, 0x15, 0x9, 0x11-0x14` and
+  nothing else: `BLIT` (30 = `0x1e`), which is what both freedreno and Turnip
+  use to trigger the RB blit engine, falls through to the generic path and is
+  not dispatched. `CP_BLIT` (`0x2c`, `sqe-a730.asm:2469`) *is* implemented and
+  is what starts the engine (`EVENT_CMD = 4`, then `HLSQ_EVENT_CMD`/
+  `PC_EVENT_CMD` with `0x2a`/`0x2b` and `CP_EVENT_END`), with the a5xx blitter
+  (`a5xx/fd5_blitter.c:273`) as the shape that builds it: `CP_BLIT` with
+  `BLIT_OP_FILL`/`COPY` and the source and destination rectangles, followed by
+  `CP_SET_RENDER_MODE(END2D)`. So the a7xx GL path's clears and resolves cannot
+  work on this chip as Mesa 25.0.7 emits them, and the candidates are a Mesa
+  patch that drives `CP_BLIT` on a7xx (the RB blit registers the same code sets
+  up are what the engine reads) or a driver-side rewrite of the `FD_BLIT` event
+  into that packet.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
