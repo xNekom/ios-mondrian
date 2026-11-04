@@ -51,14 +51,14 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **UI pacing.** The lock screen is drawn by the GPU and presented at 57 swaps
-   a second (`docs/MONDIAN_GPU.md`); a frame is 3.8 ms of commands and 4.7 ms of
-   `glFinish()`, and it reaches the display 8 ms after the vsync it was meant
-   for, so the panel shows each frame a refresh late — the per-frame wait has to
-   become a fence the compositor waits on at present time. Touch works (`0153`)
-   and its 220 KB firmware is 8 s of bit-bang SPI (`0156`: `ml_get_timebase()`
-   is 609 MHz here, not the 19.2 MHz timer; keep the bring-up before `launchd`,
-   a thread raced the RPMh iovdd vote).
+1. **The GPU's pixels never reach memory, so the panel is black.** Frames are
+   composed and the display swaps 57-64 times a second, but a self test (clear a
+   texture to red, read it back) returns zeros (`docs/MONDIAN_GPU.md`) and every
+   presentation path leaves the surface at zero: freedreno triggers the clear
+   and the GMEM resolve with `CP_EVENT_WRITE(FD_BLIT)`, and this CP refuses
+   event writes (`CP_INTERRUPT_STATUS` bit 7), the refusal that made the fence a
+   `CP_MEM_WRITE`. Next: OR `BIT(27)` into every event dword (`0181`'s form).
+   Touch works (`0153`, its 220 KB firmware is 8 s of bit-bang SPI, `0156`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
