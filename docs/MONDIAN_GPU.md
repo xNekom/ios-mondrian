@@ -466,7 +466,25 @@ them has Metal. That is the path this port follows.
   runs KDE Plasma on one with mainline `msm`; `lfdevs/mesa-for-android-container`
   runs FD725 GL under KGSL, Mesa 25.3), and upstream CI is green for gen7 GL on
   a750 — so the failure here is this port's command processor state (BV and the
-  thread semaphore first), not the Mesa code path.
+  thread semaphore first), not the Mesa code path. The bootstrap handshake is
+  not the gap: `l162` in the SQE (`brne $02, 0x0, #l162`, right after
+  `THREAD_SYNC` bit 0 is cleared) is the wait Pong describes, and this port
+  passes it — the streams execute. `CP_ME_INIT` already carries kgsl's DMS bit
+  (`0x14b | BIT(11)`) and the four stream slots are leased in one bank. What is
+  left to prove, in this order:
+  1. **Can this CP do a 2D copy at all?** A bring-up probe like the
+     `CP_MEM_WRITE` canary: fill a small linear buffer, run `CP_BLIT`
+     (`BLIT_OP_COPY`, 1:1 rects) into another and read it back. If bytes move,
+     the engine runs and only Mesa's event-based trigger is missing, which is a
+     Mesa patch in `emit_blit()` (`fd6_gmem.cc`): for `CHIP >= A7XX` emit
+     `CP_BLIT` + `CP_SET_RENDER_MODE(END2D)` instead of `FD_BLIT`.
+  2. If `CP_BLIT` moves nothing, the 2D engine is not running on this CP and the
+     next place to look is the per-engine state (`CP_MODE`, `RB_MODE`, the
+     restore list, `CP_SET_AMBLE`), not the packets.
+  3. The proven path for a fluid UI on this exact silicon is Turnip
+     (`pong-adreno`, Nothing Phone 2, "desktop rendering"), which for a
+     CoreAnimation GLES client means GL on top of it (zink) or metal2vulkan as
+     Pong does it — a much larger change than the two probes above.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
