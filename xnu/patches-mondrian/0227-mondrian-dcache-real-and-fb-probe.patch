@@ -31,7 +31,7 @@ told apart from a copy that never ran.
  extern uint32_t mondrian_cmd_db_addr(const char *id);
  extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
  extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
-@@ -3889,13 +3891,65 @@
+@@ -3889,14 +3891,65 @@
  	return 0;
  }
  
@@ -94,6 +94,7 @@ told apart from a copy that never ran.
  		return -1;
  	}
 -	flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
+-	__asm__ volatile("dsb sy" ::: "memory");
 +	mondrian_dcache_flush_pa(pa, bytes);
  	return 0;
  }
@@ -148,7 +149,7 @@ told apart from a copy that never ran.
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -547,6 +571,60 @@
+@@ -547,6 +571,61 @@
  			continue;
  		}
  		uintptr_t src = s->kernelAddress();
@@ -206,10 +207,11 @@ told apart from a copy that never ran.
 +				(void)mondrian_gpu_uc_flush(pa, length);
 +				off += length;
 +			}
- 		}
++		}
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		/*
-@@ -608,6 +686,24 @@
+ 		 * A full canvas-sized layer is scaled to the panel. Nearest
+@@ -607,6 +686,24 @@
  				    (size_t)w * 4);
  			}
  		}

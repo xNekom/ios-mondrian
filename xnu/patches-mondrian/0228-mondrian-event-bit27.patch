@@ -1,0 +1,185 @@
+xnu 0228: give CP_EVENT_WRITE the BIT(27) this CP requires
+
+The GL self test in the CoreAnimation shim settles what kept the panel black: a
+framebuffer-complete texture cleared to red reads back as zeros, so nothing the
+Adreno renders reaches memory. freedreno drives the RB blit engine with
+CP_EVENT_WRITE -- FD_BLIT (event 30) is what makes a clear happen and what
+resolves a tile out of GMEM into the render target (a6xx/fd6_emit.h,
+fd6_emit_blit()), FD_CACHE_CLEAN (0x31) pushes the GPU's own writes out of its
+cache -- and this CP refuses an event write without BIT(27) in its event dword
+(CP_INTERRUPT_STATUS bit 7, CP_ILLEGAL_INSTR_ERROR). That refusal is the same
+one that made this port's ring fence a CP_MEM_WRITE (0181, cpfence=mem), and
+the form that was measured working there is CACHE_CLEAN|BIT(27).
+
+The user client rewrites every CP_EVENT_WRITE in a submission, and in the
+indirect buffers it chains, to that form: one OR of BIT(27) into the event
+dword, then a write-back of the buffer, because the CP fetches from memory and
+the changed dwords are in the CPU's cache. gpuevent=0 leaves the streams alone
+for the A/B.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -206,6 +206,8 @@
+ 	IOReturn submit(struct msm_gem_submit *request);
+ 	IOReturn expandDrawState(mondrian_buffer *src, uint32_t offset,
+ 	    uint32_t size, uint64_t *ib, uint32_t *dwords);
++	IOReturn rewriteEvents(mondrian_buffer *buffer, uint32_t offset,
++	    uint32_t size, unsigned depth, unsigned *rewritten);
+ 	uint64_t scratchCarve(uint64_t bytes);
+ 	uint32_t expandGroups(const uint8_t *in, uint32_t size, uint8_t *out,
+ 	    uint32_t outMax);
+@@ -229,6 +231,8 @@
+ 	uint32_t fDumped;
+ 	uint32_t fNested;
+ 	uint32_t fStateGroup;
++	uint32_t fEventLogged;
++	uint32_t fEventTotal;
+ 	uint32_t fPrepLogged;
+ 	bool fSyncAll;
+ 	uint32_t fSyncLogged;
+@@ -312,6 +316,8 @@
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ #define super IOUserClient
++/* Defined next to rewriteEvents(); submit() runs before it in this file. */
++static int mondrian_uc_events_on(void);
+ OSDefineMetaClassAndStructors(MondrianGPUUserClient, IOUserClient);
+ 
+ bool
+@@ -332,6 +338,8 @@
+ 	fDumped = 0;
+ 	fNested = 0;
+ 	fStateGroup = 0;
++	fEventLogged = 0;
++	fEventTotal = 0;
+ 	fPrepLogged = 0;
+ 	fSyncLogged = 0;
+ 	fSyncAll = mondrian_sync_all();
+@@ -937,6 +945,25 @@
+ 				    cmds[i].submit_offset;
+ 				uint32_t expanded = dwords;
+ 
++				if (mondrian_uc_events_on()) {
++					unsigned rewritten = 0;
++
++					(void)rewriteEvents(buffer,
++					    cmds[i].submit_offset, cmds[i].size,
++					    0, &rewritten);
++					fEventTotal += rewritten;
++					if (rewritten != 0 && fEventLogged < 8) {
++						fEventLogged++;
++						IOLog("MondrianGPU: event write"
++						    " %u dwords given"
++						    " BIT(27)\n", rewritten);
++					}
++					if (rewritten != 0) {
++						/* the sync above ran before this
++						 * rewrite */
++						bufferSync(buffer);
++					}
++				}
+ 				if (expandDrawState(buffer,
+ 				    cmds[i].submit_offset, dwords * 4, &ib,
+ 				    &expanded) == kIOReturnSuccess) {
+@@ -1101,6 +1128,102 @@
+ 	return groups != 0 ? to : 0;
+ }
+ 
++/*
++ * gpuevent=1 (the default): give every CP_EVENT_WRITE in a submission the
++ * BIT(27) this CP needs.
++ *
++ * An event write without it is refused -- CP_INTERRUPT_STATUS bit 7,
++ * CP_ILLEGAL_INSTR_ERROR, the same refusal that made this port's ring fence a
++ * CP_MEM_WRITE instead (`cpfence=mem`, 0181). freedreno drives the RB blit
++ * engine with those packets: `FD_BLIT` (event 30) is what makes a *clear*
++ * happen and what resolves a tile out of GMEM into the render target
++ * (a6xx/fd6_emit.h, `fd6_emit_blit()`), and `FD_CACHE_CLEAN` (0x31) is what
++ * pushes the GPU's own writes out of its cache. Refused, every frame is drawn
++ * into GMEM and never reaches memory: the framebuffer is complete, there is no
++ * GL error, and the surface reads as zeros (measured with the GL self test).
++ *
++ * The form that works is 0181's: `CP_EVENT_WRITE` with `CACHE_CLEAN|BIT(27)`
++ * in the event dword, which writes its value. This walks the stream, and the
++ * indirect buffers it chains, and sets the bit on every event write.
++ */
++static int mondrian_uc_events = -1;
++
++static int
++mondrian_uc_events_on(void)
++{
++	int on = 1;
++
++	if (mondrian_uc_events < 0) {
++		mondrian_uc_events = (PE_parse_boot_argn("gpuevent", &on,
++		    sizeof(on)) && on == 0) ? 0 : 1;
++	}
++	return mondrian_uc_events;
++}
++
++IOReturn
++MondrianGPUUserClient::rewriteEvents(mondrian_buffer *buffer, uint32_t offset,
++    uint32_t size, unsigned depth, unsigned *rewritten)
++{
++	uint32_t at = 0;
++
++	if (buffer == NULL || depth > 3) {
++		return kIOReturnUnsupported;
++	}
++	while (at + 4 <= size) {
++		uint32_t header = 0, words[3], op, count;
++
++		if (buffer->memory->readBytes(offset + at, &header, 4) != 4) {
++			break;
++		}
++		if ((header >> 28) != 7) {
++			at += 4;
++			continue;
++		}
++		op = (header >> 16) & 0x7f;
++		count = header & 0x3fff;
++		if (at + 4 * (1 + count) > size) {
++			break;
++		}
++		if (op == 0x46 && count >= 1) {
++			uint32_t event = 0;
++
++			if (buffer->memory->readBytes(offset + at + 4, &event,
++			    4) == 4 && (event & (1u << 27)) == 0) {
++				event |= 1u << 27;
++				if (buffer->memory->writeBytes(offset + at + 4,
++				    &event, 4) == 4) {
++					(*rewritten)++;
++				}
++			}
++		} else if (op == 0x3f && count == 3 &&
++		    buffer->memory->readBytes(offset + at + 4, words, 12) == 12) {
++			uint64_t addr = words[0] | ((uint64_t)words[1] << 32);
++			uint32_t n = words[2], b;
++
++			for (b = 0; b < fBufferCount; b++) {
++				mondrian_buffer *target = fBuffers[b];
++
++				if (n == 0 || addr < target->iova ||
++				    addr + 4ull * n > target->iova +
++				    target->size) {
++					continue;
++				}
++				(void)rewriteEvents(target,
++				    (uint32_t)(addr - target->iova), 4 * n,
++				    depth + 1, rewritten);
++				/* The dwords this changed are in the CPU's
++				 * cache; the CP fetches from memory. */
++				if (*rewritten != 0) {
++					bufferSync(target);
++				}
++				break;
++			}
++		}
++		at += 4 * (1 + count);
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ MondrianGPUUserClient::expandDrawState(mondrian_buffer *src, uint32_t offset,
+     uint32_t size, uint64_t *ib, uint32_t *dwords)

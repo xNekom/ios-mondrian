@@ -3,14 +3,30 @@
 set -euo pipefail
 [[ "${MACHINE_CONFIG:-}" == MONDRIAN ]] || exit 0
 [[ -f libkern/crypto/corecrypto_aes.c ]] || exit 1
+# Already staged (this tree has been built): the sources are the pinned commit
+# below, and bearssl.org is a single git host that does answer 502.
+[[ -d libkern/crypto/mondrian_bearssl/src/symcipher ]] && exit 0
 bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
-bearssl_tmp=$(mktemp -d)
-trap 'rm -rf "$bearssl_tmp"' EXIT
-git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
-git -C "$bearssl_tmp" checkout -q FETCH_HEAD
-[[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
+# The tree is reset and cleaned before the staging scripts run, so the sources
+# have to live outside it: bearssl.org is a single git host and it does answer
+# 502, which used to cost a whole build. Keep a copy in the cache and fetch only
+# when it is not there.
+bearssl_cache=${BEARSSL_CACHE:-$HOME/.cache/ios-mondrian/bearssl}
+if [ -d "$bearssl_cache/src/symcipher" ]; then
+	bearssl_tmp=$bearssl_cache
+else
+	bearssl_tmp=$(mktemp -d)
+	# Only the fetched copy is temporary: the cache outlives the build.
+	trap 'rm -rf "$bearssl_tmp"' EXIT
+	git init -q "$bearssl_tmp"
+	git -C "$bearssl_tmp" fetch -q --depth 1 \
+	    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
+	git -C "$bearssl_tmp" checkout -q FETCH_HEAD
+	[[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
+	mkdir -p "$(dirname "$bearssl_cache")"
+	rm -rf "$bearssl_cache"
+	cp -a "$bearssl_tmp" "$bearssl_cache"
+fi
 python3 - "$bearssl_tmp" <<'PY'
 from pathlib import Path
 import shutil
