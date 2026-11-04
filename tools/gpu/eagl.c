@@ -4419,6 +4419,39 @@ gpu_self_test(void)
 	say("mondrian-gl: gpu self test: fbo status 0x%x, clear+read %02x %02x %02x %02x, error 0x%x\n",
 	    status, pixel[0], pixel[1], pixel[2], pixel[3], error);
 	/*
+	 * The upload the shaders arrive in: fill one texel of this texture from
+	 * the CPU (glTexSubImage2D, which becomes a CP_LOAD_STATE6 state load)
+	 * and read it back through the GPU. Black here means the state-load
+	 * packets do not reach the GPU, which would also carry the shaders --
+	 * and would be one missing piece for a pipeline whose clear and draw
+	 * both read as zeros.
+	 */
+	{
+		unsigned char *tex = NULL;
+		unsigned char loaded[4] = { 0xdd, 0xdd, 0xdd, 0xdd };
+
+		glBindTexture(GL_TEXTURE_2D, texture);
+		unsigned char fill[64 * 64 * 4];
+		memset(fill, 0x11, sizeof(fill));
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_BGRA,
+		    GL_UNSIGNED_BYTE, fill);
+		{
+			const unsigned char texel[4] = { 255, 0, 0, 255 };
+
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 8, 8, 1, 1, GL_BGRA,
+			    GL_UNSIGNED_BYTE, texel);
+			(void)tex;
+		}
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_TEXTURE_2D, texture, 0);
+		glReadPixels(8, 8, 1, 1, GL_BGRA, GL_UNSIGNED_BYTE, loaded);
+		error = glGetError();
+		say("mondrian-gl: gpu self test: texsub+read %02x %02x %02x %02x, error 0x%x\n",
+		    loaded[0], loaded[1], loaded[2], loaded[3], error);
+	}
+	/*
 	 * The clear above goes through the RB blit engine. The draw below goes
 	 * through the shader pipeline, and the two fail for different reasons:
 	 * a black clear with a green draw means the engine that writes memory is

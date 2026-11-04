@@ -460,18 +460,20 @@ them has Metal. That is the path this port follows.
   `cp_type7_packet(CP_EVENT_WRITE, 1)` + `0x31`, and `24`/`25` for the CCU
   invalidates), so the count-1 packet was never the problem; `0228`'s rewrite is
   off by default and is only a bisect tool.
-- **Both halves of the pipeline are silent, and the self test now says so per
-  boot.** With the event writes left exactly as Mesa emits them (`gpuevent=0`),
-  a full boot shows every submission completing (`uc big 253/67/168/… done 1`,
-  no `gpu stopped answering`, no `writeR` crash, one FD725 context) while the
-  self test reads zeros from *both* paths:
-  `fbo status 0x8cd5, clear+read 00 00 00 00, error 0x0` and
-  `draw linked 1, drew 00 00 00 00, error 0x0`. So it is not the RB blit engine
-  alone — nothing the shader pipeline draws reaches memory either, with no GL
-  error and no CP fault. The count-1 event writes are not the cause: a bring-up
-  probe that puts `CP_EVENT_WRITE` count 1 with `0x31` and with `0x1e` in front
-  of the canary still lets the canary and the fence land
-  (`cp memwrite … canary 0x600dc0de fence 0x600dc0df`, `cp int 0x0`).
+- **Every GPU-side memory write reads black; the CP's do not.** The self test
+  covers the three pieces in order — the clear (RB blit → CCU → memory), a
+  CPU-to-GPU texel upload read back through the GPU (a `CP_LOAD_STATE6` state
+  load, the same packet class the shaders travel in) and a shader draw — and
+  all three read back zeros, with the FBO complete and no GL error, on the no-
+  binning and the sysmem and the UBWC-off configurations — while the CP's own
+  writes land (the canary, the fence and Mesa's buffers are written by the CP
+  and read back correctly). So the failure is not one engine or one packet:
+  it is the render path's memory writes as a whole
+  (`UCHE → GBIF → SMMU → DRAM`), where the CP's are fine. Right next to it:
+  the two buffers carry the same permissions the CP writes with (`perms 3`,
+  `AP[2]=0`), the bootstrap's `THREAD_SYNC` handshake at `l162` is passed,
+  every submission fences, and GL on this chip works elsewhere with the same
+  Mesa.
 - **The next thing to measure is the pipeline state as a matrix**, because the
   self test turns each knob into a yes/no: `glselftest=1` with the default
   (GMEM, `A7XX_RB_UNKNOWN_8812(0x3ff)` "all buffers in sysmem"), with
@@ -499,19 +501,18 @@ them has Metal. That is the path this port follows.
   passes it — the streams execute. `CP_ME_INIT` already carries kgsl's DMS bit
   (`0x14b | BIT(11)`) and the four stream slots are leased in one bank. What is
   left to prove, in this order:
-  1. **Compare the resolve state, not the packets.** `fd6_emit_common_init` /
-     `fd6_emit_tile_init` (`a6xx/fd6_emit.cc`, `fd6_gmem.cc`) program
-     `RB_CCU_CNTL`, the GMEM base/mode and `RB_RESOLVE_OPERATION_TYPE`; the
-     vendor's gen7 init has the same block. Dump what our streams carry for those
-     registers (the pm4 dumps already show them: `4888xxxx` writes) and compare
-     against what a working a730 run uses — the value
-     `A7XX_RB_UNKNOWN_8812(0x3ff)` ("all buffers in sysmem") in
-     `fd6_emit_common_init` is the first one to question.
-  2. **A ring-level probe of the trigger.** Append `70460001 0000001e`, a
-     `CP_NOP` and a `CP_EVENT_WRITE` fence (`70460004 08000004 <addr> <seqno>`) to
-     the ring after `CP_ME_INIT` and read `CP_INTERRUPT_STATUS`: on this firmware
-     that must complete with `int 0`, `fault 0` and the fence in memory. If bit 7
-     appears there, the difference is CP init/APRIV state rather than the packet.
+  1. **The render path's SMMU ownership.** The CP writes with bank 0's context
+     (SID 0/0x400) and those writes land; the shader/blit engines ride the same
+     `_emit` context, so compare the *stream attachments* against pong's lease
+     (SID 0/0x400 for user, 1/0x401 for LPAC, one context) and against what the
+     SMMU's ACTLR `0x32b` expects — a mismatched route would drop writes with
+     no fault on the CP.
+  2. **The render blocks' own state** — the one thing kgsl programs that this
+     port may not: dump `RB_CCU_CNTL`, `RB_DBG_ECO_CNTL`, `RB_UNKNOWN_8812`,
+     `UCHE_CLIENT_PF` as Mesa sends them, then compare against the vendor's
+     gen7 startup (NothingOSS sm8475, the matching `gen7_perfcounter`/restore
+     list). If the CCU's client Enumeration is wrong, the blit and the
+     shader's writes both stay in cache that is never published.
   3. The proven path for a fluid UI on this exact silicon is Turnip
      (`pong-adreno`, Nothing Phone 2, "desktop rendering"), which for a
      CoreAnimation GLES client means GL on top of it (zink) or metal2vulkan as
