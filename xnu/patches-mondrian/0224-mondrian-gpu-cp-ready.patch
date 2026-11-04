@@ -23,6 +23,177 @@ reports instead of retrying. If it still fails the ring stays unpublished and
 `mondrian_gpu_uc_ready()` stays 0, so Mesa fails at pipe creation instead of
 300 ms into the first frame.
 
+The measured reason the switch parks is `CP_APRIV_CNTL`. The a730 SQE
+microcode mirrors that register into its per-pipe privileged-opcode mask, and
+every boot so far left it at the bootloader's zero, so the CP refused each
+privileged packet with `CP_INTERRUPT_STATUS` bit 7 (CP_ILLEGAL_INSTR_ERROR) and
+latched nothing in `CP_HW_FAULT` -- one fault, not two. That is the shape the
+log has always had: `CP_MEM_WRITE` lands, `CP_EVENT_WRITE` (CACHE_CLEAN) is
+refused (`cp int 0x80`), and `setsecure` parks the SQE on ucode pc 0x649, its
+switch handler. The ZAP resets the CP block, so the values go in at both of the
+vendor's points: with the first publication before the ZAP, and again in the
+re-arm before anything is published a second time -- `CP_APRIV_CNTL` 0x4f,
+`CP_BV_APRIV_CNTL` 0x0f, `CP_LPAC_APRIV_CNTL` 0x0f, and the LPAC protect
+control at 0xb09 (0xb, the protect default the block-0 control at 0x84f already
+carries; kgsl keeps that one in `gen7_reg.h` only, so the offset is defined
+next to the include). It prints once, in the re-arm, with its read-backs:
+`cp apriv 0x4f bv 0xf lpac 0xf lpacprot 0xb`.
+
+Because the re-arm zeroes `CP_RB_WPTR`, the same mode carries cporder's ME_INIT
+republish: the ten dwords go back in, the ring is published at 10, the CP is
+waited on, and only then is the switch written and published at 10..11. The
+protected-mode bracket is dropped from the submission frame and from the
+bring-up in this mode: measured with the masks programmed, a `cpfence=mem`
+fence and the switch skipped, the bring-up completes (`cp ready`, `cp int 0x0`)
+and the 2000-submission stress then freezes the machine with no `uc` line at
+all. `CP_SET_PROTECTED_MODE` is the only packet a frame adds over the bring-up
+pair, and it is privileged exactly like the CACHE_CLEAN event write: kgsl runs
+every submission with protected mode off ("All submissions are run with
+protected mode off due to APRIV") and mainline emits none on a7xx. The first
+submission prints `uc frame no protected-mode packet`. `cpapriv=0` restores the
+previous programming dword for dword: 0x6f/0xf/0xf, no ME_INIT republish unless
+`cporder=1`, and the full bracket in the bring-up and in the frame.
+
+Two experiments, independent of each other and off by default, attack the two
+candidates left for the difference between the two kinds of boot (everything
+before the switch is byte-identical, and `CP_RB_WPTR = 10` is published with the
+switch written and published immediately behind it, without ever checking that
+the CP retired ME_INIT):
+
+	cporder=1	write and publish the switch only after the CP is seen
+			to retire ME_INIT. The ZAP resets the CP and the
+			re-arm below zeroes CP_RB_WPTR, so ME_INIT has to be
+			offered again before it can be waited for: the same
+			ten dwords the first publish wrote are rewritten,
+			cleaned and published at 10 first, then waited on.
+			Prints `cp meinit rptr N of 10`, or `cp meinit stuck
+			rptr N of 10` (measured without the re-publish: rptr 0,
+			SQE parked at ucode pc 0x10e on the ME_INIT header);
+			on the stuck path nothing else is published, the
+			memory packet is skipped, the ring is not published
+			and the ready check reports the CP dead.
+	gpureset=1	after the ZAP and before the CP registers are re-armed,
+			cycle the core through the GMU's own HFI power vote
+			(command 30, the message the bring-up prints as `hfi
+			power gpu 2 bus 2`): vote 0, a bounded 200 x 1 ms wait,
+			vote 1, the same wait. Prints `gpu reset hfi off ack N`
+			and `gpu reset hfi on ack N` (1 acknowledged, 0 silent
+			for 200 ms, -1 another answer). A core the GMU does not
+			grant back stops the bring-up before any CP register
+			write.
+
+	cpnosecmode=1	write and publish nothing for the switch at all. The ZAP
+			has already put the CP in nonsecure mode by packet, so
+			this asks whether the explicit switch is needed on top
+			of it: `at` stays 10, the memory packet below is the
+			first packet the SQE fetches, and the ready check judges
+			the CP by that packet. Prints
+			`cp secmode skipped (cpnosecmode)`.
+
+With the switch skipped, the next two packets say where the CP stops: the
+memory write retires and its canary lands, and the event write behind it does
+not (`cp NOT ready rptr 19 of 23, sqe 0x450 0x70460004`, `fault 0x0 int 0x80
+rbbm3 0x0`). Two more gates take that apart, one at a time, both off by
+default, and both emit nothing when off so the ring stays byte-identical:
+
+	cpprot=1	put the bring-up's memory packet and its IB probe inside
+			the CP_SET_PROTECTED_MODE(0) ... (1) bracket a
+			submission carries under `cpapriv=0`
+			(`mondrian_cp_prot_enter` / `_exit`, 2 dwords in front
+			of each group and 2 behind): a privileged packet issued
+			while the CP still believes the context is protected is
+			a candidate for a dispatch halt. Prints
+			`cp protected-mode bracket on`.
+	cpfence=mem	write the fence with a second CP_MEM_WRITE of the same
+			32-bit sequence to the same dword instead of
+			CP_EVENT_WRITE -- one dword shorter, in the bring-up
+			pair, the IB probe, the 2000-submission stress IB and
+			the submit path's ring fence; the CPU already polls that
+			dword, so nothing else changes. One copy stays an event
+			write: the post-init probe (`cp init canary submit`),
+			which runs after the stress and is a diagnostic, so it
+			keeps asking the CP for CACHE_CLEAN and its answer stays
+			comparable. Prints `cp fence by mem write`. What is lost
+			is that cache clean: the GPU's own writes are no longer
+			flushed before the CPU reads them, so pixels can arrive
+			stale while the fence itself lands -- a frame printed
+			`1 picture copied out` with a zero picture, or a black
+			copy on the panel.
+	cpevent=4	write the fence's event dword as CACHE_FLUSH_TS (4,
+			payload 0x08000004) instead of CACHE_CLEAN (0x31,
+			payload 0x31 | BIT(27)): same packet, same count,
+			same 64-bit destination, same value dword. Mainline's
+			a6xx/a7xx ring fence (a6xx_gpu.c) and Mesa's a7xx fence
+			(freedreno_pipe.c) both use WRITE_ENABLED |
+			EV_WRITE_USER_32B | EV_DST_RAM with event 4, and it is
+			CACHE_CLEAN the CP refuses with the memory write in
+			front of it retired (`cp int 0x80`), so this separates
+			"the event write is privileged" from "this event code
+			is". The post-init probe keeps CACHE_CLEAN as the
+			same-boot control it already is under `cpfence=mem`.
+			Prints `cp fence event 4`, or `cp fence event 0x31`
+			when off; `cpfence=mem` writes no event and prints
+			neither. Event 4 flushes the timestamp, not the GPU's
+			pixel writes, so a boot that reaches the panel on it
+			still owes the copy its own CPU-side invalidate.
+
+Two diagnostics ride along and need no boot argument. `cp zap to switch N ms`
+prints once, on the boot that publishes the switch: the time between the ZAP
+returning and the switch going in, which is the one interval that differs
+between a boot that drains it and one that halts on it. `cp notready detail`
+follows every `cp NOT ready` line with the rest of `CP_SQE_STAT` (pops 2 and
+3), the trust register, the SQE base the CP fetches from, both ring pointers,
+`CP_SQE_CNTL`, the fault, interrupt and `RBBM_STATUS3` words, and the CPU's
+own copy of ring dwords 8..13: enough to tell a secure-mode hang from a broken
+fetch, all plain reads, no new waits. A second `cp notready secure` line reads
+`CP_SECURE_MODE`, `CP_APRIV_CNTL`, `CP_CP2GMU_STATUS` and
+`RBBM_SECVID_TSB_STATUS_LO`/`_HI`: those four separate "the CP is still in
+secure mode" from "the secure TSB is invalid", which the detail line cannot
+tell apart.
+
+The submission path prints one line at every step under `gpudump=1`, each
+flushed before the next step is entered, so the ring holds the last step that
+completed when a submission hands the CPU to a register that never answers:
+`uc submit D dwords at 0xN` on entry, `uc keepalive up at 0xN` after the GMU
+vote, `uc room wait at 0xN` *before* the first `CP_RB_RPTR` read, `uc room poll
+S rptr 0xR room N` on the first eight spins and every 256th after that, `uc room
+at 0xN rptr 0xR reads N` once the ring has room, `uc wrap at 0xN`, `uc frame
+written at 0xN seq S` once the dwords are in the ring and cleaned, `uc doorbell
+0xN` after the `CP_RB_WPTR` store, and `uc submit done seq S ret R` on the way
+out. Every wait and every return prints, including the room test's 2 s
+patience and both doorbell paths. Reading them: `uc room` repeating with the
+same rptr means the CP stopped consuming at the ring, `uc frame written`
+followed by silence means the WPTR store or the register access behind it hung,
+and `uc submit done` with a `refused` that grows while the room waits mean it is
+the 2 s patience that stalled the boot and not the GPU. The 2000-submission
+stress prints `stress round K at 0xN refused R` before its first round and every
+250 after that, because its 9-dword submission is under the `dwords > 16` gate
+on `uc enter`/`uc pre`.
+
+With `gpudump` off the boot differs by three lines only: the first three
+submissions print `uc submit D first` before the keepalive write, so a ring that
+stops there still says whether the submission path was reached at all.
+
+The wrap publishes the lap end. The tail was always filled with one CP_NOP, but
+the write pointer used to jump from the end of a lap to the first submission of
+the next one, and the CP resolved the gap by consuming forward: measured with
+`gpudump=1`, `uc rptr reg 0x403 sh 0x400 bv 0x0 at 0x3f0 room 18` and the same
+poll for the rest of the boot. The read pointer was 19 dwords ahead of the write
+cursor, so the 26-room test could only shrink: 2 s a submission, 2000 of them,
+and the boot never reached userland. `mondrian_uc_wrap` now cleans the tail,
+publishes `CP_RB_WPTR = MONDRIAN_UC_RING_DWORDS` (0x2000: 32 KiB, 8192 dwords)
+and waits up to 2000 x 1 ms for `CP_RB_RPTR` to reach the end of the lap. Two
+indications are accepted and the line says which: a read pointer at or past the
+ring size, or one below the value sampled before the doorbell -- inside a lap
+the pointer only moves forward, so a value below it is the CP having passed the
+end and restarted. Only then is the cursor rolled to 0, and the cached read
+pointer is invalidated so it cannot be used as a bound across the lap it no
+longer describes. The room test takes its decision from that cached pointer only
+when the room it implies covers the 26 dwords about to be written; a short room
+is a fresh `CP_RB_RPTR` read, not the 2 s patience. `cpstress=0` skips the
+2000-submission stress entirely: it is a diagnostic, and with anything wrong in
+the ring it is 40 minutes of 2 s timeouts before userland starts.
+
 What the next boot's log says:
 
 	MONDRIAN GPU: cp secmode rptr 12 wptr 12
@@ -36,9 +207,168 @@ What the next boot's log says:
 	MONDRIAN GPU: cp NOT ready rptr 11 of 12, sqe 0x649 0x70e60001, ring not published
 	    the CP is dead: MondrianGPU does not appear, so Mesa's open fails
 	    immediately rather than every frame waiting out a fence.
+	MONDRIAN GPU: gpu reset hfi off ack 1
+	MONDRIAN GPU: gpu reset hfi on ack 1
+	    gpureset=1: the GMU acknowledged both votes, so the CP was re-armed
+	    on a core it had just powered off and on.
+	MONDRIAN GPU: cp meinit rptr 10 of 10
+	MONDRIAN GPU: cp secmode rptr 12 wptr 12
+	    cporder=1, or any boot with the default cpapriv=1: ME_INIT was
+	    re-offered and the CP retired it before the switch was published;
+	    the ready check follows as in any other boot.
+	MONDRIAN GPU: cp meinit stuck rptr 0 of 10
+	MONDRIAN GPU: cp NOT ready rptr 0 of 10, sqe 0x10e 0x70c80007, ring not published
+	    cporder=1 and the CP never fetched the re-offered ME_INIT: nothing
+	    else is written, so the ring stays unpublished and MondrianGPU does
+	    not appear.
+	MONDRIAN GPU: cp apriv 0x4f bv 0xf lpac 0xf lpacprot 0xb
+	MONDRIAN GPU: cp meinit rptr 10 of 10
+	MONDRIAN GPU: cp secmode rptr 12 wptr 12
+	MONDRIAN GPU: cp memwrite rptr 21 wptr 21 canary 0x600dc0de fence 0x600dc0df
+	MONDRIAN GPU: cp int 0x0 int0 0x0 ...
+	    cpapriv=1: the read-backs prove the CP kept the masks, ME_INIT ran
+	    with them, and every privileged packet after it executed -- the
+	    event write and the fence land and no illegal-instruction bit is
+	    latched. This is the shape of a fixed boot.
+	MONDRIAN GPU: cp apriv 0x4f bv 0xf lpac 0xf lpacprot 0xb
+	MONDRIAN GPU: cp meinit rptr 10 of 10
+	MONDRIAN GPU: cp NOT ready rptr 11 of 12, sqe 0x649 0x70e60001, ring not published
+	MONDRIAN GPU: cp notready secure 0x... apriv 0x4f cp2gmu 0x... tsb 0x.../0x...
+	    cpapriv=1 and the switch still parks: the privilege side is right,
+	    so the secure world is what refuses. `secure` non-zero names the
+	    switch itself, the TSB pair names a secure-mode fetch that does not
+	    validate, and a cleared apriv says the CP block was reset again
+	    behind the ZAP.
+	MONDRIAN GPU: cp secmode skipped (cpnosecmode)
+	MONDRIAN GPU: cp memwrite rptr 19 wptr 19 canary 0x600dc0de fence 0x0
+	    cpnosecmode=1: the CP fetched the first packet after ME_INIT without
+	    a switch ever being written, so it was nonsecure already; the memory
+	    write executed and the event write behind it did not.
+	MONDRIAN GPU: cp protected-mode bracket on
+	MONDRIAN GPU: cp memwrite rptr 23 wptr 23 canary 0x600dc0de fence 0x600dc0df
+	MONDRIAN GPU: cp ready rptr 31 of 31
+	    cpprot=1: the same boot with the bracket; the ring is four dwords
+	    longer, so every pointer is four past the unbracketed one, and the
+	    event write the boot parks on without it now retires.
+	MONDRIAN GPU: cp fence by mem write
+	MONDRIAN GPU: cp memwrite rptr 18 wptr 18 canary 0x600dc0de fence 0x600dc0df
+	MONDRIAN GPU: cp ready rptr 22 of 22
+	    cpfence=mem: both writes to the memptr page retired and their values
+	    are the ones the pair asked for; the IB probe follows at 22.
+	MONDRIAN GPU: cp fence event 4
+	MONDRIAN GPU: cp memwrite rptr 19 wptr 19 canary 0x600dc0de fence 0x600dc0df
+	MONDRIAN GPU: cp int 0x0
+	    cpevent=4 with the switch skipped: the event write is dispatched
+	    where CACHE_CLEAN halted the SQE, so the refusal is the event code
+	    and not the opcode. `cp int 0x80` instead says both event types are
+	    privileged and the fence has to stop being an event write.
+	MONDRIAN GPU: uc frame no protected-mode packet
+	MONDRIAN GPU: cp uc stress 2000 refused 0 wait 1 canary 0x... fence 0x...
+	    cpapriv=1: the first submission says its frame carries no 0x5f and
+	    the stress retires all 2000 of them, so the packet that stopped the
+	    CP was CP_SET_PROTECTED_MODE. A stress that still stops behind this
+	    line leaves the INDIRECT_BUFFER or the fence inside the submission
+	    as the refused packet, and `cpevent=4` / `cpfence=mem` separate those.
+	MONDRIAN GPU: uc frame protected-mode bracket
+	    cpapriv=0: the frame brackets both halves, as it always did.
+	MONDRIAN GPU: cp notready detail sqe 0x... 0x... trust 0x... sqebase ...
+	    the CP stopped with the ring published up to the switch; a non-zero
+	    trust register or a secure SQE base names the secure handshake, while
+	    a clean set of values with rptr still at 11 names the fetch itself.
+	MONDRIAN GPU: uc wrap waited rptr 0x... past the lap end
+	    gpudump=1, at the end of a lap: the NOP tail is in DRAM, the write
+	    pointer named the end of the buffer and the read pointer got there.
+	    `wrapped below the lap end` is the same consumption reported by a
+	    register masked with the ring size. `uc wrap timeout rptr 0x... seen
+	    0x... at 0x...` instead says the CP never took the tail: that
+	    submission is refused and the cursor is not rolled, so no dword the
+	    CP has not read is overwritten.
+	MONDRIAN GPU: cp uc stress 2000 refused 0 wait 1
+	    a stress with no `uc no room` and no `uc room poll` spin: the room
+	    test reads the register again instead of waiting out its patience.
+	MONDRIAN GPU: cp stress skipped
+	    cpstress=0: the 2000 submissions are not run; the ring stays the one
+	    the bring-up published and the boot goes on.
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+index 39feb9b..e59882c 100644
 --- a/bsd/dev/mondrian_gpu.c
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -1730,6 +1730,11 @@
+@@ -38,6 +38,19 @@
+ #include "mondrian_cp_profile.h"
+ #define MONDRIAN_CP_PROFILE 1
+ #endif
++#ifdef MONDRIAN_CP_PROFILE
++/*
++ * The generated profile carries the registers the vendor's own tables name;
++ * these two are only in kgsl's headers, so they live here. Both are dword
++ * offsets into the CP window, like the rest of the gen7 set.
++ */
++#ifndef GEN7_CP_LPAC_PROTECT_CNTL
++#define GEN7_CP_LPAC_PROTECT_CNTL 0xb09	/* kgsl gen7_reg.h */
++#endif
++#ifndef GEN7_CP_SECURE_MODE
++#define GEN7_CP_SECURE_MODE 0x075	/* mainline a6xx CP_SECURE_MODE */
++#endif
++#endif /* MONDRIAN_CP_PROFILE */
+ #if __has_include("mondrian_zap_fw.h")
+ #include "mondrian_zap_fw.h"
+ #define MONDRIAN_ZAP_FW 1
+@@ -55,6 +68,8 @@
+ 
+ static int mondrian_uc_up;
+ static int mondrian_uc_logged;
++/* The frame shape the submit path used, printed on its first submission. */
++static int mondrian_uc_frame_logged;
+ static uint32_t mondrian_uc_pm4;
+ static int mondrian_uc_noblit;
+ static uint32_t mondrian_uc_nop_opcode;
+@@ -70,6 +85,13 @@
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ /*
++ * The first three submissions print a line before they touch a register,
++ * whatever gpudump says: without it a boot that hangs in this path says
++ * nothing at all, and a hang on the GMU keepalive write cannot be told from
++ * one on the CP_RB_RPTR read from one in the room loop.
++ */
++static uint32_t mondrian_uc_sub_first;
++/*
+  * 1 (the default): the keepalive is raised at cp start and held.
+  * Measured, that is the boot that survives; with the toggle (0) a boot died
+  * right after backboardd loaded the GL driver and before it submitted
+@@ -78,6 +100,14 @@
+ static int mondrian_uc_keep = 1;
+ static int mondrian_cp_init_hw;
+ /*
++ * The 2000-submission stress in the CP bring-up: a diagnostic, on by default
++ * because it is what proves the ring, the fence slots and the order. cpstress=0
++ * skips it, for a boot where the point is to get past the bring-up: with
++ * anything wrong in the ring one submission costs its 2 s room timeout, and
++ * 2000 of those keep userland from ever starting.
++ */
++static int mondrian_cp_stress = 1;
++/*
+  * Measured: with the door thread on, the 71-dword stream never fences and the
+  * UI freezes at 0 fps; written inline, it completes in 14 ms. Keep the thread
+  * for measuring with gpuasync=1, default to the write that works.
+@@ -97,6 +127,16 @@
+ static uint32_t mondrian_uc_rptr;
+ static int mondrian_uc_rptr_valid;
+ /*
++ * CP_RB_CNTL selects the rptr shadow page, so the pointer that matters may
++ * be the word the CP writes into memory rather than the register. These are
++ * the last register/shadow pair the room loop saw, and whether the shadow
++ * moving while the register does not has already been reported.
++ */
++static uint32_t mondrian_uc_sh_reg;
++static uint32_t mondrian_uc_sh_shadow;
++static int mondrian_uc_sh_seen;
++static int mondrian_uc_sh_said;
++/*
+  * gpuringslow=1 cleans the whole 32 KiB ring before every doorbell, which is
+  * what this path did before 0222: the valve for a boot where the CP reads a
+  * ring dword the CPU never flushed.
+@@ -1730,6 +1770,73 @@
  /* gpustart: start the SQE. On by default now that the whole path works
   * (the parity fix and the four streams); gpustart=0 leaves it stopped. */
  static int mondrian_cp_run = 1;
@@ -47,13 +377,141 @@ What the next boot's log says:
 + * (the same kernel drains the switch in one boot and halts on it in the next),
 + * and it is one SQE restart, not a GPU reset. */
 +static int mondrian_cp_noretry;
++/* cporder=1: publish the secure-mode switch only once the CP has been seen to
++ * retire the ME_INIT the rearm re-issued (CP_RB_RPTR >= 10). The measured
++ * difference between the boot that works and every boot since ring72 is this
++ * one ordering: the good one retired ME_INIT before the switch went in, the
++ * bad one got the switch published on top of it and halted on the switch's own
++ * header with rptr 11 of 12. */
++static int mondrian_cp_order;
++/* gpureset=1: after the ZAP, cycle the GPU core through the GMU's HFI power
++ * vote before the CP registers are re-armed, so the CP starts from a core the
++ * GMU has just powered off and on rather than from whatever state the previous
++ * boot left in it. */
++static int mondrian_cp_reset;
++/* cpnosecmode=1: leave CP_SET_SECURE_MODE out entirely -- no write, no publish.
++ * The ZAP switches the CP by packet already, so this asks whether a second,
++ * explicit switch is needed at all. `at` stays 10, nothing is published for the
++ * switch, and the memory packet below goes in first: the existing `if (rptr >=
++ * at)` path and the ready check then judge the CP by that packet. */
++static int mondrian_cp_nosecmode;
++/* cpprot=1: bracket the bring-up's memory packet and its IB probe with
++ * CP_SET_PROTECTED_MODE(0) ... (1). Measured with the switch skipped, the CP
++ * retires the memory write and then parks on the EVENT_WRITE behind it; a
++ * packet issued from a context the CP still believes is protected is the
++ * candidate this tests. Off, both emit nothing and the bring-up is
++ * byte-identical. cpapriv=1 (the default) writes neither half, for the reason
++ * the bracket below gives: no 0x5f belongs in a frame in that mode, so cpprot
++ * only reaches a cpapriv=0 boot. */
++static int mondrian_cp_protmode;
++/* cpfence=mem: write the fence with CP_MEM_WRITE to the same dword instead of
++ * CP_EVENT_WRITE. The measured CP retires the memory write and parks on the
++ * event write, and the CPU already polls that dword, so this asks whether the
++ * event write is itself the packet the SQE cannot dispatch. What it gives up
++ * is CACHE_CLEAN: the GPU's own writes are no longer flushed before the CPU
++ * reads them. */
++static int mondrian_cp_fence_mem;
++/* cpevent=4: put CACHE_FLUSH_TS (4) in the fence's event dword instead of
++ * CACHE_CLEAN (0x31). Measured with cpapriv in place: the CP retires the
++ * CP_MEM_WRITE in front of the fence and refuses the event write itself
++ * (`cp int 0x80`, CP_ILLEGAL_INSTR_ERROR, nothing in CP_HW_FAULT). Mainline's
++ * a6xx/a7xx ring fence and Mesa's a7xx fence are CP_EVENT_WRITE with
++ * WRITE_ENABLED|EV_WRITE_USER_32B|EV_DST_RAM and event 4, so the payload
++ * 0x08000004 asks whether it is the event code and not the opcode that is
++ * refused: same count, same 64-bit destination, same value dword.
++ * cpevent=31, or no argument, keeps 0x31 | (1u << 27) byte for byte. */
++static int mondrian_cp_event4;
++/* cpapriv=1 (the default): program CP_APRIV_CNTL before ME_INIT runs, and
++ * republish ME_INIT on its own before the secure-mode switch.
++ *
++ * Cause, measured against kgsl's gen7_start and the a730 SQE microcode: the
++ * microcode masks its per-pipe privileged opcodes from CP_APRIV_CNTL, and
++ * every earlier boot left that register at the bootloader's zero. The CP then
++ * refuses each privileged packet with CP_INTERRUPT_STATUS bit 7
++ * (CP_ILLEGAL_INSTR_ERROR) and latches nothing in CP_HW_FAULT -- one fault,
++ * not two. That is the shape we measured: CP_MEM_WRITE lands, CP_EVENT_WRITE
++ * (CACHE_CLEAN) is refused (`cp int 0x80`), and setsecure's switch parks the
++ * SQE on ucode pc 0x649, its own switch handler. The ZAP resets the CP block,
++ * so the values have to be in place when ME_INIT runs *after* the ZAP, not
++ * only at the first publication.
++ *
++ * cporder's ME_INIT republish is part of this mode because the re-arm zeroes
++ * CP_RB_WPTR and a CP that is never offered ME_INIT again never fetches it.
++ * cpapriv=0 restores the previous programming dword for dword. */
++static int mondrian_cp_apriv = 1;
  static uint64_t mondrian_cp_ttbr0;
  static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
  static vm_offset_t mondrian_cp_scratch_view;
-@@ -2250,6 +2255,29 @@
+@@ -2250,6 +2357,163 @@
  	    (mondrian_pm4_parity(reg) << 27);
  }
  
++/*
++ * The fence packet, into `buf` at `at`; returns the new cursor. The default is
++ * CP_EVENT_WRITE with CACHE_CLEAN: the CP writes the 32-bit sequence to the
++ * dword the CPU polls and cleans its caches first, so the work queued behind
++ * the fence is visible when the fence lands. `cpfence=mem` writes the same
++ * value to the same dword with a plain CP_MEM_WRITE -- one dword shorter, and
++ * no cache clean, so a pixel the IB wrote can sit in the GPU's cache while the
++ * CPU reads a stale line. `cpevent=4` keeps the event write and changes only
++ * its event dword, to CACHE_FLUSH_TS.
++ */
++static uint32_t
++mondrian_cp_fence(uint32_t *buf, uint32_t at, uint64_t dst, uint32_t value)
++{
++	if (mondrian_cp_fence_mem) {
++		buf[at++] = mondrian_pm4_type7(0x3du, 3);	/* MEM_WRITE */
++		buf[at++] = (uint32_t)dst;
++		buf[at++] = (uint32_t)(dst >> 32);
++		buf[at++] = value;
++	} else {
++		buf[at++] = mondrian_pm4_type7(0x46u, 4);	/* EVENT_WRITE */
++		/* cpevent=4: CACHE_FLUSH_TS, the event mainline and Mesa use;
++		 * CACHE_CLEAN otherwise. Count, destination and value are the
++		 * same either way. */
++		buf[at++] = mondrian_cp_event4 ? 0x08000004u :
++		    0x31u | (1u << 27);	/* CACHE_FLUSH_TS / CACHE_CLEAN */
++		buf[at++] = (uint32_t)dst;
++		buf[at++] = (uint32_t)(dst >> 32);
++		buf[at++] = value;
++	}
++	return at;
++}
++
++/*
++ * The protected-mode bracket for the bring-up's own packet groups: (0) before
++ * the privileged packets, (1) after. Both are no-ops unless cpprot=1, so an
++ * off boot writes exactly the dwords it wrote before, and both are no-ops
++ * under cpapriv=1: 0x5f is privileged the same way the CACHE_CLEAN event
++ * write is, kgsl runs every submission with protected mode off ("All
++ * submissions are run with protected mode off due to APRIV") and mainline
++ * emits none on a7xx, so the packet has no business in a frame there.
++ */
++static uint32_t
++mondrian_cp_prot_enter(uint32_t *buf, uint32_t at)
++{
++	if (mondrian_cp_protmode && !mondrian_cp_apriv) {
++		buf[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++		buf[at++] = 0;
++	}
++	return at;
++}
++
++static uint32_t
++mondrian_cp_prot_exit(uint32_t *buf, uint32_t at)
++{
++	/*
++	 * Same gate as the enter half: no (1) under cpapriv=1, where no
++	 * bracket is written at all, because ending on it would leave
++	 * protection on for whatever packet follows.
++	 */
++	if (mondrian_cp_protmode && !mondrian_cp_apriv) {
++		buf[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
++		buf[at++] = 1;
++	}
++	return at;
++}
++
 +/*
 + * Wait, with a bound, for the CP to consume up to `want` dwords. Every read of
 + * CP_RB_RPTR in the bring-up goes through here: a register access that stalls
@@ -77,10 +535,248 @@ What the next boot's log says:
 +	return rptr;
 +}
 +
++/*
++ * cpapriv: the privileged-transaction masks kgsl's gen7_start programs just
++ * before it publishes the ring and starts the SQE. CP_APRIV_CNTL 0x4f marks
++ * instruction-cache fetches, ringbuffer reads, PM4 memory accesses and
++ * crashdumper writes privileged; kgsl's BR value 0x6f only adds crashdumper
++ * reads, which this kernel does not use. BV and LPAC get the four PM4 bits,
++ * and the LPAC protect control at 0xb09 gets GEN7_PROTECT_DEFAULT (enable,
++ * fault on a violation, protect the last span to the end of the space) --
++ * the same value the block-0 control at 0x84f already carries.
++ *
++ * `log` prints the read-backs once: the register block is read back after the
++ * write, so a boot that reports 0x4f/0xf/0xf/0xb proves the CP kept them.
++ */
++static void
++mondrian_cp_apriv_program(vm_offset_t gpu, int log)
++{
++	mondrian_gpu_write(gpu, GEN7_CP_APRIV_CNTL * 4u, 0x4fu);
++	mondrian_gpu_write(gpu, GEN7_CP_BV_APRIV_CNTL * 4u, 0x0fu);
++	mondrian_gpu_write(gpu, GEN7_CP_LPAC_APRIV_CNTL * 4u, 0x0fu);
++	mondrian_gpu_write(gpu, GEN7_CP_LPAC_PROTECT_CNTL * 4u, 0x0bu);
++	if (log) {
++		printf("MONDRIAN GPU: cp apriv 0x%x bv 0x%x lpac 0x%x lpacprot 0x%x\n",
++		    mondrian_gpu_read(gpu, GEN7_CP_APRIV_CNTL * 4u),
++		    mondrian_gpu_read(gpu, GEN7_CP_BV_APRIV_CNTL * 4u),
++		    mondrian_gpu_read(gpu, GEN7_CP_LPAC_APRIV_CNTL * 4u),
++		    mondrian_gpu_read(gpu, GEN7_CP_LPAC_PROTECT_CNTL * 4u));
++		mondrian_log_flush_now();
++	}
++}
++
++/*
++ * gpureset: one HFI power vote (command 30, the message whose "on" value is
++ * the one the bring-up prints as "hfi power gpu 2 bus 2"), with `on` in
++ * vote[0]: 0 hands the GPU core back to the GMU, 1 asks for it again. The
++ * wait is 200 x 1 ms -- twice the 100 x 1 ms the bring-up's other commands
++ * use, and still bounded, because a GMU that stops answering must not hold
++ * cp_start. Returns 1 when the GMU acknowledged, 0 when it stayed silent
++ * inside the window, -1 when it answered something else (or the power tables
++ * or the HFI queue are not there).
++ */
++static int
++mondrian_gpu_hfi_vote(vm_offset_t gmu, uint32_t on)
++{
++	uint32_t perf[58] = { 0 }, bw[159] = { 0 };
++	uint32_t gpu_idx = 0, bus_idx = 0, vote[3], count = 0, out[16];
++	uint32_t s;
++	int i, r = 0;
++
++	if (mondrian_hfi_va == 0 ||
++	    mondrian_gpu_build_power_tables(perf, bw, &gpu_idx, &bus_idx)) {
++		return -1;
++	}
++	vote[0] = on;
++	vote[1] = gpu_idx;
++	vote[2] = bus_idx;
++	s = mondrian_hfi_seq++;
++	mondrian_gpu_hfi_send(gmu, mondrian_hfi_va, 30, vote, 3, s);
++	for (i = 0; i < 200; i++) {
++		flush_dcache64((addr64_t)mondrian_hfi_pa, 0x4000, TRUE);
++		r = mondrian_gpu_hfi_poll(mondrian_hfi_va, s, out, &count);
++		if (r != 0) {
++			break;
++		}
++		delay(1000);
++	}
++	return r;
++}
++
  static int
  mondrian_gpu_cp_start(vm_offset_t gpu, vm_offset_t smmu, vm_offset_t gpucc,
      vm_offset_t gmu)
-@@ -2623,16 +2651,54 @@
+@@ -2262,6 +2526,20 @@
+ 
+ 	printf("MONDRIAN GPU: cp start enter\n");
+ 	mondrian_log_flush_now();
++	if (mondrian_cp_protmode) {
++		printf("MONDRIAN GPU: cp protected-mode bracket on\n");
++		mondrian_log_flush_now();
++	}
++	if (mondrian_cp_fence_mem) {
++		printf("MONDRIAN GPU: cp fence by mem write\n");
++		mondrian_log_flush_now();
++	} else if (mondrian_cp_event4) {
++		printf("MONDRIAN GPU: cp fence event 4\n");
++		mondrian_log_flush_now();
++	} else {
++		printf("MONDRIAN GPU: cp fence event 0x31\n");
++		mondrian_log_flush_now();
++	}
+ 	mondrian_gpu_gmu_hold(gmu);
+ 	/* Pong holds the GPU through the GMU and then only waits for GX;
+ 	 * re-driving the GDSC here undoes that grant and the CP start hangs. */
+@@ -2365,10 +2643,16 @@
+ 	printf("MONDRIAN GPU: cp hw protect ok\n");
+ 	mondrian_log_flush_now();
+ 	/* Vendor value: bit 0 marks instruction-cache fetches privileged, and
+-	 * the SQE is mapped read-only privileged (perms 5), as pong does. */
+-	CPW(GEN7_CP_APRIV_CNTL, 0x6fu);	/* icache fetches privileged */
+-	CPW(GEN7_CP_BV_APRIV_CNTL, 0xfu);
+-	CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xfu);
++	 * the SQE is mapped read-only privileged (perms 5), as pong does.
++	 * cpapriv=1 programs the whole set the vendor's gen7_start does, on the
++	 * first publication and again after the ZAP. */
++	if (mondrian_cp_apriv) {
++		mondrian_cp_apriv_program(gpu, 0);
++	} else {
++		CPW(GEN7_CP_APRIV_CNTL, 0x6fu);	/* icache fetches privileged */
++		CPW(GEN7_CP_BV_APRIV_CNTL, 0xfu);
++		CPW(GEN7_CP_LPAC_APRIV_CNTL, 0xfu);
++	}
+ 	CPW(GEN7_CP_CHICKEN_DBG, 1);
+ 	CPW(GEN7_CP_BV_CHICKEN_DBG, 1);
+ 	CPW(GEN7_CP_LPAC_CHICKEN_DBG, 1);
+@@ -2556,6 +2840,7 @@
+ 	    CPR(GEN7_CP_HW_FAULT));
+ 	if (rptr == 10) {
+ 		uint32_t at = 10;
++		uint64_t switch_t0, switch_ns = 0;
+ #ifdef MONDRIAN_ZAP_FW
+ 	printf("MONDRIAN GPU: cp start zap enter\n");
+ 	mondrian_log_flush_now();
+@@ -2575,6 +2860,11 @@
+ 	mondrian_log_flush_now();
+ zap_done:
+ #endif
++	/* When the ZAP returned. The switch is published after the HFI votes and
++	 * the CP register re-arm, and that interval is the one part of the
++	 * bring-up that differs between a boot that drains the switch and one
++	 * that halts on it. */
++	switch_t0 = mach_absolute_time();
+ 	/*
+ 	 * The GPU can come out of reset "trusted": the bootloader then keeps a
+ 	 * secure SQE base and the CP fetches from it (measured: FAR
+@@ -2591,11 +2881,48 @@
+ 	 * tagged window the high words select is how the CP is reached. */
+ 
+ 	/*
++	 * gpureset=1: the ZAP leaves the core powered, and the CP's own state
++	 * is still whatever the previous boot or the bootloader put there --
++	 * the other half of the measured difference between the boot that
++	 * works and the ones that stop on the switch (the SQE ucode and the
++	 * ring even landed at different IOVAs). Hand the core back to the GMU
++	 * through the same HFI power vote the bring-up sends, wait for the
++	 * acknowledgement, and ask for it again. Both waits are bounded. A GMU
++	 * that does not grant the core back stops the bring-up here instead of
++	 * letting the CP register writes below run against a core that may be
++	 * off, which is where a stalled register access takes the CPU with it.
++	 */
++	if (mondrian_cp_reset && mondrian_hfi_va != 0) {
++		uint32_t off_ack, on_ack;
++
++		off_ack = (uint32_t)mondrian_gpu_hfi_vote(gmu, 0);
++		printf("MONDRIAN GPU: gpu reset hfi off ack %u\n", off_ack);
++		mondrian_log_flush_now();
++		on_ack = (uint32_t)mondrian_gpu_hfi_vote(gmu, 1);
++		printf("MONDRIAN GPU: gpu reset hfi on ack %u\n", on_ack);
++		mondrian_log_flush_now();
++		if (on_ack != 1) {
++			printf("MONDRIAN GPU: gpu reset failed, cp not re-armed\n");
++			mondrian_log_flush_now();
++			return -1;
++		}
++	}
++
++	/*
+ 	 * The ZAP authentication resets the GPU, so the CP register block is
+ 	 * back to the bootloader's defaults (measured: the SQE base reads
+ 	 * 0xe00000100000, the secure one, after the ZAP). Publish the ring and
+ 	 * the SQE again now, in redwood's order: ZAP first, CP registers after.
++	 *
++	 * cpapriv=1 goes first, because the reset cleared CP_APRIV_CNTL too and
++	 * the ME_INIT below is what reads it: with the register at zero the
++	 * microcode masks every privileged opcode it is about to be asked for.
++	 * This is the vendor's order -- APRIV, then the ring/SQE bases, then
++	 * the switch that starts the fetch.
+ 	 */
++	if (mondrian_cp_apriv) {
++		mondrian_cp_apriv_program(gpu, 1);
++	}
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_BASE * 4u, mondrian_cp_ring.iova);
+ 	CPW(GEN7_CP_RB_CNTL, 12u | (2u << 8));	/* rptr shadow on (kgsl/mainline) */
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_RPTR_ADDR_LO * 4u,
+@@ -2614,6 +2941,58 @@
+ 
+ 
+ 		/*
++		 * cporder=1, or cpapriv=1 (the default): the switch is
++		 * published only after the CP has been seen to retire ME_INIT
++		 * (rptr 10).
++		 *
++		 * The re-arm above zeroed CP_RB_WPTR, and the ZAP reset the CP
++		 * with it, so the ring holds ME_INIT but the CP has nothing to
++		 * fetch: measured with the check alone, the SQE parks at ucode
++		 * pc 0x10e on the ME_INIT header (0x70c80007) with `rptr 0x0
++		 * wptr 0x0` and ring dwords 8..13 zero. The plain boot only
++		 * reaches rptr 11 because publishing the switch (wptr 12) drags
++		 * the CP through ME_INIT and the switch header in one go. So
++		 * ME_INIT is offered again first: the same ten dwords the first
++		 * publish wrote (init[10], still unmodified), cleaned the same
++		 * way, published at 10. Then the wait is meaningful, and a CP
++		 * that retires it continues to the switch at dwords 10..11. A CP
++		 * that does not is given no switch at all: the memory packet
++		 * below is skipped and the ring is not published.
++		 */
++		if (mondrian_cp_order || mondrian_cp_apriv) {
++			for (i = 0; i < 10; i++) {
++				ring[i] = init[i];
++			}
++			mondrian_gpu_mem_flush(&mondrian_cp_ring,
++			    mondrian_cp_ring.bytes);
++			__asm__ volatile("dsb sy" ::: "memory");
++			CPW(GEN7_CP_RB_WPTR, 10);
++			rptr = mondrian_cp_wait_rptr(gpu, 10);
++			if (rptr >= 10) {
++				printf("MONDRIAN GPU: cp meinit rptr %u of 10\n",
++				    rptr);
++				mondrian_log_flush_now();
++			} else {
++				printf("MONDRIAN GPU: cp meinit stuck rptr %u of 10\n",
++				    rptr);
++				mondrian_log_flush_now();
++				goto no_switch;
++			}
++		}
++		/*
++		 * cpnosecmode=1: no switch at all. The ZAP has already put the
++		 * CP in nonsecure mode by packet, so this is the experiment that
++		 * says whether the explicit switch is needed on top of it. With
++		 * nothing written and nothing published, `at` is still 10 and
++		 * the memory packet below becomes the first thing the SQE
++		 * fetches; the ready check then judges the CP by that packet.
++		 */
++		if (mondrian_cp_nosecmode) {
++			printf("MONDRIAN GPU: cp secmode skipped (cpnosecmode)\n");
++			mondrian_log_flush_now();
++			goto no_switch;
++		}
++		/*
+ 		 * Take the CP out of secure mode. The switch goes in alone:
+ 		 * a THREAD_CONTROL that syncs both threads stalls here,
+ 		 * because BV is not running yet on this ring.
+@@ -2623,38 +3002,85 @@
  		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
  		__asm__ volatile("dsb sy" ::: "memory");
  		CPW(GEN7_CP_RB_WPTR, at);
@@ -91,8 +787,12 @@ What the next boot's log says:
 -			}
 -			delay(1000);
 -		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - switch_t0,
++		    &switch_ns);
 +		rptr = mondrian_cp_wait_rptr(gpu, at);
  		printf("MONDRIAN GPU: cp secmode rptr %u wptr %u\n", rptr, at);
++		printf("MONDRIAN GPU: cp zap to switch %u ms\n",
++		    (uint32_t)(switch_ns / 1000000ull));
  		mondrian_log_flush_now();
  
 +		if (rptr < at && mondrian_cp_noretry == 0) {
@@ -139,10 +839,64 @@ What the next boot's log says:
 +			at = want;
 +		}
 +
++		/* cporder=1 with a CP that never retired ME_INIT arrives here
++		 * with the switch unwritten and `at` still 10, so nothing below
++		 * is published and the ready check reports the CP as dead. */
++no_switch:
  		if (rptr >= at) {
  			/*
  			 * First memory packet after the switch: a canary into
-@@ -2724,14 +2790,38 @@
+ 			 * the memptr page (the CP already writes its RPTR
+ 			 * shadow there, so the mapping is known to take GPU
+ 			 * writes) and a fence into the next dword. Both
+-			 * headers carry the a7xx parity bits.
++			 * headers carry the a7xx parity bits. With cpprot=1
++			 * the pair sits inside the same CP_SET_PROTECTED_MODE
++			 * bracket a submission uses, and cpfence=mem replaces
++			 * the fence event write with a second memory write.
+ 			 */
+ 			const uint64_t dst = mondrian_cp_memptr.iova + 0x800u;
+ 			const uint64_t fen = mondrian_cp_memptr.iova + 0x810u;
+ 			volatile uint32_t *mv =
+ 			    (volatile uint32_t *)mondrian_cp_memptr_view;
+ 
++			at = mondrian_cp_prot_enter(ring, at);
+ 			ring[at++] = mondrian_pm4_type7(0x3du, 3);  /* MEM_WRITE */
+ 			ring[at++] = (uint32_t)dst;
+ 			ring[at++] = (uint32_t)(dst >> 32);
+ 			ring[at++] = 0x600dc0deu;
+-			ring[at++] = mondrian_pm4_type7(0x46u, 4);  /* EVENT_WRITE */
+-			ring[at++] = 0x31u | (1u << 27);	/* CACHE_CLEAN */
+-			ring[at++] = (uint32_t)fen;
+-			ring[at++] = (uint32_t)(fen >> 32);
+-			ring[at++] = 0x600dc0dfu;
++			at = mondrian_cp_fence(ring, at, fen, 0x600dc0dfu);
++			at = mondrian_cp_prot_exit(ring, at);
+ 			mondrian_gpu_mem_flush(&mondrian_cp_ring,
+ 			    mondrian_cp_ring.bytes);
+ 			__asm__ volatile("dsb sy" ::: "memory");
+@@ -2694,17 +3120,15 @@
+ 				ib[n++] = (uint32_t)dst2;
+ 				ib[n++] = (uint32_t)(dst2 >> 32);
+ 				ib[n++] = 0x1b00deadu;
+-				ib[n++] = mondrian_pm4_type7(0x46u, 4);
+-				ib[n++] = 0x31u | (1u << 27);
+-				ib[n++] = (uint32_t)fen2;
+-				ib[n++] = (uint32_t)(fen2 >> 32);
+-				ib[n++] = 0x1b00deaeu;
++				n = mondrian_cp_fence(ib, n, fen2, 0x1b00deaeu);
+ 				mondrian_gpu_mem_flush(&mondrian_cp_ib,
+ 				    mondrian_cp_ib.bytes);
++				at = mondrian_cp_prot_enter(ring, at);
+ 				ring[at++] = mondrian_pm4_type7(0x3fu, 3);
+ 				ring[at++] = (uint32_t)mondrian_cp_ib.iova;
+ 				ring[at++] = (uint32_t)(mondrian_cp_ib.iova >> 32);
+ 				ring[at++] = n;
++				at = mondrian_cp_prot_exit(ring, at);
+ 				mondrian_gpu_mem_flush(&mondrian_cp_ring,
+ 				    mondrian_cp_ring.bytes);
+ 				__asm__ volatile("dsb sy" ::: "memory");
+@@ -2724,54 +3148,140 @@
  				mondrian_log_flush_now();
  			}
  		}
@@ -166,6 +920,12 @@ What the next boot's log says:
 +		 */
 +		rptr = mondrian_cp_wait_rptr(gpu, at);
  		if (rptr >= at) {
+-			/* Submissions through the call the user client uses,
+-			 * back to back. 2000 of them wrap the 32 KiB ring
+-			 * twice, reuse every fence slot and prove the order:
+-			 * the last canary and the last fence have to be the
+-			 * ones the last submission asked for. */
+-			uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
 +			printf("MONDRIAN GPU: cp ready rptr %u of %u\n", rptr, at);
 +			/* From here the ring is the user client's, which
 +			 * continues at this dword. */
@@ -175,20 +935,167 @@ What the next boot's log says:
 +			mondrian_uc_at = at;
 +			mondrian_uc_up = 1;
 +		} else {
-+			uint32_t s0, s1;
++			uint32_t s0, s1, s2, s3;
 +
 +			CPW(GEN7_CP_SQE_STAT_ADDR, 0);
 +			s0 = CPR(GEN7_CP_SQE_STAT_DATA);
 +			s1 = CPR(GEN7_CP_SQE_STAT_DATA);
 +			printf("MONDRIAN GPU: cp NOT ready rptr %u of %u, sqe 0x%x 0x%x, ring not published\n",
 +			    rptr, at, s0, s1);
++			/*
++			 * Everything needed to tell a secure-mode hang from a
++			 * broken fetch: the two SQE_STAT pops the line above
++			 * does not print (2 and 3), the trust register and the
++			 * base the SQE actually fetches from, both pointers,
++			 * the SQE gate and the fault/interrupt/status words.
++			 * Plain reads, no new waits.
++			 */
++			CPW(GEN7_CP_SQE_STAT_ADDR, 2);
++			s2 = CPR(GEN7_CP_SQE_STAT_DATA);
++			s3 = CPR(GEN7_CP_SQE_STAT_DATA);
++			printf("MONDRIAN GPU: cp notready detail sqe 0x%x 0x%x trust 0x%x sqebase 0x%x/0x%x rptr 0x%x wptr 0x%x sqecntl 0x%x fault 0x%x int 0x%x rbbm3 0x%x ring %08x %08x %08x %08x %08x %08x\n",
++			    s2, s3, CPR(GEN7_RBBM_SECVID_TRUST_CNTL),
++			    CPR(GEN7_CP_SQE_INSTR_BASE_LO),
++			    CPR(GEN7_CP_SQE_INSTR_BASE_HI),
++			    CPR(GEN7_CP_RB_RPTR), CPR(GEN7_CP_RB_WPTR),
++			    CPR(GEN7_CP_SQE_CNTL), CPR(GEN7_CP_HW_FAULT),
++			    CPR(GEN7_CP_INTERRUPT_STATUS),
++			    CPR(GEN7_RBBM_STATUS3),
++			    ring[8], ring[9], ring[10], ring[11], ring[12],
++			    ring[13]);
++			/*
++			 * The four reads that separate "the CP is still in
++			 * secure mode" from "the secure TSB is invalid", which
++			 * the line above cannot tell apart: CP_SECURE_MODE is
++			 * the switch's own state, CP_APRIV_CNTL says whether
++			 * the privileged mask survived (cpapriv=0 leaves it at
++			 * the old 0x6f/0xf/0xf), CP_CP2GMU_STATUS says whether
++			 * the CP still answers the GMU, and the TSB status pair
++			 * is what the secure-mode fetch validates against.
++			 * Printed on every not-ready boot, in either mode: this
++			 * line only exists when the CP did not consume the
++			 * bring-up. Plain reads, no waits.
++			 */
++			printf("MONDRIAN GPU: cp notready secure 0x%x apriv 0x%x cp2gmu 0x%x tsb 0x%x/0x%x\n",
++			    CPR(GEN7_CP_SECURE_MODE), CPR(GEN7_CP_APRIV_CNTL),
++			    CPR(GEN7_CP_CP2GMU_STATUS),
++			    CPR(GEN7_RBBM_SECVID_TSB_STATUS_LO),
++			    CPR(GEN7_RBBM_SECVID_TSB_STATUS_HI));
++			mondrian_log_flush_now();
 +		}
 +		mondrian_log_flush_now();
 +		if (mondrian_uc_up) {
- 			/* Submissions through the call the user client uses,
- 			 * back to back. 2000 of them wrap the 32 KiB ring
- 			 * twice, reuse every fence slot and prove the order:
-@@ -2943,7 +3033,7 @@
+ 			volatile uint32_t *mv =
+ 			    (volatile uint32_t *)mondrian_cp_memptr_view;
+-			const uint32_t rounds = 2000;
+-			const uint64_t dst = mondrian_cp_memptr.iova + 0x900u;
+-			const uint64_t fen = mondrian_cp_memptr.iova + 0x910u;
+-			uint32_t f = 0, last = 0, refused = 0, w, k, n = 0;
+-
+-			ib[n++] = mondrian_pm4_type7(0x3du, 3);
+-			ib[n++] = (uint32_t)dst;
+-			ib[n++] = (uint32_t)(dst >> 32);
+-			ib[n++] = 0;			/* value, per round */
+-			ib[n++] = mondrian_pm4_type7(0x46u, 4);
+-			ib[n++] = 0x31u | (1u << 27);
+-			ib[n++] = (uint32_t)fen;
+-			ib[n++] = (uint32_t)(fen >> 32);
+-			ib[n++] = 0;			/* fence, per round */
+-			for (k = 1; k <= rounds; k++) {
+-				ib[3] = 0x600d0000u | (k & 0xfffu);
+-				ib[8] = k;
+-				mondrian_gpu_mem_flush(&mondrian_cp_ib,
+-				    mondrian_cp_ib.bytes);
+-				__asm__ volatile("dsb sy" ::: "memory");
+-				if (mondrian_gpu_uc_submit(mondrian_cp_ib.iova,
+-				    n, &f) != 0) {
+-					refused++;
++
++			/*
++			 * cpstress=0 skips the 2000 submissions below. They are a
++			 * diagnostic, and when anything about the ring or the CP is
++			 * off one submission becomes a 2 s wait: the loop then costs
++			 * the boot about 40 minutes and userland is never reached.
++			 * The bring-up has already published the ring, so every
++			 * step after this point still runs on the same state.
++			 */
++			if (mondrian_cp_stress == 0) {
++				printf("MONDRIAN GPU: cp stress skipped\n");
++				mondrian_log_flush_now();
++			} else {
++				/* Submissions through the call the user client uses,
++				 * back to back. 2000 of them wrap the 32 KiB ring
++				 * twice, reuse every fence slot and prove the order:
++				 * the last canary and the last fence have to be the
++				 * ones the last submission asked for. */
++				uint32_t *ib = (uint32_t *)mondrian_cp_ib.va;
++				const uint32_t rounds = 2000;
++				const uint64_t dst = mondrian_cp_memptr.iova + 0x900u;
++				const uint64_t fen = mondrian_cp_memptr.iova + 0x910u;
++				uint32_t f = 0, last = 0, refused = 0, w, k, n = 0;
++
++				ib[n++] = mondrian_pm4_type7(0x3du, 3);
++				ib[n++] = (uint32_t)dst;
++				ib[n++] = (uint32_t)(dst >> 32);
++				ib[n++] = 0;			/* value, per round */
++				n = mondrian_cp_fence(ib, n, fen, 0);	/* per round */
++				for (k = 1; k <= rounds; k++) {
++					/* The submit steps print per submission; this is
++					 * what says how far the loop itself got when one
++					 * of them is the last line in the ring. */
++					if (mondrian_uc_dump != 0 &&
++					    (k == 1 || (k % 250) == 0)) {
++						printf("MONDRIAN GPU: stress round %u at 0x%x refused %u\n",
++						    k, mondrian_uc_at, refused);
++						mondrian_log_flush_now();
++					}
++					ib[3] = 0x600d0000u | (k & 0xfffu);
++					/* The fence value is the fence packet's last
++					 * dword in both shapes, so the sequence does
++					 * not have to know which one was written. */
++					ib[n - 1] = k;
++					mondrian_gpu_mem_flush(&mondrian_cp_ib,
++					    mondrian_cp_ib.bytes);
++					__asm__ volatile("dsb sy" ::: "memory");
++					if (mondrian_gpu_uc_submit(mondrian_cp_ib.iova,
++					    n, &f) != 0) {
++						refused++;
++					}
++					last = f;
+ 				}
+-				last = f;
++				w = (uint32_t)mondrian_gpu_uc_wait(last, 5000);
++				printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x br_rptr 0x%x bv_rptr 0x%x\n",
++				    rounds, refused, w, mv ? mv[0x900 / 4] : 0,
++				    mv ? mv[0x910 / 4] : 0,
++				    mv ? mv[0] : 0, mv ? mv[2] : 0);
++				mondrian_log_flush_now();
+ 			}
+-			w = (uint32_t)mondrian_gpu_uc_wait(last, 5000);
+-			printf("MONDRIAN GPU: cp uc stress %u refused %u wait %u canary 0x%x fence 0x%x br_rptr 0x%x bv_rptr 0x%x\n",
+-			    rounds, refused, w, mv ? mv[0x900 / 4] : 0,
+-			    mv ? mv[0x910 / 4] : 0,
+-			    mv ? mv[0] : 0, mv ? mv[2] : 0);
+-			mondrian_log_flush_now();
+ 			if (mondrian_cp_init_hw != 0) {
+ 				/*
+ 				 * kgsl's gen7_start, and with gpuinit=2 its
+@@ -2860,7 +3370,13 @@
+ 					mondrian_log_flush_now();
+ 				}
+ 				{
+-					/* Does the CP still run after the init? */
++					/* Does the CP still run after the init?
++					 * cpfence=mem leaves this one packet as
++					 * the event write on purpose: it is the
++					 * only copy left that still asks for
++					 * CACHE_CLEAN, and it runs after the
++					 * stress, so a CP that parks on it says
++					 * the event write itself is the halt. */
+ 					uint32_t *ib2 = (uint32_t *)mondrian_cp_ib.va;
+ 					const uint64_t d3 =
+ 					    mondrian_cp_memptr.iova + 0x920u;
+@@ -2943,7 +3459,7 @@
  #undef CPW
  #undef CPR
  #undef CPW64
@@ -197,12 +1104,475 @@ What the next boot's log says:
  }
  
  /* ------------------------------------------------------------------ */
-@@ -3946,6 +4036,8 @@
+@@ -3363,28 +3879,97 @@
+ 
+ /*
+  * Close the ring. The CP fetches from the read pointer towards the write
+- * pointer and wraps at the end of the buffer, so the tail has to decode as
+- * a valid packet. Fill it with one CP_NOP, but do not publish the wrap here:
+- * a write pointer of zero while the start still holds the previous lap lets
+- * the CP execute those dwords again, its read pointer runs to 25 and the
+- * wait for zero never matches (measured: the 2000-submission stress refused
+- * 1373 of them). The write pointer is published with the submission that is
+- * written at the start, so the CP crosses the NOP and then reads new data.
++ * pointer and wraps at the end of the buffer, so the tail has to decode as a
++ * valid packet. Fill it with one CP_NOP, publish the end of the lap and wait
++ * for the read pointer to reach it:
++ *
++ *  - A write pointer of zero while the start still holds the previous lap
++ *    lets the CP execute those dwords again and its read pointer runs to 25
++ *    (measured: the 2000-submission stress refused 1373 of them).
++ *  - Leaving the wrap to the submission at the start of the next lap (the
++ *    previous shape: publish only `at` once the new dwords are written) is
++ *    what deadlocked this ring. The CP is told the ring grew from a pointer
++ *    near the end to a small one, so it consumes forward through dwords the
++ *    CPU has already rewritten: measured with gpudump=1, `uc rptr reg 0x403
++ *    sh 0x400 bv 0x0 at 0x3f0 room 18` and then the same poll forever. The
++ *    room test needs 26 free dwords and the read pointer was 19 dwords past
++ *    the write cursor, so room could only shrink: 2 s a submission, 2000 of
++ *    them, and the boot never reached userland.
++ *
++ * So the lap boundary is made explicit: CP_RB_WPTR = MONDRIAN_UC_RING_DWORDS
++ * tells the CP to consume the NOP tail and stop at the end of the buffer, and
++ * the wait proves it did before this cursor is handed back to the submission
++ * path. Two indications are accepted, and the line says which one fired:
++ *
++ *  - rptr >= MONDRIAN_UC_RING_DWORDS: the register keeps counting past the
++ *    end of the buffer. Relied on when the hardware reports the raw dword
++ *    offset; then the value names the end of the lap directly.
++ *  - rptr < seen, the pointer sampled before the doorbell: inside one lap the
++ *    read pointer only moves forward, so the only way back below `seen` is
++ *    that the CP passed the end of the lap and restarted at zero. Relied on
++ *    when the register is masked with the ring size, and the reason `seen` is
++ *    read here rather than taken from the cached bound.
++ *
++ * On timeout the cursor is not rolled: overwriting the first dwords of a lap
++ * the CP has not finished would be the same bug in the other direction, so the
++ * submission is refused and the next one looks again.
+  */
+ static int
+ mondrian_uc_wrap(uint32_t *ring)
+ {
+ 	uint32_t pad = MONDRIAN_UC_RING_DWORDS - mondrian_uc_at;
++	uint32_t at = mondrian_uc_at;
++	uint32_t seen, rptr, rounds;
+ 	uint32_t i;
+ 
+ 	if (pad != 0) {
+-		ring[mondrian_uc_at] = mondrian_pm4_type7(0x10u, pad - 1);
++		ring[at] = mondrian_pm4_type7(0x10u, pad - 1);
+ 		for (i = 1; i < pad; i++) {
+-			ring[mondrian_uc_at + i] = 0;
++			ring[at + i] = 0;
+ 		}
+ 		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
++	/*
++	 * The lap ends here. The write is posted, so the dsb orders it behind
++	 * the ring dwords and the CP cannot fetch the end of the lap before
++	 * the NOP tail is in memory.
++	 */
++	seen = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u);
++	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u,
++	    (uint32_t)MONDRIAN_UC_RING_DWORDS);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc wrap doorbell wptr 0x%x rptr 0x%x\n",
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
++		    seen);
++		mondrian_log_flush_now();
++	}
++	rptr = seen;
++	for (rounds = 0; rounds < 2000; rounds++) {
++		rptr = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u);
++		if (rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS || rptr < seen) {
++			break;
++		}
++		delay(1000);
++	}
++	if (rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS || rptr < seen) {
++		printf("MONDRIAN GPU: uc wrap waited rptr 0x%x %s\n", rptr,
++		    rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS ?
++		    "past the lap end" : "wrapped below the lap end");
++	} else {
++		printf("MONDRIAN GPU: uc wrap timeout rptr 0x%x seen 0x%x at 0x%x\n",
++		    rptr, seen, at);
++		mondrian_log_flush_now();
++		return -1;
++	}
++	mondrian_log_flush_now();
++	/*
++	 * The lap restarted, so the cached read pointer is not a lower bound
++	 * any more: it names a position in the lap that just ended, and the
++	 * room test has to read the register again before it can use it.
++	 */
++	mondrian_uc_rptr_valid = 0;
+ 	mondrian_uc_at = 0;
+ 	return 0;
+ }
+@@ -3412,7 +3997,7 @@
+ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ {
+ 	uint32_t *ring;
+-	uint32_t at, from, seq;
++	uint32_t at, from, seq, rptr, spins, room;
+ 	uint64_t slot, ringStart;
+ 
+ 	if (fence == NULL) {
+@@ -3425,7 +4010,27 @@
+ 	}
+ 	ring = (uint32_t *)mondrian_cp_ring.va;
+ 	/* Everything from here reads GPU registers, the diagnostics too. */
++	seq = mondrian_uc_fence + 1;
++	/*
++	 * One line at every step, flushed as it is printed: a submission that
++	 * hangs on its first register access leaves the step that completed in
++	 * the ring, and the access after that line is the one the CPU died on.
++	 */
++	if (mondrian_uc_sub_first < 3) {
++		mondrian_uc_sub_first++;
++		printf("MONDRIAN GPU: uc submit %u first\n", dwords);
++		mondrian_log_flush_now();
++	}
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc submit %u dwords at 0x%x\n", dwords,
++		    mondrian_uc_at);
++		mondrian_log_flush_now();
++	}
+ 	mondrian_uc_keepalive(1);
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc keepalive up at 0x%x\n", mondrian_uc_at);
++		mondrian_log_flush_now();
++	}
+ 	if (dwords > 16 && mondrian_uc_logged < 8) {
+ 		mondrian_uc_logged++;
+ 		/* Before the first register read: a wedged CP makes that read
+@@ -3450,25 +4055,86 @@
+ 	 *
+ 	 * The register read behind that is an uncached round trip to the GPU,
+ 	 * and the pointer only moves forward inside a lap, so a value read once
+-	 * stays a lower bound until the write position is a whole lap past it:
+-	 * while (at - seen) mod size is under size - 26, the 26 dwords written
+-	 * below cannot reach the CP whatever it does in between. That is one
+-	 * read a lap (315 submissions of 26 dwords) instead of one a
+-	 * submission; the room test itself is unchanged and still runs
+-	 * whenever the bound expires or the CP has to be waited for.
+-	 */
+-	if (mondrian_uc_rptr_valid == 0 ||
+-	    (at + MONDRIAN_UC_RING_DWORDS - mondrian_uc_rptr) %
+-	    MONDRIAN_UC_RING_DWORDS > MONDRIAN_UC_RING_DWORDS - 27) {
++	 * stays a lower bound: while the room it implies still covers the 26
++	 * dwords written below, they cannot reach the CP whatever it does in
++	 * between. That is one read a lap (315 submissions of 26 dwords)
++	 * instead of one a submission.
++	 *
++	 * The bound is only ever a lower bound, so a short room means nothing
++	 * more than "the cached value is not enough": the CP may well be far
++	 * ahead of it. It has to be read again before anything waits on it --
++	 * a stale bound is what deadlocked the ring (measured: cached 0x3f0,
++	 * write cursor 0x3f0, real read pointer 0x403, room 18, and the wait
++	 * below spun for 2 s a submission for the whole 2000-submission
++	 * stress). `uc no room` and its patience stay as they were; only the
++	 * decision to wait is taken from a fresh read.
++	 */
++	rptr = mondrian_uc_rptr;
++	room = mondrian_uc_rptr_valid != 0 ?
++	    (rptr + MONDRIAN_UC_RING_DWORDS - at - 1) %
++	    MONDRIAN_UC_RING_DWORDS : 0;
++	spins = 0;
++	if (room < 26) {
+ 		uint32_t spent_us = 0;
+ 
++		if (mondrian_uc_dump != 0) {
++			/* Printed before the read, not after it: a CP whose
++			 * register port stopped answering never returns from
++			 * it, and this is the line that says the CPU died
++			 * there. */
++			printf("MONDRIAN GPU: uc room wait at 0x%x\n", at);
++			mondrian_log_flush_now();
++		}
+ 		for (;;) {
+-			uint32_t rptr = mondrian_gpu_read(mondrian_uc_gpu,
++			uint32_t reg, sh, bv;
++			volatile uint32_t *shadow =
++			    (volatile uint32_t *)mondrian_cp_memptr_view;
++
++			reg = mondrian_gpu_read(mondrian_uc_gpu,
+ 			    GEN7_CP_RB_RPTR * 4u);
+-			uint32_t room = (rptr + MONDRIAN_UC_RING_DWORDS -
++			sh = shadow != NULL ? shadow[0] : 0;
++			bv = shadow != NULL ? shadow[2] : 0;
++			/*
++			 * CP_RB_CNTL turns the rptr shadow on, so the CP may
++			 * be publishing its read pointer in memory and not in
++			 * the register. Take whichever is further: a register
++			 * that stays stale must not strand the ring, and a
++			 * shadow outside the ring is not a pointer at all.
++			 */
++			rptr = (sh < MONDRIAN_UC_RING_DWORDS && sh > reg) ?
++			    sh : reg;
++			room = (rptr + MONDRIAN_UC_RING_DWORDS -
+ 			    at - 1) % MONDRIAN_UC_RING_DWORDS;
+-
+ 			mondrian_uc_rptr_reads++;
++			/* A CP that stopped consuming shows the same rptr on
++			 * every spin; a wedged register port shows none. */
++			if (mondrian_uc_dump != 0 &&
++			    (spins < 8 || (spins % 256) == 0)) {
++				printf("MONDRIAN GPU: uc room poll %u rptr 0x%x room %u\n",
++				    spins, rptr, room);
++				printf("MONDRIAN GPU: uc rptr reg 0x%x sh 0x%x bv 0x%x at 0x%x room %u\n",
++				    reg, sh, bv, at, room);
++				mondrian_log_flush_now();
++			}
++			/*
++			 * The shadow moving while the register does not is the
++			 * whole bug: the CP is consuming and the submission
++			 * path was polling the wrong pointer.
++			 */
++			if (mondrian_uc_dump != 0) {
++				if (mondrian_uc_sh_seen != 0 &&
++				    mondrian_uc_sh_said == 0 &&
++				    sh != mondrian_uc_sh_shadow &&
++				    reg == mondrian_uc_sh_reg) {
++					mondrian_uc_sh_said = 1;
++					printf("MONDRIAN GPU: cp rptr shadow moves, register stale\n");
++					mondrian_log_flush_now();
++				}
++				mondrian_uc_sh_seen = 1;
++				mondrian_uc_sh_shadow = sh;
++				mondrian_uc_sh_reg = reg;
++			}
++			spins++;
+ 			if (room >= 26) {
+ 				mondrian_uc_rptr = rptr;
+ 				mondrian_uc_rptr_valid = 1;
+@@ -3477,6 +4143,8 @@
+ 			if (spent_us >= 2000000u) {
+ 				if (mondrian_uc_dump != 0) {
+ 					printf("MONDRIAN GPU: uc no room at 0x%x\n", at);
++					printf("MONDRIAN GPU: uc submit done seq %u ret %d\n",
++					    seq, -1);
+ 					mondrian_log_flush_now();
+ 				}
+ 				return -1;
+@@ -3485,21 +4153,31 @@
+ 			spent_us += mondrian_uc_poll_us;
+ 		}
+ 	}
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc room at 0x%x rptr 0x%x reads %u\n",
++		    at, rptr, mondrian_uc_rptr_reads);
++		mondrian_log_flush_now();
++	}
+ 	if (at + 26 > MONDRIAN_UC_RING_DWORDS) {
+ 		if (mondrian_uc_wrap(ring) != 0) {
++			if (mondrian_uc_dump != 0) {
++				printf("MONDRIAN GPU: uc submit done seq %u ret %d\n",
++				    seq, -1);
++				mondrian_log_flush_now();
++			}
+ 			return -1;
+ 		}
+ 		at = 0;
+ 	}
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc wrap at 0x%x\n", at);
++		mondrian_log_flush_now();
++	}
+ 	from = at;
+-	seq = mondrian_uc_fence + 1;
+ 	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
+ 	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
+-	/* kgsl brackets a submission with CP_SET_PROTECTED_MODE(0) … (1) when
+-	 * the caller asks for an unprotected one; without the exit the state
+-	 * stream's type-4 register writes are refused. The CCU invalidates and
+-	 * the IFPC marker that kgsl and pong also emit around a submission
+-	 * change nothing here (measured). */
++	/* The CCU invalidates and the IFPC marker that kgsl and pong also emit
++	 * around a submission change nothing here (measured). */
+ 	/*
+ 	 * kgsl brackets every submission with these: the two CP threads are
+ 	 * synchronised, IFPC (inter-frame power collapse) is disabled for the
+@@ -3507,6 +4185,24 @@
+ 	 * declared inside an IB1LIST. Without the IFPC markers the SQE is free
+ 	 * to collapse the GPU in the middle of the submission.
+ 	 */
++	/*
++	 * cpapriv=1 (the default): no CP_SET_PROTECTED_MODE in the frame at
++	 * all, neither half. Measured with the masks programmed and the fence
++	 * a CP_MEM_WRITE: the bring-up completes (`cp ready`, `cp int 0x0`)
++	 * and the 2000-submission stress then freezes the machine with no
++	 * `uc` line, so the CP stopped consuming on one of the two packets
++	 * this frame adds. 0x5f is privileged exactly like the CACHE_CLEAN
++	 * event write, kgsl runs every submission with protected mode off
++	 * ("All submissions are run with protected mode off due to APRIV")
++	 * and mainline emits none on a7xx. cpapriv=0 restores both halves
++	 * dword for dword.
++	 */
++	if (mondrian_uc_frame_logged == 0) {
++		mondrian_uc_frame_logged = 1;
++		printf("MONDRIAN GPU: uc frame %s\n", mondrian_cp_apriv ?
++		    "no protected-mode packet" : "protected-mode bracket");
++		mondrian_log_flush_now();
++	}
+ 	if (mondrian_uc_nomark == 0) {
+ 		ring[at++] = mondrian_pm4_type7(0x17u, 1);	/* THREAD_CONTROL */
+ 		ring[at++] = 3;			/* both threads */
+@@ -3515,8 +4211,10 @@
+ 		ring[at++] = mondrian_pm4_type7(0x17u, 1);	/* THREAD_CONTROL */
+ 		ring[at++] = 1;			/* BR thread */
+ 	}
+-	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
+-	ring[at++] = 0;
++	if (!mondrian_cp_apriv) {
++		ring[at++] = mondrian_pm4_type7(0x5fu, 1); /* SET_PROTECTED_MODE */
++		ring[at++] = 0;
++	}
+ 	if (mondrian_uc_nomark == 0) {
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x00du;		/* IB1LIST start */
+@@ -3529,13 +4227,11 @@
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x00eu;		/* IB1LIST end */
+ 	}
+-	ring[at++] = mondrian_pm4_type7(0x46u, 4);	/* EVENT_WRITE */
+-	ring[at++] = 0x31u | (1u << 27);		/* cache clean */
+-	ring[at++] = (uint32_t)slot;
+-	ring[at++] = (uint32_t)(slot >> 32);
+-	ring[at++] = seq;
+-	ring[at++] = mondrian_pm4_type7(0x5fu, 1);	/* SET_PROTECTED_MODE */
+-	ring[at++] = 1;
++	at = mondrian_cp_fence(ring, at, slot, seq);
++	if (!mondrian_cp_apriv) {
++		ring[at++] = mondrian_pm4_type7(0x5fu, 1); /* SET_PROTECTED_MODE */
++		ring[at++] = 1;
++	}
+ 	if (mondrian_uc_nomark == 0) {
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x100;		/* IFPC mode: IFPC enabled */
+@@ -3571,6 +4267,10 @@
+ 	}
+ 	mondrian_uc_fence = seq;
+ 	mondrian_uc_at = at;
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc frame written at 0x%x seq %u\n", at, seq);
++		mondrian_log_flush_now();
++	}
+ 	/*
+ 	 * Every 1024 submissions, what the ring costs and how much of it is
+ 	 * cleaned: the two numbers this change moves, in the log of the boot
+@@ -3626,16 +4326,53 @@
+ 			printf("MONDRIAN GPU: door thread stopped answering at seq %u, submissions refused\n",
+ 			    seq);
+ 			mondrian_log_flush_now();
++			if (mondrian_uc_dump != 0) {
++				printf("MONDRIAN GPU: uc submit done seq %u ret %d\n",
++				    seq, 0);
++				mondrian_log_flush_now();
++			}
+ 			mondrian_uc_up = 0;
+ 			mondrian_uc_keepalive(0);
+ 			return 0;
+ 		}
++		if (mondrian_uc_dump != 0) {
++			printf("MONDRIAN GPU: uc doorbell 0x%x\n", at);
++			mondrian_log_flush_now();
++		}
+ 		if (dwords > 16) {
+ 			printf("MONDRIAN GPU: uc door posted %u\n", seq);
+ 			mondrian_log_flush_now();
+ 		}
+ 	} else {
+ 		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++		if (mondrian_uc_dump != 0) {
++			printf("MONDRIAN GPU: uc doorbell 0x%x\n", at);
++			mondrian_log_flush_now();
++		}
++	}
++	/*
++	 * gpudump=1, the first three submissions: what the doorbell left
++	 * behind. A wptr that reads back as the value just written means the
++	 * store landed and the CP was told the ring grew; a stale one means it
++	 * did not. rptr and the shadow on the same line say whether the CP is
++	 * consuming at all, and the SQE/status/RBBM registers say what state
++	 * the block is in when it is not. These reads are the ones that never
++	 * return from a wedged register port, hence gpudump=1.
++	 */
++	if (mondrian_uc_dump != 0 && seq <= 3) {
++		volatile uint32_t *shadow =
++		    (volatile uint32_t *)mondrian_cp_memptr_view;
++
++		printf("MONDRIAN GPU: uc doorbell readback wptr 0x%x rptr 0x%x sh 0x%x sqecntl 0x%x int 0x%x status1 0x%x rbbm 0x%x\n",
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u),
++		    shadow != NULL ? shadow[0] : 0,
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_SQE_CNTL * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu,
++		    GEN7_CP_INTERRUPT_STATUS * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_STATUS_1 * 4u),
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u));
++		mondrian_log_flush_now();
+ 	}
+ 	/*
+ 	 * The read-back that used to be here (CP_RB_WPTR) made sure the posted
+@@ -3760,6 +4497,10 @@
+ 		}
+ 	}
+ 	mondrian_uc_keepalive(0);
++	if (mondrian_uc_dump != 0) {
++		printf("MONDRIAN GPU: uc submit done seq %u ret %d\n", seq, 0);
++		mondrian_log_flush_now();
++	}
+ 	return 0;
+ }
+ 
+@@ -3946,6 +4687,38 @@
  	    sizeof(mondrian_cp_zap));
  	(void)PE_parse_boot_argn("gpustart", &mondrian_cp_run,
  	    sizeof(mondrian_cp_run));
 +	(void)PE_parse_boot_argn("cpnoretry", &mondrian_cp_noretry,
 +	    sizeof(mondrian_cp_noretry));
++	(void)PE_parse_boot_argn("cporder", &mondrian_cp_order,
++	    sizeof(mondrian_cp_order));
++	(void)PE_parse_boot_argn("cpapriv", &mondrian_cp_apriv,
++	    sizeof(mondrian_cp_apriv));
++	(void)PE_parse_boot_argn("gpureset", &mondrian_cp_reset,
++	    sizeof(mondrian_cp_reset));
++	(void)PE_parse_boot_argn("cpnosecmode", &mondrian_cp_nosecmode,
++	    sizeof(mondrian_cp_nosecmode));
++	(void)PE_parse_boot_argn("cpprot", &mondrian_cp_protmode,
++	    sizeof(mondrian_cp_protmode));
++	{
++		char fence[8] = { 0 };
++
++		/* cpfence=mem is the only value that means anything; the
++		 * default (no argument, or any other word) keeps the event
++		 * write. */
++		if (PE_parse_boot_argn("cpfence", fence, sizeof(fence)) &&
++		    strncmp(fence, "mem", 3) == 0) {
++			mondrian_cp_fence_mem = 1;
++		}
++	}
++	{
++		uint32_t event = 0;
++
++		/* cpevent=4 is the only value that means anything; any other
++		 * word, or no argument, leaves CACHE_CLEAN in the packet. */
++		if (PE_parse_boot_argn("cpevent", &event, sizeof(event))) {
++			mondrian_cp_event4 = (event == 4);
++		}
++	}
  	(void)PE_parse_boot_argn("gpupm4", &mondrian_uc_pm4,
  	    sizeof(mondrian_uc_pm4));
  	(void)PE_parse_boot_argn("gpunoblit", &mondrian_uc_noblit,
+@@ -3972,6 +4745,8 @@
+ 	    sizeof(mondrian_uc_async));
+ 	(void)PE_parse_boot_argn("gpuinit", &mondrian_cp_init_hw,
+ 	    sizeof(mondrian_cp_init_hw));
++	(void)PE_parse_boot_argn("cpstress", &mondrian_cp_stress,
++	    sizeof(mondrian_cp_stress));
+ 	(void)PE_parse_boot_argn("gpuringslow", &mondrian_uc_ring_slow,
+ 	    sizeof(mondrian_uc_ring_slow));
+ 	{

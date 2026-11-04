@@ -1,0 +1,79 @@
+xnu 0226: gpuperf=N moves the GMU's default perf vote
+
+The GMU boots with a default vote of index 2, which this table maps to 285 MHz,
+and it stays there: the vendor raises the level per submission with a DCVS
+message (`HFI_H2F_MSG_WORKLOAD`/`DCVS`), and this port sends only the boot-time
+perf and bandwidth tables. Measured on the lock screen: a steady frame spends
+~0.1-0.6 ms handing work to the CP and ~10.7 ms in `glFinish()` waiting for the
+draw to finish, which is the shape of a GPU held at a low OPP rather than a CP
+that is slow to consume (a full frame of submissions moves the ring pointer in
+well under a millisecond).
+
+`gpuperf=N` selects the entry the perf table votes as its default: `N` is the
+index into that table (1 is 220 MHz, 2 the kgsl default 285, 13 the top OPP
+900 MHz), and the bus vote follows the same level, taken from
+`mondrian_power_levels`. The console line now reports the resulting
+frequency so the boot says what it voted for:
+
+	MONDRIAN GPU: hfi power gpu 13 bus 11, 900 MHz
+
+what the next boot has to show
+	`hfi power gpu 13 bus 11, 900 MHz` with `gpuperf=13`, and the per-frame
+	GPU wait dropping against the default's ~10.7 ms. If the wait does not
+	move, the wall is submission latency or bandwidth, not the clock, and
+	the default vote should go back to kgsl's 2.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1040,6 +1040,15 @@
+ 	uint32_t hz, level, cx_level, bus, bus_min, bus_max, acd;
+ };
+ 
++/*
++ * The entry of the perf table the GMU votes by default -- what the GPU runs at
++ * while no client asks for anything. kgsl's own default vote is index 2, which
++ * this table maps to 285 MHz (index 1 is 220 and index 13 the top OPP, 900):
++ * the vendor changes it per submission with a DCVS message, which this port
++ * does not send. gpuperf=N moves it; 13 is the top of the table.
++ */
++static uint32_t mondrian_gpu_perf = 2;
++
+ static const struct mondrian_power_level mondrian_power_levels[13] = {
+ 	{ 0x35a4e900u, 0x1a0u, 0x1a0u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
+ 	{ 0x33611380u, 0x180u, 0x180u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
+@@ -1254,8 +1263,9 @@
+ 			}
+ 		}
+ 	}
+-	*gpu_idx = 2;
+-	*bus_idx = mondrian_power_levels[11].bus;
++	*gpu_idx = mondrian_gpu_perf;
++	*bus_idx = mondrian_power_levels[mondrian_gpu_perf != 0 ?
++	    13 - mondrian_gpu_perf : 12].bus;
+ 	return 0;
+ }
+ 
+@@ -1293,7 +1303,9 @@
+ 		printf("MONDRIAN GPU: hfi power tables missing\n");
+ 		return;
+ 	}
+-	printf("MONDRIAN GPU: hfi power gpu %u bus %u\n", gpu_idx, bus_idx);
++	printf("MONDRIAN GPU: hfi power gpu %u bus %u, %u MHz\n", gpu_idx,
++	    bus_idx, gpu_idx != 0 ?
++	    mondrian_power_levels[13 - gpu_idx].hz / 1000000u : 0);
+ 
+ 	s = mondrian_hfi_seq++;
+ 	mondrian_gpu_hfi_send(gmu, hfi, 4, perf, 58, s);
+@@ -4692,6 +4704,13 @@
+ 	(void)PE_parse_boot_argn("gpugx", &mondrian_gpu_gx, sizeof(mondrian_gpu_gx));
+ 	(void)PE_parse_boot_argn("gpucp", &cp, sizeof(cp));
+ 	(void)PE_parse_boot_argn("gpusubmit", &submit, sizeof(submit));
++	{
++		int perf = 0;
++
++		if (PE_parse_boot_argn("gpuperf", &perf, sizeof(perf))) {
++			mondrian_gpu_perf = (uint32_t)(perf < 0 ? 0 : (perf > 13 ? 13 : perf));
++		}
++	}
+ 	(void)PE_parse_boot_argn("gpublind", &mondrian_cp_blind,
+ 	    sizeof(mondrian_cp_blind));
+ 	(void)PE_parse_boot_argn("gpuzap", &mondrian_cp_zap,
