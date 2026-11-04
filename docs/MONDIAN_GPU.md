@@ -460,14 +460,26 @@ them has Metal. That is the path this port follows.
   `cp_type7_packet(CP_EVENT_WRITE, 1)` + `0x31`, and `24`/`25` for the CCU
   invalidates), so the count-1 packet was never the problem; `0228`'s rewrite is
   off by default and is only a bisect tool.
-- **The black clear is resolve state, not the packet.** `FD_BLIT` (`0x1e`) is
-  only the trigger: what writes the tile out of the CCU/GMEM is the a7xx resolve
-  state programmed in the same stream (`RB_CCU_CNTL`, `RB_RESOLVE_*`, the GMEM
-  base and mode), so a correctly executed `0x1e` with that state missing also
-  reads back as zeros. The self test says exactly that: the stream completes,
-  `int 0`, `fault 0`, and the readback is zeros. The next thing to compare is
-  that state against `fd6_emit.cc`'s `fd6_emit_common_init`/`fd6_emit_tile_init`
-  and against the vendor's gen7 init, not more packet archaeology.
+- **Both halves of the pipeline are silent, and the self test now says so per
+  boot.** With the event writes left exactly as Mesa emits them (`gpuevent=0`),
+  a full boot shows every submission completing (`uc big 253/67/168/… done 1`,
+  no `gpu stopped answering`, no `writeR` crash, one FD725 context) while the
+  self test reads zeros from *both* paths:
+  `fbo status 0x8cd5, clear+read 00 00 00 00, error 0x0` and
+  `draw linked 1, drew 00 00 00 00, error 0x0`. So it is not the RB blit engine
+  alone — nothing the shader pipeline draws reaches memory either, with no GL
+  error and no CP fault. The count-1 event writes are not the cause: a bring-up
+  probe that puts `CP_EVENT_WRITE` count 1 with `0x31` and with `0x1e` in front
+  of the canary still lets the canary and the fence land
+  (`cp memwrite … canary 0x600dc0de fence 0x600dc0df`, `cp int 0x0`).
+- **The next thing to measure is the pipeline state as a matrix**, because the
+  self test turns each knob into a yes/no: `glselftest=1` with the default
+  (GMEM, `A7XX_RB_UNKNOWN_8812(0x3ff)` "all buffers in sysmem"), with
+  `glenv=FD_MESA_DEBUG=sysmem` and with `gmem` forced, and the same three with
+  `glcopy=1` so the readback does not depend on the surface import. A green draw
+  in any cell names the state that is wrong; all-black with the submissions
+  completing points at the shader/state upload (`CP_LOAD_STATE6`,
+  `CP_IM_LOAD`) or at a render-target address the RB never sees.
 - **The same silicon has a working UI, and it is Turnip, not GL.** The other
   SM8475 port (`Chengdong-Yu/pong-adreno`, Nothing Phone 2) drives its Adreno
   730 with **Turnip through metal2vulkan**, and its notes name three things

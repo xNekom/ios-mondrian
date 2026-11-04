@@ -4418,6 +4418,53 @@ gpu_self_test(void)
 	error = glGetError();
 	say("mondrian-gl: gpu self test: fbo status 0x%x, clear+read %02x %02x %02x %02x, error 0x%x\n",
 	    status, pixel[0], pixel[1], pixel[2], pixel[3], error);
+	/*
+	 * The clear above goes through the RB blit engine. The draw below goes
+	 * through the shader pipeline, and the two fail for different reasons:
+	 * a black clear with a green draw means the engine that writes memory is
+	 * the broken half, and the other way round means the shaders are.
+	 */
+	{
+		static const char *vertex_source =
+		    "attribute vec2 p;\n"
+		    "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+		static const char *fragment_source =
+		    "void main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+		static const float vertices[] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+		GLuint vs = glCreateShader(GL_VERTEX_SHADER), fs = glCreateShader(GL_FRAGMENT_SHADER);
+		GLuint program = glCreateProgram();
+		unsigned char drawn[4] = { 0xbb, 0xbb, 0xbb, 0xbb };
+		GLint ok = 0;
+		GLenum draw_error;
+
+		while (glGetError() != 0) {
+		}
+		glShaderSource(vs, 1, &vertex_source, NULL);
+		glCompileShader(vs);
+		glShaderSource(fs, 1, &fragment_source, NULL);
+		glCompileShader(fs);
+		glAttachShader(program, vs);
+		glAttachShader(program, fs);
+		glBindAttribLocation(program, 0, "p");
+		glLinkProgram(program);
+		glGetProgramiv(program, GL_LINK_STATUS, &ok);
+		glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		glViewport(0, 0, 64, 64);
+		glUseProgram(program);
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, vertices);
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+		glReadPixels(32, 32, 1, 1, GL_BGRA, GL_UNSIGNED_BYTE, drawn);
+		draw_error = glGetError();
+		say("mondrian-gl: gpu self test: draw linked %d, drew %02x %02x %02x %02x, error 0x%x\n",
+		    (int)ok, drawn[0], drawn[1], drawn[2], drawn[3], draw_error);
+		glDisableVertexAttribArray(0);
+		glUseProgram(0);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glDeleteProgram(program);
+		glDeleteShader(vs);
+		glDeleteShader(fs);
+	}
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glDeleteFramebuffers(1, &fbo);
 	glDeleteTextures(1, &texture);
