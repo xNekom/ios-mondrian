@@ -80,7 +80,7 @@ for the A/B.
  				if (expandDrawState(buffer,
  				    cmds[i].submit_offset, dwords * 4, &ib,
  				    &expanded) == kIOReturnSuccess) {
-@@ -1101,6 +1128,146 @@
+@@ -1101,6 +1128,156 @@
  	return groups != 0 ? to : 0;
  }
  
@@ -102,15 +102,19 @@ for the A/B.
 + * in the event dword, which writes its value. This walks the stream, and the
 + * indirect buffers it chains, and sets the bit on every event write.
 + */
-+static uint64_t mondrian_uc_events = ~0ull;
++/* Off unless gpuevent= names events: see the note on the rewrite below. */
++static uint64_t mondrian_uc_events;
 +static int mondrian_uc_events_parsed;
 +
 +/*
-+ * gpuevent=<event>[,<event>...] limits the rewrite to those event numbers, in
-+ * hex as the packet carries them (1e is FD_BLIT, 31 CACHE_CLEAN); gpuevent=0
-+ * turns it off; absent, every event write gets the bit. The CP halts on some
-+ * event with WRITE_ENABLED set, so the list is how the one that does it is
-+ * found without giving up the others.
++ * gpuevent=<event>[,<event>...] or gpuevent=1: set WRITE_ENABLED on the event
++ * writes whose number is named (hex, as the packet carries it; 1e is BLIT, 31
++ * is CACHE_CLEAN). Off by default, and the default is the right one: Mesa sets
++ * WRITE_ENABLED itself for the events whose fd_gpu_event_info says needs_seqno,
++ * and deliberately does not for the ones that only signal the engine, so
++ * forcing the bit changes the meaning of those packets -- a stream that carries
++ * one parks the CP with the whole IB consumed and no fence. The knob stays for
++ * bisecting a stream by hand.
 + */
 +static bool
 +mondrian_uc_event_wanted(uint32_t event)
@@ -122,6 +126,9 @@ for the A/B.
 +		if (PE_parse_boot_argn("gpuevent", text, sizeof(text))) {
 +			const char *p = text;
 +
++			if (text[0] == '1' && text[1] == 0) {
++				mondrian_uc_events = ~0ull;
++			} else {
 +			mondrian_uc_events = 0;
 +			while (*p != 0) {
 +				uint32_t value = 0, digits = 0;
@@ -146,6 +153,7 @@ for the A/B.
 +					mondrian_uc_events |= 1ull << value;
 +				}
 +			}
++			}
 +		}
 +	}
 +	return (mondrian_uc_events &
@@ -158,6 +166,8 @@ for the A/B.
 +	(void)mondrian_uc_event_wanted(0);
 +	return mondrian_uc_events != 0;
 +}
++
++/* gpuevent=1 means "every event", which is only for a bisect. */
 +
 +IOReturn
 +MondrianGPUUserClient::rewriteEvents(mondrian_buffer *buffer, uint32_t offset,

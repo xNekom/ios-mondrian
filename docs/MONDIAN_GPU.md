@@ -441,6 +441,32 @@ them has Metal. That is the path this port follows.
   patch that drives `CP_BLIT` on a7xx (the RB blit registers the same code sets
   up are what the engine reads) or a driver-side rewrite of the `FD_BLIT` event
   into that packet.
+- **The reset of the packet reasoning: `WRITE_ENABLED` is not missing.**
+  `fd6_emit.h`'s `__event_write` sets it for exactly the events whose
+  `fd_gpu_event_info` says `needs_seqno` (`FD_RB_DONE`, `FD_CACHE_CLEAN`, the
+  `*_TS` ones) and leaves it off for the ones that only signal an engine
+  (`FD_CCU_INVALIDATE_*`, `FD_CCU_CLEAN_*`, `FD_LABEL`, `FD_BLIT`), which is
+  deliberate. The 2D path is `fd6_blitter.cc` (`CP_BLIT` with
+  `BLIT_OP_SCALE`, `FD_LABEL`, `FD_CCU_CLEAN_BLIT_CACHE`) and the resolve is
+  `RB_RESOLVE_OPERATION_TYPE(BLIT_EVENT_STORE[_AND_CLEAR])`
+  (`fd6_gmem.cc:2082`), not one event packet. So forcing the bit on the
+  signal-only events changes their meaning, which is exactly why a stream that
+  carries the rewritten ones parks this CP. `gpuevent=` is now off by default
+  and exists only to bisect.
+- **The same silicon has a working UI, and it is Turnip, not GL.** The other
+  SM8475 port (`Chengdong-Yu/pong-adreno`, Nothing Phone 2) drives its Adreno
+  730 with **Turnip through metal2vulkan**, and its notes name three things
+  this port does not do: `CP_ME_INIT` "disables unnegotiated DMS with bit11";
+  "the A730 firmware starts its BR/BV/LPAC engines before processing PM4; BR at
+  PC0xa2 waits for their THREAD_SYNC semaphore", so the SID 0/0x400/1/0x401
+  lease has to be in the *same* GPU context for all of them; and the SQE has to
+  be published as the full owned `0x13000` backing rather than the short
+  payload (their v98 failed GPU/SQE preparation with `0xe00002c2` until they
+  did). freedreno GL on an a730 is known to work elsewhere (`aaronsb/sm-x800-linux`
+  runs KDE Plasma on one with mainline `msm`; `lfdevs/mesa-for-android-container`
+  runs FD725 GL under KGSL, Mesa 25.3), and upstream CI is green for gen7 GL on
+  a750 — so the failure here is this port's command processor state (BV and the
+  thread semaphore first), not the Mesa code path.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
