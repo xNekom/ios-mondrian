@@ -394,6 +394,23 @@ them has Metal. That is the path this port follows.
   the *next* boot, not the one it was built for. The ring shows
   `MONDRIAN GLBLOB: <path> <bytes> -> 0` after the hook's lines; `-> 30` (EROFS)
   means the volume is read-only and the copy in the root is what runs.
+- **The GPU's pixels never reach memory, and `CP_EVENT_WRITE` is why.** A self
+  test at the first GL context clears a texture of the renderer's own to red and
+  reads it back (`mondrian-gl: gpu self test: fbo status 0x8cd5, clear+read 00 00
+  00 00, error 0x0` in every boot measured): the framebuffer is complete, there
+  is no GL error, and the readback is zeros. That is not CoreAnimation's state —
+  it is the GPU's output. freedreno drives the RB blit engine, which is both the
+  *clear* and the GMEM→memory *resolve*, with `CP_EVENT_WRITE(FD_BLIT)`
+  (`fd6_emit.h:308`, event 30 = `0x1e`), and cleans its caches with
+  `FD_CACHE_CLEAN` (`0x31`); this CP refuses event writes with
+  `CP_INTERRUPT_STATUS` bit 7, which is the same refusal that forced the ring
+  fence to be a `CP_MEM_WRITE` (`cpfence=mem`, `0196`). `cpapriv=0 cpprot=1`
+  does not change it. The one form that was measured to *work* in this port is
+  the fence packet of `0181`: `CP_EVENT_WRITE` with `CACHE_CLEAN|BIT(27)` in the
+  payload, which writes `0x600dc0df` — so the next experiment is a submit
+  rewrite that ORs `BIT(27)` into every event dword the way `gpunop` rewrites an
+  opcode, and the presentation paths above are only worth revisiting after that
+  lands.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
