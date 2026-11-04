@@ -1,10 +1,10 @@
 # GPU and boot time
 
 The UI renders through the GPU: the draw completes, the frame is drawn in
-place (no readback, no copy) and the display swaps it 57 times in the best
-second measured, against the 60 Hz the panel and the iPhone X mode run at. The
-wall is pacing — a frame reaches the display 8 ms after the vsync it was meant
-for — not rasterisation. The other ios-sweet ports render through
+place (no readback, no copy) and the display swaps it 57-64 times in a second,
+against the 60 Hz the panel and the iPhone X mode run at. The wall is pacing — a
+frame reaches the display 8 ms after the vsync it was meant for — not
+rasterisation. The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
 
@@ -533,18 +533,22 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **The GPU presents the UI at 57 swaps a second, and pacing is what is left.**
-  A lock-screen frame is 350 GL calls, 51 draws and 320 triangles drawn in place
-  (`0 pictures copied out`), 3.8 ms handing the commands on and 4.7 ms waiting;
-  the display swaps 57 times in the best second, and the sampler reports frames
-  arriving 8 ms *after* the vsync they were meant for (`late avg 8176 us`), so the
-  panel shows each one a refresh late instead of on time. Two measured costs:
+- **The GPU presents the UI at 57-64 swaps a second, and pacing is what is
+  left.** A lock-screen frame is 96-350 GL calls, 11-51 draws and 36-320
+  triangles drawn in place (`0 pictures copied out`), 2.9-3.8 ms of which is
+  handing the commands on and ~2-4.7 ms waiting; the display swaps up to 64
+  times in a second while the screen is touched (`touch 17/s`) and 57 on the
+  lock screen before it settles, and the sampler reports frames arriving 8 ms
+  *after* the vsync they were meant for (`late avg 8176 us`), so the panel shows
+  each one a refresh late instead of on time. Three measured costs:
   `frame_end()` calls `glFinish()` once per frame because `display_waits()`
   reports that the display driver does not wait for the submission that named the
   surface (`tools/gpu/eagl.c`, `glwait=`), which serialises the CPU behind the
-  GPU; and CoreAnimation draws only when something changes, so a still screen
-  swaps 1-4 times a second. A fence the compositor can wait on at present time is
-  the first one to remove.
+  GPU; CoreAnimation draws only when something changes, so a still screen swaps
+  1-4 times a second; and SpringBoard spends its sampling window in the
+  forced-activation poll (`SBSetupManager sharedInstance, reason forced 0` every
+  two seconds), which is where its 256-deep sample comes from. A fence the
+  compositor can wait on at present time is the first one to remove.
   The firmware blocks, the GMU context bank and the CM3 start are in
   `mondrian_gpu.c` under `gmustart=1`.
 

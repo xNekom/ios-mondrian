@@ -45,7 +45,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `SBLockdownManager` and `SBSetupManager` gates. The cmdline in
   `tools/boards.py` carries `mondrian_ui_hook=7`; the root must have
   `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
-  The UI draws through the GPU at 57 swaps a second (`docs/MONDIAN_GPU.md`).
+  The UI draws through the GPU at 57-64 swaps a second (`docs/MONDIAN_GPU.md`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
