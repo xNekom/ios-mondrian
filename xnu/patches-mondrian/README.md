@@ -27,7 +27,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0181`–`0184` | the CP path and its SMMU context (`0181`), the `MondrianGPU` user client (`0182`), the surface wrap refusal (`0183`) and the inert `mondrian_gpu_uc_*` fallback when the local CP profile is absent (`0184`) |
 | `0185`–`0202` | the submission path: the CP's SMMU ASID invalidate when the tables change (`0185`), diagnostics that survive a wedged CP (`0186`–`0188`), the GPU left stopped after a missed fence (`0191`), the draw-state expansion behind `gpunostate=1` (`0193`, `0195`), the doorbell written from its own thread and then defaulted back to inline (`0196`, `0197`), `gen7_start` + `CP_ME_INIT` behind `gpuinit=1`/`gpuinit=2` (`0198`), and the diagnostics that answer the wedged draw: `CB_FAR`/syndrome in the dump (`0199`), the latched-SMMU-fault clear plus a page-table walk for the faulting address (`0200`), and kgsl's IFPC/IB1LIST bracket, which is what lets the first draw fence (`0201`, behind `gpunomark=1`), and the submit-step markers plus `RBBM_STATUS` that say where a boot died (`0202`) |
 | `0203`–`0216` | what made the first draw complete and then stay healthy: the bracket off by default (`0203`), kgsl's ring wrap with backpressure (`0204`), the `uc enter` marker (`0205`), a 512 KiB CP page-table region (`0206`), IOVA range reuse (`0207`), no colour bars over the boot logo (`0208`), the digitizer event marked display integrated so backboardd delivers it (`0209`), the kernel log painted on the panel with a page scroll (`0210`), GPU buffers allowed above the lowest 4 GiB (`0211`), a console painter the log cannot outrun (`0212`), that painting moved off the printf path into the log thread (`0213`), the console following the newest line and reporting its rate (`0214`–`0216`), and the GPU keepalive held around every register read by default (`0215`) |
-| `0214`–`0215` | the console following the newest line (`0214`), and a boot that survives without a magic argument: the GMU keepalive raised at `cp start` and held, with `gpukeep=0` still bracketing every GPU register read (`0215`) |
+| `0217`–`0225` | the frame path: the CP's page tables covering the whole IOVA window (`0217`), the console painting every line (`0218`), more than 64 buffers a submission (`0219`), the kernel installing the CoreAnimation dylibs at boot (`0220`), writing back only the buffers the CPU touched (`0221`), a cheaper ring clean and one rptr read a lap (`0222`), the wallpaper's poster extensions getting the UI library (`0223`), the CP proving it consumed the bring-up before the ring is published (`0224`), and the ring clean keeping the low 14 bits of the 16 KiB page offset (`0225`) |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`.
@@ -42,7 +42,7 @@ tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 
 The CI **skips** a patch that does not apply and still reports success, so run
 the command above (or `tools/check-patches.sh`) before pushing. It reports
-207/207 for the current series. Two traps it catches: `git apply` rejects a hunk
+223/223 for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
 ran; `NO_STAGE=1` makes `0036` fail for that reason alone. A *cancelled* job is
@@ -51,7 +51,7 @@ reported as `failure` too.
 `tools/validate-repo.py` is stricter than `git apply`, and three of its
 findings on this series are known and harmless: the prose preamble of `0087`
 (its diff starts further down, which `git apply` accepts) and a hunk count in
-`0060`. All 207 patches apply with `git apply`; CI validates the kernel build.
+`0060`. All 223 patches apply with `git apply`; CI validates the kernel build.
 
 ## What is still missing
 

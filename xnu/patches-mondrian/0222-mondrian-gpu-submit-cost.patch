@@ -11,7 +11,9 @@ range this submission wrote is the range that has to go out:
 boundary because the next physical page is not contiguous with this one.
 `gpuringslow=1` cleans the whole ring again: the valve for a boot where the CP
 reads a ring dword the CPU never flushed, whose symptom is 0182's
-unknown-opcode halt.
+unknown-opcode halt. The offset inside the physical page has to keep the low
+14 bits (`0225`); with 0xfff it cleaned three quarters of every page where the
+first quarter was and that valve could not help either.
 
 The backpressure read. CP_RB_RPTR was read before every submission: an
 uncached round trip to the GPU, five a frame, always to learn that the ring

@@ -185,6 +185,51 @@ this port follows.
   `0x600dc0de` into the memptr page and a `CP_EVENT_WRITE` (0x46,
   `CACHE_CLEAN|BIT(27)`) fences `0x600dc0df` into the next dword; `rptr` and
   `wptr` end equal (21), the RPTR shadow follows, `CP_INTERRUPT_STATUS` 0.
+- **The switch is a no-op that parks.** Plain: `CP_SET_SECURE_MODE(0)` (ring
+  dword 10, header `0x70e60001`) never retires (`cp secmode rptr 11 wptr 12`,
+  SQE parked at ucode PC 0x649, `fault 0`, `int 0x80`), nothing after it runs,
+  and neither a full power cycle nor the retry that puts a `CP_NOP` over the
+  stalled dword changes it. The reason is in the read-back: after a successful
+  ZAP the CP is **already nonsecure** (`cp notready secure 0x0`, `trust 0x1`,
+  `sqebase 0x100000`), so its `setsecure` has nothing to switch and parks.
+  `cpnosecmode=1` skips the packet; the next one, `CP_MEM_WRITE`, then
+  executes and its canary lands.
+- **`CP_APRIV_CNTL` is what decides whether a privileged packet is refused.**
+  The SQE microcode reads `CP_APRIV_CNTL` (0x844) and mirrors it into its
+  per-pipe privileged-opcode mask (internal `0x0aa`), so with that register
+  unprogrammed a privileged packet is rejected with `CP_INTERRUPT_STATUS` bit
+  7 (`CP_ILLEGAL_INSTR_ERROR`) while `CP_HW_FAULT` stays 0. Vendor
+  `gen7_start` and mainline set `0x4f`, `CP_BV_APRIV_CNTL` `0x0f`,
+  `CP_LPAC_APRIV_CNTL` `0x0f` and `CP_LPAC_PROTECT_CNTL` `0x0b` before the
+  ring/SQE bases; the ZAP resets the block, so they have to be written again
+  after it and before `CP_ME_INIT`, which therefore has to be re-published
+  (`cp meinit rptr 10 of 10`). `cpapriv=0` restores the old path. APRIV alone
+  does not make every privileged packet legal: with it programmed and the CP
+  nonsecure, `CP_EVENT_WRITE` with event `0x31` (`CACHE_CLEAN`) is still
+  refused, so the event type matters on its own.
+- **The protected-mode bracket is not a substitute, and not in the frame.**
+  On a7xx neither kgsl ("all submissions run with protected mode off due to
+  APRIV") nor mainline emits `CP_SET_PROTECTED_MODE` per submission, and
+  ending a bracket with `(1)` leaves protection *on* for whatever follows;
+  payload 0 leaves protected mode, 1 enters it. With `cpapriv` on, a frame
+  carries no `0x5f` and the first submission prints `uc frame no
+  protected-mode packet`; `cpprot` then only reaches a `cpapriv=0` boot, which
+  restores both halves.
+- **`cp notready secure 0x%x apriv 0x%x cp2gmu 0x%x tsb 0x%x/0x%x`** follows a
+  failed bring-up: `CP_SECURE_MODE`, the APRIV read-back, the CP's GMU status
+  and the secure TSB status pair. A non-zero `tsb` means the secure fetch does
+  not validate, `apriv` back at 0 means the block was reset again after the
+  re-arm, and a non-zero `secure` means the switch really did not happen.
+- **`gpureset=1` (GMU HFI power off/on) is not a usable reset.** Both acks
+  return 1 and the CP does go back to `rptr 0`, but it then stops on
+  `CP_ME_INIT` itself (`cp meinit stuck rptr 0 of 10`, header `0x70c80007`,
+  ucode PC 0x10e): coming back from a collapse needs the vendor's power-up
+  sequence, not just a republished ring and SQE base.
+- **`cp notready detail`** prints what separates a hang from a fault: SQE
+  status pops 2-3, `trust`, `sqebase`, `rptr`/`wptr`, `sqecntl`, `hw fault`,
+  `CP_INTERRUPT_STATUS`, `RBBM_STATUS3` and CPU copies of ring dwords 8-13.
+  `fault 0`, `rbbm3 0` and `int 0x80` on a stalled packet mean no bus or
+  fetch error: the microcode is waiting, not lost.
 - **SMMU context**: pong's qualified image for this chip, `sctlr` 0x127 and a
   write-back inner-shareable walk (`0x3500`); the earlier `0x1027` kept
   ASIDPNE and had fault reporting off, which is why the faults below were
@@ -203,6 +248,15 @@ this port follows.
   before writing at the start. Measured with 2000 back-to-back submissions:
   183 refused before the fix, 0 after it, with the last canary and fence
   exactly the ones the last submission asked for.
+- **A clean publishes what was written, in the page's own offset.** With 16 KiB
+  pages (`__ARM_16K_PG__`) the offset inside a physical page is the low 14 bits;
+  a clean that masked it with 0xfff cleans the first 4 KiB of a page for every
+  quarter of it. Measured (`0222`): the CP stopped dead at ring dword 0x400, the
+  first dword of the second quarter, and `uc room poll` spun on `rptr 0x403 room
+  18` for the rest of the boot while a thousand submissions piled up behind it.
+  The rptr read after the wrap looked a kilobyte ahead of the writer, so the ring
+  only "filled" a lap later. `0225` restores 0x3fff; a boot that stops consuming
+  with `rptr` frozen just past a 4 KiB boundary is a clean, not the CP.
 - **Back-to-back submissions work.** Two `mondrian_gpu_uc_submit` calls in a
   row (the exact call the user client makes) return fences 1 and 2, both
   waits complete, both canaries and both fence dwords land: ring advance,
@@ -308,9 +362,11 @@ this port follows.
   noaccess << 31`, e.g. `0x13fc0000` is start 0 count 0x4ff and `0x0160050b`
   is start 0x50b count 0x58, ending at 0x563), and `CP_PROTECT_CNTL` is the
   vendor's 0xb.
-- **Protected mode matters.** With `CP_PROTECT_CNTL` enabled and no way out,
-  Mesa's type-4 register writes are refused; kgsl brackets a submission with
-  `CP_SET_PROTECTED_MODE(0)` … `(1)` for that reason and our frame does too.
+- **Protected mode matters, and the frame does not enter it.** With
+  `CP_PROTECT_CNTL` enabled and no way out, Mesa's type-4 register writes are
+  refused, which is what kgsl brackets a submission for; kgsl still runs every
+  submission with protected mode off, and with `cpapriv` on our frame carries
+  no `CP_SET_PROTECTED_MODE` at all.
 - **An Xcode update silently breaks both build trees.** The Mesa cross file
   (`out/mesa/cross.ini`) bakes the absolute SDK path, so once Xcode replaces
   `iPhoneOS27.1.sdk` with `27.2` every compile fails with "`time.h` not found".

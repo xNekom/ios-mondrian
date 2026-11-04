@@ -1,0 +1,55 @@
+xnu 0225: the ring clean keeps the low 14 bits of the page offset
+
+A boot that reached the GL driver wedged with the CP stopped at ring dword
+0x400. `uc room poll` spun on `rptr 0x403 room 18` for the rest of the boot,
+the CP had consumed nothing for a thousand submissions, and the ring filled.
+0x400 is byte 0x1000 of the ring: the first dword of the second 4 KiB of the
+ring's 16 KiB page.
+
+`0222`'s range clean computed the offset inside the physical page with
+`(m->va + off) & 0xfff`. This kernel's page is 16 KiB (`__ARM_16K_PG__`,
+`ARM_PGSHIFT` 14, the machine config of `0001`), so the offset in the page is
+the low 14 bits; masking it with 0xfff cleaned the first 4 KiB of a page for
+every 4 KiB of it. Three quarters of every buffer never reached DRAM, so the CP
+read what was there from the previous lap and stopped. `0222`'s whole-ring
+`gpuringslow=1` valve carried the same mask, so it did not cover this either.
+The flush that takes a physical address in the same file already used 0x3fff.
+
+The 4 KiB split stays: it only has to keep one flush inside one page, because
+`pmap_find_phys` is asked per page and the next 4 KiB need not be contiguous in
+DRAM. Only the mask changes.
+
+what the next boot has to show
+	MONDRIAN GPU: uc room at 0x... rptr 0x... reads 1
+	    the pointer read once a lap, and the ring getting past dword 0x400
+	    without a `uc room poll` spin; a boot that stops there again means
+	    a second unflushed dword, not this mask.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -909,6 +909,17 @@
+ 	if (end > m->bytes) {
+ 		end = m->bytes;
+ 	}
++	/*
++	 * The offset inside the physical page is the low 14 bits, not the low
++	 * 12: this kernel's page is 16 KiB (__ARM_16K_PG__, ARM_PGSHIFT 14).
++	 * Masking it with 0xfff cleaned the first 4 KiB of a page for every
++	 * 4 KiB of it, so the second to fourth quarter of every page never
++	 * reached DRAM (measured: the CP stopped on the first ring dword in the
++	 * second quarter, dword 0x400, and every boot that wrote that far
++	 * wedged in the room test). 0x3fff is the mask the buffer flush below
++	 * already used; the 4 KiB split only has to keep one flush inside one
++	 * page.
++	 */
+ 	while (off < end) {
+ 		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(m->va + off));
+ 		/* Never across a page: the next one is not contiguous in DRAM. */
+@@ -919,7 +930,7 @@
+ 		}
+ 		if (pn != 0) {
+ 			flush_dcache64((addr64_t)(ptoa_64(pn) +
+-			    ((m->va + off) & 0xfffu)), len, TRUE);
++			    ((m->va + off) & 0x3fffu)), len, TRUE);
+ 		}
+ 		off += len;
+ 	}
