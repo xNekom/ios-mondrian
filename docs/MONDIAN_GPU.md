@@ -441,18 +441,33 @@ them has Metal. That is the path this port follows.
   patch that drives `CP_BLIT` on a7xx (the RB blit registers the same code sets
   up are what the engine reads) or a driver-side rewrite of the `FD_BLIT` event
   into that packet.
-- **The reset of the packet reasoning: `WRITE_ENABLED` is not missing.**
-  `fd6_emit.h`'s `__event_write` sets it for exactly the events whose
-  `fd_gpu_event_info` says `needs_seqno` (`FD_RB_DONE`, `FD_CACHE_CLEAN`, the
-  `*_TS` ones) and leaves it off for the ones that only signal an engine
-  (`FD_CCU_INVALIDATE_*`, `FD_CCU_CLEAN_*`, `FD_LABEL`, `FD_BLIT`), which is
-  deliberate. The 2D path is `fd6_blitter.cc` (`CP_BLIT` with
-  `BLIT_OP_SCALE`, `FD_LABEL`, `FD_CCU_CLEAN_BLIT_CACHE`) and the resolve is
-  `RB_RESOLVE_OPERATION_TYPE(BLIT_EVENT_STORE[_AND_CLEAR])`
-  (`fd6_gmem.cc:2082`), not one event packet. So forcing the bit on the
-  signal-only events changes their meaning, which is exactly why a stream that
-  carries the rewritten ones parks this CP. `gpuevent=` is now off by default
-  and exists only to bisect.
+- **The `BIT(27)` rewrite desynchronises the stream; count-1 events are legal.**
+  The a730 handler for `0x46` (`sqe-a730.asm:810`, opcode `0x46` dispatch at
+  `0x1a64` in the vendor build) takes an explicit no-write path when
+  `WRITE_ENABLED` is clear: `brne $0a, b27, #...` and it reads *zero* dwords past
+  the event word. With the bit set it always consumes the 64-bit address and
+  then a payload dword chosen by `WRITE_SRC`, with no `$rem` guard — so on a
+  count-1 packet it eats the following headers, the rest of the IB runs as
+  garbage and nothing is written. That is the measured stall: `pc 0x2f8` is not
+  an event handler but `CP_WAIT_REG_MEM`'s sixth payload read
+  (`0x2e4`-`0x3ac`, `0x2f8` = `ubfx $04, $data, b0, b16`) with `rem 0x0`, i.e.
+  the SQE waiting for a word that never comes, `int 0` and `fault 0`. The legal
+  shapes are the ones Mesa already emits (`fd6_emit.h`): event + `WRITE_ENABLED`
+  clear and count 1 for a pure flush/invalidate/resolve; count 4
+  (`EV_WRITE_USER_32B` + `EV_DST_RAM`) with the bit for a fence; count 2 for the
+  on-chip timestamp sum. The vendor driver for this exact phone emits the
+  count-1 form in every submission (`adreno_gen7_ringbuffer.c`:
+  `cp_type7_packet(CP_EVENT_WRITE, 1)` + `0x31`, and `24`/`25` for the CCU
+  invalidates), so the count-1 packet was never the problem; `0228`'s rewrite is
+  off by default and is only a bisect tool.
+- **The black clear is resolve state, not the packet.** `FD_BLIT` (`0x1e`) is
+  only the trigger: what writes the tile out of the CCU/GMEM is the a7xx resolve
+  state programmed in the same stream (`RB_CCU_CNTL`, `RB_RESOLVE_*`, the GMEM
+  base and mode), so a correctly executed `0x1e` with that state missing also
+  reads back as zeros. The self test says exactly that: the stream completes,
+  `int 0`, `fault 0`, and the readback is zeros. The next thing to compare is
+  that state against `fd6_emit.cc`'s `fd6_emit_common_init`/`fd6_emit_tile_init`
+  and against the vendor's gen7 init, not more packet archaeology.
 - **The same silicon has a working UI, and it is Turnip, not GL.** The other
   SM8475 port (`Chengdong-Yu/pong-adreno`, Nothing Phone 2) drives its Adreno
   730 with **Turnip through metal2vulkan**, and its notes name three things
@@ -472,22 +487,23 @@ them has Metal. That is the path this port follows.
   passes it — the streams execute. `CP_ME_INIT` already carries kgsl's DMS bit
   (`0x14b | BIT(11)`) and the four stream slots are leased in one bank. What is
   left to prove, in this order:
-  1. **Can this CP move pixels out of the 2D engine at all?** `CP_BLIT` writes
-     into the CCU, not into memory (`fd6_blitter.cc:1185`: "CP_BLIT writes to
-     the CCU, unlike CP_EVENT_WRITE::BLIT which writes to [memory]"), so the
-     probe is `CP_BLIT` (`BLIT_OP_COPY`, 1:1 rects) into a small linear buffer
-     followed by `CCU_CLEAN_COLOR` (a `needs_seqno` event, which this CP does
-     accept with `WRITE_ENABLED`), then read the destination back. Bytes there
-     mean the engine and the clean both work and only the `BLIT` event's
-     memory write is missing; that is a Mesa question in `emit_blit()`
-     (`fd6_gmem.cc`), not a bring-up one.
-  2. If nothing moves, the engine is not running on this CP and the next place
-     to look is per-engine state (`CP_MODE`, `RB_MODE`, the restore list,
-     `CP_SET_AMBLE`), not the packet encodings.
+  1. **Compare the resolve state, not the packets.** `fd6_emit_common_init` /
+     `fd6_emit_tile_init` (`a6xx/fd6_emit.cc`, `fd6_gmem.cc`) program
+     `RB_CCU_CNTL`, the GMEM base/mode and `RB_RESOLVE_OPERATION_TYPE`; the
+     vendor's gen7 init has the same block. Dump what our streams carry for those
+     registers (the pm4 dumps already show them: `4888xxxx` writes) and compare
+     against what a working a730 run uses — the value
+     `A7XX_RB_UNKNOWN_8812(0x3ff)` ("all buffers in sysmem") in
+     `fd6_emit_common_init` is the first one to question.
+  2. **A ring-level probe of the trigger.** Append `70460001 0000001e`, a
+     `CP_NOP` and a `CP_EVENT_WRITE` fence (`70460004 08000004 <addr> <seqno>`) to
+     the ring after `CP_ME_INIT` and read `CP_INTERRUPT_STATUS`: on this firmware
+     that must complete with `int 0`, `fault 0` and the fence in memory. If bit 7
+     appears there, the difference is CP init/APRIV state rather than the packet.
   3. The proven path for a fluid UI on this exact silicon is Turnip
      (`pong-adreno`, Nothing Phone 2, "desktop rendering"), which for a
      CoreAnimation GLES client means GL on top of it (zink) or metal2vulkan as
-     Pong does it — a much larger change than the two probes above.
+     Pong does it — a much larger change than the probes above.
 - **The a7xx CP has two threads and the kernel must pin one.** BR (render) and
   BV (visibility) share the ring. Mesa GL emits
   `CP_THREAD_CONTROL(BR|CONCURRENT_BIN_DISABLE)` for a7xx and our submit frame
