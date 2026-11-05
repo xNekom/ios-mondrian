@@ -1,0 +1,113 @@
+xnu 0251: time a submission, and how much of it is the buffer writeback
+
+The frame line's "handing on" is glFlush(), which is Mesa's work plus one call
+into this driver, and it ranged from 0.4 ms to 921 ms across the frames of one
+boot with no draw count to explain it: a 202-call frame cost 17.8 ms while a
+1159-call one cost 22.5 ms, so the cost is per submission, not per call. What
+this side of the boundary can measure is which part of a submission it is, and
+the writeback of the buffers the CPU may have written is the largest candidate
+(a frame submits the 23 MB display surface, 4500 pages of getPhysicalSegment
+and flush_dcache64).
+
+gpusubtime=1 logs one line a submission: the time the whole client call took,
+the slice the CPU-side writeback (bufferSync) took, how many client calls
+arrived since the submission before, how many buffers were written back and
+how many bytes, the commands and the fence. Next to the frame's own line it
+says whether a slow frame is waiting on the writeback, on the ring, or on
+Mesa, without a bisect. Off unless the boot argument asks for it.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -245,8 +245,30 @@
+ 	bool f2dFaultDone;          /* the unmapped-destination blit ran */
+ 	bool f2dBigDone;            /* the oversized blit ran */
+ 	uint32_t fSyncLogged;
++	uint32_t fEntries;          /* gpusubtime=1: client calls since the last submission */
++	uint32_t fSubmitLogged;
+ };
+ 
++/*
++ * gpusubtime=1: one line a submission with the time the whole call took, the
++ * slice of it the CPU-side writeback (bufferSync) took, how many client calls
++ * arrived since the submission before, and how much memory was written back.
++ * The frame line's "handing on" is glFlush(), which is this function plus
++ * Mesa's own work in the process; this says which of the two is the frame.
++ */
++static bool
++mondrian_sub_time(void)
++{
++	static int parsed;
++	static int on;
++
++	if (parsed == 0) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("gpusubtime", &on, sizeof(on));
++	}
++	return on != 0;
++}
++
+ class MondrianGPU : public IOService
+ {
+ 	OSDeclareDefaultStructors(MondrianGPU);
+@@ -351,6 +373,8 @@
+ 	fEventTotal = 0;
+ 	fPrepLogged = 0;
+ 	fSyncLogged = 0;
++	fEntries = 0;
++	fSubmitLogged = 0;
+ 	fSyncAll = mondrian_sync_all();
+ 	fSurfaceLogged = 0;
+ 	f2dFillDone = false;
+@@ -1292,6 +1316,8 @@
+ 	IOReturn result = kIOReturnSuccess;
+ 	uint32_t cmd_bytes, bo_bytes;
+ 	uint64_t syncStart, syncedBytes = 0, heldBytes = 0;
++	uint64_t submitStart = mach_absolute_time(), syncUsed = 0;
++	uint32_t entries;
+ 	uint32_t synced = 0, held = 0;
+ 
+ 	if (request->nr_bos > kMondrianSubmits || request->nr_cmds == 0 ||
+@@ -1464,12 +1490,13 @@
+ 	 * are logged, so a device log answers "did the writeback shrink" (and,
+ 	 * against the frame line's "waiting", "by how much") without a bisect.
+ 	 */
++	entries = fEntries;
++	fEntries = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - syncStart, &syncUsed);
+ 	if (fSyncLogged < 4) {
+-		uint64_t used = 0;
++		uint64_t used = syncUsed;
+ 
+ 		fSyncLogged++;
+-		absolutetime_to_nanoseconds(mach_absolute_time() - syncStart,
+-		    &used);
+ 		if (fSyncAll) {
+ 			IOLog("MondrianGPU: gpusyncall=1: wrote back all %u "
+ 			    "buffers (%llu KiB) in %llu us\n", synced,
+@@ -1655,6 +1682,19 @@
+ 			run2dBig();
+ 		}
+ 	}
++	if (mondrian_sub_time()) {
++		uint64_t total = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - submitStart,
++		    &total);
++		IOLog("MondrianGPU: submit %u %s: %llu us (sync %llu us), "
++		    "entries %u, bos %u synced %u (%llu KiB), cmds %u, "
++		    "fence %u\n", ++fSubmitLogged,
++		    result == kIOReturnSuccess ? "ok" : "refused",
++		    total / 1000, syncUsed / 1000, entries, request->nr_bos,
++		    synced, (unsigned long long)(syncedBytes >> 10),
++		    request->nr_cmds, fence);
++	}
+ 	IOFreeData(cmds, cmd_bytes);
+ 	IOFreeData(bos, bo_bytes);
+ 	return result;
+@@ -2133,6 +2173,7 @@
+ 	(void)dispatch;
+ 	(void)target;
+ 	(void)reference;
++	fEntries++;
+ 	if (arguments->structureInput == NULL || size > sizeof(request)) {
+ 		return kIOReturnBadArgument;
+ 	}

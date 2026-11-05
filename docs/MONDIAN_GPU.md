@@ -774,11 +774,15 @@ them has Metal. That is the path this port follows.
   with a full-screen `a 0,0 1440x3200` rect. What is on the panel is the content
   of that surface, and the draws that fill it now run on the GPU: the lock
   screen's first frames are `136 GL calls, 4 draws, 8 triangles` and later
-  `316 GL calls, 44 draws, 228 triangles`. The wallpaper and some text are still
-  white blocks because a texture upload fails (`glDrawElements: 0x502`
-  eighteen times and `glTexImage2D: 0x505` in one boot; `0x502` is
-  `GL_INVALID_OPERATION`, `0x505` is `GL_OUT_OF_MEMORY`). Do not read the
-  picture as a geometry or a GPU bug.
+  `316 GL calls, 44 draws, 228 triangles`, with the clock's glyphs white and in
+  place. The wallpaper is black because nothing ever draws it: CollectionsPoster
+  makes the poster surface (`MONDRIAN SURF: CollectionsPoster create id 11
+  1326x1326 fmt 0x4c303038`) and is then killed by the scene-create watchdog
+  (`CRASH CollectionsPoste reason ns 10 code 0x8badf00d: ... scene-create
+  watchdog transgression`) before it fills it, so the panel shows that
+  surface's memory: zeros give the black wallpaper, and `gpusurfpat=1`, which
+  fills a fresh surface with `0xffffffff`, gives the white one the port used to
+  report as a texture-upload failure. Geometry is not the fault line.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
@@ -786,24 +790,21 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **The GPU presents the UI at 57-64 swaps a second, and pacing is what is
-  left.** A lock-screen frame is 96-350 GL calls, 11-51 draws and 36-320
-  triangles drawn in place (`0 pictures copied out`), 2.9-3.8 ms of which is
-  handing the commands on and ~2-4.7 ms waiting; the display swaps up to 64
-  times in a second while the screen is touched (`touch 17/s`) and 57 on the
-  lock screen before it settles, and the sampler reports frames arriving 8 ms
-  *after* the vsync they were meant for (`late avg 8176 us`), so the panel shows
-  each one a refresh late instead of on time. Three measured costs:
-  `frame_end()` calls `glFinish()` once per frame because `display_waits()`
-  reports that the display driver does not wait for the submission that named the
-  surface (`tools/gpu/eagl.c`, `glwait=`), which serialises the CPU behind the
-  GPU; CoreAnimation draws only when something changes, so a still screen swaps
-  1-4 times a second; and SpringBoard spends its sampling window in the
-  forced-activation poll (`SBSetupManager sharedInstance, reason forced 0` every
-  two seconds), which is where its 256-deep sample comes from. A fence the
-  compositor can wait on at present time is the first one to remove.
-  The firmware blocks, the GMU context bank and the CM3 start are in
-  `mondrian_gpu.c` under `gmustart=1`.
+- **A lock-screen frame costs its submissions, not its draws.** Measured with
+  the secure-mode switch on and the compositor drawing through the GPU: `0
+  pictures copied out, 1 drawn in place`, 25-47 draws and 182-1122 GL calls a
+  frame, fps peaking at 22 while the screen is touched and falling to 0 when it
+  is still (CoreAnimation draws on change, so a still screen asks for no frame),
+  the panel copy 2-6 ms and `late avg` 8-17 ms. Inside a frame `glFlush`
+  ranged 0.4-921 ms, and a 202-call frame cost 17.8 ms while a 1159-call one
+  cost 22.5 ms, so the time is per submission and not per call: `gpusubtime=1`
+  (`0251`) writes one line a submission with the writeback slice, the client
+  calls since the last one and the bytes written back. The sub-case that can
+  block for a second is the ring: `mondrian_gpu_uc_submit` waits for CP room in
+  1 ms steps and gives up after 2 s, and every process that opens a
+  `MondrianGPU` client submits to the same ring while each client only takes
+  its own `fLock`. The firmware blocks, the GMU context bank and the CM3 start
+  are in `mondrian_gpu.c` under `gmustart=1`.
 - **The present path is the GPU's, measured on the secure-mode boot.** With
   `glcopy=1` a frame is `1 picture copied out` at ~11 ms; with `glcopy=0
   glwait=0` the same boot reports `0 pictures copied out, 1 drawn in place`,
