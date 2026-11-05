@@ -46,6 +46,18 @@ phone_android() {
 
 if [ "$WAIT_ONLY" = 0 ]; then
 	[ -f "$IMAGE" ] || { echo "no hay imagen en $IMAGE" >&2; exit 1; }
+	# ABL spends one retry per boot and the port's kernel never marks a boot
+	# successful, so the active slot runs out and ABL then refuses every image
+	# ("Failed to load/authenticate boot image: Not Found"). Re-activating the
+	# slot resets the budget and writes no partition.
+	slot=$(fastboot -s "$PHONE_SERIAL" getvar current-slot 2>&1 | tr -d '\r' |
+		sed -n 's/^current-slot: *//p')
+	if [ -n "$slot" ] &&
+	   [ "$(fastboot -s "$PHONE_SERIAL" getvar "slot-unbootable:$slot" 2>&1 |
+		tr -d '\r' | sed -n "s/^slot-unbootable:$slot: *//p")" = yes ]; then
+		echo "== slot $slot no arrancable: fastboot set_active $slot"
+		fastboot -s "$PHONE_SERIAL" set_active "$slot" >/dev/null
+	fi
 	echo "== arrancando $IMAGE (fastboot boot, no escribe nada)"
 	( fastboot -s "$PHONE_SERIAL" boot "$IMAGE" > /tmp/fb-boot.txt 2>&1 ) &
 	pid=$!

@@ -185,26 +185,26 @@ tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
-# `boot_b` carries the kernel the kernel-less `recovery` ramdisk (OrangeFox) is
-# paired with: write `backup/boot_b-as-found.img` back before `fastboot reboot
-# recovery`; `fastboot boot` is refused on this phone.
+# boot_b pairs with the kernel-less `recovery` ramdisk: put
+# backup/boot_b-as-found.img back before `fastboot reboot recovery`. A refused
+# boot is usually the slot's spent retry budget: `fastboot set_active b`.
 tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
 sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
 python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 ```
 
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
-existing `.simg` when handed the `.img`, so make the sparse file again by hand.
+existing `.simg`, so remake the sparse file by hand.
 
 A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
-(volatile proof of the same image, `fastboot getvar current-slot`, verified
-backup, write, read back). To read the kernel log, boot the viewer shim: it
-reads the ring out of `userdata`, prints the last screenful and writes nothing.
-With a recovery that has adb, `tools/ios-log-pull.sh` reads the same area.
+(volatile proof, `fastboot getvar current-slot`, verified backup, read back).
+`tools/phone-log.sh` boots an image and decodes the ring through the recovery;
+`tools/phone-deploy.sh logview` prints the last screenful on the panel instead.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1
 fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
+tools/phone-log.sh /tmp/boot-mondrian.img ring.txt
 ```
 
 ## Repository layout

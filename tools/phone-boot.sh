@@ -34,6 +34,23 @@ if [ ! -f "$IMAGE" ]; then
 	bash tools/phone-deploy.sh build
 fi
 
+# The A/B retry budget belongs to the bootloader: it takes one attempt per
+# boot and the port's kernel never reports a boot as successful, so after
+# seven tries ABL marks the active slot unbootable. It then refuses *every*
+# boot image -- the stock recovery included -- with "Failed to load/
+# authenticate boot image: Not Found", which reads like a bad image and is
+# not. Activating the slot again resets the flag and the budget; it writes no
+# partition.
+slot=$(fastboot getvar current-slot 2>&1 | tr -d '\r' | sed -n 's/^current-slot: *//p')
+if [ -n "$slot" ]; then
+	unbootable=$(fastboot getvar "slot-unbootable:$slot" 2>&1 | tr -d '\r' |
+		sed -n "s/^slot-unbootable:$slot: *//p")
+	if [ "$unbootable" = yes ]; then
+		echo "== slot $slot marcado no arrancable: fastboot set_active $slot"
+		fastboot set_active "$slot" >/dev/null
+	fi
+fi
+
 echo "== arrancando $IMAGE (fastboot boot, no escribe nada)"
 ( fastboot boot "$IMAGE" > /tmp/fb-boot.txt 2>&1 ) &
 pid=$!
@@ -43,4 +60,8 @@ for _ in $(seq 1 45); do
 done
 kill -9 $pid 2>/dev/null || true
 cat /tmp/fb-boot.txt
+if grep -q 'Failed to load/authenticate boot image' /tmp/fb-boot.txt; then
+	echo "== ABL rechaza la imagen: el slot casi seguro volvio a agotar sus" >&2
+	echo "   reintentos; 'fastboot set_active $slot' lo rearma y no escribe nada." >&2
+fi
 echo "== el movil deberia mostrar la consola del shim y la del kernel"

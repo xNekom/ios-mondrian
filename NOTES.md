@@ -10,14 +10,30 @@ learn; the work list, the hardware delta and the partition rules are in
 `docs/MONDIAN_PORT.md`. The upstream `sweet` port is the reference
 implementation and is not re-described here: `xnu/patches/` is its record.
 
-## State (2026-10-28)
+## State (2026-11-05)
 
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   kernel console draws into the splash framebuffer the ABL leaves at
   **0xB8000000** (1440x3200, stride 5760). Build the shim with `SMALL_SHIM=1`
-  (`tools/phone-deploy.sh` does): the full shim's `test_gic()` storms and
-  never jumps, so the phone shows IRQ lines and no kernel.
+  (`tools/phone-deploy.sh` does): the full shim's `test_gic()` storms, so the
+  phone shows IRQ lines and no kernel.
+- **Two loader modes, and the slot budget that blames the image.** `fastboot
+  devices` answers in the bootloader's own fastboot (power + volume down),
+  which accepts `fastboot boot`, and in **fastbootd**, which the kernel's reset
+  selects (`0133` writes the BCB command `boot-fastboot`) and which answers
+  `Unrecognized command boot`. Separately, ABL spends one retry per boot and
+  the port never reports a boot as successful, so after seven the slot reads
+  `slot-unbootable:b:yes` and ABL refuses *every* image, the stock signed one
+  included, with `Failed to load/authenticate boot image: Not Found` — the
+  slot's state, not the image. `fastboot set_active b` resets flag and budget
+  and writes no partition; `fastboot reboot recovery` leaves either loader
+  mode for the recovery, the only place adb lives (`tools/phone-log.sh` walks
+  the three states of one boot).
+- **A hand-built image is not the deployed image.** `tools/phone-deploy.sh
+  build` is the only recipe to copy: `DTB=` picks the boot image header, the
+  payload takes a ramdisk, and the command line carries `mondriantime` — an
+  image assembled by hand differs in all three.
 - **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
   shim, payload and kernel all run the granule iOS is built for:
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
@@ -39,25 +55,23 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The lock screen draws. CoreAnimation needs
   `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
-  waits 30 s and draws nothing); `0114` publishes them and it runs. SpringBoard
-  waits on MobileActivation in `_setupActivationState`;
-  the dylib forces activation and skips Setup, including the
-  `SBLockdownManager` and `SBSetupManager` gates. The cmdline in
-  `tools/boards.py` carries `mondrian_ui_hook=7`; the root must have
-  `/usr/libexec/mondrian-ui-hook.dylib`, or the boot sits at the Apple logo.
-  The UI draws through the GPU at 57-64 swaps a second (`docs/MONDIAN_GPU.md`).
+  waits 30 s and draws nothing); `0114` publishes them. SpringBoard waits on
+  MobileActivation in `_setupActivationState`; the dylib forces activation and
+  skips Setup, including the `SBLockdownManager` and `SBSetupManager` gates.
+  The cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root
+  must have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the
+  Apple logo. GPU pixel correctness and fluidity are not established
+  (`docs/MONDIAN_GPU.md`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **La GPU no escribe memoria; la vía del CP sí.** La UI corre (stream CP
-   completo, sin fallos, un contexto FD725, sin `submissions refused`) pero
-   clear, upload de estado (`CP_LOAD_STATE6`) y draws leen negro:
-   `docs/MONDIAN_GPU.md`. Es la clase de fallo "las escrituras del camino
-   render no aterrizan" — SMMU/ruta/CCU, no un paquete. Siguiente: la ruta de
-   stream y el estado de CCU/RB contra los del vendor (pong/NothingOSS).
-   Touch works (`0153`, its 220 KB firmware is 8 s of bit-bang SPI, `0156`).
+1. **GPU rendering is not yet pixel-correct or fluid.** The CP bring-up,
+   canary and fence work; the FD725 self-tests read black for clear, texel
+   upload and draw, while a kernel probe of the display surface once read an
+   opaque-black clear, so the readback is suspect too. Next: the shared-surface
+   path and the readback (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
@@ -197,22 +211,19 @@ address space the device is mapped nowhere and the next read is a bus abort
 `0062` keeps a reserved low-global alias for it.
 
 **`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** The touch command
-DB (128 KiB) and RSC (64 KiB) were re-mapped per cmd-db lookup and rail vote;
-the GPU power tables added dozens and the next `kmem_alloc(..., 131072,
-KMA_NOFAIL)` panicked in `io_map`. Map a window once (`0179`).
+DB (128 KiB) and RSC (64 KiB) were re-mapped per cmd-db lookup and rail vote,
+and the next `kmem_alloc(..., 131072, KMA_NOFAIL)` panicked in `io_map`. Map a
+window once (`0179`).
 
 **Never free the panel's memory.** The ABL leaves MDP → DSC → DSI scanning a
 reserved buffer, so a linear framebuffer exists — but the boot arguments
-describe the whole window as RAM. The frames must be initialized and then
-kept off the free list (`mondrian_page_is_screen()` in `pmap_startup()`).
-Stepping `pmap_next_page()` over the hole instead breaks the invariant that a
-page's physical address is derived from its *index* in `vm_pages`
-(`ppnum == VM_PAGE_GET_PHYS_PAGE(m)` assert in `vm_page_init`).
+describe the whole window as RAM. The frames must be initialized and then kept
+off the free list (`mondrian_page_is_screen()` in `pmap_startup()`); stepping
+`pmap_next_page()` over the hole breaks `vm_page_init`'s `ppnum == index` assert.
 
 **Contiguous memory comes in small runs.** With 4 KiB pages
-`kmem_alloc_contig(1 MiB)` never returned (256 pages); 128 KiB (36 pages)
-did. Size descriptors and bounce buffers to what the zone map can give — the
-UFS host asks for 144 KiB (nine 16 KiB pages) and gets it.
+`kmem_alloc_contig(1 MiB)` never returned (256 pages); 128 KiB (36 pages) did.
+Size descriptors to what the zone map can give (the UFS host asks for 144 KiB).
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels
@@ -263,22 +274,10 @@ everything for 0x5a and 0x60.
 ## UFS bring-up, the sequence that works
 
 UFS 3.1 host at `0x1d84000`; the sweet driver's register names still exist but
-the UTRD is 16 dwords and the PRDT entries are 64-bit. What the working boot
-does:
-
-1. power the GCC branch for the host (`0x870`: BCR `0x87000`, AXI `0x87018`,
-   AHB `0x87020`, UniPro `0x87064`, ICE `0x8706c`, PHY_AUX `0x870a4`,
-   AGGRE `0x870d4`) — without it every register reads 0 and `HCE` does not
-   stick;
-2. take over the transfer list at a bounce buffer and verify the readback
-   before ringing a doorbell; stop the list and wait before changing its base;
-3. `hce 0x1 hcs 0x10f cap 0x1587031f ver 0x300`;
-4. the device answers NOP OUT/IN but every LU is NOT READY with power mode
-   `0x33` (PowerDown). Wake it with READ ATTRIBUTE `bCurrentPowerMode`, then
-   **START STOP UNIT with power condition ACTIVE (CDB byte 4 = 0x10) on the
-   UFS device well-known LUN `0xd0`**, then poll TUR on LUN 0. Power mode goes
-   to `0x11`. Do not restart the link; the firmware state is adopted;
-5. GPT header at LBA 2, `EFI PART`, `userdata` found, `BSD root: ufsroot0`.
+the UTRD is 16 dwords and the PRDT entries are 64-bit. The sequence that wakes
+it — GCC branch, transfer-list takeover, `hce 0x1 hcs 0x10f`, START STOP UNIT
+active on the well-known LUN `0xd0`, then TUR on LUN 0 — is in the
+`mondrian-ufs-debug` skill.
 
 Wait loops are spin counts, not `delay()`: the timer interrupt was not
 delivered when this was written, and a wait that never completes has to be
