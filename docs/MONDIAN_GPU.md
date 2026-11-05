@@ -483,19 +483,19 @@ them has Metal. That is the path this port follows.
   completing points at the shader/state upload (`CP_LOAD_STATE6`,
   `CP_IM_LOAD`) or at a render-target address the RB never sees.
 - **The SP warm-up kernel: the last unfilled piece of the pipeline, and it
-  belongs in Mesa's stream.** Mesa 25.0.7 has the a725/a730 `cmdbuf_start_a725_quirk`
-  in Turnip's path (`tu_init_cmdbuf_start_a725_quirk`: a multiply over the whole
-  shader array, 12 groups of 255 waves, the register writes that aim it, and
-  `CP_EXEC_CS`, whose comment says "It is unknown what this workaround is for
-  and what it fixes") — the GL build does not, and on this BringUp's a730 with
-  vendor 01730158 firmware, the pipeline draws nothing to memory without it:
-  `0229` builds the same stream in the kernel and emits it at the start of a
-  submission with `cpuirk=1`. When the ring flashes it, the submission that
-  carries it consumes and parks (`uc big 253 dwords fence 1 done 0`), so the
-  kernel cannot wrap it around a whole client IB — its invalidations eat the
+  belongs in Mesa's stream.** Turnip's `tu_init_cmdbuf_start_a725_quirk` (a
+  compute kernel over the whole shader array, 12 groups of 255 waves, the
+  register writes that aim it, and `CP_EXEC_CS`; "It is unknown what this
+  workaround is for and what it fixes") runs at the start of every command
+  buffer on a725/a730 silicon — and the GL build of this Mesa does not have it.
+  Measured flashed (`cpuirk=1`, `0229`): the submission that carries the
+  warm-up consumes and parks
+  (`uc big 253 dwords fence 1 done 0`, submissions refused, backboardd's
+  second context softpipe — the green self-test lines were *softpipe*), so the
+  kernel cannot wrap it around a whole client IB: its invalidations eat the
   batch's own state loads. The bisect to run next is emit-side: build the
   warm-up stream in the GL library and emit it at the start of every
-  `fd6_emit_restore` for `CHIP >= A7XX`, with the kernel knob off, exactly
+  `fd6_emit_restore` for `CHIP >= A7XX`, with the kernel knob off — exactly
   where Turnip puts it inside its command buffers. The bootstrap handshake is
   not the gap: `l162` in the SQE (`brne $02, 0x0, #l162`, right after
   `THREAD_SYNC` bit 0 is cleared) is the wait Pong describes, and this port
