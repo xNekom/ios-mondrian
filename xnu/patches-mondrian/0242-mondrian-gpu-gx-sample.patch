@@ -1,0 +1,88 @@
+xnu 0242: sample the GX power/clock status while an IB runs
+
+The 2D engine holds the state it is given, its destination is writable by
+the CP, no fault is raised for an unmapped destination and an 8 MiB blit
+leaves nothing behind, so no fragment is produced at all. The render
+blocks sit in the GX domain while the CP is in CX, so the one state that
+fits is GX being down (or collapsing) while the CP keeps running.
+
+GMU_GFX_PWR_CLK_STATUS says it in one register: bit 0 is the GX GDSC off
+and bit 1 the GX clock off. The bring-up reads it once, before any
+submission, and it reads 0 -- but that is the state the GMU *reports at
+rest*, and IFPC is allowed to collapse GX between submissions. This reads
+it on every fence poll of a submission, so the line covers the whole time
+the IB was in flight, and prints the OR of the samples next to the last
+one and the keepalive register.
+
+gxsample=1.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -86,6 +86,8 @@
+ static uint32_t mondrian_uc_draw_state;
+ static uint32_t mondrian_uc_ds_addr;
+ static int mondrian_uc_nostate;
++/* gxsample=1: read the GMU's GX power/clock status while an IB runs. */
++static int mondrian_uc_gxsample;
+ /* Off by default: measured, the 0201 bracket stops the 71-dword stream
+  * from fencing while the same stream completes without it. gpunomark=0
+  * turns it back on. */
+@@ -4779,9 +4781,23 @@
+ 		volatile uint32_t *view =
+ 		    (volatile uint32_t *)mondrian_cp_memptr_view;
+ 		uint32_t spent_us = 0, value = 0;
++		uint32_t gx_or = 0, gx_last = 0, gx_n = 0;
+ 
+ 		for (;;) {
+ 			__asm__ volatile("dsb sy" ::: "memory");
++			/*
++			 * gxsample=1: GMU_GFX_PWR_CLK_STATUS while the IB is running.
++			 * Bit 0 is the GX GDSC off and bit 1 the GX clock off, so a
++			 * sample with either set says the render domain was down
++			 * at that moment -- which would explain fragment writes
++			 * that never reach memory while the CP's own do.
++			 */
++			if (mondrian_uc_gxsample != 0) {
++				gx_last = mondrian_gpu_read(mondrian_uc_gmu,
++				    GMU_OFF(0x1f8d0u));
++				gx_or |= gx_last;
++				gx_n++;
++			}
+ 			value = view[mondrian_uc_fence_word(seq)];
+ 			if ((int32_t)(value - seq) >= 0) {
+ 				break;
+@@ -4793,6 +4809,13 @@
+ 			spent_us += mondrian_uc_poll_us;
+ 		}
+ 		mondrian_uc_done++;
++		if (mondrian_uc_gxsample != 0) {
++			printf("MONDRIAN GPU: uc gx sample n %u or 0x%x last 0x%x"
++			    " keep 0x%x pwr 0x%x\n", gx_n, gx_or, gx_last,
++			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8c3u)),
++			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)));
++			mondrian_log_flush_now();
++		}
+ 		/*
+ 		 * This line has to be able to print whatever happened: it is
+ 		 * built from the fence word in memory and needs no GPU
+@@ -4805,6 +4828,12 @@
+ 		printf("MONDRIAN GPU: uc big %u dwords fence %u done %u in %u ms\n",
+ 		    dwords, seq, (int32_t)(value - seq) >= 0, spent_us / 1000);
+ 		mondrian_log_flush_now();
++		if (mondrian_uc_gxsample != 0) {
++			printf("MONDRIAN GPU: uc gx idle pwr 0x%x keep 0x%x\n",
++			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)),
++			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8c3u)));
++			mondrian_log_flush_now();
++		}
+ 		/*
+ 		 * The fence is answered, so the GPU is idle and its registers
+ 		 * can be read. RB_MRT_0_BASE is where the RB is told to put
+@@ -5205,6 +5234,8 @@
+ 	    sizeof(mondrian_uc_ds_addr));
+ 	(void)PE_parse_boot_argn("gpunostate", &mondrian_uc_nostate,
+ 	    sizeof(mondrian_uc_nostate));
++	(void)PE_parse_boot_argn("gxsample", &mondrian_uc_gxsample,
++	    sizeof(mondrian_uc_gxsample));
+ 	(void)PE_parse_boot_argn("gpunomark", &mondrian_uc_nomark,
+ 	    sizeof(mondrian_uc_nomark));
+ 	(void)PE_parse_boot_argn("gpudump", &mondrian_uc_dump,

@@ -1,0 +1,92 @@
+xnu 0243: program the a7xx UCHE command queue and GBIF QoS
+
+The 2D engine keeps every register it is given, the CP's own write into
+the same buffer lands, an unmapped destination raises no fault and 8 MiB
+of blit leaves nothing behind: the request never leaves the render
+blocks. The userland self test says the same from the other side --
+`gpu self test: texsub+read 00 00 00 00` and `draw linked 1, drew 00 00
+00 00` -- so reads fail as well as writes.
+
+Mainline's a7xx hw_init programs two registers this mirror never wrote:
+UCHE_CMDQ_CONFIG, the UCHE command queue's shape for a730, and
+RBBM_GBIF_CLIENT_QOS_CNTL. The UCHE is where RB and 2D traffic leaves
+the GPU; the SQE's own CP_MEM_WRITE and event writes take a different
+path, which is why those are the only writes this port has ever seen
+land. They are written here with mainline's values, printed before and
+read back after the fence, next to the GBIF system-cache config and
+RBBM's status. gpuif=0 leaves them at the reset values for an A/B boot.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -111,6 +111,12 @@
+ static int mondrian_uc_keep = 1;
+ static int mondrian_cp_init_hw;
+ /*
++ * 1 (the default): program the two a7xx memory-interface registers mainline's
++ * hw_init writes and this mirror did not -- UCHE_CMDQ_CONFIG and
++ * RBBM_GBIF_CLIENT_QOS_CNTL. 0 leaves them at their reset values.
++ */
++static int mondrian_cp_if_init = 1;
++/*
+  * The 2000-submission stress in the CP bring-up: a diagnostic, on by default
+  * because it is what proves the ring, the fence slots and the order. cpstress=0
+  * skips it, for a boot where the point is to get past the bring-up: with
+@@ -2673,6 +2679,25 @@
+ 	CPW64(GEN7_UCHE_TRAP_BASE_LO, 0x1fffffffff000ULL);
+ 	CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, 0x1fffffffff000ULL);
+ 	CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
++	printf("MONDRIAN GPU: cp if before uche_cfg 0x%x qos 0x%x gx 0x%x\n",
++	    CPR(GEN7_UCHE_CMDQ_CONFIG), CPR(GEN7_RBBM_GBIF_CLIENT_QOS_CNTL),
++	    CPR(GEN7_UCHE_GBIF_GX_CONFIG));
++	mondrian_log_flush_now();
++	/*
++	 * Mainline's a7xx hw_init writes both of these and this mirror did
++	 * not. UCHE_CMDQ_CONFIG is the UCHE's command-queue shape for a730
++	 * (`(6<<16)|(6<<12)|(9<<8)|BIT(3)|BIT(2)|2`); the UCHE is the block
++	 * every RB and 2D write leaves the GPU through, while the CP's own
++	 * writes take a different path -- which is the split measured here:
++	 * the canary and the fence land, no fragment ever does, and a blit
++	 * into an unmapped page raises no translation fault at all, so the
++	 * request never reaches the SMMU. gpuif=0 keeps the reset values.
++	 */
++	if (mondrian_cp_if_init != 0) {
++		CPW(GEN7_RBBM_GBIF_CLIENT_QOS_CNTL, 0x2120212u);
++		CPW(GEN7_UCHE_CMDQ_CONFIG, (6u << 16) | (6u << 12) |
++		    (9u << 8) | (1u << 3) | (1u << 2) | 2u);
++	}
+ 
+ 	CPW(GEN7_CP_AHB_CNTL, 1);
+ 	CPW(GEN7_RBBM_PERFCTR_CNTL, 1);
+@@ -4010,6 +4035,24 @@
+ 	out[6] = mondrian_gpu_read(mondrian_uc_gpu,
+ 	    GEN7_CP_PROTECT_STATUS * 4u);
+ 	out[7] = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_HW_FAULT * 4u);
++	/*
++	 * The memory interface the render blocks leave through, read here
++	 * because this is the one place in the boot where the CP is known
++	 * idle: what the two writes above actually left behind, next to the
++	 * GBIF system-cache config (a730's LLCC slice, which nothing in this
++	 * port programs), the GX client config and RBBM's own status.
++	 */
++	printf("MondrianGPU: 2d if uche_cfg 0x%x qos 0x%x scache0 0x%x"
++	    " scache1 0x%x gx 0x%x rbbm 0x%x rbbm3 0x%x\n",
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_CMDQ_CONFIG * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu,
++	    GEN7_RBBM_GBIF_CLIENT_QOS_CNTL * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_GBIF_SCACHE_CNTL0 * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_GBIF_SCACHE_CNTL1 * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_GBIF_GX_CONFIG * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS3 * 4u));
++	mondrian_log_flush_now();
+ }
+ 
+ /*
+@@ -5248,6 +5291,8 @@
+ 	    sizeof(mondrian_uc_async));
+ 	(void)PE_parse_boot_argn("gpuinit", &mondrian_cp_init_hw,
+ 	    sizeof(mondrian_cp_init_hw));
++	(void)PE_parse_boot_argn("gpuif", &mondrian_cp_if_init,
++	    sizeof(mondrian_cp_if_init));
+ 	(void)PE_parse_boot_argn("cpstress", &mondrian_cp_stress,
+ 	    sizeof(mondrian_cp_stress));
+ 	(void)PE_parse_boot_argn("gpuringslow", &mondrian_uc_ring_slow,

@@ -1,0 +1,178 @@
+xnu 0241: a blit larger than the colour cache
+
+0240 answers whether the 2D engine issues its write at all. If it does not
+(no fault on an unmapped destination), the colour is lost between the
+engine and DRAM, and the only block on that path is the CCU. A cache that
+is never cleaned holds the pixels and nothing else changes -- which is what
+every measurement so far looks like.
+
+An 8 MiB blit cannot fit in it. If the data spills, the first rows (written
+earliest) are evicted to memory and read back non-zero; if they still read
+zero, the colour never entered a cache that drains and the engine is not
+producing fragments at all. 2048 rows of 4096 bytes, the same rectangle
+form the surface clear uses.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -212,6 +212,7 @@
+ 	void run2dFill(void);
+ 	void run2dSurfaceFill(void);
+ 	void run2dFault(void);
++	void run2dBig(void);
+ 	uint32_t expandGroups(const uint8_t *in, uint32_t size, uint8_t *out,
+ 	    uint32_t outMax);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+@@ -242,6 +243,7 @@
+ 	bool f2dFillDone;           /* the gpu2dfill test ran */
+ 	bool f2dSurfaceDone;        /* the surface fill ran */
+ 	bool f2dFaultDone;          /* the unmapped-destination blit ran */
++	bool f2dBigDone;            /* the oversized blit ran */
+ 	uint32_t fSyncLogged;
+ };
+ 
+@@ -354,6 +356,7 @@
+ 	f2dFillDone = false;
+ 	f2dSurfaceDone = false;
+ 	f2dFaultDone = false;
++	f2dBigDone = false;
+ 	if (fLock == NULL) {
+ 		return false;
+ 	}
+@@ -1045,6 +1048,127 @@
+ 	bufferFree(dst);
+ }
+ 
++/*
++ * gpu2dbig=1: one blit far larger than the colour cache.
++ *
++ * Everything measured so far says the 2D engine is configured and the CP
++ * applied the state, yet the destination does not change. The one block
++ * between the engine and DRAM is the CCU, and a CCU that never cleans would
++ * look exactly like this: the pixels sit in the cache and the event that
++ * should push them out does nothing. A cache cannot hold 8 MiB, so a blit
++ * that size either spills to memory -- and the first rows, written earliest,
++ * are the ones that must be evicted -- or the data is not being cached at all
++ * and the blit writes nothing anywhere.
++ *
++ * The rectangle is in bytes across (pitch 0x40 << 6 = 4096) and rows down, as
++ * the surface clear's own `(0x0018 << 16) | 0x0fff` says: 25 rows of 4096
++ * bytes. 2048 rows is 8 MiB.
++ */
++#define MONDRIAN_2DBIG_BYTES	0x800000ull
++#define MONDRIAN_2DBIG_ROWS	2048u
++
++void
++MondrianGPUUserClient::run2dBig(void)
++{
++	mondrian_buffer *dst, *ib;
++	uint32_t words[64], zeros[64], sample[16];
++	uint32_t n, i, j, fence = 0, nonzero[3] = { 0, 0, 0 }, first[3];
++	uint64_t off, at[3];
++	int submitted, polled;
++
++	{
++		static int parsed, on;
++
++		if (!parsed) {
++			parsed = 1;
++			if (!PE_parse_boot_argn("gpu2dbig", &on, sizeof(on))) {
++				on = 0;
++			}
++		}
++		if (!on) {
++			return;
++		}
++	}
++	IOLockLock(fLock);
++	dst = bufferNew(MONDRIAN_2DBIG_BYTES);
++	ib = bufferNew(0x1000);
++	IOLockUnlock(fLock);
++	if (dst == NULL || ib == NULL) {
++		IOLog("MondrianGPU: 2d big: no buffer\n");
++		return;
++	}
++	memset(zeros, 0, sizeof(zeros));
++	for (off = 0; off < MONDRIAN_2DBIG_BYTES; off += sizeof(zeros)) {
++		if (dst->memory->writeBytes(off, zeros, sizeof(zeros)) !=
++		    sizeof(zeros)) {
++			break;
++		}
++	}
++	n = mondrian_uc_2dfill_words(words, dst->iova, dst->iova + 0x1000,
++	    MONDRIAN_2DBIG_ROWS, 0xff, 0x00, 0xff, 0xff);
++	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
++		IOLog("MondrianGPU: 2d big: ib write failed\n");
++		return;
++	}
++	bufferSync(ib);
++	bufferSync(dst);
++	mondrian_gpu_uc_fault_clear();
++	submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
++	polled = submitted && mondrian_gpu_uc_wait(fence, 2000) == 0;
++	bufferSync(dst);
++	at[0] = 0;
++	at[1] = MONDRIAN_2DBIG_BYTES / 2;
++	at[2] = MONDRIAN_2DBIG_BYTES - 0x1000;
++	for (i = 0; i < 3; i++) {
++		first[i] = 0;
++		bzero(sample, sizeof(sample));
++		(void)dst->memory->readBytes(at[i], sample, sizeof(sample));
++		for (j = 0; j < 16; j++) {
++			if (sample[j] != 0) {
++				nonzero[i]++;
++			}
++		}
++		first[i] = sample[0];
++	}
++	IOLog("MondrianGPU: 2d big bytes 0x%llx submit %d poll %d fence %u"
++	    " start %u/16 0x%08x mid %u/16 0x%08x end %u/16 0x%08x\n",
++	    (unsigned long long)MONDRIAN_2DBIG_BYTES, submitted, polled, fence,
++	    nonzero[0], first[0], nonzero[1], first[1], nonzero[2], first[2]);
++	/*
++	 * Then ask for the colour cache by itself, in its own submission: if the
++	 * blit left the pixels in the CCU and the clean in the same stream ran
++	 * before the engine finished, a clean that is certainly after it brings
++	 * them out -- and the start of the buffer changes between the two reads.
++	 */
++	if (polled) {
++		words[0] = 0x70460001u;	/* CCU_CLEAN_COLOR */
++		words[1] = 0x00000021u;
++		words[2] = 0x70460001u;	/* CCU */
++		words[3] = 0x00000020u;
++		words[4] = 0x70460001u;	/* CACHE_CLEAN */
++		words[5] = 0x00000031u;
++		words[6] = 0x70268000u;	/* CP_WAIT_FOR_IDLE */
++		if (ib->memory->writeBytes(0, words, 7 * 4) == 7 * 4) {
++			bufferSync(ib);
++			if (mondrian_gpu_uc_submit(ib->iova, 7, &fence) == 0) {
++				(void)mondrian_gpu_uc_wait(fence, 1000);
++			}
++			bufferSync(dst);
++			bzero(sample, sizeof(sample));
++			(void)dst->memory->readBytes(0, sample, sizeof(sample));
++			for (nonzero[0] = 0, j = 0; j < 16; j++) {
++				if (sample[j] != 0) {
++					nonzero[0]++;
++				}
++			}
++			IOLog("MondrianGPU: 2d big after clean fence %u start %u/16"
++			    " 0x%08x\\n", fence, nonzero[0], sample[0]);
++		}
++	}
++	bufferFree(ib);
++	bufferFree(dst);
++}
++
+ IOReturn
+ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ {
+@@ -1412,6 +1536,10 @@
+ 			f2dFaultDone = true;
+ 			run2dFault();
+ 		}
++		if (!f2dBigDone) {
++			f2dBigDone = true;
++			run2dBig();
++		}
+ 	}
+ 	IOFreeData(cmds, cmd_bytes);
+ 	IOFreeData(bos, bo_bytes);

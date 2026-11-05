@@ -1,0 +1,94 @@
+xnu 0245: aim the 2D fill at the buffer's physical address
+
+RBBM_STATUS sampled across an 8 MiB blit is 0xc30df7: RB, CCU, RAS, TSE,
+VPC and UCHE all run the blit for its whole length, and the destination
+still changes by nothing -- after CCU_CLEAN_COLOR, CACHE_CLEAN and
+WAIT_FOR_IDLE in a submission of their own. A CP_MEM_WRITE to the same
+iova lands, so the buffer and the mapping are right; an unmapped iova
+raises no fault, so the request is not translated either.
+
+That leaves one question: does the render path use the address at all?
+gpu2dpa=1 runs the same fill with the destination set to the buffer's
+physical address, taken page by page from its memory descriptor, while
+the canary stays on the iova. A buffer that changes says the RB and the
+UCHE write physical addresses; one that does not says the write is lost
+after the engine instead. The line prints both addresses.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -792,6 +792,29 @@
+ 	return on != 0;
+ }
+ 
++/*
++ * gpu2dpa=1: aim the blit at the buffer's *physical* address instead of the
++ * iova it is mapped at. Everything measured so far says the two paths already
++ * disagree about which address they use -- a CP_MEM_WRITE to the iova lands,
++ * while the RB writes nothing there, raises no fault for an unmapped iova and
++ * still reports RB, CCU and UCHE busy for a whole 8 MiB blit. If the blit
++ * writes the physical address, the render blocks are not translated at all and
++ * every "no fragment" reading is a write to an address nobody reads.
++ */
++static int
++mondrian_uc_2dfill_pa(void)
++{
++	static int parsed, on;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("gpu2dpa", &on, sizeof(on))) {
++			on = 0;
++		}
++	}
++	return on != 0;
++}
++
+ static uint32_t
+ mondrian_uc_2dfill_words(uint32_t *words, uint64_t iova, uint64_t canary,
+     uint32_t rows, uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3)
+@@ -858,6 +881,7 @@
+ 	uint32_t fsr = 0, gfsr = 0;
+ 	uint64_t off;
+ 	int submitted, polled;
++	uint64_t fill_dst, fill_pa;
+ 
+ 	if (!mondrian_uc_2dfill_on()) {
+ 		return;
+@@ -877,7 +901,22 @@
+ 			break;
+ 		}
+ 	}
+-	n = mondrian_uc_2dfill_words(words, dst->iova, dst->iova + 0x1000,
++	/*
++	 * The canary stays on the iova: it is the CP's own write, it always
++	 * lands, and it is what proves the buffer being read is the one the
++	 * submission named. Only the blit's destination moves.
++	 */
++	fill_dst = dst->iova;
++	fill_pa = 0;
++	if (mondrian_uc_2dfill_pa()) {
++		IOByteCount length = 0;
++
++		fill_pa = (uint64_t)dst->memory->getPhysicalSegment(0, &length);
++		if (fill_pa != 0) {
++			fill_dst = fill_pa;
++		}
++	}
++	n = mondrian_uc_2dfill_words(words, fill_dst, dst->iova + 0x1000,
+ 	    25, 0xff, 0x00, 0xff, 0xff);
+ 	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
+ 		IOLog("MondrianGPU: 2d fill: ib write failed\n");
+@@ -918,11 +957,12 @@
+ 	    " fence %u nonzero %u/%u first 0x%08x mid 0x%08x canary 0x%08x"
+ 	    " got 0x%08x ccu %d dst_info 0x%x dst 0x%08x%08x pitch 0x%x"
+ 	    " blit 0x%x unk 0x%x protect 0x%x fault 0x%x fsr 0x%x"
+-	    " gfsr 0x%x\n", dst->handle,
++	    " gfsr 0x%x pa 0x%llx blit_dst 0x%llx\n", dst->handle,
+ 	    (unsigned long long)dst->iova, submitted, polled, fence, nonzero,
+ 	    sampled, first, mid, canary, got, mondrian_uc_2dfill_ccu(),
+ 	    regs[0], regs[2], regs[1], regs[3], regs[4], regs[5], regs[6],
+-	    regs[7], fsr, gfsr);
++	    regs[7], fsr, gfsr, (unsigned long long)fill_pa,
++	    (unsigned long long)fill_dst);
+ 	bufferFree(ib);
+ 	bufferFree(dst);
+ }

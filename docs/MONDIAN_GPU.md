@@ -792,6 +792,40 @@ them has Metal. That is the path this port follows.
   compositor can wait on at present time is the first one to remove.
   The firmware blocks, the GMU context bank and the CM3 start are in
   `mondrian_gpu.c` under `gmustart=1`.
+- **GX runs under a submission, and the render blocks run the blit.** The two
+  power questions are both answered, so neither is worth re-measuring:
+  `GMU_GFX_PWR_CLK_STATUS` reads `0` (GDSC on, clock on) on every fence poll
+  while an IB is in flight (`gxsample=1`), and the OR of sixteen
+  `RBBM_STATUS` samples taken across an 8 MiB blit is `0xc30df7` -- `RB_BUSY`
+  (7), `CCU_BUSY` (8), `RAS`/`TSE` (6/5), `VPC` (16) and `UCHE_BUSY` (17) are
+  set while the CP is still executing. The 2D engine, its colour cache and the
+  UCHE therefore execute the whole blit; what they do not do is change the
+  destination.
+- **Nothing but the CP's own writes reaches the destination.** Measured on one
+  boot, same buffer, same submission: `CP_MEM_WRITE` canary lands
+  (`got 0xcafe1234`), the blit leaves `nonzero 0/64`, an 8 MiB blit leaves
+  start/mid/end at zero, `CCU_CLEAN_COLOR` + `CACHE_CLEAN` + `WAIT_FOR_IDLE` in
+  a submission of their own change nothing, and a blit into an unmapped page
+  raises no SMMU fault. Aiming the blit at the buffer's *physical* address
+  (`gpu2dpa=1`) instead of its iova changes nothing either, so the render path
+  is neither translated nor bypassing translation: the write never reaches the
+  address the instruction names. The loss is inside the GPU, past the RB/CCU.
+- **The shader path fails the same way, so this is not the 2D engine.**
+  `glselftest=1` clears a 64x64 FBO and reads it back (`clear+read 00 00 00 00`),
+  uploads a texel and reads it back (`texsub+read 00 00 00 00`) and draws a
+  green triangle over it (`draw linked 1, drew 00 00 00 00`), all with
+  `error 0x0`. Shaders compile and link and `glDrawArrays` returns cleanly. Use
+  this test before blaming `CP_BLIT`: it separates "the blitter is wrong" from
+  "no render block writes memory", and only the second is true here.
+- **The two a7xx memory-interface registers mainline writes were already
+  right; the GBIF system cache was not, and fixing it changes nothing.**
+  `UCHE_CMDQ_CONFIG` (`0x6690e`) and `RBBM_GBIF_CLIENT_QOS_CNTL` (`0x2120212`)
+  read back correct before this port ever wrote them (`gpuif=1` writes them
+  anyway). `GBIF_SCACHE_CNTL0/1` read `0`, so `gpuscache=1` writes the a730
+  LLCC slice the way mainline's `a7xx_llc_activate` does for sm8450
+  (`LLCC_GPU = 9`; `CNTL1` with the id in its fields = `0x1294a529`, `CNTL0`
+  = `id<<10 | BIT(8)` = `0x2500`), the writes stick and the blit still writes
+  nothing. Both flags default on; `gpuif=0`/`gpuscache=0` are the A/B.
 
 ### Running the GPU test from the UI hook
 

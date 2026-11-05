@@ -1,0 +1,106 @@
+xnu 0244: the LLCC slice, and RBBM's busy bits during an IB
+
+UCHE_CMDQ_CONFIG and RBBM_GBIF_CLIENT_QOS_CNTL are programmed now (0243)
+and the answer to whether the render blocks ever start is in RBBM_STATUS:
+bits 17/9/8/7 say UCHE, A2D, CCU and RB busy. The fence poll of a
+submission reads it as well as the GMU's GX status, so the line covers the
+time the IB was in flight, and a blit that produces no fragment either
+never sets one of those bits or sets them and loses the write.
+
+gpuscache=1 additionally writes the a730 LLCC slice the way mainline's
+a7xx_llc_activate does on sm8450, where LLCC_GPU is slice 9:
+GBIF_SCACHE_CNTL1 holds the id in all of its id fields and
+GBIF_SCACHE_CNTL0 is id<<10 | BIT(8). Neither register is written anywhere
+in this port, and the GPU's traffic is tagged by them.
+
+Both are gated (gpuif=0, gpuscache=0) so one kernel can measure either
+side.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -117,6 +117,12 @@
+  */
+ static int mondrian_cp_if_init = 1;
+ /*
++ * 1: write the a730 GBIF system-cache config the LLCC slice needs
++ * (sm8450's LLCC_GPU slice is 9): SCACHE_CNTL1 with the scid in all five
++ * client fields, SCACHE_CNTL0 as scid<<10 | BIT(8).
++ */
++static int mondrian_cp_scache = 1;
++/*
+  * The 2000-submission stress in the CP bring-up: a diagnostic, on by default
+  * because it is what proves the ring, the fence slots and the order. cpstress=0
+  * skips it, for a boot where the point is to get past the bring-up: with
+@@ -2698,6 +2704,19 @@
+ 		CPW(GEN7_UCHE_CMDQ_CONFIG, (6u << 16) | (6u << 12) |
+ 		    (9u << 8) | (1u << 3) | (1u << 2) | 2u);
+ 	}
++	/*
++	 * gpuscache=1: the a730 LLCC slice. Mainline takes the id from the
++	 * LLCC driver (`llcc_get_slice_id(LLCC_GPU)`, 9 on sm8450) and writes
++	 * it into every id field of GBIF_SCACHE_CNTL1, with
++	 * GBIF_SCACHE_CNTL0 as scid<<10 | BIT(8). Nothing in this port
++	 * programs either, so if the bootloader's values did not survive the
++	 * reset the GPU's traffic is tagged for a slice that is not there.
++	 */
++	if (mondrian_cp_scache != 0) {
++		CPW(GEN7_GBIF_SCACHE_CNTL1, (9u << 0) | (9u << 5) |
++		    (9u << 10) | (9u << 15) | (9u << 20) | (9u << 25));
++		CPW(GEN7_GBIF_SCACHE_CNTL0, (9u << 10) | (1u << 8));
++	}
+ 
+ 	CPW(GEN7_CP_AHB_CNTL, 1);
+ 	CPW(GEN7_RBBM_PERFCTR_CNTL, 1);
+@@ -4825,6 +4844,7 @@
+ 		    (volatile uint32_t *)mondrian_cp_memptr_view;
+ 		uint32_t spent_us = 0, value = 0;
+ 		uint32_t gx_or = 0, gx_last = 0, gx_n = 0;
++		uint32_t rbbm_or = 0, rbbm_first = 0, rbbm_n = 0;
+ 
+ 		for (;;) {
+ 			__asm__ volatile("dsb sy" ::: "memory");
+@@ -4841,6 +4861,22 @@
+ 				gx_or |= gx_last;
+ 				gx_n++;
+ 			}
++			/*
++			 * RBBM_STATUS while the IB is in flight: bits 17 (UCHE),
++			 * 9 (A2D), 8 (CCU) and 7 (RB) busy. A blit that produces
++			 * no fragment either never starts the engine (no busy
++			 * bit ever set) or runs it and loses the write.
++			 */
++			if (mondrian_uc_gxsample != 0) {
++				uint32_t st = mondrian_gpu_read(mondrian_uc_gpu,
++				    GEN7_RBBM_STATUS * 4u);
++
++				if (rbbm_n == 0) {
++					rbbm_first = st;
++				}
++				rbbm_or |= st;
++				rbbm_n++;
++			}
+ 			value = view[mondrian_uc_fence_word(seq)];
+ 			if ((int32_t)(value - seq) >= 0) {
+ 				break;
+@@ -4854,9 +4890,11 @@
+ 		mondrian_uc_done++;
+ 		if (mondrian_uc_gxsample != 0) {
+ 			printf("MONDRIAN GPU: uc gx sample n %u or 0x%x last 0x%x"
+-			    " keep 0x%x pwr 0x%x\n", gx_n, gx_or, gx_last,
++			    " keep 0x%x pwr 0x%x rbbm %u first 0x%x or 0x%x\n",
++			    gx_n, gx_or, gx_last,
+ 			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8c3u)),
+-			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)));
++			    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)),
++			    rbbm_n, rbbm_first, rbbm_or);
+ 			mondrian_log_flush_now();
+ 		}
+ 		/*
+@@ -5293,6 +5331,8 @@
+ 	    sizeof(mondrian_cp_init_hw));
+ 	(void)PE_parse_boot_argn("gpuif", &mondrian_cp_if_init,
+ 	    sizeof(mondrian_cp_if_init));
++	(void)PE_parse_boot_argn("gpuscache", &mondrian_cp_scache,
++	    sizeof(mondrian_cp_scache));
+ 	(void)PE_parse_boot_argn("cpstress", &mondrian_cp_stress,
+ 	    sizeof(mondrian_cp_stress));
+ 	(void)PE_parse_boot_argn("gpuringslow", &mondrian_uc_ring_slow,
