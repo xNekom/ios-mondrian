@@ -17,7 +17,9 @@ CP_INDIRECT_BUFFER to it before the client indirect buffer, the way the
 IFPC bracket was folded. cpuirk=0 leaves the streams alone.
 --- a/bsd/dev/mondrian_gpu.c
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -1787,6 +1787,20 @@
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1787,6 +1787,24 @@
  static struct mondrian_gpu_mem mondrian_cp_memptr;
  static struct mondrian_gpu_mem mondrian_cp_ib;
  static struct mondrian_gpu_mem mondrian_cp_pwrup;
@@ -34,11 +36,15 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
 +static struct mondrian_gpu_mem mondrian_uc_quirk;
 +static void mondrian_uc_quirk_build(void);
 +static uint32_t mondrian_uc_quirk_words;
-+static int mondrian_cp_quirk = 1;
++static int mondrian_cp_quirk;
++/* the kernel-side warm-up submission wedges the CP when the client frame is
++ * in the same ring buffer: Turnip runs it inside the command buffer, whose
++ * first packets are the GPU state itself. Off by default; the bisect is
++ * Mesa-side (cpuirk=1 as an argument assembles it again). */
  static struct mondrian_gpu_mem mondrian_cp_scratch;
  static uint32_t mondrian_cp_sctlr;
  
-@@ -1942,6 +1956,7 @@
+@@ -1942,6 +1960,7 @@
  		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x8000, 0x200000) != 0 ||
  		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
  		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
@@ -46,7 +52,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0 ||
  		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ib, 0x4000, 0x400000) != 0) {
  			printf("MONDRIAN GPU: cp memory allocation failed\n");
-@@ -1972,6 +1987,9 @@
+@@ -1972,6 +1991,9 @@
  		    mondrian_cp_tables.pa, mondrian_cp_pwrup.iova,
  		    mondrian_cp_pwrup.va, mondrian_cp_pwrup.bytes, 3, &next) != 0 ||
  		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
@@ -56,7 +62,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  		    mondrian_cp_tables.pa, mondrian_cp_scratch.iova,
  		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 3, &next) != 0 ||
  		    /* The command stream is fetched by the non-privileged CP
-@@ -2487,7 +2505,8 @@
+@@ -2487,7 +2509,8 @@
  static void
  mondrian_cp_apriv_program(vm_offset_t gpu, int log)
  {
@@ -66,7 +72,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  	mondrian_gpu_write(gpu, GEN7_CP_BV_APRIV_CNTL * 4u, 0x0fu);
  	mondrian_gpu_write(gpu, GEN7_CP_LPAC_APRIV_CNTL * 4u, 0x0fu);
  	mondrian_gpu_write(gpu, GEN7_CP_LPAC_PROTECT_CNTL * 4u, 0x0bu);
-@@ -2642,9 +2661,10 @@
+@@ -2642,9 +2665,10 @@
  	CPW64(GEN7_UCHE_TRAP_BASE_LO, 0x1fffffffff000ULL);
  	CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, 0x1fffffffff000ULL);
  	CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
@@ -78,7 +84,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  	CPW(GEN7_RB_NC_MODE_CNTL, (1u << 11) | (1u << 4) | (bank << 1));
  	CPW(GEN7_TPL1_NC_MODE_CNTL, bank << 1);
  	CPW(GEN7_SP_NC_MODE_CNTL, (2u << 4) | (bank << 1));
-@@ -4069,6 +4089,78 @@
+@@ -4069,6 +4093,78 @@
  	}
  }
  
@@ -157,7 +163,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  int
  mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
  {
-@@ -4211,7 +4303,7 @@
+@@ -4211,7 +4307,7 @@
  				mondrian_uc_sh_reg = reg;
  			}
  			spins++;
@@ -166,7 +172,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  				mondrian_uc_rptr = rptr;
  				mondrian_uc_rptr_valid = 1;
  				break;
-@@ -4249,6 +4341,20 @@
+@@ -4249,6 +4345,20 @@
  		printf("MONDRIAN GPU: uc wrap at 0x%x\n", at);
  		mondrian_log_flush_now();
  	}
@@ -187,7 +193,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  	from = at;
  	slot = mondrian_cp_memptr.iova + MONDRIAN_UC_FENCE_BASE +
  	    4ull * (seq % MONDRIAN_UC_FENCE_SLOTS);
-@@ -4295,6 +4401,17 @@
+@@ -4295,6 +4405,17 @@
  		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
  		ring[at++] = 0x00du;		/* IB1LIST start */
  	}
@@ -205,7 +211,7 @@ IFPC bracket was folded. cpuirk=0 leaves the streams alone.
  	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
  	ring[at++] = (uint32_t)ib;
  	ring[at++] = (uint32_t)(ib >> 32);
-@@ -4774,6 +4891,8 @@
+@@ -4774,6 +4895,8 @@
  	    sizeof(mondrian_cp_noretry));
  	(void)PE_parse_boot_argn("cporder", &mondrian_cp_order,
  	    sizeof(mondrian_cp_order));
