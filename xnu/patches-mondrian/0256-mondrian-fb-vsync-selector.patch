@@ -1,0 +1,92 @@
+xnu 0256: the real vsync selector, and a count of what the window server asks
+
+The port's notification method was number 72 with three arguments; the
+documented IOMobileFramebuffer ABI (The Apple Wiki, Dev:IOMobileFramebuffer)
+has push vsync as selector 9, setVSyncNotifications(functionAddress,
+userData), with the mach port coming in through IOConnectSetNotificationPort
+and the async completion carrying the callback and its argument in the
+reference. Implement 9 that way next to the port's own method, so a client that
+asks for vsync is answered.
+
+Nothing in the ring calls either method today, so this also counts every
+selector call and prints, once a second, what the window server asked for. The
+numbers say which half is missing: swapBegin/swapEnd at 60 a second with no
+draw is a compositor that renders and does not present; no swapBegin at all is a
+compositor that is not running; a nonzero 9 is the registration this patch
+exists for.
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -57,6 +57,7 @@
+ 	kMondrianFBGetDisplaySize          = 8,
+ 	kMondrianFBIsMainDisplay           = 18,
+ 	kMondrianFBGetDotPitch             = 28,
++	kMondrianFBSetVSyncNotifications   = 9,
+ 	kMondrianFBNotifications           = 72,
+ 	kMondrianFBGetCurrentAbsoluteTime  = 77,
+ 	kMondrianFBGetBlock                = 79,
+@@ -67,6 +68,9 @@
+ #define MONDRIAN_FB_NOTIFY_TYPES           8
+ #define MONDRIAN_FB_NOTIFY_VSYNC           5
+ #define MONDRIAN_FB_VSYNC_US               16667
++/* Selector calls since the last fps line: what the window server asks for. */
++#define MONDRIAN_FB_SELECTORS 128
++static uint32_t mondrian_fb_selectors_called[MONDRIAN_FB_SELECTORS];
+ #define MONDRIAN_FB_DOT_PITCH              526     /* ppi, 6.67" 1440x3200 */
+ #define MONDRIAN_FB_FORMAT_BGRA            0x42475241
+ /* bsd/dev/mondrian_sample.c: the sampler, ticked from this driver's timer. */
+@@ -521,6 +525,15 @@
+ 		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+ 		    fb->fTouchRate, fb->fTouchRepeatRate);
++		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
++		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
++		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
++		    mondrian_fb_selectors_called[33], mondrian_fb_selectors_called[50], mondrian_fb_selectors_called[55],
++		    mondrian_fb_selectors_called[68], mondrian_fb_selectors_called[74], mondrian_fb_selectors_called[79],
++		    mondrian_fb_selectors_called[84]);
++		for (unsigned s = 0; s < MONDRIAN_FB_SELECTORS; s++) {
++			mondrian_fb_selectors_called[s] = 0;
++		}
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
+@@ -850,6 +863,10 @@
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	if (selector < MONDRIAN_FB_SELECTORS) {
++		mondrian_fb_selectors_called[selector]++;
++	}
++
+ 	switch (selector) {
+ 	case kMondrianFBGetLayerDefaultSurface:
+ 		out[0] = mondrian_surface_port_in_task(fFB->fSurface, fTask);
+@@ -893,6 +910,28 @@
+ 		out[0] = mach_absolute_time();
+ 		outCount = 1;
+ 		break;
++	case kMondrianFBSetVSyncNotifications:
++		/*
++		 * setVSyncNotifications(functionAddress, userData): 0 disables.
++		 * The mach port arrives through registerNotificationPort, the
++		 * pair through here, and the async completion carries them back.
++		 */
++		if (args->scalarInputCount < 2) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		IOLockLock(fFB->fLock);
++		fFunc[MONDRIAN_FB_NOTIFY_VSYNC] = args->scalarInput[0];
++		fRefcon[MONDRIAN_FB_NOTIFY_VSYNC] = args->scalarInput[1];
++		IOLockUnlock(fFB->fLock);
++		{
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("MONDRIAN FB: %s vsync notifications %s (%llx)\n", name,
++			    args->scalarInput[0] ? "on" : "off",
++			    (unsigned long long)args->scalarInput[0]);
++		}
++		break;
+ 	case kMondrianFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < MONDRIAN_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];

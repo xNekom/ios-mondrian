@@ -1,0 +1,87 @@
+xnu 0255: a synthetic 60 Hz finger, to measure what caps the frame rate
+
+The UI redraws once per touch event and the panel reports at 10-32 Hz during a
+drag, so measured frame rates follow the part, not the panel. Whether that is
+the whole story cannot be settled with a hand on the glass: boot-arg
+mondriandrag=N makes the digitizer service emit a finger that swipes up from the
+bottom edge for three seconds every N seconds at 16 ms a step, with no input
+hardware involved. If the fps line then shows about 60 and the frames run 11-17
+ms apart, the compositor follows input and the panel's report rate is the
+bottleneck; if it stays near 30, the cost is in the commit path, not in the
+touch count. A diagnostic, not a product feature.
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -358,6 +358,11 @@
+ 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
+ private:
++	static void dragFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fDrag;
++	UInt32 fDragPeriod;      /* boot-arg mondriandrag, seconds a cycle */
++	UInt32 fDragTick;
++	UInt32 fDragSweep;
+ 	IOLock *fLock;
+ 	bool fDown[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fX[MONDRIAN_TOUCH_FINGERS];
+@@ -429,12 +434,61 @@
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	if (PE_parse_boot_argn("mondriandrag", &fDragPeriod, sizeof(fDragPeriod)) &&
++	    fDragPeriod) {
++		fDrag = IOTimerEventSource::timerEventSource(this, &MondrianHIDTouch::dragFired);
++		if (fDrag && _hidWorkLoop->addEventSource(fDrag) == kIOReturnSuccess) {
++			fDrag->setTimeoutMS(16);
++			IOLog("MONDRIAN HID: drag every %u s\n", fDragPeriod);
++		}
++	}
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("MONDRIAN HID: touch registered\n");
+ 	return true;
+ }
+ 
++/*
++ * Boot-arg mondriandrag=N: a synthetic finger that swipes up from the bottom
++ * edge at the panel rate for three seconds every N seconds. The frame rate
++ * then says whether the UI follows a 60 Hz stream of positions or whether
++ * something else caps it, with no hand on the glass.
++ */
++void
++MondrianHIDTouch::dragFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	MondrianHIDTouch *self = (MondrianHIDTouch *)owner;
++	UInt32 sweep = 3 * 62;                  /* 3 s of motion */
++	UInt32 cycle = self->fDragPeriod * 62;
++	UInt32 t = self->fDragTick % cycle;
++	uint64_t ns = 0;
++	int y;
++
++	if (t < sweep) {
++		/*
++		 * Up for a second, back down for a second, three times. A
++		 * monotonic swipe follows the finger until the animation it drives
++		 * saturates and then stops drawing; this one keeps it moving for
++		 * the whole sweep.
++		 */
++		UInt32 k = t % 62;
++		y = (k < 31) ? 31000 - (int)(k * 322) : 21000 + (int)((k - 31) * 322);
++		self->touch(0, true, 7200, y);
++		if (t == 0) {
++			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++			IOLog("MONDRIAN HID: drag sweep %u start %llu\n", self->fDragSweep,
++			    ns / 1000);
++		}
++	} else if (t == sweep) {
++		self->touch(0, false, 7200, 21000);
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		IOLog("MONDRIAN HID: drag sweep %u end %llu\n", self->fDragSweep++,
++		    ns / 1000);
++	}
++	self->fDragTick++;
++	sender->setTimeoutMS(16);
++}
++
+ void
+ MondrianHIDTouch::touch(int finger, bool down, int x, int y)
+ {

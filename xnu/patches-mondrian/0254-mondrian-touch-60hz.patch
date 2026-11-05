@@ -1,0 +1,219 @@
+xnu 0254: deliver a touch position every vsync, and drain what the part has
+
+The lock screen redraws once per touch event. Measured with glframes=1 and
+mondrianfb_fps=1 in the same boot, panel swaps and reports read agree one for
+one: 32 swaps in the second the part answered 32 reports, 7 in the second it
+answered 7, 3 in the second it answered 3, and the frames that arrive with no
+touch draw in bursts of 11-17 ms apart (60 fps). So the UI was not slow, it was
+starved of positions: the part reports at about 100 Hz and this thread is woken
+once a vsync and read exactly one report a wakeup.
+
+Two changes: drain whatever the part has queued (the IRQ line stays low until a
+zero byte is written back, so read until it is high, four reports a tick at
+most), and, on a tick with no new report while a finger is down, send the last
+position again. The second is what makes a drag a 60 Hz stream of positions
+instead of whatever rate the part happened to answer at; the window server
+coalesces repeated moves. bsd/dev/mondrian_touch.c, and the fps line prints the
+re-sent moves as rep N/s.
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1059,6 +1059,7 @@
+ /* Reports read since boot, for the fps line; and the vsync kick below. */
+ static uint32_t mondrian_touch_reports_read;
+ static uint32_t mondrian_touch_polls;
++static uint32_t mondrian_touch_repeats;
+ 
+ uint32_t
+ mondrian_touch_report_count(void)
+@@ -1066,6 +1067,13 @@
+ 	return mondrian_touch_reports_read;
+ }
+ 
++/* Moves re-sent from the last position, once a vsync: see the thread. */
++uint32_t
++mondrian_touch_repeat_count(void)
++{
++	return mondrian_touch_repeats;
++}
++
+ #define MONDRIAN_TOUCH_POINT_LEN	8
+ #define MONDRIAN_TOUCH_FINGERS		10
+ 
+@@ -1531,58 +1539,91 @@
+ 		last_y[i] = 0;
+ 	}
+ 	for (;;) {
++		int passes, read_one = 0;
++
+ 		(void)tsleep((caddr_t)&mondrian_touch_data_addr, PZERO - 1, "mtouch", 1);
+ 		mondrian_touch_polls++;
+-		if (!mondrian_touch_poll &&
+-		    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
+-			continue;
+-		}
+-		(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
+-		mondrian_touch_reports_read++;
+-		num = head[2] & 0x0f;
+-		if (num > MONDRIAN_TOUCH_FINGERS) {
+-			num = MONDRIAN_TOUCH_FINGERS;
+-		}
+-		for (i = 0; i < MONDRIAN_TOUCH_FINGERS; i++) {
+-			now[i] = 0;
+-		}
+-		if (num > 0) {
+-			for (i = 0; i < sizeof(point_buf); i++) {
+-				point_buf[i] = 0;
++		/*
++		 * Drain what the part has queued. Its line stays low while a report
++		 * waits and one zero byte at the report address releases it, so a
++		 * tick that read a single report threw away the rest of a stream the
++		 * part sends at about 100 Hz. The reports of one tick are coalesced
++		 * into one event a finger below: what the UI wants is the position
++		 * this vsync, not every sample the part made.
++		 */
++		for (passes = 0; passes < 4; passes++) {
++			if (!mondrian_touch_poll &&
++			    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
++				break;
+ 			}
+-			(void)mondrian_goodix_read(mondrian_touch_data_addr + sizeof(head),
+-			    point_buf, (uint32_t)(num * MONDRIAN_TOUCH_POINT_LEN + 2));
+-			for (point = 0; point < num; point++) {
+-				uint8_t *p = &point_buf[point * MONDRIAN_TOUCH_POINT_LEN];
+-				int id = (p[0] >> 4) & 0x0f;
+-				int x = p[2] | (p[3] << 8);
+-				int y = p[4] | (p[5] << 8);
+-
+-				if (id >= MONDRIAN_TOUCH_FINGERS) {
+-					continue;
++			read_one = 1;
++			(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
++			mondrian_touch_reports_read++;
++			num = head[2] & 0x0f;
++			if (num > MONDRIAN_TOUCH_FINGERS) {
++				num = MONDRIAN_TOUCH_FINGERS;
++			}
++			for (i = 0; i < MONDRIAN_TOUCH_FINGERS; i++) {
++				now[i] = 0;
++			}
++			if (num > 0) {
++				for (i = 0; i < sizeof(point_buf); i++) {
++					point_buf[i] = 0;
+ 				}
+-				now[id] = 1;
+-				last_x[id] = (int16_t)x;
+-				last_y[id] = (int16_t)y;
+-				mondrian_hid_touch(id, 1, x, y);
+-				if (reports < 30) {
+-					printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
+-					    reports, id, x, y);
++				(void)mondrian_goodix_read(mondrian_touch_data_addr + sizeof(head),
++				    point_buf, (uint32_t)(num * MONDRIAN_TOUCH_POINT_LEN + 2));
++				for (point = 0; point < num; point++) {
++					uint8_t *p = &point_buf[point * MONDRIAN_TOUCH_POINT_LEN];
++					int id = (p[0] >> 4) & 0x0f;
++					int x = p[2] | (p[3] << 8);
++					int y = p[4] | (p[5] << 8);
++
++					if (id >= MONDRIAN_TOUCH_FINGERS) {
++						continue;
++					}
++					now[id] = 1;
++					last_x[id] = (int16_t)x;
++					last_y[id] = (int16_t)y;
+ 				}
+ 			}
++			/* One zero byte at the report address clears it and releases IRQ. */
++			(void)mondrian_goodix_write(mondrian_touch_data_addr, &zero, 1);
++			if (reports < 30) {
++				printf("MONDRIAN TOUCH: report %u %u point%s\n", reports,
++				    num, num == 1 ? "" : "s");
++			}
+ 		}
++		/*
++		 * One event a finger a tick. The lock screen redraws once per touch
++		 * event (measured: panel swaps 32 in the second the part answered 32
++		 * reports, 7 when it answered 7, 3 when it answered 3), so a tick
++		 * that had a finger down and no new report still owes the UI the
++		 * position it already knows -- that is what turns a drag into 60
++		 * positions a second instead of the part's report rate.
++		 */
+ 		for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
+-			if (was[finger] && !now[finger]) {
+-				mondrian_hid_touch(finger, 0, last_x[finger], last_y[finger]);
++			if (read_one && now[finger]) {
++				mondrian_hid_touch(finger, 1, last_x[finger],
++				    last_y[finger]);
++				if (reports < 30) {
++					printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
++					    reports, finger, last_x[finger],
++					    last_y[finger]);
++				}
++			} else if (read_one && was[finger] && !now[finger]) {
++				mondrian_hid_touch(finger, 0, last_x[finger],
++				    last_y[finger]);
+ 				if (reports < 30) {
+ 					printf("MONDRIAN TOUCH: report %u finger %d up\n",
+ 					    reports, finger);
+ 				}
++			} else if (!read_one && was[finger]) {
++				mondrian_hid_touch(finger, 1, last_x[finger],
++				    last_y[finger]);
++				mondrian_touch_repeats++;
+ 			}
+ 			was[finger] = now[finger];
+ 		}
+-		/* One zero byte at the report address clears it and releases IRQ. */
+-		(void)mondrian_goodix_write(mondrian_touch_data_addr, &zero, 1);
+ 		if (reports < 30) {
+ 			mondrian_log_flush_now();
+ 		}
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -73,6 +73,7 @@
+ extern "C" void mondrian_sample_tick(void);
+ extern "C" void mondrian_touch_vsync(void);
+ extern "C" uint32_t mondrian_touch_report_count(void);
++extern "C" uint32_t mondrian_touch_repeat_count(void);
+ /* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
+ extern "C" uint64_t mondrian_early_fb_va(void);
+ extern "C" int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
+@@ -246,6 +247,7 @@
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
+ 	uint32_t            fTouchRate;      /* touch reports read in the last second */
++	uint32_t            fTouchRepeatRate;/* moves re-sent from the last position */
+ 	bool                fFpsLog;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -480,14 +482,17 @@
+ 	 * never fires on this board, and the part reports at about 100 Hz.
+ 	 */
+ 	{
+-		static uint32_t touched_last;
++		static uint32_t touched_last, repeated_last;
+ 
+ 		mondrian_touch_vsync();
+ 		if ((count % MONDRIAN_FB_REFRESH_HZ) == 0) {
+ 			uint32_t now_reports = mondrian_touch_report_count();
++			uint32_t now_repeats = mondrian_touch_repeat_count();
+ 
+ 			fb->fTouchRate = now_reports - touched_last;
++			fb->fTouchRepeatRate = now_repeats - repeated_last;
+ 			touched_last = now_reports;
++			repeated_last = now_repeats;
+ 		}
+ 	}
+ 	/*
+@@ -513,9 +518,9 @@
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s\n",
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+-		    fb->fTouchRate);
++		    fb->fTouchRate, fb->fTouchRepeatRate);
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;

@@ -1,10 +1,11 @@
 # GPU and boot time
 
 The UI renders through the GPU: the draw completes, the frame is drawn in
-place (no readback, no copy) and the display swaps it 57-64 times in a second,
-against the 60 Hz the panel and the iPhone X mode run at. The wall is pacing — a
-frame reaches the display 8 ms after the vsync it was meant for — not
-rasterisation. The other ios-sweet ports render through
+place (no readback, no copy), and a burst of frames runs at the panel's 60 Hz
+(11-17 ms apart, `glframes=1`). What the user feels is not rasterisation but
+when a frame is asked for: the compositor draws once per touch event, and the
+touch path delivered the part's report rate (see "A lock-screen frame" below).
+The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
 
@@ -803,6 +804,37 @@ them has Metal. That is the path this port follows.
   with no other change. What is left of the frame is the `waiting` slice,
   8-18 ms, which is the blit into the surface plus the fence that sends the
   batch on (`glsync=0` drops the fence).
+- **The frame rate follows a display link the port does not have.** `glframes=1`
+  logs one line a frame; the bursts that do run are at the panel rate (11-17 ms
+  apart, 5-49 draws, 0.2-0.5 s long) and everything between them is silence,
+  which is CoreAnimation's design for a still screen. Feeding a synthetic
+  finger at 62 positions a second for three seconds (`0255`, boot-arg
+  `mondriandrag=8`) produced 0-3 frames a sweep, so the digitizer's rate is not
+  what the UI waits for. Counted in the driver (`0256`): the window server
+  calls the framebuffer in 6 of 116 seconds, never more than 18 swaps a second,
+  and `sel 4:0 5:0 6:0` in every second of the drag. backboardd carries
+  `BKDisplayLink`, `BKDigitizerEventSchedulerWithDisplayLink` and
+  `_dispatchingTouchesOnDisplayLink`, so digitizer events are parked until a
+  display link tick; between ticks the lock screen's clock does not advance.
+  The compositor is not slow, it is not running, and the panel's report rate
+  (`0xC0` to the IC, 240 to 480 Hz) is a later problem.
+- **The vsync registration selector is 9, not 72.** The documented
+  IOMobileFramebuffer ABI (The Apple Wiki, `Dev:IOMobileFramebuffer`) puts
+  `setVSyncNotifications(functionAddress, userData)` at selector 9, with the
+  mach port delivered through `IOConnectSetNotificationPort`; the port's
+  method 72 takes three arguments and no ABI has it. `0256` implements 9 beside
+  72 and counts every selector call. Nothing calls either yet (`9:0` every
+  second), so the 60 Hz timer in the driver still has no client to notify.
+- **The GMU is voted once, at the idle OPP.** The boot prints `MONDRIAN GPU:
+  hfi power gpu 2 bus 2, 285 MHz`: the HFI power vote carries perf index 2,
+  which this port's table maps to 285 MHz and which kgsl uses while no client
+  asks for anything. kgsl sends a fresh DCVS vote per submission, so on Android
+  the GPU runs at the OPP the load needs; here the vote sent when the GMU
+  starts stands for the whole session, and `gpuperf=N` picks another entry (13
+  is the top OPP, 900 MHz). This is not what the frame rate was hitting -- a
+  25-draw frame already runs 11-17 ms apart at 285 MHz -- and voting index 13
+  at boot did not come back to fastboot, so raise the vote after the CP is
+  running, the way kgsl does, rather than moving the boot-time vote.
 - **The wallpaper is a killed poster.** CollectionsPoster makes the poster
   surface (`MONDRIAN SURF: CollectionsPoster create id 11 1326x1326 fmt
   0x4c303038`) and dies before it draws one frame -- no `|CollectionsPoste|
@@ -997,6 +1029,9 @@ cost is CPU frequency, the boot CPU and debug I/O:
 ## Milestones
 
 Done: GPU memory, command submission and the Mesa `FD725` context; CoreAnimation
-GLES drawn by the GPU with the no-copy IOSurface presenter, 57 swaps a second.
-Open: paced presentation (frames land 8 ms after their vsync), `bootcpu`/
-`cpufreq`, the release kernel and the boot-time measurements.
+GLES drawn by the GPU with the no-copy IOSurface presenter, a lock-screen frame
+in 25-47 draws, and a burst of frames 11-17 ms apart.
+Open: the display link the compositor waits for (nothing registers the
+framebuffer's vsync, selector 9, and the clock stands still between ticks), the
+wallpaper (the poster extension draws no frame), the panel's report rate
+(`0xC0`), `bootcpu`/`cpufreq`, the release kernel and the boot-time measurements.
