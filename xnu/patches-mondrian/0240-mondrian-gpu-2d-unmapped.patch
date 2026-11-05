@@ -1,0 +1,226 @@
+xnu 0240: does the 2D engine issue the write at all?
+
+0239 left the question one step further in: the destination address is
+right (`RB_2D_DST` reads back the buffer's iova), the pitch and control
+words are exactly the ones replayed, CP_PROTECT_STATUS and CP_HW_FAULT are
+zero, FSR shows no fault -- and the blit writes 0 of 64 sampled dwords,
+while a CP_MEM_WRITE into that same client buffer, in the same IB, lands.
+So the address, the mapping and the CP are all fine and the colour never
+appears.
+
+This points the same blit at a page that is deliberately unmapped and
+clears FSR/GFSR first: a translation fault (FSR 0x402) with CB_FAR naming
+the destination means the engine did issue the write and the loss is in
+where it went; no fault at all means the write never reaches the memory
+system, i.e. the RB/CCU drops it. The canary still goes to the mapped
+second page, so a landed canary proves the CP ran the IB either way. One
+row is drawn, so only the unmapped page is touched.
+
+It runs last: a fault with no handler can stall the block.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -211,6 +211,7 @@
+ 	uint64_t scratchCarve(uint64_t bytes);
+ 	void run2dFill(void);
+ 	void run2dSurfaceFill(void);
++	void run2dFault(void);
+ 	uint32_t expandGroups(const uint8_t *in, uint32_t size, uint8_t *out,
+ 	    uint32_t outMax);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+@@ -240,6 +241,7 @@
+ 	bool fSyncAll;
+ 	bool f2dFillDone;           /* the gpu2dfill test ran */
+ 	bool f2dSurfaceDone;        /* the surface fill ran */
++	bool f2dFaultDone;          /* the unmapped-destination blit ran */
+ 	uint32_t fSyncLogged;
+ };
+ 
+@@ -351,6 +353,7 @@
+ 	fSurfaceLogged = 0;
+ 	f2dFillDone = false;
+ 	f2dSurfaceDone = false;
++	f2dFaultDone = false;
+ 	if (fLock == NULL) {
+ 		return false;
+ 	}
+@@ -788,7 +791,7 @@
+ 
+ static uint32_t
+ mondrian_uc_2dfill_words(uint32_t *words, uint64_t iova, uint64_t canary,
+-    uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3)
++    uint32_t rows, uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3)
+ {
+ 	static const uint32_t ib[51] = {
+ 		0x408c0001u, 0x10f00380u,	/* RB_2D_BLIT_CNTL */
+@@ -835,6 +838,8 @@
+ 	words[at + 20] = c3;
+ 	words[at + 28] = (uint32_t)iova;
+ 	words[at + 29] = (uint32_t)(iova >> 32);
++	/* GRAS_2D_DST_BR: the last row and column the blit covers. */
++	words[at + 33] = ((rows - 1u) << 16) | 0x0fffu;
+ 	/* After the blit's last CP_WAIT_FOR_IDLE: what the CP can write here. */
+ 	n += mondrian_gpu_uc_mem_write(words + n, canary, 0xcafe1234u);
+ 	return n;
+@@ -870,7 +875,7 @@
+ 		}
+ 	}
+ 	n = mondrian_uc_2dfill_words(words, dst->iova, dst->iova + 0x1000,
+-	    0xff, 0x00, 0xff, 0xff);
++	    25, 0xff, 0x00, 0xff, 0xff);
+ 	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
+ 		IOLog("MondrianGPU: 2d fill: ib write failed\n");
+ 		return;
+@@ -946,7 +951,7 @@
+ 		return;
+ 	}
+ 	n = mondrian_uc_2dfill_words(words, iova, iova + 0x1000,
+-	    0xff, 0x00, 0xff, 0xff);
++	    25, 0xff, 0x00, 0xff, 0xff);
+ 	if (ib->memory->writeBytes(0, words, n * 4) == n * 4) {
+ 		bufferSync(ib);
+ 		submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
+@@ -958,6 +963,88 @@
+ 	bufferFree(ib);
+ }
+ 
++/*
++ * gpu2dfault=1: the same blit, aimed at a page the SMMU does not map.
++ *
++ * 0239 measured everything except whether the engine writes at all: the 2D
++ * state registers read back exactly as written (`dst 0x14ae4000`, `pitch
++ * 0x40`), `CP_PROTECT` refused nothing, the fence completed, the CP wrote a
++ * canary into that same client buffer -- and the blit left 0 of 64 sampled
++ * dwords. A write into an unmapped page is the one way to see the write
++ * itself: if the engine issues it, the SMMU latches a translation fault and
++ * `CB_FAR` names the address it tried; if nothing faults, the blit never
++ * reaches the memory system and the loss is inside the RB/CCU.
++ *
++ * One row, so only the unmapped first page is touched, and the canary goes to
++ * the second page, which stays mapped: if the canary lands, the CP ran this
++ * IB and the fault, or its absence, belongs to the blit. Run last: a fault
++ * with no handler can leave the block stalled.
++ */
++void
++MondrianGPUUserClient::run2dFault(void)
++{
++	mondrian_buffer *dst, *ib;
++	uint32_t words[64], zeros[16];
++	uint32_t n, fence = 0, got = 0, fsr = 0, gfsr = 0;
++	uint64_t far = 0;
++	int submitted, polled;
++
++	{
++		static int parsed, on;
++
++		if (!parsed) {
++			parsed = 1;
++			if (!PE_parse_boot_argn("gpu2dfault", &on, sizeof(on))) {
++				on = 0;
++			}
++		}
++		if (!on) {
++			return;
++		}
++	}
++	IOLockLock(fLock);
++	dst = bufferNew(0x2000);
++	ib = bufferNew(0x1000);
++	IOLockUnlock(fLock);
++	if (dst == NULL || ib == NULL) {
++		IOLog("MondrianGPU: 2d fault: no buffer\n");
++		return;
++	}
++	memset(zeros, 0, sizeof(zeros));
++	(void)dst->memory->writeBytes(0, zeros, sizeof(zeros));
++	(void)dst->memory->writeBytes(0x1000, zeros, sizeof(zeros));
++	if (mondrian_gpu_uc_unmap_page(dst->iova) != 0 ||
++	    mondrian_gpu_uc_tables_sync() != 0) {
++		IOLog("MondrianGPU: 2d fault: unmap failed\n");
++		bufferFree(ib);
++		bufferFree(dst);
++		return;
++	}
++	n = mondrian_uc_2dfill_words(words, dst->iova, dst->iova + 0x1000,
++	    1, 0xff, 0x00, 0xff, 0xff);
++	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
++		IOLog("MondrianGPU: 2d fault: ib write failed\n");
++		return;
++	}
++	bufferSync(ib);
++	bufferSync(dst);
++	mondrian_gpu_uc_fault_clear();
++	submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
++	polled = submitted && mondrian_gpu_uc_wait(fence, 1000) == 0;
++	if (polled) {
++		fsr = mondrian_gpu_uc_fault_state(&gfsr);
++		far = mondrian_gpu_uc_fault_addr();
++	}
++	bufferSync(dst);
++	(void)dst->memory->readBytes(0x1000, &got, sizeof(got));
++	IOLog("MondrianGPU: 2d fault iova 0x%llx submit %d poll %d fence %u"
++	    " canary got 0x%08x fsr 0x%x gfsr 0x%x far 0x%llx\n",
++	    (unsigned long long)dst->iova, submitted, polled, fence, got, fsr,
++	    gfsr, (unsigned long long)far);
++	bufferFree(ib);
++	bufferFree(dst);
++}
++
+ IOReturn
+ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ {
+@@ -1321,6 +1408,10 @@
+ 			f2dSurfaceDone = true;
+ 			run2dSurfaceFill();
+ 		}
++		if (!f2dFaultDone) {
++			f2dFaultDone = true;
++			run2dFault();
++		}
+ 	}
+ 	IOFreeData(cmds, cmd_bytes);
+ 	IOFreeData(bos, bo_bytes);
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3945,6 +3945,19 @@
+  * The SMMU's latched syndrome, for a caller that cleared it first: FSR is the
+  * context bank's, GFSR the global one. Read-only.
+  */
++/*
++ * The input address of the last fault, for a caller that cleared the latch
++ * first. Zero when nothing faulted.
++ */
++uint64_t
++mondrian_gpu_uc_fault_addr(void)
++{
++	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
++		return 0;
++	}
++	return mondrian_smmu_read64(mondrian_uc_smmu, mondrian_uc_tlb_ctx + 0x60u);
++}
++
+ uint32_t
+ mondrian_gpu_uc_fault_state(uint32_t *gfsr)
+ {
+@@ -4989,6 +5002,12 @@
+ 	return 0;
+ }
+ 
++uint64_t
++mondrian_gpu_uc_fault_addr(void)
++{
++	return 0;
++}
++
+ void
+ mondrian_gpu_uc_2d_state(uint32_t *out)
+ {
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -48,6 +48,7 @@
+ uint64_t mondrian_gpu_uc_surface_iova(void);
+ void mondrian_gpu_uc_fault_clear(void);
+ uint32_t mondrian_gpu_uc_fault_state(uint32_t *gfsr);
++uint64_t mondrian_gpu_uc_fault_addr(void);
+ void mondrian_gpu_uc_2d_state(uint32_t *out);
+ uint32_t mondrian_gpu_uc_mem_write(uint32_t *buf, uint64_t dst,
+     uint32_t value);

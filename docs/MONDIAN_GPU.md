@@ -555,6 +555,19 @@ them has Metal. That is the path this port follows.
   its old value, and these read back as written. (Register reads are only
   valid once the fence has answered; a wedged CP stops answering the register
   port and the read never returns.)
+- **The blit issues no memory transaction at all.** `0240` points the same
+  blit at a page it has just unmapped and cleared FSR/GFSR first. Measured:
+  `2d fault ... submit 1 poll 1 fence 10 canary got 0xcafe1234 fsr 0x400
+  gfsr 0x0`, where the canary still arrives on the mapped page, so the CP ran
+  the IB. A write into an unmapped page raises a translation fault if the
+  engine issues it; none appears, so no fragment is produced, or the pixels go
+  no further than a cache. `gfx pwr clk 0x0` (the GMU's GX GDSC + GX clock
+  status) and `replay ... protect 0x0` together say it is not power, clock or
+  a refused register write. Note that a write which sits in the CCU would also
+  fault only when it is evicted, so "no fault" alone does not yet separate
+  "never drawn" from "never cleaned"; `gpu2dbig=1` (`0241`) blits 8 MiB, more
+  than the colour cache can hold, and reads the first rows, which a cache that
+  spills must have written back.
 - **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
   `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
   array, 12 groups of 255 waves, the register writes that aim it, and
