@@ -6,6 +6,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <execinfo.h>
 #import <mach/mach.h>
+#import <mach/mach_time.h>
 #import <mach/thread_act.h>
 #import <mach/thread_state.h>
 #import <mach/thread_info.h>
@@ -883,6 +884,11 @@ load_gpu_test(void)
  * main one is a stuck main run loop.
  */
 static volatile uint64_t mondrian_link_ticks[2];
+static volatile uint64_t mondrian_timer_ticks;
+static volatile uint64_t mondrian_wait_ticks;
+static CADisplayLink *mondrian_main_link;
+static volatile double mondrian_link_duration;
+static volatile double mondrian_link_timestamp;
 
 @interface MondrianLinkTarget : NSObject
 @property(nonatomic) int which;
@@ -894,7 +900,113 @@ static volatile uint64_t mondrian_link_ticks[2];
 	(void)link;
 	mondrian_link_ticks[self.which]++;
 }
+
+- (void)timerTick:(NSTimer *)timer
+{
+	(void)timer;
+	mondrian_timer_ticks++;
+}
 @end
+
+/*
+ * Two counters beside the links, because "the link never fires" has three
+ * different causes and the fix differs for each. A plain one-second NSTimer on
+ * the same run loop says whether the run loop serves timers at all; a thread
+ * that only ever calls mach_wait_until says whether an absolute deadline in
+ * this kernel wakes a user thread.
+ */
+static void *
+mondrian_wait_run(void *unused)
+{
+	mach_timebase_info_data_t tb;
+	uint64_t period;
+
+	(void)unused;
+	mach_timebase_info(&tb);
+	period = tb.numer != 0 ? (uint64_t)1000000000ULL * tb.denom / tb.numer : 24000000ULL;
+	for (;;) {
+		mach_wait_until(mach_absolute_time() + period);
+		mondrian_wait_ticks++;
+	}
+	return NULL;
+}
+
+/*
+ * Boot-arg mondrianmain=1: every two seconds, one sample of the main thread's
+ * pc and frame-pointer chain, resolved to symbols. The sampler above follows
+ * the busiest thread, which on this port is always an idle libdispatch worker;
+ * when the main run loop stops being serviced (no CADisplayLink, no NSTimer)
+ * this is what says where the main thread actually is.
+ */
+static void
+mondrian_main_frame(uint64_t addr, char *out, size_t size)
+{
+	Dl_info info;
+
+	if (addr == 0) {
+		snprintf(out, size, "-");
+		return;
+	}
+	if (dladdr((void *)addr, &info) != 0 && info.dli_sname != NULL) {
+		snprintf(out, size, "%s+%ld", info.dli_sname,
+		    (long)((char *)addr - (char *)info.dli_saddr));
+		return;
+	}
+	snprintf(out, size, "%llx", (unsigned long long)addr);
+}
+
+static void *
+mondrian_main_watch(void *unused)
+{
+	(void)unused;
+	for (int n = 0; n < 90; n++) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+		char line[420], f[6][72];
+		uint64_t fp;
+		int used = 0;
+
+		sleep(2);
+		if (mondrian_main_thread == MACH_PORT_NULL) {
+			continue;
+		}
+		if (thread_get_state(mondrian_main_thread, ARM_THREAD_STATE64,
+		    (thread_state_t)&state, &count) != KERN_SUCCESS) {
+			continue;
+		}
+		mondrian_main_frame(state.__pc, f[0], sizeof(f[0]));
+		mondrian_main_frame(state.__lr, f[1], sizeof(f[1]));
+		fp = state.__fp;
+		for (int i = 2; i < 6 && fp >= 0x100000000ULL; i++) {
+			uint64_t frame[2];
+			vm_size_t got = 0;
+
+			if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
+			    sizeof(frame), (vm_address_t)frame, &got) != KERN_SUCCESS ||
+			    got != sizeof(frame) || frame[1] == 0) {
+				break;
+			}
+			mondrian_main_frame(frame[1], f[i], sizeof(f[i]));
+			used = i;
+			fp = frame[0];
+		}
+		used = used < 2 ? 2 : used + 1;
+		{
+			char *p = line;
+			size_t left = sizeof(line);
+
+			int k = snprintf(p, left, "MONDRIAN UI: main pid %d", getpid());
+			p += k; left -= (size_t)k;
+			for (int i = 0; i < used && left > 8; i++) {
+				k = snprintf(p, left, " %s", f[i]);
+				p += k; left -= (size_t)k;
+			}
+			snprintf(p, left, "\n");
+		}
+		say(line);
+	}
+	return NULL;
+}
 
 static void *
 mondrian_link_run(void *unused)
@@ -929,12 +1041,22 @@ mondrian_link_report(void *unused)
 {
 	(void)unused;
 	for (int i = 0; i < 150; i++) {
-		char line[96];
+		char line[128];
 
 		sleep(1);
-		snprintf(line, sizeof(line), "MONDRIAN UI: link main %llu own %llu\n",
+		if (mondrian_main_link != nil) {
+			mondrian_link_duration = mondrian_main_link.duration;
+			mondrian_link_timestamp = mondrian_main_link.timestamp;
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: link pid %d main %llu own %llu timer %llu wait %llu dur %d ts %d\n",
+		    getpid(),
 		    (unsigned long long)mondrian_link_ticks[0],
-		    (unsigned long long)mondrian_link_ticks[1]);
+		    (unsigned long long)mondrian_link_ticks[1],
+		    (unsigned long long)mondrian_timer_ticks,
+		    (unsigned long long)mondrian_wait_ticks,
+		    (int)(mondrian_link_duration * 1000.0),
+		    (int)mondrian_link_timestamp);
 		say(line);
 	}
 	return NULL;
@@ -951,6 +1073,7 @@ mondrian_link_probe(void)
 	}
 	dispatch_async(dispatch_get_main_queue(), ^{
 		CADisplayLink *link;
+		NSTimer *timer;
 
 		main_target = [[MondrianLinkTarget alloc] init];
 		main_target.which = 0;
@@ -958,14 +1081,23 @@ mondrian_link_probe(void)
 		    selector:@selector(tick:)];
 		if (link == nil) {
 			say("MONDRIAN UI: link main: no link\n");
-			return;
+		} else {
+			[link addToRunLoop:[NSRunLoop mainRunLoop]
+			    forMode:NSRunLoopCommonModes];
+			mondrian_main_link = link;
+			say("MONDRIAN UI: link main armed\n");
 		}
-		[link addToRunLoop:[NSRunLoop mainRunLoop]
+		timer = [NSTimer timerWithTimeInterval:1.0 target:main_target
+		    selector:@selector(timerTick:) userInfo:nil repeats:YES];
+		[[NSRunLoop mainRunLoop] addTimer:timer
 		    forMode:NSRunLoopCommonModes];
-		say("MONDRIAN UI: link main armed\n");
+		say("MONDRIAN UI: timer armed\n");
 	});
 	if (pthread_create(&thread, NULL, mondrian_link_run, NULL) != 0) {
 		say("MONDRIAN UI: link own thread failed\n");
+	}
+	if (pthread_create(&thread, NULL, mondrian_wait_run, NULL) != 0) {
+		say("MONDRIAN UI: wait thread failed\n");
 	}
 	if (pthread_create(&thread, NULL, mondrian_link_report, NULL) != 0) {
 		say("MONDRIAN UI: link report failed\n");
@@ -984,6 +1116,13 @@ mondrian_install_ui_hooks(void)
 	install_display_diagnostic();
 	install_activation_hooks();
 	start_heartbeat();
+	if (boot_arg_set("mondrianmain=1")) {
+		pthread_t thread;
+
+		if (pthread_create(&thread, NULL, mondrian_main_watch, NULL) != 0) {
+			say("MONDRIAN UI: main watch failed\n");
+		}
+	}
 	mondrian_link_probe();
 	load_gpu_test();
 }

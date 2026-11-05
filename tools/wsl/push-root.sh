@@ -64,6 +64,9 @@ usage: tools/wsl/push-root.sh --save-base
                  (default: IMAGE with .work.img)
 
 The diff push needs the phone in recovery with adb; --flash needs fastboot.
+ADB must reach exactly one device: with another adb target on the workstation
+(wireless debugging), every call here fails with "more than one device" -- set
+ADB to a wrapper that appends -s SERIAL.
 Environment: ADB, FASTBOOT, DUMP_MIB, PUSH_STAGE.
 EOF
 }
@@ -346,6 +349,10 @@ flash_cmd() {
 	free=$(df -Pm "$repo/backup" | awk 'NR == 2 { print $4 }')
 	# fastboot.exe is a Windows binary: it cannot open /root or a WSL /mnt path
 	# spelled the Linux way, so the sparse file is written where it can see it.
+	# Nothing else may read that file while fastboot streams it: a concurrent
+	# 15 GiB read (grep on the image) made fastboot stop at chunk 182 of 232
+	# with "Error reading sparse file", and the partition was left half
+	# written. The image itself was fine; the write was simply redone.
 	say "building the sparse image at $win (${free} MiB free there)"
 	python3 "$repo/tools/mk-simg.py" "$image" "$win"
 	wpath=$(wslpath -w "$win")
