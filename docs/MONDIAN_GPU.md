@@ -804,27 +804,46 @@ them has Metal. That is the path this port follows.
   with no other change. What is left of the frame is the `waiting` slice,
   8-18 ms, which is the blit into the surface plus the fence that sends the
   batch on (`glsync=0` drops the fence).
-- **The frame rate follows a display link the port does not have.** `glframes=1`
-  logs one line a frame; the bursts that do run are at the panel rate (11-17 ms
-  apart, 5-49 draws, 0.2-0.5 s long) and everything between them is silence,
-  which is CoreAnimation's design for a still screen. Feeding a synthetic
-  finger at 62 positions a second for three seconds (`0255`, boot-arg
-  `mondriandrag=8`) produced 0-3 frames a sweep, so the digitizer's rate is not
-  what the UI waits for. Counted in the driver (`0256`): the window server
-  calls the framebuffer in 6 of 116 seconds, never more than 18 swaps a second,
-  and `sel 4:0 5:0 6:0` in every second of the drag. backboardd carries
-  `BKDisplayLink`, `BKDigitizerEventSchedulerWithDisplayLink` and
-  `_dispatchingTouchesOnDisplayLink`, so digitizer events are parked until a
-  display link tick; between ticks the lock screen's clock does not advance.
-  The compositor is not slow, it is not running, and the panel's report rate
+- **The frame rate is set by SpringBoard's main run loop, not by a missing
+  display link.** Measured with `CADisplayLink`s of the probe's own
+  (`mondrianlink=1`): the link exists, `duration` is 16 ms, and on a thread of
+  its own it ticks thousands of times a boot, so CADisplayLink is neither
+  absent nor kernel-driven -- it never asks the framebuffer for vsync (`sel
+  9:0` and `72` uncalled in every second) and `mach_wait_until` fires exactly
+  once a second (`wait` matches the seconds elapsed), so the kernel's deadlines
+  are fine. In the same boot backboardd's main link runs while SpringBoard's
+  does not: one cache dump per second reads `link pid 27 main 2 own 932 timer
+  18 wait 72` -- the main run loop serves a 1 Hz `NSTimer` 18 times in 72 s and
+  the 60 Hz link twice, and between those it is blocked. Frames follow it:
+  the same boot swaps in bursts of 3, 30, 1, 30 fps and nothing in between
+  (147 seconds of `fps 0` when the loop never ran). Everything else is ready:
+  the digitizer rate is not what the UI waits for (`mondriandrag=8` at 62
+  positions a second draws 0-3 frames a sweep), and the panel's report rate
   (`0xC0` to the IC, 240 to 480 Hz) is a later problem.
+- **A volume written by `--flash` needs two boots.** The first boot after the
+  whole-partition write draws nothing at all (`fps 0` for 147 s) and kills
+  `mobileactivationd` (`exit mobileactivation[137] status 0x9`) while it
+  creates the containers and the activation ark; the second boot draws (bursts
+  of 27-30 fps) and the links run at 40+ ticks a second instead of 7. Reflash
+  only when the root has to change, and read the frame counters from the
+  second boot onwards.
 - **The vsync registration selector is 9, not 72.** The documented
   IOMobileFramebuffer ABI (The Apple Wiki, `Dev:IOMobileFramebuffer`) puts
   `setVSyncNotifications(functionAddress, userData)` at selector 9, with the
   mach port delivered through `IOConnectSetNotificationPort`; the port's
   method 72 takes three arguments and no ABI has it. `0256` implements 9 beside
-  72 and counts every selector call. Nothing calls either yet (`9:0` every
-  second), so the 60 Hz timer in the driver still has no client to notify.
+  72 and counts every selector call. Nothing calls either (`9:0` every second)
+  even in boots whose links tick, so the 60 Hz timer in the driver has no
+  client and CoreAnimation is not the one that would have been waiting for it.
+- **The panel console is silenced when the framebuffer starts, not at the first
+  swap.** `mondrianfb_noconsole=1` (in the board cmdline) used to take effect
+  inside the first swap, and the UI can go a minute without one, so the HID and
+  FB traces stayed painted over the lock screen; `0257` applies the switch at
+  the end of `AppleCLCD::start()` and drops the liveness marker with it.
+  `mondrian_early_status()` -- the `console N chars/s, M behind` row, painted
+  below the text area and outside the console -- ignored the flag and had to be
+  gated on the same switch. The ring keeps every line, and
+  `mondrianfb_noconsole=0` in the extra args brings the screen console back.
 - **The GMU is voted once, at the idle OPP.** The boot prints `MONDRIAN GPU:
   hfi power gpu 2 bus 2, 285 MHz`: the HFI power vote carries perf index 2,
   which this port's table maps to 285 MHz and which kgsl uses while no client

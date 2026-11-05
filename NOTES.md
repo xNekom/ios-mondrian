@@ -293,9 +293,10 @@ can wrap; guard with `nent > BOUNCE_SIZE / esz` in the patch that enables writes
 `fsck.hfsplus -fy` on a copy of the 16 GiB root names the damage: overlapped
 extents, a bad volume bitmap and a wrong free-block count; repeat `-fn` until it
 says `appears to be OK`, then push the changed blocks back. The volume is
-non-journaled (`0x80000100`), so a hard reset dirties it again and the kernel then
-mounts it read-only: repair before blaming a B-tree, and do not hand-write the
-header unless fsck cannot. A zeroed extents node (block 2178, `0x882000`) still
+non-journaled (`0x80000100`), so a hard reset dirties it again; once the damage
+reaches the allocation-block count (`Invalid number of allocation blocks`) the
+dump fails fsck, `--save-base` has no base to write, and the root has to be
+rebuilt from a clean image. A zeroed extents node (block 2178, `0x882000`) also
 means restoring the gzip image; the live GPT is the single `userdata`.
 
 ## Display

@@ -1,0 +1,86 @@
+xnu 0257: give the panel to the UI when the framebuffer starts, not at the first swap
+
+mondrianfb_noconsole=1 was already in the cmdline but only took effect inside
+the first swap, and the UI can spend a minute without producing one: every line
+the kernel printed in the meantime (the HID and FB traces, the liveness marker)
+stayed painted on top of it. Apply the switch at the end of AppleCLCD::start(),
+right after the panel line is logged, so the screen belongs to the window server
+from the moment the display exists. The ring keeps the same text and a boot with
+mondrianfb_noconsole=0 keeps the screen console.
+
+The status row is the one that survives even that: mondrian_early_status()
+paints below the text area and did not consult the flag the console itself
+honours, so "console N chars/s, M behind" kept appearing over the lock screen.
+Gate it on the same switch.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -267,6 +267,7 @@
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
++	bool          fQuietScreen;      /* mondrianfb_noconsole at start */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -310,6 +311,8 @@
+ 	fCopyTicks = fCopyMaxTicks = 0;
+ 	fLateTicks = fLateMaxTicks = 0;
+ 	fFpsLog = false;
++	fConsolePaused = false;
++	fQuietScreen = false;
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+@@ -429,6 +432,26 @@
+ 	mondrian_publish_accelerator(provider);
+ 	IOLog("MONDRIAN FB: AppleCLCD panel %ux%u canvas %ux%u stride %u at 0x%llx, default surface %u\n",
+ 	    fWidth, fHeight, fCanvasWidth, fCanvasHeight, fRowBytes, fPhys, fSurface->id);
++	/*
++	 * mondrianfb_noconsole=1 takes the screen away from the console here, not
++	 * at the first swap: the UI can spend a minute without producing a frame,
++	 * and everything printed in the meantime (the HID and FB lines, the
++	 * early status row) stays painted on top of it. The ring keeps the same
++	 * text, and a boot with mondrianfb_noconsole=0 keeps the screen console.
++	 */
++	{
++		int quiet = 0;
++
++		if (PE_parse_boot_argn("mondrianfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
++			extern int disableConsoleOutput;
++			extern int mondrian_fbcon_quiet;
++
++			fQuietScreen = true;
++			disableConsoleOutput = 1;
++			mondrian_fbcon_quiet = 1;
++			IOLog("MONDRIAN FB: screen console off at start (mondrianfb_noconsole=1)\n");
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -461,7 +484,8 @@
+ 	 * with the console at the first swap, when the UI owns the screen.
+ 	 * Drawn before the sampler below, whose printf can block.
+ 	 */
+-	if (!fb->fConsolePaused && (count % (MONDRIAN_FB_REFRESH_HZ / 2)) == 0) {
++	if (!fb->fQuietScreen && !fb->fConsolePaused &&
++	    (count % (MONDRIAN_FB_REFRESH_HZ / 2)) == 0) {
+ 		uint32_t phase = (uint32_t)((count / (MONDRIAN_FB_REFRESH_HZ / 2)) & 1);
+ 		uint8_t *row = (uint8_t *)fb->fPixels + (size_t)(phase ? 72 : 16) * fb->fRowBytes;
+ 
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -257,7 +257,12 @@
+ {
+ 	unsigned int row = early_row;
+ 	unsigned int col = early_col;
++	extern int mondrian_fbcon_quiet;
+ 
++	/* The UI owns the panel: the status row goes with the console. */
++	if (mondrian_fbcon_quiet) {
++		return;
++	}
+ 	early_row = EARLY_HUD_ROW0;
+ 	early_col = 0;
+ 	mondrian_early_clear_row();
