@@ -775,14 +775,11 @@ them has Metal. That is the path this port follows.
   of that surface, and the draws that fill it now run on the GPU: the lock
   screen's first frames are `136 GL calls, 4 draws, 8 triangles` and later
   `316 GL calls, 44 draws, 228 triangles`, with the clock's glyphs white and in
-  place. The wallpaper is black because nothing ever draws it: CollectionsPoster
-  makes the poster surface (`MONDRIAN SURF: CollectionsPoster create id 11
-  1326x1326 fmt 0x4c303038`) and is then killed by the scene-create watchdog
-  (`CRASH CollectionsPoste reason ns 10 code 0x8badf00d: ... scene-create
-  watchdog transgression`) before it fills it, so the panel shows that
-  surface's memory: zeros give the black wallpaper, and `gpusurfpat=1`, which
-  fills a fresh surface with `0xffffffff`, gives the white one the port used to
-  report as a texture-upload failure. Geometry is not the fault line.
+  place. The wallpaper is black because nothing ever draws it (see the
+  CollectionsPoster bullet below), so the panel shows the poster surface's
+  memory: zeros give the black wallpaper, and `gpusurfpat=1`, which fills a
+  fresh surface with `0xffffffff`, gives the white one the port used to report
+  as a texture-upload failure. Geometry is not the fault line.
 - **Installing the userland into the root image is one pass.** Mesa's
   `libOSMesa.8.dylib` goes to `/usr/lib` (its install name), the UI hook and
   the GPU test to `/usr/libexec`:
@@ -790,20 +787,39 @@ them has Metal. That is the path this port follows.
   --mesa out/mesa/stage`, then `tools/mk-simg.py` and
   `tools/flash-root.sh`. The kernel only injects the UI hook
   (`mondrian_ui_hook`), so everything else hangs off it.
-- **A lock-screen frame costs its submissions, not its draws.** Measured with
-  the secure-mode switch on and the compositor drawing through the GPU: `0
-  pictures copied out, 1 drawn in place`, 25-47 draws and 182-1122 GL calls a
-  frame, fps peaking at 22 while the screen is touched and falling to 0 when it
-  is still (CoreAnimation draws on change, so a still screen asks for no frame),
-  the panel copy 2-6 ms and `late avg` 8-17 ms. Inside a frame `glFlush`
-  ranged 0.4-921 ms, and a 202-call frame cost 17.8 ms while a 1159-call one
-  cost 22.5 ms, so the time is per submission and not per call: `gpusubtime=1`
-  (`0251`) writes one line a submission with the writeback slice, the client
-  calls since the last one and the bytes written back. The sub-case that can
-  block for a second is the ring: `mondrian_gpu_uc_submit` waits for CP room in
-  1 ms steps and gives up after 2 s, and every process that opens a
-  `MondrianGPU` client submits to the same ring while each client only takes
-  its own `fLock`. The firmware blocks, the GMU context bank and the CM3 start
+- **A lock-screen frame costs its submissions, not its draws, and the
+  writeback was the submission.** Measured with the secure-mode switch on and
+  the compositor drawing through the GPU: `0 pictures copied out, 1 drawn in
+  place`, 25-47 draws and 182-1122 GL calls a frame, the panel copy 2-6 ms and
+  `late avg` 8-17 ms. `gpusubtime=1` (`0251`) then put 93 % of every submission
+  in `bufferSync`: 84 MB written back per submission, 1773 us at the median and
+  7875 us at p90, because every buffer the task had mapped was written back on
+  every submission -- including the two 23 MB surfaces the compositor renders
+  into, which the CPU never wrote. `gpusyncmapmax=8192` (`0252`) stops that
+  for mapped buffers above 8 MiB and leaves the small ones (poster, textures,
+  staging blob, command buffers) exactly as they were: the same boot measures
+  409 us at the median, 2248 us at p90, 22.8 MB a submission, and the frame's
+  `glFlush` falls from p90 25.9 ms / max 213 ms to p90 5.3 ms / max 9.9 ms
+  with no other change. What is left of the frame is the `waiting` slice,
+  8-18 ms, which is the blit into the surface plus the fence that sends the
+  batch on (`glsync=0` drops the fence).
+- **The wallpaper is a killed poster.** CollectionsPoster makes the poster
+  surface (`MONDRIAN SURF: CollectionsPoster create id 11 1326x1326 fmt
+  0x4c303038`) and dies before it draws one frame -- no `|CollectionsPoste|
+  mondrian-gl: frame` line ever appears. Which kill depends on how fast the
+  frames are: with the slow frames of `glcopy=1` it is the scene-create
+  watchdog (`reason ns 10 code 0x8badf00d`), and with `gpusyncmapmax=8192` it
+  is `reason ns 7 code 0x3: extension check-in timeout`, after three poster
+  surfaces in a row. Either way the surface is never filled and the panel
+  shows its memory, which is why the wallpaper is black with `gpusurfpat=0`
+  and white with `gpusurfpat=1`. Fix the check-in, not the texture path.
+- **One ring, one lock.** Every `MondrianGPU` client (backboardd,
+  SpringBoard, the poster extensions, mediaserverd) submits to the same CP
+  ring, whose cursor, fence sequence and memptr slots are file-static in
+  `mondrian_gpu.c`, but `MondrianGPUUserClient` gave each client its own
+  `fLock`: a client only serialised against itself. The ring-room wait is
+  1 ms-polled and gives up after 2 s.
+  The firmware blocks, the GMU context bank and the CM3 start
   are in `mondrian_gpu.c` under `gmustart=1`.
 - **The present path is the GPU's, measured on the secure-mode boot.** With
   `glcopy=1` a frame is `1 picture copied out` at ~11 ms; with `glcopy=0

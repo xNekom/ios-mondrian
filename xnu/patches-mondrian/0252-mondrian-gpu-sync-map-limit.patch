@@ -1,0 +1,65 @@
+xnu 0252: a mapped buffer of many MiB is not written back every submission
+
+gpusubtime=1 answers the question the frame line could not: of an 8.0 ms
+submission, 7.8 ms is bufferSync, and it writes back 84 MB of buffers the task
+holds a mapping of -- the two 23 MB surfaces the compositor renders into plus
+everything else it touched. Those bytes are the GPU's writes: the CPU never
+wrote them, the GPU has to read them back, and the panel copy already
+invalidates the surface it reads (mondrian_fb_clean), so the writeback buys
+nothing and costs the largest slice of the frame.
+
+gpusyncmapmax=<KiB> caps it: a mapped buffer larger than that is written back
+only when it is a command stream or the kernel wrote it. At 8192 the two
+display surfaces stop being written back and the small ones (the poster,
+textures, the staging blob, command buffers of a few KiB) are treated exactly
+as before, so a CPU-written texture still reaches the CP. 0 is the old rule.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -157,6 +157,29 @@
+ }
+ 
+ /*
++ * gpusyncmapmax=<KiB>: a mapped buffer larger than that is written back only
++ * when it is a command stream or the kernel wrote it, not because the task
++ * holds a mapping of it. Measured with gpusubtime=1: a submission wrote back
++ * 84 MB of mapped buffers in 7.8 ms of an 8.0 ms call, and the two 23 MB
++ * surfaces the compositor renders into are most of it -- bytes the CPU never
++ * wrote, which the GPU then reads back. The panel copy invalidates what it
++ * reads (mondrian_fb_clean), so the display surface needs no writeback here.
++ * Zero keeps the old rule: every mapped buffer is written back.
++ */
++static uint32_t
++mondrian_sync_map_max(void)
++{
++	static int parsed;
++	static uint32_t limit;
++
++	if (parsed == 0) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("gpusyncmapmax", &limit, sizeof(limit));
++	}
++	return limit;
++}
++
++/*
+  * Whether a submission must write a buffer back depends on who can have
+  * written it since the last writeback:
+  *
+@@ -1462,6 +1485,7 @@
+ 	 * write into.
+ 	 */
+ 	syncStart = mach_absolute_time();
++	const uint32_t map_max = mondrian_sync_map_max() << 10;
+ 	for (i = 0; i < request->nr_bos; i++) {
+ 		mondrian_buffer *bo = bufferForType(bos[i].handle);
+ 		bool stream = false;
+@@ -1476,7 +1500,8 @@
+ 				stream = true;
+ 			}
+ 		}
+-		if (fSyncAll || stream || bo->dirty || bo->mapped) {
++		if (fSyncAll || stream || bo->dirty ||
++		    (bo->mapped && (map_max == 0 || bo->size <= map_max))) {
+ 			bufferSync(bo);
+ 			synced++;
+ 			syncedBytes += bo->size;
