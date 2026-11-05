@@ -485,13 +485,17 @@ them has Metal. That is the path this port follows.
   so no stale cache — reads `first 0x00000000`, alpha included, while the copy
   path had left `0xff000000` there. So the surface the panel scans is never
   written: the RB's stores do not reach DRAM, and that is upstream of both the
-  readback and the presentation. The CP's own writes do land in the same boot
-  (`cp memwrite ... canary 0x600dc0de fence 0x600dc0df`, `uc ... fence 7 done 1
-  in 0 ms`), so the difference is the render path, not the ring, the SMMU
-  attributes or the fences. The next measurement is kernel-side: a `CP_BLIT`
-  fill (the a730 SQE implements it, `sqe-a730.asm:2469`) into a known buffer,
-  which separates "the 2D/RB engine never runs" from "it runs and writes
-  somewhere else".
+  readback and the presentation. **The RB can write memory, though:** `0231`
+  puts a `RB_DONE_TS` (event 22, `WRITE_ENABLED`) in an IB and reads the
+  address back — `rb done ts 0x0000000000184541 fence 0x600dc0e1 polls 0 int 0
+  fault 0`, on the first poll, so the engine that draws writes a 64-bit
+  timestamp into DRAM with no fault and the CP's own writes land in the same
+  boot (`cp memwrite ... canary 0x600dc0de`, `uc ... done 1 in 0 ms`). What is
+  left is *where* a draw writes: the render target the stream names is not the
+  surface that is read, or the draws never run (a `CP_SET_DRAW_STATE` group
+  that is not applied leaves the RB pointed at the previous buffer). `glmark=1`
+  separates the two: it draws magenta into whatever is bound just before the
+  frame is handed on, and the probe reads it.
 - **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
   `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
   array, 12 groups of 255 waves, the register writes that aim it, and
