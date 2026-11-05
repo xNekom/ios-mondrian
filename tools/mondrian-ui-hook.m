@@ -3,13 +3,13 @@
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <execinfo.h>
 #import <mach/mach.h>
 #import <mach/thread_act.h>
 #import <mach/thread_state.h>
 #import <mach/thread_info.h>
 #import <dlfcn.h>
-#import <xpc/xpc.h>
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -873,6 +873,105 @@ load_gpu_test(void)
 	}
 }
 
+/*
+ * Boot-arg mondrianlink=1: two CADisplayLinks of our own, one on the main
+ * run loop and one on a run loop of a thread we start, and a line a second
+ * with how many times each fired. Everything the window server does with a
+ * finger and every animation CoreAnimation runs hang off this link; if it
+ * never fires, the clock stands still and touches are only parked. Two links
+ * tell the two failures apart: neither ticking is the link itself, only the
+ * main one is a stuck main run loop.
+ */
+static volatile uint64_t mondrian_link_ticks[2];
+
+@interface MondrianLinkTarget : NSObject
+@property(nonatomic) int which;
+@end
+
+@implementation MondrianLinkTarget
+- (void)tick:(CADisplayLink *)link
+{
+	(void)link;
+	mondrian_link_ticks[self.which]++;
+}
+@end
+
+static void *
+mondrian_link_run(void *unused)
+{
+	(void)unused;
+	@autoreleasepool {
+		MondrianLinkTarget *target = [[MondrianLinkTarget alloc] init];
+		CADisplayLink *link;
+
+		target.which = 1;
+		link = [CADisplayLink displayLinkWithTarget:target
+		    selector:@selector(tick:)];
+		if (link == nil) {
+			say("MONDRIAN UI: link own thread: no link\n");
+			return NULL;
+		}
+		[link addToRunLoop:[NSRunLoop currentRunLoop]
+		    forMode:NSDefaultRunLoopMode];
+		say("MONDRIAN UI: link own thread armed\n");
+		for (;;) {
+			@autoreleasepool {
+				[[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+				    beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.5]];
+			}
+		}
+	}
+	return NULL;
+}
+
+static void *
+mondrian_link_report(void *unused)
+{
+	(void)unused;
+	for (int i = 0; i < 150; i++) {
+		char line[96];
+
+		sleep(1);
+		snprintf(line, sizeof(line), "MONDRIAN UI: link main %llu own %llu\n",
+		    (unsigned long long)mondrian_link_ticks[0],
+		    (unsigned long long)mondrian_link_ticks[1]);
+		say(line);
+	}
+	return NULL;
+}
+
+static void
+mondrian_link_probe(void)
+{
+	static MondrianLinkTarget *main_target;
+	pthread_t thread;
+
+	if (!boot_arg_set("mondrianlink=1")) {
+		return;
+	}
+	dispatch_async(dispatch_get_main_queue(), ^{
+		CADisplayLink *link;
+
+		main_target = [[MondrianLinkTarget alloc] init];
+		main_target.which = 0;
+		link = [CADisplayLink displayLinkWithTarget:main_target
+		    selector:@selector(tick:)];
+		if (link == nil) {
+			say("MONDRIAN UI: link main: no link\n");
+			return;
+		}
+		[link addToRunLoop:[NSRunLoop mainRunLoop]
+		    forMode:NSRunLoopCommonModes];
+		say("MONDRIAN UI: link main armed\n");
+	});
+	if (pthread_create(&thread, NULL, mondrian_link_run, NULL) != 0) {
+		say("MONDRIAN UI: link own thread failed\n");
+	}
+	if (pthread_create(&thread, NULL, mondrian_link_report, NULL) != 0) {
+		say("MONDRIAN UI: link report failed\n");
+	}
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -885,5 +984,6 @@ mondrian_install_ui_hooks(void)
 	install_display_diagnostic();
 	install_activation_hooks();
 	start_heartbeat();
+	mondrian_link_probe();
 	load_gpu_test();
 }

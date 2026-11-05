@@ -35,7 +35,7 @@ note=
 work_opt=
 
 save_base=0
-dylib= inject= mesa=
+dylib= inject= mesa= ui_hook=
 flash=0 dry=0 force=0 assume_yes=0
 
 say() { echo "== $*"; }
@@ -49,6 +49,7 @@ usage: tools/wsl/push-root.sh --save-base
 
   --save-base    dump userdata to the base image, fsck it, write the note
   --dylib FILE   mondrian-gl.dylib to install into the copy
+  --ui-hook FILE the userland hook dylib to install into the copy
   --inject FILE  mondrian-inject.dylib to install into the copy
   --mesa DIR     directory holding libOSMesa.8.dylib
   --flash        rewrite userdata from the sparse image instead of pushing the
@@ -75,11 +76,12 @@ while [ $# -gt 0 ]; do
 	--force) force=1 ;;
 	--yes) assume_yes=1 ;;
 	-h|--help) usage; exit 0 ;;
-	--dylib|--inject|--mesa|--base|--note|--work)
+	--dylib|--ui-hook|--inject|--mesa|--base|--note|--work)
 		option=$1 value=${2:-}
 		[ -n "$value" ] || die "$option needs a value"
 		case "$option" in
 		--dylib) dylib=$value ;;
+		--ui-hook) ui_hook=$value ;;
 		--inject) inject=$value ;;
 		--mesa) mesa=$value ;;
 		--base) base=$value ;;
@@ -394,10 +396,11 @@ push_cmd() {
 		say "whole-partition write: the age of the base does not matter here"
 	fi
 
-	if [ -n "$dylib$inject$mesa" ]; then
+	if [ -n "$dylib$inject$mesa$ui_hook" ]; then
 		[ -z "$dylib" ] || [ -f "$dylib" ] || die "no $dylib"
 		[ -z "$inject" ] || [ -f "$inject" ] || die "no $inject"
 		[ -z "$mesa" ] || [ -f "$mesa/libOSMesa.8.dylib" ] || die "no $mesa/libOSMesa.8.dylib"
+		[ -z "$ui_hook" ] || [ -f "$ui_hook" ] || die "no $ui_hook"
 		need_fsck
 		work=${work_opt:-${base%.img}.work.img}
 		[ "$work" != "$base" ] || die "--work must not be the base image"
@@ -408,6 +411,7 @@ push_cmd() {
 		if [ -n "$dylib" ]; then args+=(--gl "$dylib"); fi
 		if [ -n "$inject" ]; then args+=(--inject "$inject"); fi
 		if [ -n "$mesa" ]; then args+=(--mesa "$mesa"); fi
+		if [ -n "$ui_hook" ]; then args+=(--ui-hook "$ui_hook"); fi
 		bash "$repo/tools/wsl/install-dylibs.sh" "$work" "${args[@]+"${args[@]}"}"
 		say "checking the installed image (fsck.hfsplus -fn)"
 		if ! out=$(fsck.hfsplus -fn "$work" 2>&1); then
@@ -434,13 +438,13 @@ push_cmd() {
 }
 
 if [ "$save_base" = 1 ]; then
-	[ -z "$dylib$inject$mesa" ] || die "--save-base takes no install options"
+	[ -z "$dylib$inject$mesa$ui_hook" ] || die "--save-base takes no install options"
 	[ "$flash" = 0 ] || die "--save-base does not flash"
 	save_base_cmd
 	exit 0
 fi
 
-if [ -z "$dylib$inject$mesa" ] && [ "$flash" = 0 ]; then
+if [ -z "$dylib$inject$mesa$ui_hook" ] && [ "$flash" = 0 ]; then
 	usage
 	exit 2
 fi
