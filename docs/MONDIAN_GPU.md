@@ -491,11 +491,27 @@ them has Metal. That is the path this port follows.
   fault 0`, on the first poll, so the engine that draws writes a 64-bit
   timestamp into DRAM with no fault and the CP's own writes land in the same
   boot (`cp memwrite ... canary 0x600dc0de`, `uc ... done 1 in 0 ms`). What is
-  left is *where* a draw writes: the render target the stream names is not the
-  surface that is read, or the draws never run (a `CP_SET_DRAW_STATE` group
-  that is not applied leaves the RB pointed at the previous buffer). `glmark=1`
-  separates the two: it draws magenta into whatever is bound just before the
-  frame is handed on, and the probe reads it.
+  left is *where* a draw writes, and `0232` reads that from the GPU itself:
+  after a stream's fence is answered it prints `RB_MRT_0_BASE`, `BUF_INFO`,
+  `PITCH` and `RB_RENDER_CNTL`, and `surfaceBuffer()` records the iova it gave
+  the IOSurface. Measured: with the boot's own self test in front, the RB still
+  had the test's 64x64 texture as its target (`pitch 256`) while the window
+  server's frames were being drawn; with `glselftest=0` it moves to the window
+  server's own buffer (`0x12251000`, `pitch 5888` = 1472 px) and never to the
+  surface (`0x10c24000`, `bpr 5760`). `FD_MESA_DEBUG=sysmem` changes neither
+  the target nor the outcome. So CoreAnimation draws into a texture of its own
+  and the surface is written only by the present, which is a blit on every
+  path: with `glcopy=0` eagl blits the frame into `image->mirror` (the
+  surface's memory) with `glBlitFramebuffer`, and with `glcopy=1` it reads the
+  frame back with `glReadPixels` first. Measured with `glcopy=1`: `1 picture
+  copied out`, 5-11 ms a frame spent copying, and the surface still
+  `first 0x00000000`. The fast blit is the 2D engine (`fd6_blitter.cc`'s
+  `emit_blit_texture` writes `GRAS_2D_*` and `CP_BLIT`), which
+  `FD_MESA_DEBUG=noblit` replaces with the generic 3D blitter. `glmark=1`
+  draws magenta into whatever is bound just before the frame is handed on, and
+  the probe reads it. The probe itself looked at four pixels of the first 64
+  rows, where a black corner and an empty surface look alike; `0234` samples a
+  grid over the whole surface and prints `nonzero N/M`.
 - **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
   `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
   array, 12 groups of 255 waves, the register writes that aim it, and

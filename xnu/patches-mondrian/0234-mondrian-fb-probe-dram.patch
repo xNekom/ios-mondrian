@@ -1,0 +1,139 @@
+xnu 0234: the framebuffer probe reads DRAM, over the whole surface
+
+Two ways the probe lied. It read four pixels of the first 64 rows, and a
+lock screen is black in that corner, so a frame that drew everything else read
+`first 0x00000000 rows 0x0`. And it read before the physical-address clean the
+copy to the panel does thirty lines below, while CoreAnimation's mapping of the
+same pages is cacheable, so it could report the zeros the CPU had cached before
+the GPU wrote. With noblit the RB is measured pointing at the surface itself
+(`rb target 0x10c24000 pitch 5760 | surface 2 iova 0x10c24000`) and the probe
+still read zero: that is the instrument, not the frame.
+
+Clean first, then sample a grid over the whole surface and print `nonzero
+N/M`: `nonzero 0/4600` is an empty surface, `nonzero 3000/4600` is a frame.
+The clean moves into one helper both callers use.
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -90,6 +90,41 @@
+  */
+ static int mondrian_fb_coherent = 1;
+ 
++/*
++ * Clean and drop the CPU's lines for a surface's pixels, by physical address.
++ * The framebuffer's mapping is Normal Non-Cacheable but CoreAnimation's own
++ * mapping of the same pages is cacheable, so DRAM is not what a plain read of
++ * either sees until this runs. The probe reads through it too: without it the
++ * probe reports what the CPU cached before the GPU wrote, which is how a
++ * correct frame reads as `first 0x00000000`.
++ */
++static void
++mondrian_fb_clean(MondrianSurface *s)
++{
++	uint64_t end, off;
++
++	if (s == NULL || s->memory == NULL || s->bytesPerRow == 0 ||
++	    s->height == 0) {
++		return;
++	}
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * s->height;
++	off = (uint64_t)s->offset;
++	while (off < end) {
++		IOByteCount length = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &length);
++
++		if (pa == 0 || length == 0) {
++			off += 0x4000;
++			continue;
++		}
++		if (off + length > end) {
++			length = (IOByteCount)(end - off);
++		}
++		(void)mondrian_gpu_uc_flush(pa, length);
++		off += length;
++	}
++}
++
+ #define MONDRIAN_FB_REFRESH_HZ             60
+ #define MONDRIAN_FB_TIMING_ID              1
+ #define MONDRIAN_FB_COLOR_ID               1
+@@ -574,8 +609,12 @@
+ 		if (mondrian_fb_probe > 0 && src != 0 && s->bytesPerRow != 0 &&
+ 		    s->height != 0) {
+ 			uint64_t sum = 0, first = 0;
++			uint32_t nonblack = 0, sampled = 0;
+ 			int32_t row;
+ 
++			if (mondrian_fb_coherent) {
++				mondrian_fb_clean(s);
++			}
+ 			for (row = 0; row < 64 && row < (int32_t)s->height; row++) {
+ 				const uint32_t *p = (const uint32_t *)(src + s->offset +
+ 				    (uint64_t)row * s->bytesPerRow);
+@@ -585,13 +624,35 @@
+ 				}
+ 				sum += p[0] + p[1] + p[2] + p[3];
+ 			}
++			/*
++			 * What the corner says is not what the frame says: a lock
++			 * screen is black at the top left, so four pixels read zero
++			 * for a frame that drew everything else. Sample a grid over
++			 * the whole surface instead.
++			 */
++			if (s->width != 0 && s->height != 0) {
++				uint32_t x, y;
++
++				for (y = 0; y < s->height; y += 32) {
++					const uint32_t *p = (const uint32_t *)(src +
++					    s->offset + (uint64_t)y * s->bytesPerRow);
++
++					for (x = 0; x < s->width; x += 32) {
++						sampled++;
++						if (p[x] != 0) {
++							nonblack++;
++						}
++					}
++				}
++			}
+ 			IOLog("MONDRIAN FB: probe %d layer %u id %u %ux%u off %u bpr %u"
+-			    " len %llu own %d src 0x%llx first 0x%08x rows 0x%llx\n",
++			    " len %llu own %d src 0x%llx first 0x%08x rows 0x%llx"
++			    " nonzero %u/%u\n",
+ 			    mondrian_fb_probe, layer, id, s->width, s->height,
+ 			    s->offset, s->bytesPerRow,
+ 			    s->memory != NULL ? s->memory->getLength() : 0ull,
+ 			    s == fSurface, (unsigned long long)src, (unsigned)first,
+-			    (unsigned long long)sum);
++			    (unsigned long long)sum, nonblack, sampled);
+ 		}
+ 		/*
+ 		 * The panel copies the surface out of DRAM, and the writer left
+@@ -604,27 +665,8 @@
+ 		 * drop the lines by physical address before the copy, every
+ 		 * layer, so what is on the panel is what was drawn.
+ 		 */
+-		if (mondrian_fb_coherent && s->memory != NULL &&
+-		    s->bytesPerRow != 0 && s->height != 0) {
+-			uint64_t end = (uint64_t)s->offset +
+-			    (uint64_t)s->bytesPerRow * s->height;
+-			uint64_t off = (uint64_t)s->offset;
+-
+-			while (off < end) {
+-				IOByteCount length = 0;
+-				addr64_t pa = s->memory->getPhysicalSegment(off,
+-				    &length);
+-
+-				if (pa == 0 || length == 0) {
+-					off += 0x4000;
+-					continue;
+-				}
+-				if (off + length > end) {
+-					length = (IOByteCount)(end - off);
+-				}
+-				(void)mondrian_gpu_uc_flush(pa, length);
+-				off += length;
+-			}
++		if (mondrian_fb_coherent) {
++			mondrian_fb_clean(s);
+ 		}
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		/*
