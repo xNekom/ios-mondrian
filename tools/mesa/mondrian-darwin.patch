@@ -397,3 +397,187 @@
     assert(vao->_EnabledWithMapMode ==
            _mesa_vao_enable_to_vp_inputs(vao->_AttributeMapMode, vao->Enabled));
  
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.h
+@@ -95,6 +95,9 @@
+    /* pre-baked stateobj for preamble: */
+    struct fd_ringbuffer *preamble, *restore;
+ 
++   /* Per-batch A725 compute-shader warm-up. */
++   struct fd_ringbuffer *cmdbuf_start_a725_quirk;
++
+    /* storage for ctx->last.key: */
+    struct ir3_shader_key last_key;
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+@@ -390,6 +390,8 @@
+ template <chip CHIP>
+ void fd6_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring);
+ 
++bool fd6_emit_init_cmdbuf_start_a725_quirk(struct fd6_context *fd6_ctx);
++
+ void fd6_emit_init_screen(struct pipe_screen *pscreen);
+ 
+ static inline void
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -50,6 +50,9 @@
+    if (fd6_ctx->restore)
+       fd_ringbuffer_del(fd6_ctx->restore);
+ 
++   if (fd6_ctx->cmdbuf_start_a725_quirk)
++      fd_ringbuffer_del(fd6_ctx->cmdbuf_start_a725_quirk);
++
+    fd_context_destroy(pctx);
+ 
+    if (fd6_ctx->vsc_draw_strm)
+@@ -323,6 +326,12 @@
+    fd6_emit_static_regs<CHIP>(&fd6_ctx->base, ring);
+    fd6_ctx->restore = ring;
+ 
+-   return fd_context_init_tc(pctx, flags);
++   pctx = fd_context_init_tc(pctx, flags);
++   if (pctx && CHIP == A7XX && screen->info->a7xx.cmdbuf_start_a725_quirk &&
++       !fd6_emit_init_cmdbuf_start_a725_quirk(fd6_ctx)) {
++      pctx->destroy(pctx);
++      return NULL;
++   }
++   return pctx;
+ }
+ FD_GENX(fd6_context_create);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -1080,6 +1080,112 @@
+       WRITE(REG_A6XX_SP_FS_CTRL_REG0, 0);
+    }
+ }
++
++/*
++ * Mirror Turnip's A725 command-buffer-start compute dispatch. The device
++ * table enables this only on chips that need the SP warm-up.
++ */
++bool
++fd6_emit_init_cmdbuf_start_a725_quirk(struct fd6_context *fd6_ctx)
++{
++   static const uint32_t raw_shader[] = {
++      0x00040000, 0x40600000, // mul.f hr0.x, hr0.x, hr1.x
++      0x00050001, 0x40600001, // mul.f hr0.y, hr0.y, hr1.y
++      0x00060002, 0x40600002, // mul.f hr0.z, hr0.z, hr1.z
++      0x00070003, 0x40600003, // mul.f hr0.w, hr0.w, hr1.w
++      0x00000000, 0x03000000, // end
++   };
++   struct fd_context *ctx = &fd6_ctx->base;
++   struct fd_bo *shader_bo;
++   struct fd_ringbuffer *ring;
++   void *shader_map;
++
++   shader_bo = fd_bo_new(ctx->screen->dev, 0x1000, 0, "a725 warm-up shader");
++   if (!shader_bo)
++      return false;
++
++   shader_map = fd_bo_map(shader_bo);
++   if (!shader_map) {
++      fd_bo_del(shader_bo);
++      return false;
++   }
++   memcpy(shader_map, raw_shader, sizeof(raw_shader));
++
++   ring = fd_ringbuffer_new_object(ctx->pipe, 47 * 4);
++   if (!ring) {
++      fd_bo_del(shader_bo);
++      return false;
++   }
++
++   fd_ringbuffer_attach_bo(ring, shader_bo);
++
++   OUT_REG(ring, HLSQ_INVALIDATE_CMD(A7XX,
++            .vs_state = true, .hs_state = true, .ds_state = true,
++            .gs_state = true, .fs_state = true, .gfx_ibo = true,
++            .cs_bindless = 0xff, .gfx_bindless = 0xff));
++   OUT_REG(ring, HLSQ_CS_CNTL(A7XX,
++            .constlen = 4,
++            .enabled = true));
++   OUT_REG(ring, A6XX_SP_CS_CONFIG(.enabled = true));
++   OUT_REG(ring, A6XX_SP_CS_CTRL_REG0(
++             .threadmode = MULTI,
++            .threadsize = THREAD128,
++            .mergedregs = true));
++   OUT_REG(ring, A6XX_SP_CS_CTRL_REG1(.shared_size = 1));
++   OUT_REG(ring, HLSQ_CS_KERNEL_GROUP_X(A7XX, 1),
++                 HLSQ_CS_KERNEL_GROUP_Y(A7XX, 1),
++                 HLSQ_CS_KERNEL_GROUP_Z(A7XX, 1));
++   OUT_REG(ring, A6XX_SP_CS_INSTRLEN(1));
++   OUT_REG(ring, A6XX_SP_CS_TEX_COUNT(0));
++   OUT_REG(ring, A6XX_SP_CS_IBO_COUNT(0));
++   OUT_REG(ring, HLSQ_CS_CNTL_1(A7XX,
++            .linearlocalidregid = regid(63, 0),
++            .threadsize = THREAD128,
++            .workgrouprastorderzfirsten = true,
++            .wgtilewidth = 4,
++            .wgtileheight = 17));
++   OUT_REG(ring, A6XX_SP_CS_CNTL_0(
++             .wgidconstid = regid(51, 3),
++            .wgsizeconstid = regid(48, 0),
++            .wgoffsetconstid = regid(63, 0),
++            .localidregid = regid(63, 0)));
++   OUT_REG(ring, SP_CS_CNTL_1(A7XX,
++            .linearlocalidregid = regid(63, 0),
++            .threadsize = THREAD128,
++            .workitemrastorder = WORKITEMRASTORDER_TILED));
++   OUT_REG(ring, A7XX_SP_CS_UNKNOWN_A9BE(0));
++
++   OUT_REG(ring,
++      HLSQ_CS_NDRANGE_0(A7XX, .kerneldim = 3,
++                               .localsizex = 255,
++                               .localsizey = 1,
++                               .localsizez = 1),
++      HLSQ_CS_NDRANGE_1(A7XX, .globalsize_x = 3072),
++      HLSQ_CS_NDRANGE_2(A7XX, .globaloff_x = 0),
++      HLSQ_CS_NDRANGE_3(A7XX, .globalsize_y = 1),
++      HLSQ_CS_NDRANGE_4(A7XX, .globaloff_y = 0),
++      HLSQ_CS_NDRANGE_5(A7XX, .globalsize_z = 1),
++      HLSQ_CS_NDRANGE_6(A7XX, .globaloff_z = 0));
++   OUT_REG(ring, A7XX_HLSQ_CS_LAST_LOCAL_SIZE(
++            .localsizex = 255,
++            .localsizey = 0,
++            .localsizez = 0));
++   OUT_PKT4(ring, REG_A6XX_SP_CS_OBJ_FIRST_EXEC_OFFSET, 3);
++   OUT_RING(ring, 0);
++   OUT_RELOC(ring, shader_bo, 0, 0, 0);
++
++   OUT_PKT7(ring, CP_EXEC_CS, 4);
++   OUT_RING(ring, 0);
++   OUT_RING(ring, CP_EXEC_CS_1_NGROUPS_X(12));
++   OUT_RING(ring, CP_EXEC_CS_2_NGROUPS_Y(1));
++   OUT_RING(ring, CP_EXEC_CS_3_NGROUPS_Z(1));
++
++   fd6_ctx->cmdbuf_start_a725_quirk = ring;
++   fd_bo_del(shader_bo);
++   mesa_logi("mondrian: a725/a730 warm-up IB built for this context");
++   return true;
++}
++
+ FD_GENX(fd6_emit_static_regs);
+ 
+ /* emit setup at begin of new cmdstream buffer (don't rely on previous
+@@ -1139,6 +1245,19 @@
+    fd6_emit_ib(ring, fd6_context(ctx)->restore);
+    fd6_emit_ccu_cntl<CHIP>(ring, screen, false);
+ 
++   if (CHIP == A7XX && screen->info->a7xx.cmdbuf_start_a725_quirk) {
++      static bool warmup_logged;
++      if (!warmup_logged) {
++         warmup_logged = true;
++         mesa_logi("mondrian: a725/a730 warm-up emitted before the batch's own state");
++      }
++      OUT_PKT7(ring, CP_COND_REG_EXEC, 2);
++      OUT_RING(ring, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
++                     CP_COND_REG_EXEC_0_BR | CP_COND_REG_EXEC_0_LPAC);
++      OUT_RING(ring, RENDER_MODE_CP_COND_REG_EXEC_1_DWORDS(4));
++      __OUT_IB5(ring, fd6_context(ctx)->cmdbuf_start_a725_quirk);
++   }
++
+    OUT_PKT7(ring, CP_SET_AMBLE, 3);
+    uint32_t dwords = fd_ringbuffer_emit_reloc_ring_full(ring, fd6_context(ctx)->preamble, 0) / 4;
+    OUT_RING(ring, CP_SET_AMBLE_2_DWORDS(dwords) |

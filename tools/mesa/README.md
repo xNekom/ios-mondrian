@@ -21,7 +21,10 @@ frame at 1440x3200.
   the GPU's screen instead of only the software one, and the OSMesa
   `osmesa_st_get_egl_image()` hook that turns an IOSurface ID into that surface's
   texture (`osmesa_surface_resource()`, request `0x7e`). `gl_osmesa.c` in
-  `tools/gpu` calls `glEGLImageTargetTexture2DOES` with that ID.
+  `tools/gpu` calls `glEGLImageTargetTexture2DOES` with that ID. It also adds
+  the A725/A730 compute-shader warm-up Turnip emits at the start of every
+  command buffer (`fd6_emit_init_cmdbuf_start_a725_quirk`, called from
+  `fd6_emit_restore` when `info->a7xx.cmdbuf_start_a725_quirk` is set).
 
 ## Build
 
@@ -34,9 +37,10 @@ Needs Xcode with the iphoneos SDK, ninja, python3 and GNU bison 3 (`brew
 install bison`; the script puts `/opt/homebrew/opt/bison/bin` first). It makes
 its own meson venv, so no global meson is needed. A `MESA=` tree is edited in
 place, so point it at a scratch checkout. After changing
-`mondrian-darwin.patch`, delete `out/mesa/mesa-25.0.7` first: the script treats
-a tree whose `meson.build` already names `mondrian-drm` as patched and will not
-apply the new hunks.
+`mondrian-darwin.patch`, the script applies the base diff once (its marker is
+`meson.build` naming `mondrian-drm`) and then applies only the A725 warm-up
+hunk set when `fd6_context.h` lacks it; an edit to either existing hunk needs a
+fresh `out/mesa/mesa-25.0.7`.
 
 The result is in `out/mesa/stage/`: `libOSMesa.8.dylib` (ad-hoc signed,
 install name `/usr/lib/libOSMesa.8.dylib`), `gl.xml` (Mesa's GL registry, for

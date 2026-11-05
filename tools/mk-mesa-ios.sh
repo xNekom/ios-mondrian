@@ -69,12 +69,25 @@ cp -R "$root/tools/mesa/mondrian-drm" "$src/src/mondrian-drm"
 
 # The Darwin edits: freedreno's drm layer built without Linux's DRM, its
 # buffers mapped by the kernel's user client, and OSMesa able to create the
-# GPU's screen instead of only the software one. The patched meson.build is the
-# mark of a tree that has them, so a second run does not patch again and a
-# reverted tree is patched again.
+# GPU's screen instead of only the software one. The meson.build marker avoids
+# reapplying the full diff; the A725 warm-up below has its own marker so this
+# patch can update a source tree that already has the base Mondrian edits.
 patchfile=$root/tools/mesa/mondrian-darwin.patch
 if grep -q "mondrian-drm" "$src/meson.build"; then
-	echo "== $(basename "$src") is already patched"
+	echo "== $(basename "$src") has the base Mondrian patch"
+	# A source tree may have been patched by an earlier run. Apply the
+	# freedreno warm-up hunk set incrementally when the tracked patch grows;
+	# otherwise the marker above would silently skip the new A725/A730 fix.
+	if ! grep -q 'cmdbuf_start_a725_quirk;' \
+	    "$src/src/gallium/drivers/freedreno/a6xx/fd6_context.h"; then
+		echo "== applying the A725/A730 GL warm-up"
+		if ! sed -n '/^--- a\/src\/gallium\/drivers\/freedreno\/a6xx\/fd6_context.h/,$p' \
+		    "$patchfile" | patch -p1 -d "$src" --batch --forward \
+		    --no-backup-if-mismatch; then
+			echo "error: could not apply the incremental freedreno warm-up patch" >&2
+			exit 1
+		fi
+	fi
 else
 	echo "== patching $(basename "$src")"
 	if ! patch -p1 -d "$src" --batch --forward --no-backup-if-mismatch \

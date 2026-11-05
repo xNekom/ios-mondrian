@@ -474,30 +474,43 @@ them has Metal. That is the path this port follows.
   `AP[2]=0`), the bootstrap's `THREAD_SYNC` handshake at `l162` is passed,
   every submission fences, and GL on this chip works elsewhere with the same
   Mesa.
-- **The next thing to measure is the pipeline state as a matrix**, because the
-  self test turns each knob into a yes/no: `glselftest=1` with the default
-  (GMEM, `A7XX_RB_UNKNOWN_8812(0x3ff)` "all buffers in sysmem"), with
-  `glenv=FD_MESA_DEBUG=sysmem` and with `gmem` forced, and the same three with
-  `glcopy=1` so the readback does not depend on the surface import. A green draw
-  in any cell names the state that is wrong; all-black with the submissions
-  completing points at the shader/state upload (`CP_LOAD_STATE6`,
-  `CP_IM_LOAD`) or at a render-target address the RB never sees.
-- **The SP warm-up kernel: the last unfilled piece of the pipeline, and it
-  belongs in Mesa's stream.** Turnip's `tu_init_cmdbuf_start_a725_quirk` (a
-  compute kernel over the whole shader array, 12 groups of 255 waves, the
-  register writes that aim it, and `CP_EXEC_CS`; "It is unknown what this
-  workaround is for and what it fixes") runs at the start of every command
-  buffer on a725/a730 silicon — and the GL build of this Mesa does not have it.
-  Measured flashed (`cpuirk=1`, `0229`): the submission that carries the
-  warm-up consumes and parks
-  (`uc big 253 dwords fence 1 done 0`, submissions refused, backboardd's
-  second context softpipe — the green self-test lines were *softpipe*), so the
-  kernel cannot wrap it around a whole client IB: its invalidations eat the
-  batch's own state loads. The bisect to run next is emit-side: build the
-  warm-up stream in the GL library and emit it at the start of every
-  `fd6_emit_restore` for `CHIP >= A7XX`, with the kernel knob off — exactly
-  where Turnip puts it inside its command buffers. The bootstrap handshake is
-  not the gap: `l162` in the SQE (`brne $02, 0x0, #l162`, right after
+- **The pipeline matrix is measured, and every cell is black.** The self test
+  ran on the default (GMEM, `A7XX_RB_UNKNOWN_8812(0x3ff)` "all buffers in
+  sysmem"), with `glenv=FD_MESA_DEBUG=sysmem`, with `gmem` forced and with
+  UBWC off, and with `glcopy=1`; the clear, the texel upload and the draw read
+  zeros in all of them, with the FBO complete, no GL error and every submission
+  fencing. `glcopy=0` then draws CoreAnimation's layer *in place*
+  (`1 drawn in place` in the frame line, fps 3, frames 11 ms late instead of
+  4.7 s), and the kernel's probe of that surface — a write-combining mapping,
+  so no stale cache — reads `first 0x00000000`, alpha included, while the copy
+  path had left `0xff000000` there. So the surface the panel scans is never
+  written: the RB's stores do not reach DRAM, and that is upstream of both the
+  readback and the presentation. The CP's own writes do land in the same boot
+  (`cp memwrite ... canary 0x600dc0de fence 0x600dc0df`, `uc ... fence 7 done 1
+  in 0 ms`), so the difference is the render path, not the ring, the SMMU
+  attributes or the fences. The next measurement is kernel-side: a `CP_BLIT`
+  fill (the a730 SQE implements it, `sqe-a730.asm:2469`) into a known buffer,
+  which separates "the 2D/RB engine never runs" from "it runs and writes
+  somewhere else".
+- **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
+  `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
+  array, 12 groups of 255 waves, the register writes that aim it, and
+  `CP_EXEC_CS`; "It is unknown what this workaround is for and what it fixes")
+  runs at the start of every command buffer on a725/a730 silicon, and Mesa
+  25.0.7's GL build did not have it. Two facts from the kernel-side trial
+  (`0229`): any nonzero `cpuirk` prefixes one nested IB before the client IB in
+  the same ring submission — it is not a separate submission — and that IB
+  pointed at the allocation base, which holds the shader, while the PM4 stream
+  starts at `+64`, so the CP fetched shader words as packets. `0230` fixes the
+  address; the parked CP it produced (`uc big 253 dwords fence 1 done 0`,
+  submissions refused) therefore says nothing about the compute kernel itself.
+  What follows a wedge is not GPU evidence either: the green self-test lines
+  are the restarted process on softpipe. The supported form is emit-side —
+  `fd6_emit_restore` builds the stream once per context and emits it when
+  `info->a7xx.cmdbuf_start_a725_quirk` is set (a7xx gen1/gen2 in
+  `freedreno_devices.py`), with `cpuirk=0` — which is implemented in
+  `tools/mesa/mondrian-darwin.patch` and needs a `glblob=1` boot to be measured.
+  The bootstrap handshake is not the gap: `l162` in the SQE (`brne $02, 0x0, #l162`, right after
   `THREAD_SYNC` bit 0 is cleared) is the wait Pong describes, and this port
   passes it — the streams execute. `CP_ME_INIT` already carries kgsl's DMS bit
   (`0x14b | BIT(11)`) and the four stream slots are leased in one bank. What is

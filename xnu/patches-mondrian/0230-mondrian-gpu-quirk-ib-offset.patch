@@ -1,0 +1,58 @@
+xnu 0230: point the warm-up IB at the PM4 stream
+
+The quirk allocation contains the 10-dword shader at its base and the
+46-dword PM4 stream at +64; the stream length is already measured from +64.
+The ring currently points the nested IB at the base, so the CP fetches shader
+words as PM4 instead of executing the warm-up. Turnip keeps the shader and
+command-buffer substreams separate, so the kernel IB must point at the latter.
+Clarify that cpuirk is a boolean prefix, not a standalone submission.
+
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -1787,16 +1787,13 @@
+ static struct mondrian_gpu_mem mondrian_cp_memptr;
+ static struct mondrian_gpu_mem mondrian_cp_ib;
+ static struct mondrian_gpu_mem mondrian_cp_pwrup;
+ /*
+- * cpuirk=1 (the default): every client submission starts with this stream --
+- * a compute kernel over the whole shader array, 12 groups of 255 waves, plus
+- * the register writes that aim it. Turnip emits the same thing at the start
+- * of every command buffer on a725/a730 (`cmdbuf_start_a725_quirk` in
+- * tu_device.cc, "It is unknown what this workaround is for and what it
+- * fixes"), and its absence is the difference between an a730 whose renders
+- * reach memory and an a730 whose submissions complete and fence while every
+- * clear, state upload, draw and shader output reads back zeros.
++ * The 725/730 SP warm-up kernel: a compute over the shader array, 12 groups
++ * of 255 waves, and the register writes that aim it. Turnip emits it after
++ * `tu6_init_hw` has set up a command buffer. Here cpuirk is a boolean opt-in:
++ * any nonzero value prefixes one IB before the entire client IB in the same
++ * ring submission; it is not a standalone submit or the Turnip ordering.
+  */
+ static struct mondrian_gpu_mem mondrian_uc_quirk;
+ static void mondrian_uc_quirk_build(void);
+ static uint32_t mondrian_uc_quirk_words;
+@@ -4404,17 +4401,16 @@
+ 	if (mondrian_uc_nomark == 0) {
+ 		ring[at++] = mondrian_pm4_type7(0x65u, 1);	/* SET_MARKER */
+ 		ring[at++] = 0x00du;		/* IB1LIST start */
+ 	}
+-	/*
+-	 * cpquirk=1 (the default): the 725/730 wakes its shader array before the
+-	 * submission's packets run (the same stream Turnip puts at the start of
+-	 * every command buffer).
+-	 */
++	/* Any nonzero cpuirk value prefixes one warm-up IB before the client IB. */
+ 	if (mondrian_cp_quirk && mondrian_uc_quirk.va != 0) {
++		/* The allocation starts with shader code; PM4 starts at +64. */
++		const uint64_t quirk_ib = mondrian_uc_quirk.iova + 64u;
++
+ 		ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
+-		ring[at++] = (uint32_t)mondrian_uc_quirk.iova;
+-		ring[at++] = (uint32_t)(mondrian_uc_quirk.iova >> 32);
++		ring[at++] = (uint32_t)quirk_ib;
++		ring[at++] = (uint32_t)(quirk_ib >> 32);
+ 		ring[at++] = mondrian_uc_quirk_words;
+ 	}
+ 	ring[at++] = mondrian_pm4_type7(0x3fu, 3);	/* INDIRECT_BUFFER */
+ 	ring[at++] = (uint32_t)ib;
