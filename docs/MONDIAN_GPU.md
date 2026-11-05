@@ -512,6 +512,25 @@ them has Metal. That is the path this port follows.
   the probe reads it. The probe itself looked at four pixels of the first 64
   rows, where a black corner and an empty surface look alike; `0234` samples a
   grid over the whole surface and prints `nonzero N/M`.
+- **Nothing writes the surface, not even a clear.** `0235` fills a freshly
+  adopted surface with `0xffffffff` and marks the buffer dirty, so the pattern
+  reaches DRAM before the first submission that names it. Measured: every layer
+  reads `first 0xffffffff ... nonzero 4500/4500` and the panel probe reads
+  `first 0xffffffff` too, so the pattern survives whole frames and the copy to
+  the panel is working — the GPU simply never writes those pages. A draw that
+  ran and a surface that was never touched are then distinguishable in one
+  boot, which is what `gpusurfpat=1` is for.
+- **A6xx register offsets park the a730's CP.** The first kernel-side 2D fill
+  (`gpu2dfill`, `0236`) re-derived the blit registers from `a6xx.xml` and wrote
+  `SP_2D_DST_FORMAT` at `0xacc0`; that is the a6xx offset and the a730 has the
+  register at `0xa9bf` (`<reg32 offset="0xa9bf" ... variants="A7XX-">`). The
+  next frame took 1.6 s, Mesa logged `flush_submit_list:135: submit failed:
+  -35`, and every submission after that failed; the surface then read
+  `0xff000000` everywhere, which is userland's fallback and **not** a GPU
+  colour write. The fix is to replay the dwords Mesa itself emits — the window
+  server's first frame carries a 51-dword clearing IB — and change only the
+  destination and the colour. Do the same for any other a7xx register: check
+  the `variants` attribute before using an `A6XX_*` constant.
 - **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
   `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
   array, 12 groups of 255 waves, the register writes that aim it, and

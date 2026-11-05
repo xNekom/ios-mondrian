@@ -1,0 +1,306 @@
+xnu 0236: Mesa's own 2D clear, replayed from the kernel
+
+Nothing Mesa draws reaches memory -- with the 2D blitter and with the generic
+3D one -- while the CP's own writes land and the RB is measured pointing at
+the surface with the surface's pitch. A pattern written into the surface
+survives a whole frame: nothing writes it, no clear included. Two
+explanations are left, and they differ in the 2D engine, which needs no
+shader, viewport or binning: the draw state never makes the RB write, or the
+colour path to DRAM is broken on this GPU.
+
+So the test is Mesa's own clear, byte for byte: the window server's first
+frame carries a 51-dword clearing IB, and this replays those exact dwords
+with only the destination address and the solid colour changed. Nothing here
+re-derives a register value -- the first attempt did, wrote SP_2D_DST_FORMAT
+at 0xacc0 (the a6xx offset; the a730 has it at 0xa9bf), and parked the CP for
+1.6 s until every later submission failed with `submit failed: -35`.
+
+gpu2dfill=1 fills a 0x20000-byte buffer of the driver's own and then, when a
+surface has been adopted, the memory the display reads: the first says
+whether the engine writes, the second whether the surface is memory it can
+write. The buffer is read back even when the poll fails, because the answer
+is what the engine wrote, not whether the fence answered.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -209,6 +209,8 @@
+ 	IOReturn rewriteEvents(mondrian_buffer *buffer, uint32_t offset,
+ 	    uint32_t size, unsigned depth, unsigned *rewritten);
+ 	uint64_t scratchCarve(uint64_t bytes);
++	void run2dFill(void);
++	void run2dSurfaceFill(void);
+ 	uint32_t expandGroups(const uint8_t *in, uint32_t size, uint8_t *out,
+ 	    uint32_t outMax);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+@@ -236,6 +238,8 @@
+ 	uint32_t fSurfaceLogged;     /* surfaceBuffer() lines printed */
+ 	uint32_t fPrepLogged;
+ 	bool fSyncAll;
++	bool f2dFillDone;           /* the gpu2dfill test ran */
++	bool f2dSurfaceDone;        /* the surface fill ran */
+ 	uint32_t fSyncLogged;
+ };
+ 
+@@ -344,6 +348,9 @@
+ 	fPrepLogged = 0;
+ 	fSyncLogged = 0;
+ 	fSyncAll = mondrian_sync_all();
++	fSurfaceLogged = 0;
++	f2dFillDone = false;
++	f2dSurfaceDone = false;
+ 	if (fLock == NULL) {
+ 		return false;
+ 	}
+@@ -721,6 +728,188 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * gpu2dfill=1: replay one of Mesa's own 2D clears, from the kernel.
++ *
++ * Nothing Mesa draws reaches memory -- with the 2D blitter and with the generic
++ * 3D one -- while the CP's own writes land (the fence, RB_DONE_TS) and the RB is
++ * measured pointing at the surface with the surface's pitch. A pattern written
++ * into the surface survives a whole frame: nothing writes it, no clear
++ * included. Two explanations are left, and they differ in the 2D engine, which
++ * needs no shader, viewport or binning: the draw state never makes the RB
++ * write, or the colour path to DRAM is broken on this GPU.
++ *
++ * So the test is Mesa's own clear, byte for byte. The window server's first
++ * frame carries a 51-dword clearing IB, and this replays those exact dwords with
++ * only the destination address and the solid colour changed -- 25 rows of
++ * 0x1000 bytes at a 0x40 pitch, as Mesa's clear has, 0x20000 bytes of buffer.
++ * Nothing here re-derives a register value: the first attempt did, and it wrote
++ * SP_2D_DST_FORMAT at 0xacc0, which is the a6xx offset (the a730 has it at
++ * 0xa9bf); that parked the CP for 1.6 s and made every later submission fail
++ * (`submit failed: -35`), so the dwords are copied instead.
++ *
++ * The same blit then runs against the last adopted surface, when there is one:
++ * the private buffer tests the engine, the surface tests the memory the display
++ * reads. The buffer is read back even when the poll fails, because the answer is
++ * what the engine wrote, not whether the fence answered.
++ */
++#define MONDRIAN_2DFILL_BYTES	0x20000ull
++
++static int
++mondrian_uc_2dfill_on(void)
++{
++	static int parsed, on;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("gpu2dfill", &on, sizeof(on))) {
++			on = 0;
++		}
++	}
++	return on != 0;
++}
++
++static uint32_t
++mondrian_uc_2dfill_words(uint32_t *words, uint64_t iova, uint32_t c0,
++    uint32_t c1, uint32_t c2, uint32_t c3)
++{
++	static const uint32_t ib[51] = {
++		0x408c0001u, 0x10f00380u,	/* RB_2D_BLIT_CNTL */
++		0x48840001u, 0x10f00380u,	/* GRAS_2D_BLIT_CNTL */
++		0x48b2d201u, 0x20000000u,	/* TPL1_2D_SRC_CNTL */
++		0x40a9bf01u, 0x0000f018u,	/* SP_2D_DST_FORMAT (a7xx) */
++		0x488c0101u, 0x00000000u,	/* RB_2D_UNKNOWN_8C01 */
++		0x48b2c085u, 0u, 0u, 0u, 0u, 0u,	/* SP_PS_2D_SRC_* */
++		0x488c2c04u, 0u, 0u, 0u, 0u,	/* RB_2D_SRC_SOLID_C0..3 */
++		0x40840104u, 0u, 0u, 0u, 0u,	/* GRAS_2D_SRC_* */
++		0x408c1704u, 0x00000003u, 0u, 0u, 0x00000040u,	/* RB_2D_DST */
++		0x48840502u, 0x00000000u, 0x00180fffu,	/* GRAS_2D_DST_TL/BR */
++		0x70460001u, 0x0000003fu,	/* CP_EVENT_WRITE LABEL */
++		0x70268000u,			/* CP_WAIT_FOR_IDLE */
++		0x408e0401u, 0x00000000u,	/* RB_DBG_ECO_CNTL */
++		0x702c0001u, 0x00000003u,	/* CP_BLIT BLIT_OP_SCALE */
++		0x70268000u,			/* CP_WAIT_FOR_IDLE */
++		0x408e0401u, 0x00000000u,	/* RB_DBG_ECO_CNTL */
++		0x70460001u, 0x00000021u,	/* CCU_CLEAN_COLOR */
++		0x70460001u, 0x00000020u,	/* CCU */
++		0x70460001u, 0x00000031u,	/* CACHE_CLEAN */
++		0x70268000u,			/* CP_WAIT_FOR_IDLE */
++	};
++	uint32_t n;
++
++	for (n = 0; n < 51; n++) {
++		words[n] = ib[n];
++	}
++	words[17] = c0;
++	words[18] = c1;
++	words[19] = c2;
++	words[20] = c3;
++	words[28] = (uint32_t)iova;
++	words[29] = (uint32_t)(iova >> 32);
++	return 51;
++}
++
++void
++MondrianGPUUserClient::run2dFill(void)
++{
++	mondrian_buffer *dst, *ib;
++	uint32_t words[64], zeros[16], sample[16];
++	uint32_t n, i, j, fence = 0, nonzero = 0, sampled = 0;
++	uint32_t first = 0, mid = 0;
++	uint64_t off;
++	int submitted, polled;
++
++	if (!mondrian_uc_2dfill_on()) {
++		return;
++	}
++	IOLockLock(fLock);
++	dst = bufferNew(MONDRIAN_2DFILL_BYTES);
++	ib = bufferNew(0x1000);
++	IOLockUnlock(fLock);
++	if (dst == NULL || ib == NULL) {
++		IOLog("MondrianGPU: 2d fill: no buffer\n");
++		return;
++	}
++	memset(zeros, 0, sizeof(zeros));
++	for (off = 0; off < MONDRIAN_2DFILL_BYTES; off += sizeof(zeros)) {
++		if (dst->memory->writeBytes(off, zeros, sizeof(zeros)) !=
++		    sizeof(zeros)) {
++			break;
++		}
++	}
++	n = mondrian_uc_2dfill_words(words, dst->iova, 0xff, 0x00, 0xff, 0xff);
++	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
++		IOLog("MondrianGPU: 2d fill: ib write failed\n");
++		return;
++	}
++	bufferSync(ib);
++	bufferSync(dst);
++	submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
++	polled = submitted && mondrian_gpu_uc_wait(fence, 1000) == 0;
++	bufferSync(dst);
++	for (i = 0; i < 4; i++) {
++		bzero(sample, sizeof(sample));
++		(void)dst->memory->readBytes((uint64_t)i * MONDRIAN_2DFILL_BYTES / 4,
++		    sample, sizeof(sample));
++		for (j = 0; j < 16; j++) {
++			sampled++;
++			if (sample[j] != 0) {
++				nonzero++;
++			}
++		}
++		if (i == 0) {
++			first = sample[0];
++		}
++		if (i == 2) {
++			mid = sample[0];
++		}
++	}
++	IOLog("MondrianGPU: 2d fill handle %u iova 0x%llx submit %d poll %d"
++	    " fence %u nonzero %u/%u first 0x%08x mid 0x%08x\n", dst->handle,
++	    (unsigned long long)dst->iova, submitted, polled, fence, nonzero,
++	    sampled, first, mid);
++	bufferFree(ib);
++	bufferFree(dst);
++}
++
++/*
++ * The same blit into the memory the display reads, once a surface has been
++ * adopted. If the private pass lands and this one does not, the engine writes
++ * and the address the driver mapped is not one it can write, which is a mapping
++ * fault; if both land, the surface is writable and the fault is entirely in
++ * what Mesa submits. The pitch stays Mesa's 0x40, so the picture is a smear
++ * across a surface with a wider stride -- any magenta at all is the answer.
++ */
++void
++MondrianGPUUserClient::run2dSurfaceFill(void)
++{
++	mondrian_buffer *ib;
++	uint32_t words[64];
++	uint32_t n, fence = 0;
++	uint64_t iova = mondrian_gpu_uc_surface_iova();
++	int submitted, polled;
++
++	if (iova == 0 || !mondrian_uc_2dfill_on()) {
++		return;
++	}
++	IOLockLock(fLock);
++	ib = bufferNew(0x1000);
++	IOLockUnlock(fLock);
++	if (ib == NULL) {
++		return;
++	}
++	n = mondrian_uc_2dfill_words(words, iova, 0xff, 0x00, 0xff, 0xff);
++	if (ib->memory->writeBytes(0, words, n * 4) == n * 4) {
++		bufferSync(ib);
++		submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
++		polled = submitted && mondrian_gpu_uc_wait(fence, 1000) == 0;
++		IOLog("MondrianGPU: 2d surface fill iova 0x%llx submit %d poll %d"
++		    " fence %u\n", (unsigned long long)iova, submitted, polled,
++		    fence);
++	}
++	bufferFree(ib);
++}
++
+ IOReturn
+ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ {
+@@ -1076,6 +1265,14 @@
+ 	if (result == kIOReturnSuccess) {
+ 		request->fence = fence;
+ 		fLastFence = fence;
++		if (!f2dFillDone) {
++			f2dFillDone = true;
++			run2dFill();
++		}
++		if (!f2dSurfaceDone && mondrian_gpu_uc_surface_iova() != 0) {
++			f2dSurfaceDone = true;
++			run2dSurfaceFill();
++		}
+ 	}
+ 	IOFreeData(cmds, cmd_bytes);
+ 	IOFreeData(bos, bo_bytes);
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3638,6 +3638,17 @@
+ 	mondrian_uc_surface_iova = iova;
+ }
+ 
++/*
++ * The address surfaceBuffer() gave the last IOSurface, for the 2D fill test:
++ * the pixels the panel reads and the pixels a submission names have to be the
++ * same memory, and this is the number that says so.
++ */
++uint64_t
++mondrian_gpu_uc_surface_iova(void)
++{
++	return mondrian_uc_surface_iova;
++}
++
+ uint32_t
+ mondrian_gpu_uc_nop_opcode(void)
+ {
+@@ -4883,6 +4894,19 @@
+ 	return -1;
+ }
+ 
++void
++mondrian_gpu_uc_note_surface(uint32_t id, uint64_t iova)
++{
++	(void)id;
++	(void)iova;
++}
++
++uint64_t
++mondrian_gpu_uc_surface_iova(void)
++{
++	return 0;
++}
++
+ uint64_t
+ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ {
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -45,6 +45,7 @@
+ /* The iova an adopted IOSurface got, so a submission can report the RB's
+  * target next to it (gpurbt=1). */
+ void mondrian_gpu_uc_note_surface(uint32_t id, uint64_t iova);
++uint64_t mondrian_gpu_uc_surface_iova(void);
+ 
+ /* One indirect command stream, fenced. Returns the fence to wait on. */
+ int mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence);
