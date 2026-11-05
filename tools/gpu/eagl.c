@@ -3804,6 +3804,81 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	}
 }
 
+/*
+ * glmark=1: paint the whole render target magenta just before the frame is
+ * handed on. The kernel's mondrianfb_probe (`0227`) reads the surface the panel
+ * scans, so magenta there proves that a shader draw reached the memory the
+ * panel reads, and zeros prove it did not. That is the one question
+ * glReadPixels cannot answer: its own copy is a GPU blit too, so a broken blit
+ * and a broken draw both read black.
+ */
+static int mark_draws;                  /* boot-arg glmark=1 */
+
+static void
+mark_draw(void)
+{
+	static GLuint program;
+	static int tried;
+	GLint previous_program = 0;
+	GLboolean blend, depth, scissor;
+	static const char *vertex_source =
+	    "attribute vec2 p;\n"
+	    "void main() { gl_Position = vec4(p, 0.0, 1.0); }\n";
+	static const char *fragment_source =
+	    "void main() { gl_FragColor = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+	static const float vertices[] = { -1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f };
+
+	if (!mark_draws) {
+		return;
+	}
+	if (!tried) {
+		GLuint vs, fs;
+
+		tried = 1;
+		vs = glCreateShader(GL_VERTEX_SHADER);
+		fs = glCreateShader(GL_FRAGMENT_SHADER);
+		program = glCreateProgram();
+		glShaderSource(vs, 1, &vertex_source, NULL);
+		glCompileShader(vs);
+		glShaderSource(fs, 1, &fragment_source, NULL);
+		glCompileShader(fs);
+		glAttachShader(program, vs);
+		glAttachShader(program, fs);
+		glBindAttribLocation(program, 0, "p");
+		glLinkProgram(program);
+		glDeleteShader(vs);
+		glDeleteShader(fs);
+		while (glGetError() != 0) {
+		}
+	}
+	if (program == 0) {
+		return;
+	}
+	glGetIntegerv(GL_CURRENT_PROGRAM, &previous_program);
+	blend = glIsEnabled(0x0be2 /* GL_BLEND */);
+	depth = glIsEnabled(0x0b71 /* GL_DEPTH_TEST */);
+	scissor = glIsEnabled(0x0c11 /* GL_SCISSOR_TEST */);
+	glDisable(0x0c11 /* GL_SCISSOR_TEST */);
+	glDisable(0x0be2 /* GL_BLEND */);
+	glDisable(0x0b71 /* GL_DEPTH_TEST */);
+	glColorMask(1, 1, 1, 1);
+	glUseProgram(program);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, vertices);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glDisableVertexAttribArray(0);
+	glUseProgram((GLuint)previous_program);
+	if (blend) {
+		glEnable(0x0be2 /* GL_BLEND */);
+	}
+	if (depth) {
+		glEnable(0x0b71 /* GL_DEPTH_TEST */);
+	}
+	if (scissor) {
+		glEnable(0x0c11 /* GL_SCISSOR_TEST */);
+	}
+}
+
 static void
 my_glFinish(void *context)
 {
@@ -3814,6 +3889,7 @@ my_glFinish(void *context)
 		eagl_trace("glFinish()\n");
 	}
 	clear_now(e);
+	mark_draw();
 	glFinish();
 	frame_end(e, true);
 	EAGL_LEAVE(e, MONDIAN_GL_FINISH);
@@ -3830,6 +3906,7 @@ my_glFlush(void *context)
 		eagl_trace("glFlush()\n");
 	}
 	clear_now(e);
+	mark_draw();
 	began = now_us();
 	glFlush();
 	e->flushing += now_us() - began;
@@ -4894,6 +4971,10 @@ install(void)
 			icon_order = (int)strtoul(argument + 7, NULL, 10);
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
+		mark_draws = strstr(arguments, "glmark=1") != NULL;
+		if (mark_draws) {
+			say("mondrian-gl: glmark=1: every frame ends with a magenta draw into its target\n");
+		}
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
