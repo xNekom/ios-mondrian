@@ -505,8 +505,9 @@ them has Metal. That is the path this port follows.
   4.7 s), and the kernel's probe of that surface — a write-combining mapping,
   so no stale cache — reads `first 0x00000000`, alpha included, while the copy
   path had left `0xff000000` there. So the surface the panel scans is never
-  written: the RB's stores do not reach DRAM, and that is upstream of both the
-  readback and the presentation. **The RB can write memory, though:** `0231`
+  written, and that is upstream of both the readback and the presentation; the
+  cause is the trusted GPU without `CP_SET_SECURE_MODE(0)`, not the RB or the
+  address. **The RB can write memory, though:** `0231`
   puts a `RB_DONE_TS` (event 22, `WRITE_ENABLED`) in an IB and reads the
   address back — `rb done ts 0x0000000000184541 fence 0x600dc0e1 polls 0 int 0
   fault 0`, on the first poll, so the engine that draws writes a 64-bit
@@ -803,6 +804,15 @@ them has Metal. That is the path this port follows.
   compositor can wait on at present time is the first one to remove.
   The firmware blocks, the GMU context bank and the CM3 start are in
   `mondrian_gpu.c` under `gmustart=1`.
+- **The present path is the GPU's, measured on the secure-mode boot.** With
+  `glcopy=1` a frame is `1 picture copied out` at ~11 ms; with `glcopy=0
+  glwait=0` the same boot reports `0 pictures copied out, 1 drawn in place`,
+  680-1949 us a frame, and each present is `MONDRIAN FB: swap N layer 0
+  surface X 1440x3200`. A still screen then stops swapping after five or six
+  frames (`fps 0`): that is CoreAnimation drawing only on change, not a stall,
+  and no process dies. Frames per second under motion has to be read with a
+  swipe or an unlock running, because a lock screen at rest never asks for a
+  frame.
 - **GX runs under a submission, and the render blocks run the blit.** The two
   power questions are both answered, so neither is worth re-measuring:
   `GMU_GFX_PWR_CLK_STATUS` reads `0` (GDSC on, clock on) on every fence poll
