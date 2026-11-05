@@ -1,0 +1,92 @@
+xnu 0235: a known pattern in a fresh surface
+
+The probe now samples the whole surface instead of four pixels, and with the
+generic 3D blitter the RB is measured pointing at it
+(`rb target 0x10c24000 pitch 5760 | surface 2 iova 0x10c24000`); it still
+reads `nonzero 0/4500`, and those zeros have three causes that look alike: a
+draw that never ran, a clear that wrote black, and a surface nothing wrote.
+With gpusurfpat=1 a surface adopted for the first time is filled with
+0xffffffff and written back before the GPU reads it, so the probe separates
+them: the pattern survives (nothing writes the surface), the surface is all
+zeros (something does write it, black), or part of it changed (the draws land
+and the count says how much).
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -421,6 +421,59 @@
+ 	buffer->dirty = false;
+ }
+ 
++/*
++ * gpusurfpat=1: a surface adopted for the first time starts as 0xffffffff
++ * instead of whatever the allocator left there.
++ *
++ * `nonzero 0/4500` over a cleared Grid says the surface reads as zeros, but
++ * not why: a draw that never ran, a clear that wrote black, and a surface that
++ * was never written at all all read the same. A known pattern separates them.
++ * The pattern survives -> nothing wrote it. All zeros -> something wrote
++ * zeros, which is a clear or a fast-clear flag and not a missing write.
++ * Anything else -> the draws land, and the count says how much of the surface
++ * they covered. The buffer is `dirty`, so the next submission writes the
++ * pattern back to DRAM before the GPU reads it.
++ */
++static int
++mondrian_uc_surfpat_on(void)
++{
++	static int parsed, on;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("gpusurfpat", &on, sizeof(on))) {
++			on = 0;
++		}
++	}
++	return on != 0;
++}
++
++static void
++mondrian_uc_fill_pattern(mondrian_buffer *buffer)
++{
++	uint8_t *scratch;
++	uint64_t off;
++
++	scratch = (uint8_t *)IOMalloc(0x4000);
++	if (scratch == NULL) {
++		return;
++	}
++	memset(scratch, 0xff, 0x4000);
++	for (off = 0; off < buffer->size; off += 0x4000) {
++		uint64_t chunk = buffer->size - off;
++
++		if (chunk > 0x4000) {
++			chunk = 0x4000;
++		}
++		if (buffer->memory->writeBytes(off, scratch, chunk) != chunk) {
++			IOLog("MondrianGPU: surface pattern stopped at 0x%llx\n",
++			    (unsigned long long)off);
++			break;
++		}
++	}
++	IOFree(scratch, 0x4000);
++}
++
+ mondrian_buffer *
+ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ {
+@@ -493,6 +546,17 @@
+ 	buffer->dirty = true;
+ 	buffer->mapped = false;
+ 	fBuffers[fBufferCount++] = buffer;
++	/*
++	 * Surface-sized only: a pattern test on a texture would say nothing
++	 * about the surface and would cost a flush of every buffer.
++	 */
++	if (size >= 0x100000ull && mondrian_uc_surfpat_on()) {
++		mondrian_uc_fill_pattern(buffer);
++		IOLog("MondrianGPU: surface pattern handle %u iova 0x%llx "
++		    "size %llu\n", buffer->handle,
++		    (unsigned long long)buffer->iova,
++		    (unsigned long long)buffer->size);
++	}
+ 	return buffer;
+ }
+ 

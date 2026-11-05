@@ -1,0 +1,64 @@
+xnu 0233: one iova per IOSurface
+
+0232 showed the RB pointed at 0x12251000 (pitch 5888) while the surface the
+framebuffer reads had been given 0x10c24000 (bpr 5760), and nothing said
+whether those are two names for the same pixels or two different buffers.
+They could be two names: bufferAdopt() allocates a fresh iova and maps the
+surface's pages again on every call, and the GL client asks for a surface once
+per texture it makes of it.  One memory descriptor, one iova: the address a
+submission names and the address the display reads are then one number, and
+`adopt reuse` says when the second request came.  Every adoption is logged
+with its surface id, handle and iova.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -233,6 +233,7 @@
+ 	uint32_t fStateGroup;
+ 	uint32_t fEventLogged;
+ 	uint32_t fEventTotal;
++	uint32_t fSurfaceLogged;     /* surfaceBuffer() lines printed */
+ 	uint32_t fPrepLogged;
+ 	bool fSyncAll;
+ 	uint32_t fSyncLogged;
+@@ -432,6 +433,28 @@
+ 	    fBufferCount >= kMondrianBuffers) {
+ 		return NULL;
+ 	}
++	/*
++	 * The GL client can ask for the same surface once per texture it makes
++	 * of it. Adopting it again would map the same pages at a second iova,
++	 * so the address a submission names and the address the display reads
++	 * would no longer be one number, and nothing says they stay in step.
++	 * One buffer per memory descriptor: the same pixels, one iova.
++	 *
++	 * The return keeps `dirty` set: the CPU may have written the pixels
++	 * since the last submit, and the second adoption is not the moment to
++	 * assume it has not.
++	 */
++	for (i = 0; i < fBufferCount; i++) {
++		if (fBuffers[i]->memory == memory &&
++		    fBuffers[i]->size == size) {
++			fBuffers[i]->dirty = true;
++			IOLog("MondrianGPU: adopt reuse handle %u iova 0x%llx "
++			    "size %llu\n", fBuffers[i]->handle,
++			    (unsigned long long)fBuffers[i]->iova,
++			    (unsigned long long)fBuffers[i]->size);
++			return fBuffers[i];
++		}
++	}
+ 	iova = mondrian_gpu_uc_iova_alloc(size);
+ 	if (iova == 0) {
+ 		return NULL;
+@@ -624,6 +647,13 @@
+ 	}
+ 	request->handle = buffer->handle;
+ 	mondrian_gpu_uc_note_surface(request->surface, buffer->iova);
++	if (fSurfaceLogged < 24) {
++		fSurfaceLogged++;
++		IOLog("MondrianGPU: surface %u handle %u iova 0x%llx size %llu\n",
++		    request->surface, buffer->handle,
++		    (unsigned long long)buffer->iova,
++		    (unsigned long long)buffer->size);
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
