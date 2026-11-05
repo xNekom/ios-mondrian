@@ -1,0 +1,217 @@
+xnu 0250: read the UCHE trap page after the blit, page aligned
+
+The trap probe read 16 words at offset 0xf00 of the CP's memptr page, and it
+read them from the 2d-if report, which runs before run2dFill submits anything:
+the one page that could show a redirected write was inspected while it was
+still zero by construction. Both halves were wrong, and either one alone
+would keep the answer invisible.
+
+The trap now has a page of its own (iova 0x304000, mapped RW, WCOMB view) and
+the scan runs in run2dFill after the fill's fence, over all 1024 words: a
+non-zero word is a write the UCHE could not translate, which is where a
+request that neither lands nor faults is expected to go.
+
+Zero means the request never reached the UCHE. The report then reads what the
+SMMU knows -- the global FSR/GFSYNR, four context banks (SCTLR, FSR, FAR,
+TTBR0) and the eight low SMR/S2CR pairs -- because the port masks every
+interrupt and the stream table is the other place a refused write leaves a
+trace. gputrap=0 keeps mainline's 0x1fffffffff000 and skips both reads.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -778,6 +778,10 @@
+ #define SMMU_MAIR0		0x38u
+ #define SMMU_MAIR1		0x3cu
+ #define SMMU_FSR		0x58u
++#define SMMU_FAR		0x60u
++#define SMMU_GFSR		0x48u
++#define SMMU_GFSYNR0		0x50u
++#define SMMU_GFSYNR1		0x54u
+ #define SMMU_TLBIASID		0x610u
+ #define SMMU_TLBSYNC		0x7f0u
+ #define SMMU_TLBSTATUS		0x7f4u
+@@ -1832,6 +1836,14 @@
+  * first packets are the GPU state itself. Off by default; the bisect is
+  * Mesa-side (cpuirk=1 as an argument assembles it again). */
+ static struct mondrian_gpu_mem mondrian_cp_scratch;
++/*
++ * The page UCHE_TRAP_BASE and UCHE_WRITE_THRU_BASE point at with
++ * gputrap=1. It is a page of its own and the probe starts at offset
++ * zero, because the hardware aligns the trap address down to a page:
++ * reading 0xf00 of a page shared with the CP's memptr could never
++ * see the write it was looking for.
++ */
++static struct mondrian_gpu_mem mondrian_cp_trap;
+ static uint32_t mondrian_cp_sctlr;
+ 
+ static int mondrian_cp_blind;
+@@ -1910,6 +1922,7 @@
+ static uint32_t mondrian_cp_tcr_live, mondrian_cp_tcr_dark;
+ static vm_offset_t mondrian_cp_scratch_view;
+ static vm_offset_t mondrian_cp_memptr_view;
++static vm_offset_t mondrian_cp_trap_view;
+ 
+ static int
+ mondrian_gpu_cp_smmu(vm_offset_t smmu)
+@@ -1987,6 +2000,7 @@
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_uc_quirk, 0x1000, 0x303000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_trap, 0x1000, 0x304000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_scratch, 0x1000, 0x302000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ib, 0x4000, 0x400000) != 0) {
+ 			printf("MONDRIAN GPU: cp memory allocation failed\n");
+@@ -2022,6 +2036,9 @@
+ 		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
+ 		    mondrian_cp_tables.pa, mondrian_cp_scratch.iova,
+ 		    mondrian_cp_scratch.va, mondrian_cp_scratch.bytes, 3, &next) != 0 ||
++		    mondrian_gpu_smmu_map_va((uint64_t *)mondrian_cp_tables.va,
++		    mondrian_cp_tables.pa, mondrian_cp_trap.iova,
++		    mondrian_cp_trap.va, mondrian_cp_trap.bytes, 3, &next) != 0 ||
+ 		    /* The command stream is fetched by the non-privileged CP
+ 		     * path: user-accessible, and executable so neither fetch
+ 		     * flavour can permission-fault. */
+@@ -2038,7 +2055,10 @@
+ 		    0x1000, VM_WIMG_WCOMB);
+ 		mondrian_cp_memptr_view = ml_io_map_unmappable(mondrian_cp_memptr.pa,
+ 		    0x1000, VM_WIMG_WCOMB);
++		mondrian_cp_trap_view = ml_io_map_unmappable(mondrian_cp_trap.pa,
++		    0x1000, VM_WIMG_WCOMB);
+ 		mondrian_gpu_mem_flush(&mondrian_cp_scratch, 0x1000);
++		mondrian_gpu_mem_flush(&mondrian_cp_trap, 0x1000);
+ 		printf("MONDRIAN GPU: cp map done\n");
+ 		mondrian_log_flush_now();
+ #ifdef MONDRIAN_SQE_FW
+@@ -2698,8 +2718,8 @@
+ 	{
+ 		uint64_t trap = 0x1fffffffff000ULL;
+ 
+-		if (mondrian_cp_trap_watch != 0) {
+-			trap = mondrian_cp_memptr.iova + 0xf00u;
++		if (mondrian_cp_trap_watch != 0 && mondrian_cp_trap.iova != 0) {
++			trap = mondrian_cp_trap.iova;
+ 		}
+ 		CPW64(GEN7_UCHE_TRAP_BASE_LO, trap);
+ 		CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, trap);
+@@ -4092,27 +4112,6 @@
+ 	 * GBIF system-cache config (a730's LLCC slice, which nothing in this
+ 	 * port programs), the GX client config and RBBM's own status.
+ 	 */
+-	if (mondrian_cp_trap_watch != 0 &&
+-	    mondrian_cp_memptr_view != 0) {
+-		volatile uint32_t *t =
+-		    (volatile uint32_t *)mondrian_cp_memptr_view;
+-		uint32_t k, nz = 0, first = 0;
+-
+-		for (k = 0; k < 16; k++) {
+-			uint32_t v = t[(0xf00u / 4u) + k];
+-
+-			if (v != 0) {
+-				if (nz == 0) {
+-					first = v;
+-				}
+-				nz++;
+-			}
+-		}
+-		printf("MondrianGPU: 2d trap page nz %u/16 first 0x%x"
+-		    " base 0x%llx\n", nz, first,
+-		    (unsigned long long)(mondrian_cp_memptr.iova + 0xf00u));
+-		mondrian_log_flush_now();
+-	}
+ 	printf("MondrianGPU: 2d if uche_cfg 0x%x qos 0x%x scache0 0x%x"
+ 	    " scache1 0x%x gx 0x%x rbbm 0x%x rbbm3 0x%x ways 0x%x pf 0x%x"
+ 	    " trap 0x%x%08x thru 0x%x%08x gmem 0x%x%08x..0x%x%08x\n",
+@@ -4146,6 +4145,74 @@
+ 	mondrian_log_flush_now();
+ }
+ 
++/*
++ * Read after a 2D blit has fenced. Two questions, one page and one table:
++ *
++ * - UCHE_TRAP_BASE and UCHE_WRITE_THRU_BASE both name this page when
++ *   gputrap=1, so a non-zero word in it is a write the UCHE could not
++ *   translate. The whole 4 KiB is scanned: the hardware aligns the trap
++ *   address down to a page, and an earlier probe that read offset 0xf00 of
++ *   a shared page saw nothing even when the blit had gone somewhere.
++ * - A write that is not trapped is one the SMMU refused, and the port masks
++ *   every interrupt, so the only trace is a latched FSR/FAR. Bank 0 is the
++ *   CP's; the next banks and the global registers say whether the GPU's
++ *   non-CP traffic is matched by the stream table at all.
++ */
++void
++mondrian_gpu_uc_trap_report(void)
++{
++	volatile uint32_t *t;
++	uint32_t k, nz = 0, first = 0, at = 0;
++
++	if (mondrian_cp_trap_watch == 0 || mondrian_cp_trap_view == 0) {
++		return;
++	}
++	t = (volatile uint32_t *)mondrian_cp_trap_view;
++	for (k = 0; k < 0x1000u / 4u; k++) {
++		uint32_t v = t[k];
++
++		if (v != 0) {
++			if (nz == 0) {
++				first = v;
++				at = k * 4u;
++			}
++			nz++;
++		}
++	}
++	printf("MondrianGPU: 2d trap page nz %u/1024 first 0x%08x at 0x%x"
++	    " base 0x%llx\n", nz, first, at,
++	    (unsigned long long)mondrian_cp_trap.iova);
++	mondrian_log_flush_now();
++	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
++		return;
++	}
++	mondrian_uc_keepalive(1);
++	printf("MONDRIAN GPU: smmu gfsr 0x%x gfsynr0 0x%x gfsynr1 0x%x"
++	    " ctx 0x%x\n",
++	    mondrian_gpu_read(mondrian_uc_smmu, SMMU_GFSR),
++	    mondrian_gpu_read(mondrian_uc_smmu, SMMU_GFSYNR0),
++	    mondrian_gpu_read(mondrian_uc_smmu, SMMU_GFSYNR1),
++	    mondrian_uc_tlb_ctx);
++	for (k = 0; k < 4; k++) {
++		uint32_t c = mondrian_uc_tlb_ctx + k * 0x1000u;
++
++		printf("MONDRIAN GPU: smmu ctx%u sctlr 0x%x fsr 0x%x far 0x%x"
++		    " ttbr0 0x%llx\n", k,
++		    mondrian_gpu_read(mondrian_uc_smmu, c + SMMU_SCTLR),
++		    mondrian_gpu_read(mondrian_uc_smmu, c + SMMU_FSR),
++		    mondrian_gpu_read(mondrian_uc_smmu, c + SMMU_FAR),
++		    (unsigned long long)mondrian_smmu_read64(mondrian_uc_smmu,
++		    c + SMMU_TTBR0));
++	}
++	for (k = 0; k < 8; k++) {
++		printf("MONDRIAN GPU: smmu s%u smr 0x%x s2cr 0x%x\n", k,
++		    mondrian_gpu_read(mondrian_uc_smmu, SMMU_SMR(k)),
++		    mondrian_gpu_read(mondrian_uc_smmu, SMMU_S2CR(k)));
++	}
++	mondrian_uc_keepalive(0);
++	mondrian_log_flush_now();
++}
++
+ /*
+  * A CP_MEM_WRITE of one dword, emitted into `buf`. The CP's own writes are
+  * the only ones this port has ever seen land, and they have all landed in a
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -50,6 +50,7 @@
+ uint32_t mondrian_gpu_uc_fault_state(uint32_t *gfsr);
+ uint64_t mondrian_gpu_uc_fault_addr(void);
+ void mondrian_gpu_uc_2d_state(uint32_t *out);
++void mondrian_gpu_uc_trap_report(void);
+ uint32_t mondrian_gpu_uc_mem_write(uint32_t *buf, uint64_t dst,
+     uint32_t value);
+ 
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -970,6 +970,7 @@
+ 		/* The CP is idle: its registers and the SMMU answer. */
+ 		mondrian_gpu_uc_2d_state(regs);
+ 		fsr = mondrian_gpu_uc_fault_state(&gfsr);
++		mondrian_gpu_uc_trap_report();
+ 	}
+ 	bufferSync(dst);
+ 	(void)dst->memory->readBytes(0x1000, &got, sizeof(got));

@@ -1,0 +1,120 @@
+xnu 0248: put the a7xx sysmem registers in front of the 2D blit
+
+fd6_emit_sysmem_prep() writes five a7xx registers and a direct-render
+marker before a sysmem pass; RB_UNKNOWN_8812 = 0x3ff is the one that says
+the render targets are in system memory. The replay now emits that block
+ahead of the blit, off by default: with it the blit never fences and the CP
+stops answering its register port, so the 2D engine needs the render-target
+setup that comes with the registers, not the registers alone.
+
+The same line reads back RB_UNKNOWN_8812, RB_UNKNOWN_8E06, RB_UNKNOWN_8E09
+and RBBM_INT_0_STATUS: whether the block took, and whether the UCHE or the
+trusted-size check latched an error the masked interrupt hid.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -793,6 +793,29 @@
+ }
+ 
+ /*
++ * gpu2dsysmem=1: put the a7xx direct-render registers in front of the
++ * blit, the set fd6_emit_sysmem_prep() writes (RB_UNKNOWN_8812 = 0x3ff marks
++ * every render target as living in system memory). Measured: the blit then
++ * never fences and the CP stops answering its register port, so the 2D engine
++ * needs the render-target setup that comes with those registers, not just the
++ * registers; off by default. Mesa emits the same block on every frame and
++ * frames fence, so the switch is in effect on the UI path either way.
++ */
++static int
++mondrian_uc_2dfill_sysmem(void)
++{
++	static int parsed, on = 0;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("gpu2dsysmem", &on, sizeof(on))) {
++			on = 0;
++		}
++	}
++	return on != 0;
++}
++
++/*
+  * gpu2dpa=1: aim the blit at the buffer's *physical* address instead of the
+  * iova it is mapped at. Everything measured so far says the two paths already
+  * disagree about which address they use -- a CP_MEM_WRITE to the iova lands,
+@@ -850,6 +873,20 @@
+ 	 * stream (`4088e501 80000000`): colour cache full, colour offset
+ 	 * 0x100000.
+ 	 */
++	if (mondrian_uc_2dfill_sysmem()) {
++		words[n++] = 0x40881201u;	/* RB_UNKNOWN_8812 */
++		words[n++] = 0x000003ffu;	/* all buffers in sysmem */
++		words[n++] = 0x408e0601u;	/* RB_UNKNOWN_8E06 */
++		words[n++] = 0x02080000u;	/* a730 magic_regs value */
++		words[n++] = 0x40800701u;	/* GRAS_UNKNOWN_8007 */
++		words[n++] = 0x00000000u;
++		words[n++] = 0x40811001u;	/* GRAS_UNKNOWN_8110 */
++		words[n++] = 0x00000002u;
++		words[n++] = 0x408e0901u;	/* RB_UNKNOWN_8E09 */
++		words[n++] = 0x00000004u;
++		words[n++] = 0x70650001u;	/* CP_SET_MARKER */
++		words[n++] = 0x00000001u;	/* RM6_DIRECT_RENDER */
++	}
+ 	if (mondrian_uc_2dfill_ccu()) {
+ 		words[n++] = 0x4088e501u;	/* pkt4: RB_CCU_CNTL2 */
+ 		words[n++] = 0x80000000u;
+@@ -875,7 +912,7 @@
+ MondrianGPUUserClient::run2dFill(void)
+ {
+ 	mondrian_buffer *dst, *ib;
+-	uint32_t words[64], zeros[16], sample[16], regs[8];
++	uint32_t words[64], zeros[16], sample[16], regs[12];
+ 	uint32_t n, i, j, fence = 0, nonzero = 0, sampled = 0;
+ 	uint32_t first = 0, mid = 0, canary = 0xdeadbeef, got = 0;
+ 	uint32_t fsr = 0, gfsr = 0;
+@@ -957,12 +994,14 @@
+ 	    " fence %u nonzero %u/%u first 0x%08x mid 0x%08x canary 0x%08x"
+ 	    " got 0x%08x ccu %d dst_info 0x%x dst 0x%08x%08x pitch 0x%x"
+ 	    " blit 0x%x unk 0x%x protect 0x%x fault 0x%x fsr 0x%x"
+-	    " gfsr 0x%x pa 0x%llx blit_dst 0x%llx\n", dst->handle,
++	    " gfsr 0x%x pa 0x%llx blit_dst 0x%llx"
++	    " sysmem 0x%x 8e06 0x%x 8e09 0x%x rint 0x%x\n", dst->handle,
+ 	    (unsigned long long)dst->iova, submitted, polled, fence, nonzero,
+ 	    sampled, first, mid, canary, got, mondrian_uc_2dfill_ccu(),
+ 	    regs[0], regs[2], regs[1], regs[3], regs[4], regs[5], regs[6],
+ 	    regs[7], fsr, gfsr, (unsigned long long)fill_pa,
+-	    (unsigned long long)fill_dst);
++	    (unsigned long long)fill_dst, mondrian_uc_2dfill_sysmem(),
++	    regs[8], regs[9], regs[10], regs[11]);
+ 	bufferFree(ib);
+ 	bufferFree(dst);
+ }
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4075,6 +4075,17 @@
+ 	    GEN7_CP_PROTECT_STATUS * 4u);
+ 	out[7] = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_HW_FAULT * 4u);
+ 	/*
++	 * RB_UNKNOWN_8812 is the a7xx switch that says which render targets
++	 * are in system memory (Mesa writes 0x3ff from its own stream); 8E06
++	 * and 8E09 are the two a730 magic registers next to it. RBBM's raw
++	 * interrupt status is here because the port masks every interrupt at
++	 * init: a UCHE trap or a TSB write error still latches there.
++	 */
++	out[8] = mondrian_gpu_read(mondrian_uc_gpu, 0x8812u * 4u);
++	out[9] = mondrian_gpu_read(mondrian_uc_gpu, 0x8e06u * 4u);
++	out[10] = mondrian_gpu_read(mondrian_uc_gpu, 0x8e09u * 4u);
++	out[11] = mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_INT_0_STATUS * 4u);
++	/*
+ 	 * The memory interface the render blocks leave through, read here
+ 	 * because this is the one place in the boot where the CP is known
+ 	 * idle: what the two writes above actually left behind, next to the
+@@ -5183,7 +5194,7 @@
+ mondrian_gpu_uc_2d_state(uint32_t *out)
+ {
+ 	if (out != NULL) {
+-		bzero(out, 8 * sizeof(uint32_t));
++		bzero(out, 12 * sizeof(uint32_t));
+ 	}
+ }
+ 

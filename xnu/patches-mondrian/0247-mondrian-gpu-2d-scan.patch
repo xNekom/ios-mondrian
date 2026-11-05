@@ -1,0 +1,86 @@
+xnu 0247: scan the whole blit destination, and read the UCHE GMEM range
+
+The blit writes nothing at the iova, nothing at the physical address and
+raises no fault, so the next question is whether it writes *somewhere*.
+The 8 MiB probe sampled three places; this walks all of it and reports how
+many dwords are non-zero and where the first one is, which separates
+"no fragment" from "every row moved by a pitch the probe does not share".
+
+UCHE_GMEM_RANGE_MIN/MAX come with it: an access inside that window is
+served by GMEM, so a destination the UCHE reads as a GMEM offset would be
+written on-chip and never reach the address the instruction names -- the
+one mechanism that fits a busy RB, a busy CCU and an unchanged buffer.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -1175,6 +1175,40 @@
+ 	    (unsigned long long)MONDRIAN_2DBIG_BYTES, submitted, polled, fence,
+ 	    nonzero[0], first[0], nonzero[1], first[1], nonzero[2], first[2]);
+ 	/*
++	 * Three samples cannot tell "nothing was written" from "written
++	 * somewhere else in the buffer": a pitch or offset the engine takes
++	 * differently from the probe would move every row and leave all three
++	 * samples clean. Walk the whole thing.
++	 */
++	if (polled) {
++		uint32_t chunk[1024];
++		uint32_t nz = 0, val = 0, found = 0;
++		uint64_t where = 0;
++
++		for (off = 0; off < MONDRIAN_2DBIG_BYTES;
++		    off += sizeof(chunk)) {
++			uint32_t k;
++
++			if (dst->memory->readBytes(off, chunk,
++			    sizeof(chunk)) != sizeof(chunk)) {
++				break;
++			}
++			for (k = 0; k < 1024; k++) {
++				if (chunk[k] == 0) {
++					continue;
++				}
++				if (found == 0) {
++					found = 1;
++					where = off + k * 4u;
++					val = chunk[k];
++				}
++				nz++;
++			}
++		}
++		IOLog("MondrianGPU: 2d big scan nz %u first at 0x%llx 0x%08x\n",
++		    nz, (unsigned long long)where, val);
++	}
++	/*
+ 	 * Then ask for the colour cache by itself, in its own submission: if the
+ 	 * blit left the pixels in the CCU and the clean in the same stream ran
+ 	 * before the engine finished, a clean that is certainly after it brings
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4104,7 +4104,7 @@
+ 	}
+ 	printf("MondrianGPU: 2d if uche_cfg 0x%x qos 0x%x scache0 0x%x"
+ 	    " scache1 0x%x gx 0x%x rbbm 0x%x rbbm3 0x%x ways 0x%x pf 0x%x"
+-	    " trap 0x%x%08x thru 0x%x%08x\n",
++	    " trap 0x%x%08x thru 0x%x%08x gmem 0x%x%08x..0x%x%08x\n",
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_CMDQ_CONFIG * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu,
+ 	    GEN7_RBBM_GBIF_CLIENT_QOS_CNTL * 4u),
+@@ -4120,7 +4120,18 @@
+ 	    mondrian_gpu_read(mondrian_uc_gpu,
+ 	    GEN7_UCHE_WRITE_THRU_BASE_HI * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu,
+-	    GEN7_UCHE_WRITE_THRU_BASE_LO * 4u));
++	    GEN7_UCHE_WRITE_THRU_BASE_LO * 4u),
++	    /*
++	     * The GMEM window, read raw: the xml places it at 0xe0b/0xe0d as
++	     * two 64-bit registers. An access the UCHE reads as a GMEM offset
++	     * is served by on-chip memory, so a destination inside this window
++	     * would be written into GMEM and never reach the address the
++	     * instruction names -- which is what every probe here reports.
++	     */
++	    mondrian_gpu_read(mondrian_uc_gpu, 0xe0cu * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0xe0bu * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0xe0eu * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0xe0du * 4u));
+ 	mondrian_log_flush_now();
+ }
+ 

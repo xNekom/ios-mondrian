@@ -212,9 +212,9 @@ forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
 is a real MDSS driver (`qcom,mdss_mdp@ae00000`,
 `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`).
 
-The UI draws and presents on the GPU with no CPU copy (`docs/MONDIAN_GPU.md`);
-what is left is pacing (9 ms frames, at most 20 swaps a second, a per-frame
-`glFinish()`) and the texture uploads that leave the wallpaper white.
+The GPU write path is open: a trusted GPU dropped every render-block write
+until `CP_SET_SECURE_MODE(0)` (`docs/MONDIAN_GPU.md`); what is left is
+presentation, pacing and the texture uploads that leave the wallpaper white.
 
 ### 4. The touch
 

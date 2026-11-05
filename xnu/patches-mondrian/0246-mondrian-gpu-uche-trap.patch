@@ -1,0 +1,111 @@
+xnu 0246: watch the UCHE's trap page
+
+A blit whose RB, CCU and UCHE are all busy for its whole length leaves the
+destination untouched and raises no fault, and the CP's own write to the
+same iova lands. That is what a request the UCHE cannot translate looks
+like: it is not faulted, it is redirected to UCHE_WRITE_THRU_BASE, and
+mainline parks that at 0x1fffffffff000 where nobody will ever look.
+
+gputrap=1 points UCHE_TRAP_BASE and UCHE_WRITE_THRU_BASE at the last 0x100
+of the CP's memptr page and reads it back after the fill. A page that holds
+the blit's colour is the whole answer; a page that is still zero moves the
+loss past the UCHE. The same line reads UCHE_CACHE_WAYS and UCHE_CLIENT_PF
+back as well.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -123,6 +123,12 @@
+  */
+ static int mondrian_cp_scache = 1;
+ /*
++ * 1: point UCHE_TRAP_BASE/UCHE_WRITE_THRU_BASE at the last 0x100 of the CP's
++ * memptr page, which this port can read back, instead of mainline's
++ * 0x1fffffffff000. A write the UCHE cannot translate lands there.
++ */
++static int mondrian_cp_trap_watch;
++/*
+  * The 2000-submission stress in the CP bring-up: a diagnostic, on by default
+  * because it is what proves the ring, the fence slots and the order. cpstress=0
+  * skips it, for a boot where the point is to get past the bring-up: with
+@@ -2682,8 +2688,22 @@
+ 	CPW(GEN7_RBBM_INT_0_MASK, 0);
+ 	CPW(GEN7_UCHE_GBIF_GX_CONFIG, 0x10240e0u);
+ 	CPW(GEN7_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
+-	CPW64(GEN7_UCHE_TRAP_BASE_LO, 0x1fffffffff000ULL);
+-	CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, 0x1fffffffff000ULL);
++	/*
++	 * The trap base is where the UCHE sends an access it cannot translate,
++	 * and the write-through base is the same address for writes. Mainline
++	 * parks both at 0x1fffffffff000, a place nobody maps, which is what a
++	 * write that never arrives and never faults looks like. gputrap=1
++	 * parks them at a page this port reads back instead.
++	 */
++	{
++		uint64_t trap = 0x1fffffffff000ULL;
++
++		if (mondrian_cp_trap_watch != 0) {
++			trap = mondrian_cp_memptr.iova + 0xf00u;
++		}
++		CPW64(GEN7_UCHE_TRAP_BASE_LO, trap);
++		CPW64(GEN7_UCHE_WRITE_THRU_BASE_LO, trap);
++	}
+ 	CPW(GEN7_UCHE_CACHE_WAYS, 0x800000u);
+ 	printf("MONDRIAN GPU: cp if before uche_cfg 0x%x qos 0x%x gx 0x%x\n",
+ 	    CPR(GEN7_UCHE_CMDQ_CONFIG), CPR(GEN7_RBBM_GBIF_CLIENT_QOS_CNTL),
+@@ -4061,8 +4081,30 @@
+ 	 * GBIF system-cache config (a730's LLCC slice, which nothing in this
+ 	 * port programs), the GX client config and RBBM's own status.
+ 	 */
++	if (mondrian_cp_trap_watch != 0 &&
++	    mondrian_cp_memptr_view != 0) {
++		volatile uint32_t *t =
++		    (volatile uint32_t *)mondrian_cp_memptr_view;
++		uint32_t k, nz = 0, first = 0;
++
++		for (k = 0; k < 16; k++) {
++			uint32_t v = t[(0xf00u / 4u) + k];
++
++			if (v != 0) {
++				if (nz == 0) {
++					first = v;
++				}
++				nz++;
++			}
++		}
++		printf("MondrianGPU: 2d trap page nz %u/16 first 0x%x"
++		    " base 0x%llx\n", nz, first,
++		    (unsigned long long)(mondrian_cp_memptr.iova + 0xf00u));
++		mondrian_log_flush_now();
++	}
+ 	printf("MondrianGPU: 2d if uche_cfg 0x%x qos 0x%x scache0 0x%x"
+-	    " scache1 0x%x gx 0x%x rbbm 0x%x rbbm3 0x%x\n",
++	    " scache1 0x%x gx 0x%x rbbm 0x%x rbbm3 0x%x ways 0x%x pf 0x%x"
++	    " trap 0x%x%08x thru 0x%x%08x\n",
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_CMDQ_CONFIG * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu,
+ 	    GEN7_RBBM_GBIF_CLIENT_QOS_CNTL * 4u),
+@@ -4070,7 +4112,15 @@
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_GBIF_SCACHE_CNTL1 * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_GBIF_GX_CONFIG * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u),
+-	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS3 * 4u));
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS3 * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_CACHE_WAYS * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_CLIENT_PF * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_TRAP_BASE_HI * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_UCHE_TRAP_BASE_LO * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu,
++	    GEN7_UCHE_WRITE_THRU_BASE_HI * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu,
++	    GEN7_UCHE_WRITE_THRU_BASE_LO * 4u));
+ 	mondrian_log_flush_now();
+ }
+ 
+@@ -5333,6 +5383,8 @@
+ 	    sizeof(mondrian_cp_if_init));
+ 	(void)PE_parse_boot_argn("gpuscache", &mondrian_cp_scache,
+ 	    sizeof(mondrian_cp_scache));
++	(void)PE_parse_boot_argn("gputrap", &mondrian_cp_trap_watch,
++	    sizeof(mondrian_cp_trap_watch));
+ 	(void)PE_parse_boot_argn("cpstress", &mondrian_cp_stress,
+ 	    sizeof(mondrian_cp_stress));
+ 	(void)PE_parse_boot_argn("gpuringslow", &mondrian_uc_ring_slow,

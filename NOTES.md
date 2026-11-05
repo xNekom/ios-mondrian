@@ -60,18 +60,19 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   skips Setup, including the `SBLockdownManager` and `SBSetupManager` gates.
   The cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root
   must have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the
-  Apple logo. GPU pixel correctness and fluidity are not established
+  Apple logo. GPU writes memory once `CP_SET_SECURE_MODE(0)` retires; pixel correctness and
+   fluidity are still being measured
   (`docs/MONDIAN_GPU.md`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **GPU rendering is not yet pixel-correct or fluid.** The CP bring-up,
-   canary and fence work; the FD725 self-tests read black for clear, texel
-   upload and draw, while a kernel probe of the display surface once read an
-   opaque-black clear, so the readback is suspect too. Next: the shared-surface
-   path and the readback (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`).
+1. **GPU rendering: correctness and fluidity.** The write path is unlocked: a
+   trusted GPU dropped every render-block write silently, and the secure-mode
+   switch is what fixes it. The Apple logo and the lock screen draw; next are
+   the shared-surface and readback paths, then frames per second
+   (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.

@@ -195,15 +195,26 @@ them has Metal. That is the path this port follows.
   `0x600dc0de` into the memptr page and a `CP_EVENT_WRITE` (0x46,
   `CACHE_CLEAN|BIT(27)`) fences `0x600dc0df` into the next dword; `rptr` and
   `wptr` end equal (21), the RPTR shadow follows, `CP_INTERRUPT_STATUS` 0.
-- **The switch is a no-op that parks.** Plain: `CP_SET_SECURE_MODE(0)` (ring
-  dword 10, header `0x70e60001`) never retires (`cp secmode rptr 11 wptr 12`,
-  SQE parked at ucode PC 0x649, `fault 0`, `int 0x80`), nothing after it runs,
-  and neither a full power cycle nor the retry that puts a `CP_NOP` over the
-  stalled dword changes it. The reason is in the read-back: after a successful
-  ZAP the CP is **already nonsecure** (`cp notready secure 0x0`, `trust 0x1`,
-  `sqebase 0x100000`), so its `setsecure` has nothing to switch and parks.
-  `cpnosecmode=1` skips the packet; the next one, `CP_MEM_WRITE`, then
-  executes and its canary lands.
+- **The switch is what puts the render blocks in nonsecure mode, and the
+  whole GPU write path depends on it.** The bootloader leaves
+  `RBBM_SECVID_TRUST_CNTL=1` (trusted) and a non-secure write to it aborts, so
+  the register route mainline takes without a zap shader is closed here;
+  `CP_SET_SECURE_MODE(0)` is the only way out. With the switch retired
+  (`cp secmode rptr 12 wptr 12`) the 2D probe writes: `2d fill … nonzero
+  64/64 first 0xffffffff` and the 8 MiB blow scans `nz 2097152` at
+  `0xffffffff`. With it skipped (`cpnosecmode=1`) the same submission writes
+  nothing, the scan finds only the CP's own canary, and the UCHE trap page
+  stays zero. That is the entire "no write and no fault" signature: a trusted
+  GPU sends the render blocks' traffic down the secure path, whose TSB this
+  port leaves empty (`RBBM_SECVID_TSB_CNTL` 0), so it is dropped silently,
+  while the CP's privileged traffic keeps translating and its fence lands.
+  A `CP_MEM_WRITE` canary is therefore not evidence that the render path
+  works — it is a privileged access and takes the other route.
+- **The switch parks on some boots.** `cp secmode rptr 11 wptr 12`, SQE at
+  ucode PC 0x649, `fault 0`, `int 0x80`: nothing behind it runs. The retry
+  puts a `CP_NOP` over the stalled dword and re-sends the switch
+  (`cp secmode retry rptr 11 of 15`), after which the CP continues; a boot
+  that reaches `rptr 12 wptr 12` is the one to judge.
 - **`CP_APRIV_CNTL` is what decides whether a privileged packet is refused.**
   The SQE microcode reads `CP_APRIV_CNTL` (0x844) and mirrors it into its
   per-pipe privileged-opcode mask (internal `0x0aa`), so with that register

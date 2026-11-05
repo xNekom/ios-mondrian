@@ -1,0 +1,72 @@
+xnu 0249: read the a7xx sysmem state after the early submissions
+
+The UI path is Mesa's own stream, so the a7xx direct-render registers are
+already in it; whether the CP took them is not visible from the outside.
+RB_UNKNOWN_8812 = 0x3ff means the render targets are in system memory and
+0x0 means GMEM, so the value read back after a frame that wrote nothing
+says whether the mode switch arrived. RB_CCU_CNTL/CNTL2 come with it (the
+colour cache size and offset, and the concurrent-resolve mode), and so does
+RBBM's raw interrupt status, which the port's masked interrupts hide.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -5100,6 +5100,52 @@
+ 	return 0;
+ }
+ 
++/*
++ * gpusysmem=1 (the default): what the submission that just fenced left on the
++ * a7xx memory path. Mesa writes the sysmem block at the head of every direct
++ * render pass -- RB_UNKNOWN_8812 = 0x3ff is the register that says the render
++ * targets are in system memory -- so reading it here says whether the CP took
++ * those writes at all, and RB_CCU_CNTL/CNTL2 say which way the colour cache is
++ * pointed. RBBM's raw interrupt status is on the line because the port masks
++ * every interrupt at init: a UCHE trap or a TSB write error still latches
++ * there. Six submissions, then silence.
++ */
++static void
++mondrian_uc_sysmem_state(uint32_t fence)
++{
++	static int parsed, on = 1;
++	static int left = 6;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("gpusysmem", &on, sizeof(on))) {
++			on = 1;
++		}
++	}
++	if (on == 0 || left <= 0) {
++		return;
++	}
++	left--;
++	mondrian_uc_keepalive(1);
++	printf("MONDRIAN GPU: sysmem fence %u 8812 0x%x 8e06 0x%x 8e09 0x%x"
++	    " 8110 0x%x 8007 0x%x 8811 0x%x ccu2 0x%x ccu 0x%x nc 0x%x"
++	    " bin 0x%x rint 0x%x rbbm 0x%x\n", fence,
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8812u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8e06u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8e09u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8110u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8007u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8811u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x88e5u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8e07u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x8e08u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, 0x80a1u * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_INT_0_STATUS * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u));
++	mondrian_uc_keepalive(0);
++	mondrian_log_flush_now();
++}
++
+ int
+ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ {
+@@ -5114,6 +5160,7 @@
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		value = view[mondrian_uc_fence_word(fence)];
+ 		if ((int32_t)(value - fence) >= 0) {
++			mondrian_uc_sysmem_state(fence);
+ 			if (mondrian_uc_logged < 10) {
+ 				mondrian_uc_logged++;
+ 				mondrian_uc_keepalive(1);
