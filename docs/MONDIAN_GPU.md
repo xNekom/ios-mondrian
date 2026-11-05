@@ -147,6 +147,16 @@ them has Metal. That is the path this port follows.
   and resolves `CB_FAR` through the CP's own tables (`gpudump` prints
   `pte present|absent`), which separates a stale TLB entry from a buffer the
   client never mapped.
+- **The SMMU is not what drops the render path's writes.** The tables are
+  installed for SID `0x5` and `0x405` (`smr 0x80000005` / `0x80000405`) and the
+  log shows `s2cr 0x1` for both, which is `S2CR.TYPE = TRANS` (type is bits
+  `17:16`; BYPASS is `1 << 16`, FAULT is `2 << 16`). SID `0` — the lease
+  Pong's `smid` uses — matches no SMR and therefore falls back to `S2CR[0]`,
+  the same translate entry, so the context bank, its `TTBR0` and its `MAIR0`
+  cover every stream ID the GPU can raise. `0x20000` in the other slots is
+  FAULT, i.e. those slots are unused, not bypassed. A missing render SID would
+  have to be matched *and* pointed at a second bank to explain a silent drop,
+  and nothing writes a second bank.
 - **The ZAP resets the GPU.** After `zap auth` the CP register block is back
   at the bootloader's values, so the ring and SQE bases have to be published
   again *after* the ZAP, before `CP_SQE_CNTL=1` (redwood's order: ZAP, then CP
@@ -531,6 +541,20 @@ them has Metal. That is the path this port follows.
   server's first frame carries a 51-dword clearing IB — and change only the
   destination and the colour. Do the same for any other a7xx register: check
   the `variants` attribute before using an `A6XX_*` constant.
+- **The 2D engine is configured and still writes nothing.** `0239` makes the
+  replay faithful (Mesa's `RB_CCU_CNTL2` head, measured as `4088e501
+  80000000`: colour cache full at offset `0x100000`), then reads the engine's
+  state back after the fence and puts a `CP_MEM_WRITE` into the same client
+  buffer. Measured: `dst_info 0x3 dst 0x0000000014ae4000 pitch 0x40 blit
+  0x10f00380 protect 0x0 fault 0x0`, the canary reads back `cafe1234`, the
+  blit's 64 sampled dwords are still zero, and FSR shows no fault. So the CP
+  applied every register write, the destination is the buffer, and the GPU can
+  write that memory from the CP — the colour is lost inside the RB/CCU, after
+  the point where the CP can see it. This also rules out `CP_PROTECT` and
+  protected mode for the draws: a refused type-4 write leaves the register at
+  its old value, and these read back as written. (Register reads are only
+  valid once the fence has answered; a wedged CP stops answering the register
+  port and the read never returns.)
 - **The SP warm-up kernel belongs in Mesa's stream.** Turnip's
   `tu_init_cmdbuf_start_a725_quirk` (a compute kernel over the whole shader
   array, 12 groups of 255 waves, the register writes that aim it, and

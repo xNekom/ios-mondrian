@@ -1,0 +1,297 @@
+xnu 0239: what the CP did with the blit -- read the 2D state back
+
+0236 replayed the window server's own 51-dword clearing IB and the fill
+completed (`submit 1 poll 1`) while writing nothing (`nonzero 0/64`). The
+replay was not faithful: Mesa writes RB_CCU_CNTL2 at the head of every
+batch (measured in this GPU's stream as `4088e501 80000000`, colour cache
+full at offset 0x100000), and a standalone blit without it runs with
+whatever CCU geometry the last batch left. That pair now leads the replay.
+
+Two hypotheses fit "the engine runs and memory does not change", and one
+boot separates them:
+
+  * A type-4 register write that CP_PROTECT covers is dropped with no
+    error, no fault and no stall, which would leave the blit with no
+    destination at all. The registers are read back after the fence
+    (RB_2D_DST_INFO, RB_2D_DST, RB_2D_DST_PITCH, RB_2D_BLIT_CNTL) together
+    with CP_PROTECT_STATUS and CP_HW_FAULT: if they read zero or something
+    else, the CP refused the writes.
+  * The client's memory is not reachable from the GPU. Every write this
+    port has seen land went to a page the driver allocated, so the IB
+    ends with a CP_MEM_WRITE of 0xcafe1234 into the same buffer, through
+    the same IOVA: if that dword reads back, the address and the mapping
+    are fine and the fault is the engine's.
+
+FSR/GFSR are cleared before the submission and read after it, so a fault
+belongs to this IB. `ccucntl=0` reproduces the earlier replay.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -769,9 +769,26 @@
+ 	return on != 0;
+ }
+ 
++/*
++ * ccucntl=0 drops the two dwords; the default keeps them.
++ */
++static int
++mondrian_uc_2dfill_ccu(void)
++{
++	static int parsed, on = 1;
++
++	if (!parsed) {
++		parsed = 1;
++		if (!PE_parse_boot_argn("ccucntl", &on, sizeof(on))) {
++			on = 1;
++		}
++	}
++	return on != 0;
++}
++
+ static uint32_t
+-mondrian_uc_2dfill_words(uint32_t *words, uint64_t iova, uint32_t c0,
+-    uint32_t c1, uint32_t c2, uint32_t c3)
++mondrian_uc_2dfill_words(uint32_t *words, uint64_t iova, uint64_t canary,
++    uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3)
+ {
+ 	static const uint32_t ib[51] = {
+ 		0x408c0001u, 0x10f00380u,	/* RB_2D_BLIT_CNTL */
+@@ -795,27 +812,42 @@
+ 		0x70460001u, 0x00000031u,	/* CACHE_CLEAN */
+ 		0x70268000u,			/* CP_WAIT_FOR_IDLE */
+ 	};
+-	uint32_t n;
++	uint32_t n = 0, at, i;
+ 
+-	for (n = 0; n < 51; n++) {
+-		words[n] = ib[n];
+-	}
+-	words[17] = c0;
+-	words[18] = c1;
+-	words[19] = c2;
+-	words[20] = c3;
+-	words[28] = (uint32_t)iova;
+-	words[29] = (uint32_t)(iova >> 32);
+-	return 51;
++	/*
++	 * Mesa writes RB_CCU_CNTL2 at the head of every batch, before the
++	 * blit: the colour cache's size and offset live there, and this replay
++	 * used to skip it. The value is the one measured in this GPU's own
++	 * stream (`4088e501 80000000`): colour cache full, colour offset
++	 * 0x100000.
++	 */
++	if (mondrian_uc_2dfill_ccu()) {
++		words[n++] = 0x4088e501u;	/* pkt4: RB_CCU_CNTL2 */
++		words[n++] = 0x80000000u;
++	}
++	at = n;
++	for (i = 0; i < 51; i++) {
++		words[n++] = ib[i];
++	}
++	words[at + 17] = c0;
++	words[at + 18] = c1;
++	words[at + 19] = c2;
++	words[at + 20] = c3;
++	words[at + 28] = (uint32_t)iova;
++	words[at + 29] = (uint32_t)(iova >> 32);
++	/* After the blit's last CP_WAIT_FOR_IDLE: what the CP can write here. */
++	n += mondrian_gpu_uc_mem_write(words + n, canary, 0xcafe1234u);
++	return n;
+ }
+ 
+ void
+ MondrianGPUUserClient::run2dFill(void)
+ {
+ 	mondrian_buffer *dst, *ib;
+-	uint32_t words[64], zeros[16], sample[16];
++	uint32_t words[64], zeros[16], sample[16], regs[8];
+ 	uint32_t n, i, j, fence = 0, nonzero = 0, sampled = 0;
+-	uint32_t first = 0, mid = 0;
++	uint32_t first = 0, mid = 0, canary = 0xdeadbeef, got = 0;
++	uint32_t fsr = 0, gfsr = 0;
+ 	uint64_t off;
+ 	int submitted, polled;
+ 
+@@ -837,16 +869,26 @@
+ 			break;
+ 		}
+ 	}
+-	n = mondrian_uc_2dfill_words(words, dst->iova, 0xff, 0x00, 0xff, 0xff);
++	n = mondrian_uc_2dfill_words(words, dst->iova, dst->iova + 0x1000,
++	    0xff, 0x00, 0xff, 0xff);
+ 	if (ib->memory->writeBytes(0, words, n * 4) != n * 4) {
+ 		IOLog("MondrianGPU: 2d fill: ib write failed\n");
+ 		return;
+ 	}
+ 	bufferSync(ib);
+ 	bufferSync(dst);
++	/* Only what this IB does counts: the latch is cleared first. */
++	mondrian_gpu_uc_fault_clear();
+ 	submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
+ 	polled = submitted && mondrian_gpu_uc_wait(fence, 1000) == 0;
++	bzero(regs, sizeof(regs));
++	if (polled) {
++		/* The CP is idle: its registers and the SMMU answer. */
++		mondrian_gpu_uc_2d_state(regs);
++		fsr = mondrian_gpu_uc_fault_state(&gfsr);
++	}
+ 	bufferSync(dst);
++	(void)dst->memory->readBytes(0x1000, &got, sizeof(got));
+ 	for (i = 0; i < 4; i++) {
+ 		bzero(sample, sizeof(sample));
+ 		(void)dst->memory->readBytes((uint64_t)i * MONDRIAN_2DFILL_BYTES / 4,
+@@ -865,9 +907,14 @@
+ 		}
+ 	}
+ 	IOLog("MondrianGPU: 2d fill handle %u iova 0x%llx submit %d poll %d"
+-	    " fence %u nonzero %u/%u first 0x%08x mid 0x%08x\n", dst->handle,
++	    " fence %u nonzero %u/%u first 0x%08x mid 0x%08x canary 0x%08x"
++	    " got 0x%08x ccu %d dst_info 0x%x dst 0x%08x%08x pitch 0x%x"
++	    " blit 0x%x unk 0x%x protect 0x%x fault 0x%x fsr 0x%x"
++	    " gfsr 0x%x\n", dst->handle,
+ 	    (unsigned long long)dst->iova, submitted, polled, fence, nonzero,
+-	    sampled, first, mid);
++	    sampled, first, mid, canary, got, mondrian_uc_2dfill_ccu(),
++	    regs[0], regs[2], regs[1], regs[3], regs[4], regs[5], regs[6],
++	    regs[7], fsr, gfsr);
+ 	bufferFree(ib);
+ 	bufferFree(dst);
+ }
+@@ -898,7 +945,8 @@
+ 	if (ib == NULL) {
+ 		return;
+ 	}
+-	n = mondrian_uc_2dfill_words(words, iova, 0xff, 0x00, 0xff, 0xff);
++	n = mondrian_uc_2dfill_words(words, iova, iova + 0x1000,
++	    0xff, 0x00, 0xff, 0xff);
+ 	if (ib->memory->writeBytes(0, words, n * 4) == n * 4) {
+ 		bufferSync(ib);
+ 		submitted = mondrian_gpu_uc_submit(ib->iova, n, &fence) == 0;
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3941,6 +3941,79 @@
+ 	mondrian_uc_keepalive(0);
+ }
+ 
++/*
++ * The SMMU's latched syndrome, for a caller that cleared it first: FSR is the
++ * context bank's, GFSR the global one. Read-only.
++ */
++uint32_t
++mondrian_gpu_uc_fault_state(uint32_t *gfsr)
++{
++	uint32_t fsr = 0;
++
++	if (gfsr != NULL) {
++		*gfsr = 0;
++	}
++	if (mondrian_uc_smmu == 0 || mondrian_uc_tlb_ctx == 0) {
++		return 0;
++	}
++	mondrian_uc_keepalive(1);
++	fsr = mondrian_gpu_read(mondrian_uc_smmu, mondrian_uc_tlb_ctx + SMMU_FSR);
++	if (gfsr != NULL) {
++		*gfsr = mondrian_gpu_read(mondrian_uc_smmu, 0x48u);
++	}
++	mondrian_uc_keepalive(0);
++	return fsr;
++}
++
++/*
++ * The 2D engine's own view of the blit it was given, and whether the CP took
++ * the register writes at all: a type-4 write that `CP_PROTECT` covers is
++ * dropped without an error, without a fault and without a stall, so a blit
++ * that ran with its state refused writes exactly as much as one that ran
++ * with it. Eight words: RB_2D_DST_INFO, RB_2D_DST (two), RB_2D_DST_PITCH,
++ * RB_2D_BLIT_CNTL, RB_2D_UNKNOWN_8C01, CP_PROTECT_STATUS, CP_HW_FAULT.
++ *
++ * Only safe once the fence answered: a wedged CP stops answering its
++ * register port and the read never returns.
++ */
++void
++mondrian_gpu_uc_2d_state(uint32_t *out)
++{
++	if (out == NULL) {
++		return;
++	}
++	if (mondrian_uc_up == 0 || mondrian_uc_gpu == 0) {
++		bzero(out, 8 * sizeof(uint32_t));
++		return;
++	}
++	out[0] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c17u * 4u);
++	out[1] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c18u * 4u);
++	out[2] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c19u * 4u);
++	out[3] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c1au * 4u);
++	out[4] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c00u * 4u);
++	out[5] = mondrian_gpu_read(mondrian_uc_gpu, 0x8c01u * 4u);
++	out[6] = mondrian_gpu_read(mondrian_uc_gpu,
++	    GEN7_CP_PROTECT_STATUS * 4u);
++	out[7] = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_HW_FAULT * 4u);
++}
++
++/*
++ * A CP_MEM_WRITE of one dword, emitted into `buf`. The CP's own writes are
++ * the only ones this port has ever seen land, and they have all landed in a
++ * page the driver allocated: this one lands in a client buffer, through the
++ * same IOVA the blit is given, so "the address is fine and the engine is
++ * not" and "the client's memory is not reachable" stop looking alike.
++ */
++uint32_t
++mondrian_gpu_uc_mem_write(uint32_t *buf, uint64_t dst, uint32_t value)
++{
++	buf[0] = mondrian_pm4_type7(0x3du, 3);	/* CP_MEM_WRITE */
++	buf[1] = (uint32_t)dst;
++	buf[2] = (uint32_t)(dst >> 32);
++	buf[3] = value;
++	return 4;
++}
++
+ int
+ mondrian_gpu_uc_unmap_page(uint64_t iova)
+ {
+@@ -4907,6 +4980,32 @@
+ 	return 0;
+ }
+ 
++uint32_t
++mondrian_gpu_uc_fault_state(uint32_t *gfsr)
++{
++	if (gfsr != NULL) {
++		*gfsr = 0;
++	}
++	return 0;
++}
++
++void
++mondrian_gpu_uc_2d_state(uint32_t *out)
++{
++	if (out != NULL) {
++		bzero(out, 8 * sizeof(uint32_t));
++	}
++}
++
++uint32_t
++mondrian_gpu_uc_mem_write(uint32_t *buf, uint64_t dst, uint32_t value)
++{
++	(void)buf;
++	(void)dst;
++	(void)value;
++	return 0;
++}
++
+ uint64_t
+ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ {
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -46,6 +46,11 @@
+  * target next to it (gpurbt=1). */
+ void mondrian_gpu_uc_note_surface(uint32_t id, uint64_t iova);
+ uint64_t mondrian_gpu_uc_surface_iova(void);
++void mondrian_gpu_uc_fault_clear(void);
++uint32_t mondrian_gpu_uc_fault_state(uint32_t *gfsr);
++void mondrian_gpu_uc_2d_state(uint32_t *out);
++uint32_t mondrian_gpu_uc_mem_write(uint32_t *buf, uint64_t dst,
++    uint32_t value);
+ 
+ /* One indirect command stream, fenced. Returns the fence to wait on. */
+ int mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence);
