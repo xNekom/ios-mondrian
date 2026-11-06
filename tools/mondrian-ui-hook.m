@@ -1,6 +1,7 @@
 /* Opt-in containermanagerd/backboardd diagnostics for the mondrian bring-up test. */
 #import <objc/objc.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
@@ -665,6 +666,773 @@ mondrian_dump_class_methods(const char *name)
 	free(methods);
 }
 
+/*
+ * Auto-lock. SpringBoard arms its idle timer about two minutes after the UI
+ * settles, the display sleeps, and every CADisplayLink in the system stops
+ * with it while NSTimers keep their rate (measured: links stop at ts 146 s,
+ * the timer sample keeps ticking, and the framebuffer keeps the last frame,
+ * so the phone looks frozen on the lock screen). The names below are from the
+ * shipped iOS 16 userland:
+ *
+ *   -[SBUserAgent setIdleTimerDisabled:forReason:]
+ *   -[SBUserAgent isIdleTimerDisabledForReason:]
+ *   -[SBLockScreenManager unlockUIFromSource:withOptions:]
+ *   -[SBLockScreenManager isUILocked]
+ *
+ * plus SBDeviceLockBlocked in com.apple.springboard. Everything is looked up
+ * at run time, so a missing method is a log line and not a crash.
+ */
+static void (*original_idle_disabled)(id, SEL, BOOL, id);
+
+static int boot_arg_set(const char *name);
+
+static void
+mondrian_idle_disabled(id self, SEL selector, BOOL disabled, id reason)
+{
+	static int last = -1;
+	char line[96];
+
+	if ((int)disabled != last) {
+		last = (int)disabled;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: idle timer asked %d, forced 1\n", (int)disabled);
+		say(line);
+	}
+	if (original_idle_disabled != NULL) {
+		original_idle_disabled(self, selector, YES, reason);
+	}
+}
+
+static BOOL
+mondrian_idle_disabled_for_reason(id self, SEL selector, id reason)
+{
+	(void)self;
+	(void)selector;
+	(void)reason;
+	return YES;
+}
+
+/*
+ * Every method of a class, unfiltered: SBLockScreenManager's list is the only
+ * place that says which wake and unlock entry points this build actually has
+ * (the selectors in the shared cache are not attributed to a class).
+ */
+static void
+mondrian_dump_all_methods(const char *name)
+{
+	Class cls = objc_getClass(name);
+	Method *methods;
+	unsigned int count = 0, i;
+	char line[192];
+
+	if (cls == Nil) {
+		return;
+	}
+	methods = class_copyMethodList(cls, &count);
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s -%u methods\n", name, count);
+	say(line);
+	for (i = 0; i < count; i++) {
+		const char *types = method_getTypeEncoding(methods[i]);
+
+		snprintf(line, sizeof(line), "  -%s %s\n",
+		    sel_getName(method_getName(methods[i])), types != NULL ? types : "?");
+		say(line);
+	}
+	free(methods);
+}
+
+/*
+ * SBUserAgent is looked up when the thread needs it, not at load time (the
+ * class may not be registered yet when a dylib initializer runs), and it is
+ * installed exactly once: a second install would hand the hook its own
+ * implementation and recurse.
+ */
+static int
+mondrian_install_agent_hooks(void)
+{
+	Class agent = objc_getClass("SBUserAgent");
+	Method method;
+	char line[112];
+
+	if (agent == Nil) {
+		return 0;
+	}
+	mondrian_dump_all_methods("SBUserAgent");
+	method = class_getInstanceMethod(agent,
+	    sel_registerName("setIdleTimerDisabled:forReason:"));
+	if (method != NULL) {
+		original_idle_disabled = (void (*)(id, SEL, BOOL, id))
+		    method_setImplementation(method, (IMP)mondrian_idle_disabled);
+		say("MONDRIAN UI: idle timer disable hook installed\n");
+	} else {
+		say("MONDRIAN UI: SBUserAgent setIdleTimerDisabled:forReason: missing\n");
+	}
+	method = class_getInstanceMethod(agent,
+	    sel_registerName("isIdleTimerDisabledForReason:"));
+	if (method != NULL) {
+		method_setImplementation(method, (IMP)mondrian_idle_disabled_for_reason);
+		say("MONDRIAN UI: idle timer getter hook installed\n");
+	}
+	/*
+	 * SBDeviceLockBlocked is not "block locking": in com.apple.springboard it
+	 * is true when the device is blocked, and that is the screen that says
+	 * "iPhone is not available" and refuses every unlock (measured after this
+	 * hook wrote true: `unlock attempt -> 0` thirteen times). Clear it, and
+	 * clear the failed-attempt counter that goes with it.
+	 */
+	CFPreferencesSetAppValue(CFSTR("SBDeviceLockBlocked"), kCFBooleanFalse,
+	    CFSTR("com.apple.springboard"));
+	CFPreferencesSetAppValue(CFSTR("SBDeviceLockFailedAttempts"),
+	    (CFNumberRef)[NSNumber numberWithInt:0], CFSTR("com.apple.springboard"));
+	snprintf(line, sizeof(line), "MONDRIAN UI: lock block cleared, written %d\n",
+	    (int)CFPreferencesAppSynchronize(CFSTR("com.apple.springboard")));
+	say(line);
+	return 1;
+}
+
+/*
+ * SpringBoard traps when its lock screen is driven from another queue:
+ * "BUG IN CLIENT OF LIBDISPATCH: Assertion failed: Block was expected to
+ * execute on queue [com.apple.main-thread]" (SIGTRAP, ring198), which killed it
+ * thirteen seconds into every launch and made the device reboot. Everything
+ * that touches SBLockScreenManager therefore runs as a block on the main
+ * queue, posted by a thread whose only job is the five second tick, and
+ * +[SBLockScreenManager sharedInstance] still waits for +[UIApplication
+ * sharedApplication] because it asserts before that object exists.
+ */
+static volatile int mondrian_lock_step_pending;
+static int mondrian_agent_hooks;
+static int mondrian_lock_last = -1;
+static int mondrian_unlock_enabled;
+static int mondrian_unlock2_enabled;
+static int mondrian_anim_enabled;
+static int mondrian_anim_started;
+static int mondrian_lock_ticks;
+
+static void mondrian_try_unlock_options(void);
+
+/*
+ * A frame rate needs something that moves: a static lock screen draws nothing,
+ * so `fps 0` says nothing about the renderer. This puts one red square in
+ * SpringBoard's own window layer and animates it with CoreAnimation, which the
+ * render server composites at the display rate; if the screen shows the square
+ * moving and `MONDRIAN FB: fps` says 60, the whole CoreAnimation -> GL -> panel
+ * path is running at 60 Hz with no finger on the glass.
+ */
+/*
+ * The home screen: an empty layer tree and an empty icon model look the same on
+ * the panel, so ask SpringBoard what it has. `leafIcons` is the model's flat
+ * list (apps, folders, widgets); zero means nothing to draw, non-zero with no
+ * icons on screen means the model is there and the view is not.
+ */
+static void
+mondrian_log_home_screen(void)
+{
+	/*
+	 * `iconModel` answering nil (measured, five boots: `controller 1 model 0
+	 * leaf 0`) is not proof that the model is absent: it may be `_iconModel`,
+	 * behind `SBIconController`'s icon manager, or `rootFolder`. Ask every
+	 * name this build might have and print which one answers, with the leaf
+	 * count when it does.
+	 */
+	static const char *const model_selectors[] = {
+		"iconModel", "_iconModel", "model", "rootFolder",
+	};
+	static const char *const manager_selectors[] = {
+		"iconManager", "_iconManager",
+	};
+	Class controller_class = objc_getClass("SBIconController");
+	id controller = controller_class != Nil
+	    ? ((id (*)(id, SEL))objc_msgSend)((id)controller_class,
+	    sel_registerName("sharedInstance")) : nil;
+	char line[160];
+	unsigned i;
+
+	snprintf(line, sizeof(line), "MONDRIAN UI: home screen controller %d\n",
+	    controller != nil);
+	say(line);
+	if (controller == nil) {
+		return;
+	}
+	for (i = 0; i < sizeof(model_selectors) / sizeof(model_selectors[0]); i++) {
+		id model = nil;
+		id icons = nil;
+		unsigned count = 0;
+
+		if (![controller respondsToSelector:sel_registerName(model_selectors[i])]) {
+			continue;
+		}
+		model = ((id (*)(id, SEL))objc_msgSend)(controller,
+		    sel_registerName(model_selectors[i]));
+		if (model != nil &&
+		    [model respondsToSelector:sel_registerName("leafIcons")]) {
+			icons = ((id (*)(id, SEL))objc_msgSend)(model,
+			    sel_registerName("leafIcons"));
+		}
+		if (icons != nil && [icons respondsToSelector:sel_registerName("count")]) {
+			count = (unsigned)((NSUInteger (*)(id, SEL))objc_msgSend)(icons,
+			    sel_registerName("count"));
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: icon %s -> %d leaf %u\n",
+		    model_selectors[i], model != nil, count);
+		say(line);
+	}
+	for (i = 0; i < sizeof(manager_selectors) / sizeof(manager_selectors[0]); i++) {
+		id manager;
+		id model = nil;
+		unsigned count = 0;
+
+		if (![controller respondsToSelector:sel_registerName(manager_selectors[i])]) {
+			continue;
+		}
+		manager = ((id (*)(id, SEL))objc_msgSend)(controller,
+		    sel_registerName(manager_selectors[i]));
+		if (manager == nil) {
+			continue;
+		}
+		if ([manager respondsToSelector:sel_registerName("model")]) {
+			model = ((id (*)(id, SEL))objc_msgSend)(manager,
+			    sel_registerName("model"));
+		}
+		if (model != nil &&
+		    [model respondsToSelector:sel_registerName("leafIcons")]) {
+			id icons = ((id (*)(id, SEL))objc_msgSend)(model,
+			    sel_registerName("leafIcons"));
+
+			if (icons != nil &&
+			    [icons respondsToSelector:sel_registerName("count")]) {
+				count = (unsigned)((NSUInteger (*)(id, SEL))objc_msgSend)(icons,
+				    sel_registerName("count"));
+			}
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: %s -> %d leaf %u\n",
+		    manager_selectors[i], model != nil, count);
+		say(line);
+	}
+}
+
+/*
+ * Do icon views exist at all? `-[SBIconView setIcon:]` runs whenever SpringBoard
+ * lays one out, so counting the calls separates "no model, nothing to draw"
+ * from "views built and nothing reaches the panel". The first five answer with
+ * the icon's class, the rest is a total every ten seconds.
+ */
+static void (*original_set_icon)(id, SEL, id);
+static volatile unsigned mondrian_icon_calls;
+
+static id
+mondrian_send(id object, const char *selector)
+{
+	if (object == nil || ![object respondsToSelector:sel_registerName(selector)]) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName(selector));
+}
+
+/*
+ * Icons are laid out and invisible (measured, ring210: 79 SBIconView setIcon:
+ * calls, `icon model -> 1 leaf 13`, and nothing of it on the panel). Two
+ * causes look the same from outside, so this separates them on the next boot:
+ * an icon view with no image (the artwork never loads -- `assetsd` aborts and
+ * `iconservicesagent` exits 0x9 on this root) or a view that is not in the
+ * tree the render server composites. `mondrianiconpaint=1` paints the third
+ * view's own layer, so a red square where the icon should be means the view is
+ * composited and only its image is missing.
+ */
+static void
+mondrian_set_icon(id self, SEL selector, id icon)
+{
+	static unsigned logged;
+
+	if (original_set_icon != NULL) {
+		original_set_icon(self, selector, icon);
+	}
+	/*
+	 * Only the calls that carry an icon say anything: SpringBoard clears
+	 * its recycled views with `setIcon:nil` (measured, ring212: the first
+	 * five all nil, `image 0 frame -7,-7 64x78`), so counting those hides
+	 * the ones that matter.
+	 */
+	if (icon != nil && logged < 5) {
+		char line[200];
+		id image_view = mondrian_send(self, "iconImageView");
+		id image = image_view != nil ? mondrian_send(image_view, "image") : nil;
+		id name = mondrian_send(icon, "displayName");
+		CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(self,
+		    sel_registerName("frame"));
+
+		logged++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: icon %s%s%s image %d frame %.0f,%.0f %.0fx%.0f\n",
+		    object_getClassName(icon),
+		    name != nil ? " name " : "",
+		    name != nil ? [(NSString *)name UTF8String] : "",
+		    image != nil, frame.origin.x, frame.origin.y,
+		    frame.size.width, frame.size.height);
+		say(line);
+		if (logged == 3 && boot_arg_set("mondrianiconpaint=1")) {
+			id layer = mondrian_send(self, "layer");
+			CGFloat red[4] = { 1.0, 0.0, 0.0, 1.0 };
+			CGColorRef colour = CGColorCreate(
+			    CGColorSpaceCreateDeviceRGB(), red);
+
+			if (layer != nil) {
+				((void (*)(id, SEL, CGColorRef))objc_msgSend)(layer,
+				    sel_registerName("setBackgroundColor:"), colour);
+				say("MONDRIAN UI: icon painted red\n");
+			}
+			if (colour != NULL) {
+				CGColorRelease(colour);
+			}
+		}
+	}
+	mondrian_icon_calls++;
+}
+
+static void
+install_icon_probe(void)
+{
+	Class view = objc_getClass("SBIconView");
+	Method method = view != Nil
+	    ? class_getInstanceMethod(view, sel_registerName("setIcon:")) : NULL;
+
+	if (method == NULL) {
+		say("MONDRIAN UI: SBIconView missing; icons not observable\n");
+		return;
+	}
+	original_set_icon = (void (*)(id, SEL, id))method_getImplementation(method);
+	method_setImplementation(method, (IMP)mondrian_set_icon);
+	say("MONDRIAN UI: SBIconView setIcon: hooked\n");
+}
+
+static void
+mondrian_icon_report(void)
+{
+	static unsigned last;
+	char line[112];
+
+	if (mondrian_icon_calls == last) {
+		return;
+	}
+	last = mondrian_icon_calls;
+	snprintf(line, sizeof(line), "MONDRIAN UI: icons laid out %u so far\n",
+	    mondrian_icon_calls);
+	say(line);
+}
+
+/*
+ * The wallpaper is the home screen's frame budget, not the icon drawing: HakiOS
+ * measured 28 fps with it composed every frame, 78 with it hidden and 92 with it
+ * frozen as one still picture, and its gradients drawn 3509 times a run
+ * (CHANGELOG 2.3.3-2.3.4). This port has no still picture to put in its place
+ * yet, so `mondrianwallpaper=1` hides the wallpaper window and measures what
+ * that is worth here: a black backdrop behind the icons, and one number that
+ * says whether freezing the wallpaper is the next thing worth building.
+ */
+static volatile int mondrian_wallpaper_done;
+
+static void
+mondrian_hide_wallpaper(void)
+{
+	id app = [objc_getClass("UIApplication") sharedApplication];
+	id windows = app != nil ? [app windows] : nil;
+	unsigned count = windows != nil ? (unsigned)[windows count] : 0;
+	unsigned hidden = 0;
+	char line[128];
+	unsigned i;
+
+	for (i = 0; i < count; i++) {
+		id window = [windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+
+		if (name == NULL ||
+		    (strcasestr(name, "wallpaper") == NULL &&
+		    strcasestr(name, "poster") == NULL)) {
+			continue;
+		}
+		if ([window respondsToSelector:sel_registerName("setHidden:")]) {
+			[window setHidden:YES];
+			hidden++;
+		}
+	}
+	snprintf(line, sizeof(line), "MONDRIAN UI: wallpaper windows hidden %u\n",
+	    hidden);
+	say(line);
+}
+
+static int
+mondrian_probe_tick(void)
+{
+	id app = [objc_getClass("UIApplication") sharedApplication];
+	id windows = [app windows];
+	id key = [app respondsToSelector:sel_registerName("keyWindow")]
+	    ? [app keyWindow] : nil;
+	id target = nil;
+	CGFloat components[4] = { 1.0, 0.0, 0.0, 1.0 };
+	CGColorRef red = NULL;
+	unsigned count;
+	unsigned i;
+	unsigned attached = 0;
+	char line[128];
+
+	if (windows == nil) {
+		return 0;
+	}
+	/*
+	 * One window, the one on the glass: SpringBoard has fifteen (the lock
+	 * screen's, the wallpaper's, the home screen's, helpers), and a layer
+	 * animated in an offscreen one is a layer nobody composites -- that is
+	 * how a boot reads `fps 0` while the probe says it is attached. The key
+	 * window is the one UIKit puts in front; if it has no size, fall back to
+	 * an unhidden window as large as the display.
+	 */
+	count = (unsigned)[windows count];
+	/*
+	 * The key window first, then the first window that is not hidden and is
+	 * as wide as the display: the layer has to be in the tree backboardd
+	 * composites, or the boot reads `fps 0` while the probe swears it is
+	 * attached.
+	 */
+	if (key != nil) {
+		id root = [key layer];
+
+		if (root != nil && [root bounds].size.width >= 100.0) {
+			target = key;
+		}
+	}
+	for (i = 0; target == nil && i < count; i++) {
+		id window = [windows objectAtIndex:i];
+		id root = [window layer];
+
+		if (root == nil || [root bounds].size.width < 100.0) {
+			continue;
+		}
+		if ([window respondsToSelector:sel_registerName("isHidden")] &&
+		    [window isHidden]) {
+			continue;
+		}
+		target = window;
+	}
+	if (target == nil) {
+		return 0;
+	}
+	red = CGColorCreate(CGColorSpaceCreateDeviceRGB(), components);
+	{
+		id root = [target layer];
+		id sublayers;
+		id move;
+		id dot = nil;
+		double w = [root bounds].size.width;
+		unsigned j;
+
+		sublayers = [root sublayers];
+		for (j = 0; j < (unsigned)[sublayers count]; j++) {
+			id sub = [sublayers objectAtIndex:j];
+
+			if ([[sub name] isEqualToString:@"mondrian-probe"]) {
+				dot = sub;
+				break;
+			}
+		}
+		if (dot == nil) {
+			static unsigned told;
+
+			dot = [objc_getClass("CALayer") layer];
+			[dot setName:@"mondrian-probe"];
+			[dot setFrame:CGRectMake(60.0, 200.0, 120.0, 120.0)];
+			if (red != NULL) {
+				[dot setBackgroundColor:red];
+			}
+			[root addSublayer:dot];
+			if (told++ < 4) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: probe attached (%.0fx%.0f, key %d)\n",
+				    w, [root bounds].size.height, target == key);
+				say(line);
+			}
+		}
+		attached = 1;
+		move = [objc_getClass("CABasicAnimation") animationWithKeyPath:@"position.x"];
+		[move setFromValue:[NSNumber numberWithDouble:60.0]];
+		[move setToValue:[NSNumber numberWithDouble:w - 60.0]];
+		[move setDuration:2.0];
+		[move setAutoreverses:YES];
+		[move setRepeatCount:1e9];
+		[dot addAnimation:move forKey:@"mondrian-move"];
+	}
+	if (red != NULL) {
+		CGColorRelease(red);
+	}
+	return (int)attached;
+}
+
+/*
+ * The device state, once, from the classes that own it: these four answers say
+ * whether the lock screen is refusing because of a passcode, a lockout or a
+ * blocked device, which a bare "unlock returned 0" cannot.
+ */
+static void
+mondrian_log_device_state(void)
+{
+	static const struct {
+		const char *name;
+		const char *selector;
+	} agent_queries[] = {
+		{ "deviceIsLocked", "deviceIsLocked" },
+		{ "deviceIsPasscodeLocked", "deviceIsPasscodeLocked" },
+		{ "deviceIsBlocked", "deviceIsBlocked" },
+		{ "lockScreenIsShowing", "lockScreenIsShowing" },
+	};
+	static const char *const manager_queries[] = {
+		"isUILocked", "isLockScreenVisible", "isLockScreenDisabledForAssertion",
+	};
+	Class agent = objc_getClass("SBUserAgent");
+	Class manager_cls = objc_getClass("SBLockScreenManager");
+	Method shared_method = manager_cls != Nil
+	    ? class_getClassMethod(manager_cls, sel_registerName("sharedInstance")) : NULL;
+	id manager = shared_method != NULL
+	    ? ((id (*)(id, SEL))method_getImplementation(shared_method))(
+		(id)manager_cls, sel_registerName("sharedInstance")) : nil;
+	id user_agent = nil;
+	char line[96];
+	unsigned i;
+
+	if (agent != Nil) {
+		Method shared = class_getClassMethod(agent,
+		    sel_registerName("sharedUserAgentInstance"));
+
+		if (shared == NULL) {
+			shared = class_getClassMethod(agent, sel_registerName("sharedInstance"));
+		}
+		if (shared != NULL) {
+			user_agent = ((id (*)(id, SEL))method_getImplementation(shared))(
+			    (id)agent, sel_registerName("sharedUserAgentInstance"));
+		}
+	}
+	for (i = 0; i < sizeof(agent_queries) / sizeof(agent_queries[0]); i++) {
+		Method method = user_agent != nil
+		    ? class_getInstanceMethod(agent, sel_registerName(agent_queries[i].selector))
+		    : NULL;
+
+		if (method == NULL) {
+			continue;
+		}
+		snprintf(line, sizeof(line), "MONDRIAN UI: state %s %d\n",
+		    agent_queries[i].name,
+		    (int)((BOOL (*)(id, SEL))method_getImplementation(method))(user_agent,
+			sel_registerName(agent_queries[i].selector)));
+		say(line);
+	}
+	for (i = 0; i < sizeof(manager_queries) / sizeof(manager_queries[0]); i++) {
+		Method method = manager_cls != Nil
+		    ? class_getInstanceMethod(manager_cls, sel_registerName(manager_queries[i]))
+		    : NULL;
+
+		if (method == NULL || manager == nil) {
+			continue;
+		}
+		snprintf(line, sizeof(line), "MONDRIAN UI: state %s %d\n",
+		    manager_queries[i],
+		    (int)((BOOL (*)(id, SEL))method_getImplementation(method))(manager,
+			sel_registerName(manager_queries[i])));
+		say(line);
+	}
+}
+
+/*
+ * The lock screen is dismissed through the entry point its own swipe uses
+ * (-lockScreenViewControllerRequestsUnlock), once, twenty seconds after the UI
+ * is up. unlockUIFromSource:withOptions: with a nil request returns NO and each
+ * refused call counts as a failed attempt (ring199: thirteen of them, then
+ * "iPhone not available" on the screen), so it is not retried.
+ */
+static void
+mondrian_lock_step(void *context)
+{
+	Class cls = objc_getClass("SBLockScreenManager");
+	Class app_cls = objc_getClass("UIApplication");
+	SEL shared_sel = sel_registerName("sharedInstance");
+	SEL app_sel = sel_registerName("sharedApplication");
+	SEL locked_sel = sel_registerName("isUILocked");
+	SEL request_sel = sel_registerName("lockScreenViewControllerRequestsUnlock");
+	Method method;
+	id manager;
+	BOOL locked;
+	char line[96];
+
+	(void)context;
+	mondrian_lock_step_pending = 0;
+	if (cls == Nil) {
+		return;
+	}
+	if (!mondrian_agent_hooks) {
+		mondrian_agent_hooks = mondrian_install_agent_hooks();
+	}
+	method = app_cls != Nil ? class_getClassMethod(app_cls, app_sel) : NULL;
+	if (method == NULL) {
+		return;
+	}
+	if (((id (*)(id, SEL))method_getImplementation(method))((id)app_cls, app_sel) == nil) {
+		/* still starting: the next tick retries */
+		return;
+	}
+	method = class_getClassMethod(cls, shared_sel);
+	if (method == NULL) {
+		return;
+	}
+	manager = ((id (*)(id, SEL))method_getImplementation(method))((id)cls, shared_sel);
+	if (manager == nil) {
+		return;
+	}
+	method = class_getInstanceMethod(cls, locked_sel);
+	locked = method != NULL
+	    ? ((BOOL (*)(id, SEL))method_getImplementation(method))(manager, locked_sel)
+	    : YES;
+	if ((int)locked != mondrian_lock_last) {
+		mondrian_lock_last = (int)locked;
+		snprintf(line, sizeof(line), "MONDRIAN UI: lock screen %s\n",
+		    locked ? "up" : "gone");
+		say(line);
+	}
+	if (!locked) {
+		/*
+		 * The home screen is up: this is where a frame rate can be measured,
+		 * so the probe is (re)attached on every tick and the model is asked
+		 * once what it is supposed to show.
+		 */
+		if (mondrian_anim_enabled) {
+			int attached = mondrian_probe_tick();
+
+			mondrian_icon_report();
+			if (attached > 0 && !mondrian_anim_started) {
+				mondrian_anim_started = 1;
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: probe alive on %d windows\n", attached);
+				say(line);
+				mondrian_log_home_screen();
+			}
+			if (attached > 0 && !mondrian_wallpaper_done &&
+			    boot_arg_set("mondrianwallpaper=1")) {
+				mondrian_wallpaper_done = 1;
+				mondrian_hide_wallpaper();
+			}
+		}
+		return;
+	}
+	if (!mondrian_unlock_enabled) {
+		return;
+	}
+	mondrian_lock_ticks++;
+	if (mondrian_lock_ticks == 10) {
+		mondrian_log_device_state();
+	}
+	if (mondrian_lock_ticks == 12 && mondrian_anim_enabled && !mondrian_anim_started &&
+	    mondrian_probe_tick() > 0) {
+		mondrian_anim_started = 1;
+	}
+	if (mondrian_lock_ticks == 25) {
+		if (mondrian_unlock2_enabled) {
+			say("MONDRIAN UI: trying the options unlock\n");
+			mondrian_try_unlock_options();
+			mondrian_log_device_state();
+		}
+		return;
+	}
+	if (mondrian_lock_ticks < 10 || mondrian_lock_ticks > 10) {
+		return;			/* one attempt at tick 10 only */
+	}
+	method = class_getInstanceMethod(cls, request_sel);
+	if (method != NULL) {
+		((void (*)(id, SEL))method_getImplementation(method))(manager, request_sel);
+		say("MONDRIAN UI: unlock requested (lock screen view)\n");
+	} else {
+		say("MONDRIAN UI: lockScreenViewControllerRequestsUnlock missing\n");
+	}
+}
+
+/*
+ * The documented refusal path ("Bailing from UIUnlock because: turnOnScreenFirst
+ * ...") reads the options argument, so a dictionary of the SpringBoardServices
+ * keys is worth one attempt -- but only behind its own boot argument: if the
+ * build wants a typed object instead, the call raises inside SpringBoard and
+ * every new SpringBoard would raise again, which is a boot loop.
+ */
+static void
+mondrian_try_unlock_options(void)
+{
+	Class cls = objc_getClass("SBLockScreenManager");
+	Method shared = cls != Nil
+	    ? class_getClassMethod(cls, sel_registerName("sharedInstance")) : NULL;
+	Method method = cls != Nil
+	    ? class_getInstanceMethod(cls, sel_registerName("unlockUIFromSource:withOptions:")) : NULL;
+	NSDictionary *options;
+	id manager;
+	BOOL done;
+	char line[96];
+
+	if (shared == NULL || method == NULL) {
+		return;
+	}
+	manager = ((id (*)(id, SEL))method_getImplementation(shared))(
+	    (id)cls, sel_registerName("sharedInstance"));
+	if (manager == nil) {
+		return;
+	}
+	options = @{
+		@"SBUIUnlockOptionsTurnOnScreenFirstKey": @YES,
+		@"SBUIUnlockOptionsStartFadeInAnimation": @YES,
+		@"SBUIUnlockOptionsStartFadeInAnimationKey": @YES,
+		@"SBUIUnlockOptionsSimulateSwipeToUnlock": @YES,
+		@"SBUIUnlockOptionsSimulateSwipeToUnlockKey": @YES,
+	};
+	done = ((BOOL (*)(id, SEL, id, id))method_getImplementation(method))(
+	    manager, sel_registerName("unlockUIFromSource:withOptions:"), nil, options);
+	snprintf(line, sizeof(line), "MONDRIAN UI: unlock with options -> %d\n", (int)done);
+	say(line);
+}
+
+static void *
+mondrian_unlock_run(void *unused)
+{
+	(void)unused;
+	if (objc_getClass("SBLockScreenManager") == Nil) {
+		return NULL;
+	}
+	if (!boot_arg_set("mondrianunlock=1")) {
+		say("MONDRIAN UI: unlock disabled (mondrianunlock=1 to enable)\n");
+	} else {
+		mondrian_unlock_enabled = 1;
+	}
+	mondrian_unlock2_enabled = boot_arg_set("mondrianunlock2=1") != 0;
+	mondrian_anim_enabled = boot_arg_set("mondriananim=1") != 0;
+	for (;;) {
+		if (!mondrian_lock_step_pending) {
+			mondrian_lock_step_pending = 1;
+			dispatch_async_f(dispatch_get_main_queue(), NULL, mondrian_lock_step);
+		}
+		sleep(2);
+	}
+	return NULL;
+}
+
+static void
+install_idle_hooks(void)
+{
+	pthread_t thread;
+
+	/* SBLockScreenManager only exists in SpringBoard: leave the other
+	 * injected daemons alone. */
+	if (objc_getClass("SBLockScreenManager") == Nil) {
+		return;
+	}
+	mondrian_dump_all_methods("SBLockScreenManager");
+	if (pthread_create(&thread, NULL, mondrian_unlock_run, NULL) != 0) {
+		say("MONDRIAN UI: unlock thread failed\n");
+	}
+}
+
 static void
 install_activation_hooks(void)
 {
@@ -1115,6 +1883,8 @@ mondrian_install_ui_hooks(void)
 	install_personas_hook();
 	install_display_diagnostic();
 	install_activation_hooks();
+	install_icon_probe();
+	install_idle_hooks();
 	start_heartbeat();
 	if (boot_arg_set("mondrianmain=1")) {
 		pthread_t thread;

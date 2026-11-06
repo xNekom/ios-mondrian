@@ -1,0 +1,69 @@
+xnu 0258: a home press every N seconds, to test the sleeping panel
+
+The lock screen stops drawing a minute into a boot and every CADisplayLink in
+the system freezes with it, while NSTimers and mach_wait_until keep their rate.
+That is what a display that went to sleep looks like from userland: CA
+deactivates the display link and no CADisplayLink client is served. Boot-arg
+mondrianwake=N presses home, release 100 ms later, every N seconds, so a boot
+can say whether waking the display brings the link (and the frames) back
+without writing userdata for a new dylib.
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -336,9 +336,13 @@
+ 	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 1; }
+ private:
+ 	static void testFired(OSObject *owner, IOTimerEventSource *sender);
++	static void wakeFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fTest;
+ 	UInt32 fTestSecs;
+ 	UInt32 fTestCount;
++	IOTimerEventSource *fWake;
++	UInt32 fWakeSecs;
++	UInt32 fWakeCount;
+ };
+ OSDefineMetaClassAndStructors(MondrianHIDButtons, IOHIDEventService);
+ 
+@@ -388,6 +392,15 @@
+ 			fTest->setTimeoutMS(fTestSecs * 1000);
+ 		}
+ 	}
++	if (PE_parse_boot_argn("mondrianwake", &fWakeSecs, sizeof(fWakeSecs)) && fWakeSecs) {
++		fWake = IOTimerEventSource::timerEventSource(this, &MondrianHIDButtons::wakeFired);
++		if (fWake != NULL) {
++			fWake->setTimeoutMS(fWakeSecs * 1000);
++			if (_hidWorkLoop->addEventSource(fWake) == kIOReturnSuccess) {
++				IOLog("MONDRIAN HID: home press every %u s\n", fWakeSecs);
++			}
++		}
++	}
+ 	gSweetButtons = this;
+ 	registerService();
+ 	IOLog("MONDRIAN HID: buttons registered (test every %u s)\n", fTestSecs);
+@@ -423,6 +436,27 @@
+ 	}
+ }
+ 
++/*
++ * Boot-arg mondrianwake=N: a home press every N seconds, press then release a
++ * tenth of a second later. The lock screen dims and then the display sleeps on
++ * its own, and a sleeping display takes every CADisplayLink in the system with
++ * it; the home key is the event that wakes it, so this keeps the link alive
++ * while the UI is being measured.
++ */
++void
++MondrianHIDButtons::wakeFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	MondrianHIDButtons *self = (MondrianHIDButtons *)owner;
++	bool press = (self->fWakeCount & 1) == 0;
++
++	self->key(kHIDUsage_Csmr_Menu, press);
++	if (press) {
++		IOLog("MONDRIAN HID: wake %u\n", self->fWakeCount / 2);
++	}
++	self->fWakeCount++;
++	sender->setTimeoutMS(press ? 100 : self->fWakeSecs * 1000);
++}
++
+ bool
+ MondrianHIDTouch::start(IOService *provider)
+ {

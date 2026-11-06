@@ -1,0 +1,71 @@
+xnu 0261: name every framebuffer selector, and time the slow swaps
+
+SpringBoard's main thread stops in BKSDisplayServicesSetScreenBlanked and never
+comes back, so the run loop that serves the display link and the idle timer is
+gone for the rest of the boot. Nothing in the ring says which of the framebuffer
+selectors that blanking path calls, and the driver answers the ones it does not
+know with a silent success, which a caller can wait on forever. Log each
+selector the first time a process calls it, with its argument counts, and log
+both ends of a swap that starts more than 40 ms after the last vsync, so a frame
+that never returns is visible as an entry with no exit.
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -601,7 +601,15 @@
+ 	uint64_t began = mach_absolute_time();
+ 	uint64_t late = (fLastVsync != 0 && began > fLastVsync) ? began - fLastVsync : 0;
+ 	uint64_t elapsed;
++	uint64_t lateNs = 0;
++	bool slowIn;
+ 
++	absolutetime_to_nanoseconds(late, &lateNs);
++	slowIn = (lateNs > 40000000ULL);
++	if (slowIn) {
++		IOLog("MONDRIAN FB: swap %u enter late %llu us\n", get32(rec, 0x50),
++		    (unsigned long long)(lateNs / 1000));
++	}
+ 	fSwapCount++;
+ 
+ 	if (!fConsolePaused) {
+@@ -792,6 +800,13 @@
+ 	}
+ 
+ 	elapsed = mach_absolute_time() - began;
++	if (slowIn) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(elapsed, &ns);
++		IOLog("MONDRIAN FB: swap %u exit after %llu us\n", get32(rec, 0x50),
++		    (unsigned long long)(ns / 1000));
++	}
+ 	fCopyTicks += elapsed;
+ 	if (elapsed > fCopyMaxTicks) {
+ 		fCopyMaxTicks = elapsed;
+@@ -887,6 +902,28 @@
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
+ 
++	/*
++	 * The selector numbers are the interface: iOS 16 does not use the
++	 * handful this driver was written for, and a call that is answered with
++	 * a silent success is a call the caller may wait on forever. Name each
++	 * one the first time it arrives, with its argument counts, so a stall
++	 * in the display path can be matched to a number.
++	 */
++	{
++		static uint8_t seen[MONDRIAN_FB_SELECTORS];
++		uint32_t s = selector;
++
++		if (s < MONDRIAN_FB_SELECTORS && seen[s] == 0) {
++			char name[32];
++
++			seen[s] = 1;
++			proc_selfname(name, sizeof(name));
++			IOLog("MONDRIAN FB: %s selector %u %u/%u struct %u/%u\n", name, s,
++			    args->scalarInputCount, args->scalarOutputCount,
++			    (unsigned)args->structureInputSize,
++			    (unsigned)args->structureOutputSize);
++		}
++	}
+ 	if (selector < MONDRIAN_FB_SELECTORS) {
+ 		mondrian_fb_selectors_called[selector]++;
+ 	}

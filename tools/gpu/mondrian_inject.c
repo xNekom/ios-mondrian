@@ -343,7 +343,8 @@ mondrian_inject(void)
 	 * check-in timeout". The kernel hands the extensions this library from its
 	 * writable path (/private/var/vm), so one build covers both.
 	 */
-	if (name == NULL || (strcmp(name, "backboardd") != 0 && strstr(name, "Poster") == NULL)) {
+	if (name == NULL || (strcmp(name, "backboardd") != 0 && strstr(name, "Poster") == NULL &&
+	    !(strcmp(name, "SpringBoard") == 0 && has_boot_argument("glsb=1")))) {
 		return;
 	}
 	say("mondrian-gl: interposer armed in %s\n", name);

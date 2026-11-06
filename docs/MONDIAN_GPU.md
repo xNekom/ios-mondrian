@@ -17,8 +17,24 @@ them has Metal. That is the path this port follows.
   `userland/gpu` (`eagl.c`, `gl_osmesa.c`, `inject.c`, `bbd_wrap.c`) and
   `userland/mesa` (freedreno Darwin patches, `redwood-drm`). Patches
   `0900`-`0950`. Credits HackiOS (APSL 2.0 kernel, MIT user space).
-- **HackiOS** (`oosexgang/hackios-xnu-kernel`, `hackios-xnu-userland`): Adreno
-  650 through Mesa GLES, `gpu=1`, an image built with `GL=1`; no Metal.
+- **HakiOS** (`oosexgang/hakios-xnu-kernel`, v2.3.4, Darwin 22.5 on sc7280 /
+  SM7325, a6xx): Adreno through Mesa GLES, `gpu=1`. Its ring code is the
+  reference for ours: `ring_at = (ring_at + 1) % RING_WORDS` and
+  `CP_RB_WPTR = ring_at`, i.e. the write pointer is never published at or past
+  the end of the buffer, and a lap is closed by writing one `CP_NOP` over the
+  tail (kgsl `adreno_ringbuffer_allocspace` does the same). Its `CP_RB_CNTL`
+  adds bit 27, "do not copy the read position to memory", so it reads
+  `CP_RB_RPTR` from the register and nothing else; kgsl's a7xx default is our
+  `12 | 2 << 8`.
+- **HakiOS's frame budget** (its `CHANGELOG.md`, 2.3.3-2.3.4) says where the
+  time goes on a home screen, and it is not the rasteriser's arithmetic: with
+  the wallpaper composed every frame the home button runs at 28 fps, with it
+  hidden at 78, and with it frozen as one still picture at 92. The wallpaper is
+  `PosterBoard`'s layers through a layer host, and its gradients were drawn
+  3509 times a run at 0.6 ms each. The second lever is the screen class: it
+  renders 828x1792 (XR) or 750x1624 (X) at 2x and stretches to the panel,
+  `fbsubtype`/`fbwidth`/`fbheight`/`fbscale` choosing the class, which is 1.85x
+  fewer pixels for the GPU. Both are cheap for us and neither is in the kernel.
 - **Mesa freedreno** supports the Adreno 700 series (`a730`/`a740`, SM8450 /
   SM8550) since Mesa 24.3; Mesa 26.x keeps improving the a7xx.
 
@@ -262,14 +278,17 @@ them has Metal. That is the path this port follows.
   touches therefore needs `AP[1]=1` (user accessible), which is pong's
   `perms 3` for the ring, memptr, power-up list and scratch, and the vendor's
   `IOMMU_READ`-without-`IOMMU_PRIV` for user buffers. The SQE stays `perms 5`.
-- **The ring is closed with a `CP_NOP` when it wraps.** The CP fetches from
-  the read pointer towards the write pointer, so a write pointer that jumps
-  back to zero leaves it fetching dwords nobody wrote (the ring starts zeroed,
-  so they decode as type-0 register writes). Fill the tail with one
-  `CP_NOP` covering it, publish the wrap, and wait for `CP_RB_RPTR` to read 0
-  before writing at the start. Measured with 2000 back-to-back submissions:
-  183 refused before the fix, 0 after it, with the last canary and fence
-  exactly the ones the last submission asked for.
+- **The ring is closed with a `CP_NOP` when it wraps, and nothing else is
+  published.** The CP fetches from the read pointer towards the write pointer,
+  so a write pointer that jumps back to zero leaves it fetching dwords nobody
+  wrote (the ring starts zeroed, so they decode as type-0 register writes).
+  One `CP_NOP` covers the tail and the cursor restarts at 0; the only value
+  ever written to `CP_RB_WPTR` is the small one that comes with the next
+  submission. Publishing the one-past-the-end value instead makes the CP fetch
+  the tail and then never fetch lap 2 (measured at 32 KiB and 128 KiB, see
+  `0266` below). Measured with 2000 back-to-back submissions: 183 refused
+  before the fix, 0 after it, with the last canary and fence exactly the ones
+  the last submission asked for.
 - **A clean publishes what was written, in the page's own offset.** With 16 KiB
   pages (`__ARM_16K_PG__`) the offset inside a physical page is the low 14 bits;
   a clean that masked it with 0xfff cleans the first 4 KiB of a page for every
@@ -827,6 +846,84 @@ them has Metal. That is the path this port follows.
   of 27-30 fps) and the links run at 40+ ticks a second instead of 7. Reflash
   only when the root has to change, and read the frame counters from the
   second boot onwards.
+- **The ring wraps the way kgsl wraps it, and that is enough for 8 laps.** The
+  symptom used to be a frozen UI a few seconds into a boot: `submit failed: -5
+  (Operation not supported)` from the mesa shim, which is the only submission
+  exit that maps to `mondrian_gpu_uc_submit() != 0`, and then every later
+  submission refused while the display link kept ticking at `dur 16`. The
+  cause was the lap boundary, not the surface path. At 32 KiB and at 128 KiB
+  the CP retired the lap, walked into the tail and never fetched the first
+  packet of the next lap (`uc retired 3941 of 3989, wptr 0x180` with `fault
+  0x0 fsr 0x400`, ring218; `uc lap 1 closes at 0x1b40`, ring214). The port had
+  been publishing `CP_RB_WPTR = RING_DWORDS` so the CP would fetch the tail
+  first; that value is what breaks it. kgsl never writes it: one `CP_NOP`
+  reaches the end of the ring, the cursor restarts at 0, and only the small
+  wptr of the next submission is published (`0266`). Measured after that change
+  (ring219): 8 laps closed, 0 fence-gate refusals, 0 submit failures, and 121
+  of 217 one-second samples at 55 fps or more, steady 63-64.
+  **`CP_RB_RPTR` cannot be the ring's flow control on this part.** Measured with
+  `uc prog` (ring207): inside a lap it tracks the cursor (`at 0x810 rptr 0x7b4`,
+  `at 0x1010 rptr 0x1004`, `at 0x1810 rptr 0x1808`), then reads `0x0` for the
+  whole next lap, and at another boundary reads `0x1fe9` with the cursor already
+  back at `0x28`. A room test on it either waits two seconds a submission
+  (`uc no room at 0x1fe8 rptr 0x0 room 23 seq 2040`) or believes the ring is
+  empty a lap early. Backpressure is therefore the fence ring: at most 48
+  submissions unanswered, so under 400 dwords of ring in flight whatever the
+  ring's size, and the cursor is published inside the buffer
+  (kgsl `_wptr % KGSL_RB_DWORDS`, HakiOS `ring_at`).
+- **The icons exist; their artwork does not.** Measured (ring210, with
+  `-[SBIconView setIcon:]` hooked): SpringBoard builds the home screen --
+  `iconModel -> 1 leaf 13`, `rootFolder -> 1 leaf 9`, 79 `setIcon:` calls, the
+  first with an `SBApplicationIcon` -- so what is missing is not the model and
+  not the view tree, which the red probe layer proves backboardd composites.
+  The artwork never arrives: `assetsd` aborts on exec (`CRASH assetsd sig 6`,
+  twice, right after `exec assetsd`) and `iconservicesagent` exits `0x9`, the
+  same status a dozen services return on this root (keybagd, usermanagerd,
+  mobileactivationd). Ask `-[SBIconView iconImageView]`'s `image` and paint the
+  view's own layer (`mondrianiconpaint=1`) to tell "no image" from "not in the
+  composited tree" -- a red square where the icon belongs means the view is
+  there and only the image is missing.
+
+- **A sleeping display stops every CADisplayLink.** Two minutes after the UI
+  settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
+  0, every link stops (measured: the last line says `ts 146` in a 240 s boot)
+  and the framebuffer keeps the last frame, so the screen shows a frozen lock
+  screen while `MONDRIAN TIMER` keeps its rate. `mondrianwake=N` does not fix
+  it: it presses the power key, which locks a lit device as often as it wakes a
+  dark one. The fix is in the userland hook -- `-[SBUserAgent
+  setIdleTimerDisabled:forReason:]` forced to `YES` -- and with it the display
+  stayed up for the whole 171 s boot (`link pid 57 ... dur 16 ts 171` at the
+  end) instead of dying at 146 s. Leaving the lock screen is the harder half:
+  `-[SBLockScreenManager unlockUIFromSource:withOptions:]` returns 0 for every
+  call and each refused call counts as a failed attempt, which after thirteen
+  of them left the screen saying "iPhone is not available" and refusing
+  everything (ring199). That flag pair lives in
+  `/var/mobile/Library/Preferences/com.apple.springboard.plist`, where
+  `SBDeviceLockBlocked` **true means the device is blocked** (it is the
+  "unavailable" state, not "block locking": see pwnboot's
+  `docs/lockout-reset.md`) and `SBDeviceLockFailedAttempts` counts the
+  refusals; a hook that writes `SBDeviceLockBlocked` = `true` puts the device
+  into that state by itself. Write `false` and `SBDeviceLockFailedAttempts` 0,
+  and unlock once through the entry point the swipe uses
+  (`-lockScreenViewControllerRequestsUnlock`), not in a loop. Three traps come
+  with this hook. `+[SBLockScreenManager sharedInstance]` must not run before
+  `+[UIApplication sharedApplication]` exists: from the dylib initializer it
+  asserts ("Unexpectedly created SBLockScreenManager before UIApplication
+  instance was created") and terminates SpringBoard, eleven times in one boot.
+  Every `SBLockScreenManager` call must run on the main queue: from a thread of
+  the hook's own it traps in libdispatch ("BUG IN CLIENT OF LIBDISPATCH:
+  Assertion failed: Block was expected to execute on queue
+  [com.apple.main-thread]", SIGTRAP with `pc` == `lr` - 8) and SpringBoard dies
+  thirteen seconds into every launch, which reboots the device in a loop and
+  looks like a hang on the Apple logo. And the frame rate needs something that
+  moves: a static lock screen draws nothing, so `fps 0` there says nothing about
+  the renderer -- `mondriananim=1` puts one animated layer in SpringBoard's
+  window to measure the path without a finger on the glass. That layer must be a
+  fresh `CALayer` per window, never a copy: the class does not implement
+  `NSCopying`, and `[layer copy]` aborts SpringBoard with an uncaught
+  `NSInvalidArgumentException` ("-[CALayer copyWithZone:]: unrecognized
+  selector") the second the lock screen goes, which shows up as four crashes and
+  a spinner while SpringBoard relaunches (ring202).
 - **The vsync registration selector is 9, not 72.** The documented
   IOMobileFramebuffer ABI (The Apple Wiki, `Dev:IOMobileFramebuffer`) puts
   `setVSyncNotifications(functionAddress, userData)` at selector 9, with the

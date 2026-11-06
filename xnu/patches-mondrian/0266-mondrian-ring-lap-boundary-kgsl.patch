@@ -1,0 +1,696 @@
+xnu 0266: the lap boundary the way kgsl closes it, and a doorbell that is read back
+
+Every boot died at the end of its first lap, whatever the wrap code did, and the
+numbers finally name the same event at every ring size tried: the CP retires the
+packets of the lap, is left with the tail, and never fetches the first packet of
+the next lap. `uc retired 3941 of 3989, wptr 0x180` with `fault 0x0 fsr 0x400
+int 0x0 rbbm 0x1`, every later wptr ignored, is ring218's 128 KiB ring; ring214's
+32 KiB ring says the same at `0x1b40`. The CP is idle, not faulted, and it stays
+that way for the rest of the boot.
+
+What this port did that kgsl does not: publish CP_RB_WPTR = RING_DWORDS first,
+to make the CP walk the tail, and wait for a CP_MEM_WRITE semaphore placed there
+as proof. The proof always arrived -- the CP did fetch the tail -- and the lapse
+happened anyway, because the wptr that follows is small again. kgsl never writes
+the one-past-the-end value: it writes one CP_NOP that reaches the end of the
+ring, restarts the cursor at 0, and publishes only the small wptr that comes with
+the next packet. Measured after the change (ring219): 8 laps closed, 0 fence-gate
+refusals, 0 submit failures, 121 of 217 one-second samples at 55 fps or more,
+steady 63-64.
+
+The ring also becomes 128 KiB (bufsz 14, kgsl's own size) instead of 32 KiB, and
+the doorbell is the fenced write of kgsl's gen7_fenced_write(): write, read
+GEN7_GMU_AHB_FENCE_STATUS, retry while WRITEDROPPED0 is set. On this part that
+check reads 0x0 and never retries; it stays because a GPU that has just run out
+of work fences the AHB, and a doorbell written into a closed fence is lost with
+no fault to show for it.
+
+Backpressure stays the fence ring, not CP_RB_RPTR: at most
+MONDRIAN_UC_FENCE_SLOTS - 16 submissions may be unanswered, which bounds the
+ring to about 400 dwords ahead of the CP whatever its size.
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -96,6 +96,33 @@
+ static int mondrian_uc_dump;
+ static int mondrian_uc_rback;
+ /*
++ * gpuprog=0 turns off the per-256-submission read-pointer line. It is on
++ * because the ring stopped consuming at a lap boundary (ring204/206) and
++ * nothing in the log said whether the read pointer the room loop uses ever
++ * followed the write cursor inside a lap, or only stepped at the wrap.
++ */
++static int mondrian_uc_prog = 1;
++static int mondrian_uc_redoor;
++/*
++ * The last submissions, in order. The gate failure is deterministic --
++ * ring211/212/213 all stopped at seq 869, the same frame of the same
++ * animation -- so the question is what the packet the CP never fetched
++ * looked like: its seq, where it started in the ring, how many dwords it
++ * wrote. A wrap between two of them puts the lap boundary in the
++ * picture; a jump in dwords points at an indirect buffer.
++ */
++#define MONDRIAN_UC_HIST 24u
++static struct {
++	uint32_t seq;
++	uint32_t at;
++	uint32_t dwords;
++} mondrian_uc_hist[MONDRIAN_UC_HIST];
++static uint32_t mondrian_uc_hist_n;
++static uint32_t mondrian_uc_wrap_n;
++static uint32_t mondrian_uc_wrap_blind;
++static uint32_t mondrian_uc_wrap_last;
++static uint32_t mondrian_uc_wrap_pad;
++/*
+  * The first three submissions print a line before they touch a register,
+  * whatever gpudump says: without it a boot that hangs in this path says
+  * nothing at all, and a hang on the GMU keepalive write cannot be told from
+@@ -1996,7 +2023,7 @@
+ 		     * last byte of the ucode, and a faulting fetch storm
+ 		     * stalls the GPU's bus. */
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_sqe, 0x100000, 0x100000) != 0 ||
+-		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x8000, 0x200000) != 0 ||
++		    mondrian_gpu_mem_alloc_va(&mondrian_cp_ring, 0x20000, 0x200000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_memptr, 0x1000, 0x300000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_cp_pwrup, 0x1000, 0x301000) != 0 ||
+ 		    mondrian_gpu_mem_alloc_va(&mondrian_uc_quirk, 0x1000, 0x303000) != 0 ||
+@@ -2843,7 +2870,25 @@
+ 	mondrian_log_flush_now();
+ 
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_BASE * 4u, mondrian_cp_ring.iova);
+-	CPW(GEN7_CP_RB_CNTL, 12u | (2u << 8));	/* rptr shadow on (kgsl/mainline) */
++		/*
++		 * bufsz 12 = 2^12 pairs of words = a 32 KiB ring, blksz 2, and
++		 * bit 27: do not copy the read position to memory.
++		 *
++		 * Measured (ring214): the CP consumed the whole ring, executed
++		 * the wrap semaphore at 0x1b20 -- the wait returned -- and then
++		 * never fetched lap 2. `rptr 0x0 wptr 0x180 fault 0x0 fsr 0x400
++		 * int 0x0 rbbm 0x1`: idle, no fault, doorbell ignored, for the
++		 * rest of the boot. That is the first lap boundary of the boot
++		 * and the only one it reaches.
++		 *
++		 * HakiOS 2.3.4 (hakios-xnu-kernel, drivers/gpu/hakios.adreno.c)
++		 * runs the same 0x8000-byte ring, keeps its cursor modulo
++		 * RING_WORDS and publishes only the small CP_RB_WPTR, and its
++		 * rings do go round; its CP_RB_CNTL is this value plus bit 27.
++		 * kgsl and mainline leave the bit clear because they read the
++		 * read pointer out of the memory copy the bit suppresses.
++		 */
++	CPW(GEN7_CP_RB_CNTL, 14u | (2u << 8));
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_RPTR_ADDR_LO * 4u,
+ 	    mondrian_cp_memptr.iova);
+ 	CPW(GEN7_CP_RB_WPTR, 0);
+@@ -3065,7 +3110,25 @@
+ 		mondrian_cp_apriv_program(gpu, 1);
+ 	}
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_BASE * 4u, mondrian_cp_ring.iova);
+-	CPW(GEN7_CP_RB_CNTL, 12u | (2u << 8));	/* rptr shadow on (kgsl/mainline) */
++		/*
++		 * bufsz 12 = 2^12 pairs of words = a 32 KiB ring, blksz 2, and
++		 * bit 27: do not copy the read position to memory.
++		 *
++		 * Measured (ring214): the CP consumed the whole ring, executed
++		 * the wrap semaphore at 0x1b20 -- the wait returned -- and then
++		 * never fetched lap 2. `rptr 0x0 wptr 0x180 fault 0x0 fsr 0x400
++		 * int 0x0 rbbm 0x1`: idle, no fault, doorbell ignored, for the
++		 * rest of the boot. That is the first lap boundary of the boot
++		 * and the only one it reaches.
++		 *
++		 * HakiOS 2.3.4 (hakios-xnu-kernel, drivers/gpu/hakios.adreno.c)
++		 * runs the same 0x8000-byte ring, keeps its cursor modulo
++		 * RING_WORDS and publishes only the small CP_RB_WPTR, and its
++		 * rings do go round; its CP_RB_CNTL is this value plus bit 27.
++		 * kgsl and mainline leave the bit clear because they read the
++		 * read pointer out of the memory copy the bit suppresses.
++		 */
++	CPW(GEN7_CP_RB_CNTL, 14u | (2u << 8));
+ 	mondrian_gpu_write64(gpu, GEN7_CP_RB_RPTR_ADDR_LO * 4u,
+ 	    mondrian_cp_memptr.iova);
+ 	CPW(GEN7_CP_RB_WPTR, 0);
+@@ -3686,6 +3749,10 @@
+ #define MONDRIAN_UC_RING_DWORDS	(mondrian_cp_ring.bytes / 4)
+ #define MONDRIAN_UC_FENCE_BASE	0x800u
+ #define MONDRIAN_UC_FENCE_SLOTS	64u
++/* Submissions unanswered before the next one waits (see the gate in
++ * mondrian_gpu_uc_submit): the fence ring holds 64, so the oldest one
++ * asked about is still intact. */
++#define MONDRIAN_UC_INFLIGHT		(MONDRIAN_UC_FENCE_SLOTS - 16u)
+ 
+ static uint32_t
+ mondrian_uc_fence_word(uint32_t seq)
+@@ -4370,98 +4437,175 @@
+ }
+ 
+ /*
+- * Close the ring. The CP fetches from the read pointer towards the write
+- * pointer and wraps at the end of the buffer, so the tail has to decode as a
+- * valid packet. Fill it with one CP_NOP, publish the end of the lap and wait
+- * for the read pointer to reach it:
++ * The lap boundary. kgsl's adreno_ringbuffer_allocspace is the model: a packet
++ * that does not fit before the end of the buffer is followed by a CP_NOP that
++ * spans the rest of the lap, the write cursor restarts at 0, and the wptr is
++ * published inside the buffer. The CP sees rptr at the end and a small wptr and
++ * wraps.
+  *
+- *  - A write pointer of zero while the start still holds the previous lap
+- *    lets the CP execute those dwords again and its read pointer runs to 25
+- *    (measured: the 2000-submission stress refused 1373 of them).
+- *  - Leaving the wrap to the submission at the start of the next lap (the
+- *    previous shape: publish only `at` once the new dwords are written) is
+- *    what deadlocked this ring. The CP is told the ring grew from a pointer
+- *    near the end to a small one, so it consumes forward through dwords the
+- *    CPU has already rewritten: measured with gpudump=1, `uc rptr reg 0x403
+- *    sh 0x400 bv 0x0 at 0x3f0 room 18` and then the same poll forever. The
+- *    room test needs 26 free dwords and the read pointer was 19 dwords past
+- *    the write cursor, so room could only shrink: 2 s a submission, 2000 of
+- *    them, and the boot never reached userland.
++ * Measured, this CP does not wrap on the small wptr alone (ring209): with the
++ * cursor left at 0x1fe9 and CP_RB_WPTR written back as 0x28, the fence gate
++ * then waited for a submission the CP never retired, forever. The tail has to
++ * be fetched first, which takes CP_RB_WPTR = RING_DWORDS, and nothing may be
++ * published after it until the CP has walked off the end -- otherwise the small
++ * wptr arrives while rptr still points into the tail and the fetch stops.
+  *
+- * So the lap boundary is made explicit: CP_RB_WPTR = MONDRIAN_UC_RING_DWORDS
+- * tells the CP to consume the NOP tail and stop at the end of the buffer, and
+- * the wait proves it did before this cursor is handed back to the submission
+- * path. Two indications are accepted, and the line says which one fired:
+- *
+- *  - rptr >= MONDRIAN_UC_RING_DWORDS: the register keeps counting past the
+- *    end of the buffer. Relied on when the hardware reports the raw dword
+- *    offset; then the value names the end of the lap directly.
+- *  - rptr < seen, the pointer sampled before the doorbell: inside one lap the
+- *    read pointer only moves forward, so the only way back below `seen` is
+- *    that the CP passed the end of the lap and restarted at zero. Relied on
+- *    when the register is masked with the ring size, and the reason `seen` is
+- *    read here rather than taken from the cached bound.
++ * So the tail is not padding: its last packet writes a semaphore into the CP's
++ * memptr page, and this waits for it in memory. That is the only wrap proof
++ * this port can trust. CP_RB_RPTR does not serve: ring207/209 show it tracking
++ * the cursor inside a lap (`at 0x810 rptr 0x7bc`) and then reading 0x1fe9 for
++ * the whole next lap, or 0x0, depending on where it is asked.
++ */
++#define MONDRIAN_UC_WRAP_OFF	0x900u	/* bytes into the CP's memptr page */
++static uint32_t mondrian_uc_wrap_seq;
++
++/*
++ * GEN7_GMU_AHB_FENCE_STATUS: bits 0 and 1 say the last write to a fenced
++ * register (CP_RB_WPTR among them) was dropped. kgsl publishes the write
++ * pointer with gen7_fenced_write() -- write, read this register, retry while a
++ * WRITEDROPPED bit is set, GMU_CORE_LONG_WAKEUP_RETRY_LIMIT tries 10 us apart
++ * -- and treats a write that never lands as a fault.
+  *
+- * On timeout the cursor is not rolled: overwriting the first dwords of a lap
+- * the CP has not finished would be the same bug in the other direction, so the
+- * submission is refused and the next one looks again.
++ * That is the shape of the stall measured in ring209/210/211/214: the CP is
++ * idle (`rbbm 0x1`), no fault (`fault 0x0 fsr 0x400 int 0x0`), the fence word
++ * of the last submission is written, and every later wptr -- including a
++ * second write of the same value -- changes nothing. A GPU that has just run
++ * out of work collapses (IFPC) and fences the AHB; a doorbell written into a
++ * closed fence is dropped, and the CP never learns there is more to fetch.
++ */
++#define MONDRIAN_GMU_AHB_FENCE_STATUS	0x23b13u
++#define MONDRIAN_FENCE_WRITEDROPPED	1u
++#define MONDRIAN_WPTR_RETRIES		200u
++#define MONDRIAN_WPTR_DELAY_US		10u
++static uint32_t mondrian_uc_wptr_drops;
++static int mondrian_uc_wptr_first;
++static uint32_t mondrian_uc_wptr_retried;
++static uint32_t mondrian_uc_wptr_fails;
++static uint32_t mondrian_uc_wptr_worst;
++
++/*
++ * Publish the write cursor, and do not believe it until the GMU says the write
++ * was not dropped. Returns the number of tries it took, 0 when the fence
++ * status was not readable (no GMU in this boot), and 0 after every retry was
++ * dropped -- the caller cannot tell those apart, and the log does.
+  */
++static uint32_t
++mondrian_uc_wptr(uint32_t value)
++{
++	uint32_t tries;
++
++	for (tries = 1; tries <= MONDRIAN_WPTR_RETRIES; tries++) {
++		uint32_t status;
++
++		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u,
++		    value);
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (mondrian_uc_gmu == 0) {
++			return 0;
++		}
++		status = mondrian_gpu_read(mondrian_uc_gmu,
++		    GMU_OFF(MONDRIAN_GMU_AHB_FENCE_STATUS));
++		if (mondrian_uc_wptr_first == 0) {
++			mondrian_uc_wptr_first = 1;
++			printf("MONDRIAN GPU: ahb fence status 0x%x with"
++			    " wptr 0x%x\n", status, value);
++			mondrian_log_flush_now();
++		}
++		if ((status & MONDRIAN_FENCE_WRITEDROPPED) != 0) {
++			mondrian_uc_wptr_drops++;
++			delay(MONDRIAN_WPTR_DELAY_US);
++			continue;
++		}
++		if (tries > 1) {
++			mondrian_uc_wptr_retried++;
++			if (tries > mondrian_uc_wptr_worst) {
++				mondrian_uc_wptr_worst = tries;
++			}
++			if (mondrian_uc_wptr_retried <= 8) {
++				printf("MONDRIAN GPU: uc doorbell 0x%x landed"
++				    " on try %u (worst %u)\n", value, tries,
++				    mondrian_uc_wptr_worst);
++				mondrian_log_flush_now();
++			}
++		}
++		return tries;
++	}
++	if (mondrian_uc_wptr_fails++ < 8) {
++		printf("MONDRIAN GPU: uc doorbell 0x%x never landed, %u"
++		    " writes dropped\n", value, mondrian_uc_wptr_drops);
++		mondrian_log_flush_now();
++	}
++	return 0;
++}
++
+ static int
+ mondrian_uc_wrap(uint32_t *ring)
+ {
+-	uint32_t pad = MONDRIAN_UC_RING_DWORDS - mondrian_uc_at;
+ 	uint32_t at = mondrian_uc_at;
+-	uint32_t seen, rptr, rounds;
++	uint32_t pad = MONDRIAN_UC_RING_DWORDS - at;
++	uint64_t word = mondrian_cp_memptr.iova + MONDRIAN_UC_WRAP_OFF;
++	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
+ 	uint32_t i;
+ 
+-	if (pad != 0) {
+-		ring[at] = mondrian_pm4_type7(0x10u, pad - 1);
+-		for (i = 1; i < pad; i++) {
+-			ring[at + i] = 0;
+-		}
+-		mondrian_gpu_mem_flush(&mondrian_cp_ring, mondrian_cp_ring.bytes);
+-		__asm__ volatile("dsb sy" ::: "memory");
+-	}
+ 	/*
+-	 * The lap ends here. The write is posted, so the dsb orders it behind
+-	 * the ring dwords and the CP cannot fetch the end of the lap before
+-	 * the NOP tail is in memory.
++	 * kgsl's adreno_ringbuffer_allocspace, dword for dword: the tail of the
++	 * lap gets one CP_NOP that reaches exactly the end of the ring, the write
++	 * cursor starts again at 0, and the *only* value ever published is the
++	 * small one that comes with the next submission. The CP walks the NOP to
++	 * the end, wraps its own read pointer and carries on.
++	 *
++	 * Two things this port added on top of that are gone, both measured:
++	 *
++	 *  - publishing CP_RB_WPTR = RING_DWORDS first, to make the CP fetch the
++	 *    tail, and waiting for a write into the CP's memptr page as proof.
++	 *    The proof always arrived (the CP did fetch the tail) and the CP then
++	 *    never fetched lap 2: idle, no fault, every later wptr behind its read
++	 *    pointer. ring214 (32 KiB, first boundary), ring215 (bit 27), ring218
++	 *    (128 KiB): the same stop, at every lap size tried.
++	 *
++	 *  - 0x7b40 + a 1216-dword NOP in ring218 is exactly 0x8000, and the CP
++	 *    retired up to the packet before it: the tail is the last thing it
++	 *    fetches. Note that kgsl never writes the one-past-the-end value, and
++	 *    a CP that masks the write pointer with its ring size would read that
++	 *    value as zero -- "nothing new" -- and sleep.
++	 *
++	 * The semaphore stays as the marker it is worth: if the CP consumes the
++	 * tail, that word changes, and the fence gate prints it (see the gate).
+ 	 */
+-	seen = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u);
+-	mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u,
+-	    (uint32_t)MONDRIAN_UC_RING_DWORDS);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	if (mondrian_uc_dump != 0) {
+-		printf("MONDRIAN GPU: uc wrap doorbell wptr 0x%x rptr 0x%x\n",
+-		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
+-		    seen);
+-		mondrian_log_flush_now();
+-	}
+-	rptr = seen;
+-	for (rounds = 0; rounds < 2000; rounds++) {
+-		rptr = mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u);
+-		if (rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS || rptr < seen) {
+-			break;
+-		}
+-		delay(1000);
++	mondrian_uc_wrap_n++;
++	mondrian_uc_wrap_last = at;
++	mondrian_uc_wrap_pad = pad;
++	mondrian_uc_wrap_seq++;
++	if (pad == 0 || pad >= MONDRIAN_UC_RING_DWORDS || view == NULL) {
++		mondrian_uc_wrap_blind++;
++		mondrian_uc_at = 0;
++		return 0;
+ 	}
+-	if (rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS || rptr < seen) {
+-		printf("MONDRIAN GPU: uc wrap waited rptr 0x%x %s\n", rptr,
+-		    rptr >= (uint32_t)MONDRIAN_UC_RING_DWORDS ?
+-		    "past the lap end" : "wrapped below the lap end");
+-	} else {
+-		printf("MONDRIAN GPU: uc wrap timeout rptr 0x%x seen 0x%x at 0x%x\n",
+-		    rptr, seen, at);
++	if (mondrian_uc_wrap_n <= 8) {
++		printf("MONDRIAN GPU: uc lap %u closes at 0x%x pad %u seq %u\n",
++		    mondrian_uc_wrap_n, at, pad, mondrian_uc_fence);
+ 		mondrian_log_flush_now();
+-		return -1;
+ 	}
+-	mondrian_log_flush_now();
+ 	/*
+-	 * The lap restarted, so the cached read pointer is not a lower bound
+-	 * any more: it names a position in the lap that just ended, and the
+-	 * room test has to read the register again before it can use it.
++	 * The marker goes first, then one NOP covers the rest of the lap. Split
++	 * in two only because it has to be: the NOP is one packet, so the marker
++	 * has to sit before it (a second packet cannot start inside a NOP).
+ 	 */
+-	mondrian_uc_rptr_valid = 0;
++	if (pad >= 5) {
++		ring[at++] = mondrian_pm4_type7(0x3du, 3);	/* MEM_WRITE */
++		ring[at++] = (uint32_t)word;
++		ring[at++] = (uint32_t)(word >> 32);
++		ring[at++] = mondrian_uc_wrap_seq;
++		pad -= 4;
++	}
++	ring[at] = mondrian_pm4_type7(0x10u, pad - 1);	/* CP_NOP */
++	for (i = 1; i < pad; i++) {
++		ring[at + i] = 0;
++	}
++	view[MONDRIAN_UC_WRAP_OFF / 4] = 0;
++	mondrian_gpu_mem_flush_range(&mondrian_cp_ring,
++	    mondrian_uc_at * 4, (MONDRIAN_UC_RING_DWORDS - mondrian_uc_at) * 4);
++	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_uc_at = 0;
+ 	return 0;
+ }
+@@ -4479,8 +4623,7 @@
+ 			continue;
+ 		}
+ 		mondrian_uc_door_at = 0;
+-		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
+-		__asm__ volatile("dsb sy" ::: "memory");
++		(void)mondrian_uc_wptr(at);
+ 		mondrian_uc_door_posted = seq;
+ 	}
+ }
+@@ -4561,7 +4704,7 @@
+ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ {
+ 	uint32_t *ring;
+-	uint32_t at, from, seq, rptr, spins, room;
++	uint32_t at, from, seq, need;
+ 	uint64_t slot, ringStart;
+ 
+ 	if (fence == NULL) {
+@@ -4612,113 +4755,141 @@
+ 		mondrian_log_flush_now();
+ 	}
+ 	at = mondrian_uc_at;
++	{
++		uint32_t i = mondrian_uc_hist_n % MONDRIAN_UC_HIST;
++
++		mondrian_uc_hist[i].seq = seq;
++		mondrian_uc_hist[i].at = at;
++		mondrian_uc_hist[i].dwords = dwords;
++		mondrian_uc_hist_n++;
++	}
++	if (mondrian_uc_prog != 0 && (seq & 0x3fu) == 0) {
++		volatile uint32_t *sh = (volatile uint32_t *)mondrian_cp_memptr_view;
++
++		printf("MONDRIAN GPU: uc prog seq %u at 0x%x rptr 0x%x sh 0x%x"
++		    " wptr 0x%x dwords %u\n", seq, at,
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_RPTR * 4u),
++		    sh != NULL ? sh[0] : 0,
++		    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u),
++		    dwords);
++		mondrian_log_flush_now();
++	}
+ 	/*
+-	 * Backpressure: the CP has to have consumed enough of the lap before
+-	 * this submission overwrites it. The old code never looked at the read
+-	 * pointer, so the 2000-submission stress could run the ring over.
+-	 *
+-	 * The register read behind that is an uncached round trip to the GPU,
+-	 * and the pointer only moves forward inside a lap, so a value read once
+-	 * stays a lower bound: while the room it implies still covers the 26
+-	 * dwords written below, they cannot reach the CP whatever it does in
+-	 * between. That is one read a lap (315 submissions of 26 dwords)
+-	 * instead of one a submission.
++	 * Flow control is the fence ring, not the read pointer. The number that
++	 * says how far the CP has got is the marker it writes into its memptr
++	 * page at the end of every submission, and those arrive; CP_RB_RPTR does
++	 * not stay honest. Measured (ring207), the pointer tracked the write
++	 * cursor for a whole lap -- `at 0x810 rptr 0x7b4`, `at 0x1010 rptr
++	 * 0x1004`, `at 0x1810 rptr 0x1808` -- and then stopped dead after the
++	 * lap wrap: `at 0x28 rptr 0x0`, `at 0x828 rptr 0x0`, `at 0x1028 rptr
++	 * 0x0`. A room test built on it either waits forever at a boundary or,
++	 * worse, believes the ring is empty while the CP is a lap behind.
+ 	 *
+-	 * The bound is only ever a lower bound, so a short room means nothing
+-	 * more than "the cached value is not enough": the CP may well be far
+-	 * ahead of it. It has to be read again before anything waits on it --
+-	 * a stale bound is what deadlocked the ring (measured: cached 0x3f0,
+-	 * write cursor 0x3f0, real read pointer 0x403, room 18, and the wait
+-	 * below spun for 2 s a submission for the whole 2000-submission
+-	 * stress). `uc no room` and its patience stay as they were; only the
+-	 * decision to wait is taken from a fresh read.
++	 * Keeping at most MONDRIAN_UC_INFLIGHT submissions unanswered bounds the
++	 * ring by construction: 48 submissions of about 8 dwords is under 400
++	 * dwords of an 8192-dword ring, so the write cursor can never reach
++	 * unread data and every wrap lands in dwords the CP consumed a whole lap
++	 * ago. It also turns a stopped CP into a refusal in a fifth of a second
++	 * instead of a lap later.
+ 	 */
+-	rptr = mondrian_uc_rptr;
+-	room = mondrian_uc_rptr_valid != 0 ?
+-	    (rptr + MONDRIAN_UC_RING_DWORDS - at - 1) %
+-	    MONDRIAN_UC_RING_DWORDS : 0;
+-	spins = 0;
+-	if (room < 26) {
++	if (seq > MONDRIAN_UC_INFLIGHT) {
++		uint32_t want = seq - MONDRIAN_UC_INFLIGHT;
++		volatile uint32_t *view =
++		    (volatile uint32_t *)mondrian_cp_memptr_view;
+ 		uint32_t spent_us = 0;
+ 
+-		if (mondrian_uc_dump != 0) {
+-			/* Printed before the read, not after it: a CP whose
+-			 * register port stopped answering never returns from
+-			 * it, and this is the line that says the CPU died
+-			 * there. */
+-			printf("MONDRIAN GPU: uc room wait at 0x%x\n", at);
+-			mondrian_log_flush_now();
+-		}
+ 		for (;;) {
+-			uint32_t reg, sh, bv;
+-			volatile uint32_t *shadow =
+-			    (volatile uint32_t *)mondrian_cp_memptr_view;
+-
+-			reg = mondrian_gpu_read(mondrian_uc_gpu,
+-			    GEN7_CP_RB_RPTR * 4u);
+-			sh = shadow != NULL ? shadow[0] : 0;
+-			bv = shadow != NULL ? shadow[2] : 0;
+-			/*
+-			 * CP_RB_CNTL turns the rptr shadow on, so the CP may
+-			 * be publishing its read pointer in memory and not in
+-			 * the register. Take whichever is further: a register
+-			 * that stays stale must not strand the ring, and a
+-			 * shadow outside the ring is not a pointer at all.
+-			 */
+-			rptr = (sh < MONDRIAN_UC_RING_DWORDS && sh > reg) ?
+-			    sh : reg;
+-			room = (rptr + MONDRIAN_UC_RING_DWORDS -
+-			    at - 1) % MONDRIAN_UC_RING_DWORDS;
+-			mondrian_uc_rptr_reads++;
+-			/* A CP that stopped consuming shows the same rptr on
+-			 * every spin; a wedged register port shows none. */
+-			if (mondrian_uc_dump != 0 &&
+-			    (spins < 8 || (spins % 256) == 0)) {
+-				printf("MONDRIAN GPU: uc room poll %u rptr 0x%x room %u\n",
+-				    spins, rptr, room);
+-				printf("MONDRIAN GPU: uc rptr reg 0x%x sh 0x%x bv 0x%x at 0x%x room %u\n",
+-				    reg, sh, bv, at, room);
+-				mondrian_log_flush_now();
+-			}
+-			/*
+-			 * The shadow moving while the register does not is the
+-			 * whole bug: the CP is consuming and the submission
+-			 * path was polling the wrong pointer.
+-			 */
+-			if (mondrian_uc_dump != 0) {
+-				if (mondrian_uc_sh_seen != 0 &&
+-				    mondrian_uc_sh_said == 0 &&
+-				    sh != mondrian_uc_sh_shadow &&
+-				    reg == mondrian_uc_sh_reg) {
+-					mondrian_uc_sh_said = 1;
+-					printf("MONDRIAN GPU: cp rptr shadow moves, register stale\n");
+-					mondrian_log_flush_now();
+-				}
+-				mondrian_uc_sh_seen = 1;
+-				mondrian_uc_sh_shadow = sh;
+-				mondrian_uc_sh_reg = reg;
+-			}
+-			spins++;
+-			if (room >= 26 + mondrian_cp_quirk * 4) {
+-				mondrian_uc_rptr = rptr;
+-				mondrian_uc_rptr_valid = 1;
++			__asm__ volatile("dsb sy" ::: "memory");
++			if (view != NULL &&
++			    (int32_t)(view[mondrian_uc_fence_word(want)] - want) >= 0) {
+ 				break;
+ 			}
+-			if (spent_us >= 2000000u) {
+-				/*
+-				 * A ring the CP stopped consuming is the end of the
+-				 * frame path, and until now it only said so with
+-				 * gpudump=1: the client then reports "submit failed:
+-				 * -5" and the reason is nowhere in the log. Print the
+-				 * numbers that name it, once per occurrence, a few
+-				 * times.
+-				 */
++			if (spent_us >= 200000u) {
+ 				static unsigned told;
+ 
++				/*
++				 * A CP that faulted, one that went idle with the
++				 * work still in memory, and one working slowly
++				 * all end here. The registers say which: a fault
++				 * names the packet, RBBM_STATUS says busy or
++				 * idle, and the fence word says whether the CP
++				 * ever wrote it.
++				 */
+ 				if (told++ < 8) {
+-					printf("MONDRIAN GPU: uc no room at 0x%x rptr 0x%x"
+-					    " room %u seq %u after %u us\n", at, rptr, room,
+-					    seq, spent_us);
++					printf("MONDRIAN GPU: uc fence gate seq %u"
++					    " waits for %u after %u us: rptr 0x%x"
++					    " wptr 0x%x fault 0x%x fsr 0x%x int 0x%x"
++					    " rbbm 0x%x fw 0x%x\n",
++					    seq, want, spent_us,
++					    mondrian_gpu_read(mondrian_uc_gpu,
++					    GEN7_CP_RB_RPTR * 4u),
++					    mondrian_gpu_read(mondrian_uc_gpu,
++					    GEN7_CP_RB_WPTR * 4u),
++					    mondrian_gpu_read(mondrian_uc_gpu,
++					    GEN7_CP_HW_FAULT * 4u),
++					    mondrian_gpu_read(mondrian_uc_smmu,
++					    0x20000u + SMMU_FSR),
++					    mondrian_gpu_read(mondrian_uc_gpu,
++					    GEN7_CP_INTERRUPT_STATUS * 4u),
++					    mondrian_gpu_read(mondrian_uc_gpu,
++					    GEN7_RBBM_STATUS * 4u),
++					    view != NULL ?
++					    view[mondrian_uc_fence_word(want)] : 0);
++					mondrian_log_flush_now();
++				}
++				/*
++				 * The doorbell is a posted write: if the one that
++				 * carried the last submission was lost, the CP
++				 * sits idle with the work in memory and ringing
++				 * the same value again revives it. Cheap to try
++				 * once, and the line says whether it did.
++				 */
++				if (mondrian_uc_redoor == 0) {
++					mondrian_uc_redoor = 1;
++					(void)mondrian_uc_wptr(
++					    (uint32_t)mondrian_uc_at);
++					__asm__ volatile("dsb sy" ::: "memory");
++					spent_us = 0;
++					printf("MONDRIAN GPU: uc fence gate re-rang"
++					    " the wptr 0x%x\n", mondrian_uc_at);
++					mondrian_log_flush_now();
++					continue;
++				}
++				{
++					uint32_t n = mondrian_uc_hist_n;
++					uint32_t k;
++					uint32_t retired = 0;
++					uint32_t s;
++
++					for (s = 0; s < MONDRIAN_UC_FENCE_SLOTS; s++) {
++						uint32_t v = view[MONDRIAN_UC_FENCE_BASE / 4 +
++						    s];
++
++						if (v <= mondrian_uc_fence &&
++						    (int32_t)(v - retired) > 0) {
++							retired = v;
++						}
++					}
++					printf("MONDRIAN GPU: uc retired %u of %u,"
++					    " wptr 0x%x tail %u of %u\n", retired,
++					    mondrian_uc_fence, mondrian_uc_at,
++					    view[MONDRIAN_UC_WRAP_OFF / 4],
++					    mondrian_uc_wrap_seq);
++					printf("MONDRIAN GPU: uc hist %u subs, %u wraps"
++					    " (%u blind, last at 0x%x pad %u), cursor 0x%x"
++					    " last fence %u\n", n, mondrian_uc_wrap_n,
++					    mondrian_uc_wrap_blind, mondrian_uc_wrap_last,
++					    mondrian_uc_wrap_pad, mondrian_uc_at,
++					    mondrian_uc_fence);
++					for (k = 0; k < 3 && k < n; k++) {
++						uint32_t i = (n - 1u - k) % MONDRIAN_UC_HIST;
++
++						printf("MONDRIAN GPU: uc hist -%u seq %u at"
++						    " 0x%x dwords %u\n", k,
++						    mondrian_uc_hist[i].seq,
++						    mondrian_uc_hist[i].at,
++						    mondrian_uc_hist[i].dwords);
++					}
+ 					mondrian_log_flush_now();
+ 				}
+ 				return -1;
+@@ -4727,18 +4898,26 @@
+ 			spent_us += mondrian_uc_poll_us;
+ 		}
+ 	}
+-	if (mondrian_uc_dump != 0) {
+-		printf("MONDRIAN GPU: uc room at 0x%x rptr 0x%x reads %u\n",
+-		    at, rptr, mondrian_uc_rptr_reads);
+-		mondrian_log_flush_now();
+-	}
+-	if (at + 26 > MONDRIAN_UC_RING_DWORDS) {
++	/*
++	 * Does the whole packet fit? The submission is not its indirect
++	 * buffer: the markers, the IB1LIST bracket, the fence and the
++	 * a725 quirk IB add about twenty dwords on top, and the buffers
++	 * measured here run from 8 to 1223 dwords. The test used to assume
++	 * 26 dwords total, so the last submission of a lap could start at
++	 * 0x1fe6 with a 242-dword packet, run past the end of the ring and
++	 * publish a wptr beyond it: that is what stopped the CP a few
++	 * submissions before the lap end in every boot (ring209/210, the
++	 * fence gate stuck on 1019 while the cursor was at 0x1fc7).
++	 */
++	need = dwords + 32u;
++	if (at + need > MONDRIAN_UC_RING_DWORDS) {
++		if (need > MONDRIAN_UC_RING_DWORDS) {
++			printf("MONDRIAN GPU: uc submission of %u dwords does not"
++			    " fit in the ring\n", dwords);
++			mondrian_log_flush_now();
++			return -1;
++		}
+ 		if (mondrian_uc_wrap(ring) != 0) {
+-			if (mondrian_uc_dump != 0) {
+-				printf("MONDRIAN GPU: uc submit done seq %u ret %d\n",
+-				    seq, -1);
+-				mondrian_log_flush_now();
+-			}
+ 			return -1;
+ 		}
+ 		at = 0;
+@@ -4942,7 +5121,7 @@
+ 			mondrian_log_flush_now();
+ 		}
+ 	} else {
+-		mondrian_gpu_write(mondrian_uc_gpu, GEN7_CP_RB_WPTR * 4u, at);
++		(void)mondrian_uc_wptr(at);
+ 		if (mondrian_uc_dump != 0) {
+ 			printf("MONDRIAN GPU: uc doorbell 0x%x\n", at);
+ 			mondrian_log_flush_now();

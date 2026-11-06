@@ -1,0 +1,124 @@
+xnu 0264: the kernel carries the UI hook, so a hook change is one build
+
+The UI hook is the file that changes most: it is where the idle timer, the
+unlock and the frame-rate probe live, and every change to it meant a 16 GiB
+userdata flash (475 s) because it only exists as
+/usr/libexec/mondrian-ui-hook.dylib in the root image. glblob=1 already carries
+the two CoreAnimation dylibs in the kernel image and writes them into
+/private/var/vm at boot; the hook now travels with them.
+
+kern_exec.c injects the /private/var/vm copy when it exists and falls back to
+/usr/libexec otherwise, so a root image built before this patch still works and
+a root image does not have to be rewritten for a new hook. The name it chose is
+printed once per process, which is the evidence that the boot used the copy in
+the kernel and not the stale one in the image.
+
+Each of the three files is written once and its own flag remembers that: a file
+rewritten while a process is execing it is truncated under the loader ("not a
+mach-o file"), and a file that cannot be written yet (EROFS before the root is
+mounted) must not hold back the other two.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5590,6 +5590,21 @@
+ #define MONDRIAN_HOOK_POSTER            0x8
+ 
+ static bool
++mondrian_ui_hook_in_vm(void)
++{
++	vnode_t vp = NULLVP;
++	int error;
++
++	error = vnode_lookup("/private/var/vm/mondrian-ui-hook.dylib", 0, &vp,
++	    vfs_context_kernel());
++	if (error != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+ 	int targets = 0;
+@@ -5597,6 +5612,14 @@
+ 	const char *name;
+ 	const char library[] = "DYLD_INSERT_LIBRARIES=/usr/libexec/mondrian-ui-hook.dylib";
+ 	/*
++	 * glblob=1 writes this build's copy of the hook into /private/var/vm at
++	 * boot (mondrian_ufs.c). When that copy exists it wins: a hook change
++	 * then costs one kernel build and one `fastboot boot` instead of a
++	 * userdata flash, while a root image that still carries the old
++	 * /usr/libexec copy keeps working.
++	 */
++	const char library_vm[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-ui-hook.dylib";
++	/*
+ 	 * The poster extensions get the injector itself, from /private/var/vm:
+ 	 * that copy is the one glblob=1 rewrites at boot, while the root is
+ 	 * read-only. The UI hook in /usr/libexec only dlopens the injector as a
+@@ -5638,7 +5661,17 @@
+ 		strlcpy(env, poster, size);
+ 		return true;
+ 	}
+-	strlcpy(env, library, size);
++	{
++		static unsigned vm_told;
++		bool in_vm = mondrian_ui_hook_in_vm();
++
++		if (vm_told++ < 4) {
++			printf("MONDRIAN HOOK: %.*s uses the %s copy\n",
++			    (int)imgp->ip_ndp->ni_cnd.cn_namelen, name,
++			    in_vm ? "/private/var/vm" : "/usr/libexec");
++		}
++		strlcpy(env, in_vm ? library_vm : library, size);
++	}
+ 	return true;
+ }
+ #endif
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1222,6 +1222,9 @@
+ static uint64_t mondrian_log_painted;
+ /* glblob=1: the dylibs still have to be written, once the root is writable. */
+ static int mondrian_glblob_pending;
++static int mondrian_glblob_hook_done;
++static int mondrian_glblob_gl_done;
++static int mondrian_glblob_inject_done;
+ static uint64_t mondrian_log_paint_chars;
+ static uint64_t mondrian_log_paint_us;
+ static uint64_t mondrian_log_paint_next_log;
+@@ -1529,10 +1532,30 @@
+ 	if (!mondrian_glblob_pending) {
+ 		return;
+ 	}
+-	if (mondrian_glblob_one("/private/var/vm/mondrian-gl.dylib",
+-	    mondrian_gl_dylib, mondrian_gl_dylib_len) == 0 &&
+-	    mondrian_glblob_one("/private/var/vm/mondrian-inject.dylib",
+-	    mondrian_inject_dylib, mondrian_inject_dylib_len) == 0) {
++	/*
++	 * One write per file, then the flag. A file that is written twice would
++	 * be truncated under a process that is execing it, which the loader
++	 * reports as "not a mach-o file"; and a file that fails to be written
++	 * must not stop the other two (EROFS on the first ticks only means the
++	 * root is not mounted yet, and that is what the retries are for).
++	 */
++	if (!mondrian_glblob_hook_done) {
++		mondrian_glblob_hook_done = mondrian_ui_hook_dylib_len == 0 ||
++		    mondrian_glblob_one("/private/var/vm/mondrian-ui-hook.dylib",
++		    mondrian_ui_hook_dylib, mondrian_ui_hook_dylib_len) == 0;
++	}
++	if (!mondrian_glblob_gl_done) {
++		mondrian_glblob_gl_done =
++		    mondrian_glblob_one("/private/var/vm/mondrian-gl.dylib",
++		    mondrian_gl_dylib, mondrian_gl_dylib_len) == 0;
++	}
++	if (!mondrian_glblob_inject_done) {
++		mondrian_glblob_inject_done =
++		    mondrian_glblob_one("/private/var/vm/mondrian-inject.dylib",
++		    mondrian_inject_dylib, mondrian_inject_dylib_len) == 0;
++	}
++	if (mondrian_glblob_hook_done && mondrian_glblob_gl_done &&
++	    mondrian_glblob_inject_done) {
+ 		mondrian_glblob_pending = 0;
+ 	}
+ #endif

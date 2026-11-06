@@ -211,16 +211,26 @@ MONDRIAN = Board(
     #   first bank's firmware islands and the gap between the banks were both
     #   inside the old 1.12 GiB window.
     #
-    # 0xb0000000+0x30000000 ends exactly at the first carve-out
-    # (qheebsp_reserved_region) and contains no other. 768 MiB of real memory
-    # beats 1.12 GiB of which 360 MiB could never be used. The panel's own
-    # pages are kept off the free list separately (mondrian_page_is_screen).
+    # 0xaa000000+0x36000000 (864 MiB): the base is 32 MiB aligned, so the
+    # early block mapping needs no ragged edge, and it clears the shim (ABL
+    # loads it at 0xa8000000; the build appends the LZ4 payload at _end,
+    # which today ends at 0xa8757a29). The end is the first carve-out above
+    # the panel (qheebsp_reserved_region at 0xe0000000), as before.
+    #
+    # These two numbers are not only the payload header: mkadt.py writes them
+    # into /chosen as dram-base/dram-size, and the shim passes the same
+    # window in boot_args. They have to agree. The 889 MiB attempt had the
+    # ADT say 0xa7400000/0x38b00000 while the shim said
+    # 0xa8758000/0x378a8000, and the kernel never reached early mark 21.
+    # A payload that grows past the base makes the shim raise it again and
+    # breaks that agreement: bump both numbers together, and the shim prints
+    # `WINDOW RAISED` when it has to.
     #
     # Keep the size at or above 0x30000000: the bootstrap VA window scales
     # with the number of 256 MiB segments (two plus ten per segment,
     # arm_vm_init.c) and a smaller window leaves the early page tables short.
-    phys_base=0xb0000000,
-    mem_size=0x30000000,
+    phys_base=0xaa000000,
+    mem_size=0x36000000,
     # Pinned: the physmap slide comes from this seed, and with a random one
     # the boot is a coin flip (one run in three dies in pmap_map_bd). This
     # one is known to work with the window above (checked on the host).

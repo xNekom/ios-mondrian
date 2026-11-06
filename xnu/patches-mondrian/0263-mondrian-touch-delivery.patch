@@ -1,0 +1,66 @@
+xnu 0263: say who is listening to the digitizer
+
+Every synced sweep dispatches digitizer events and no frame follows, but a lock
+screen that is not animating draws nothing either, so the frames cannot tell
+"the touch never arrived" from "the touch arrived and did nothing". backboardd
+counts as a client of the button service and the log says so; print the client
+count of the digitizer service the same way, on the first events and whenever it
+changes, so one boot answers it.
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -346,6 +346,17 @@
+ };
+ OSDefineMetaClassAndStructors(MondrianHIDButtons, IOHIDEventService);
+ 
++/* Print the first few, then only when the number of listeners changes. */
++static bool
++self_events(UInt32 events, UInt32 clients, UInt32 *logged)
++{
++	if (events < 4 || clients != *logged) {
++		*logged = clients;
++		return true;
++	}
++	return false;
++}
++
+ /*
+  * Touch screen: digitizer collection events with finger children,
+  * coordinates normalized to 0..1 like IOHIDEventDriver produces for
+@@ -368,6 +379,8 @@
+ 	UInt32 fDragTick;
+ 	UInt32 fDragSweep;
+ 	IOLock *fLock;
++	UInt32 fLoggedClients;   /* client count last printed */
++	UInt32 fEvents;          /* events dispatched */
+ 	bool fDown[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fX[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fY[MONDRIAN_TOUCH_FINGERS];
+@@ -461,6 +474,8 @@
+ MondrianHIDTouch::start(IOService *provider)
+ {
+ 	fLock = IOLockAlloc();
++	fLoggedClients = 0xffffffffu;	/* so the first event always prints */
++	fEvents = 0;
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+@@ -551,6 +566,19 @@
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
++	/*
++	 * Who is listening: a digitizer event with no client is a finger on a
++	 * dead screen, and the boot cannot tell the two apart from the frames
++	 * alone (a lock screen that is not animating draws nothing either).
++	 */
++	{
++		UInt32 clients = _clients != NULL ? _clients->getCount() : 0;
++
++		if (self_events(fEvents, clients, &fLoggedClients)) {
++			IOLog("MONDRIAN HID: touch %u (%u clients)\n", fEvents, clients);
++		}
++		fEvents++;
++	}
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
+ 	/*
+ 	 * backboardd only delivers a digitizer event to a display when the

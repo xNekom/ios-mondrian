@@ -65,9 +65,10 @@ ABL (stock Xiaomi bootloader, unlocked)
 There is no serial port (the debug UART is wired as SPI on these boards). The
 kernel draws its console into the framebuffer the bootloader leaves — 1440x3200
 at `0xb8000000` on mondrian (120 Hz; iOS/CA run at 60), 1080x2400 at
-`0x9c000000` on sweet — and keeps the
-whole log in a 4 MiB ring at the end of `userdata` (`0096`), because a screen
-only ever shows the last page of a boot.
+`0x9c000000` on sweet — and keeps the whole log in a 4 MiB ring at the end of
+`userdata` (`0096`), because a screen only ever shows the last page of a boot.
+The ring is written from the UFS path, so a boot reset before userland writes
+leaves the previous ring: unchanged is not proof of failure.
 
 ## Boards
 
@@ -185,21 +186,20 @@ tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
-# boot_b pairs with the kernel-less `recovery` ramdisk: put
-# backup/boot_b-as-found.img back before `fastboot reboot recovery`. A refused
-# boot is usually the slot's spent retry budget: `fastboot set_active b`.
+# boot_b pairs with the kernel-less `recovery` ramdisk: restore
+# backup/boot_b-as-found.img before `fastboot reboot recovery`; a refused boot
+# is usually the slot's spent retry budget (`fastboot set_active b`).
 tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
 sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
 python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 ```
 
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
-existing `.simg`, so remake the sparse file by hand.
-
-A definite write follows the graded protocol in `docs/MONDIAN_PORT.md`
-(volatile proof, `fastboot getvar current-slot`, verified backup, read back).
-`tools/phone-log.sh` boots an image and decodes the ring through the recovery;
-`tools/phone-deploy.sh logview` prints the last screenful on the panel instead.
+existing `.simg`, so remake the sparse file by hand. A definite write follows
+the graded protocol in `docs/MONDIAN_PORT.md` (volatile proof, `fastboot getvar
+current-slot`, verified backup, read back). `tools/phone-log.sh` boots an image
+and decodes the ring through the recovery; `tools/phone-deploy.sh logview`
+prints the last screenful on the panel instead.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1

@@ -259,12 +259,20 @@ const char *loader_boot(uintptr_t dtb)
 		 */
 		uint64_t scratch = (win_base + win_size - raw) & ~0xFFFUL;
 
+		con_hex64("BLOB", (uint64_t)(uintptr_t)b);
+		con_hex64("BCMP", comp);
+		con_hex64("BRAW", raw);
+		con_hex64("BDST", scratch);
+		con_hex64("BWIN", win_base);
+		con_hex64("BWSZ", win_size);
 		if (!win_size || scratch < win_base)
 			return "no room to unpack the payload";
 		long n = lz4_decompress_frame(b + BLOB_DATA, comp,
 					      (uint8_t *)(uintptr_t)scratch, raw);
-		if (n < 0 || (uint64_t)n != raw)
+		if (n < 0 || (uint64_t)n != raw) {
+			con_hex2("BADUNP", "n=", (uint32_t)n, "raw=", (uint32_t)raw);
 			return "cannot unpack the payload";
+		}
 		con_hex2("UNPACK", "n=", (uint32_t)n, "at=", (uint32_t)(scratch >> 32));
 		rd_start = scratch;
 		rd_end = scratch + raw;

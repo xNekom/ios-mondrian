@@ -35,17 +35,24 @@
  * the bank (the hypervisor is at 0x80000000; the kernel image written over
  * it resets the phone).
  *
- * It ends at 0xe0000000, the first firmware carve-out (qheebsp_reserved_region).
- * The live device tree says the RAM runs are 0x80000000+0x6a000000 and
- * 0xf4600000+0xba00000 and marks the islands below 0xea000000 no-map, so a
- * window that reaches past 0xe0000000 hands the VM pages that the AP cannot
- * touch: the first access is a synchronous external abort, minutes into the
- * boot. The device tree confirms the window is inside a memory region; the
- * shim prints both so a mismatch is visible on the screen.
+ * The base here is the floor, not necessarily the base the kernel gets: ABL
+ * loads this image at 0xa8000000, inside the free run below the panel, and the
+ * loader wipes the window before it places anything in it. The shim therefore
+ * starts the window at the end of this image (and of the device tree), which
+ * costs about 8 MiB of the 140 MiB this floor wins over the old 0xb0000000.
+ *
+ * The end is 0xe0000000, the first firmware carve-out above the panel
+ * (qheebsp_reserved_region). The live device tree says the RAM runs are
+ * 0x80000000+0x6a000000 and 0xf4600000+0xba00000 and marks the islands below
+ * 0xea000000 no-map, so a window that reaches past 0xe0000000 hands the VM
+ * pages that the AP cannot touch: the first access is a synchronous external
+ * abort, minutes into the boot. The device tree confirms the window is inside
+ * a memory region; the shim prints both so a mismatch is visible on the
+ * screen.
  *
  * The wipe below only touches what the device tree says is memory. */
-#define BOARD_MEM_BASE		0xb0000000UL
-#define BOARD_MEM_SIZE		0x30000000UL
+#define BOARD_MEM_BASE		0xaa000000UL
+#define BOARD_MEM_SIZE		0x36000000UL
 
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */

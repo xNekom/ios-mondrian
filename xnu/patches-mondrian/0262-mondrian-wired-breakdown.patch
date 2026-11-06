@@ -1,0 +1,111 @@
+xnu 0262: split the wired total into what this port allocates
+
+A boot runs with 14 MiB free and 502 MiB wired out of a 768 MiB window, and
+jetsam kills a process every few seconds. The two owners this port can name are
+the IOSurface buffers and the GEM buffers the GPU client adopts; print both, with
+their live object counts, beside the VM totals, so a boot says whether the next
+hundred megabytes are a leak of ours or the userland's own demand.
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -75,6 +75,31 @@
+ static uint64_t      mondrian_surface_wired;       /* bytes of buffer surfaces */
+ #define MONDRIAN_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/* What the sampler prints: how much of the wired total is surfaces. */
++extern "C" uint64_t
++mondrian_surface_wired_bytes(void)
++{
++	return (uint64_t)mondrian_surface_wired;
++}
++
++extern "C" uint32_t
++mondrian_surface_live_count(void)
++{
++	uint32_t live = 0;
++
++	if (mondrian_surface_lock == NULL) {
++		return 0;
++	}
++	IOLockLock(mondrian_surface_lock);
++	for (uint32_t id = 1; id < MONDRIAN_SURFACE_MAX_ID; id++) {
++		if (mondrian_surface_table[id] != NULL) {
++			live++;
++		}
++	}
++	IOLockUnlock(mondrian_surface_lock);
++	return live;
++}
++
+ OSDefineMetaClassAndStructors(MondrianSurface, OSObject);
+ 
+ void
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -534,6 +534,22 @@
+ 	IOFree(scratch, 0x4000);
+ }
+ 
++/* What the sampler prints: live GEM buffers, the port's other big owner. */
++static uint64_t mondrian_gpu_buffer_bytes;
++static uint32_t mondrian_gpu_buffer_count;
++
++extern "C" uint64_t
++mondrian_gpu_buffer_bytes_total(void)
++{
++	return mondrian_gpu_buffer_bytes;
++}
++
++extern "C" uint32_t
++mondrian_gpu_buffer_count_total(void)
++{
++	return mondrian_gpu_buffer_count;
++}
++
+ mondrian_buffer *
+ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ {
+@@ -606,6 +622,8 @@
+ 	buffer->dirty = true;
+ 	buffer->mapped = false;
+ 	fBuffers[fBufferCount++] = buffer;
++	mondrian_gpu_buffer_bytes += size;
++	mondrian_gpu_buffer_count++;
+ 	/*
+ 	 * Surface-sized only: a pattern test on a texture would say nothing
+ 	 * about the surface and would cost a flush of every buffer.
+@@ -676,6 +694,8 @@
+ 	if (buffer->memory != NULL) {
+ 		buffer->memory->release();
+ 	}
++	mondrian_gpu_buffer_bytes -= buffer->size;
++	mondrian_gpu_buffer_count--;
+ 	for (i = 0; i < fBufferCount; i++) {
+ 		if (fBuffers[i] == buffer) {
+ 			fBuffers[i] = fBuffers[--fBufferCount];
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -238,12 +238,22 @@
+ 		extern unsigned int vm_page_wire_count, vm_page_active_count;
+ 		extern unsigned int vm_page_inactive_count;
+ 		/* 16 KiB pages: count * 16 is KiB, >> 10 is MiB. */
+-		printf("MONDRIAN MEM: free %uMiB spec %uMiB wire %uMiB active %uMiB inactive %uMiB\n",
++		extern uint64_t mondrian_surface_wired_bytes(void);
++		extern uint32_t mondrian_surface_live_count(void);
++		extern uint64_t mondrian_gpu_buffer_bytes_total(void);
++		extern uint32_t mondrian_gpu_buffer_count_total(void);
++
++		printf("MONDRIAN MEM: free %uMiB spec %uMiB wire %uMiB active %uMiB inactive %uMiB"
++		    " surf %uMiB/%u gpu %uMiB/%u\n",
+ 		    (vm_page_free_count * 16) >> 10,
+ 		    (vm_page_speculative_count * 16) >> 10,
+ 		    (vm_page_wire_count * 16) >> 10,
+ 		    (vm_page_active_count * 16) >> 10,
+-		    (vm_page_inactive_count * 16) >> 10);
++		    (vm_page_inactive_count * 16) >> 10,
++		    (unsigned)(mondrian_surface_wired_bytes() >> 20),
++		    mondrian_surface_live_count(),
++		    (unsigned)(mondrian_gpu_buffer_bytes_total() >> 20),
++		    mondrian_gpu_buffer_count_total());
+ 	}
+ 	printf("SMP t=%llus %d procs", (unsigned long long)(now / 1000000000ULL),
+ 	    mondrian_proc_count);

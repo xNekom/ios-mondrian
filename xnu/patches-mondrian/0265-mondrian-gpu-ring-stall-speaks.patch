@@ -1,0 +1,41 @@
+xnu 0265: a ring the CP stopped consuming says so without gpudump
+
+The wrap line was the last thing the GPU path printed before the frame path
+died in ring204: 55, 57 and 44 fps, then `MESA: error: flush_submit_list:135:
+submit failed: -5 (Operation not supported)` and no frame after it, with the
+ring still logging. -5 is the mesa shim's default for an IOReturn it does not
+know, and the only place the submission path returns one is
+`mondrian_gpu_uc_submit() != 0`, whose two exits -- no room in the ring, and a
+wrap whose doorbell never came back -- only printed with gpudump=1.
+
+The no-room exit is the one worth naming on every boot: it means the CP stopped
+consuming, and the numbers that say why (the write cursor, the read pointer the
+poll saw, the room it computed, the sequence and how long it waited) cost one
+line. Capped at eight, because a refusal repeats at the frame rate.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4705,10 +4705,20 @@
+ 				break;
+ 			}
+ 			if (spent_us >= 2000000u) {
+-				if (mondrian_uc_dump != 0) {
+-					printf("MONDRIAN GPU: uc no room at 0x%x\n", at);
+-					printf("MONDRIAN GPU: uc submit done seq %u ret %d\n",
+-					    seq, -1);
++				/*
++				 * A ring the CP stopped consuming is the end of the
++				 * frame path, and until now it only said so with
++				 * gpudump=1: the client then reports "submit failed:
++				 * -5" and the reason is nowhere in the log. Print the
++				 * numbers that name it, once per occurrence, a few
++				 * times.
++				 */
++				static unsigned told;
++
++				if (told++ < 8) {
++					printf("MONDRIAN GPU: uc no room at 0x%x rptr 0x%x"
++					    " room %u seq %u after %u us\n", at, rptr, room,
++					    seq, spent_us);
+ 					mondrian_log_flush_now();
+ 				}
+ 				return -1;

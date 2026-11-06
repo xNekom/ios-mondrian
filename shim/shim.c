@@ -53,6 +53,7 @@ static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; 
 static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 
 extern char secondary_entry[];
+extern char _end[];		/* this image's end, linked at 0 */
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
 
@@ -621,6 +622,66 @@ static void board_memory(uintptr_t dtb)
 	}
 }
 
+/*
+ * The window must not contain this image: the loader wipes it before it places
+ * anything in it. ABL loads the boot image at 0xA8000000, in the free run below
+ * the panel, so a window that starts at the bottom of that run starts inside
+ * our own code and the boot dies with the screen still frozen on the shim.
+ * Start it above this image and the appended payload, and keep the end where
+ * the board table put it. The bootloader's device tree is *not* a floor: it
+ * dies with board_memory(), and keeping it out costs 236 MiB plus, worse, a
+ * window base 14 MiB below the splash, where the kernel image lands on the
+ * framebuffer (measured: screen turned to noise).
+ */
+static void
+window_above_own_image(uint64_t dtb)
+{
+	/*
+	 * _end is an address, not an offset: this image is linked at 0 and runs
+	 * wherever ABL put it, and the compiler reaches its symbols PC-relative,
+	 * so adding shim_base to it points past the top of the address space
+	 * (measured: a data abort at 0x1500b500 with _end in X3).
+	 */
+	const uint8_t *blob = (const uint8_t *)_end;
+	uint64_t own = (uint64_t)(uintptr_t)blob;
+	uint64_t need = own;
+	uint64_t end = win.base + win.size;
+
+	/*
+	 * The payload the build appends starts at _end, not after it, and the
+	 * loader unpacks it from there: a window that starts at _end wipes the
+	 * payload and the boot stops with the screen still on the shim.
+	 * Compare the bytes: the magic is "LZ4P", whose little-endian word is
+	 * 0x50345a4c, and reading it as 0x505a344c ("L4ZP") missed it, left the
+	 * floor at _end and wiped the payload the loader was about to unpack.
+	 */
+	if (blob[0] == 'L' && blob[1] == 'Z' && blob[2] == '4' && blob[3] == 'P') {
+		need += 24 + rd64((uintptr_t)(blob + 16));	/* header + compressed */
+	}
+	/*
+	 * The bootloader's device tree is deliberately not kept out of the
+	 * window. It is only read before this point; the kernel gets the ADT
+	 * the payload carries. Reserving it cost 236 MiB and, worse, put the
+	 * window base at the DT's end (0xb72ac000, 14 MiB below the splash):
+	 * the 16 MiB kernel image then landed on the framebuffer and the
+	 * screen came back as noise.
+	 */
+	(void)dtb;
+	need = (need + 0x3FFFUL) & ~0x3FFFULL;
+	if (win.size && win.base < need && need < end) {
+		win.base = need;
+		win.size = end - need;
+	}
+	/* The window the kernel will actually get, on the panel: the log ring is
+	 * not written until userland runs, so a boot that stops here has no
+	 * other record. */
+	con_hex64("OWN", own);
+	con_hex64("WIN", win.base);
+	con_hex64("WSZ", win.size);
+	if (win.base != BOARD_MEM_BASE)
+		con_str("WINDOW", "RAISED above the board window (ADT disagrees)");
+}
+
 
 /* ---- main ---- */
 
@@ -675,6 +736,7 @@ void shim_main(uint64_t dtb)
 	 * bootloader reports, not the one the image was built for. */
 	stage = "mem";
 	board_memory(dtb);
+	window_above_own_image(dtb);
 	con_str("S3", "memory");
 	con_skip();
 	if (win.size)

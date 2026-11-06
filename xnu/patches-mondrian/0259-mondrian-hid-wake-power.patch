@@ -1,0 +1,23 @@
+xnu 0259: wake the panel with the power key, not home
+
+A home press is delivered to backboardd (one client) and changes nothing on a
+panel that went to sleep, which is what the frozen display links look like from
+userland. The side button is the event that wakes a sleeping display on this
+userland, so the mondrianwake= presses send kHIDUsage_Csmr_Power and the log
+says so. If the display is awake the same press sleeps it, so an alternating
+pattern of frames every N seconds is the expected result and still answers the
+question.
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -449,9 +449,9 @@
+ 	MondrianHIDButtons *self = (MondrianHIDButtons *)owner;
+ 	bool press = (self->fWakeCount & 1) == 0;
+ 
+-	self->key(kHIDUsage_Csmr_Menu, press);
++	self->key(kHIDUsage_Csmr_Power, press);
+ 	if (press) {
+-		IOLog("MONDRIAN HID: wake %u\n", self->fWakeCount / 2);
++		IOLog("MONDRIAN HID: wake %u (power)\n", self->fWakeCount / 2);
+ 	}
+ 	self->fWakeCount++;
+ 	sender->setTimeoutMS(press ? 100 : self->fWakeSecs * 1000);

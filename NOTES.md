@@ -53,26 +53,28 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The lock screen draws. CoreAnimation needs
+- **Display and UI.** The lock screen draws and the home screen composites at a
+  steady 63-64 fps for the whole boot. CoreAnimation needs
   `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
   waits 30 s and draws nothing); `0114` publishes them. SpringBoard waits on
   MobileActivation in `_setupActivationState`; the dylib forces activation and
   skips Setup, including the `SBLockdownManager` and `SBSetupManager` gates.
   The cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root
   must have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the
-  Apple logo. GPU writes memory once `CP_SET_SECURE_MODE(0)` retires; pixel correctness and
-   fluidity are still being measured
+  Apple logo. GPU writes memory once `CP_SET_SECURE_MODE(0)` retires; the ring
+  now wraps the way kgsl wraps it (`0266`), which removed the lap-boundary
+  freeze, and the remaining cost is the CPU copy of each layer into the panel
   (`docs/MONDIAN_GPU.md`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **GPU rendering: correctness and fluidity.** The write path is unlocked: a
-   trusted GPU dropped every render-block write silently, and the secure-mode
-   switch is what fixes it. The Apple logo and the lock screen draw; next are
-   the shared-surface and readback paths, then frames per second
-   (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`).
+1. **GPU rendering: correctness.** Fluidity is there (`63-64 fps` steady, the
+   ring wraps, no submit failures); what is wrong is content. The home screen
+   builds its 79 icon views but their images are nil, the wallpaper poster
+   crashes, and the frame still pays a CPU memcpy of every layer into the panel
+   (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`, `0263`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
@@ -144,29 +146,30 @@ This device has **no `init_boot`**.
 
 ## Traps already paid for
 
-**The window of RAM.** `phys_base = 0xb0000000`, `mem_size = 0x30000000`
-(ends at `0xe0000000`). Four rules, each learned by a reset or a panic:
+**The window of RAM.** `phys_base = 0xaa000000`, `mem_size = 0x36000000`
+(ends at `0xe0000000`, 864 MiB). Five rules, each paid for with a reset:
 
-- it must contain the splash framebuffer, because the early console maps
-  `VA=PA` inside the window;
-- it must start above the firmware's own memory: the kernel image is written
-  to the start of the window, and overwriting the hypervisor at
-  `0x80000000+0x600000` resets the phone;
-- it must end in memory that exists: XNU takes its first heap pages from the
-  *end* of the window, and a window ending in the hole hands them to nothing
-  (`Undefined kernel instruction`, pc inside the physmap);
-- it must not **contain** a carve-out or a hole in the middle: the VM hands
-  out pages across the whole window, and the first access to a page it took
-  from `0xe0000000`+ is a synchronous external abort (`Kernel data abort`,
-  `far` inside the physmap of `qheebsp_reserved_region`). The previous 1.12
-  GiB window had `0xe0000000..0xea000000` (the first bank's firmware islands)
-  and `0xea000000..0xf4600000` (the gap between the banks) in the middle;
-  launchd ran for minutes before an allocation landed there.
+- it must contain the splash framebuffer (the early console maps `VA=PA`
+  inside the window) and start above firmware memory: the kernel goes to the
+  window's start, and overwriting `0x80000000+0x600000` resets the phone;
+- it must start above the shim, **including the appended LZ4 payload**, because
+  the loader wipes the window before it unpacks. `_end` is a runtime address,
+  not an offset (symbols are PC-relative), and the magic `LZ4P` is `0x50345a4c`
+  little-endian; reading it as `0x505a344c` left the base at `_end`, and the
+  wipe kept the header and ate the frame;
+- the base must be 32 MiB aligned, and `boards.py`/`shim/board.h` must be the
+  window the shim passes: `mkadt.py` writes the pair into `/chosen` as
+  `dram-base`/`dram-size`, and the shim puts it in `boot_args`. At
+  `0xa8758000` (889 MiB, ADT at `0xa7400000/0x38b00000`) the loader jumped and
+  the kernel died in `start.s` before its first `MONDRIAN EARLY` mark;
+- it must end in memory that exists (XNU takes its first heap pages from the
+  *end*) and not **contain** a carve-out or hole: the VM hands out pages across
+  the window, and an access to one taken from `0xe0000000`+ aborts
+  (`Kernel data abort`, `far` inside the physmap of `qheebsp_reserved_region`).
 
-`0x30000000` is the largest window that ends at the first carve-out. Smaller
-is not safe either: the bootstrap VA window is sized from `mem_size` in
-256 MiB segments (`arm_vm_init.c`), and the early page tables run out below
-768 MiB.
+The bootloader's device tree is *not* a floor: keeping it (ends `0xb72ac000`)
+cost 236 MiB and put the base 14 MiB under the splash, where the 16 MB kernel
+landed on the framebuffer. The early page tables run out below 768 MiB.
 
 The **physmap slide** comes
 from `/chosen/random-seed`, so a random seed makes the boot a coin flip
@@ -236,15 +239,15 @@ payload: that truncates it to a header promising 0 bytes and the shim answers
 header back.
 
 **Booting from UFS is not the same as booting from fastboot.** The ABL leaves
-the UFS powered when it boots the normal way and powers it down in fastboot;
-either way the kernel now brings the host up itself (`0074`–`0076`).
+the UFS powered when it boots normally and powers it down in fastboot; either
+way the kernel brings the host up itself (`0074`–`0076`).
 
 **The shim is not a no-op, and it can hide kernel bugs.** The full shim runs
 `test_gic()` before the jump: it arms `CNTV_TVAL`, storms until it gives up and
 leaves the UFS warm. Behind it the kernel looked healthy; with `SMALL_SHIM=1`
-the kernel has to arm the timer itself (`0173`) and wake the UFS from the state
-ABL leaves. If the panel shows IRQ lines and no `MONDRIAN EARLY`, check the
-shim before the kernel (`nm shim/out/shim.elf | grep test_gic`).
+the kernel arms the timer itself (`0173`) and wakes the UFS. Panel showing IRQ
+lines and no `MONDRIAN EARLY` means the shim, not the kernel (`nm
+shim/out/shim.elf | grep test_gic`).
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed, and reading the partition back then fails (`Failed
@@ -258,13 +261,13 @@ e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
 
 **The console paints the kernel log and scrolls.** The early console drew only
 its own marks and the kernel log reached the ring, not the panel, so the boot
-looked frozen. `0210` paints it, clears the panel once first (the rows nothing
+looked frozen. `0210` paints it, clears the panel once first (rows nothing
 wrote kept the bootloader's splash) and scrolls half a screen at the last text
 row, a pass being 4.6M stores. `0213` moves the painting into the log thread:
 from `console_write()` every line waited for the framebuffer, and two CPUs
 printing at once painted over each other's rows. The shim's `test_ufs()` faults
-on any boot that came from fastboot, which leaves the host powered down: build
-that image with `SHIM_NO_UFS` (`LOGVIEW` implies it).
+on a boot that came from fastboot (host powered down): build with `SHIM_NO_UFS`
+(`LOGVIEW` implies it).
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
@@ -295,9 +298,9 @@ extents, a bad volume bitmap and a wrong free-block count; repeat `-fn` until it
 says `appears to be OK`, then push the changed blocks back. The volume is
 non-journaled (`0x80000100`), so a hard reset dirties it again; once the damage
 reaches the allocation-block count (`Invalid number of allocation blocks`) the
-dump fails fsck, `--save-base` has no base to write, and the root has to be
-rebuilt from a clean image. A zeroed extents node (block 2178, `0x882000`) also
-means restoring the gzip image; the live GPT is the single `userdata`.
+dump fails fsck and the root has to be rebuilt from a clean image. A zeroed
+extents node (block 2178, `0x882000`) means the same; the live GPT is the single
+`userdata`.
 
 ## Display
 
@@ -310,8 +313,8 @@ userland runs at 60, so `mondrianfb_hz=60` is the target.
 - `0085` ports sweet's IOSurface + IOMobileFramebuffer pair to `AppleCLCD` on
   `/arm-io/disp0`; backboardd swaps are observed and the lock screen renders.
 - Sweet's `0056` (present at most every few vsyncs) and `0079`
-  (`RequestPowerChange`) have to be rebased when the power button needs them.
-  A fallback MDSS/DSI driver is only needed if the scanout ever stops.
+  (`RequestPowerChange`) need a rebase, and a fallback MDSS/DSI driver is only
+  needed if the scanout stops.
 
 ## Boot menu and dual boot
 
