@@ -871,7 +871,7 @@ them has Metal. That is the path this port follows.
   submissions unanswered, so under 400 dwords of ring in flight whatever the
   ring's size, and the cursor is published inside the buffer
   (kgsl `_wptr % KGSL_RB_DWORDS`, HakiOS `ring_at`).
-- **The icons exist; their artwork does not.** Measured (ring210, with
+- **The icons exist; their artwork does not arrive.** Measured (ring210, with
   `-[SBIconView setIcon:]` hooked): SpringBoard builds the home screen --
   `iconModel -> 1 leaf 13`, `rootFolder -> 1 leaf 9`, 79 `setIcon:` calls, the
   first with an `SBApplicationIcon` -- so what is missing is not the model and
@@ -883,6 +883,17 @@ them has Metal. That is the path this port follows.
   view's own layer (`mondrianiconpaint=1`) to tell "no image" from "not in the
   composited tree" -- a red square where the icon belongs means the view is
   there and only the image is missing.
+
+  Two traps when probing this, both paid for: `-setIcon:` is the moment the
+  view has the model and **not** the artwork (the image is set afterwards from
+  the icon's cache), so reading `image` there always says 0; and the first
+  eight views cannot be kept by pointer -- SpringBoard recycles them, and by
+  thirty seconds the array names whatever object took their memory (measured,
+  ring220: the class dump answered `CSCoverSheetView`). Keep the views by
+  walking the windows' subtree for `SBIconView` at the time of the probe. A
+  subclass in this userland declares almost nothing itself (`SBApplicationIcon`:
+  two own methods), so the artwork selectors have to be read up the whole class
+  chain.
 
 - **A sleeping display stops every CADisplayLink.** Two minutes after the UI
   settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
@@ -951,16 +962,24 @@ them has Metal. That is the path this port follows.
   25-draw frame already runs 11-17 ms apart at 285 MHz -- and voting index 13
   at boot did not come back to fastboot, so raise the vote after the CP is
   running, the way kgsl does, rather than moving the boot-time vote.
-- **The wallpaper is a killed poster.** CollectionsPoster makes the poster
-  surface (`MONDRIAN SURF: CollectionsPoster create id 11 1326x1326 fmt
-  0x4c303038`) and dies before it draws one frame -- no `|CollectionsPoste|
-  mondrian-gl: frame` line ever appears. Which kill depends on how fast the
-  frames are: with the slow frames of `glcopy=1` it is the scene-create
-  watchdog (`reason ns 10 code 0x8badf00d`), and with `gpusyncmapmax=8192` it
-  is `reason ns 7 code 0x3: extension check-in timeout`, after three poster
-  surfaces in a row. Either way the surface is never filled and the panel
-  shows its memory, which is why the wallpaper is black with `gpusurfpat=0`
-  and white with `gpusurfpat=1`. Fix the check-in, not the texture path.
+- **The wallpaper is a killed poster, and its renderer cannot work here.**
+  CollectionsPoster makes the poster surface (`MONDRIAN SURF: CollectionsPoster
+  create id 11 1326x1326 fmt 0x4c303038`) and dies before it draws one frame --
+  no `|CollectionsPoste| mondrian-gl: frame` line ever appears. Which kill
+  depends on how fast the frames are: with the slow frames of `glcopy=1` it is
+  the scene-create watchdog (`reason ns 10 code 0x8badf00d`), and with
+  `gpusyncmapmax=8192` it is `reason ns 7 code 0x3: extension check-in timeout`,
+  after three poster surfaces in a row. Either way the surface is never filled
+  and the panel shows its memory, which is why the wallpaper is black with
+  `gpusurfpat=0` and white with `gpusurfpat=1`. AegirPoster's own crash reports
+  add the second half: `-[NUNIAegirRenderer
+  getOrCreateUniformBufferforFrameBufferIndex:]` throws `-[__NSArrayM
+  insertObject:atIndex:]` (22 of them on the root), a Metal renderer indexing
+  its uniform-buffer array. The root ships one Metal driver, `AGXMetalA11`, so
+  Metal is the A11's GPU and this port draws through Mesa/freedreno OpenGL ES:
+  a Metal poster renderer has nothing to talk to. The home screen's correct
+  answer here is a still image behind the icons, not a live poster; fix the
+  check-in only for the GL extensions.
 - **One ring, one lock.** Every `MondrianGPU` client (backboardd,
   SpringBoard, the poster extensions, mediaserverd) submits to the same CP
   ring, whose cursor, fence sequence and memptr slots are file-static in

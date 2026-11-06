@@ -250,14 +250,12 @@ lines and no `MONDRIAN EARLY` means the shim, not the kernel (`nm
 shim/out/shim.elf | grep test_gic`).
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
-raw file is resparsed, and reading the partition back then fails (`Failed
-reading from userdata`). Flash a sparse image instead (`tools/mk-simg.py`,
-`tools/flash-root.sh`), which fastboot sends in `-S` chunks.
+raw file is resparsed and reading it back fails; flash a sparse image instead
+(`tools/mk-simg.py`), which fastboot sends in `-S` chunks.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again (2026-10-25: the sampler printed one
-line, the log flushed one 8 KiB batch). Pace periodic work from work that runs,
-e.g. `mondrian_ufs_strategy()` (`0100`), or with `delay()`.
+line and the log one batch); pace from work that runs (`0100`) or `delay()`.
 
 **The console paints the kernel log and scrolls.** The early console drew only
 its own marks and the kernel log reached the ring, not the panel, so the boot
@@ -344,10 +342,9 @@ through the `misc` BCB are in `docs/MONDIAN_PORT.md`.
   bootstrap-capacity patch is in `0001` and it documents the UFS LU wake.
 - **Bergamota / Chlorophyll / HackiOS** — CPU fallback, Adreno 630, and the
   iOS 16.5 persona hook that `0106` redoes for 20H392.
-- **`palazik/ios-dodge`**, **`mytiantian001/iPadOS-nabu`** — local TLB flush,
-  timer quiesce, *no* `CNTP_CTL_EL0` write at handover; `cpus=1` as the safe
-  default and the ring at the end of `userdata`.
-- **`MakrSas/ios-topaz`** — home screen on SM6225; walls: SGI/timer and the
-  ARMv8.0 LSE/RCpc emulation.
+- **`palazik/ios-dodge`**, **`mytiantian001/iPadOS-nabu`** — local TLB flush, timer
+  quiesce, *no* `CNTP_CTL_EL0` write at handover; `cpus=1` and the ring at the end
+  of `userdata`.
+- **`MakrSas/ios-topaz`** — home screen on SM6225; walls: SGI/timer, LSE/RCpc.
 - **`Gsjsjzhznsz/ios-raphael`**, **`Log1nYT/ios-sweet`** — lock screen; CPU
-  `compatible` match, DWC3 clocks and the SPI touch/PMIC keys.
+  `compatible` match, DWC3 clocks, SPI touch/PMIC keys.

@@ -808,6 +808,7 @@ static int mondrian_unlock2_enabled;
 static int mondrian_anim_enabled;
 static int mondrian_anim_started;
 static int mondrian_lock_ticks;
+static volatile unsigned mondrian_home_ticks;
 
 static void mondrian_try_unlock_options(void);
 
@@ -933,14 +934,40 @@ mondrian_send(id object, const char *selector)
 
 /*
  * Icons are laid out and invisible (measured, ring210: 79 SBIconView setIcon:
- * calls, `icon model -> 1 leaf 13`, and nothing of it on the panel). Two
- * causes look the same from outside, so this separates them on the next boot:
- * an icon view with no image (the artwork never loads -- `assetsd` aborts and
- * `iconservicesagent` exits 0x9 on this root) or a view that is not in the
- * tree the render server composites. `mondrianiconpaint=1` paints the third
- * view's own layer, so a red square where the icon should be means the view is
- * composited and only its image is missing.
+ * calls, `icon model -> 1 leaf 13`, and nothing of it on the panel). Three
+ * causes look the same from outside, and the previous probe could not tell
+ * them apart because it read `iconImageView.image` *inside* `-setIcon:`, which
+ * is the moment the view has just been handed its model and not yet its
+ * artwork: on this build the image is set later, from the icon's image cache.
+ * Measured that way, "image 0" on the first five calls says nothing.
+ *
+ * So the boot keeps the first eight views and asks them again thirty seconds
+ * after the home screen is up, which separates:
+ *
+ *  - the artwork never arrives (image nil, contents nil) -- the icon image
+ *    pipeline is dead, `assetsd` aborts and `iconservicesagent` exits 0x9;
+ *  - the artwork arrives but the view is not composited (image non-nil, window
+ *    nil or hidden or alpha 0) -- a layout/visibility problem;
+ *  - the view is composited and the panel still shows nothing -- a render
+ *    server or surface problem, which is where the red paint
+ *    (`mondrianiconpaint=1`) and `layer.contents` tell the two apart.
+ *
+ * `mondriandumpicon=1` prints the model's own image selectors instead of
+ * guessing them, and `mondrianiconset=1` falls back to loading the app's
+ * `AppIcon60x60@2x.png` straight out of its bundle, which is the artwork the
+ * pipeline is failing to produce.
  */
+#define MONDRIAN_ICON_VIEWS 8
+
+static id mondrian_icon_views[MONDRIAN_ICON_VIEWS];
+static id mondrian_icon_objects[MONDRIAN_ICON_VIEWS];
+static id mondrian_live_views[MONDRIAN_ICON_VIEWS];
+static id mondrian_live_objects[MONDRIAN_ICON_VIEWS];
+static unsigned mondrian_icon_view_count;
+static unsigned mondrian_live_count;
+static volatile unsigned mondrian_icon_late_done;
+static volatile unsigned mondrian_icon_dump_done;
+
 static void
 mondrian_set_icon(id self, SEL selector, id icon)
 {
@@ -988,6 +1015,11 @@ mondrian_set_icon(id self, SEL selector, id icon)
 			}
 		}
 	}
+	if (icon != nil && mondrian_icon_view_count < MONDRIAN_ICON_VIEWS) {
+		mondrian_icon_views[mondrian_icon_view_count] = self;
+		mondrian_icon_objects[mondrian_icon_view_count] = icon;
+		mondrian_icon_view_count++;
+	}
 	mondrian_icon_calls++;
 }
 
@@ -1019,6 +1051,333 @@ mondrian_icon_report(void)
 	last = mondrian_icon_calls;
 	snprintf(line, sizeof(line), "MONDRIAN UI: icons laid out %u so far\n",
 	    mondrian_icon_calls);
+	say(line);
+}
+
+/*
+ * Ask the model what it can do across its whole class chain: a subclass in
+ * this userland declares almost nothing itself (`SBApplicationIcon` measured:
+ * two own methods), so a dump of one class says nothing about the artwork
+ * entry points, which live in `SBIcon`/`SBLeafIcon`.
+ */
+static void
+mondrian_icon_dump_selectors(id view, id icon)
+{
+	Class classes[2];
+	unsigned c;
+
+	classes[0] = object_getClass(view);
+	classes[1] = icon != NULL ? object_getClass(icon) : Nil;
+	for (c = 0; c < 2; c++) {
+		Class cls = classes[c];
+
+		for (; cls != Nil; cls = class_getSuperclass(cls)) {
+			Method *methods;
+			unsigned count = 0, i;
+			char line[160];
+
+			methods = class_copyMethodList(cls, &count);
+			snprintf(line, sizeof(line), "MONDRIAN UI: %s %u methods\n",
+			    class_getName(cls), count);
+			say(line);
+			for (i = 0; i < count; i++) {
+				const char *name =
+				    sel_getName(method_getName(methods[i]));
+
+				if (strstr(name, "mage") == NULL &&
+				    strstr(name, "con") == NULL) {
+					continue;
+				}
+				snprintf(line, sizeof(line), "  -%s\n", name);
+				say(line);
+			}
+			free(methods);
+		}
+	}
+}
+
+static const char *
+mondrian_icon_label(id icon)
+{
+	id name = icon != NULL ? mondrian_send(icon, "displayName") : nil;
+
+	return (name != nil && [name isKindOfClass:[NSString class]])
+	    ? [(NSString *)name UTF8String] : "?";
+}
+
+/*
+ * One icon view: its image, its layer contents and its place in the window
+ * tree. A view that is hidden or has no window is invisible whatever its
+ * image says; an image with empty contents never reached the render server.
+ */
+static void
+mondrian_icon_probe_one(id view, id icon, const char *where)
+{
+	id image_view = mondrian_send(view, "iconImageView");
+	id image = image_view != NULL ? mondrian_send(image_view, "image") : nil;
+	id layer = mondrian_send(view, "layer");
+	id contents = layer != NULL ? mondrian_send(layer, "contents") : nil;
+	id window = mondrian_send(view, "window");
+	CGSize size = CGSizeZero;
+	CGFloat alpha = 0.0;
+	int hidden = 0;
+	char line[240];
+
+	if (image != NULL) {
+		size = ((CGSize (*)(id, SEL))objc_msgSend)(image,
+		    sel_registerName("size"));
+	}
+	if ([view respondsToSelector:sel_registerName("isHidden")]) {
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("isHidden")) ? 1 : 0;
+	}
+	if ([view respondsToSelector:sel_registerName("alpha")]) {
+		alpha = ((CGFloat (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("alpha"));
+	}
+	snprintf(line, sizeof(line),
+	    "MONDRIAN UI: icon %s %s image %d %.0fx%.0f contents %d win %d"
+	    " hidden %d alpha %.2f\n",
+	    mondrian_icon_label(icon), where, image != NULL, size.width,
+	    size.height, contents != NULL, window != NULL, hidden, alpha);
+	say(line);
+}
+
+/*
+ * The first eight views are handed to the hook long before the home screen
+ * exists, and SpringBoard recycles them: by thirty seconds the pointers name
+ * whatever object took their memory (measured, ring220: the dump answered
+ * `CSCoverSheetView`, and every late line read `image 0`). The live views are
+ * therefore found by walking the windows' view trees instead of keeping
+ * pointers to the first ones.
+ *
+ * The visit budget is large on purpose: the wallpaper and lock windows carry
+ * subtrees of hundreds of views, and a small cap spends itself before the
+ * home screen's icon list is reached. The walk stops as soon as it has the
+ * eight views it can hold.
+ */
+#define MONDRIAN_ICON_VISITS 20000
+
+static unsigned
+mondrian_icon_walk(id view, unsigned depth, unsigned *seen, unsigned *store)
+{
+	Class icon_view = objc_getClass("SBIconView");
+	id subs;
+	unsigned n, i;
+
+	if (view == NULL || depth > 24 || *seen >= MONDRIAN_ICON_VISITS ||
+	    *store >= MONDRIAN_ICON_VIEWS) {
+		return 0;
+	}
+	(*seen)++;
+	if (icon_view != Nil && [view isKindOfClass:icon_view]) {
+		mondrian_live_views[*store] = view;
+		mondrian_live_objects[*store] = mondrian_send(view, "icon");
+		(*store)++;
+		return 1;
+	}
+	subs = mondrian_send(view, "subviews");
+	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_icon_walk([(NSArray *)subs objectAtIndex:i], depth + 1,
+		    seen, store);
+	}
+	return 0;
+}
+
+static void
+mondrian_icon_scan_window(id window, unsigned *seen, unsigned *live)
+{
+	const char *name = object_getClassName(window);
+
+	mondrian_icon_walk(window, 0, seen, live);
+	if (*live > 0) {
+		char line[160];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: icon window %s carries %u\n", name, *live);
+		say(line);
+	}
+}
+
+static void
+mondrian_icon_late_report(void)
+{
+	id app = [objc_getClass("UIApplication") sharedApplication];
+	id windows = app != nil ? [app windows] : nil;
+	unsigned count = windows != nil ? (unsigned)[windows count] : 0;
+	unsigned seen = 0, live = 0, i;
+	char line[200];
+
+	for (i = 0; i < mondrian_icon_view_count; i++) {
+		mondrian_icon_probe_one(mondrian_icon_views[i],
+		    mondrian_icon_objects[i], "kept");
+	}
+	/*
+	 * The home screen window first: it is where the icon views live, and
+	 * the other fourteen windows are large enough to matter for the budget.
+	 */
+	for (i = 0; i < count && live == 0; i++) {
+		const char *name = object_getClassName([windows objectAtIndex:i]);
+
+		if (name != NULL && strstr(name, "HomeScreen") != NULL) {
+			mondrian_icon_scan_window([windows objectAtIndex:i],
+			    &seen, &live);
+		}
+	}
+	for (i = 0; i < count && live == 0; i++) {
+		const char *name = object_getClassName([windows objectAtIndex:i]);
+
+		if (name == NULL || strstr(name, "HomeScreen") == NULL) {
+			mondrian_icon_scan_window([windows objectAtIndex:i],
+			    &seen, &live);
+		}
+	}
+	mondrian_live_count = live;
+	snprintf(line, sizeof(line),
+	    "MONDRIAN UI: icon tree %u views, %u icon views live\n", seen, live);
+	say(line);
+	for (i = 0; i < live; i++) {
+		mondrian_icon_probe_one(mondrian_live_views[i],
+		    mondrian_live_objects[i], "live");
+	}
+}
+
+/*
+ * The artwork the pipeline never produced, from the app's own bundle. The
+ * bundle path comes from the model's application object; the file names are
+ * the ones this userland ships (the 60 pt @2x pair is the home screen's).
+ */
+static const char *const mondrian_icon_files[] = {
+	"AppIcon60x60@2x.png",
+	"AppIcon60x60@3x.png",
+	"AppIcon76x76@2x~ipad.png",
+	"Icon-60@2x.png",
+	"Icon-72@2x.png",
+	"Icon.png",
+	"Icon@2x.png",
+	"AppIcon29x29@2x.png",
+};
+
+static NSString *
+mondrian_icon_bundle_path(id icon)
+{
+	static const char *const selectors[] = {
+		"bundleURL", "dataContainerURL", "bundleContainerURL",
+		"containerURL", "url",
+	};
+	id app = mondrian_send(icon, "application");
+	unsigned i;
+
+	for (i = 0; app != NULL && i < sizeof(selectors) / sizeof(selectors[0]);
+	    i++) {
+		id url = mondrian_send(app, selectors[i]);
+
+		if (url != NULL && [url isKindOfClass:[NSURL class]]) {
+			return [(NSURL *)url path];
+		}
+	}
+	return nil;
+}
+
+/*
+ * `-iconImageView` is the accessor the lock screen's mechanism used in earlier
+ * builds; if it is absent (or answers without an image), the artwork view is
+ * the first descendant that takes a `-setImage:` -- an `SBIconImageView` is a
+ * `UIImageView`. Guessing only the accessor is what leaves an icon view with a
+ * live image nobody set.
+ */
+static id
+mondrian_icon_find_image_view(id view, unsigned depth)
+{
+	id subs;
+	unsigned n, i;
+
+	if (view == NULL || depth > 8) {
+		return nil;
+	}
+	if ([view respondsToSelector:sel_registerName("setImage:")]) {
+		return view;
+	}
+	subs = mondrian_send(view, "subviews");
+	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		id found = mondrian_icon_find_image_view(
+		    [(NSArray *)subs objectAtIndex:i], depth + 1);
+
+		if (found != NULL) {
+			return found;
+		}
+	}
+	return nil;
+}
+
+static void
+mondrian_icon_force_artwork(void)
+{
+	unsigned count = mondrian_live_count > 0 ? mondrian_live_count
+	    : mondrian_icon_view_count;
+	id *views = mondrian_live_count > 0 ? mondrian_live_views
+	    : mondrian_icon_views;
+	id *objects = mondrian_live_count > 0 ? mondrian_live_objects
+	    : mondrian_icon_objects;
+	unsigned i, f;
+	unsigned loaded = 0;
+	char line[240];
+
+	for (i = 0; i < count; i++) {
+		id view = views[i];
+		id icon = objects[i];
+		id image_view = mondrian_send(view, "iconImageView");
+		NSString *path = mondrian_icon_bundle_path(icon);
+		const char *label = mondrian_icon_label(icon);
+
+		if (image_view == NULL ||
+		    mondrian_send(image_view, "image") == NULL) {
+			id other = mondrian_icon_find_image_view(view, 0);
+
+			if (other != NULL) {
+				image_view = other;
+			}
+		}
+
+		if (image_view == NULL || path == nil) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: icon %s no artwork path (view %d path %d)\n",
+			    label, image_view != NULL, path != nil);
+			say(line);
+			continue;
+		}
+		for (f = 0; f < sizeof(mondrian_icon_files) /
+		    sizeof(mondrian_icon_files[0]); f++) {
+			char file[512];
+			id image;
+			Class ui_image = objc_getClass("UIImage");
+
+			snprintf(file, sizeof(file), "%s/%s",
+			    [path UTF8String], mondrian_icon_files[f]);
+			if (access(file, R_OK) != 0) {
+				continue;
+			}
+			image = ui_image != Nil
+			    ? ((id (*)(id, SEL, id))objc_msgSend)((id)ui_image,
+			        sel_registerName("imageWithContentsOfFile:"),
+			        [NSString stringWithUTF8String:file]) : nil;
+			if (image == NULL) {
+				continue;
+			}
+			((void (*)(id, SEL, id))objc_msgSend)(image_view,
+			    sel_registerName("setImage:"), image);
+			loaded++;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: icon %s <- %s\n", label,
+			    mondrian_icon_files[f]);
+			say(line);
+			break;
+		}
+	}
+	snprintf(line, sizeof(line), "MONDRIAN UI: icons loaded from the bundle %u\n",
+	    loaded);
 	say(line);
 }
 
@@ -1302,6 +1661,7 @@ mondrian_lock_step(void *context)
 		 * so the probe is (re)attached on every tick and the model is asked
 		 * once what it is supposed to show.
 		 */
+		mondrian_home_ticks++;
 		if (mondrian_anim_enabled) {
 			int attached = mondrian_probe_tick();
 
@@ -1317,6 +1677,29 @@ mondrian_lock_step(void *context)
 			    boot_arg_set("mondrianwallpaper=1")) {
 				mondrian_wallpaper_done = 1;
 				mondrian_hide_wallpaper();
+			}
+			/*
+			 * The artwork is set after -setIcon: returns, so the views
+			 * are asked again fifteen ticks in (thirty seconds), with
+			 * the boot settled.
+			 */
+			if (mondrian_home_ticks == 15 && !mondrian_icon_late_done) {
+				mondrian_icon_late_done = 1;
+				mondrian_icon_late_report();
+				if (!mondrian_icon_dump_done &&
+				    boot_arg_set("mondriandumpicon=1")) {
+					mondrian_icon_dump_done = 1;
+					mondrian_icon_dump_selectors(
+					    mondrian_live_count > 0
+					        ? mondrian_live_views[0]
+					        : mondrian_icon_views[0],
+					    mondrian_live_count > 0
+					        ? mondrian_live_objects[0]
+					        : mondrian_icon_objects[0]);
+				}
+				if (boot_arg_set("mondrianiconset=1")) {
+					mondrian_icon_force_artwork();
+				}
 			}
 		}
 		return;
