@@ -895,6 +895,15 @@ them has Metal. That is the path this port follows.
   two own methods), so the artwork selectors have to be read up the whole class
   chain.
 
+  The artwork itself once worked, which dates the regression: the shared icon
+  cache (`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.
+  lsd.iconscache/Library/Caches/com.apple.IconsCache`) holds **24 `.isdata`
+  entries, all written on 2026-10-28**, one home screen page's worth, and
+  nothing since -- and 2026-10-30 is when CoreAnimation moved onto the GL
+  compatibility profile. So a boot that draws nothing icon-shaped is not
+  "IconServices never ran": it ran and cached the page, and the present path
+  stopped showing it. Check the cache dates before blaming the artwork.
+
 - **A sleeping display stops every CADisplayLink.** Two minutes after the UI
   settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
   0, every link stops (measured: the last line says `ts 146` in a 240 s boot)
