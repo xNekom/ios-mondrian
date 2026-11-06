@@ -17,8 +17,8 @@ Payload layout (little endian, all offsets from payload start):
   0x030  u64   kernel_end_va  end of the highest segment (page aligned)
   0x038  u64   phys_base      kernel-managed RAM (same values as the ADT's dram-base/size)
   0x040  u64   mem_size
-  0x048  char  cmdline[608]
-  0x2a8  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
+  0x048  char  cmdline[1024]
+  0x448  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
 kernel_end past it, so the shim needs no changes: the image lands below the
@@ -34,9 +34,9 @@ import boards  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
-BOOT_LINE_LENGTH = 608
+BOOT_LINE_LENGTH = 1024
 CMDLINE = 0x48
-SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
+SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x448
 
 
 def parse_macho(buf):

@@ -39,7 +39,7 @@ def set_board(name):
     FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
-BOOT_LINE_LENGTH = 608
+BOOT_LINE_LENGTH = 1024
 
 
 def check_qemu_dependency(cpu='cortex-a76'):
@@ -101,14 +101,14 @@ def build_image(payload):
     top = ba_pa + PAGE
     img = bytearray(top - phys_base)
     for i in range(nsegs):
-        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x448 + 32 * i)
         o = vmaddr + delta - phys_base
         img[o:o + fsize] = payload[foff:foff + fsize]
     img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
     ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
                      FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
     ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
-    assert len(ba) == 736
+    assert len(ba) == 1152
     img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
     return phys_base, bytes(img), ba_pa, entry_va + delta
 
@@ -135,7 +135,7 @@ def payload_data(payload, va, size):
     """Read initialized segment bytes by VA (the payload has no slide)."""
     nsegs = struct.unpack_from('<I', payload, 12)[0]
     for i in range(nsegs):
-        vmaddr, _, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        vmaddr, _, foff, fsize = struct.unpack_from('<4Q', payload, 0x448 + 32 * i)
         if vmaddr <= va and va + size <= vmaddr + fsize:
             offset = foff + va - vmaddr
             return payload[offset:offset + size]

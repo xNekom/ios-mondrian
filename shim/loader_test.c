@@ -16,7 +16,7 @@
 #include <string.h>
 #include "lz4.h"
 
-#define BOOT_LINE_LENGTH	608
+#define BOOT_LINE_LENGTH	1024
 
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;

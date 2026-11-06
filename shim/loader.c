@@ -14,7 +14,7 @@
 #include "loader.h"
 #include "lz4.h"
 
-#define BOOT_LINE_LENGTH	608
+#define BOOT_LINE_LENGTH	1024
 #define PAGE_16K		0x4000UL
 
 struct payload_seg {
@@ -46,10 +46,10 @@ struct boot_args {
 	uint64_t bootFlags, memSizeActual;
 };
 
-_Static_assert(__builtin_offsetof(struct payload, segs) == 0x2a8, "payload header layout");
+_Static_assert(__builtin_offsetof(struct payload, segs) == 0x448, "payload header layout");
 _Static_assert(__builtin_offsetof(struct boot_args, Video) == 40, "boot_args layout");
 _Static_assert(__builtin_offsetof(struct boot_args, CommandLine) == 108, "boot_args layout");
-_Static_assert(sizeof(struct boot_args) == 736, "boot_args layout");
+_Static_assert(sizeof(struct boot_args) == 1152, "boot_args layout");
 
 /* MMU off: everything is Device memory, so copy in aligned 8-byte words. */
 static void copy64(uintptr_t dst, uintptr_t src, uint64_t n)

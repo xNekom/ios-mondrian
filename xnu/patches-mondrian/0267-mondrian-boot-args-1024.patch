@@ -1,0 +1,40 @@
+xnu 0267: 1024 bytes of boot arguments, because the tail was being dropped
+
+The cmdline this port boots with passed 608 bytes when the first canvas
+measurement flags were added, and nothing said so: the shim copies the payload
+header's `cmdline[BOOT_LINE_LENGTH]` byte for byte into `boot_args.CommandLine`,
+`tools/mkpayload.py` cuts the string to the same size, and `kern.bootargs` is
+`strlcpy(..., BOOT_LINE_LENGTH)`, so every reader saw the first 607 characters
+and no more. That is invisible until a flag near the end has to work: ring225
+booted with `mondriandumpicon=1 mondrianiconset=1`, the dump ran, and the
+artwork pass never did, because its flag sat just past the cut. Who iBoot's
+limit was sized for no longer matters here -- the shim is the bootloader -- and
+i386 already uses 1024.
+
+The shim, tools/mkpayload.py, tools/qemu-ios.py and this header have to agree on
+the number, and the payload header's segment table moves with it.
+
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -22,8 +22,19 @@
+  *
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
++ *
++ * mondrian: iBoot is not in this path any more, the shim is the bootloader and
++ * it fills CommandLine from the payload header, so this is *our* limit and not
++ * Apple's. At 608 a boot whose arguments include a few measurement flags lost
++ * its tail silently: the shim and the payload header cut the string at the same
++ * size, and `kern.bootargs` is only ever 607 characters, so a flag near the end
++ * simply did not exist for the hook that was looking for it (measured, ring225:
++ * `mondrianiconset=1` was absent while `mondriandumpicon=1`, seventeen bytes
++ * earlier, was there). 1024 is what i386 uses and it leaves room for the
++ * measurement flags; the shim, tools/mkpayload.py and tools/qemu-ios.py carry
++ * the same number and have to change together.
+  */
+-#define BOOT_LINE_LENGTH        608
++#define BOOT_LINE_LENGTH        1024
+ 
+ /*
+  * Video information..
