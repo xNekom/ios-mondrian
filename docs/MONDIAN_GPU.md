@@ -887,13 +887,14 @@ them has Metal. That is the path this port follows.
   Two traps when probing this, both paid for: `-setIcon:` is the moment the
   view has the model and **not** the artwork (the image is set afterwards from
   the icon's cache), so reading `image` there always says 0; and the first
-  eight views cannot be kept by pointer -- SpringBoard recycles them, and by
-  thirty seconds the array names whatever object took their memory (measured,
-  ring220: the class dump answered `CSCoverSheetView`). Keep the views by
-  walking the windows' subtree for `SBIconView` at the time of the probe. A
-  subclass in this userland declares almost nothing itself (`SBApplicationIcon`:
-  two own methods), so the artwork selectors have to be read up the whole class
-  chain.
+  eight views must not be kept by pointer -- SpringBoard frees them, so the
+  array first names whatever object took their memory (measured, ring220: the
+  class dump answered `CSCoverSheetView`) and then, once the probe runs early
+  enough, messaging one of them is a `SIGSEGV` in SpringBoard (`ns 2 code 0xb`,
+  ring223, three restarts in a row). Keep nothing: walk the windows' subtree
+  for `SBIconView` at probe time. A subclass in this userland declares almost
+  nothing itself (`SBApplicationIcon`: two own methods), so the artwork
+  selectors have to be read up the whole class chain.
 
   The artwork itself once worked, which dates the regression: the shared icon
   cache (`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.

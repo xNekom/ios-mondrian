@@ -959,8 +959,6 @@ mondrian_send(id object, const char *selector)
  */
 #define MONDRIAN_ICON_VIEWS 8
 
-static id mondrian_icon_views[MONDRIAN_ICON_VIEWS];
-static id mondrian_icon_objects[MONDRIAN_ICON_VIEWS];
 static id mondrian_live_views[MONDRIAN_ICON_VIEWS];
 static id mondrian_live_objects[MONDRIAN_ICON_VIEWS];
 static unsigned mondrian_icon_view_count;
@@ -1016,8 +1014,11 @@ mondrian_set_icon(id self, SEL selector, id icon)
 		}
 	}
 	if (icon != nil && mondrian_icon_view_count < MONDRIAN_ICON_VIEWS) {
-		mondrian_icon_views[mondrian_icon_view_count] = self;
-		mondrian_icon_objects[mondrian_icon_view_count] = icon;
+		/*
+		 * Counted, never kept: SpringBoard frees these views, and a
+		 * message to a freed object is the SIGSEGV that killed ring223.
+		 * The live ones are found by the tree walk at probe time.
+		 */
 		mondrian_icon_view_count++;
 	}
 	mondrian_icon_calls++;
@@ -1118,11 +1119,14 @@ mondrian_icon_probe_one(id view, id icon, const char *where)
 	id layer = mondrian_send(view, "layer");
 	id contents = layer != NULL ? mondrian_send(layer, "contents") : nil;
 	id window = mondrian_send(view, "window");
+	CGRect frame = CGRectZero;
 	CGSize size = CGSizeZero;
 	CGFloat alpha = 0.0;
 	int hidden = 0;
 	char line[240];
 
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+	    sel_registerName("frame"));
 	if (image != NULL) {
 		size = ((CGSize (*)(id, SEL))objc_msgSend)(image,
 		    sel_registerName("size"));
@@ -1137,9 +1141,10 @@ mondrian_icon_probe_one(id view, id icon, const char *where)
 	}
 	snprintf(line, sizeof(line),
 	    "MONDRIAN UI: icon %s %s image %d %.0fx%.0f contents %d win %d"
-	    " hidden %d alpha %.2f\n",
+	    " hidden %d alpha %.2f frame %.0f,%.0f %.0fx%.0f\n",
 	    mondrian_icon_label(icon), where, image != NULL, size.width,
-	    size.height, contents != NULL, window != NULL, hidden, alpha);
+	    size.height, contents != NULL, window != NULL, hidden, alpha,
+	    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
 	say(line);
 }
 
@@ -1209,10 +1214,6 @@ mondrian_icon_late_report(void)
 	unsigned seen = 0, live = 0, i;
 	char line[200];
 
-	for (i = 0; i < mondrian_icon_view_count; i++) {
-		mondrian_icon_probe_one(mondrian_icon_views[i],
-		    mondrian_icon_objects[i], "kept");
-	}
 	/*
 	 * The home screen window first: it is where the icon views live, and
 	 * the other fourteen windows are large enough to matter for the budget.
@@ -1315,15 +1316,17 @@ mondrian_icon_find_image_view(id view, unsigned depth)
 static void
 mondrian_icon_force_artwork(void)
 {
-	unsigned count = mondrian_live_count > 0 ? mondrian_live_count
-	    : mondrian_icon_view_count;
-	id *views = mondrian_live_count > 0 ? mondrian_live_views
-	    : mondrian_icon_views;
-	id *objects = mondrian_live_count > 0 ? mondrian_live_objects
-	    : mondrian_icon_objects;
+	id *views = mondrian_live_views;
+	id *objects = mondrian_live_objects;
+	unsigned count = mondrian_live_count;
 	unsigned i, f;
 	unsigned loaded = 0;
 	char line[240];
+
+	if (count == 0) {
+		say("MONDRIAN UI: icons no live view to paint\n");
+		return;
+	}
 
 	for (i = 0; i < count; i++) {
 		id view = views[i];
@@ -1341,12 +1344,38 @@ mondrian_icon_force_artwork(void)
 			}
 		}
 
-		if (image_view == NULL || path == nil) {
+		if (path == nil) {
 			snprintf(line, sizeof(line),
-			    "MONDRIAN UI: icon %s no artwork path (view %d path %d)\n",
-			    label, image_view != NULL, path != nil);
+			    "MONDRIAN UI: icon %s no artwork path (view %d)\n",
+			    label, image_view != NULL);
 			say(line);
 			continue;
+		}
+		if (image_view == NULL) {
+			/*
+			 * None of the view's descendants takes an image (measured,
+			 * ring222: Phone and Safari answered `view 0` while their
+			 * neighbours answered yes). A UIImageView of our own, at
+			 * the view's own bounds, is the one path that always
+			 * draws.
+			 */
+			Class ui_image_view = objc_getClass("UIImageView");
+			CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("bounds"));
+
+			if (ui_image_view != Nil) {
+				image_view = ((id (*)(id, SEL))objc_msgSend)(
+				    (id)ui_image_view, sel_registerName("alloc"));
+				image_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+				    image_view, sel_registerName("initWithFrame:"),
+				    bounds);
+				((void (*)(id, SEL, id))objc_msgSend)(view,
+				    sel_registerName("addSubview:"), image_view);
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: icon %s own image view %.0fx%.0f\n",
+				    label, bounds.size.width, bounds.size.height);
+				say(line);
+			}
 		}
 		for (f = 0; f < sizeof(mondrian_icon_files) /
 		    sizeof(mondrian_icon_files[0]); f++) {
@@ -1379,6 +1408,23 @@ mondrian_icon_force_artwork(void)
 	snprintf(line, sizeof(line), "MONDRIAN UI: icons loaded from the bundle %u\n",
 	    loaded);
 	say(line);
+}
+
+/*
+ * After the artwork is set: does the view carry an image now, and did its
+ * layer get contents? Without this the only evidence would be a photograph,
+ * and "the image was set" is not "the render server has it".
+ */
+static void
+mondrian_icon_report_after(void)
+{
+	unsigned i;
+
+	say("MONDRIAN UI: icons after the bundle\n");
+	for (i = 0; i < mondrian_live_count; i++) {
+		mondrian_icon_probe_one(mondrian_live_views[i],
+		    mondrian_live_objects[i], "after");
+	}
 }
 
 /*
@@ -1605,22 +1651,29 @@ mondrian_log_device_state(void)
  * the lock screen too, and the unlock is the flakiest step in this port
  * (ring221 never left the lock screen at all). Probing from both branches is
  * what keeps an icon finding from depending on it.
+ *
+ * The first ticks after the unlock can still be too early for the icon list,
+ * so an empty walk retries (ten ticks, twenty seconds) instead of spending the
+ * one probe on a tree that had nothing in it yet.
  */
 static void
 mondrian_icon_probe_once(void)
 {
+	static unsigned attempts;
+
 	if (mondrian_icon_late_done) {
 		return;
 	}
-	mondrian_icon_late_done = 1;
 	mondrian_icon_late_report();
-	if (!mondrian_icon_dump_done && boot_arg_set("mondriandumpicon=1")) {
+	if (mondrian_live_count == 0 && ++attempts < 10) {
+		return;
+	}
+	mondrian_icon_late_done = 1;
+	if (!mondrian_icon_dump_done && mondrian_live_count > 0 &&
+	    boot_arg_set("mondriandumpicon=1")) {
 		mondrian_icon_dump_done = 1;
-		mondrian_icon_dump_selectors(
-		    mondrian_live_count > 0 ? mondrian_live_views[0]
-		        : mondrian_icon_views[0],
-		    mondrian_live_count > 0 ? mondrian_live_objects[0]
-		        : mondrian_icon_objects[0]);
+		mondrian_icon_dump_selectors(mondrian_live_views[0],
+		    mondrian_live_objects[0]);
 	}
 	if (boot_arg_set("mondrianiconset=1")) {
 		mondrian_icon_force_artwork();
@@ -1713,6 +1766,9 @@ mondrian_lock_step(void *context)
 			 * are asked again thirty seconds in, boot settled.
 			 */
 			mondrian_icon_probe_once();
+			if (mondrian_home_ticks == 20 && mondrian_icon_late_done) {
+				mondrian_icon_report_after();
+			}
 		}
 		return;
 	}
@@ -1730,6 +1786,9 @@ mondrian_lock_step(void *context)
 	 */
 	if (mondrian_lock_ticks == 30) {
 		mondrian_icon_probe_once();
+	}
+	if (mondrian_lock_ticks == 36 && mondrian_icon_late_done) {
+		mondrian_icon_report_after();
 	}
 	if (mondrian_lock_ticks == 12 && mondrian_anim_enabled && !mondrian_anim_started &&
 	    mondrian_probe_tick() > 0) {
