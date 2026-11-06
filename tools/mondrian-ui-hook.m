@@ -1601,11 +1601,41 @@ mondrian_log_device_state(void)
 }
 
 /*
+ * One probe, once, whatever the lock state: the home screen is built behind
+ * the lock screen too, and the unlock is the flakiest step in this port
+ * (ring221 never left the lock screen at all). Probing from both branches is
+ * what keeps an icon finding from depending on it.
+ */
+static void
+mondrian_icon_probe_once(void)
+{
+	if (mondrian_icon_late_done) {
+		return;
+	}
+	mondrian_icon_late_done = 1;
+	mondrian_icon_late_report();
+	if (!mondrian_icon_dump_done && boot_arg_set("mondriandumpicon=1")) {
+		mondrian_icon_dump_done = 1;
+		mondrian_icon_dump_selectors(
+		    mondrian_live_count > 0 ? mondrian_live_views[0]
+		        : mondrian_icon_views[0],
+		    mondrian_live_count > 0 ? mondrian_live_objects[0]
+		        : mondrian_icon_objects[0]);
+	}
+	if (boot_arg_set("mondrianiconset=1")) {
+		mondrian_icon_force_artwork();
+	}
+}
+
+/*
  * The lock screen is dismissed through the entry point its own swipe uses
- * (-lockScreenViewControllerRequestsUnlock), once, twenty seconds after the UI
- * is up. unlockUIFromSource:withOptions: with a nil request returns NO and each
+ * (-lockScreenViewControllerRequestsUnlock), twenty seconds after the UI is
+ * up. unlockUIFromSource:withOptions: with a nil request returns NO and each
  * refused call counts as a failed attempt (ring199: thirteen of them, then
- * "iPhone not available" on the screen), so it is not retried.
+ * "iPhone not available" on the screen), so that path is not used. The request
+ * itself gives no answer, and one call is not always enough -- ring221 stayed
+ * `lock screen up` for the whole boot after a single request -- so it is
+ * repeated twice more, a minute apart, and the log says which attempt it was.
  */
 static void
 mondrian_lock_step(void *context)
@@ -1680,27 +1710,9 @@ mondrian_lock_step(void *context)
 			}
 			/*
 			 * The artwork is set after -setIcon: returns, so the views
-			 * are asked again fifteen ticks in (thirty seconds), with
-			 * the boot settled.
+			 * are asked again thirty seconds in, boot settled.
 			 */
-			if (mondrian_home_ticks == 15 && !mondrian_icon_late_done) {
-				mondrian_icon_late_done = 1;
-				mondrian_icon_late_report();
-				if (!mondrian_icon_dump_done &&
-				    boot_arg_set("mondriandumpicon=1")) {
-					mondrian_icon_dump_done = 1;
-					mondrian_icon_dump_selectors(
-					    mondrian_live_count > 0
-					        ? mondrian_live_views[0]
-					        : mondrian_icon_views[0],
-					    mondrian_live_count > 0
-					        ? mondrian_live_objects[0]
-					        : mondrian_icon_objects[0]);
-				}
-				if (boot_arg_set("mondrianiconset=1")) {
-					mondrian_icon_force_artwork();
-				}
-			}
+			mondrian_icon_probe_once();
 		}
 		return;
 	}
@@ -1710,6 +1722,14 @@ mondrian_lock_step(void *context)
 	mondrian_lock_ticks++;
 	if (mondrian_lock_ticks == 10) {
 		mondrian_log_device_state();
+	}
+	/*
+	 * A minute in, ask the icon views even if the unlock has not taken: the
+	 * report is read-only and a locked boot is still a boot that can say
+	 * whether the artwork exists.
+	 */
+	if (mondrian_lock_ticks == 30) {
+		mondrian_icon_probe_once();
 	}
 	if (mondrian_lock_ticks == 12 && mondrian_anim_enabled && !mondrian_anim_started &&
 	    mondrian_probe_tick() > 0) {
@@ -1723,13 +1743,18 @@ mondrian_lock_step(void *context)
 		}
 		return;
 	}
-	if (mondrian_lock_ticks < 10 || mondrian_lock_ticks > 10) {
-		return;			/* one attempt at tick 10 only */
+	if (mondrian_lock_ticks != 10 && mondrian_lock_ticks != 30 &&
+	    mondrian_lock_ticks != 50) {
+		return;			/* three attempts, twenty seconds apart */
 	}
 	method = class_getInstanceMethod(cls, request_sel);
 	if (method != NULL) {
 		((void (*)(id, SEL))method_getImplementation(method))(manager, request_sel);
-		say("MONDRIAN UI: unlock requested (lock screen view)\n");
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: unlock requested (lock screen view, attempt %u)\n",
+		    (mondrian_lock_ticks == 10) ? 1u
+		    : (mondrian_lock_ticks == 30) ? 2u : 3u);
+		say(line);
 	} else {
 		say("MONDRIAN UI: lockScreenViewControllerRequestsUnlock missing\n");
 	}
@@ -1790,12 +1815,28 @@ mondrian_unlock_run(void *unused)
 	}
 	mondrian_unlock2_enabled = boot_arg_set("mondrianunlock2=1") != 0;
 	mondrian_anim_enabled = boot_arg_set("mondriananim=1") != 0;
-	for (;;) {
-		if (!mondrian_lock_step_pending) {
-			mondrian_lock_step_pending = 1;
-			dispatch_async_f(dispatch_get_main_queue(), NULL, mondrian_lock_step);
+	{
+		unsigned stuck = 0;
+
+		for (;;) {
+			if (!mondrian_lock_step_pending) {
+				stuck = 0;
+				mondrian_lock_step_pending = 1;
+				dispatch_async_f(dispatch_get_main_queue(), NULL,
+				    mondrian_lock_step);
+			} else if (++stuck == 5) {
+				/*
+				 * The step never reached the main queue -- a blocked
+				 * main thread, measured in ring217 as a boot that
+				 * stayed `lock screen up` for 1049 s. Say so and let
+				 * the next tick post it again.
+				 */
+				say("MONDRIAN UI: lock step stuck; reposting\n");
+				mondrian_lock_step_pending = 0;
+				stuck = 0;
+			}
+			sleep(2);
 		}
-		sleep(2);
 	}
 	return NULL;
 }
