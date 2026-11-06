@@ -937,10 +937,23 @@ them has Metal. That is the path this port follows.
   improve (ring226: `copy avg 25351 us`), so the store was the next suspect --
   but assembling each row in cached memory and `memcpy`-ing it did not improve
   it either (ring228: `copy avg 18326..31514 us`, `fps 24..39`), because the
-  scalar row build is 4.6 M iterations before the copy even starts. `0268`
-  therefore does both at once: the DDA for the index and four pixels per 16-byte
-  store, straight into the panel, which is the store width the unscaled
-  `memcpy` path gets for free.
+  scalar row build is 4.6 M iterations before the copy even starts. Four pixels
+  per 16-byte store, straight into the panel, got it to `copy avg 7585..12324
+  us`, `fps 45..56` (ring229) -- still far from the `fps 63-64` of the unscaled
+  panel. Splitting the number (`0269`, `clean avg`/`scale avg` on the fps line)
+  named the cost: the per-swap cache clean is `736..1008 us` and the scale was
+  `9135..13127 us` of the same swap (ring231, `fps 51..60`), so the clean is
+  noise and the DDA's serial accumulator chain was the whole remainder. `0268`
+  now builds the column map once (`fColMap`: source column of every panel pixel)
+  and the inner loop is four loads, four table lookups and one 16-byte store,
+  with no dependency chain between output pixels -- `scale avg 4.9..8.1 ms`,
+  `fps 56..61` (ring232). 1440/1125 is exactly 32/25, so a row is 45 identical
+  blocks of 32 outputs taken from 25 inputs and the block is spelled out with
+  constant indices, no lookups; that path is taken for any canvas whose ratio
+  is 32/25, and the map remains the fallback. With it the scale is `2.9..5.4 ms`
+  and the frame rate `63-64` (ring233) -- the same 2.85 ms the unscaled panel
+  pays for its `memcpy`, so the canvas is now free and the iPhone X geometry is
+  the default in `tools/boards.py`.
 
   Where the artwork goes, when it is injected by hand -- and why it cannot be
   SpringBoard's own view. `-[SBIconView iconImageView]` answers without an image
@@ -1204,9 +1217,11 @@ cost is CPU frequency, the boot CPU and debug I/O:
   It is no longer a way around the CPU rasterizer (that trick stopped paying
   once the GPU drew) but the geometry the icon bitmaps require: 1125x2436 =
   the iPhone X's 375x812 pt, the size SpringBoard's `CPMemoryPool` was built
-  for. The scaled copy indexes with a DDA and stores four pixels per 16-byte
-  write (`0268`); each of the three cheaper versions of it still measured
-  18-31 ms a swap (see the icon section).
+  for. The scaled copy walks a column map built once, four pixels per 16-byte
+  write (`0268`), and the fps line reports `clean avg` and `scale avg` so the
+  next change has a number to aim at (`0269`); the earlier DDA versions measured
+  9-13 ms of scale a swap plus 18-31 ms for the memcpy-cached one (see the icon
+  section).
   Use `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
   The CP tests hard-reset a non-journaled HFS; after several resets the next
   mount can take longer than 60 s (the ring stops at the UFS GPT with one

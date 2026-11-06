@@ -1720,7 +1720,13 @@ mondrian_icon_probe_once(void)
 		mondrian_icon_dump_selectors(mondrian_live_views[0],
 		    mondrian_live_objects[0]);
 	}
-	if (boot_arg_set("mondrianiconset=1")) {
+	/*
+	 * The artwork goes on unconditionally: the icon views have no image of
+	 * their own on this port, and the view this adds is the only one that
+	 * draws an icon (`docs/MONDIAN_GPU.md`). `mondrianiconset=0` is the way
+	 * to boot a clean home screen without it.
+	 */
+	if (!boot_arg_set("mondrianiconset=0")) {
 		mondrian_icon_force_artwork();
 	}
 	/*
@@ -1797,9 +1803,11 @@ mondrian_lock_step(void *context)
 	}
 	if (!locked) {
 		/*
-		 * The home screen is up: this is where a frame rate can be measured,
-		 * so the probe is (re)attached on every tick and the model is asked
-		 * once what it is supposed to show.
+		 * The home screen is up. The artwork is set after -setIcon:
+		 * returns, so the views are asked again twenty seconds in, boot
+		 * settled; the animation probe is only a frame-rate reference,
+		 * and hiding the wallpaper is only for a boot that cannot draw
+		 * one.
 		 */
 		mondrian_home_ticks++;
 		if (mondrian_anim_enabled) {
@@ -1813,17 +1821,13 @@ mondrian_lock_step(void *context)
 				say(line);
 				mondrian_log_home_screen();
 			}
-			if (attached > 0 && !mondrian_wallpaper_done &&
-			    boot_arg_set("mondrianwallpaper=1")) {
-				mondrian_wallpaper_done = 1;
-				mondrian_hide_wallpaper();
-			}
-			/*
-			 * The artwork is set after -setIcon: returns, so the views
-			 * are asked again thirty seconds in, boot settled.
-			 */
-			mondrian_icon_probe_once();
 		}
+		if (!mondrian_wallpaper_done &&
+		    boot_arg_set("mondrianwallpaper=1")) {
+			mondrian_wallpaper_done = 1;
+			mondrian_hide_wallpaper();
+		}
+		mondrian_icon_probe_once();
 		return;
 	}
 	if (!mondrian_unlock_enabled) {

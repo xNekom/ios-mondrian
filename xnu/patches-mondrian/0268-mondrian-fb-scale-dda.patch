@@ -1,25 +1,36 @@
-xnu 0268: scale the canvas with an index DDA and 16-byte stores
+xnu 0268: scale the canvas through a column map, four pixels a store
 
-The scaled swap copies a full canvas layer to the panel, and three measurements
-say what that copy really costs -- none of them the filter:
+The scaled swap copies a full canvas layer to the panel, and each version of it
+was measured before the next guess:
 
 - `drow[x] = srow[x * width / fWidth]` is a 64-bit divide per output pixel, and
   arm64 has no such instruction, so the compiler emitted a helper call 4.6 M
   times for 1125x2436 -> 1440x3200 (ring225: `fps 26 copy avg 24391 us`).
-- With a two-accumulator DDA in its place (the same floor(x * width / fWidth),
-  an add and a compare) the copy did not get faster: ring226 still measured
-  `fps 29 copy avg 25351 us`, because the panel mapping punished 4.6 M separate
-  4-byte stores while the unscaled memcpy path moves 18 MB in 2.8 ms.
-- Assembling each row in cached memory and copying it with memcpy did not fix
-  it either (ring228: `copy avg 18326..31514 us`, `fps 24..39`): the per-pixel
-  scalar loop that builds the row is itself 4.6 M iterations.
+- A two-accumulator DDA in its place did not help (ring226: `copy avg
+  25351 us`), nor did building each row in cached memory and memcpy-ing it
+  (ring228: `copy avg 18326..31514 us`, `fps 24..39`).
+- 16-byte stores did help -- the panel punished 4.6 M 4-byte stores -- but the
+  serial accumulator chain that fed them still cost 9-13 ms (ring231: `scale
+  avg 9135..13127 us`, with `clean avg 736..1008 us`, so the cache clean was
+  never the problem).
+- A column map built once took it to 4.9-8.1 ms and `fps 56-61` (ring232).
 
-So the row is built four pixels at a time into a 16-byte `mondrian_px4` and
-stored straight into the panel with one instruction pair, the width the memcpy
-path gets for free. The DDA stays (it is what makes the index exact without a
-divide) and nearest neighbour stays (the target is the frame budget, not the
-filter). `fPixels` and `fRowBytes` are checked once per swap; if they are not
-16-byte aligned the loop falls back to single-pixel stores.
+So the swap no longer walks a DDA at all. `fColMap` holds the source column of
+every panel pixel, built once from the canvas and panel widths, and the inner
+loop is four table lookups, four loads and one 16-byte store per four pixels,
+straight into the panel -- the store width the unscaled memcpy path gets for
+free, with no dependency chain between output pixels.
+
+For the widths this port runs, 1440/1125 is exactly 32/25, so the map has a
+closed form as well: every row is 45 identical blocks of 32 outputs taken from 25
+inputs, and the source index of each output pixel inside a block is the constant
+`floor(i * 25 / 32)`. That path is spelled out with no lookups at all and is
+taken whenever `fWidth * 25 == fCanvasWidth * 32` and `fWidth` is a multiple of
+32; anything else falls back to the map. With it the scale is `2.9..5.4 ms` at
+`fps 63-64` (ring233), the same 2.85 ms the unscaled panel pays for its memcpy,
+so the iPhone X canvas no longer costs frame rate. `fPixels` and `fRowBytes` are
+checked once per swap, and if they are not 16-byte aligned the loop falls back to
+single-pixel stores.
 
 diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
 --- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
@@ -36,62 +47,125 @@ diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/Mondria
  class AppleCLCD : public IOMobileFramebuffer {
  	OSDeclareDefaultStructors(AppleCLCD);
  
-@@ -730,14 +735,59 @@
+@@ -248,6 +253,9 @@
+ 	uint64_t            fLastVsync;      /* mach time of the last vsync notify */
+ 	uint64_t            fCopyTicks;      /* time in swap() since the last line */
+ 	uint64_t            fCopyMaxTicks;
++	uint32_t           *fColMap;       /* source column of each panel pixel */
++	uint32_t            fColMapWidth;
++	uint32_t            fColMapSource;
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
+ 	uint32_t            fTouchRate;      /* touch reports read in the last second */
+@@ -730,14 +738,111 @@
  		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
  		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow +
  		    (uint64_t)s->width * 4 <= s->memory->getLength()) {
+-			for (int32_t y = 0; y < (int32_t)fHeight; y++) {
+-				uint32_t sy2 = (uint32_t)((uint64_t)y * s->height / fHeight);
 +			/*
-+			 * The canvas needs an index, not a filter: the source column
-+			 * advances by a two-accumulator DDA, which is the same
-+			 * floor(x * width / fWidth) with an add and a compare (arm64
-+			 * has no 64-bit divide, and the per-pixel `x * width / fWidth`
-+			 * was a helper call each).
++			 * The canvas needs an index, not a filter, and the index is the
++			 * same every frame: `fColMap` holds the source column of each
++			 * panel pixel, built once from the canvas and panel widths (the
++			 * mapping is floor(x * canvas / panel), accumulated so no 64-bit
++			 * division is needed -- arm64 has none, and doing it per pixel
++			 * cost 24 ms a frame, ring225).
 +			 *
-+			 * Four pixels per store. The panel mapping is the expensive
-+			 * side of this copy: the same loop with a 4-byte store per
-+			 * output pixel measured 23-25 ms a frame (ring225/226), and
-+			 * the arithmetic was never the whole of it -- 4.6 M stores
-+			 * are. `mondrian_px4` is 16 bytes and 16-byte aligned, so the
-+			 * compiler stores a quad with one instruction pair, which is
-+			 * what the unscaled memcpy path gets for free (18 MB in
-+			 * 2.8 ms).
++			 * With the map in place the inner loop is four loads, four table
++			 * lookups and one 16-byte store for four pixels. That took the
++			 * scale from 9-13 ms (ring231: `scale avg 9135..13127 us`, with
++			 * `clean avg 736..1008 us`, so the clean was never the problem)
++			 * to 4.9-8.1 ms (ring232) and the frame rate from 45-56 to
++			 * 56-61. 1440/1125 is exactly 32/25, so the width that matters
++			 * also has a closed form, and the exact path below uses it.
 +			 */
++			if (fColMap == NULL || fColMapWidth != fWidth ||
++			    fColMapSource != fCanvasWidth) {
++				if (fColMap != NULL) {
++					IOFree(fColMap, (vm_size_t)fColMapWidth * 4);
++				}
++				fColMap = (uint32_t *)IOMalloc((vm_size_t)fWidth * 4);
++				fColMapWidth = fColMap != NULL ? fWidth : 0;
++				fColMapSource = fCanvasWidth;
++				uint32_t acc = 0, sx = 0;
++
++				for (uint32_t x = 0; fColMap != NULL && x < fWidth; x++) {
++					fColMap[x] = sx;
++					acc += fCanvasWidth;
++					while (acc >= fWidth) {
++						acc -= fWidth;
++						sx++;
++					}
++				}
++			}
 +			bool wide = ((uintptr_t)fPixels & 15u) == 0 &&
 +			    (fRowBytes & 15u) == 0;
++			/*
++			 * 1440/1125 is exactly 32/25, so one row is a whole number of
++			 * identical 32-from-25 blocks and the index of every output
++			 * pixel in a block is a constant: floor(i * 25 / 32). Spelling
++			 * that out removes the per-pixel table load from the loop.
++			 */
++			bool exact = wide && (fWidth % 32u) == 0 &&
++			    (uint64_t)fWidth * 25u == (uint64_t)fCanvasWidth * 32u;
 +			uint32_t csy = 0, csyacc = 0;
- 			for (int32_t y = 0; y < (int32_t)fHeight; y++) {
--				uint32_t sy2 = (uint32_t)((uint64_t)y * s->height / fHeight);
++
++			for (int32_t y = 0; exact && y < (int32_t)fHeight; y++) {
  				const uint32_t *srow = (const uint32_t *)(src + s->offset +
 -				    (uint64_t)sy2 * s->bytesPerRow);
 +				    (uint64_t)csy * s->bytesPerRow);
  				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
-+				uint32_t csx = 0, csxacc = 0;
-+				int32_t x = 0;
  
 -				for (int32_t x = 0; x < (int32_t)fWidth; x++) {
 -					drow[x] = srow[(uint32_t)((uint64_t)x * s->width / fWidth)];
++				const uint32_t *sp = srow;
++				uint32_t *dp = drow;
++
++				for (uint32_t bx = 0; bx < fWidth; bx += 32, sp += 25, dp += 32) {
++					mondrian_px4 q;
++
++					q.v[0] = sp[0];  q.v[1] = sp[0];  q.v[2] = sp[1];  q.v[3] = sp[2];
++					*(mondrian_px4 *)(dp + 0) = q;
++					q.v[0] = sp[3];  q.v[1] = sp[3];  q.v[2] = sp[4];  q.v[3] = sp[5];
++					*(mondrian_px4 *)(dp + 4) = q;
++					q.v[0] = sp[6];  q.v[1] = sp[7];  q.v[2] = sp[7];  q.v[3] = sp[8];
++					*(mondrian_px4 *)(dp + 8) = q;
++					q.v[0] = sp[9];  q.v[1] = sp[10]; q.v[2] = sp[10]; q.v[3] = sp[11];
++					*(mondrian_px4 *)(dp + 12) = q;
++					q.v[0] = sp[12]; q.v[1] = sp[13]; q.v[2] = sp[14]; q.v[3] = sp[14];
++					*(mondrian_px4 *)(dp + 16) = q;
++					q.v[0] = sp[15]; q.v[1] = sp[16]; q.v[2] = sp[17]; q.v[3] = sp[17];
++					*(mondrian_px4 *)(dp + 20) = q;
++					q.v[0] = sp[18]; q.v[1] = sp[19]; q.v[2] = sp[20]; q.v[3] = sp[21];
++					*(mondrian_px4 *)(dp + 24) = q;
++					q.v[0] = sp[21]; q.v[1] = sp[22]; q.v[2] = sp[23]; q.v[3] = sp[24];
++					*(mondrian_px4 *)(dp + 28) = q;
++				}
++				csyacc += s->height;
++				while (csyacc >= fHeight) {
++					csyacc -= fHeight;
++					csy++;
++				}
++			}
++			for (int32_t y = 0; !exact && fColMap != NULL && y < (int32_t)fHeight; y++) {
++				const uint32_t *srow = (const uint32_t *)(src + s->offset +
++				    (uint64_t)csy * s->bytesPerRow);
++				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++				int32_t x = 0;
++
 +				if (wide) {
 +					for (; x + 4 <= (int32_t)fWidth; x += 4) {
 +						mondrian_px4 px;
 +
-+						for (int32_t k = 0; k < 4; k++) {
-+							px.v[k] = srow[csx];
-+							csxacc += s->width;
-+							while (csxacc >= fWidth) {
-+								csxacc -= fWidth;
-+								csx++;
-+							}
-+						}
++						px.v[0] = srow[fColMap[x]];
++						px.v[1] = srow[fColMap[x + 1]];
++						px.v[2] = srow[fColMap[x + 2]];
++						px.v[3] = srow[fColMap[x + 3]];
 +						*(mondrian_px4 *)(drow + x) = px;
 +					}
 +				}
 +				for (; x < (int32_t)fWidth; x++) {
-+					drow[x] = srow[csx];
-+					csxacc += s->width;
-+					while (csxacc >= fWidth) {
-+						csxacc -= fWidth;
-+						csx++;
-+					}
++					drow[x] = srow[fColMap[x]];
 +				}
 +				csyacc += s->height;
 +				while (csyacc >= fHeight) {

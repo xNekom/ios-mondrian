@@ -1,0 +1,88 @@
+xnu 0269: say how much of a swap is the cache clean and how much is the scale
+
+`copy avg` folds the layer copies, the per-swap dcache clean of the source
+surface and the canvas scale into one number, which is not enough to choose the
+next change. ring231 answered it with this line: `clean avg 736..1008 us` and
+`scale avg 9135..13127 us` at canvas 1125x2436 -- the clean is noise and the
+scale was the whole cost. The fps line carries both from now on, next to
+`copy avg`.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -256,6 +256,8 @@
+ 	uint32_t           *fColMap;       /* source column of each panel pixel */
+ 	uint32_t            fColMapWidth;
+ 	uint32_t            fColMapSource;
++	uint64_t            fCleanTicks;    /* cache clean inside swap() */
++	uint64_t            fScaleTicks;    /* canvas scale inside swap() */
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
+ 	uint32_t            fTouchRate;      /* touch reports read in the last second */
+@@ -540,6 +542,7 @@
+ 		uint32_t swaps = fb->fSwapCount;
+ 		uint32_t n = swaps - fb->fFpsLast;
+ 		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
++		uint64_t clean_avg = 0, scale_avg = 0;
+ 
+ 		if (n > 0) {
+ 			absolutetime_to_nanoseconds(fb->fCopyTicks, &copy_avg);
+@@ -548,15 +551,19 @@
+ 			absolutetime_to_nanoseconds(fb->fLateMaxTicks, &late_max);
+ 			copy_avg /= n;
+ 			late_avg /= n;
++			absolutetime_to_nanoseconds(fb->fCleanTicks, &clean_avg);
++			absolutetime_to_nanoseconds(fb->fScaleTicks, &scale_avg);
++			clean_avg /= n;
++			scale_avg /= n;
+ 		}
+ 		/*
+ 		 * copy: the memcpy of every layer into the panel, in the caller's
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s\n",
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+-		    fb->fTouchRate, fb->fTouchRepeatRate);
++		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -569,6 +576,7 @@
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
++		fb->fCleanTicks = fb->fScaleTicks = 0;
+ 	}
+ }
+ 
+@@ -723,9 +731,12 @@
+ 		 * drop the lines by physical address before the copy, every
+ 		 * layer, so what is on the panel is what was drawn.
+ 		 */
++		uint64_t cleanBegan = mach_absolute_time();
++
+ 		if (mondrian_fb_coherent) {
+ 			mondrian_fb_clean(s);
+ 		}
++		fCleanTicks += mach_absolute_time() - cleanBegan;
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		/*
+ 		 * A full canvas-sized layer is scaled to the panel. Nearest
+@@ -773,6 +784,7 @@
+ 					}
+ 				}
+ 			}
++			uint64_t scaleBegan = mach_absolute_time();
+ 			bool wide = ((uintptr_t)fPixels & 15u) == 0 &&
+ 			    (fRowBytes & 15u) == 0;
+ 			/*
+@@ -845,6 +857,7 @@
+ 					csy++;
+ 				}
+ 			}
++			fScaleTicks += mach_absolute_time() - scaleBegan;
+ 			s->release();
+ 			continue;
+ 		}

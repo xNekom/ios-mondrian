@@ -54,8 +54,9 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The lock screen draws and the home screen composites at
-  63-64 fps at the panel canvas; it runs on the iPhone X's 1125x2436 canvas
-  because that is the geometry SpringBoard's icon bitmaps fit
+  63-64 fps on the iPhone X's 1125x2436 canvas, the geometry SpringBoard's icon
+  bitmaps fit; the canvas's scaled `swap()` costs 2.9-5.4 ms, the same as the
+  unscaled `memcpy`, and the icon artwork is a `UIImageView` the hook owns
   (`docs/MONDIAN_GPU.md`). CoreAnimation needs `TimingElements`/`ColorElements`
   and an `IOAcceleratorES` service (else it waits 30 s and draws nothing);
   `0114` publishes them. SpringBoard waits on MobileActivation in
@@ -69,11 +70,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **GPU rendering: correctness.** Fluidity and GPU drawing are there; content
-   is not. Icon views have no image of their own (`iconservicesagent` and twenty
-   other daemons are SIGKILLed at check-in), so the hook paints a `UIImageView`
-   of its own over each icon (`docs/MONDIAN_GPU.md`); the wallpaper is Metal and
-   `AGXMetalA11` cannot draw it. Touch works (`0153`, `0156`, `0263`).
+1. **GPU rendering: the content.** The home screen composites at 63-64 fps and
+   the hook paints the icon artwork into a `UIImageView` of its own over each
+   icon, because `iconservicesagent` is SIGKILLed at check-in. The wallpaper is
+   Metal and `AGXMetalA11` cannot draw it. Touch works (`0153`, `0156`, `0263`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
