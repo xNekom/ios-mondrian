@@ -905,6 +905,28 @@ them has Metal. That is the path this port follows.
   "IconServices never ran": it ran and cached the page, and the present path
   stopped showing it. Check the cache dates before blaming the artwork.
 
+  **The bitmap SpringBoard cannot make is the one that matters.** Every boot
+  that lays out the home screen raises, inside SpringBoard:
+
+  ```
+  _SBFCGBitmapImageCreate: requested slot length (64512) larger than maximum
+  slotLength (57600), not large enough for A8 context with dimensions
+  {84, 84} @3.000000x
+  ```
+
+  an uncaught `NSInternalInconsistencyException` that aborts the app
+  (`ns 2 code 0x6`, then `exec SpringBoard`). 64512 is a 252x252 A8 bitmap
+  plus its header, and 57600 is exactly 240x240 -- an **80 pt icon at 3x**.
+  `CPMemoryPool` is sized for an iPhone's icon while the request follows the
+  screen, and this port declares the panel itself, 1440x3200 = 480x1067 pt, so
+  SpringBoard asks for an **84 pt** icon and the pool refuses it. That is why
+  no icon ever gets an image: it is never created, and the live views stay at
+  `image 0 contents 0` with perfectly good frames (ring224: dock at
+  `110,21 64x64`, folder `252,107 170x184`). The lever is the canvas:
+  `mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436` declares the iPhone X's
+  375x812 pt and the kernel scales that to the panel, which is the geometry the
+  pool was built for. Read this before touching icon artwork.
+
 - **A sleeping display stops every CADisplayLink.** Two minutes after the UI
   settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
   0, every link stops (measured: the last line says `ts 146` in a 240 s boot)

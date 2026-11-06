@@ -1313,6 +1313,8 @@ mondrian_icon_find_image_view(id view, unsigned depth)
 	return nil;
 }
 
+static void mondrian_icon_check_one(id view, const char *label);
+
 static void
 mondrian_icon_force_artwork(void)
 {
@@ -1402,6 +1404,7 @@ mondrian_icon_force_artwork(void)
 			    "MONDRIAN UI: icon %s <- %s\n", label,
 			    mondrian_icon_files[f]);
 			say(line);
+			mondrian_icon_check_one(image_view, label);
 			break;
 		}
 	}
@@ -1411,20 +1414,34 @@ mondrian_icon_force_artwork(void)
 }
 
 /*
- * After the artwork is set: does the view carry an image now, and did its
- * layer get contents? Without this the only evidence would be a photograph,
- * and "the image was set" is not "the render server has it".
+ * After the artwork is set, read it back *in the same tick*, on the object that
+ * was just written: a delayed report would have to reuse view pointers, and
+ * SpringBoard frees icon views (ring224: the ten-second report crashed it four
+ * times). "The image was set" is not "the layer has contents", so both are
+ * printed here while the object is certainly alive.
  */
 static void
-mondrian_icon_report_after(void)
+mondrian_icon_check_one(id view, const char *label)
 {
-	unsigned i;
+	id image = mondrian_send(view, "image");
+	id layer = mondrian_send(view, "layer");
+	id contents = layer != NULL ? mondrian_send(layer, "contents") : nil;
+	CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+	    sel_registerName("frame"));
+	CGSize size = CGSizeZero;
+	char line[200];
 
-	say("MONDRIAN UI: icons after the bundle\n");
-	for (i = 0; i < mondrian_live_count; i++) {
-		mondrian_icon_probe_one(mondrian_live_views[i],
-		    mondrian_live_objects[i], "after");
+	if (image != NULL) {
+		size = ((CGSize (*)(id, SEL))objc_msgSend)(image,
+		    sel_registerName("size"));
 	}
+	snprintf(line, sizeof(line),
+	    "MONDRIAN UI: icon %s set %s image %d %.0fx%.0f contents %d"
+	    " frame %.0f,%.0f %.0fx%.0f\n",
+	    label, object_getClassName(view), image != NULL, size.width,
+	    size.height, contents != NULL, frame.origin.x, frame.origin.y,
+	    frame.size.width, frame.size.height);
+	say(line);
 }
 
 /*
@@ -1766,9 +1783,6 @@ mondrian_lock_step(void *context)
 			 * are asked again thirty seconds in, boot settled.
 			 */
 			mondrian_icon_probe_once();
-			if (mondrian_home_ticks == 20 && mondrian_icon_late_done) {
-				mondrian_icon_report_after();
-			}
 		}
 		return;
 	}
@@ -1786,9 +1800,6 @@ mondrian_lock_step(void *context)
 	 */
 	if (mondrian_lock_ticks == 30) {
 		mondrian_icon_probe_once();
-	}
-	if (mondrian_lock_ticks == 36 && mondrian_icon_late_done) {
-		mondrian_icon_report_after();
 	}
 	if (mondrian_lock_ticks == 12 && mondrian_anim_enabled && !mondrian_anim_started &&
 	    mondrian_probe_tick() > 0) {
