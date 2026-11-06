@@ -809,6 +809,7 @@ static int mondrian_anim_enabled;
 static int mondrian_anim_started;
 static int mondrian_lock_ticks;
 static volatile unsigned mondrian_home_ticks;
+static volatile unsigned mondrian_icon_after_wait;
 
 static void mondrian_try_unlock_options(void);
 
@@ -1281,33 +1282,27 @@ mondrian_icon_bundle_path(id icon)
 	return nil;
 }
 
+#define MONDRIAN_ICON_TAG	0x4d4f4e31	/* 'MON1', ours */
+
 /*
- * `-iconImageView` is the accessor the lock screen's mechanism used in earlier
- * builds; if it is absent (or answers without an image), the artwork view is
- * the first descendant that takes a `-setImage:` -- an `SBIconImageView` is a
- * `UIImageView`. Guessing only the accessor is what leaves an icon view with a
- * live image nobody set.
+ * The view this hook paints: an image view of ours, tagged so a later pass
+ * finds it again without keeping a pointer. SpringBoard's own image views are
+ * never written -- see mondrian_icon_force_artwork for what writing them cost.
  */
 static id
-mondrian_icon_find_image_view(id view, unsigned depth)
+mondrian_icon_own_view(id view)
 {
-	id subs;
-	unsigned n, i;
+	id subs = mondrian_send(view, "subviews");
+	unsigned n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	unsigned i;
 
-	if (view == NULL || depth > 8) {
-		return nil;
-	}
-	if ([view respondsToSelector:sel_registerName("setImage:")]) {
-		return view;
-	}
-	subs = mondrian_send(view, "subviews");
-	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
 	for (i = 0; i < n; i++) {
-		id found = mondrian_icon_find_image_view(
-		    [(NSArray *)subs objectAtIndex:i], depth + 1);
+		id sub = [(NSArray *)subs objectAtIndex:i];
+		long tag = ((long (*)(id, SEL))objc_msgSend)(sub,
+		    sel_registerName("tag"));
 
-		if (found != NULL) {
-			return found;
+		if (tag == MONDRIAN_ICON_TAG) {
+			return sub;
 		}
 	}
 	return nil;
@@ -1333,51 +1328,58 @@ mondrian_icon_force_artwork(void)
 	for (i = 0; i < count; i++) {
 		id view = views[i];
 		id icon = objects[i];
-		id image_view = mondrian_send(view, "iconImageView");
+		id image_view;
 		NSString *path = mondrian_icon_bundle_path(icon);
 		const char *label = mondrian_icon_label(icon);
-
-		if (image_view == NULL ||
-		    mondrian_send(image_view, "image") == NULL) {
-			id other = mondrian_icon_find_image_view(view, 0);
-
-			if (other != NULL) {
-				image_view = other;
-			}
-		}
+		CGRect bounds;
 
 		if (path == nil) {
 			snprintf(line, sizeof(line),
-			    "MONDRIAN UI: icon %s no artwork path (view %d)\n",
-			    label, image_view != NULL);
+			    "MONDRIAN UI: icon %s no artwork path\n", label);
 			say(line);
 			continue;
 		}
+		/*
+		 * Always an image view of our own, never one of SpringBoard's.
+		 * Writing theirs makes SpringBoard rebuild the icon at the
+		 * model's image info, and that request is 84 pt against a pool
+		 * whose maximum slot is 80 pt: `requested slot length (64512)
+		 * larger than maximum slotLength (57600)` is an uncaught
+		 * exception, so SpringBoard dies and restarts (measured,
+		 * ring227: 52 assertions and 24 restarts, after the second
+		 * pass repainted its views). Our own UIImageView has a layer
+		 * of its own -- the compositor draws it and no icon image is
+		 * ever requested -- and it is placed at the icon view's bounds
+		 * and above its siblings.
+		 */
+		bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("bounds"));
+		/*
+		 * The icon view is the icon plus its label (60x74 on the home
+		 * screen); the artwork is square and sits at the top, so a
+		 * square of the view's width is the right frame -- stretching a
+		 * 60x60 PNG over 60x74 would show a squashed icon.
+		 */
+		bounds.size.height = bounds.size.width;
+		image_view = mondrian_icon_own_view(view);
 		if (image_view == NULL) {
-			/*
-			 * None of the view's descendants takes an image (measured,
-			 * ring222: Phone and Safari answered `view 0` while their
-			 * neighbours answered yes). A UIImageView of our own, at
-			 * the view's own bounds, is the one path that always
-			 * draws.
-			 */
 			Class ui_image_view = objc_getClass("UIImageView");
-			CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
-			    sel_registerName("bounds"));
 
-			if (ui_image_view != Nil) {
-				image_view = ((id (*)(id, SEL))objc_msgSend)(
-				    (id)ui_image_view, sel_registerName("alloc"));
-				image_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-				    image_view, sel_registerName("initWithFrame:"),
-				    bounds);
-				((void (*)(id, SEL, id))objc_msgSend)(view,
-				    sel_registerName("addSubview:"), image_view);
-				snprintf(line, sizeof(line),
-				    "MONDRIAN UI: icon %s own image view %.0fx%.0f\n",
-				    label, bounds.size.width, bounds.size.height);
-				say(line);
+			if (ui_image_view == Nil) {
+				continue;
 			}
+			image_view = ((id (*)(id, SEL))objc_msgSend)(
+			    (id)ui_image_view, sel_registerName("alloc"));
+			image_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+			    image_view, sel_registerName("initWithFrame:"), bounds);
+			((void (*)(id, SEL, long))objc_msgSend)(image_view,
+			    sel_registerName("setTag:"), (long)MONDRIAN_ICON_TAG);
+			((void (*)(id, SEL, id))objc_msgSend)(view,
+			    sel_registerName("addSubview:"), image_view);
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: icon %s own view %.0fx%.0f\n", label,
+			    bounds.size.width, bounds.size.height);
+			say(line);
 		}
 		for (f = 0; f < sizeof(mondrian_icon_files) /
 		    sizeof(mondrian_icon_files[0]); f++) {
@@ -1442,6 +1444,32 @@ mondrian_icon_check_one(id view, const char *label)
 	    size.height, contents != NULL, frame.origin.x, frame.origin.y,
 	    frame.size.width, frame.size.height);
 	say(line);
+}
+
+/*
+ * Read-only: does the view this hook painted still carry the image, and has the
+ * render server got contents for it? Only our own tagged subviews are touched,
+ * and the walk that finds them is repeated, so no icon view pointer is kept.
+ */
+static void
+mondrian_icon_own_report(void)
+{
+	unsigned i, n = mondrian_live_count;
+	char line[200];
+
+	for (i = 0; i < n; i++) {
+		id view = mondrian_live_views[i];
+		id own = mondrian_icon_own_view(view);
+		id image = own != NULL ? mondrian_send(own, "image") : nil;
+		id layer = own != NULL ? mondrian_send(own, "layer") : nil;
+		id contents = layer != NULL ? mondrian_send(layer, "contents") : nil;
+		const char *label = mondrian_icon_label(mondrian_live_objects[i]);
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: icon %s own %d image %d contents %d\n",
+		    label, own != NULL, image != NULL, contents != NULL);
+		say(line);
+	}
 }
 
 /*
@@ -1695,6 +1723,13 @@ mondrian_icon_probe_once(void)
 	if (boot_arg_set("mondrianiconset=1")) {
 		mondrian_icon_force_artwork();
 	}
+	/*
+	 * And once more, later: the artwork is what the icon list does with the
+	 * model a few seconds after it exists, so a view that answers `image 0`
+	 * at the probe can still be right a moment afterwards. The walk repeats
+	 * from the windows -- nothing is kept -- and only reads.
+	 */
+	mondrian_icon_after_wait = 10;
 }
 
 /*
@@ -1749,6 +1784,11 @@ mondrian_lock_step(void *context)
 	locked = method != NULL
 	    ? ((BOOL (*)(id, SEL))method_getImplementation(method))(manager, locked_sel)
 	    : YES;
+	if (mondrian_icon_after_wait != 0 && --mondrian_icon_after_wait == 0) {
+		say("MONDRIAN UI: icon again, twenty seconds on\n");
+		mondrian_icon_late_report();
+		mondrian_icon_own_report();
+	}
 	if ((int)locked != mondrian_lock_last) {
 		mondrian_lock_last = (int)locked;
 		snprintf(line, sizeof(line), "MONDRIAN UI: lock screen %s\n",

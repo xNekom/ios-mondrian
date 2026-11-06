@@ -905,8 +905,9 @@ them has Metal. That is the path this port follows.
   "IconServices never ran": it ran and cached the page, and the present path
   stopped showing it. Check the cache dates before blaming the artwork.
 
-  **The bitmap SpringBoard cannot make is the one that matters.** Every boot
-  that lays out the home screen raises, inside SpringBoard:
+  **The bitmap SpringBoard cannot make is the one that matters.** A boot that
+  lays out the home screen with the panel itself declared as the screen raises,
+  inside SpringBoard:
 
   ```
   _SBFCGBitmapImageCreate: requested slot length (64512) larger than maximum
@@ -915,17 +916,47 @@ them has Metal. That is the path this port follows.
   ```
 
   an uncaught `NSInternalInconsistencyException` that aborts the app
-  (`ns 2 code 0x6`, then `exec SpringBoard`). 64512 is a 252x252 A8 bitmap
-  plus its header, and 57600 is exactly 240x240 -- an **80 pt icon at 3x**.
-  `CPMemoryPool` is sized for an iPhone's icon while the request follows the
-  screen, and this port declares the panel itself, 1440x3200 = 480x1067 pt, so
-  SpringBoard asks for an **84 pt** icon and the pool refuses it. That is why
-  no icon ever gets an image: it is never created, and the live views stay at
-  `image 0 contents 0` with perfectly good frames (ring224: dock at
-  `110,21 64x64`, folder `252,107 170x184`). The lever is the canvas:
-  `mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436` declares the iPhone X's
-  375x812 pt and the kernel scales that to the panel, which is the geometry the
-  pool was built for. Read this before touching icon artwork.
+  (`ns 2 code 0x6`, then `exec SpringBoard`). 64512 is a 252x252 A8 bitmap plus
+  its header and 57600 is exactly 240x240 -- an **80 pt icon at 3x**. The pool
+  is sized for an iPhone's icon while the request follows the screen: at
+  1440x3200 = 480x1067 pt SpringBoard asks for an **84 pt** icon and no icon
+  image is ever created, whatever the artwork says. Declaring the iPhone X
+  canvas is the fix for the boot, and it is measured (ring225,
+  `mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436`): the assertion
+  disappears, SpringBoard stops restarting, and the dock views come out at
+  `70,17 60x60` with the folder at `197,71 155x169` -- the 60 pt layout the pool
+  and the userland were built for. The 84 pt request has not gone away, it is
+  only not reached; anything that makes SpringBoard rebuild an icon image brings
+  it back (see below). Read this before touching icon artwork.
+
+  The canvas costs a scaled `swap()`, and making that copy cheap took three
+  measurements that each named a different cost. `drow[x] = srow[x * width /
+  fWidth]` is a 64-bit divide per output pixel and arm64 has no such instruction
+  (ring225: `fps 26 copy avg 24391 us` against `fps 63 copy avg 2853 us` at the
+  unscaled panel). With a two-accumulator DDA in its place the copy did not
+  improve (ring226: `copy avg 25351 us`), so the store was the next suspect --
+  but assembling each row in cached memory and `memcpy`-ing it did not improve
+  it either (ring228: `copy avg 18326..31514 us`, `fps 24..39`), because the
+  scalar row build is 4.6 M iterations before the copy even starts. `0268`
+  therefore does both at once: the DDA for the index and four pixels per 16-byte
+  store, straight into the panel, which is the store width the unscaled
+  `memcpy` path gets for free.
+
+  Where the artwork goes, when it is injected by hand -- and why it cannot be
+  SpringBoard's own view. `-[SBIconView iconImageView]` answers without an image
+  in this userland, and the descendant that takes `-setImage:` is the *label's*
+  image view (measured, ring226: `App Store set SBIconLegibilityLabelView`, a
+  74x21 label). Writing either is worse than useless: SpringBoard reacts by
+  rebuilding the icon at the model's image info, and that is 84 pt, which the
+  pool refuses -- 52 `requested slot length (64512) larger than maximum
+  slotLength (57600)` assertions and 24 SpringBoard restarts in one boot
+  (ring227, after a second painting pass twenty seconds in). The artwork
+  therefore goes into a `UIImageView` of the hook's own, tagged `MON1` and added
+  at the icon view's bounds: a layer nobody else owns, so the compositor draws
+  it and no icon image is requested. That is measured to work (ring228): six
+  icons painted, SpringBoard with zero crashes, and twenty seconds later
+  `icon Photos own 1 image 1 contents 1` -- the view is still ours, still holds
+  the image, and the layer has contents for the first time on this port.
 
 - **A sleeping display stops every CADisplayLink.** Two minutes after the UI
   settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
@@ -1169,11 +1200,14 @@ cost is CPU frequency, the boot CPU and debug I/O:
 - **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
   frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
 - **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
-  CoreAnimation into a smaller surface and scales it to the panel in
-  `swap()`. It was a way around the CPU rasterizer (900x2000 measured 9.3 fps
-  against 6.4 at the full panel) and the CPU scale in `swap()` costs 30-40 ms a
-  swap, so do not use it to chase frame rate now that the GPU draws. Use
-  `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
+  CoreAnimation into a smaller surface and scales it to the panel in `swap()`.
+  It is no longer a way around the CPU rasterizer (that trick stopped paying
+  once the GPU drew) but the geometry the icon bitmaps require: 1125x2436 =
+  the iPhone X's 375x812 pt, the size SpringBoard's `CPMemoryPool` was built
+  for. The scaled copy indexes with a DDA and stores four pixels per 16-byte
+  write (`0268`); each of the three cheaper versions of it still measured
+  18-31 ms a swap (see the icon section).
+  Use `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
   The CP tests hard-reset a non-journaled HFS; after several resets the next
   mount can take longer than 60 s (the ring stops at the UFS GPT with one
   process), so use 300 s or run `fsck_hfs` on the root image.

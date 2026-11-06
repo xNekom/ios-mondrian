@@ -53,28 +53,27 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The lock screen draws and the home screen composites at a
-  steady 63-64 fps for the whole boot. CoreAnimation needs
-  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else it
-  waits 30 s and draws nothing); `0114` publishes them. SpringBoard waits on
-  MobileActivation in `_setupActivationState`; the dylib forces activation and
-  skips Setup, including the `SBLockdownManager` and `SBSetupManager` gates.
-  The cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root
-  must have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the
-  Apple logo. GPU writes memory once `CP_SET_SECURE_MODE(0)` retires; the ring
-  now wraps the way kgsl wraps it (`0266`), which removed the lap-boundary
-  freeze, and the remaining cost is the CPU copy of each layer into the panel
-  (`docs/MONDIAN_GPU.md`).
+- **Display and UI.** The lock screen draws and the home screen composites at
+  63-64 fps at the panel canvas; it runs on the iPhone X's 1125x2436 canvas
+  because that is the geometry SpringBoard's icon bitmaps fit
+  (`docs/MONDIAN_GPU.md`). CoreAnimation needs `TimingElements`/`ColorElements`
+  and an `IOAcceleratorES` service (else it waits 30 s and draws nothing);
+  `0114` publishes them. SpringBoard waits on MobileActivation in
+  `_setupActivationState`; the dylib forces activation and skips Setup. The
+  cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root must
+  have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the Apple logo.
+  GPU writes memory once `CP_SET_SECURE_MODE(0)` retires, and the ring wraps the
+  way kgsl wraps it (`0266`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **GPU rendering: correctness.** Fluidity is there (`63-64 fps` steady, the
-   ring wraps, no submit failures); what is wrong is content. The home screen
-   builds its 79 icon views but their images are nil, the wallpaper poster
-   crashes, and the frame still pays a CPU memcpy of every layer into the panel
-   (`docs/MONDIAN_GPU.md`). Touch works (`0153`, `0156`, `0263`).
+1. **GPU rendering: correctness.** Fluidity and GPU drawing are there; content
+   is not. Icon views have no image of their own (`iconservicesagent` and twenty
+   other daemons are SIGKILLed at check-in), so the hook paints a `UIImageView`
+   of its own over each icon (`docs/MONDIAN_GPU.md`); the wallpaper is Metal and
+   `AGXMetalA11` cannot draw it. Touch works (`0153`, `0156`, `0263`).
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
@@ -89,26 +88,27 @@ and apply `xnu/patches-mondrian/`; a skipped patch fails the build. Run
 series: CI skips a patch that does not apply and still builds, which is how
 `0161` was missing until 2026-10-28 (`0157` carried its first hunk). A mondrian
 build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the user-client
-surface without the CP profile (`docs/BUILD_LINUX.md`).
+surface without the CP profile. Artifacts and the KDK cache live outside
+`/private/tmp` (emptied on reboot), and `DXB_DIR` must not contain a space
+(`build.sh` uses it unquoted).
 
 **Apple's clang builtins are load-bearing.** Without `__builtin_xnu_type_*`
 (`tools/wsl/patches/0002` stubs them) every kalloc_type view is a data view, none
 is kept, the iterator that follows asserts (`kalloc.c:1264`) inside
 `kernel_bootstrap` (black panel, no ring), and `0008` returns when none was kept.
 
-Build artifacts and the KDK cache live outside `/private/tmp` (emptied on
-reboot); `DXB_DIR` must not contain a space, `build.sh` uses it unquoted.
-
-**Bisecting the early boot.** `mondrianstop=N` halts at early mark N with IRQs
-masked; `0174` keeps marks above 20 visible after the console is off, so the
-last line on the panel names the function that hung.
-
 **`iig` trap.** A newer Xcode's `iig` regenerates the DriverKit stubs wrong
 (`docs/MONDIAN_GPU.md`); seed them from a build made with Xcode 15.
 
 **Image and deploy.** `tools/phone-boot.sh` builds if needed and boots
 volatile; `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
-and refuses `boot_a` unless `BOOT_A=1`.
+and refuses `boot_a` unless `BOOT_A=1`. `tools/qemu-ios.py` boots the same
+payload; `--kernel` only feeds its decoder (`docs/QEMU_TESTING.md`).
+
+**Boot arguments have a hard end.** `BOOT_LINE_LENGTH` (1024 since `0267`)
+bounds the shim's payload header, `boot_args.CommandLine` and `kern.bootargs`,
+and an argument past it does not exist, silently (measured, ring225:
+`mondrianiconset=1` sat a few bytes past 608 and its pass never ran).
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
@@ -116,9 +116,9 @@ log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
 CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
 A previous boot is read by running the real kernel, then a dump kernel with
 `mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
-
-**Host-side testing.** `tools/qemu-ios.py` boots the payload; `--kernel` only
-feeds its decoder (`docs/QEMU_TESTING.md`), so rebuild the payload.
+`mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
+above 20 visible after the console is off, so the last line on the panel names
+the function that hung.
 
 ## Measured hardware facts
 

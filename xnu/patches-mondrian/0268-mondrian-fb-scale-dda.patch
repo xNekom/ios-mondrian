@@ -1,0 +1,102 @@
+xnu 0268: scale the canvas with an index DDA and 16-byte stores
+
+The scaled swap copies a full canvas layer to the panel, and three measurements
+say what that copy really costs -- none of them the filter:
+
+- `drow[x] = srow[x * width / fWidth]` is a 64-bit divide per output pixel, and
+  arm64 has no such instruction, so the compiler emitted a helper call 4.6 M
+  times for 1125x2436 -> 1440x3200 (ring225: `fps 26 copy avg 24391 us`).
+- With a two-accumulator DDA in its place (the same floor(x * width / fWidth),
+  an add and a compare) the copy did not get faster: ring226 still measured
+  `fps 29 copy avg 25351 us`, because the panel mapping punished 4.6 M separate
+  4-byte stores while the unscaled memcpy path moves 18 MB in 2.8 ms.
+- Assembling each row in cached memory and copying it with memcpy did not fix
+  it either (ring228: `copy avg 18326..31514 us`, `fps 24..39`): the per-pixel
+  scalar loop that builds the row is itself 4.6 M iterations.
+
+So the row is built four pixels at a time into a 16-byte `mondrian_px4` and
+stored straight into the panel with one instruction pair, the width the memcpy
+path gets for free. The DDA stays (it is what makes the index exact without a
+divide) and nearest neighbour stays (the target is the frame budget, not the
+filter). `fPixels` and `fRowBytes` are checked once per swap; if they are not
+16-byte aligned the loop falls back to single-pixel stores.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -237,6 +237,11 @@
+ 
+ class IOMobileFramebufferUserClient;
+ 
++/* Four pixels of the canvas, stored as one 16-byte write. */
++typedef struct {
++	uint32_t v[4];
++} __attribute__((aligned(16))) mondrian_px4;
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -730,14 +735,59 @@
+ 		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
+ 		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow +
+ 		    (uint64_t)s->width * 4 <= s->memory->getLength()) {
++			/*
++			 * The canvas needs an index, not a filter: the source column
++			 * advances by a two-accumulator DDA, which is the same
++			 * floor(x * width / fWidth) with an add and a compare (arm64
++			 * has no 64-bit divide, and the per-pixel `x * width / fWidth`
++			 * was a helper call each).
++			 *
++			 * Four pixels per store. The panel mapping is the expensive
++			 * side of this copy: the same loop with a 4-byte store per
++			 * output pixel measured 23-25 ms a frame (ring225/226), and
++			 * the arithmetic was never the whole of it -- 4.6 M stores
++			 * are. `mondrian_px4` is 16 bytes and 16-byte aligned, so the
++			 * compiler stores a quad with one instruction pair, which is
++			 * what the unscaled memcpy path gets for free (18 MB in
++			 * 2.8 ms).
++			 */
++			bool wide = ((uintptr_t)fPixels & 15u) == 0 &&
++			    (fRowBytes & 15u) == 0;
++			uint32_t csy = 0, csyacc = 0;
+ 			for (int32_t y = 0; y < (int32_t)fHeight; y++) {
+-				uint32_t sy2 = (uint32_t)((uint64_t)y * s->height / fHeight);
+ 				const uint32_t *srow = (const uint32_t *)(src + s->offset +
+-				    (uint64_t)sy2 * s->bytesPerRow);
++				    (uint64_t)csy * s->bytesPerRow);
+ 				uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++				uint32_t csx = 0, csxacc = 0;
++				int32_t x = 0;
+ 
+-				for (int32_t x = 0; x < (int32_t)fWidth; x++) {
+-					drow[x] = srow[(uint32_t)((uint64_t)x * s->width / fWidth)];
++				if (wide) {
++					for (; x + 4 <= (int32_t)fWidth; x += 4) {
++						mondrian_px4 px;
++
++						for (int32_t k = 0; k < 4; k++) {
++							px.v[k] = srow[csx];
++							csxacc += s->width;
++							while (csxacc >= fWidth) {
++								csxacc -= fWidth;
++								csx++;
++							}
++						}
++						*(mondrian_px4 *)(drow + x) = px;
++					}
++				}
++				for (; x < (int32_t)fWidth; x++) {
++					drow[x] = srow[csx];
++					csxacc += s->width;
++					while (csxacc >= fWidth) {
++						csxacc -= fWidth;
++						csx++;
++					}
++				}
++				csyacc += s->height;
++				while (csyacc >= fHeight) {
++					csyacc -= fHeight;
++					csy++;
+ 				}
+ 			}
+ 			s->release();

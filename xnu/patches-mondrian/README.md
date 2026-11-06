@@ -32,6 +32,7 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0231`–`0252` | the surface and 2D paths: `RB_DONE` and the render target (`0231`–`0232`), surface IOVA and the 2D fill/readback probes with their spill, physical-address, scan and sysmem variants (`0233`–`0250`), submission timing (`0251`) and the sync-map limit (`0252`) |
 | `0254`–`0263` | the measurement path: touch at 60 Hz (`0254`), the HID drag probe (`0255`), the framebuffer vsync selector and console pause (`0256`–`0257`), HID wake (`0258`–`0259`), the memory line, the selector log and the wired breakdown (`0260`–`0262`), and the digitizer event marked integrated (`0263`) |
 | `0264`–`0266` | iteration and the ring: the userland hook carried as a kernel blob so a dylib change costs one kernel build (`0264`), the wedged-ring diagnostic that names the submission (`0265`), and the lap boundary closed the way kgsl closes it, with a 128 KiB ring and a fenced doorbell (`0266`) |
+| `0267`–`0268` | the geometry and its cost: `BOOT_LINE_LENGTH` raised to 1024 so a long measurement cmdline is not silently cut (`0267`), and the canvas scale done with a DDA instead of a 64-bit divide per pixel (`0268`) |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`. The series count in "Applying it" below is
@@ -47,7 +48,7 @@ tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 
 The CI **skips** a patch that does not apply and still reports success, so run
 the command above (or `tools/check-patches.sh`) before pushing. It reports
-228/228 for the current series. Two traps it catches: `git apply` rejects a hunk
+263/263 for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
 ran; `NO_STAGE=1` makes `0036` fail for that reason alone. A *cancelled* job is
@@ -56,7 +57,7 @@ reported as `failure` too.
 `tools/validate-repo.py` is stricter than `git apply`, and three of its
 findings on this series are known and harmless: the prose preamble of `0087`
 (its diff starts further down, which `git apply` accepts) and a hunk count in
-`0060`. All 228 patches apply with `git apply`; CI validates the kernel build.
+`0060`. All 263 patches apply with `git apply`; CI validates the kernel build.
 
 ## What is still missing
 
