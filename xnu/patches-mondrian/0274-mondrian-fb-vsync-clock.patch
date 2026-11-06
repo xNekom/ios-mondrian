@@ -1,0 +1,153 @@
+xnu 0274: make the vsync a clock instead of a chain of delays, and measure it
+
+`vsyncFired` re-armed itself with `setTimeoutUS(16667)` at the end of its own
+body, so every period was the period plus the callback's duration, and a slow
+callback pushed every later tick. Measured, ring242: `gap avg 17709 us`, with a
+third of the intervals in 20-33 ms, while the fps line still read 59 -- the
+compositor draws when it is told to, so that jitter is in the frames.
+
+The timer now counts from a deadline chain: `fNextVsync` advances by exactly
+1/HZ and the callback arms the delay to it, skipping the deadlines an overrun
+has passed rather than firing them in a burst. The interval itself is measured
+and printed as `vsync avg/min/max` with the number of intervals past 17 and
+20 ms, so the next boot says whether the clock is now the clock.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -265,6 +265,13 @@
+ 	uint64_t            fScaleTicks;    /* canvas scale inside swap() */
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
++	uint64_t            fNextVsync;      /* deadline of the next vsync, not a delay */
++	uint64_t            fVsyncGapTicks;  /* interval between vsyncs, summed */
++	uint64_t            fVsyncGapMinTicks;
++	uint64_t            fVsyncGapMaxTicks;
++	uint32_t            fVsyncGapCount;
++	uint32_t            fVsyncOver17;    /* vsync intervals past 17 ms */
++	uint32_t            fVsyncOver20;
+ 	uint64_t            fLastSwapTicks; /* swap entry of the previous frame */
+ 	uint64_t            fGapTicks;      /* interval between swaps, summed */
+ 	uint64_t            fGapMaxTicks;
+@@ -390,7 +397,14 @@
+ 		IOLog("MONDRIAN FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVsync->setTimeoutUS(MONDRIAN_FB_VSYNC_US);
++	{
++		uint64_t period;
++
++		nanoseconds_to_absolutetime(1000000000ULL / MONDRIAN_FB_REFRESH_HZ,
++		    &period);
++		fNextVsync = mach_absolute_time() + period;
++		fVsync->setTimeout(period);
++	}
+ 	{
+ 		int fps = 0;
+ 
+@@ -485,6 +499,34 @@
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 
++	/*
++	 * The interval between vsyncs is the clock the whole UI runs on: the
++	 * compositor draws when it is told to, and the panel shows what the
++	 * copy leaves behind. A timer re-armed at the end of its own callback
++	 * runs at the period plus whatever the callback took, so every frame
++	 * inherits that jitter; this counts it.
++	 */
++	if (fb->fLastVsync != 0 && now > fb->fLastVsync) {
++		uint64_t gap = now - fb->fLastVsync;
++		uint64_t gapNs = 0;
++
++		absolutetime_to_nanoseconds(gap, &gapNs);
++		fb->fVsyncGapTicks += gap;
++		fb->fVsyncGapCount++;
++		if (fb->fVsyncGapMinTicks == 0 || gap < fb->fVsyncGapMinTicks) {
++			fb->fVsyncGapMinTicks = gap;
++		}
++		if (gap > fb->fVsyncGapMaxTicks) {
++			fb->fVsyncGapMaxTicks = gap;
++		}
++		if (gapNs > 17000000ULL) {
++			fb->fVsyncOver17++;
++		}
++		if (gapNs > 20000000ULL) {
++			fb->fVsyncOver20++;
++		}
++	}
++
+ 	fb->fLastVsync = now;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -499,7 +541,28 @@
+ 		client->notify(MONDRIAN_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	sender->setTimeoutUS(MONDRIAN_FB_VSYNC_US);
++	/*
++	 * Arm the next tick against a fixed deadline. Re-arming with a delay
++	 * from here measured 17.7 ms a tick with a third of them at 20-33 ms
++	 * (ring242: `gap avg 17709`), because the callback's own duration was
++	 * part of the period and a slow one moved every later tick with it. A
++	 * deadline chain keeps the period at 1/HZ and, when a callback overruns,
++	 * skips the ticks that are already gone instead of firing them back to
++	 * back.
++	 */
++	{
++		uint64_t period;
++		uint64_t next;
++
++		nanoseconds_to_absolutetime(1000000000ULL / MONDRIAN_FB_REFRESH_HZ,
++		    &period);
++		next = fb->fNextVsync + period;
++		while (next <= now) {
++			next += period;
++		}
++		fb->fNextVsync = next;
++		sender->setTimeout(next - now);
++	}
+ 	/*
+ 	 * Liveness marker that needs neither the console nor printf: the panel
+ 	 * scans this memory by itself, so a block that moves twice a second
+@@ -564,6 +627,7 @@
+ 		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
+ 		uint64_t clean_avg = 0, scale_avg = 0;
+ 		uint64_t gap_avg = 0, gap_max = 0;
++		uint64_t vsync_avg = 0, vsync_min = 0, vsync_max = 0;
+ 
+ 		if (n > 0) {
+ 			absolutetime_to_nanoseconds(fb->fCopyTicks, &copy_avg);
+@@ -581,6 +645,12 @@
+ 			absolutetime_to_nanoseconds(fb->fGapTicks / fb->fGapCount, &gap_avg);
+ 			absolutetime_to_nanoseconds(fb->fGapMaxTicks, &gap_max);
+ 		}
++		if (fb->fVsyncGapCount != 0) {
++			absolutetime_to_nanoseconds(fb->fVsyncGapTicks / fb->fVsyncGapCount,
++			    &vsync_avg);
++			absolutetime_to_nanoseconds(fb->fVsyncGapMinTicks, &vsync_min);
++			absolutetime_to_nanoseconds(fb->fVsyncGapMaxTicks, &vsync_max);
++		}
+ 		/*
+ 		 * copy: the memcpy of every layer into the panel, in the caller's
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+@@ -592,6 +662,9 @@
+ 		    fb->fTouchPollRate, fb->fTouchEventRate);
+ 		IOLog("MONDRIAN FB: gap avg %llu us max %llu us 20-33 %u over33 %u\n",
+ 		    gap_avg / 1000, gap_max / 1000, fb->fGap20, fb->fGap33);
++		IOLog("MONDRIAN FB: vsync avg %llu us min %llu us max %llu us over17 %u over20 %u\n",
++		    vsync_avg / 1000, vsync_min / 1000, vsync_max / 1000,
++		    fb->fVsyncOver17, fb->fVsyncOver20);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -607,6 +680,9 @@
+ 		fb->fCleanTicks = fb->fScaleTicks = 0;
+ 		fb->fGapTicks = fb->fGapMaxTicks = 0;
+ 		fb->fGapCount = fb->fGap20 = fb->fGap33 = 0;
++		fb->fVsyncGapTicks = fb->fVsyncGapMaxTicks = 0;
++		fb->fVsyncGapMinTicks = 0;
++		fb->fVsyncGapCount = fb->fVsyncOver17 = fb->fVsyncOver20 = 0;
+ 	}
+ }
+ 

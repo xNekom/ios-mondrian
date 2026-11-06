@@ -1,0 +1,74 @@
+xnu 0281: say how many frames each display tick was given
+
+`present` reads 49-57/s while the renderer asks for 60 (`fps 59-62`) during a
+drag (ring246, the horizontal sweep of `0280`). With one pending record per
+tick, a tick that finds none holds the previous frame for two periods, and a
+tick that finds two can present only the newer. Both show as the same stutter
+and both are invisible in a per-second rate.
+
+The tick now counts the records it was handed (0, 1, 2, 3+) and the last eight
+intervals between records are printed in microseconds, so one boot separates a
+renderer that is late (records arrive after the tick) from one that is bursty
+(two records, then none).
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -320,6 +320,10 @@
+ 	uint32_t      fPresentCount;     /* frames put on the panel */
+ 	uint64_t      fPresentTicks;
+ 	uint64_t      fPresentMaxTicks;
++	uint32_t      fTickSwaps;        /* fSwapCount at the last tick */
++	uint32_t      fTickRec[4];       /* ticks that saw 0, 1, 2, 3+ records */
++	uint32_t      fSwapGapUs[8];     /* the last eight gaps between records */
++	uint32_t      fSwapGapIndex;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -605,6 +609,17 @@
+ 	if (fb->fDeferPresent) {
+ 		uint8_t rec[MONDRIAN_FB_SWAP_REC_SIZE];
+ 		bool have;
++		uint32_t got = fb->fSwapCount - fb->fTickSwaps;
++
++		/*
++		 * A tick that finds nothing cannot present, and a tick that finds two
++		 * can only present the newer: the panel then holds one frame for two
++		 * periods and moves twice in the next. How many records each tick
++		 * brings is the difference between a renderer that is late and one
++		 * that is bursty, and the two need opposite fixes.
++		 */
++		fb->fTickSwaps = fb->fSwapCount;
++		fb->fTickRec[got < 3 ? got : 3]++;
+ 
+ 		IOLockLock(fb->fLock);
+ 		have = fb->fPendingValid;
+@@ -743,6 +758,11 @@
+ 		    fb->fVsyncOver17, fb->fVsyncOver20);
+ 		IOLog("MONDRIAN FB: present %u/s avg %llu us max %llu us\n",
+ 		    fb->fPresentCount, present_avg / 1000, present_max / 1000);
++		IOLog("MONDRIAN FB: tick rec0 %u rec1 %u rec2 %u rec3 %u gap %u %u %u %u %u %u %u %u\n",
++		    fb->fTickRec[0], fb->fTickRec[1], fb->fTickRec[2], fb->fTickRec[3],
++		    fb->fSwapGapUs[0], fb->fSwapGapUs[1], fb->fSwapGapUs[2],
++		    fb->fSwapGapUs[3], fb->fSwapGapUs[4], fb->fSwapGapUs[5],
++		    fb->fSwapGapUs[6], fb->fSwapGapUs[7]);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -765,6 +785,8 @@
+ 		fb->fVsyncGapCount = fb->fVsyncOver17 = fb->fVsyncOver20 = 0;
+ 		fb->fPresentCount = 0;
+ 		fb->fPresentTicks = fb->fPresentMaxTicks = 0;
++		fb->fTickRec[0] = fb->fTickRec[1] = 0;
++		fb->fTickRec[2] = fb->fTickRec[3] = 0;
+ 	}
+ }
+ 
+@@ -828,6 +850,7 @@
+ 		uint64_t gapNs = 0;
+ 
+ 		absolutetime_to_nanoseconds(gap, &gapNs);
++		fSwapGapUs[fSwapGapIndex++ & 7] = (uint32_t)(gapNs / 1000);
+ 		fGapTicks += gap;
+ 		fGapCount++;
+ 		if (gapNs < 15000000ULL) {

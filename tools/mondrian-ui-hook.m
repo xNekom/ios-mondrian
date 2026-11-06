@@ -1727,6 +1727,50 @@ mondrian_log_device_state(void)
  * "Dock" and let the log name it, so the next boot says whether the radius
  * landed on the bar or on a container that does not paint.
  */
+/*
+ * Setting a layer property dirties the tree, and a material view recomposites
+ * its backdrop when it changes: a pass that writes the same radius on every
+ * tick pays for the blur sixty times a second. Read the value and write only
+ * when it is wrong -- SpringBoard's own layout does reset it, which is what the
+ * periodic re-apply is for.
+ */
+static void
+mondrian_layer_round(id layer, double radius)
+{
+	double cur = ((double (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("cornerRadius"));
+
+	if (cur < radius - 0.5 || cur > radius + 0.5) {
+		((void (*)(id, SEL, double))objc_msgSend)(layer,
+		    sel_registerName("setCornerRadius:"), radius);
+	}
+}
+
+static void
+mondrian_layer_mask_round(id layer, CGRect bounds, double radius)
+{
+	id mask, colour;
+
+	if (layer == NULL || radius <= 0.0) {
+		return;
+	}
+	mask = [objc_getClass("CALayer") layer];
+	colour = [objc_getClass("UIColor") blackColor];
+	if (mask == NULL || colour == NULL) {
+		return;
+	}
+	/*
+	 * A mask layer filled with a colour is rounded by its own corner
+	 * radius, so no path is needed, and because the mask is applied to the
+	 * material's layer the backdrop layer underneath is clipped with it --
+	 * which `clipsToBounds` did not do (measured: the bar stayed square).
+	 */
+	[mask setFrame:bounds];
+	[mask setCornerRadius:radius];
+	[mask setBackgroundColor:[colour CGColor]];
+	[layer setMask:mask];
+}
+
 static unsigned
 mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
 {
@@ -1762,8 +1806,7 @@ mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
 			say(line);
 		}
 		if (layer != NULL && radius > 0.0) {
-			((void (*)(id, SEL, double))objc_msgSend)(layer,
-			    sel_registerName("setCornerRadius:"), radius);
+			mondrian_layer_round(layer, radius);
 			done++;
 		}
 		/*
@@ -1776,31 +1819,44 @@ mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
 			id sub = [(NSArray *)kids objectAtIndex:k];
 			CGRect sf = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
 			    sel_registerName("frame"));
+			CGRect bounds;
 			id sl;
+			double br;
 
-			if (sf.size.width * sf.size.height <
-			    frame.size.width * frame.size.height * 0.5) {
-				continue;
-			}
 			if (subs_told < 6) {
-				char line[160];
+				char line[192];
 				const char *sn = object_getClassName(sub);
+				id subl = mondrian_send(sub, "layer");
+				const char *ln = subl != NULL ?
+				    object_getClassName(subl) : "?";
 
 				subs_told++;
 				snprintf(line, sizeof(line),
-				    "MONDRIAN UI: dock sub %u %s %.0fx%.0f at %.0f,%.0f\n",
-				    k, sn != NULL ? sn : "?", sf.size.width, sf.size.height,
+				    "MONDRIAN UI: dock sub %u %s layer %s"
+				    " %.0fx%.0f at %.0f,%.0f\n",
+				    k, sn != NULL ? sn : "?", ln,
+				    sf.size.width, sf.size.height,
 				    sf.origin.x, sf.origin.y);
 				say(line);
+			}
+			if (sf.size.width * sf.size.height <
+			    frame.size.width * frame.size.height * 0.5) {
+				continue;
 			}
 			sl = mondrian_send(sub, "layer");
 			if (sl == NULL || radius <= 0.0) {
 				continue;
 			}
-			((void (*)(id, SEL, double))objc_msgSend)(sl,
-			    sel_registerName("setCornerRadius:"), radius);
-			((void (*)(id, SEL, BOOL))objc_msgSend)(sub,
-			    sel_registerName("setClipsToBounds:"), YES);
+			/*
+			 * The radius follows the view that paints: the dock's own
+			 * radius is 31.2 for a 104 pt container, the material inside
+			 * it is 94 tall and wants its own.
+			 */
+			br = sf.size.height * 0.3;
+			bounds = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+			    sel_registerName("bounds"));
+			mondrian_layer_round(sl, br);
+			mondrian_layer_mask_round(sl, bounds, br);
 			done++;
 		}
 	}
@@ -1963,9 +2019,13 @@ mondrian_lock_step(void *context)
 		mondrian_icon_probe_once();
 		/*
 		 * SpringBoard rebuilds the dock when the layout changes, and a
-		 * radius put on the old view goes with it: re-apply on every tick.
+		 * radius put on the old view goes with it: walk the tree again,
+		 * but every twenty ticks rather than every one -- the walk itself
+		 * costs, and the write is already guarded by a read.
 		 */
-		mondrian_dock_round();
+		if ((mondrian_home_ticks % 20) == 0) {
+			mondrian_dock_round();
+		}
 		return;
 	}
 	if (!mondrian_unlock_enabled) {

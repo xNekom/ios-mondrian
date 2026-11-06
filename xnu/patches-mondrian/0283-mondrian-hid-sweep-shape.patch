@@ -1,0 +1,104 @@
+xnu 0283: the sweep is a horizontal drag, and nothing else unless asked
+
+`0280` made the synthetic finger horizontal and `0283` then put three seconds of
+bottom-edge swipe up in front of it, so that an unattended boot could leave the
+lock screen. On a home screen that gesture opens the app switcher, and the jump
+from the bottom edge to the middle of the panel is read as a swipe: ring250
+launched Spotlight that way, and a horizontal drag inside Spotlight draws
+nothing, so the sweep measured an empty screen for two minutes.
+
+The horizontal drag is the sweep again. The unlock prologue is still there for a
+boot that cannot get out of the lock screen, behind `mondriandragunlock=1`; it is
+off by default, and the phase clock of the pan does not move when it is on.
+
+diff --git a/iokit/Kernel/arm/hid/MondrianHID.cpp b/iokit/Kernel/arm/hid/MondrianHID.cpp
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -379,6 +379,7 @@
+ 	UInt32 fDragSweepS;      /* mondriandragsweep: seconds of motion */
+ 	UInt32 fDragDelayS;      /* mondriandragdelay: seconds before it */
+ 	bool fDragActive;        /* the synthetic finger is down */
++	bool fDragUnlock;        /* mondriandragunlock: swipe up first */
+ 	UInt32 fDragTick;
+ 	UInt32 fDragSweep;
+ 	IOLock *fLock;
+@@ -495,6 +496,15 @@
+ 		(void)PE_parse_boot_argn("mondriandragdelay", &fDragDelayS,
+ 		    sizeof(fDragDelayS));
+ 		fDragActive = false;
++		fDragUnlock = false;
++		{
++			int unlock = 0;
++
++			if (PE_parse_boot_argn("mondriandragunlock", &unlock, sizeof(unlock)) &&
++				    unlock != 0) {
++				fDragUnlock = true;
++			}
++		}
+ 		fDrag = IOTimerEventSource::timerEventSource(this, &MondrianHIDTouch::dragFired);
+ 		if (fDrag && _hidWorkLoop->addEventSource(fDrag) == kIOReturnSuccess) {
+ 			fDrag->setTimeoutMS(16);
+@@ -515,9 +525,16 @@
+  * a phone left alone can still produce the measurement, and the delay lets the
+  * boot finish and the UI come up before the first sweep.
+  *
+- * The swipe is horizontal: that is the gesture that pages the home screen. A
+- * vertical one at the bottom edge opens the app switcher instead, and an
+- * animation that has finished drawing says nothing about the cadence.
++ * The swipe is horizontal: it is the gesture that moves the lock screen and
++ * pages the home screen, and it is the one a drag is judged by. It has no
++ * vertical component on purpose -- a jump between two positions is read as a
++ * swipe, and ring250 landed in Spotlight that way, where a horizontal drag
++ * draws nothing at all.
++ *
++ * mondriandragunlock=1 puts three seconds of bottom-edge swipe up in front of
++ * each sweep, for a boot that has to leave the lock screen by itself. It is
++ * off by default: on a home screen the same gesture opens the app switcher,
++ * and what it measures afterwards is an empty screen.
+  */
+ void
+ MondrianHIDTouch::dragFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -535,18 +552,33 @@
+ 		return;
+ 	}
+ 	if (t >= delay && t < delay + sweep) {
+-		/*
+-		 * One round trip along the middle of the panel every two seconds:
+-		 * right in a second, back in the next. A monotonic swipe pans the page
+-		 * until the edge stops it, and the frames that follow say nothing; a
+-		 * round trip keeps it moving for the whole sweep.
+-		 */
+-		UInt32 k = (t - delay) % 124;
+-		int lo = 3000, hi = 11400;
++		UInt32 u = t - delay;
+ 
+-		x = (k < 62) ? lo + (hi - lo) * (int)k / 61 :
++		if (self->fDragUnlock && u < 3 * 62) {
++			/*
++			 * Up from the bottom edge for a second and back for a second, three
++			 * times: an unlock. Drawn from the last third of the panel, where the
++			 * home indicator is.
++			 */
++			UInt32 k = u % 62;
++			int y = (k < 31) ? 31000 - (int)(k * 322) :
++			    21000 + (int)((k - 31) * 322);
++
++			self->touch(0, true, 7200, y);
++		} else {
++			/*
++			 * One round trip along the middle of the panel every two seconds:
++			 * right in a second, back in the next. A monotonic swipe pans the page
++			 * until the edge stops it, and the frames that follow say nothing; a
++			 * round trip keeps it moving for the whole sweep.
++			 */
++			UInt32 k = (self->fDragUnlock ? u - 3 * 62 : u) % 124;
++			int lo = 3000, hi = 11400;
++
++			x = (k < 62) ? lo + (hi - lo) * (int)k / 61 :
+ 			    hi - (hi - lo) * (int)(k - 62) / 61;
+-		self->touch(0, true, x, 16000);
++			self->touch(0, true, x, 16000);
++		}
+ 		if (!self->fDragActive) {
+ 			self->fDragActive = true;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);

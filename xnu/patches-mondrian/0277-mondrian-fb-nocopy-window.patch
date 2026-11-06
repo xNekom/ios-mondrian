@@ -1,0 +1,69 @@
+xnu 0277: a boot argument that drops the panel copy for five seconds in ten
+
+Two things can cost the frames a drag loses: the renderer, and the 2.8 ms copy
+the compositor's own thread pays inside `swap()`. `mondrianfb_nocopy=N` drops
+the copy for N seconds out of every ten and marks those seconds `mode nocopy`
+on the fps line, so one boot measures the rate the producer sustains alone
+against the rate with the copy. If the producer alone reaches 60, the copy
+belongs on the display's thread, at the tick, where it also stops drifting
+against the panel; if it does not, the renderer is the wall and the copy is not
+worth moving.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -97,6 +97,14 @@
+  * the copy sees without it.
+  */
+ static int mondrian_fb_coherent = 1;
++/*
++ * mondrianfb_nocopy=N: skip the panel copy for N seconds out of every ten.
++ * The copy is 2.8 ms of the 16.7 a frame has, so the question "would the
++ * renderer reach 60 without it" has one boot for an answer: the seconds it
++ * is skipped show the rate the producer can sustain on its own, and the rest
++ * of the boot still shows the UI.
++ */
++static int mondrian_fb_nocopy;
+ 
+ /*
+  * Clean and drop the CPU's lines for a surface's pixels, by physical address.
+@@ -420,6 +428,8 @@
+ 	}
+ 	(void)PE_parse_boot_argn("mondrianfb_probe", &mondrian_fb_probe,
+ 	    sizeof(mondrian_fb_probe));
++	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
++	    sizeof(mondrian_fb_nocopy));
+ 	{
+ 		int nocoh = 0;
+ 
+@@ -663,10 +673,14 @@
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us poll %u/s ev %u/s\n",
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us poll %u/s ev %u/s mode %s\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+ 		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000,
+-		    fb->fTouchPollRate, fb->fTouchEventRate);
++		    fb->fTouchPollRate, fb->fTouchEventRate,
++		    (mondrian_fb_nocopy > 0 &&
++			    (count % (MONDRIAN_FB_REFRESH_HZ * 10)) <
++			    (uint64_t)mondrian_fb_nocopy * MONDRIAN_FB_REFRESH_HZ) ?
++		    "nocopy" : "copy");
+ 		IOLog("MONDRIAN FB: gap avg %llu us min %llu us max %llu us lt15 %u 15-18 %u 18-21 %u 21-26 %u 26-34 %u gt34 %u\n",
+ 		    gap_avg / 1000, gap_min / 1000, gap_max / 1000, fb->fGapUnder15,
+ 		    fb->fGap15, fb->fGap18, fb->fGap21, fb->fGap26, fb->fGapOver34);
+@@ -788,6 +802,13 @@
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		if (mondrian_fb_nocopy > 0 &&
++			    (fVsyncCount % (MONDRIAN_FB_REFRESH_HZ * 10)) <
++			    (uint64_t)mondrian_fb_nocopy * MONDRIAN_FB_REFRESH_HZ) {
++			/* The measurement window: the frame is dropped on purpose. */
++			s->release();
++			continue;
++		}
+ 		uintptr_t src = s->kernelAddress();
+ 		if (mondrian_fb_probe > 0 && src != 0 && s->bytesPerRow != 0 &&
+ 		    s->height != 0) {

@@ -1,0 +1,276 @@
+xnu 0279: copy the frame at the display tick, not on the renderer's thread
+
+`late avg 8 ms max 16.5 ms` (ring244) is the phase at which frames reached the
+panel, and the panel's own refresh quantised that jitter into one or two
+periods: the copy happened wherever the compositor finished, so the same frame
+could be shown 8 ms or 16 ms after its predecessor even at a steady rate.
+
+`swap()` now only records the request; the vsync callback presents it, after
+the clients have been notified and after the timer is armed for the next tick.
+Two things follow: every copy starts at the same point in the period, and the
+2.8 ms the copy costs leaves the renderer's thread -- which is where the 46-56
+fps of a drag was being lost. The presentation rate and its cost are printed as
+`present N/s avg/max`, and `mondrianfb_defer=0` restores the old path.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -313,10 +313,19 @@
+ 	bool          fConsolePaused;
+ 	bool          fQuietScreen;      /* mondrianfb_noconsole at start */
+ 
++	/* The swap the next display tick presents, and how it went. */
++	uint8_t       fPendingRec[MONDRIAN_FB_SWAP_REC_SIZE];
++	bool          fPendingValid;
++	bool          fDeferPresent;     /* mondrianfb_defer, default on */
++	uint32_t      fPresentCount;     /* frames put on the panel */
++	uint64_t      fPresentTicks;
++	uint64_t      fPresentMaxTicks;
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	void present(const uint8_t *rec);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -430,6 +439,14 @@
+ 	    sizeof(mondrian_fb_probe));
+ 	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
+ 	    sizeof(mondrian_fb_nocopy));
++	fDeferPresent = true;
++	{
++		int defer = 1;
++
++		if (PE_parse_boot_argn("mondrianfb_defer", &defer, sizeof(defer))) {
++			fDeferPresent = defer != 0;
++		}
++	}
+ 	{
+ 		int nocoh = 0;
+ 
+@@ -580,6 +597,36 @@
+ 		sender->setTimeout(next - now);
+ 	}
+ 	/*
++	 * Put the newest finished frame on the panel now, at the tick. The
++	 * timer is already armed for the next one, so the copy costs the period
++	 * nothing, and the clients above were notified first: the renderer
++	 * starts its next frame while this thread copies the last one.
++	 */
++	if (fb->fDeferPresent) {
++		uint8_t rec[MONDRIAN_FB_SWAP_REC_SIZE];
++		bool have;
++
++		IOLockLock(fb->fLock);
++		have = fb->fPendingValid;
++		if (have) {
++			memcpy(rec, fb->fPendingRec, sizeof(rec));
++			fb->fPendingValid = false;
++		}
++		IOLockUnlock(fb->fLock);
++		if (have) {
++			uint64_t began = mach_absolute_time();
++			uint64_t elapsed;
++
++			fb->present(rec);
++			elapsed = mach_absolute_time() - began;
++			fb->fPresentCount++;
++			fb->fPresentTicks += elapsed;
++			if (elapsed > fb->fPresentMaxTicks) {
++				fb->fPresentMaxTicks = elapsed;
++			}
++		}
++	}
++	/*
+ 	 * Liveness marker that needs neither the console nor printf: the panel
+ 	 * scans this memory by itself, so a block that moves twice a second
+ 	 * proves the kernel still runs when the log has stopped. It goes away
+@@ -644,6 +691,7 @@
+ 		uint64_t clean_avg = 0, scale_avg = 0;
+ 		uint64_t gap_avg = 0, gap_max = 0, gap_min = 0;
+ 		uint64_t vsync_avg = 0, vsync_min = 0, vsync_max = 0;
++		uint64_t present_avg = 0, present_max = 0;
+ 
+ 		if (n > 0) {
+ 			absolutetime_to_nanoseconds(fb->fCopyTicks, &copy_avg);
+@@ -662,6 +710,11 @@
+ 			absolutetime_to_nanoseconds(fb->fGapMaxTicks, &gap_max);
+ 			absolutetime_to_nanoseconds(fb->fGapMinTicks, &gap_min);
+ 		}
++		if (fb->fPresentCount != 0) {
++			absolutetime_to_nanoseconds(fb->fPresentTicks / fb->fPresentCount,
++				    &present_avg);
++			absolutetime_to_nanoseconds(fb->fPresentMaxTicks, &present_max);
++		}
+ 		if (fb->fVsyncGapCount != 0) {
+ 			absolutetime_to_nanoseconds(fb->fVsyncGapTicks / fb->fVsyncGapCount,
+ 			    &vsync_avg);
+@@ -688,6 +741,8 @@
+ 		IOLog("MONDRIAN FB: vsync avg %llu us min %llu us max %llu us over17 %u over20 %u\n",
+ 		    vsync_avg / 1000, vsync_min / 1000, vsync_max / 1000,
+ 		    fb->fVsyncOver17, fb->fVsyncOver20);
++		IOLog("MONDRIAN FB: present %u/s avg %llu us max %llu us\n",
++		    fb->fPresentCount, present_avg / 1000, present_max / 1000);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -708,6 +763,8 @@
+ 		fb->fVsyncGapTicks = fb->fVsyncGapMaxTicks = 0;
+ 		fb->fVsyncGapMinTicks = 0;
+ 		fb->fVsyncGapCount = fb->fVsyncOver17 = fb->fVsyncOver20 = 0;
++		fb->fPresentCount = 0;
++		fb->fPresentTicks = fb->fPresentMaxTicks = 0;
+ 	}
+ }
+ 
+@@ -740,24 +797,77 @@
+ 
+ static uint32_t mondrian_fb_swaps_logged;
+ 
+-/* Copy each enabled layer's surface into the panel memory (no scaling). */
++/*
++ * swap(): record the frame the renderer finished; the display tick presents it.
++ *
++ * The copy is 2.8 ms of the 16.7 a frame has, and it used to run on whichever
++ * thread the compositor called from, at whatever time the frame was ready: a
++ * drag measured `late avg 8 ms max 16.5 ms` (ring244), so consecutive copies
++ * landed a whole 8 ms apart in phase and the panel's own refresh quantised
++ * the difference into one or two periods. Doing the copy at the tick makes the
++ * phase constant, and takes the copy off the renderer's critical path: what
++ * swap() keeps is the frame, and `mondrianfb_defer=0` restores the old path.
++ */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+ 	uint64_t began = mach_absolute_time();
+ 	uint64_t late = (fLastVsync != 0 && began > fLastVsync) ? began - fLastVsync : 0;
+-	uint64_t elapsed;
+-	uint64_t lateNs = 0;
+-	bool slowIn;
+ 
+-	absolutetime_to_nanoseconds(late, &lateNs);
+-	slowIn = (lateNs > 40000000ULL);
+-	if (slowIn) {
+-		IOLog("MONDRIAN FB: swap %u enter late %llu us\n", get32(rec, 0x50),
+-		    (unsigned long long)(lateNs / 1000));
+-	}
+ 	fSwapCount++;
++	fLateTicks += late;
++	if (late > fLateMaxTicks) {
++		fLateMaxTicks = late;
++	}
++	/*
++	 * The gap between requests is the producer's cadence, which is what an
++	 * uneven drag shows when the presentations are even.
++	 */
++	if (fLastSwapTicks != 0) {
++		uint64_t gap = began - fLastSwapTicks;
++		uint64_t gapNs = 0;
++
++		absolutetime_to_nanoseconds(gap, &gapNs);
++		fGapTicks += gap;
++		fGapCount++;
++		if (gapNs < 15000000ULL) {
++			fGapUnder15++;
++		} else if (gapNs < 18000000ULL) {
++			fGap15++;
++		} else if (gapNs < 21000000ULL) {
++			fGap18++;
++		} else if (gapNs < 26000000ULL) {
++			fGap21++;
++		} else if (gapNs < 34000000ULL) {
++			fGap26++;
++		} else {
++			fGapOver34++;
++		}
++		if (gap > fGapMaxTicks) {
++			fGapMaxTicks = gap;
++		}
++		if (fGapMinTicks == 0 || gap < fGapMinTicks) {
++			fGapMinTicks = gap;
++		}
++	}
++	fLastSwapTicks = began;
++	if (!fDeferPresent) {
++		present(rec);
++		return;
++	}
++	IOLockLock(fLock);
++	memcpy(fPendingRec, rec, sizeof(fPendingRec));
++	fPendingValid = true;
++	IOLockUnlock(fLock);
++}
++
++/* Copy each enabled layer's surface into the panel memory (no scaling). */
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	uint64_t began = mach_absolute_time();
++	uint64_t elapsed;
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+@@ -1086,59 +1196,10 @@
+ 	}
+ 
+ 	elapsed = mach_absolute_time() - began;
+-	if (slowIn) {
+-		uint64_t ns = 0;
+-
+-		absolutetime_to_nanoseconds(elapsed, &ns);
+-		IOLog("MONDRIAN FB: swap %u exit after %llu us\n", get32(rec, 0x50),
+-		    (unsigned long long)(ns / 1000));
+-	}
+ 	fCopyTicks += elapsed;
+ 	if (elapsed > fCopyMaxTicks) {
+ 		fCopyMaxTicks = elapsed;
+ 	}
+-	/*
+-	 * The per-second rate says how many frames there were, not how evenly
+-	 * they landed: 60 frames can be two at 12 ms and two at 33 ms. The gap
+-	 * between consecutive swaps is what a drag feels, so it is counted here
+-	 * and printed with the rate.
+-	 */
+-	{
+-		uint64_t now = mach_absolute_time();
+-
+-		if (fLastSwapTicks != 0) {
+-			uint64_t gap = now - fLastSwapTicks;
+-			uint64_t gapNs = 0;
+-
+-			absolutetime_to_nanoseconds(gap, &gapNs);
+-			fGapTicks += gap;
+-			fGapCount++;
+-			if (gapNs < 15000000ULL) {
+-				fGapUnder15++;
+-			} else if (gapNs < 18000000ULL) {
+-				fGap15++;
+-			} else if (gapNs < 21000000ULL) {
+-				fGap18++;
+-			} else if (gapNs < 26000000ULL) {
+-				fGap21++;
+-			} else if (gapNs < 34000000ULL) {
+-				fGap26++;
+-			} else {
+-				fGapOver34++;
+-			}
+-			if (gap > fGapMaxTicks) {
+-				fGapMaxTicks = gap;
+-			}
+-			if (fGapMinTicks == 0 || gap < fGapMinTicks) {
+-				fGapMinTicks = gap;
+-			}
+-		}
+-		fLastSwapTicks = now;
+-	}
+-	fLateTicks += late;
+-	if (late > fLateMaxTicks) {
+-		fLateMaxTicks = late;
+-	}
+ }
+ 
+ bool

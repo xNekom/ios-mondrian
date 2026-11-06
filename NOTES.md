@@ -53,27 +53,27 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The lock screen draws and the home screen composites at
-  63-64 fps on the iPhone X's 1125x2436 canvas, the geometry SpringBoard's icon
-  bitmaps fit; the canvas's scaled `swap()` costs 2.9-5.4 ms, the same as the
-  unscaled `memcpy`, and the icon artwork is a `UIImageView` the hook owns
-  (`docs/MONDIAN_GPU.md`). CoreAnimation needs `TimingElements`/`ColorElements`
-  and an `IOAcceleratorES` service (else it waits 30 s and draws nothing);
-  `0114` publishes them. SpringBoard waits on MobileActivation in
-  `_setupActivationState`; the dylib forces activation and skips Setup. The
-  cmdline in `tools/boards.py` carries `mondrian_ui_hook=7`, and the root must
-  have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits at the Apple logo.
-  GPU writes memory once `CP_SET_SECURE_MODE(0)` retires, and the ring wraps the
-  way kgsl wraps it (`0266`).
+- **Display and UI.** The home screen composites at 55-62 fps on the iPhone X's
+  1125x2436 canvas (`docs/MONDIAN_GPU.md`) and the scaled `swap()` costs
+  2.2-2.8 ms. The compositor draws on its own run loop, not once per touch
+  event, and commits in bursts: one pending record per tick held the older
+  frame of a pair for two periods, two present both (`0282`). CoreAnimation
+  needs `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (else
+  it waits 30 s and draws nothing); `0114` publishes them. SpringBoard waits on
+  MobileActivation in `_setupActivationState`; the dylib forces activation and
+  skips Setup. The cmdline in `tools/boards.py` carries `mondrian_ui_hook=15`,
+  and the root must have `/usr/libexec/mondrian-ui-hook.dylib` or the boot sits
+  at the Apple logo. GPU writes memory once `CP_SET_SECURE_MODE(0)` retires,
+  and the ring wraps the way kgsl wraps it (`0266`).
 - **Swap path.** The macOS SDK defines `XNU_TARGET_OS_OSX`, so the pager looked
   for `/System/Volumes/VM/swapfile`; `0098` uses `/private/var/vm/swapfile`.
 
 Current blockers, in order:
 
-1. **GPU rendering: the content.** The home screen composites at 63-64 fps and
-   the hook paints the icon artwork into a `UIImageView` of its own over each
-   icon, because `iconservicesagent` is SIGKILLed at check-in. The wallpaper is
-   Metal and `AGXMetalA11` cannot draw it. Touch works (`0153`, `0156`, `0263`).
+1. **GPU rendering: smoothness.** The hook paints the icon artwork into a
+   `UIImageView` of its own over each icon, because `iconservicesagent` is
+   SIGKILLed at check-in. A drag holds a frame about once a second: the frames
+   the compositor is short. The wallpaper's Metal renderer cannot draw it.
 2. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not read yet.
 3. **Rest.** Audio, USB, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.

@@ -1,0 +1,215 @@
+xnu 0282: two finished frames wait for the tick, so a burst spreads out
+
+One slot is not enough for a bursty renderer. Ring247 counted the records each
+display tick was handed -- 8 a second got two, 8 got none, 44 got one -- and one
+slot can do nothing with either extreme: the pair loses its older frame, and the
+tick after it has nothing and holds the survivor for two periods. A drag then
+moves in steps of 4 ms and 33 ms, which is exactly what the hand reports.
+
+Two slots do. The older frame of a pair goes on the panel at the next tick and
+the newer one at the tick after, so the burst's second frame fills the tick that
+would have been empty: the panel gets one frame every period, the rate the
+renderer produced, in the order it produced it.
+
+Two is also the limit: the compositor alternates two display surfaces, so a
+record held for one period is presented before the surface it names can be drawn
+into again. A record that arrives with both slots full means the renderer is more
+than two frames ahead; the oldest is dropped and counted as `drop` on the present
+line, because the panel should show where the finger is.
+
+The other way -- a swap that waits for the panel before returning, the way a real
+display driver works -- was measured freezing this port's compositor (33 swaps in
+a whole boot), so nothing here waits.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -64,6 +64,13 @@
+ };
+ 
+ #define MONDRIAN_FB_SWAP_REC_SIZE          0x46c
++/*
++ * How many finished frames the tick may hold back. Two is what the
++ * compositor itself keeps: it alternates two display surfaces, so a record
++ * held for one period is presented before the surface it names can be drawn
++ * into again. A third would name a surface the renderer has taken back.
++ */
++#define MONDRIAN_FB_QUEUE                 2
+ #define MONDRIAN_FB_LAYERS                 4
+ #define MONDRIAN_FB_NOTIFY_TYPES           8
+ #define MONDRIAN_FB_NOTIFY_VSYNC           5
+@@ -308,6 +315,16 @@
+ 	IOMemoryMap  *fMap;
+ 	MondrianSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
++	IOLock       *fPresentLock;     /* one writer to the panel at a time */
++	uint64_t      fLastPresentTicks;/* when the panel last got a frame */
++	uint64_t      fPresentGapTicks;
++	uint32_t      fPresentGapCount;
++	uint32_t      fPresentGapOver18;
++	uint32_t      fPresentGapOver30;
++	uint8_t       fQueue[MONDRIAN_FB_QUEUE][MONDRIAN_FB_SWAP_REC_SIZE];
++	uint32_t      fQueueHead;       /* the oldest record */
++	uint32_t      fQueueCount;
++	uint32_t      fQueueDrop;       /* records the queue could not take */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+@@ -400,6 +417,7 @@
+ 		}
+ 	}
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/*
+ 	 * The panel is device memory: write it through the alias the console
+@@ -412,7 +430,8 @@
+ 	    fCanvasWidth * 4, MONDRIAN_FB_FORMAT_BGRA);
+ 	fPixels = (uintptr_t)mondrian_early_fb_va();
+ 	fWorkLoop = IOWorkLoop::workLoop();
+-	if (fLock == NULL || fClients == NULL || fSurface == NULL || fPixels == 0 ||
++	if (fLock == NULL || fPresentLock == NULL || fClients == NULL ||
++	    fSurface == NULL || fPixels == 0 ||
+ 	    fWorkLoop == NULL) {
+ 		IOLog("MONDRIAN FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+@@ -622,23 +641,15 @@
+ 		fb->fTickRec[got < 3 ? got : 3]++;
+ 
+ 		IOLockLock(fb->fLock);
+-		have = fb->fPendingValid;
++		have = fb->fQueueCount != 0;
+ 		if (have) {
+-			memcpy(rec, fb->fPendingRec, sizeof(rec));
+-			fb->fPendingValid = false;
++			memcpy(rec, fb->fQueue[fb->fQueueHead], sizeof(rec));
++			fb->fQueueHead = (fb->fQueueHead + 1) % MONDRIAN_FB_QUEUE;
++			fb->fQueueCount--;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (have) {
+-			uint64_t began = mach_absolute_time();
+-			uint64_t elapsed;
+-
+ 			fb->present(rec);
+-			elapsed = mach_absolute_time() - began;
+-			fb->fPresentCount++;
+-			fb->fPresentTicks += elapsed;
+-			if (elapsed > fb->fPresentMaxTicks) {
+-				fb->fPresentMaxTicks = elapsed;
+-			}
+ 		}
+ 	}
+ 	/*
+@@ -756,8 +767,18 @@
+ 		IOLog("MONDRIAN FB: vsync avg %llu us min %llu us max %llu us over17 %u over20 %u\n",
+ 		    vsync_avg / 1000, vsync_min / 1000, vsync_max / 1000,
+ 		    fb->fVsyncOver17, fb->fVsyncOver20);
+-		IOLog("MONDRIAN FB: present %u/s avg %llu us max %llu us\n",
+-		    fb->fPresentCount, present_avg / 1000, present_max / 1000);
++		IOLog("MONDRIAN FB: present %u/s avg %llu us max %llu us drop %u\n",
++		    fb->fPresentCount, present_avg / 1000, present_max / 1000,
++		    fb->fQueueDrop);
++		if (fb->fPresentGapCount != 0) {
++			uint64_t pgap = 0;
++
++			absolutetime_to_nanoseconds(fb->fPresentGapTicks /
++				    fb->fPresentGapCount, &pgap);
++			IOLog("MONDRIAN FB: pgap avg %llu us over18 %u over30 %u\n",
++				    pgap / 1000, fb->fPresentGapOver18,
++				    fb->fPresentGapOver30);
++		}
+ 		IOLog("MONDRIAN FB: tick rec0 %u rec1 %u rec2 %u rec3 %u gap %u %u %u %u %u %u %u %u\n",
+ 		    fb->fTickRec[0], fb->fTickRec[1], fb->fTickRec[2], fb->fTickRec[3],
+ 		    fb->fSwapGapUs[0], fb->fSwapGapUs[1], fb->fSwapGapUs[2],
+@@ -785,6 +806,9 @@
+ 		fb->fVsyncGapCount = fb->fVsyncOver17 = fb->fVsyncOver20 = 0;
+ 		fb->fPresentCount = 0;
+ 		fb->fPresentTicks = fb->fPresentMaxTicks = 0;
++		fb->fPresentGapTicks = fb->fPresentGapCount = 0;
++		fb->fPresentGapOver18 = fb->fPresentGapOver30 = 0;
++		fb->fQueueDrop = 0;
+ 		fb->fTickRec[0] = fb->fTickRec[1] = 0;
+ 		fb->fTickRec[2] = fb->fTickRec[3] = 0;
+ 	}
+@@ -878,9 +902,28 @@
+ 		present(rec);
+ 		return;
+ 	}
++	/*
++	 * Queue the frame for the tick, oldest first. A period holds one frame, so
++	 * the second record of a burst cannot go on the panel at the tick it
++	 * arrives; the old code kept one record and therefore dropped the older of
++	 * every pair and then held the survivor for two periods, which is the 33 ms
++	 * hold a drag shows (ring247: 8 pairs and 8 empty ticks a second). A second
++	 * slot lets the burst spread over two ticks instead, and the empty tick is
++	 * filled by the frame the burst left over.
++	 */
+ 	IOLockLock(fLock);
+-	memcpy(fPendingRec, rec, sizeof(fPendingRec));
+-	fPendingValid = true;
++	if (fQueueCount == MONDRIAN_FB_QUEUE) {
++		/*
++		 * The renderer is more than two frames ahead of the panel. Drop the
++		 * oldest, not the newest: the panel should show where the finger is.
++		 */
++		fQueueHead = (fQueueHead + 1) % MONDRIAN_FB_QUEUE;
++		fQueueCount--;
++		fQueueDrop++;
++	}
++	memcpy(fQueue[(fQueueHead + fQueueCount) % MONDRIAN_FB_QUEUE], rec,
++	    sizeof(fQueue[0]));
++	fQueueCount++;
+ 	IOLockUnlock(fLock);
+ }
+ 
+@@ -889,9 +932,35 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+-	uint64_t began = mach_absolute_time();
++	uint64_t began;
+ 	uint64_t elapsed;
+ 
++	/*
++	 * Two callers: the tick, and a swap() that has to present at once when
++	 * deferral is off. They write the same memory, so one at a time.
++	 */
++	IOLockLock(fPresentLock);
++	began = mach_absolute_time();
++	/*
++	 * The gap between frames on the panel is the one the hand feels: the
++	 * swap rate says how many were drawn, not whether any was held for two
++	 * periods.
++	 */
++	if (fLastPresentTicks != 0 && began > fLastPresentTicks) {
++		uint64_t gapNs = 0;
++
++		absolutetime_to_nanoseconds(began - fLastPresentTicks, &gapNs);
++		fPresentGapTicks += began - fLastPresentTicks;
++		fPresentGapCount++;
++		if (gapNs > 18000000ULL) {
++			fPresentGapOver18++;
++		}
++		if (gapNs > 30000000ULL) {
++			fPresentGapOver30++;
++		}
++	}
++	fLastPresentTicks = began;
++
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 
+@@ -1223,6 +1292,12 @@
+ 	if (elapsed > fCopyMaxTicks) {
+ 		fCopyMaxTicks = elapsed;
+ 	}
++	fPresentCount++;
++	fPresentTicks += elapsed;
++	if (elapsed > fPresentMaxTicks) {
++		fPresentMaxTicks = elapsed;
++	}
++	IOLockUnlock(fPresentLock);
+ }
+ 
+ bool

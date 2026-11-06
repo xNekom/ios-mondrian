@@ -1,0 +1,125 @@
+xnu 0280: an unattended drag, in the direction the UI actually pages
+
+`mondriandrag=N` swept a synthetic finger vertically near the bottom edge for
+three seconds of every N. On a home screen that gestures at the app switcher,
+and a page that never moves draws nothing, so the sweep measured the frames of
+a finished animation. Its motion also started at the first tick after boot,
+before the UI is up.
+
+The sweep is now horizontal along the middle of the panel, a round trip in two
+seconds, and two boot arguments place it: `mondriandragsweep=S` seconds of
+motion (default 3) and `mondriandragdelay=D` seconds before the first (default
+0). `mondriandrag=100 mondriandragsweep=60 mondriandragdelay=40` gives three
+60 s drags with idle gaps between them, in one boot, with nobody at the phone.
+
+diff --git a/iokit/Kernel/arm/hid/MondrianHID.cpp b/iokit/Kernel/arm/hid/MondrianHID.cpp
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -375,7 +375,10 @@
+ private:
+ 	static void dragFired(OSObject *owner, IOTimerEventSource *sender);
+ 	IOTimerEventSource *fDrag;
+-	UInt32 fDragPeriod;      /* boot-arg mondriandrag, seconds a cycle */
++	UInt32 fDragPeriod;      /* mondriandrag: seconds per cycle */
++	UInt32 fDragSweepS;      /* mondriandragsweep: seconds of motion */
++	UInt32 fDragDelayS;      /* mondriandragdelay: seconds before it */
++	bool fDragActive;        /* the synthetic finger is down */
+ 	UInt32 fDragTick;
+ 	UInt32 fDragSweep;
+ 	IOLock *fLock;
+@@ -485,10 +488,18 @@
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	if (PE_parse_boot_argn("mondriandrag", &fDragPeriod, sizeof(fDragPeriod)) &&
+ 	    fDragPeriod) {
++		fDragSweepS = 3;
++		fDragDelayS = 0;
++		(void)PE_parse_boot_argn("mondriandragsweep", &fDragSweepS,
++		    sizeof(fDragSweepS));
++		(void)PE_parse_boot_argn("mondriandragdelay", &fDragDelayS,
++		    sizeof(fDragDelayS));
++		fDragActive = false;
+ 		fDrag = IOTimerEventSource::timerEventSource(this, &MondrianHIDTouch::dragFired);
+ 		if (fDrag && _hidWorkLoop->addEventSource(fDrag) == kIOReturnSuccess) {
+ 			fDrag->setTimeoutMS(16);
+-			IOLog("MONDRIAN HID: drag every %u s\n", fDragPeriod);
++			IOLog("MONDRIAN HID: drag %u s every %u s after %u s\n",
++			    fDragSweepS, fDragPeriod, fDragDelayS);
+ 		}
+ 	}
+ 	gSweetTouch = this;
+@@ -498,41 +509,56 @@
+ }
+ 
+ /*
+- * Boot-arg mondriandrag=N: a synthetic finger that swipes up from the bottom
+- * edge at the panel rate for three seconds every N seconds. The frame rate
+- * then says whether the UI follows a 60 Hz stream of positions or whether
+- * something else caps it, with no hand on the glass.
++ * Boot-arg mondriandrag=N: a synthetic finger that drags across the middle of
++ * the panel for mondriandragsweep seconds every N seconds, starting
++ * mondriandragdelay seconds in. A drag is the gesture that shows a stutter, so
++ * a phone left alone can still produce the measurement, and the delay lets the
++ * boot finish and the UI come up before the first sweep.
++ *
++ * The swipe is horizontal: that is the gesture that pages the home screen. A
++ * vertical one at the bottom edge opens the app switcher instead, and an
++ * animation that has finished drawing says nothing about the cadence.
+  */
+ void
+ MondrianHIDTouch::dragFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	MondrianHIDTouch *self = (MondrianHIDTouch *)owner;
+-	UInt32 sweep = 3 * 62;                  /* 3 s of motion */
+ 	UInt32 cycle = self->fDragPeriod * 62;
++	UInt32 sweep = self->fDragSweepS * 62;
++	UInt32 delay = self->fDragDelayS * 62;
+ 	UInt32 t = self->fDragTick % cycle;
+ 	uint64_t ns = 0;
+-	int y;
++	int x;
+ 
+-	if (t < sweep) {
++	if (cycle == 0) {
++		sender->setTimeoutMS(16);
++		return;
++	}
++	if (t >= delay && t < delay + sweep) {
+ 		/*
+-		 * Up for a second, back down for a second, three times. A
+-		 * monotonic swipe follows the finger until the animation it drives
+-		 * saturates and then stops drawing; this one keeps it moving for
+-		 * the whole sweep.
++		 * One round trip along the middle of the panel every two seconds:
++		 * right in a second, back in the next. A monotonic swipe pans the page
++		 * until the edge stops it, and the frames that follow say nothing; a
++		 * round trip keeps it moving for the whole sweep.
+ 		 */
+-		UInt32 k = t % 62;
+-		y = (k < 31) ? 31000 - (int)(k * 322) : 21000 + (int)((k - 31) * 322);
+-		self->touch(0, true, 7200, y);
+-		if (t == 0) {
++		UInt32 k = (t - delay) % 124;
++		int lo = 3000, hi = 11400;
++
++		x = (k < 62) ? lo + (hi - lo) * (int)k / 61 :
++			    hi - (hi - lo) * (int)(k - 62) / 61;
++		self->touch(0, true, x, 16000);
++		if (!self->fDragActive) {
++			self->fDragActive = true;
+ 			absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 			IOLog("MONDRIAN HID: drag sweep %u start %llu\n", self->fDragSweep,
+-			    ns / 1000);
++				    ns / 1000);
+ 		}
+-	} else if (t == sweep) {
+-		self->touch(0, false, 7200, 21000);
++	} else if (self->fDragActive) {
++		self->fDragActive = false;
++		self->touch(0, false, 7200, 16000);
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+ 		IOLog("MONDRIAN HID: drag sweep %u end %llu\n", self->fDragSweep++,
+-		    ns / 1000);
++			    ns / 1000);
+ 	}
+ 	self->fDragTick++;
+ 	sender->setTimeoutMS(16);

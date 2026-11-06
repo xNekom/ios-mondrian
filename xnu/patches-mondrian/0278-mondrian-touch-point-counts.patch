@@ -1,0 +1,67 @@
+xnu 0278: name the points each read carried, and the last event intervals
+
+The event histogram says the positions arrive in pairs 5 ms apart and then stop
+for 28 ms (ring244: `ev 60/s`, `lt10 26 ... 25-34 26`), which is not a cadence a
+display tick can explain. A read that reports two points alternates between two
+finger ids, and the driver then sends a down for one and an up for the other on
+every tick -- exactly the pair-and-pause a drag feels as a stutter.
+
+The ev line now carries the number of reads that saw 0, 1, ... points and the
+last eight intervals in microseconds, so one boot says whether the part reports
+one finger or alternates ids.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1094,6 +1094,15 @@
+ static uint64_t mondrian_touch_event_gap_max;
+ static uint32_t mondrian_touch_event_gap_count;
+ static uint32_t mondrian_touch_event_gaps[6];
++/*
++ * How many points each read of the report block carried, and the last few
++ * event intervals in microseconds. A drag that steps can be one finger whose
++ * reports alternate between two point ids as easily as it can be a slow
++ * renderer, and the buckets hide both.
++ */
++static uint32_t mondrian_touch_points[6];
++static uint32_t mondrian_touch_gap_us[8];
++static uint32_t mondrian_touch_gap_index;
+ 
+ static void
+ mondrian_touch_event_gap(void)
+@@ -1105,6 +1114,8 @@
+ 		uint64_t gap = now - mondrian_touch_last_event;
+ 
+ 		absolutetime_to_nanoseconds(gap, &ns);
++		mondrian_touch_gap_us[mondrian_touch_gap_index++ & 7] =
++			    (uint32_t)(ns / 1000);
+ 		mondrian_touch_event_gap_ticks += gap;
+ 		mondrian_touch_event_gap_count++;
+ 		if (gap > mondrian_touch_event_gap_max) {
+@@ -1144,6 +1155,18 @@
+ 		mondrian_touch_event_gaps[0], mondrian_touch_event_gaps[1],
+ 		mondrian_touch_event_gaps[2], mondrian_touch_event_gaps[3],
+ 		mondrian_touch_event_gaps[4], mondrian_touch_event_gaps[5]);
++	printf("MONDRIAN TOUCH: points r0 %u r1 %u r2 %u r3 %u r4 %u r5 %u"
++		    " last %u %u %u %u %u %u %u %u\n",
++		mondrian_touch_points[0], mondrian_touch_points[1],
++		mondrian_touch_points[2], mondrian_touch_points[3],
++		mondrian_touch_points[4], mondrian_touch_points[5],
++		mondrian_touch_gap_us[0], mondrian_touch_gap_us[1],
++		mondrian_touch_gap_us[2], mondrian_touch_gap_us[3],
++		mondrian_touch_gap_us[4], mondrian_touch_gap_us[5],
++		mondrian_touch_gap_us[6], mondrian_touch_gap_us[7]);
++	for (i = 0; i < 6; i++) {
++		mondrian_touch_points[i] = 0;
++	}
+ 	mondrian_touch_event_gap_ticks = 0;
+ 	mondrian_touch_event_gap_max = 0;
+ 	mondrian_touch_event_gap_count = 0;
+@@ -1705,6 +1728,7 @@
+ 			(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
+ 			mondrian_touch_reports_read++;
+ 			num = head[2] & 0x0f;
++			mondrian_touch_points[num < 5 ? num : 5]++;
+ 			if (num > MONDRIAN_TOUCH_FINGERS) {
+ 				num = MONDRIAN_TOUCH_FINGERS;
+ 			}

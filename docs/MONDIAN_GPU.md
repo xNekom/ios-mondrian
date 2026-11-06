@@ -3,8 +3,9 @@
 The UI renders through the GPU: the draw completes, the frame is drawn in
 place (no readback, no copy), and a burst of frames runs at the panel's 60 Hz
 (11-17 ms apart, `glframes=1`). What the user feels is not rasterisation but
-when a frame is asked for: the compositor draws once per touch event, and the
-touch path delivered the part's report rate (see "A lock-screen frame" below).
+whether a finished frame reaches the panel at the tick it was made for: the
+compositor commits in bursts on a clock of its own, so the frames are fitted to
+the free-running panel with a two-deep queue (see "The cadence" below).
 The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
@@ -960,6 +961,45 @@ them has Metal. That is the path this port follows.
   block) takes the scale to `1.6..2.1 ms` and the whole swap to `2.2..2.8 ms`
   (ring241), against the 2.85 ms the unscaled panel pays for its `memcpy`. The
   iPhone X geometry is the default in `tools/boards.py`.
+
+  A rate is not a cadence, and the frame rate was the last thing to blame for a
+  drag that stepped. The fake vsync re-armed itself with `setTimeoutUS(16667)`
+  at the end of its own callback, so every period was that plus the callback's
+  duration, and a slow callback moved every later tick with it: a drag measured
+  `fps 59` and `gap avg 17709 us`, with a third of the intervals between 20 and
+  33 ms (ring242). `0274` arms the timer against a deadline chain -- `fNextVsync`
+  advances by exactly 1/HZ, and a deadline an overrun passed is skipped rather
+  than fired in a burst -- and prints it as `vsync avg/min/max` (ring243:
+  `avg 16666`, min/max `15.7/17.7 ms`, `over17` 0-4 a second). The finer frame
+  histogram named the rest: one second of a drag read `lt15 23 15-18 12 18-21 9
+  21-26 8 26-34 4 gt34 2` -- frames 8 ms and 21 ms apart in turn -- and the
+  cause was the input, not the renderer. The UI redraws once per touch event,
+  and the report thread woke about twice a frame and published a position on
+  every wake: 85-120 events a second, `ev gap avg 11.7 ms` with 27 of the
+  intervals under 10 ms (ring243), a step, a half step, a step. `0276` counts
+  display ticks in `mondrian_touch_vsync()` and publishes the newest position
+  once per tick, so a frame's worth of motion is one event however often the
+  thread wakes; reading still drains the part (360 reports a second measured).
+  A drag that steps while `fps` reads 60 is an input-cadence problem: read
+  `ev gap` before touching the renderer.
+
+  The presentation was the rest of it, and it was one slot deep. `0279` moved
+  the copy to the display tick, and `0281` counted what each tick was handed: in
+  a drag, 8 ticks a second got two finished records and 8 got none (ring247). One
+  pending slot can only drop the older of a pair and then hold the survivor for
+  two periods, so the panel shows 4 ms and then 33 ms, which is the step the hand
+  reports -- the fps line reads 60 and the cadence is wrong. `0282` keeps two
+  finished records, presents the older at the next tick and the newer at the tick
+  after, and a burst spreads out instead of collapsing. Measured over 64 s of a
+  horizontal drag (ring251): 3591 frames drawn and 3590 presented, `drop 0`, and
+  `pgap over30` -- frames the panel held for two periods -- 8 a second before and
+  1.3 after. What is left is arithmetic: a renderer that produces 59 frames a
+  second cannot fill 60 ticks without holding one, and `pgap over18` equals
+  `pgap over30`, i.e. there is no 18-30 ms hold at all, only the ticks that were
+  handed nothing. Two slots is a limit, not a tuning choice: the compositor
+  alternates two display surfaces, so a record held longer than one period would
+  name a surface that has already been drawn into again (and `drop` stayed 0, so
+  a third slot would never have been used).
 
   Where the artwork goes, when it is injected by hand -- and why it cannot be
   SpringBoard's own view. `-[SBIconView iconImageView]` answers without an image

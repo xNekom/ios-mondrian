@@ -1,0 +1,150 @@
+xnu 0276: publish one touch position for each display tick
+
+The panel follows the events: a drag redraws once per position it is handed, so
+the spacing of the events is the spacing of the motion. The report thread wakes
+on its own `tsleep()` timeout about twice a frame and used to hand the UI a
+position on every wake -- measured, ring243: 85-120 events a second with `ev gap
+avg 11.7 ms` and 27 of the intervals under 10 ms, i.e. a step, a half step, a
+step. No frame rate fixes that: the content itself advances unevenly.
+
+`mondrian_touch_vsync()` now counts the display ticks, and the thread publishes
+the newest position once per tick and never in between. Reading is unchanged --
+every wake still drains the part (360 reports a second measured), so the
+position published at a tick is the freshest one, and a finger that lifts
+between ticks is still reported up at the next one.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1174,10 +1174,17 @@
+  * fire on this board (the sampler has the same problem and is ticked from the
+  * framebuffer). Wake it from the vsync timer instead, so the part is read at
+  * the panel rate and not at whatever rate the broken timer allows.
++ *
++ * The display timer is also the event clock: one position for each tick, and
++ * none in between. The thread still wakes on its own timeout about twice a
++ * frame, and every one of those wakes used to hand the UI a position.
+  */
++static uint32_t mondrian_touch_ticks;
++
+ void
+ mondrian_touch_vsync(void)
+ {
++	mondrian_touch_ticks++;
+ 	if (mondrian_touch_data_addr != 0) {
+ 		wakeup((caddr_t)&mondrian_touch_data_addr);
+ 	}
+@@ -1643,7 +1650,9 @@
+ 	uint8_t head[8], point_buf[2 + MONDRIAN_TOUCH_FINGERS * MONDRIAN_TOUCH_POINT_LEN];
+ 	uint8_t was[MONDRIAN_TOUCH_FINGERS], now[MONDRIAN_TOUCH_FINGERS];
+ 	int16_t last_x[MONDRIAN_TOUCH_FINGERS], last_y[MONDRIAN_TOUCH_FINGERS];
++	int16_t sent_x[MONDRIAN_TOUCH_FINGERS], sent_y[MONDRIAN_TOUCH_FINGERS];
+ 	uint32_t reports = 0, i;
++	uint32_t emitted_tick = 0;
+ 	int finger, num, point;
+ 	uint8_t zero = 0;
+ 
+@@ -1654,12 +1663,16 @@
+ 		now[i] = 0;
+ 		last_x[i] = 0;
+ 		last_y[i] = 0;
++		sent_x[i] = (int16_t)-1;
++		sent_y[i] = (int16_t)-1;
+ 	}
+ 	for (;;) {
+-		int passes, read_one = 0;
++		int passes;
++		uint32_t tick;
+ 
+ 		(void)tsleep((caddr_t)&mondrian_touch_data_addr, PZERO - 1, "mtouch", 1);
+ 		mondrian_touch_polls++;
++		tick = mondrian_touch_ticks;
+ 		/*
+ 		 * Drain what the part has queued. Its line stays low while a report
+ 		 * waits and one zero byte at the report address releases it, so a
+@@ -1689,7 +1702,6 @@
+ 			    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
+ 				break;
+ 			}
+-			read_one = 1;
+ 			(void)mondrian_goodix_read(mondrian_touch_data_addr, head, sizeof(head));
+ 			mondrian_touch_reports_read++;
+ 			num = head[2] & 0x0f;
+@@ -1727,41 +1739,46 @@
+ 			}
+ 		}
+ 		/*
+-		 * One event a finger a tick. The lock screen redraws once per touch
+-		 * event (measured: panel swaps 32 in the second the part answered 32
+-		 * reports, 7 when it answered 7, 3 when it answered 3), so a tick
+-		 * that had a finger down and no new report still owes the UI the
+-		 * position it already knows -- that is what turns a drag into 60
+-		 * positions a second instead of the part's report rate.
++		 * One event a finger, and only at a display tick. The UI redraws once
++		 * per touch event (measured: panel swaps follow the reports answered), and
++		 * the thread wakes about twice a frame, so answering every wake delivers
++		 * 85-120 positions a second at 8 and 17 ms spacings (ring243: `ev gap avg
++		 * 11.7 ms, 27 of them under 10 ms`). The content then advances two steps
++		 * on some frames and one on others, which is a drag that jerks even when
++		 * the frames themselves are even. Reading still happens on every wake;
++		 * what a tick publishes is the newest position, once.
+ 		 */
+-		for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
+-			if (read_one && now[finger]) {
+-				mondrian_touch_event_gap();
+-				mondrian_touch_events++;
+-				mondrian_hid_touch(finger, 1, last_x[finger],
+-				    last_y[finger]);
+-				if (reports < 30) {
+-					printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
+-					    reports, finger, last_x[finger],
++		if (tick != emitted_tick) {
++			emitted_tick = tick;
++			for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
++				if (now[finger]) {
++					mondrian_touch_event_gap();
++					mondrian_touch_events++;
++					mondrian_hid_touch(finger, 1, last_x[finger],
+ 					    last_y[finger]);
++					if (sent_x[finger] == last_x[finger] &&
++					    sent_y[finger] == last_y[finger]) {
++						mondrian_touch_repeats++;
++					}
++					sent_x[finger] = last_x[finger];
++					sent_y[finger] = last_y[finger];
++					if (reports < 30) {
++						printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
++						    reports, finger, last_x[finger],
++						    last_y[finger]);
++					}
++				} else if (was[finger]) {
++					mondrian_touch_event_gap();
++					mondrian_touch_events++;
++					mondrian_hid_touch(finger, 0, last_x[finger],
++					    last_y[finger]);
++					if (reports < 30) {
++						printf("MONDRIAN TOUCH: report %u finger %d up\n",
++						    reports, finger);
++					}
+ 				}
+-			} else if (read_one && was[finger] && !now[finger]) {
+-				mondrian_touch_event_gap();
+-				mondrian_touch_events++;
+-				mondrian_hid_touch(finger, 0, last_x[finger],
+-				    last_y[finger]);
+-				if (reports < 30) {
+-					printf("MONDRIAN TOUCH: report %u finger %d up\n",
+-					    reports, finger);
+-				}
+-			} else if (!read_one && was[finger]) {
+-				mondrian_touch_event_gap();
+-				mondrian_touch_events++;
+-				mondrian_hid_touch(finger, 1, last_x[finger],
+-				    last_y[finger]);
+-				mondrian_touch_repeats++;
++				was[finger] = now[finger];
+ 			}
+-			was[finger] = now[finger];
+ 		}
+ 		if (reports < 30) {
+ 			mondrian_log_flush_now();
