@@ -1,0 +1,97 @@
+xnu 0272: the canvas scale in 16-byte lanes
+
+The 32/25 block was already spelled out, but it still cost a scalar load per
+output pixel: 32 loads and 8 stores per 32 pixels, 4-5 ms a swap (ring240), and
+the frames that arrive just past their vsync are what a drag feels as steps.
+
+Each group of four outputs reads four consecutive source bytes at a constant
+offset inside the 25-pixel (100-byte) block, so one 16-byte load per group and
+one byte shuffle is the whole job: 8 loads, 6 shuffles and 8 stores per block,
+and clang lowers each shuffle to a single `tbl`. The pattern is the same
+floor(i * 25 / 32) the scalar version spelled out.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -244,6 +244,9 @@
+ 	uint32_t v[4];
+ } __attribute__((aligned(16))) mondrian_px4;
+ 
++/* A 16-byte lane for the canvas scale; clang lowers the shuffles below to tbl. */
++typedef uint8_t mondrian_v16 __attribute__((vector_size(16)));
++
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+@@ -818,24 +821,54 @@
+ 				uint32_t *dp = drow;
+ 
+ 				for (uint32_t bx = 0; bx < fWidth; bx += 32, sp += 25, dp += 32) {
+-					mondrian_px4 q;
++					mondrian_v16 a, b, c, d, e, f, g, h;
+ 
+-					q.v[0] = sp[0];  q.v[1] = sp[0];  q.v[2] = sp[1];  q.v[3] = sp[2];
+-					*(mondrian_px4 *)(dp + 0) = q;
+-					q.v[0] = sp[3];  q.v[1] = sp[3];  q.v[2] = sp[4];  q.v[3] = sp[5];
+-					*(mondrian_px4 *)(dp + 4) = q;
+-					q.v[0] = sp[6];  q.v[1] = sp[7];  q.v[2] = sp[7];  q.v[3] = sp[8];
+-					*(mondrian_px4 *)(dp + 8) = q;
+-					q.v[0] = sp[9];  q.v[1] = sp[10]; q.v[2] = sp[10]; q.v[3] = sp[11];
+-					*(mondrian_px4 *)(dp + 12) = q;
+-					q.v[0] = sp[12]; q.v[1] = sp[13]; q.v[2] = sp[14]; q.v[3] = sp[14];
+-					*(mondrian_px4 *)(dp + 16) = q;
+-					q.v[0] = sp[15]; q.v[1] = sp[16]; q.v[2] = sp[17]; q.v[3] = sp[17];
+-					*(mondrian_px4 *)(dp + 20) = q;
+-					q.v[0] = sp[18]; q.v[1] = sp[19]; q.v[2] = sp[20]; q.v[3] = sp[21];
+-					*(mondrian_px4 *)(dp + 24) = q;
+-					q.v[0] = sp[21]; q.v[1] = sp[22]; q.v[2] = sp[23]; q.v[3] = sp[24];
+-					*(mondrian_px4 *)(dp + 28) = q;
++					/*
++					 * One 16-byte load per output group, then one byte shuffle:
++					 * the block is 25 pixels (100 bytes) and each group of four
++					 * outputs reads four consecutive bytes of it at a constant
++					 * offset, so clang turns each shuffle into a single `tbl`.
++					 * The scalar version loaded 32 words and stored 8 vectors;
++					 * this loads 8 vectors and does 6 shuffles.
++					 */
++					__builtin_memcpy(&a, (const uint8_t *)sp + 0, 16);
++					__builtin_memcpy(&b, (const uint8_t *)sp + 12, 16);
++					__builtin_memcpy(&c, (const uint8_t *)sp + 24, 16);
++					__builtin_memcpy(&d, (const uint8_t *)sp + 36, 16);
++					__builtin_memcpy(&e, (const uint8_t *)sp + 48, 16);
++					__builtin_memcpy(&f, (const uint8_t *)sp + 60, 16);
++					__builtin_memcpy(&g, (const uint8_t *)sp + 72, 16);
++					__builtin_memcpy(&h, (const uint8_t *)sp + 84, 16);
++
++					/*
++					 * The block's source index for output i is floor(i * 25 /
++					 * 32): 0,0,1,2 / 3,3,4,5 / 6,7,7,8 / 9,10,10,11 /
++					 * 12,13,14,14 / 15,16,17,17 / 18,19,20,21 / 21,22,23,24.
++					 */
++					{
++						mondrian_v16 o;
++
++						o = __builtin_shufflevector(a, a,
++						    0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 0, &o, 16);
++						o = __builtin_shufflevector(b, b,
++						    0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 4, &o, 16);
++						o = __builtin_shufflevector(c, c,
++						    0, 1, 2, 3, 4, 5, 6, 7, 4, 5, 6, 7, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 8, &o, 16);
++						o = __builtin_shufflevector(d, d,
++						    0, 1, 2, 3, 4, 5, 6, 7, 4, 5, 6, 7, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 12, &o, 16);
++						o = __builtin_shufflevector(e, e,
++						    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 16, &o, 16);
++						o = __builtin_shufflevector(f, f,
++						    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 9, 10, 11);
++						__builtin_memcpy(dp + 20, &o, 16);
++						__builtin_memcpy(dp + 24, &g, 16);
++						__builtin_memcpy(dp + 28, &h, 16);
++					}
+ 				}
+ 				csyacc += s->height;
+ 				while (csyacc >= fHeight) {

@@ -1,0 +1,172 @@
+xnu 0270: put the touch report rate on the fps line, and name the scan rates
+
+The UI's frame rate follows the digitizer, not the renderer: SpringBoard redraws
+once per touch event, so a part that answers four reports a second turns a drag
+into four steps, and no amount of compositor work fixes that. Two numbers were
+missing to tell it apart from a slow renderer, so the fps line now carries
+`poll N/s` (report-thread wakeups) and `ev N/s` (events handed to the HID side)
+beside `touch`/`rep`, and the IC info pass logs the scan rates the part is
+configured with -- the idle rate is what a drag is stuck at if it never leaves
+it.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1074,6 +1074,27 @@
+ 	return mondrian_touch_repeats;
+ }
+ 
++/*
++ * Wakeups the report thread served, and the events it handed to the HID
++ * side. The three numbers together say where a drag stalls: a low poll rate
++ * means the thread is not being woken, a high poll rate with few reports
++ * means the part is barely producing them, and few events with both high
++ * means the thread is stuck in the drain loop.
++ */
++static uint32_t mondrian_touch_events;
++
++uint32_t
++mondrian_touch_poll_count(void)
++{
++	return mondrian_touch_polls;
++}
++
++uint32_t
++mondrian_touch_event_count(void)
++{
++	return mondrian_touch_events;
++}
++
+ #define MONDRIAN_TOUCH_POINT_LEN	8
+ #define MONDRIAN_TOUCH_FINGERS		10
+ 
+@@ -1110,6 +1131,8 @@
+ 	uint8_t info[256], counts[5];
+ 	uint32_t i, off, misc, addr;
+ 	uint16_t length, head, point;
++	uint16_t rates[8];
++	uint32_t nr = 0, j;
+ 
+ 	for (i = 0; i < sizeof(info); i++) {
+ 		info[i] = 0;
+@@ -1134,6 +1157,13 @@
+ 			    counts[i], off);
+ 			return -1;
+ 		}
++		if (i == 0) {
++			nr = counts[0];
++			for (j = 0; j < nr; j++) {
++				rates[j] = (uint16_t)(info[off + j * 2] |
++				    (info[off + j * 2 + 1] << 8));
++			}
++		}
+ 		off += counts[i] * 2;
+ 	}
+ 	misc = off;
+@@ -1153,6 +1183,24 @@
+ 	    " data 0x%x head %u point %u cmd 0x%x/%u\n", length, counts[0], counts[1],
+ 	    counts[2], counts[3], counts[4], misc, addr, head, point,
+ 	    mondrian_touch_cmd_addr, mondrian_touch_cmd_len);
++	/*
++	 * The parm block lists the scan rates the part is configured for, and the
++	 * panel swaps follow the report rate: a part left at its idle rate turns
++	 * a drag into a handful of steps a second whatever the renderer does.
++	 */
++	{
++		char line[160];
++		int n = snprintf(line, sizeof(line), "MONDRIAN TOUCH: scan rates %u:",
++		    nr);
++
++		for (j = 0; j < nr && n > 0 && n < (int)sizeof(line) - 8; j++) {
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " %u", rates[j]);
++		}
++		if (n > 0 && n < (int)sizeof(line) - 2) {
++			snprintf(line + n, sizeof(line) - (size_t)n, " Hz\n");
++			printf("%s", line);
++		}
++	}
+ 	if (addr != 0 && head >= 8 && head <= 32 && point == MONDRIAN_TOUCH_POINT_LEN) {
+ 		mondrian_touch_data_addr = addr;
+ 		mondrian_log_flush_now();
+@@ -1603,6 +1651,7 @@
+ 		 */
+ 		for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
+ 			if (read_one && now[finger]) {
++				mondrian_touch_events++;
+ 				mondrian_hid_touch(finger, 1, last_x[finger],
+ 				    last_y[finger]);
+ 				if (reports < 30) {
+@@ -1611,6 +1660,7 @@
+ 					    last_y[finger]);
+ 				}
+ 			} else if (read_one && was[finger] && !now[finger]) {
++				mondrian_touch_events++;
+ 				mondrian_hid_touch(finger, 0, last_x[finger],
+ 				    last_y[finger]);
+ 				if (reports < 30) {
+@@ -1618,6 +1668,7 @@
+ 					    reports, finger);
+ 				}
+ 			} else if (!read_one && was[finger]) {
++				mondrian_touch_events++;
+ 				mondrian_hid_touch(finger, 1, last_x[finger],
+ 				    last_y[finger]);
+ 				mondrian_touch_repeats++;
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -78,6 +78,8 @@
+ extern "C" void mondrian_touch_vsync(void);
+ extern "C" uint32_t mondrian_touch_report_count(void);
+ extern "C" uint32_t mondrian_touch_repeat_count(void);
++extern "C" uint32_t mondrian_touch_poll_count(void);
++extern "C" uint32_t mondrian_touch_event_count(void);
+ /* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
+ extern "C" uint64_t mondrian_early_fb_va(void);
+ extern "C" int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
+@@ -262,6 +264,8 @@
+ 	uint64_t            fLateMaxTicks;
+ 	uint32_t            fTouchRate;      /* touch reports read in the last second */
+ 	uint32_t            fTouchRepeatRate;/* moves re-sent from the last position */
++	uint32_t            fTouchPollRate;  /* report-thread wakeups per second */
++	uint32_t            fTouchEventRate; /* events handed to the HID side */
+ 	bool                fFpsLog;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+@@ -521,16 +525,23 @@
+ 	 */
+ 	{
+ 		static uint32_t touched_last, repeated_last;
++		static uint32_t polls_last, events_last;
+ 
+ 		mondrian_touch_vsync();
+ 		if ((count % MONDRIAN_FB_REFRESH_HZ) == 0) {
+ 			uint32_t now_reports = mondrian_touch_report_count();
+ 			uint32_t now_repeats = mondrian_touch_repeat_count();
++			uint32_t now_polls = mondrian_touch_poll_count();
++			uint32_t now_events = mondrian_touch_event_count();
+ 
+ 			fb->fTouchRate = now_reports - touched_last;
+ 			fb->fTouchRepeatRate = now_repeats - repeated_last;
++			fb->fTouchPollRate = now_polls - polls_last;
++			fb->fTouchEventRate = now_events - events_last;
+ 			touched_last = now_reports;
+ 			repeated_last = now_repeats;
++			polls_last = now_polls;
++			events_last = now_events;
+ 		}
+ 	}
+ 	/*
+@@ -561,9 +572,10 @@
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us\n",
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us poll %u/s ev %u/s\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+-		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000);
++		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000,
++		    fb->fTouchPollRate, fb->fTouchEventRate);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],

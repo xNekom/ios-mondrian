@@ -1247,12 +1247,13 @@ mondrian_icon_late_report(void)
 
 /*
  * The artwork the pipeline never produced, from the app's own bundle. The
- * bundle path comes from the model's application object; the file names are
- * the ones this userland ships (the 60 pt @2x pair is the home screen's).
+ * bundle path comes from the model's application object. The canvas is a 3x
+ * geometry (1125x2436 = 375x812 pt), so the @3x file is the one whose pixels
+ * land on canvas pixels; the @2x pair is the fallback and is visibly softer.
  */
 static const char *const mondrian_icon_files[] = {
-	"AppIcon60x60@2x.png",
 	"AppIcon60x60@3x.png",
+	"AppIcon60x60@2x.png",
 	"AppIcon76x76@2x~ipad.png",
 	"Icon-60@2x.png",
 	"Icon-72@2x.png",
@@ -1374,6 +1375,24 @@ mondrian_icon_force_artwork(void)
 			    image_view, sel_registerName("initWithFrame:"), bounds);
 			((void (*)(id, SEL, long))objc_msgSend)(image_view,
 			    sel_registerName("setTag:"), (long)MONDRIAN_ICON_TAG);
+			/*
+			 * An app-icon PNG is a full square; SpringBoard masks it
+			 * with a continuous-corner shape. The radius is the same
+			 * silhouette to the eye, and the compositor pays nothing
+			 * for it on this port.
+			 */
+			{
+				id layer = mondrian_send(image_view, "layer");
+
+				if (layer != NULL) {
+					((void (*)(id, SEL, double))objc_msgSend)(
+					    layer, sel_registerName("setCornerRadius:"),
+					    (double)bounds.size.width * 0.2237);
+					((void (*)(id, SEL, BOOL))objc_msgSend)(
+					    image_view, sel_registerName("setClipsToBounds:"),
+					    YES);
+				}
+			}
 			((void (*)(id, SEL, id))objc_msgSend)(view,
 			    sel_registerName("addSubview:"), image_view);
 			snprintf(line, sizeof(line),
@@ -1701,6 +1720,119 @@ mondrian_log_device_state(void)
  * so an empty walk retries (ten ticks, twenty seconds) instead of spending the
  * one probe on a tree that had nothing in it yet.
  */
+/*
+ * The dock bar is a translucent backdrop and its corners arrive square: the
+ * icons the hook paints are rounded, the bar is not, because the blur is
+ * painted by a layer nothing masked. Round every view whose class carries
+ * "Dock" and let the log name it, so the next boot says whether the radius
+ * landed on the bar or on a container that does not paint.
+ */
+static unsigned
+mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
+{
+	static int told;
+	static int subs_told;
+	unsigned done = 0;
+	const char *name = view != NULL ? object_getClassName(view) : NULL;
+	id subs;
+	unsigned n, i;
+
+	if (view == NULL || depth > 16 || *seen >= MONDRIAN_ICON_VISITS) {
+		return 0;
+	}
+	(*seen)++;
+	if (name != NULL && strcasestr(name, "Dock") != NULL) {
+		CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("frame"));
+		id layer = mondrian_send(view, "layer");
+		id kids = mondrian_send(view, "subviews");
+		unsigned kn = kids != NULL ? (unsigned)[(NSArray *)kids count] : 0;
+		double radius = frame.size.height * 0.3;
+		unsigned k;
+
+		if (!told) {
+			char line[192];
+
+			told = 1;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: dock %s %.0fx%.0f at %.0f,%.0f"
+			    " subviews %u radius %.1f\n",
+			    name, frame.size.width, frame.size.height,
+			    frame.origin.x, frame.origin.y, kn, radius);
+			say(line);
+		}
+		if (layer != NULL && radius > 0.0) {
+			((void (*)(id, SEL, double))objc_msgSend)(layer,
+			    sel_registerName("setCornerRadius:"), radius);
+			done++;
+		}
+		/*
+		 * The bar itself is a backdrop that outgrows the dock's bounds by a
+		 * few points, so clipping the dock cuts it at the sides (measured).
+		 * The radius belongs on whatever fills the dock, and that view can
+		 * clip its own children.
+		 */
+		for (k = 0; k < kn; k++) {
+			id sub = [(NSArray *)kids objectAtIndex:k];
+			CGRect sf = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+			    sel_registerName("frame"));
+			id sl;
+
+			if (sf.size.width * sf.size.height <
+			    frame.size.width * frame.size.height * 0.5) {
+				continue;
+			}
+			if (subs_told < 6) {
+				char line[160];
+				const char *sn = object_getClassName(sub);
+
+				subs_told++;
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: dock sub %u %s %.0fx%.0f at %.0f,%.0f\n",
+				    k, sn != NULL ? sn : "?", sf.size.width, sf.size.height,
+				    sf.origin.x, sf.origin.y);
+				say(line);
+			}
+			sl = mondrian_send(sub, "layer");
+			if (sl == NULL || radius <= 0.0) {
+				continue;
+			}
+			((void (*)(id, SEL, double))objc_msgSend)(sl,
+			    sel_registerName("setCornerRadius:"), radius);
+			((void (*)(id, SEL, BOOL))objc_msgSend)(sub,
+			    sel_registerName("setClipsToBounds:"), YES);
+			done++;
+		}
+	}
+	subs = mondrian_send(view, "subviews");
+	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		done += mondrian_dock_walk([(NSArray *)subs objectAtIndex:i],
+		    depth + 1, seen);
+	}
+	return done;
+}
+
+static void
+mondrian_dock_round(void)
+{
+	id app = [objc_getClass("UIApplication") sharedApplication];
+	id windows = app != NULL ? [app windows] : nil;
+	unsigned count = windows != NULL ? (unsigned)[(NSArray *)windows count] : 0;
+	unsigned i;
+
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+		unsigned seen = 0;
+
+		if (name == NULL || strcasestr(name, "HomeScreenWindow") == NULL) {
+			continue;
+		}
+		mondrian_dock_walk(window, 0, &seen);
+	}
+}
+
 static void
 mondrian_icon_probe_once(void)
 {
@@ -1729,6 +1861,7 @@ mondrian_icon_probe_once(void)
 	if (!boot_arg_set("mondrianiconset=0")) {
 		mondrian_icon_force_artwork();
 	}
+	mondrian_dock_round();
 	/*
 	 * And once more, later: the artwork is what the icon list does with the
 	 * model a few seconds after it exists, so a view that answers `image 0`
@@ -1828,6 +1961,11 @@ mondrian_lock_step(void *context)
 			mondrian_hide_wallpaper();
 		}
 		mondrian_icon_probe_once();
+		/*
+		 * SpringBoard rebuilds the dock when the layout changes, and a
+		 * radius put on the old view goes with it: re-apply on every tick.
+		 */
+		mondrian_dock_round();
 		return;
 	}
 	if (!mondrian_unlock_enabled) {

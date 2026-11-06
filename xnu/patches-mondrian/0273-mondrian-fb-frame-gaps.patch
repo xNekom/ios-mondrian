@@ -1,0 +1,97 @@
+xnu 0273: count the interval between frames, not just the rate
+
+A rate hides cadence: 60 swaps a second is smooth if they land 16.6 ms apart and
+a stutter if they alternate 12/22, and the panel picks a frame up at the next
+vsync, so what the eye sees is the gap, not the average. Each swap now records
+the interval since the previous one and the fps line prints `gap avg`/`gap max`
+with the number of intervals in 20-33 ms (a frame that slipped) and over 33 ms
+(a frame lost). `fLastSwapTicks` is zeroed with the other counters only after the
+line is printed, so the first gap of each second is the real one.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -265,6 +265,12 @@
+ 	uint64_t            fScaleTicks;    /* canvas scale inside swap() */
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
++	uint64_t            fLastSwapTicks; /* swap entry of the previous frame */
++	uint64_t            fGapTicks;      /* interval between swaps, summed */
++	uint64_t            fGapMaxTicks;
++	uint32_t            fGapCount;      /* swaps with a previous frame */
++	uint32_t            fGap20;         /* 20-33 ms: a frame that slipped */
++	uint32_t            fGap33;         /* over 33 ms: a frame lost */
+ 	uint32_t            fTouchRate;      /* touch reports read in the last second */
+ 	uint32_t            fTouchRepeatRate;/* moves re-sent from the last position */
+ 	uint32_t            fTouchPollRate;  /* report-thread wakeups per second */
+@@ -557,6 +563,7 @@
+ 		uint32_t n = swaps - fb->fFpsLast;
+ 		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
+ 		uint64_t clean_avg = 0, scale_avg = 0;
++		uint64_t gap_avg = 0, gap_max = 0;
+ 
+ 		if (n > 0) {
+ 			absolutetime_to_nanoseconds(fb->fCopyTicks, &copy_avg);
+@@ -570,6 +577,10 @@
+ 			clean_avg /= n;
+ 			scale_avg /= n;
+ 		}
++		if (fb->fGapCount != 0) {
++			absolutetime_to_nanoseconds(fb->fGapTicks / fb->fGapCount, &gap_avg);
++			absolutetime_to_nanoseconds(fb->fGapMaxTicks, &gap_max);
++		}
+ 		/*
+ 		 * copy: the memcpy of every layer into the panel, in the caller's
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+@@ -579,6 +590,8 @@
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+ 		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000,
+ 		    fb->fTouchPollRate, fb->fTouchEventRate);
++		IOLog("MONDRIAN FB: gap avg %llu us max %llu us 20-33 %u over33 %u\n",
++		    gap_avg / 1000, gap_max / 1000, fb->fGap20, fb->fGap33);
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -592,6 +605,8 @@
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
+ 		fb->fCleanTicks = fb->fScaleTicks = 0;
++		fb->fGapTicks = fb->fGapMaxTicks = 0;
++		fb->fGapCount = fb->fGap20 = fb->fGap33 = 0;
+ 	}
+ }
+ 
+@@ -974,6 +989,33 @@
+ 	if (elapsed > fCopyMaxTicks) {
+ 		fCopyMaxTicks = elapsed;
+ 	}
++	/*
++	 * The per-second rate says how many frames there were, not how evenly
++	 * they landed: 60 frames can be two at 12 ms and two at 33 ms. The gap
++	 * between consecutive swaps is what a drag feels, so it is counted here
++	 * and printed with the rate.
++	 */
++	{
++		uint64_t now = mach_absolute_time();
++
++		if (fLastSwapTicks != 0) {
++			uint64_t gap = now - fLastSwapTicks;
++			uint64_t gapNs = 0;
++
++			absolutetime_to_nanoseconds(gap, &gapNs);
++			fGapTicks += gap;
++			fGapCount++;
++			if (gapNs > 33000000ULL) {
++				fGap33++;
++			} else if (gapNs > 20000000ULL) {
++				fGap20++;
++			}
++			if (gap > fGapMaxTicks) {
++				fGapMaxTicks = gap;
++			}
++		}
++		fLastSwapTicks = now;
++	}
+ 	fLateTicks += late;
+ 	if (late > fLateMaxTicks) {
+ 		fLateMaxTicks = late;

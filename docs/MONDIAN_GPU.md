@@ -835,10 +835,14 @@ them has Metal. That is the path this port follows.
   18 wait 72` -- the main run loop serves a 1 Hz `NSTimer` 18 times in 72 s and
   the 60 Hz link twice, and between those it is blocked. Frames follow it:
   the same boot swaps in bursts of 3, 30, 1, 30 fps and nothing in between
-  (147 seconds of `fps 0` when the loop never ran). Everything else is ready:
-  the digitizer rate is not what the UI waits for (`mondriandrag=8` at 62
-  positions a second draws 0-3 frames a sweep), and the panel's report rate
-  (`0xC0` to the IC, 240 to 480 Hz) is a later problem.
+  (147 seconds of `fps 0` when the loop never ran). The digitizer is not the
+  wall either, but the reader was: the part sends at its configured rate
+  (measured, ring240: `touch 360/s`), while the report thread only read when the
+  interrupt line happened to still be low at the look and delivered 10-25
+  reports a second during a drag (ring239) -- a scroll that steps every 40-100
+  ms whatever the frame rate. Reading on every look while `was[]` says a finger
+  is down (`0271`) is what lifts it to the part's rate; the high-rate command
+  (`0xC0` to the IC, 240 to 480 Hz) is not needed for 60.
 - **A volume written by `--flash` needs two boots.** The first boot after the
   whole-partition write draws nothing at all (`fps 0` for 147 s) and kills
   `mobileactivationd` (`exit mobileactivation[137] status 0x9`) while it
@@ -951,9 +955,11 @@ them has Metal. That is the path this port follows.
   blocks of 32 outputs taken from 25 inputs and the block is spelled out with
   constant indices, no lookups; that path is taken for any canvas whose ratio
   is 32/25, and the map remains the fallback. With it the scale is `2.9..5.4 ms`
-  and the frame rate `63-64` (ring233) -- the same 2.85 ms the unscaled panel
-  pays for its `memcpy`, so the canvas is now free and the iPhone X geometry is
-  the default in `tools/boards.py`.
+  and the frame rate `63-64` (ring233); spelling the block out in 16-byte lanes
+  (`0272`: one load and one shuffle per four outputs, 8 loads and 6 shuffles a
+  block) takes the scale to `1.6..2.1 ms` and the whole swap to `2.2..2.8 ms`
+  (ring241), against the 2.85 ms the unscaled panel pays for its `memcpy`. The
+  iPhone X geometry is the default in `tools/boards.py`.
 
   Where the artwork goes, when it is injected by hand -- and why it cannot be
   SpringBoard's own view. `-[SBIconView iconImageView]` answers without an image

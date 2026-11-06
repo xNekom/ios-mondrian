@@ -1,0 +1,41 @@
+xnu 0271: read the reports while a finger is down, not only when the line says so
+
+The digitizer is not slow; the reader was. With the part sending at its 240 Hz
+default, the report thread delivered 10-25 reports a second while a finger was
+dragging (ring239: `poll 120/s ev 120/s touch 10-25/s`), because it only read
+when the interrupt line was still low at the moment of the look, and the part
+refreshes that line long before the next look.
+
+The vendor's driver reads on every look while a finger is down and only uses the
+line to know when nobody is touching. This does the same: `was[]` is the previous
+report, so a finger that is down forces the read, and the line remains the gate
+that keeps an untouched screen from costing anything.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1600,7 +1600,23 @@
+ 		 * this vsync, not every sample the part made.
+ 		 */
+ 		for (passes = 0; passes < 4; passes++) {
+-			if (!mondrian_touch_poll &&
++			bool down = false;
++
++			/*
++			 * The line is low while a report waits, but only until the part
++			 * refreshes it: looked at 120 times a second it delivered 10-25
++			 * reports, and a drag then moves in steps of 40-100 ms whatever
++			 * the compositor does (measured, ring239). The vendor's own
++			 * driver reads on every look while a finger is down and keeps
++			 * looking between reports; do the same, and keep the line as the
++			 * idle gate so a screen nobody touches costs nothing.
++			 */
++			for (i = 0; i < MONDRIAN_TOUCH_FINGERS; i++) {
++				if (was[i]) {
++					down = true;
++				}
++			}
++			if (!mondrian_touch_poll && !down &&
+ 			    (mondrian_tlmm_read(mondrian_touch_irq_page, MONDRIAN_TLMM_IN_OUT) & 1) != 0) {
+ 				break;
+ 			}

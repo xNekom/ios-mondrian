@@ -318,7 +318,7 @@ MONDRIAN = Board(
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
              'mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436 '
              'mondrian_ui_hook=15 glenv=FD_MESA_DEBUG=nobin '
-             'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
+             'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 gpuperf=13 '
              'mondrianunlock=1'),
 )
 
