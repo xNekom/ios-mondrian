@@ -63,14 +63,14 @@ QEMU_PHYS_BASE=0x100000000 QEMU_MEM_SIZE=0x180000000 \
 ```
 
 `qemu-ios.py` sizes `-m` from the payload header, so the rest of the recipe is
-unchanged. Both windows stop at `AppleCLCD::vsyncFired`, which touches the MDP
-QEMU does not emulate: that is the pass condition for the early boot.
+unchanged; the phone's own base needs `-m 41G` (virt RAM starts at 1 GiB) and
+`vm.overcommit_memory=1`, which leaves the RSS at what the guest touches. Both
+windows stop at `AppleCLCD::vsyncFired`, which touches the MDP QEMU does not
+emulate: that is the pass condition for the early boot.
 
 Two traps it found: the ADT's CPU node must carry MPIDR 0 under QEMU (the
-phone's boot core is 7, and `ml_get_cpu_number_local()` asserts when it cannot
-find the running core), and `phystokv()` panics on any address outside the
-window, so the splash framebuffer must not go through it when the window does
-not contain the splash.
+phone's boot core is 7), and `phystokv()` panics on any address outside the
+window, so the splash must not go through it when the window excludes it.
 
 ## Environment knobs
 

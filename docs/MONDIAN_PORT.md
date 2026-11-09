@@ -156,9 +156,9 @@ The device tree has a clean **9 GiB run** at `0x840000000+0x240000000` (two
 adjacent `/memory` regions, no reservation inside). The next step is the
 window in `tools/boards.py` and `shim/board.h`: `BOARD_MEM_BASE` already wins
 over the splash bank, and `start.s` maps the framebuffer block by hand, so the
-console survives. The same kernel already boots above 4 GiB in QEMU
-(`docs/QEMU_TESTING.md`); what is left is the phone boot, blind because the
-shim console is on the panel, and the 9 GiB the shim wipes before the jump.
+console survives. QEMU reaches vsync with 9 GiB exactly as with 864 MiB; what
+is left is the phone boot, blind because the shim console is on the panel, and
+the 9 GiB the shim wipes before the jump.
 
 ## Page size
 
