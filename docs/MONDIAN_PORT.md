@@ -146,17 +146,19 @@ slide comes from `/chosen/random-seed`, so the seed is pinned in
 `tools/boards.py`; the shim checks the window against the live device tree.
 
 **864 MiB is not enough for this userland.** Measured 2026-11-09: `free` sits
-at 14-22 MiB, `wire` at ~420, and jetsam SIGKILLs `iconservicesagent` and the
-daemons launchd respawns, so the App Library draws empty cards and an app
-launches to a black window. iOS has no swap-in: the compressor cannot drain and
-the window is the whole budget.
+at 14-24 MiB, `wire` at ~454, and jetsam SIGKILLs `iconservicesagent` (which
+cannot get its 50 MB high watermark either), so the App Library draws empty
+cards and an app launches to a black window. The wire is compressor segments
+(~165 MiB) and GPU surfaces (~200 MiB); iOS has no swap-in, so the window is
+the whole budget.
 
-The live device tree has a clean **9 GiB run** at `0x840000000+0x240000000`
-(two adjacent `/memory` regions, no reservation inside). `mkadt.py --highmem`
-and `mkpayload.py` already take the window from the ADT; the shim must stop
-preferring the splash bank (its 64 GB identity map covers both), and the
-physmap, GPU/display DMA and wipe policy need validation. The first failure is
-blind (the shim console is on the panel): plan it with somebody at the phone.
+The device tree has a clean **9 GiB run** at `0x840000000+0x240000000` (two
+adjacent `/memory` regions, no reservation inside). The next step is the
+window in `tools/boards.py` and `shim/board.h`: `BOARD_MEM_BASE` already wins
+over the splash bank, and `start.s` maps the framebuffer block by hand, so the
+console survives. The same kernel already boots above 4 GiB in QEMU
+(`docs/QEMU_TESTING.md`); what is left is the phone boot, blind because the
+shim console is on the panel, and the 9 GiB the shim wipes before the jump.
 
 ## Page size
 

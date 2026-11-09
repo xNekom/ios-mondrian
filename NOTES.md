@@ -57,23 +57,24 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (`0114`); the dylib forces activation and skips Setup, and GPU writes memory
   once `CP_SET_SECURE_MODE(0)` retires.
 - **Memory, the real blocker.** The window is 864 MiB
-  (`0xaa000000+0x36000000`) and iOS 16 wants more: `free` sits at 14-22 MiB,
-  `wire` at ~420, and jetsam SIGKILLs `iconservicesagent` and the daemons it
-  respawns. The App Library then draws empty cards and an app launches to a
-  black window: the service and the app are dead, not misrendered. The device
-  tree has a clean 9 GiB run above 4 GiB (`0x8_40000000+0x240000000`); the
-  shim still picks the bank with the splash because the early console paints
-  through the bootstrap V=P map, and `--highmem` is untested.
-- **No swap.** iOS has no swap-in: `mem` reports `swapped 0` and a zero swap
-  space, so the compressor is the only sink and cannot drain.
+  (`0xaa000000+0x36000000`) and iOS 16 wants more: `free` sits at 14-24 MiB,
+  `wire` at ~454, and jetsam SIGKILLs `iconservicesagent`, which also fails
+  to opt into its 50 MB high watermark ("22"), so it dies at load; the App
+  Library draws empty cards and an app launches to a black window. The wire
+  is ~165 MiB of compressor segments (38k source pages at ~4:1) and ~200 MiB
+  of GPU surfaces, neither a leak. There is no swap to drain: `swapped 0`,
+  zero swap space, so the window is the whole budget.
+- **A window above 4 GiB boots.** In QEMU the kernel reaches the panel driver
+  with its RAM at `0x100000000`, as far as the low window gets
+  (`docs/QEMU_TESTING.md`). The one casualty was `phystokv(0xb8000000)`: the
+  console fallback panics when the splash is outside the window, and is now
+  conditional (`0295`).
 
 Current blockers, in order:
 
-1. **Memory.** The high bank is the fix, and the first failure is blind (the
-   shim console is on the panel); the work list is in `docs/MONDIAN_PORT.md`.
-2. **Idle sleep and gestures.** The idle timer still sleeps the display
-   (`mondrianunlock=1` re-requests the unlock); the home gesture needs a swipe
-   that starts within ~10 px of the bottom edge.
+1. **Memory.** The high bank is the fix; the work list is in `docs/MONDIAN_PORT.md`.
+2. **Idle sleep and gestures.** The idle timer sleeps the display
+   (`mondrianunlock=1` re-requests the unlock); the home swipe starts at the edge.
 3. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not
    read yet.
 4. **Rest.** Audio, modem and cameras: the daemons that abort
@@ -127,7 +128,7 @@ From the live device tree (and from the shim's own dump):
 
 | what | value |
 | --- | --- |
-| `/memory` | `0x80000000+0x6a000000`, `0xf4600000+0xba00000`, four regions above 32 GB |
+| `/memory` | `0x80000000+0x6a000000`, `0xf4600000+0xba00000`, `0x837b00000+0x1e00000`, `0x800000000+0x37500000`, and `0x840000000+0x240000000` as two adjacent regions (9 GiB, no reservation inside) |
 | RAM the bootloader offers the kernel | ~1.85 GB (`ddr_size` claims 12) |
 | hole that is not RAM | `0xea000000..0xf4600000` |
 | `/reserved-memory` | 38 carve-outs: hypervisor `0x80000000+0x600000`, AOP, SMEM, modem `0x8bc00000+0x13200000`, splash `0xb8000000+0x2b00000`, tags, QTEe |

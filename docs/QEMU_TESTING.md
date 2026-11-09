@@ -54,6 +54,24 @@ Options worth knowing:
 `tools/qemu-triage.py <outdir> <kernel>` prints the first exception and the
 symbol it happened in, which is usually enough to name the culprit.
 
+QEMU's `virt` puts the low GiB at `0x40000000` and the rest at `0x100000000`,
+so the kernel can be booted with the shape the phone's 9 GiB bank has:
+
+```sh
+QEMU_PHYS_BASE=0x100000000 QEMU_MEM_SIZE=0x180000000 \
+    python3 tools/mkadt.py /tmp/qemu-high.adt --qemu --board mondrian
+```
+
+`qemu-ios.py` sizes `-m` from the payload header, so the rest of the recipe is
+unchanged. Both windows stop at `AppleCLCD::vsyncFired`, which touches the MDP
+QEMU does not emulate: that is the pass condition for the early boot.
+
+Two traps it found: the ADT's CPU node must carry MPIDR 0 under QEMU (the
+phone's boot core is 7, and `ml_get_cpu_number_local()` asserts when it cannot
+find the running core), and `phystokv()` panics on any address outside the
+window, so the splash framebuffer must not go through it when the window does
+not contain the splash.
+
 ## Environment knobs
 
 | variable | effect |

@@ -142,9 +142,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +	}
 +	hud_row_text(EARLY_HUD_ROW0, s);
 +}
- 
--	/* The UI owns the panel: the status row goes with the console. */
--	if (mondrian_fbcon_quiet) {
++
 +/*
 + * MondrianEarly: the panel text console, for a bring-up boot where the ring
 + * cannot be read back. Panics paint whether this is on or not.
@@ -206,7 +204,9 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +{
 +	return early_fault_shown != 0 || panic_info_shown != 0;
 +}
-+
+ 
+-	/* The UI owns the panel: the status row goes with the console. */
+-	if (mondrian_fbcon_quiet) {
 +void
 +mondrian_early_fault(uint64_t pc, uint64_t lr, uint64_t esr, uint64_t far,
 +    uint64_t fp)
@@ -332,7 +332,9 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +	 */
 +	if (!early_text && !early_panicking) {
 +		return;
-+	}
+ 	}
+-	early_row = row;
+-	early_col = col;
 +	early_forced = 1;
 +	line[n++] = 's';
 +	line[n++] = 't';
@@ -360,9 +362,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +	/* Only the first panic is the interesting one. */
 +	if (early_fault_shown || panic_info_shown) {
 +		return;
- 	}
--	early_row = row;
--	early_col = col;
++	}
 +	early_forced = 1;
 +	early_panicking = 1;
 +
@@ -714,7 +714,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  }
  
  /*
-@@ -285,25 +900,79 @@
+@@ -285,25 +900,85 @@
  {
  	extern int mondrian_fbcon_quiet;
  
@@ -779,8 +779,14 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +			 * pixels and say so.
 +			 */
 +			mondrian_early_reg("atfail", par);
-+			early_fb = (volatile uint32_t *)(uintptr_t)mondrian_early_fb_backup;
-+			early_fb_va = (uint64_t)(uintptr_t)early_fb;
++			if (mondrian_early_fb_backup != 0) {
++				early_fb = (volatile uint32_t *)(uintptr_t)mondrian_early_fb_backup;
++				early_fb_va = (uint64_t)(uintptr_t)early_fb;
++			} else {
++				/* No physmap view: the splash is outside the
++				 * window. Keep the bootstrap one and say so. */
++				mondrian_early_string("MONDRIAN ALIAS FAIL, NO PHYSMAP VIEW\n");
++			}
 +		} else {
 +			mondrian_early_string("MONDRIAN ALIAS OK\n");
 +			early_fb = (volatile uint32_t *)(uintptr_t)base;
