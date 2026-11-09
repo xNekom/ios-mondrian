@@ -80,9 +80,10 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
    reaches SpringBoard and the compositor stops presenting (`present 0/s`,
    `panel 0/60 sampled ticks changed`). `0302` turns that into a black panel:
    after `mondrianfb_blank` seconds (default 3) without a present the tick
-   paints the panel memory black and its `CTL_START` sends it, and the next
-   present wakes the panel, so a sleeping AMOLED no longer shows the last
-   frame. Brightness is still missing: the panel is `bl_ctrl_dcs` (DCS `0x51`,
+   paints the panel memory black and its `CTL_START` sends it, and a burst of
+   presents wakes the panel (a lone housekeeping frame leaves it black), so a
+   sleeping AMOLED no longer shows the last frame. Brightness is still missing:
+   the panel is `bl_ctrl_dcs` (DCS `0x51`,
    max `0xfff`, inverted DBV) and sending it needs the DSI command path. The
    MDSS/DSI driver would also stop the 60 Hz timer and the full-canvas rescale
    (`docs/MONDIAN_PORT.md` §3).

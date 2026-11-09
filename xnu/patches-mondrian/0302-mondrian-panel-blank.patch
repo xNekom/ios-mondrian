@@ -4,16 +4,34 @@ CoreAnimation stops swapping when the screen sleeps, and this driver has no
 power call to hear it, so a quiet compositor is the signal. After
 mondrianfb_blank seconds (default 3) without a present the display tick paints
 the panel memory black; the CTL start it already issues sends that frame, and
-black is what an AMOLED shows when it is off. The next present clears the
-state and logs the wake. mondrianfb_blank=0 disables the timeout.
+black is what an AMOLED shows when it is off. A sleeping compositor still
+presents the occasional lone frame, so a wake needs a burst (3 presents inside
+1.5 s) and the lone ones leave the black frame in place. mondrianfb_blank=0
+disables the timeout.
 
 Measured: locked, the compositor presents 0/s while the panel keeps the last
 frame (panel 0/60 sampled ticks changed); on, it presents 54-60/s even with no
-touch, so the timeout separates sleep from a still screen.
+touch, so the timeout separates sleep from a still screen. Housekeeping frames
+arrive about every four seconds while asleep; treating any present as a wake
+blinked the panel, hence the burst test.
 
 --- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
 +++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
-@@ -459,6 +459,15 @@
+@@ -145,6 +145,13 @@
+  * into again. A third would name a surface the renderer has taken back.
+  */
+ #define MONDRIAN_FB_QUEUE                 2
++/*
++ * A sleeping compositor still presents the occasional lone frame. Those must
++ * not light the panel, so a wake needs this many presents inside this window;
++ * a real wake runs at 10-60 a second, housekeeping is one every few seconds.
++ */
++#define MONDRIAN_FB_WAKE_FRAMES            3
++#define MONDRIAN_FB_WAKE_WINDOW_NS         1500000000ULL
+ #define MONDRIAN_FB_LAYERS                 4
+ #define MONDRIAN_FB_NOTIFY_TYPES           8
+ #define MONDRIAN_FB_NOTIFY_VSYNC           5
+@@ -459,6 +466,17 @@
  	uint32_t      fStuck;
  	bool          fDsiDumped;
  	bool          fResetDone;
@@ -26,19 +44,23 @@ touch, so the timeout separates sleep from a still screen.
 +	 */
 +	bool          fBlanked;
 +	uint32_t      fBlankAfter;
++	uint64_t      fBlankFirstPresent; /* first present in the current burst */
++	uint32_t      fBlankPresents;     /* presents in the current burst */
  	/* mondrianfb_test: the band, and the pixels it covers. */
  	bool          fTest;
  	bool          fTestShown;
-@@ -538,6 +547,8 @@
+@@ -538,6 +556,10 @@
  	fStuck = 0;
  	fDsiDumped = false;
  	fResetDone = false;
 +	fBlanked = false;
 +	fBlankAfter = 3;
++	fBlankFirstPresent = 0;
++	fBlankPresents = 0;
  	fTest = false;
  	fTestShown = false;
  	fTestY = 0;
-@@ -617,6 +628,13 @@
+@@ -617,6 +639,13 @@
  			fFpsLog = true;
  		}
  	}
@@ -52,7 +74,7 @@ touch, so the timeout separates sleep from a still screen.
  	(void)PE_parse_boot_argn("mondrianfb_probe", &mondrian_fb_probe,
  	    sizeof(mondrian_fb_probe));
  	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
-@@ -869,6 +887,28 @@
+@@ -869,6 +898,28 @@
  		fb->fTestShown = true;
  	}
  	/*
@@ -81,14 +103,33 @@ touch, so the timeout separates sleep from a still screen.
  	 * A command-mode panel needs a start per frame: the CTL fetches the
  	 * layers once when it is started and holds that frame until the next
  	 * start. Start it after the copy of this tick, so the fetch sees the
-@@ -1345,6 +1385,10 @@
- 	 */
+@@ -1346,6 +1397,29 @@
  	IOLockLock(fPresentLock);
  	began = mach_absolute_time();
+ 	/*
++	 * A sleeping compositor still presents the occasional lone frame, and
++	 * one of those must not light the panel. A real wake presents a burst,
++	 * so count the burst and drop its first frames: the black frame stays
++	 * until the rate says the display is really on.
++	 */
 +	if (fBlanked) {
++		uint64_t window;
++
++		nanoseconds_to_absolutetime(MONDRIAN_FB_WAKE_WINDOW_NS, &window);
++		if (fBlankFirstPresent == 0 || began - fBlankFirstPresent > window) {
++			fBlankFirstPresent = began;
++			fBlankPresents = 0;
++		}
++		if (++fBlankPresents < MONDRIAN_FB_WAKE_FRAMES) {
++			IOLockUnlock(fPresentLock);
++			return;
++		}
 +		fBlanked = false;
++		fBlankFirstPresent = 0;
++		fBlankPresents = 0;
 +		IOLog("MONDRIAN FB: panel wake\n");
 +	}
- 	/*
++	/*
  	 * The gap between frames on the panel is the one the hand feels: the
  	 * swap rate says how many were drawn, not whether any was held for two
+ 	 * periods.
