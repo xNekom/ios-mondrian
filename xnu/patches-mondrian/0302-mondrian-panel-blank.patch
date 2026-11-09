@@ -1,0 +1,94 @@
+xnu 0302: blank the panel when the display sleeps
+
+CoreAnimation stops swapping when the screen sleeps, and this driver has no
+power call to hear it, so a quiet compositor is the signal. After
+mondrianfb_blank seconds (default 3) without a present the display tick paints
+the panel memory black; the CTL start it already issues sends that frame, and
+black is what an AMOLED shows when it is off. The next present clears the
+state and logs the wake. mondrianfb_blank=0 disables the timeout.
+
+Measured: locked, the compositor presents 0/s while the panel keeps the last
+frame (panel 0/60 sampled ticks changed); on, it presents 54-60/s even with no
+touch, so the timeout separates sleep from a still screen.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -459,6 +459,15 @@
+ 	uint32_t      fStuck;
+ 	bool          fDsiDumped;
+ 	bool          fResetDone;
++	/*
++	 * The display sleeps when CoreAnimation stops swapping; there is no
++	 * power call into this driver. A command-mode panel keeps the last
++	 * frame forever, so after fBlankAfter seconds without a present the
++	 * tick paints the panel memory black and the start below sends it.
++	 * The next swap wakes it. mondrianfb_blank=N seconds, 0 disables.
++	 */
++	bool          fBlanked;
++	uint32_t      fBlankAfter;
+ 	/* mondrianfb_test: the band, and the pixels it covers. */
+ 	bool          fTest;
+ 	bool          fTestShown;
+@@ -538,6 +547,8 @@
+ 	fStuck = 0;
+ 	fDsiDumped = false;
+ 	fResetDone = false;
++	fBlanked = false;
++	fBlankAfter = 3;
+ 	fTest = false;
+ 	fTestShown = false;
+ 	fTestY = 0;
+@@ -617,6 +628,13 @@
+ 			fFpsLog = true;
+ 		}
+ 	}
++	{
++		int blank = 3;
++
++		if (PE_parse_boot_argn("mondrianfb_blank", &blank, sizeof(blank))) {
++			fBlankAfter = blank > 0 ? (uint32_t)blank : 0;
++		}
++	}
+ 	(void)PE_parse_boot_argn("mondrianfb_probe", &mondrian_fb_probe,
+ 	    sizeof(mondrian_fb_probe));
+ 	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
+@@ -869,6 +887,28 @@
+ 		fb->fTestShown = true;
+ 	}
+ 	/*
++	 * The idle display: CoreAnimation stops swapping when the screen
++	 * sleeps and this driver has no power call to hear it, so the absence
++	 * of presents is the signal. A command-mode panel otherwise holds the
++	 * last frame forever, which on an AMOLED looks like an always-on
++	 * display. Black pixels are off pixels; the next swap wakes the panel.
++	 */
++	if (!fb->fBlanked && fb->fBlankAfter != 0 && fb->fMdp != NULL &&
++	    fb->fKick && count >= fb->fKickFrom && fb->fLastPresentTicks != 0) {
++		uint64_t idleNs = 0;
++		uint64_t idle = now > fb->fLastPresentTicks ? now - fb->fLastPresentTicks : 0;
++
++		absolutetime_to_nanoseconds(idle, &idleNs);
++		if (idleNs >= (uint64_t)fb->fBlankAfter * 1000000000ULL) {
++			memset((void *)fb->fPixels, 0, (size_t)fb->fHeight * fb->fRowBytes);
++			__asm__ volatile("dsb sy" ::: "memory");
++			fb->fBlanked = true;
++			fb->fPanelSig = 0;
++			IOLog("MONDRIAN FB: panel blank after %u s without a frame\n",
++			    fb->fBlankAfter);
++		}
++	}
++	/*
+ 	 * A command-mode panel needs a start per frame: the CTL fetches the
+ 	 * layers once when it is started and holds that frame until the next
+ 	 * start. Start it after the copy of this tick, so the fetch sees the
+@@ -1345,6 +1385,10 @@
+ 	 */
+ 	IOLockLock(fPresentLock);
+ 	began = mach_absolute_time();
++	if (fBlanked) {
++		fBlanked = false;
++		IOLog("MONDRIAN FB: panel wake\n");
++	}
+ 	/*
+ 	 * The gap between frames on the panel is the one the hand feels: the
+ 	 * swap rate says how many were drawn, not whether any was held for two
