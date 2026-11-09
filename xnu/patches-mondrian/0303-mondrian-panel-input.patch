@@ -1,0 +1,299 @@
+xnu 0303: the panel follows the power key and the finger
+
+0302 blanked the panel three seconds after the compositor went quiet, so the
+lock screen stayed lit after the press. Blank on the power key itself: the
+tick paints black on the next refresh, and the lock animation's frames are
+dropped for 1.2 s (measured: the animation runs about half a second) so they
+cannot light the panel again. A press while the panel is black is the wake,
+and so is a touch; the first frame after either is shown at once, while a
+frame with no input behind it still needs the three-present burst. The
+fallback timeout drops to one second; a touch or a wake gets a five-second
+grace before the timer can blank a still lock screen or a launching app.
+mondrianfb_blank=0 still disables the timer.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -152,6 +152,17 @@
+  */
+ #define MONDRIAN_FB_WAKE_FRAMES            3
+ #define MONDRIAN_FB_WAKE_WINDOW_NS         1500000000ULL
++/*
++ * The power key blanks the panel on the press itself; the lock animation
++ * keeps presenting for a moment, so its frames are dropped for this long.
++ * A key or a touch while the panel is black is a wake: show the next frame
++ * at once instead of waiting for the burst that proves a real wake. A touch
++ * or a wake also gets a grace before the idle timer can blank a still lock
++ * screen or a launching app, neither of which presents every frame.
++ */
++#define MONDRIAN_FB_BLANK_HOLD_NS          1200000000ULL
++#define MONDRIAN_FB_INPUT_WAKE_NS          1000000000ULL
++#define MONDRIAN_FB_INPUT_GRACE_NS         5000000000ULL
+ #define MONDRIAN_FB_LAYERS                 4
+ #define MONDRIAN_FB_NOTIFY_TYPES           8
+ #define MONDRIAN_FB_NOTIFY_VSYNC           5
+@@ -469,14 +480,20 @@
+ 	/*
+ 	 * The display sleeps when CoreAnimation stops swapping; there is no
+ 	 * power call into this driver. A command-mode panel keeps the last
+-	 * frame forever, so after fBlankAfter seconds without a present the
++	 * frame forever, so the power key blanks it at once and a fallback
++	 * timer blanks it after fBlankAfter seconds without a present. The
+ 	 * tick paints the panel memory black and the start below sends it.
+-	 * The next swap wakes it. mondrianfb_blank=N seconds, 0 disables.
++	 * mondrianfb_blank=N seconds (default 1), 0 disables the timer.
+ 	 */
+ 	bool          fBlanked;
+ 	uint32_t      fBlankAfter;
+ 	uint64_t      fBlankFirstPresent; /* first present in the current burst */
+ 	uint32_t      fBlankPresents;     /* presents in the current burst */
++	bool          fBlankRequest;      /* the power key asked for black now */
++	bool          fHoldBlank;         /* swallow the lock animation */
++	uint64_t      fHoldBlankUntil;
++	uint64_t      fWakeArmedTicks;    /* input asked for the next frame */
++	uint64_t      fActivityTicks;     /* no blank before this after input */
+ 	/* mondrianfb_test: the band, and the pixels it covers. */
+ 	bool          fTest;
+ 	bool          fTestShown;
+@@ -557,9 +574,14 @@
+ 	fDsiDumped = false;
+ 	fResetDone = false;
+ 	fBlanked = false;
+-	fBlankAfter = 3;
++	fBlankAfter = 1;
+ 	fBlankFirstPresent = 0;
+ 	fBlankPresents = 0;
++	fBlankRequest = false;
++	fHoldBlank = false;
++	fHoldBlankUntil = 0;
++	fWakeArmedTicks = 0;
++	fActivityTicks = 0;
+ 	fTest = false;
+ 	fTestShown = false;
+ 	fTestY = 0;
+@@ -640,7 +662,7 @@
+ 		}
+ 	}
+ 	{
+-		int blank = 3;
++		int blank = 1;
+ 
+ 		if (PE_parse_boot_argn("mondrianfb_blank", &blank, sizeof(blank))) {
+ 			fBlankAfter = blank > 0 ? (uint32_t)blank : 0;
+@@ -904,19 +926,47 @@
+ 	 * last frame forever, which on an AMOLED looks like an always-on
+ 	 * display. Black pixels are off pixels; the next swap wakes the panel.
+ 	 */
+-	if (!fb->fBlanked && fb->fBlankAfter != 0 && fb->fMdp != NULL &&
+-	    fb->fKick && count >= fb->fKickFrom && fb->fLastPresentTicks != 0) {
+-		uint64_t idleNs = 0;
+-		uint64_t idle = now > fb->fLastPresentTicks ? now - fb->fLastPresentTicks : 0;
++	if (!fb->fBlanked && fb->fMdp != NULL && fb->fKick &&
++	    count >= fb->fKickFrom) {
++		bool request = fb->fBlankRequest;
++		bool idle = false;
++		uint64_t hold;
++
++		/*
++		 * The power key asks for black now. The timer is the fallback
++		 * for sleeps iOS starts itself, and 0 disables only the timer.
++		 * A touch counts as activity and a wake gets a grace, so the
++		 * panel stays lit while the user is there even if the
++		 * compositor holds one frame.
++		 */
++		if (!request && fb->fBlankAfter != 0 && fb->fLastPresentTicks != 0) {
++			uint64_t idleNs = 0;
++			uint64_t last = fb->fLastPresentTicks;
++			uint64_t delta;
+ 
+-		absolutetime_to_nanoseconds(idle, &idleNs);
+-		if (idleNs >= (uint64_t)fb->fBlankAfter * 1000000000ULL) {
++			if (fb->fActivityTicks > last) {
++				last = fb->fActivityTicks;
++			}
++			delta = now > last ? now - last : 0;
++
++			absolutetime_to_nanoseconds(delta, &idleNs);
++			idle = idleNs >= (uint64_t)fb->fBlankAfter * 1000000000ULL;
++		}
++		if (request || idle) {
+ 			memset((void *)fb->fPixels, 0, (size_t)fb->fHeight * fb->fRowBytes);
+ 			__asm__ volatile("dsb sy" ::: "memory");
+ 			fb->fBlanked = true;
+ 			fb->fPanelSig = 0;
+-			IOLog("MONDRIAN FB: panel blank after %u s without a frame\n",
+-			    fb->fBlankAfter);
++			if (request) {
++				nanoseconds_to_absolutetime(MONDRIAN_FB_BLANK_HOLD_NS, &hold);
++				fb->fHoldBlank = true;
++				fb->fHoldBlankUntil = now + hold;
++				fb->fBlankRequest = false;
++				IOLog("MONDRIAN FB: panel blank (power key)\n");
++			} else {
++				IOLog("MONDRIAN FB: panel blank after %u s without a frame\n",
++				    fb->fBlankAfter);
++			}
+ 		}
+ 	}
+ 	/*
+@@ -1404,20 +1454,49 @@
+ 	 */
+ 	if (fBlanked) {
+ 		uint64_t window;
++		uint64_t grace;
+ 
+-		nanoseconds_to_absolutetime(MONDRIAN_FB_WAKE_WINDOW_NS, &window);
+-		if (fBlankFirstPresent == 0 || began - fBlankFirstPresent > window) {
+-			fBlankFirstPresent = began;
++		nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_GRACE_NS, &grace);
++		/*
++		 * The lock animation keeps presenting for a moment after the
++		 * power key blanked the panel; swallow it so the press really
++		 * turns the screen off.
++		 */
++		if (fHoldBlank) {
++			if (began < fHoldBlankUntil) {
++				IOLockUnlock(fPresentLock);
++				return;
++			}
++			fHoldBlank = false;
++		}
++		/*
++		 * A power key or a touch while the panel was black asked for
++		 * the screen, so its first frame is the wake, not housekeeping.
++		 */
++		if (fWakeArmedTicks != 0 && began < fWakeArmedTicks) {
++			fBlanked = false;
++			fBlankFirstPresent = 0;
++			fBlankPresents = 0;
++			fWakeArmedTicks = 0;
++			fActivityTicks = began + grace;
++			IOLog("MONDRIAN FB: panel wake (input)\n");
++		} else {
++			fWakeArmedTicks = 0;
++			nanoseconds_to_absolutetime(MONDRIAN_FB_WAKE_WINDOW_NS, &window);
++			if (fBlankFirstPresent == 0 || began - fBlankFirstPresent > window) {
++				fBlankFirstPresent = began;
++				fBlankPresents = 0;
++			}
++			if (++fBlankPresents < MONDRIAN_FB_WAKE_FRAMES) {
++				IOLockUnlock(fPresentLock);
++				return;
++			}
++			fBlanked = false;
++			fBlankFirstPresent = 0;
+ 			fBlankPresents = 0;
++			fActivityTicks = began + grace;
++			IOLog("MONDRIAN FB: panel wake\n");
+ 		}
+-		if (++fBlankPresents < MONDRIAN_FB_WAKE_FRAMES) {
+-			IOLockUnlock(fPresentLock);
+-			return;
+-		}
+-		fBlanked = false;
+-		fBlankFirstPresent = 0;
+-		fBlankPresents = 0;
+-		IOLog("MONDRIAN FB: panel wake\n");
+ 	}
+ 	/*
+ 	 * The gap between frames on the panel is the one the hand feels: the
+@@ -2067,4 +2146,63 @@
+ 	return (fb != NULL && fb->fPixels != 0) ? fb->fWidth / 2 : 0;
+ }
+ 
++/*
++ * iOS locks the device when it sees the power key, but the panel is this
++ * driver's. Blank it on the press itself; the tick paints the black frame on
++ * the next refresh. A press while the panel is already black is the wake, so
++ * cancel the hold (the two presses may have come close together) and let the
++ * first frame through instead of waiting for the burst.
++ */
++extern "C" void
++mondrian_fb_power_key(void)
++{
++	AppleCLCD *fb = gMondrianFB;
++	uint64_t arm;
++
++	if (fb == NULL) {
++		return;
++	}
++	nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_WAKE_NS, &arm);
++	if (fb->fBlanked) {
++		fb->fHoldBlank = false;
++		fb->fWakeArmedTicks = mach_absolute_time() + arm;
++	} else {
++		fb->fBlankRequest = true;
++	}
++}
++
++/*
++ * A finger on the panel is the other input signal: while the panel is black
++ * the next frame counts as the wake, and while it is lit the idle clock
++ * restarts so the screen never goes black under the finger.
++ */
++extern "C" void
++mondrian_fb_touch_activity(void)
++{
++	AppleCLCD *fb = gMondrianFB;
++	uint64_t now;
++
++	if (fb == NULL) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (fb->fBlanked) {
++		/* The hold only exists to hide the lock animation. */
++		if (fb->fHoldBlank && now >= fb->fHoldBlankUntil) {
++			fb->fHoldBlank = false;
++		}
++		if (!fb->fHoldBlank) {
++			uint64_t arm;
++
++			nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_WAKE_NS, &arm);
++			fb->fWakeArmedTicks = now + arm;
++		}
++	} else {
++		uint64_t grace;
++
++		nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_GRACE_NS, &grace);
++		fb->fActivityTicks = now + grace;
++	}
++}
++
+ #endif /* MONDRIAN */
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -719,6 +719,9 @@
+ 	collection->release();
+ }
+ 
++extern "C" void mondrian_fb_power_key(void);
++extern "C" void mondrian_fb_touch_activity(void);
++
+ /* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
+ extern "C" void
+ mondrian_hid_key(int key, int down)
+@@ -728,6 +731,14 @@
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
+ 	};
+ 
++	/*
++	 * The side button is the display-off signal this driver gets: iOS
++	 * locks on the same press, so blank the panel now instead of waiting
++	 * for the idle timer. The host's synthetic key takes this path too.
++	 */
++	if (key == 0 && down) {
++		mondrian_fb_power_key();
++	}
+ 	if (gSweetButtons && key >= 0 && key < (int)(sizeof(usages) / sizeof(usages[0]))) {
+ 		gSweetButtons->key(usages[key], down != 0);
+ 	}
+@@ -736,6 +747,9 @@
+ extern "C" void
+ mondrian_hid_touch(int finger, int down, int x, int y)
+ {
++	if (down) {
++		mondrian_fb_touch_activity();
++	}
+ 	if (gSweetTouch) {
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}

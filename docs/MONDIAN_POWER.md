@@ -78,12 +78,15 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
    so this is the release path, not `gpu=0`.
 2. **Brightness, and the MDSS idle path.** Measured 2026-11-09: the power key
    reaches SpringBoard and the compositor stops presenting (`present 0/s`,
-   `panel 0/60 sampled ticks changed`). `0302` turns that into a black panel:
-   after `mondrianfb_blank` seconds (default 3) without a present the tick
-   paints the panel memory black and its `CTL_START` sends it, and a burst of
-   presents wakes the panel (a lone housekeeping frame leaves it black), so a
-   sleeping AMOLED no longer shows the last frame. Brightness is still missing:
-   the panel is `bl_ctrl_dcs` (DCS `0x51`,
+   `panel 0/60 sampled ticks changed`). `0302` turns that into a black panel;
+   `0303` makes it follow the user: the power key blanks it on the press itself
+   (the lock animation's frames are dropped for 1.2 s), the fallback is
+   `mondrianfb_blank` seconds without a present (default 1), and the first
+   frame after a key or a touch wakes it; a touch or wake also gets five
+   seconds of grace before the timer can blank a still lock screen or a
+   launching app, and a lone housekeeping frame does not wake it. So a
+   sleeping AMOLED no longer shows the last frame. Brightness is
+   still missing: the panel is `bl_ctrl_dcs` (DCS `0x51`,
    max `0xfff`, inverted DBV) and sending it needs the DSI command path. The
    MDSS/DSI driver would also stop the 60 Hz timer and the full-canvas rescale
    (`docs/MONDIAN_PORT.md` §3).

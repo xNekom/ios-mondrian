@@ -67,10 +67,10 @@ Current blockers, in order:
 
 1. **The GPU.** The compositor still shows glitches; the a7xx path and the
    CP secure-mode handoff are in `docs/MONDIAN_GPU.md`.
-2. **Brightness.** Idle sleep now blanks the panel (`0302`: black after
-   `mondrianfb_blank` seconds without a present, default 3, woken by a burst of
-   presents, not a lone housekeeping frame); brightness itself still needs the
-   DCS `0x51` path (`bl_ctrl_dcs`, max `0xfff`, inverted DBV).
+2. **Brightness.** The panel follows the power key and the finger (`0302`/
+   `0303`: black on the press, 1 s fallback, 5 s of grace after touch/wake,
+   the first frame after a key or touch wakes it); brightness needs the DCS
+   `0x51` path (`bl_ctrl_dcs`, max `0xfff`, inverted DBV).
 3. **Rest.** Audio, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
