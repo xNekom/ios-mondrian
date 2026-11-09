@@ -1,0 +1,110 @@
+xnu 0296: the window is full, and jetsam was compiled out
+
+`VM_BASE` listed `memorystatus` but not `jetsam`, so `CONFIG_JETSAM` was 0:
+per-process limits were refused (launchd's 50 MB high watermark came back
+EINVAL), the pressure policy was a stub, and nothing killed on a footprint of
+its own. Enable it. The kernel builds against the macOS SDK, which defines
+`XNU_TARGET_OS_OSX`, so the app-swap sizing block that `CONFIG_JETSAM` reads
+does not compile; the port has no swap volume, so the limits are inert and are
+given the non-OSX values.
+
+The memory line gains the queues it was missing (`purge`, `throttled`,
+`cleaned`, the initial wired pool) and the `VMSTAT` line says what the
+compressor holds and where the memorystatus thresholds sit. Measured on the
+864 MiB window: free + speculative + wire + active + inactive is 616 MiB and
+the compressor holds another 221 MiB, so the window is full and the queues are
+empty - the fix is a larger window, not a leak.
+
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -237,6 +237,10 @@
+ 		extern unsigned int vm_page_free_count, vm_page_speculative_count;
+ 		extern unsigned int vm_page_wire_count, vm_page_active_count;
+ 		extern unsigned int vm_page_inactive_count;
++		extern unsigned int vm_page_purgeable_count;
++		extern unsigned int vm_page_throttled_count;
++		extern unsigned int vm_page_cleaned_count;
++		extern unsigned int vm_page_wire_count_initial;
+ 		/* 16 KiB pages: count * 16 is KiB, >> 10 is MiB. */
+ 		extern uint64_t mondrian_surface_wired_bytes(void);
+ 		extern uint32_t mondrian_surface_live_count(void);
+@@ -244,12 +248,17 @@
+ 		extern uint32_t mondrian_gpu_buffer_count_total(void);
+ 
+ 		printf("MONDRIAN MEM: free %uMiB spec %uMiB wire %uMiB active %uMiB inactive %uMiB"
++		    " purge %uMiB thr %uMiB clean %uMiB kinit %uMiB"
+ 		    " surf %uMiB/%u gpu %uMiB/%u\n",
+ 		    (vm_page_free_count * 16) >> 10,
+ 		    (vm_page_speculative_count * 16) >> 10,
+ 		    (vm_page_wire_count * 16) >> 10,
+ 		    (vm_page_active_count * 16) >> 10,
+ 		    (vm_page_inactive_count * 16) >> 10,
++		    (vm_page_purgeable_count * 16) >> 10,
++		    (vm_page_throttled_count * 16) >> 10,
++		    (vm_page_cleaned_count * 16) >> 10,
++		    (vm_page_wire_count_initial * 16) >> 10,
+ 		    (unsigned)(mondrian_surface_wired_bytes() >> 20),
+ 		    mondrian_surface_live_count(),
+ 		    (unsigned)(mondrian_gpu_buffer_bytes_total() >> 20),
+
+diff --git a/config/MASTER.arm64.mondrian b/config/MASTER.arm64.mondrian
+--- a/config/MASTER.arm64.mondrian
++++ b/config/MASTER.arm64.mondrian
+@@ -77,7 +77,7 @@
+ #  SCHED_RELEASE =  [ SCHED_BASE ]
+ #  SCHED_DEV =      [ SCHED_BASE ]
+ #  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
+-#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  VM_BASE =        [ vm_pressure_events jetsam memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
+ #  VM_RELEASE =     [ VM_BASE ]
+ #  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
+ #  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
+
+diff --git a/osfmk/vm/vm_compressor_backing_store.c b/osfmk/vm/vm_compressor_backing_store.c
+--- a/osfmk/vm/vm_compressor_backing_store.c
++++ b/osfmk/vm/vm_compressor_backing_store.c
+@@ -168,6 +168,17 @@
+ #define VM_MAX_SWAP_FILE_NUM            100
+ #define VM_SWAPFILE_DELAYED_TRIM_MAX    128
+ 
++/*
++ * MONDRIAN: this kernel is built against the macOS SDK, so XNU_TARGET_OS_OSX
++ * is defined and the block above - the one that defines these - does not
++ * compile. CONFIG_JETSAM still reads them for the app-swap pool sizing. The
++ * port has no swap volume, so the values are inert; they are the non-OSX
++ * ones so a system that did enable app swap would not reserve more.
++ */
++#define VM_MAX_SWAP_FILE_SWAP_ENABLED_NUM (4ULL * (1ULL << 30) / MAX_SWAP_FILE_SIZE)
++#define VM_MIN_SWAP_FILE_SWAP_ENABLED_NUM (4ULL * (1ULL << 30) / MAX_SWAP_FILE_SIZE)
++#define VM_SWAP_MIN_VOLUME_CAPACITY (128ULL * (1ULL << 30))
++
+ #define VM_SWAP_SHOULD_DEFRAGMENT()     (((vm_swap_force_defrag == TRUE) || (c_swappedout_sparse_count > (vm_swapfile_total_segs_used / 4))) ? 1 : 0)
+ #define VM_SWAP_SHOULD_PIN(_size)       (vm_swappin_avail > 0 && vm_swappin_avail >= (int64_t)(_size))
+ #define VM_SWAP_SHOULD_CREATE(cur_ts)   ((vm_num_swap_files < vm_num_swap_files_config) && ((vm_swapfile_total_segs_alloced - vm_swapfile_total_segs_used) < (unsigned int)vm_swapfile_hiwater_segs) && \
+
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -5032,6 +5032,20 @@
+ 	    (unsigned long long)vm_pageout_vminfo.vm_pageout_compressions,
+ 	    (unsigned long long)vm_pageout_vminfo.vm_compressor_pages_grabbed,
+ 	    (unsigned long long)vm_swap_get_failures);
++	/*
++	 * The page queues below the compressor add up to less than the window:
++	 * pages held by VM objects (the compressor's own buffers) are resident
++	 * but on no queue. These numbers close the accounting and say what the
++	 * pressure thresholds are built from.
++	 */
++	printf("MONDRIAN VMSTAT2: max %uMiB comp %uMiB avail %uMiB"
++	    " pressure %uMiB critical %uMiB wireinit %uMiB\n",
++	    (unsigned)(max_mem >> 20),
++	    (unsigned)(((uint64_t)VM_PAGE_COMPRESSOR_COUNT * 16) >> 10),
++	    (unsigned)((memorystatus_available_pages * 16) >> 10),
++	    (unsigned)((memorystatus_available_pages_pressure * 16) >> 10),
++	    (unsigned)((memorystatus_available_pages_critical * 16) >> 10),
++	    (unsigned)(((uint64_t)vm_page_wire_count_initial * 16) >> 10));
+ }
+ 
+ __startup_func
+

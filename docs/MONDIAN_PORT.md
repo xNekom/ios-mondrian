@@ -145,12 +145,12 @@ hole. The five rules behind those numbers and the measured memory map are in
 slide comes from `/chosen/random-seed`, so the seed is pinned in
 `tools/boards.py`; the shim checks the window against the live device tree.
 
-**864 MiB is not enough for this userland.** Measured 2026-11-09: `free` sits
-at 14-24 MiB, `wire` at ~454, and jetsam SIGKILLs `iconservicesagent` (which
-cannot get its 50 MB high watermark either), so the App Library draws empty
-cards and an app launches to a black window. The wire is compressor segments
-(~165 MiB) and GPU surfaces (~200 MiB); iOS has no swap-in, so the window is
-the whole budget.
+**864 MiB is not enough for this userland.** Measured 2026-11-09: the page
+queues hold 616 MiB (free 14-26, speculative 4-10, wire 406-454, active 78-95,
+inactive 68-89) and the compressor holds 221-251 MiB more; purgeable,
+throttled and cleaned are empty, so nothing is stuck and the window is full.
+The wire is ~200 MiB of GPU surfaces; there is no swap volume to drain, and
+`0296` enables `CONFIG_JETSAM`, which `VM_BASE` had left out (opt-in works).
 
 The device tree has a clean **9 GiB run** at `0x840000000+0x240000000` (two
 adjacent `/memory` regions, no reservation inside). The next step is the

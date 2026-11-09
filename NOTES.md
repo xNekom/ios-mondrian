@@ -57,13 +57,13 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (`0114`); the dylib forces activation and skips Setup, and GPU writes memory
   once `CP_SET_SECURE_MODE(0)` retires.
 - **Memory, the real blocker.** The window is 864 MiB
-  (`0xaa000000+0x36000000`) and iOS 16 wants more: `free` sits at 14-24 MiB,
-  `wire` at ~454, and jetsam SIGKILLs `iconservicesagent`, which also fails
-  to opt into its 50 MB high watermark ("22"), so it dies at load; the App
-  Library draws empty cards and an app launches to a black window. The wire
-  is ~165 MiB of compressor segments (38k source pages at ~4:1) and ~200 MiB
-  of GPU surfaces, neither a leak. There is no swap to drain: `swapped 0`,
-  zero swap space, so the window is the whole budget.
+  (`0xaa000000+0x36000000`) and iOS 16 wants more. Measured with `0296`:
+  free 14-26, speculative 4-10, wire 406-454, active 78-95, inactive 68-89
+  MiB — 616 MiB on the queues — and the compressor another 221-251 MiB;
+  purgeable/throttled/cleaned are empty, so nothing is stuck: the window is
+  full. `wire` is ~200 MiB of GPU surfaces plus the kernel, there is no swap
+  volume, and `VM_BASE` omitted `jetsam` (`0296` enables it; launchd's 50 MB
+  watermark had come back EINVAL). The high bank is the fix.
 - **A window above 4 GiB boots.** In QEMU the kernel reaches the panel driver
   with its RAM at `0x100000000`, as far as the low window gets
   (`docs/QEMU_TESTING.md`). The one casualty was `phystokv(0xb8000000)`: the
