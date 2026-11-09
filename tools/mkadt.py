@@ -140,22 +140,37 @@ def build(board, seed=None, qemu=False, altmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SMP: all eight cores in physical-core order. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # SMP: the cores in the order the kernel should take them: the boot core
+    # first (its node carries state = running, which is how XNU finds it),
+    # then the fastest first, so "cpus=N" means the N fastest cores rather
+    # than a prefix of the physical numbering.
+    #
+    # The core the firmware runs the shim on is not the kernel's. When the
+    # shim moves the kernel to another core (board.boot_core), that core stays
+    # parked in the shim and is left out of the tree: XNU starts every core it
+    # finds, and a CPU_ON of a core that is already running is a timeout at
+    # best. The machine then runs on seven cores.
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_compat = {'sweet': cstr('qcom,kryo470') + cstr('ARM,v8'),
                   'mondrian': cstr('qcom,kryo') + cstr('ARM,v9')}
     cpu_nodes = []
-    n_cpus = 1 if qemu else len(board.cpus)
+    usable = [c for c in board.cpus
+              if c.aff1 == board.boot_core or c.aff1 != board.fw_core]
+    n_cpus = 1 if qemu else len(usable)
     if DT_CPUS:
-        n_cpus = max(1, min(DT_CPUS, len(board.cpus)))
+        n_cpus = max(1, min(DT_CPUS, len(usable)))
+    ordered = sorted(usable,
+                     key=lambda c: (c.aff1 != board.boot_core, -c.capacity, c.aff1))
     for core in range(n_cpus):
-        cpu = board.cpus[core]
+        cpu = ordered[core]
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cpu_compat.get(board.name, cpu_compat['sweet'])),
-            ('reg', u32(cpu.aff1 << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            # QEMU's CPU0 reports MPIDR Aff1:Aff0 = 0. The phone's boot core
+            # (the X2, Aff1 7) would make ml_get_cpu_number_local() miss the
+            # topology and fail its assertion before the console is up.
+            ('reg', u32(0 if qemu else cpu.aff1 << 8)),
             ('cpu-id', u32(core)),        # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(cpu.cluster)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -170,7 +185,7 @@ def build(board, seed=None, qemu=False, altmem=False):
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
-        ]))
+        ] + ([('capacity-dmips-mhz', u32(cpu.capacity))] if cpu.capacity else [])))
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
