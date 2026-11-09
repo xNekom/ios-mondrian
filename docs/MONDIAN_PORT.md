@@ -231,17 +231,17 @@ Sweet drives a Goodix GT9896 over GENI I²C. Mondrian's Goodix on SPI is up
 (`0153`): TLMM, the GCC SE clocks, the GENI SPI transport and the firmware load
 work. The part reports at about 350/s; the report thread is ticked from the
 vsync and coalesces each drain into one HID event per finger per display tick
-(`0288`), with repeats counted. A touch that starts and ends inside one tick
-loses its down event (not fixed), and the home-gesture swipe-up inherited from
-sweet is still broken: AssistiveTouch is the workaround. Live-tree values and
-the milestone order: `docs/MONDIAN_TOUCH.md`.
+(`0288`), with repeats counted. The home and app-switcher gestures work
+(`0300`): a contact that starts within ~3 mm of an edge carries
+`kIOHIDDigitizerEventFromEdgeTip`, UIKit's touch edge type; a tap inside one
+tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 
 ### 5. The buttons, the battery and the menu
 
 The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`) and
-drives the boot menu; the kernel still needs a HID button service (`0060`) and
-the dual-boot phases. The battery and the heat are their own work list:
-`docs/MONDIAN_POWER.md`.
+drives the menu; `0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
+thread polls the PMK8350 PON and PM8350 GPIO6 and publishes both edges through
+`MondrianHIDButtons`. Dual-boot, battery and heat remain (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 

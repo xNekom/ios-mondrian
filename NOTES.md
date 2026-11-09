@@ -67,11 +67,11 @@ Current blockers, in order:
 
 1. **The GPU.** The compositor still shows glitches; the a7xx path and the
    CP secure-mode handoff are in `docs/MONDIAN_GPU.md`.
-2. **Idle sleep and gestures.** The idle timer sleeps the display
-   (`mondrianunlock=1` re-requests the unlock); the home swipe starts at the edge.
-3. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not
-   read yet.
-4. **Rest.** Audio, modem and cameras: the daemons that abort
+2. **Idle sleep and the panel.** The idle timer stops frames, but the
+   command-mode AMOLED has no off or brightness path: it holds the last frame
+   (it looks like an always-on display). The home and app-switcher gestures
+   work: the touch marks a contact that starts at an edge.
+3. **Rest.** Audio, modem and cameras: the daemons that abort
    (SiriTTSSynthesizer, KonaSynthesizer) want them.
 
 ## Building and booting

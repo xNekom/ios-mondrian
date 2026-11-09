@@ -308,6 +308,12 @@ no sudo is needed.
    Without the field backboardd reads the events — the ring shows
    `touch 16-22/s` during a swipe — and drops them before they become touches,
    so nothing on screen reacts.
+7. **Edge gestures.** A contact that starts within ~3 mm of a panel edge must
+   carry `kIOHIDDigitizerEventFromEdgeTip` for its whole life (`0300`). UIKit
+   turns that bit into `UITouch`'s edge type; without it SpringBoard gets the
+   swipe but never starts the home or app-switcher gesture. Verified on the
+   phone: bottom-edge swipe returns to the home screen, a slow swipe opens the
+   switcher, and swiping a card up closes the app.
 
 ## Milestones, each one testable in a single boot
 
@@ -320,7 +326,8 @@ no sudo is needed.
 4. One touch report into `MondrianHIDTouch`: the lock screen unlocks with a
    swipe. Reports alone are not enough: the event also has to say it is
    display integrated (layer 6).
-5. Multi-touch, then the buttons (power/volume) through the HID button service.
+5. Multi-touch, then the buttons (power/volume): the SPMI poller in
+   `0301` publishes both edges through the HID button service.
 
 ## Traps
 

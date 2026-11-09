@@ -1,0 +1,69 @@
+xnu 0300: the touch reports its contacts as coming from a screen edge
+
+iOS only starts the home and app-switcher gestures for a touch that UIKit
+knows began at a display edge. Apple's touch firmware marks such a contact
+with kIOHIDDigitizerEventFromEdgeTip for its whole life and UIKit derives
+UITouch's edge type from it (_UIEventHIDTouchEdgeTypeForHIDEvent). The
+mondrian event never set the bit, so SpringBoard saw an ordinary finger
+everywhere: an app could be opened, but no swipe from the bottom edge ever
+left it.
+
+A contact that starts within ~3 mm of any panel edge now carries the bit
+until it lifts. The identity bit is also only set on the first down, not on
+the lift, matching the event the reference driver produces.
+
+diff --git a/iokit/Kernel/arm/hid/MondrianHID.cpp b/iokit/Kernel/arm/hid/MondrianHID.cpp
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -363,6 +363,14 @@
+  * absolute digitizers.
+  */
+ #define MONDRIAN_TOUCH_FINGERS 10
++/*
++ * Contacts that start this close to a panel edge (0.1 px units, ~3 mm) carry
++ * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
++ * firmware reports them. UIKit derives UITouch's edge type from that bit
++ * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
++ * app-switcher gesture.
++ */
++#define MONDRIAN_TOUCH_EDGE 640
+ class MondrianHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(MondrianHIDTouch);
+ public:
+@@ -386,6 +394,7 @@
+ 	UInt32 fLoggedClients;   /* client count last printed */
+ 	UInt32 fEvents;          /* events dispatched */
+ 	bool fDown[MONDRIAN_TOUCH_FINGERS];
++	bool fEdge[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fX[MONDRIAN_TOUCH_FINGERS];
+ 	IOFixed fY[MONDRIAN_TOUCH_FINGERS];
+ 	UInt32 fIdentity[MONDRIAN_TOUCH_FINGERS];
+@@ -648,6 +657,10 @@
+ 
+ 	if (!was && down) {
+ 		fIdentity[finger] = ++gSweetTouchIdentity;
++		fEdge[finger] = x < MONDRIAN_TOUCH_EDGE ||
++		    x > 14399 - MONDRIAN_TOUCH_EDGE ||
++		    y < MONDRIAN_TOUCH_EDGE ||
++		    y > 31999 - MONDRIAN_TOUCH_EDGE;
+ 	}
+ 
+ 	UInt32 cmask = 0;
+@@ -663,11 +676,14 @@
+ 		if (!child) {
+ 			continue;
+ 		}
+-		UInt32 mask = 0;
++		UInt32 mask = fEdge[i] ? kIOHIDDigitizerEventFromEdgeTip : 0;
+ 		if (i == finger) {
+ 			if (was != down) {
+-				mask |= kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange |
+-				    kIOHIDDigitizerEventIdentity;
++				mask |= kIOHIDDigitizerEventTouch |
++				    kIOHIDDigitizerEventRange;
++			}
++			if (!was && down) {
++				mask |= kIOHIDDigitizerEventIdentity;
+ 			}
+ 			if (moved) {
+ 				mask |= kIOHIDDigitizerEventPosition;

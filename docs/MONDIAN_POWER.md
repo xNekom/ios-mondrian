@@ -78,8 +78,12 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
    so this is the release path, not `gpu=0`.
 2. **The panel and MDSS are never blanked.** `MondrianFramebuffer.cpp` has no
    power-state or `RequestPowerChange` path, a 60 Hz vsync timer runs forever
-   and every swap rescales the full canvas. Blanking needs the MDSS/DSI and
-   backlight driver (`docs/MONDIAN_PORT.md` §3).
+   and every swap rescales the full canvas. Measured 2026-11-09: the power key
+   reaches SpringBoard and the compositor stops presenting (`present 0/s`,
+   `panel 0/60 sampled ticks changed`), but the command-mode AMOLED keeps the
+   last frame, so it looks like an always-on display. Blanking needs a
+   panel-off/brightness path (DCS `0x28`/`0x51` over DSI, or at least black +
+   stop) and the MDSS/DSI driver (`docs/MONDIAN_PORT.md` §3).
 3. **The EPSS rows are no longer pinned** (`0299`): `cpufreq=2` runs a
    governor that follows each cluster's busy fraction from the idle hook
    around WFI (`processor_idle`, sampled at 50 Hz), so a quiet cluster reaches
