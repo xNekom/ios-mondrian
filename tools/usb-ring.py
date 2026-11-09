@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Host side of the phone's USB control channel (udp/5141).
+
+The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
+192.168.7.2 after tools/ios-usbnet.sh has given the host interface
+192.168.7.1/24.  Commands:
+
+  dump [FILE]   the whole 4 MiB console ring, reassembled a chunk at a time
+  pos           the ring's absolute position
+  mem           print the compressor and GPU-buffer histogram to the live log
+  tap X Y       one synthetic touch, panel pixels (1440x3200)
+  swipe X1 Y1 X2 Y2 [MS]
+                a straight synthetic swipe, sampled every 8 ms
+  key N down|up 0 power, 1 volume up, 2 volume down, 3 home
+  screen [FILE] half-scale capture of the panel, as a PNG
+  reboot        flush the ring, point the BCB at the bootloader and reset
+
+Why this exists: the live log on udp/5140 only carries what is written after
+it starts, a frozen UI used to force a power cycle plus a recovery dump to
+read the ring, and a swipe had to be reproduced by hand at the right moment.
+With this, the whole loop is the USB cable.
+"""
+import argparse
+import socket
+import struct
+import sys
+import time
+import zlib
+
+PHONE = ("192.168.7.2", 5141)
+HOST = ("192.168.7.1", 5141)
+MAGIC = b"RLG1"
+END = 0xFFFFFFFF
+
+
+def open_socket(timeout=2.0):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(HOST)
+    s.settimeout(timeout)
+    return s
+
+
+def simple(command, timeout=2.0):
+    s = open_socket(timeout)
+    s.sendto(command.encode(), PHONE)
+    try:
+        data, _ = s.recvfrom(2048)
+        return data
+    except socket.timeout:
+        return None
+    finally:
+        s.close()
+
+
+CHUNK = 1200
+
+
+def request_chunk(s, offset):
+    s.sendto(b"RLQ1" + struct.pack("<I", offset), PHONE)
+
+
+def dump(path, timeout):
+    answer = simple("pos")
+    if answer is None:
+        print("no answer to pos", file=sys.stderr)
+        return 1
+    total = int(answer.decode().strip())
+    start = max(0, total - (4 << 20))
+
+    # One datagram per request, a few in flight: the gadget's TX queue holds
+    # 32 frames, and a burst of the whole ring loses most of it.
+    s = open_socket(1.0)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    except OSError:
+        pass
+
+    chunks = {}
+    next_offset = start
+    pending = {}
+    deadline = time.time() + timeout
+    last_progress = time.time()
+    window = 24
+
+    while time.time() < deadline:
+        while len(pending) < window and next_offset < total:
+            request_chunk(s, next_offset)
+            pending[next_offset] = time.time()
+            next_offset += CHUNK
+        if not pending:
+            break
+        try:
+            data, _ = s.recvfrom(2048)
+        except socket.timeout:
+            now = time.time()
+            for offset, sent in list(pending.items()):
+                if now - sent > 0.5:
+                    request_chunk(s, offset)
+                    pending[offset] = now
+            if now - last_progress > 6:
+                break
+            continue
+        if len(data) < 8 or data[:4] != MAGIC:
+            continue
+        offset = struct.unpack("<I", data[4:8])[0]
+        if offset in pending:
+            del pending[offset]
+        chunks[offset] = data[8:]
+        last_progress = time.time()
+    s.close()
+
+    if not chunks:
+        print("no data: is the phone on usb=2 and 192.168.7.1/24 set?", file=sys.stderr)
+        return 1
+
+    ring = bytearray(total - start)
+    holes = 0
+    at = start
+    for offset in sorted(chunks):
+        if offset > at:
+            holes += offset - at
+        body = chunks[offset]
+        lo = offset - start
+        ring[lo:lo + len(body)] = body
+        at = max(at, offset + len(body))
+    if at < total:
+        holes += total - at
+    with open(path, "wb") as f:
+        f.write(ring)
+    print(f"{len(ring)} bytes, {len(chunks)} datagrams, {holes} bytes missing -> {path}")
+    return 0
+
+
+def touch(x1, y1, x2, y2, ms=0):
+    """Panel pixels (1440x3200); ms=0 is a tap, otherwise a swipe."""
+    s = open_socket(2.0)
+    request = b"RLT1" + struct.pack("<5H", x1, y1, x2, y2, ms)
+    s.sendto(request, PHONE)
+    s.close()
+
+
+def key(code, down):
+    """0 power, 1 volume up, 2 volume down, 3 home."""
+    s = open_socket(2.0)
+    s.sendto(b"RLK1" + bytes((code, 1 if down else 0)), PHONE)
+    s.close()
+
+
+ROW_MAGIC = b"RLP1"
+
+
+def screen(path, rows, timeout):
+    """Half-scale RGB565 of the panel, as a PNG.
+
+    One row per request: the reply is 1446 bytes, under the interface MTU, and
+    the gadget's transmit queue holds only 32 frames, so a stream needs the
+    same windowed request/response the ring dump uses.
+    """
+    s = open_socket(1.0)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+    except OSError:
+        pass
+
+    got = {}
+    next_row = 0
+    pending = {}
+    deadline = time.time() + timeout
+    last_progress = time.time()
+    window = 24
+
+    while time.time() < deadline and (next_row < rows or pending):
+        while len(pending) < window and next_row < rows:
+            s.sendto(b"RLS1" + struct.pack("<H", next_row), PHONE)
+            pending[next_row] = time.time()
+            next_row += 1
+        try:
+            data, _ = s.recvfrom(2048)
+        except socket.timeout:
+            now = time.time()
+            for row, sent in list(pending.items()):
+                if now - sent > 0.5:
+                    s.sendto(b"RLS1" + struct.pack("<H", row), PHONE)
+                    pending[row] = now
+            if now - last_progress > 6:
+                break
+            continue
+        if len(data) < 6 or data[:4] != ROW_MAGIC:
+            continue
+        row = struct.unpack("<H", data[4:6])[0]
+        pending.pop(row, None)
+        got[row] = data[6:]
+        last_progress = time.time()
+    s.close()
+
+    if not got:
+        print("no screen data (older kernel?)", file=sys.stderr)
+        return 1
+    width = max(len(body) for body in got.values()) // 2
+    rows_got = max(got) + 1
+    blank = b"\x00" * (width * 2)
+    raw = bytearray()
+    for row in range(rows_got):
+        body = got.get(row, blank)
+        if len(body) < width * 2:
+            body = body + blank[:width * 2 - len(body)]
+        rgb = bytearray(width * 3)
+        for i in range(width):
+            p = struct.unpack_from("<H", body, i * 2)[0]
+            r = (p >> 11) & 0x1f
+            g = (p >> 5) & 0x3f
+            b = p & 0x1f
+            rgb[i * 3] = (r << 3) | (r >> 2)
+            rgb[i * 3 + 1] = (g << 2) | (g >> 4)
+            rgb[i * 3 + 2] = (b << 3) | (b >> 2)
+        raw += b"\x00" + rgb
+
+    def chunk(tag, payload):
+        return (struct.pack(">I", len(payload)) + tag + payload +
+                struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    import zlib
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, rows_got, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+    print(f"{width}x{rows_got} rows {len(got)}/{rows_got} -> {path}")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command",
+                        choices=("dump", "pos", "reboot", "mem", "tap", "swipe",
+                                 "key", "screen"))
+    parser.add_argument("args", nargs="*")
+    parser.add_argument("--timeout", type=float, default=60.0,
+                        help="seconds to wait for the dump (default 60)")
+    parser.add_argument("--rows", type=int, default=1600,
+                        help="screen rows to fetch (half scale, default 1600)")
+    args = parser.parse_args()
+
+    if args.command == "dump":
+        path = args.args[0] if args.args else "usb-ring.txt"
+        return dump(path, args.timeout)
+    if args.command == "screen":
+        path = args.args[0] if args.args else "usb-screen.png"
+        return screen(path, args.rows, args.timeout)
+    if args.command == "pos":
+        answer = simple("pos")
+        if answer is None:
+            print("no answer", file=sys.stderr)
+            return 1
+        print(answer.decode(errors="replace").strip())
+        return 0
+    if args.command == "mem":
+        simple("mem")
+        print("mem requested: the histogram goes to the live log (udp/5140)")
+        return 0
+    if args.command == "tap":
+        x, y = int(args.args[0]), int(args.args[1])
+        touch(x, y, x, y, 0)
+        print(f"tap {x},{y}")
+        return 0
+    if args.command == "swipe":
+        x1, y1, x2, y2 = (int(v) for v in args.args[:4])
+        ms = int(args.args[4]) if len(args.args) > 4 else 300
+        touch(x1, y1, x2, y2, ms)
+        print(f"swipe {x1},{y1} -> {x2},{y2} in {ms} ms")
+        return 0
+    if args.command == "key":
+        code = int(args.args[0])
+        down = args.args[1] not in ("up", "0", "false")
+        key(code, down)
+        print(f"key {code} {'down' if down else 'up'}")
+        return 0
+    simple("reboot", 5.0)
+    print("reboot sent")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3,15 +3,13 @@
 **Apple's iOS 16 running on a POCO F5 Pro.**
 
 Fork of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet), which
-ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the
-Xiaomi Redmi Note 10 Pro (`sweet`, SM7150) and runs the unmodified iOS 16.7.16
-userland of the iPhone X on top of it: launchd, the system daemons,
-backboardd, SpringBoard and the stock apps.
+ports Apple's open-source XNU (xnu-8796, the iOS 16 generation) to the Xiaomi
+Redmi Note 10 Pro (`sweet`, SM7150) and runs the unmodified iOS 16.7.16 userland
+of the iPhone X on it: launchd, the daemons, backboardd, SpringBoard and apps.
 
-This fork's target is the **POCO F5 Pro / Redmi K60** (`mondrian`, Qualcomm
-SM8475 / Snapdragon 8+ Gen 1). Same idea, different silicon: ARMv9.0 with
-16 KiB pages, a UFS 3.1 host, an AMOLED on DSI D-PHY, a Goodix touch on SPI and
-a PM8008.
+This fork targets the **POCO F5 Pro / Redmi K60** (`mondrian`, Qualcomm SM8475 /
+Snapdragon 8+ Gen 1): ARMv9.0, 16 KiB pages, a UFS 3.1 host, a command-mode
+AMOLED and a Goodix touch on SPI.
 
 > Experimental bring-up, not a usable phone OS. Many pieces are missing or
 > stubbed and Apple's security model is mostly off. The iOS root lives in the
@@ -32,20 +30,19 @@ a PM8008.
 | --- | --- | --- |
 | XNU machine config, kernel boots | done | **done** |
 | Generic series (mockfs, AMFI, HFS, console, HID, SMP) | done | **done** |
-| UFS root device | done (UFSHCI 2.1) | **reads** (UFS 3.1); writes pending |
-| iOS root mount | done | blocked on `VFS_ROOT` |
-| Display | done (LCD, DSC) | splash scanout works; userland driver on branch `display` |
-| Touch | done (Goodix on I²C) | to write (Goodix on SPI) |
+| UFS root device | done (UFSHCI 2.1) | **reads and writes** (UFS 3.1) |
+| iOS root mount | done | **done** (non-journaled HFS+ in `userdata`) |
+| Display | done (LCD, DSC) | **command-mode AMOLED, 60 fps**; the kernel kicks the panel |
+| Touch | done (Goodix on I²C) | **done** (Goodix on SPI); no home-swipe gesture |
 | Keys and battery | done (PM6150) | keys work in the shim; kernel side to write |
 | Boot menu / dual boot | n/a | menu with keys works; slot switch pending |
 | iOS userland | boots to the home screen | yes (CPU rendering, touch, Settings) |
 
-On `sweet`, the reference implementation, the stock bootloader boots our shim
-volatile, XNU mounts a journaled HFS+ iOS root from `userdata` read/write, and
-the iPhone X userland reaches the home screen (CPU rendering, no GPU, no
-Wi-Fi/cellular/audio/camera/SEP, navigation gestures still broken). That is the
-target for this port: the patch series, the boot arguments and the root-image
-tooling are shared, see `xnu/README.md`.
+On `sweet`, the stock bootloader boots the shim volatile, XNU mounts a journaled
+HFS+ root from `userdata` read/write, and the userland reaches the home screen
+(CPU rendering, no GPU/Wi-Fi/cellular/audio/camera/SEP, navigation gestures still
+broken). That is the target; the series, boot arguments and root-image tooling
+are shared (`xnu/README.md`).
 
 The port plan, the hardware delta, the safety rules and the work list are in
 [`docs/MONDIAN_PORT.md`](docs/MONDIAN_PORT.md); the port state and the facts
@@ -64,9 +61,8 @@ ABL (stock Xiaomi bootloader, unlocked)
 
 There is no serial port (the debug UART is wired as SPI on these boards). The
 kernel draws its console into the framebuffer the bootloader leaves — 1440x3200
-at `0xb8000000` on mondrian (120 Hz; iOS/CA run at 60), 1080x2400 at
-`0x9c000000` on sweet — and keeps the whole log in a 4 MiB ring at the end of
-`userdata` (`0096`), because a screen only ever shows the last page of a boot.
+at `0xb8000000` on mondrian, 1080x2400 at `0x9c000000` on sweet, kicked at 60 Hz
+— and keeps the whole log in a 4 MiB ring at the end of `userdata` (`0096`).
 The ring is written from the UFS path, so a boot reset before userland writes
 leaves the previous ring: unchanged is not proof of failure.
 
@@ -123,10 +119,9 @@ gh workflow run xnu.yml -R YOU/ios-mondrian -f board=mondrian   # or board=sweet
 gh run download RUN_ID -R YOU/ios-mondrian -n xnu-kernel-mondrian -D xnu/out
 ```
 
-The same build runs locally without the cloud from a Mac or from Windows/WSL2,
-with the same pinned tree and patch series; both reset the xnu checkout first,
-so the series must apply to a clean tree and a skipped numbered patch fails the
-build instead of producing a kernel that is silently missing it:
+The same build runs locally from a Mac or Windows/WSL2, with the same pinned
+tree and series; both reset the xnu checkout first, so a skipped patch fails the
+build instead of producing a kernel that silently lacks it:
 
 ```sh
 bash tools/build-kernel-local.sh   # macOS: Xcode 15's iig, jq, cmake, ninja, a KDK
@@ -189,22 +184,28 @@ fastboot flash boot_b shim/out/shim-boot.img
 # boot_b pairs with the kernel-less `recovery` ramdisk: restore
 # backup/boot_b-as-found.img before `fastboot reboot recovery`; a refused boot
 # is usually the slot's spent retry budget (`fastboot set_active b`).
-tools/build-mondrian-ui-hook.sh /tmp/ui.dylib   # a daemon hook changed
-sudo tools/install-ui-hook.sh ios16-root.img /tmp/ui.dylib
+tools/build-mondrian-ui-hook.sh out/gpu/mondrian-ui-hook.dylib
+# a kernel build embeds it (tools/gen-glblob.py); glblob=1 boots that copy
+sudo tools/install-ui-hook.sh ios16-root.img DYLIB   # or burn it into the image
 python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 ```
 
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
 existing `.simg`, so remake the sparse file by hand. A definite write follows
-the graded protocol in `docs/MONDIAN_PORT.md` (volatile proof, `fastboot getvar
-current-slot`, verified backup, read back). `tools/phone-log.sh` boots an image
-and decodes the ring through the recovery; `tools/phone-deploy.sh logview`
-prints the last screenful on the panel instead.
+the graded protocol in `docs/MONDIAN_PORT.md`. With `usb=2` the kernel runs a
+USB gadget: `tools/ios-usbnet.sh` sets the host up and `tools/usb-ring.py`
+dumps the ring, screenshots the panel, injects input and reboots to the
+bootloader; `tools/phone-log.sh` reads the ring through the recovery.
+
+A hook change does not need the image round trip: a kernel build with
+`out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
+(`tools/gen-glblob.py`); `glblob=1` writes them into `/private/var/vm` at mount,
+the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1
-fastboot boot /tmp/boot-mondrian.img   # photograph; power+vol-down to leave
-tools/phone-log.sh /tmp/boot-mondrian.img ring.txt
+fastboot boot out/boot-mondrian.img    # photograph; power+vol-down to leave
+tools/phone-log.sh out/boot-mondrian.img ring.txt
 ```
 
 ## Repository layout
@@ -231,8 +232,7 @@ tools/phone-log.sh /tmp/boot-mondrian.img ring.txt
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
 
 Not in git: partition backups, live device trees, recovery images, Apple
-firmware and root images, build trees. They hold device serials and calibration
-data, or Apple's copyrighted files.
+firmware, root images and build trees — serials, calibration data or Apple's files.
 
 ## Credits
 

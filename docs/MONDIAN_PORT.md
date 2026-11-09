@@ -25,7 +25,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | UFS host | ufshc@1d84000, UFSHCI 2.1 | ufshc@1d84000, **UFS 3.1** |
 | Touch | Goodix GT9896 on I²C (GENI SE) | **Goodix on QUPv3 SPI** (`xiaomi,m11a-spi`, SE4 @ 0x990000) |
 | Buttons | PM6150 PON / SPMI | **PM8008** (PMR735A + PM8350B); volume up on PM8350 GPIO6 |
-| Display | 1080x2400 LCD, DSC video mode, splash at 0x9c000000 | **1440x3200 AMOLED, DSI D-PHY**; splash at 0xb8000000 |
+| Display | 1080x2400 LCD, DSC video mode, splash at 0x9c000000 | **1440x3200 AMOLED, DSI D-PHY, command mode** (one `CTL_START` a frame); splash at 0xb8000000 |
 | Memory | 0x80000000+2 GiB, 0x100000000+0xfcc00000 | `0x80000000+0x6a000000`, `0xf4600000+0xba00000` |
 | PMIC rails | PM6150 LDO11 (touch), fuel gauge | PM8008 rails, fuel gauge (not needed yet) |
 
@@ -45,9 +45,9 @@ needs, and where the numbers come from. The boot history and the traps are in
 | `tools/apply-series.py`, `tools/check-patches.sh` | apply a series to a fresh xnu tree in seconds and report what does not apply |
 | `tools/port-series.py` | ports a patch of the sweet series, renaming the board identifiers, and lists the hardware patches it skips |
 
-`0085` (the framebuffer presentation driver) is in this series. It presents
-userland IOSurface swaps on the framebuffer and the lock screen renders
-on-device.
+`0085` (the framebuffer presentation driver) is in this series. `MondrianFramebuffer`
+presents userland IOSurface swaps and kicks the command-mode interface, so the
+lock screen and the home screen render on-device.
 
 UI probe `0106` injects a diagnostic dylib into the UI daemons selected by
 `mondrian_ui_hook` (`0112`, 7 = all three). It wraps
@@ -138,24 +138,25 @@ Two rules cover the other failure mode, writing to the wrong place:
 
 ## The window of RAM
 
-The kernel gets `phys_base = 0xb0000000`, `mem_size = 0x30000000`: 768 MiB of
-real memory that ends exactly at the first firmware carve-out. The four rules
-behind those numbers (and the abort that the previous 1.12 GiB window caused)
-are in `NOTES.md` ("The window of RAM"). The physmap slide comes from
-`/chosen/random-seed`, so the seed is pinned in `tools/boards.py`.
+The kernel gets `phys_base = 0xaa000000`, `mem_size = 0x36000000`: 864 MiB of
+real memory that ends at `0xe0000000`, above the splash and short of the first
+hole. The five rules behind those numbers and the measured memory map are in
+`NOTES.md` ("The window of RAM" and "Measured hardware facts"). The physmap
+slide comes from `/chosen/random-seed`, so the seed is pinned in
+`tools/boards.py`; the shim checks the window against the live device tree.
 
-| what | value |
-| --- | --- |
-| `/memory` | `0x80000000+0x6a000000`, `0xf4600000+0xba00000`, four above 32 GB |
-| usable RAM per the bootloader | 1.85 GB (`ddr_size` says 12) |
-| `/reserved-memory` | 38 carve-outs: hypervisor 0x80000000+0x600000, AOP, SMEM, modem 0x8bc00000+0x13200000, splash 0xb8000000+0x2b00000, tags, QTEe |
-| framebuffer | 0xb8000000, 1440x3200, stride 5760 |
-| GIC | GICD 0x17100000+0x10000, GICR 0x17180000+0x200000, stride 0x40000 |
-| virtual timer | GIC INTID 27 (DT PPI 11) |
-| UFS host | 0x1d84000 (`ro.boot.bootdevice` = `1d84000.ufshc`) |
+**864 MiB is not enough for this userland.** Measured 2026-11-09: `free` sits
+at 14-22 MiB, `wire` at ~420, and jetsam SIGKILLs `iconservicesagent` and the
+daemons launchd respawns, so the App Library draws empty cards and an app
+launches to a black window. iOS has no swap-in: the compressor cannot drain and
+the window is the whole budget.
 
-The board table and the shim hold the window; the shim checks the live device
-tree agrees that it is inside a memory region and prints that on the screen.
+The live device tree has a clean **9 GiB run** at `0x840000000+0x240000000`
+(two adjacent `/memory` regions, no reservation inside). `mkadt.py --highmem`
+and `mkpayload.py` already take the window from the ADT; the shim must stop
+preferring the splash bank (its 64 GB identity map covers both), and the
+physmap, GPU/display DMA and wipe policy need validation. The first failure is
+blind (the shim console is on the panel): plan it with somebody at the phone.
 
 ## Page size
 
@@ -180,7 +181,11 @@ Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the 
 and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
 The flattened HFS root is not a stock volume layout: launchd still expects a
-Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`.
+Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`. The volume
+is non-journaled, so a boot logs 10,000-13,000 `hfs_mark_inconsistent` lines and
+`suggestd` restart-loops (200-290 crashes, 800-950 execs); a boot still held
+60 fps during a drag with that churn, so it is not a proven cause of a UI stall
+(the corruption itself is in `NOTES.md`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error.
@@ -196,32 +201,39 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 
 ### 3. The display
 
-The ABL keeps the panel scanning a linear framebuffer, so the MDSS/DSI driver
-is not on the critical path: `0083` reserves panel memory, `0085` presents
-IOSurface swaps, and the lock screen draws. `0084`'s colour bars were a one-off
-packing test, off since `0208`; `0210` puts the kernel log back on the panel
-(until then only the early console painted it) and clears the boot splash.
-Three things had to line up: CoreAnimation waits 30 s for an `IOAcceleratorES`
-service and draws nothing without `TimingElements`/`ColorElements` (`0114`
-publishes one 60 Hz mode and an empty accelerator); the panel must be written
-through the console alias (an `IOMemoryDescriptor` puts a device pager on managed
-pages and panics `pmap_remove_pv`), and the console is only stopped with
-`disableConsoleOutput` (`0115`). SpringBoard blocks in
-`-[SBLockdownManager _setupActivationState]` on MobileActivation; the dylib
-forces activation and skips Setup. Touch is §5. If scanout stops, the fallback
-is a real MDSS driver (`qcom,mdss_mdp@ae00000`,
-`qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`).
+The panel is command mode, not a scanout the ABL keeps running: it needs one
+`CTL_START` per frame, which `MondrianFramebuffer` issues (`NOTES.md`,
+"Display"). `0083` reserves the panel memory and `0085` presents IOSurface
+swaps, so the lock screen and the home screen draw. `0084`'s colour bars were a
+one-off packing test, off since `0208`; `0210` paints the kernel log and clears
+the boot splash. Three things had to line up: CoreAnimation waits 30 s for an
+`IOAcceleratorES` service and draws nothing without `TimingElements`/
+`ColorElements` (`0114`); the panel must be written through the console alias
+(an `IOMemoryDescriptor` puts a device pager on managed pages and panics
+`pmap_remove_pv`), and the console is only stopped with `disableConsoleOutput`
+(`0115`); SpringBoard blocks in `-[SBLockdownManager _setupActivationState]` on
+MobileActivation, and the dylib forces activation and skips Setup.
 
-The GPU write path is open: a trusted GPU dropped every render-block write
-until `CP_SET_SECURE_MODE(0)` (`docs/MONDIAN_GPU.md`); what is left is
-presentation, pacing and the texture uploads that leave the wallpaper white.
+Open: the 1125x2436 -> 1440x3200 upscale is nearest neighbour, which is the
+jagged text and icons (`0268`); the DPU SSPP scaler is the candidate and is not
+written. Frame production stops about a minute after the unlock because
+SpringBoard's idle timer sleeps the display (there is no backlight device in
+the tree); the hook now holds the `UIApplication` idle timer, not boot-verified.
+The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
+`backboardd` and a GL flush costs 10-12 ms on some frames
+(`docs/MONDIAN_GPU.md`). Sweet's `0056` (present at most every few vsyncs) and
+`0079` (`RequestPowerChange`) still need a rebase.
 
 ### 4. The touch
 
 Sweet drives a Goodix GT9896 over GENI I²C. Mondrian's Goodix on SPI is up
-(`0153`): TLMM, the GCC SE clocks, the GENI SPI transport and the 220 KB
-firmware load work, and the report thread is ticked from the vsync (`0161`).
-Live-tree values and the milestone order: `docs/MONDIAN_TOUCH.md`.
+(`0153`): TLMM, the GCC SE clocks, the GENI SPI transport and the firmware load
+work. The part reports at about 350/s; the report thread is ticked from the
+vsync and coalesces each drain into one HID event per finger per display tick
+(`0288`), with repeats counted. A touch that starts and ends inside one tick
+loses its down event (not fixed), and the home-gesture swipe-up inherited from
+sweet is still broken: AssistiveTouch is the workaround. Live-tree values and
+the milestone order: `docs/MONDIAN_TOUCH.md`.
 
 ### 5. The buttons, the battery and the menu
 
@@ -232,36 +244,20 @@ the dual-boot phases. The battery and the heat are their own work list:
 
 ### 6. USB
 
-Sweet's DWC3 stack (0072–0077, 0081) targets SM7150; SM8475's DWC3 needs its
-own configuration space and USB3 PHY sequencing. USB is for live diagnostics,
-not a prerequisite for log access: the dump kernel reads prior rings.
+Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
+Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
+`tools/usb-ring.py` (ring dump, panel screenshot, synthetic touch/key, memory
+breakdown, reboot to the bootloader). `usb=1` probes only; USB3 and the PHY
+sequencing remain.
 
 ## Getting the numbers off the device
 
-```
-BOARD=mondrian shim/build.sh
-fastboot boot shim/out/shim-boot.img
-```
-
-The screen shows lines like
-
-```
-FACT memory reg0 0x0 0x80000000
-FACT reg /soc/intc 0x17100000 0x10000 0x17180000 0x200000
-FACT reg /soc/ufs_mem 0x1d84000 0x3000
-```
-
-Copy them into a file and let the tools read it:
-
-```
-python3 tools/mkadt.py mondrian.adt --board mondrian --facts facts.txt
-```
-
-`--altmem` selects the upper DDR bank instead of the window in the board table
-(sweet uses it; mondrian boots from the low window).
-
-`tools/boards.py` fills the memory banks, the UFS host and the GIC from such a
-dump (`parse_facts`, `apply_facts`).
+Boot the mutable shim (`BOARD=mondrian shim/build.sh`, `fastboot boot
+shim/out/shim-boot.img`); the panel prints `FACT` lines for the memory regions
+and the GIC/UFS nodes. Save them and pass the file to `mkadt.py --facts`;
+`tools/boards.py` fills the banks, the UFS host and the GIC from the same dump
+(`parse_facts`, `apply_facts`). `--altmem` selects the upper DDR bank (sweet
+uses it; mondrian boots from the low window).
 
 ## Boot arguments
 
@@ -272,11 +268,13 @@ the less obvious ones do:
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | root on the `userdata` partition, writable |
-| `cpus=8` | all eight cores; `cpus=1` is the safe fallback |
+| `cpus=8` | every core the tree has, which is seven: the X2, the three A710s and three of the A510s. The A510 at Aff1 0 is where the firmware runs the shim; it is parked there and left out of the device tree (PSCI `CPU_OFF` does not take it down on this TZ). `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
 | `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn) |
 | `mondrianfb_hz=60` | vsync rate the display presents at (the panel itself is 120 Hz) |
+| `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
+| `mondrianunlock=1` | the hook unlocks the lock screen, re-requests it every minute, and holds the `UIApplication` idle timer |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 
 ## References
