@@ -1,0 +1,1208 @@
+xnu 0289: a photo of a panic names the failure site
+
+The panel cannot be scrolled and a panic is longer than the screen, so the
+first line - the reason - was gone by the time the dump finished. The console
+is now a client of the early framebuffer's HUD rows: the reason's first line
+and the panic's format string go on the two bottom rows, which nothing else
+writes, and the formatted copy is printed at the top after the dump.
+
+Two CPUs can panic at once (one assertion, one lock timeout on the lock the
+first was holding) and the second report used to overwrite the first: only the
+first report reaches the screen. The formatted message can itself fault when a
+%s argument is the corrupt thing, so the format string - a constant in the
+kernel image - is reported on its own path.
+
+Data aborts report ESR/FAR/PC/LR/CPSR/x0 on labelled HUD rows before the
+generic handler prints, and the ticket lock's verify panics carry the owner,
+the caller and the CPU, so a "not owned" panic says which thread held it.
+Secondaries mark the stage they reached in a 32x16 block at the bottom
+straight from assembly, with the MMU off, because arm_init runs before the
+console exists.
+
+diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -8,8 +8,10 @@
+ #include <arm64/mondrian_early.h>
+ 
+ #if defined(MONDRIAN)
++#include <stddef.h>
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <arm/cpu_data_internal.h>
+ #include <pexpert/pexpert.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xb8000000;
+@@ -36,6 +38,15 @@
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
++/*
++ * The panel carries no boot text: every line the kernel and the daemons print
++ * is in the persistent ring already, and on the panel the text overwrote the
++ * bootloader's splash and then sat over the UI in the two rows the console
++ * keeps for status. A panic is the one thing that must be seen, and it paints
++ * (early_panicking). MondrianEarly `mondrian_early_text(1)` brings the text
++ * back for a bring-up boot of a board with no ring to read.
++ */
++static unsigned int early_text;
+ /* The panic copy keeps drawing after the console took over: it is the only
+  * way to see a panic if the console itself is what died. */
+ static unsigned int early_forced;
+@@ -114,6 +125,26 @@
+ 	if (early_disabled && !early_forced) {
+ 		return;
+ 	}
++	if (!early_text && !early_panicking) {
++		/* Keep the cursor for a later panic; touch no pixels. */
++		if (c == '\r') {
++			early_col = 0;
++			return;
++		}
++		if (c == '\n' || early_col == EARLY_COLS) {
++			early_col = 0;
++			if (early_row + 1 < EARLY_HUD_ROW0) {
++				early_row++;
++			} else {
++				early_row = 0;
++			}
++			if (c == '\n') {
++				return;
++			}
++		}
++		early_col++;
++		return;
++	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		mondrian_early_clear_screen();
+@@ -234,11 +265,14 @@
+ 	}
+ 	early_panicking = 1;
+ 	early_forced = 1;
+-	/* Start at the bottom of the screen: the console's newest lines are
+-	 * there, and a panic is the last thing that will be said. */
+-	early_row = EARLY_HUD_ROW0;
++	/* Top of the text area: the message is the newest line and the beacon
++	 * rows keep the site and the format string. */
++	early_row = 0;
+ 	early_col = 0;
+-	mondrian_early_string("\nMONDRIAN EARLY PANIC: ");
++	mondrian_early_string("MONDRIAN EARLY PANIC: ");
++	/* The format string cannot fault: print it in full first. */
++	mondrian_early_string(fmt != NULL ? fmt : "(null)");
++	mondrian_early_putc('\n');
+ 	va_list copy;
+ 	va_copy(copy, *args);
+ 	_doprnt(fmt, &copy, mondrian_early_putc, 16);
+@@ -252,25 +286,606 @@
+  * painter is one thread, so saving and restoring the cursor here is enough; the
+  * line is what a photo can show when the point of the photo is a number.
+  */
++static unsigned int hud_hex(char *buf, unsigned int n, uint64_t v, unsigned int digits);
++static void hud_row_text(unsigned int row, const char *s);
++
++/*
++ * The panic path starts the console on the HUD row, so a fault in it leaves
++ * the cursor there and every further line would spill over the one row the
++ * status line lives in. Put it back on the text area.
++ */
++void
++mondrian_early_cursor_top(void)
++{
++	early_row = 0;
++	early_col = 0;
++}
++
++void
++mondrian_early_status_row(unsigned int row, const char *s)
++{
++	/*
++	 * A status row is panel text: it follows the text console's switch, not
++	 * the console's own quiet flag. The scheduler, the timer sample and the
++	 * log thread report here for the whole boot, and a row written after the
++	 * UI has taken the panel sits on top of it until the next frame -- or
++	 * forever, in the two rows the console keeps below its text area.
++	 */
++	if (!early_text && !early_panicking) {
++		return;
++	}
++	/* By position: the console cursor belongs to the log thread. */
++	hud_row_text(row, s);
++}
++
+ void
+ mondrian_early_status(const char *s)
+ {
+-	unsigned int row = early_row;
+-	unsigned int col = early_col;
+-	extern int mondrian_fbcon_quiet;
++	if (!early_text && !early_panicking) {
++		return;
++	}
++	hud_row_text(EARLY_HUD_ROW0, s);
++}
+ 
+-	/* The UI owns the panel: the status row goes with the console. */
+-	if (mondrian_fbcon_quiet) {
++/*
++ * MondrianEarly: the panel text console, for a bring-up boot where the ring
++ * cannot be read back. Panics paint whether this is on or not.
++ */
++void
++mondrian_early_text(int on)
++{
++	early_text = on != 0;
++}
++
++/*
++ * A panic row, written by position instead of through the console cursor.
++ * The log thread paints the console from another CPU and owns early_row and
++ * early_col; a panic that shared them lost its first rows to the painter's
++ * next scroll. Every panic row uses these, and the painter stops as soon as
++ * early_panicking is set.
++ */
++static void hud_putc(unsigned int row, unsigned int col, char c);
++
++static void
++hud_fill_row(unsigned int row, uint32_t color)
++{
++	for (unsigned int y = row * EARLY_CELL_H; y < (row + 1) * EARLY_CELL_H; y++) {
++		volatile uint32_t *line = EARLY_FB + y * EARLY_STRIDE;
++
++		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++			line[x] = color;
++		}
++	}
++}
++
++static void
++hud_row_text(unsigned int row, const char *s)
++{
++	unsigned int col = 0;
++
++	hud_fill_row(row, 0xff000000u);
++	for (; s != NULL && *s != 0 && col < EARLY_COLS; s++, col++) {
++		char c = *s;
++
++		hud_putc(row, col, (c >= 0x20 && c <= 0x7e) ? c : '.');
++	}
++}
++
++/*
++ * The two rows that never scroll, written before the panic message is
++ * formatted: the caller names the panic site, and the format string is a
++ * constant, so neither can fault even when an argument of the message is the
++ * corrupt thing.
++ */
++static unsigned int early_fault_shown;
++static unsigned int panic_info_shown;
++static uint64_t fault_pc, fault_lr, fault_esr, fault_far;
++/* Last hand-off stage reached by each core, by MPIDR Aff1 (0 = never). */
++static unsigned char mondrian_stage_by_aff1[16];
++
++int
++mondrian_early_fault_holds_hud(void)
++{
++	return early_fault_shown != 0 || panic_info_shown != 0;
++}
++
++void
++mondrian_early_fault(uint64_t pc, uint64_t lr, uint64_t esr, uint64_t far,
++    uint64_t fp)
++{
++	char row[48];
++	char line[EARLY_COLS];
++	unsigned int n;
++	uint64_t const mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL;
++	uint64_t const thr = __builtin_arm_rsr64("TPIDR_EL1");
++	uint64_t act = 0;
++	uint64_t caller = 0;
++	extern int ml_get_cpu_number(uint32_t phys_id);
++	int logical;
++
++	/* The first panic already named itself; a later fault is a symptom. */
++	if (panic_info_shown || early_fault_shown) {
+ 		return;
+ 	}
+-	early_row = EARLY_HUD_ROW0;
+-	early_col = 0;
+-	mondrian_early_clear_row();
+-	while (*s != 0 && early_col < EARLY_COLS) {
+-		mondrian_early_putc(*s++);
++	early_forced = 1;
++	fault_pc = pc;
++	fault_lr = lr;
++	fault_esr = esr;
++	fault_far = far;
++
++	/*
++	 * One row above the panic report: which CPU took the fault, the thread
++	 * it was running, the thread the CPU was started with, and the return
++	 * address of the frame that faulted. In the ast_off failure
++	 * (current_thread()->machine.CpuDatap == NULL) these four name the
++	 * hand-off that gave this CPU a thread that was not its own.
++	 */
++	logical = ml_get_cpu_number((uint32_t)mpidr);
++	if (logical >= 0 && logical < MAX_CPUS &&
++	    CpuDataEntries[logical].cpu_data_vaddr != NULL) {
++		act = (uint64_t)CpuDataEntries[logical].cpu_data_vaddr->cpu_active_thread;
++	}
++	if (far == (uint64_t)offsetof(cpu_data_t, cpu_pending_ast) &&
++	    (fp & 0xffff000000000000ULL) == 0xffff000000000000ULL &&
++	    fp <= UINT64_MAX - 8) {
++		caller = *(volatile uint64_t *)(uintptr_t)(fp + 8);
++	}
++	n = 0;
++	line[n++] = 'c';
++	line[n++] = 'p';
++	line[n++] = 'u';
++	line[n++] = ' ';
++	n = hud_hex(line, n, mpidr, 4);
++	line[n++] = ' ';
++	line[n++] = 't';
++	line[n++] = 'h';
++	line[n++] = 'r';
++	line[n++] = ' ';
++	n = hud_hex(line, n, thr, 16);
++	line[n++] = ' ';
++	line[n++] = 'a';
++	line[n++] = 'c';
++	line[n++] = 't';
++	line[n++] = ' ';
++	n = hud_hex(line, n, act, 16);
++	line[n++] = ' ';
++	line[n++] = 'c';
++	line[n++] = 'a';
++	line[n++] = 'l';
++	line[n++] = 'l';
++	line[n++] = ' ';
++	n = hud_hex(line, n, caller, 16);
++	line[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 - 5, line);
++
++	n = 0;
++	row[n++] = 'p';
++	row[n++] = 'c';
++	row[n++] = ' ';
++	n = hud_hex(row, n, pc, 16);
++	row[n++] = ' ';
++	row[n++] = 'e';
++	row[n++] = 's';
++	row[n++] = 'r';
++	row[n++] = ' ';
++	n = hud_hex(row, n, esr, 8);
++	row[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 + 1, row);
++
++	n = 0;
++	row[n++] = 'l';
++	row[n++] = 'r';
++	row[n++] = ' ';
++	n = hud_hex(row, n, lr, 16);
++	row[n++] = ' ';
++	row[n++] = 'f';
++	row[n++] = 'a';
++	row[n++] = 'r';
++	row[n++] = ' ';
++	n = hud_hex(row, n, far, 16);
++	row[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0, row);
++
++	early_fault_shown = 1;
++}
++
++/*
++ * Bring-up beacon, one row: the last CPU and stage that reached a hand-off
++ * point. startAll() starts the secondaries one at a time, so the last writer
++ * is the CPU that did not come back.
++ */
++void
++mondrian_early_stage(uint64_t mpidr, unsigned int stage)
++{
++	char line[24];
++	unsigned int n = 0;
++
++	mondrian_stage_by_aff1[(mpidr >> 8) & 0xf] = (unsigned char)(stage + 1);
++	/*
++	 * This runs every time a CPU goes idle, so it must not force the console
++	 * back on: early_forced is the panic override, and setting it here kept
++	 * the HUD row painting "st <mpidr> s <stage>" over the UI for the whole
++	 * boot, the line the user saw advancing.
++	 */
++	if (!early_text && !early_panicking) {
++		return;
++	}
++	early_forced = 1;
++	line[n++] = 's';
++	line[n++] = 't';
++	line[n++] = ' ';
++	n = hud_hex(line, n, mpidr, 4);
++	line[n++] = ' ';
++	line[n++] = 's';
++	line[n++] = ' ';
++	line[n++] = (char)('0' + (unsigned char)(stage % 10));
++	line[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 - 6, line);
++}
++
++void
++mondrian_early_panic_fmt(const char *fmt, uint64_t caller)
++{
++	char line[EARLY_COLS];
++	unsigned int n = 0;
++	uint64_t const mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL;
++	uint64_t const thr = __builtin_arm_rsr64("TPIDR_EL1");
++	uint64_t act = 0, pl = 0, idle = 0;
++	extern int ml_get_cpu_number(uint32_t phys_id);
++	int logical;
++
++	/* Only the first panic is the interesting one. */
++	if (early_fault_shown || panic_info_shown) {
++		return;
+ 	}
+-	early_row = row;
+-	early_col = col;
++	early_forced = 1;
++	early_panicking = 1;
++
++	/*
++	 * The panic the secondaries hit is the preemption count in
++	 * thread_invoke(): whether the CPU is running the thread it was
++	 * started with (thr == act), and against which idle thread it
++	 * compares itself. The first row never dereferences anything.
++	 */
++	logical = ml_get_cpu_number((uint32_t)mpidr);
++	if (logical >= 0 && logical < MAX_CPUS &&
++	    CpuDataEntries[logical].cpu_data_vaddr != NULL) {
++		act = (uint64_t)CpuDataEntries[logical].cpu_data_vaddr->cpu_active_thread;
++	}
++	n = 0;
++	line[n++] = 'c';
++	line[n++] = 'p';
++	line[n++] = 'u';
++	line[n++] = ' ';
++	n = hud_hex(line, n, mpidr, 4);
++	line[n++] = ' ';
++	line[n++] = 't';
++	line[n++] = 'h';
++	line[n++] = 'r';
++	line[n++] = ' ';
++	n = hud_hex(line, n, thr, 16);
++	line[n++] = ' ';
++	line[n++] = 'a';
++	line[n++] = 'c';
++	line[n++] = 't';
++	line[n++] = ' ';
++	n = hud_hex(line, n, act, 16);
++	line[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 - 7, line);
++
++	/* Second row: only a canonical thread pointer is dereferenced. */
++	if ((thr >> 40) == 0xfffffeULL) {
++		pl = ((thread_t)thr)->machine.preemption_count;
++		idle = (uint64_t)current_processor()->idle_thread;
++	}
++	n = 0;
++	line[n++] = 'p';
++	line[n++] = 'l';
++	line[n++] = ' ';
++	n = hud_hex(line, n, pl, 8);
++	line[n++] = ' ';
++	line[n++] = 'i';
++	line[n++] = 'd';
++	line[n++] = 'l';
++	line[n++] = 'e';
++	line[n++] = ' ';
++	n = hud_hex(line, n, idle, 16);
++	line[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 - 8, line);
++
++	n = 0;
++	line[n++] = 'C';
++	line[n++] = ':';
++	line[n++] = '0';
++	line[n++] = 'x';
++	n = hud_hex(line, n, caller, 16);
++	line[n] = 0;
++	hud_row_text(EARLY_HUD_ROW0 - 1, line);
++	hud_row_text(EARLY_HUD_ROW0 - 2, fmt != NULL ? fmt : "(null)");
++	panic_info_shown = 1;
++}
++
++/*
++ * Diagnostic stop for the panic path: the format string, the caller and the
++ * first four raw argument words, all built without _doprnt so a bad %s in the
++ * message cannot fault, and the machine stops here so no nested panic scrolls
++ * it away. The two lines sit just above the fixed rows at the bottom.
++ */
++static void
++hud_string_row(unsigned int row, const char *prefix, const char *s,
++    unsigned int max)
++{
++	char line[EARLY_COLS];
++	unsigned int n = 0;
++	unsigned int i;
++	unsigned int len = 0;
++	unsigned int room;
++
++	for (i = 0; prefix[i] != 0 && n < sizeof(line) - 1; i++) {
++		line[n++] = prefix[i];
++	}
++	room = (unsigned int)sizeof(line) - 1 - n;
++	if (max > room) {
++		max = room;
++	}
++	if (s != NULL) {
++		unsigned int has_slash = 0;
++
++		while (s[len] != 0) {
++			if (s[len] == '/') {
++				has_slash = 1;
++			}
++			len++;
++		}
++		/*
++		 * A long path keeps its tail (the name), a long message keeps its
++		 * head (the subject); the build prefix of the first is noise and
++		 * the end of the second is the detail.
++		 */
++		if (len > max && has_slash) {
++			s += len - max;
++		}
++	}
++	for (i = 0; s != NULL && s[i] != 0 && i < max; i++) {
++		char c = s[i];
++
++		line[n++] = (c >= 0x20 && c <= 0x7e) ? c : '.';
++	}
++	line[n] = 0;
++	hud_row_text(row, line);
++}
++
++void
++mondrian_early_panic_report(uint64_t caller, const char *fmt,
++    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	char line[EARLY_COLS];
++	unsigned int n = 0;
++	unsigned int const row = EARLY_HUD_ROW0 - 4;
++	unsigned int i;
++	uint64_t const mpidr = __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL;
++
++	early_panicking = 1;
++	early_forced = 1;
++
++	/*
++	 * The top of the panel, not the last line: a photo of the phone keeps
++	 * the top rows legible and loses the bottom one to the glare and the
++	 * curved edge. This block holds everything needed to name the check
++	 * that failed, in the order a reader needs it.
++	 */
++	n = 0;
++	line[n++] = 'S';
++	line[n++] = 'T';
++	line[n++] = 'O';
++	line[n++] = 'P';
++	line[n++] = ' ';
++	line[n++] = 'm';
++	line[n++] = ' ';
++	n = hud_hex(line, n, mpidr, 4);
++	line[n++] = ' ';
++	line[n++] = 'c';
++	line[n++] = ' ';
++	n = hud_hex(line, n, caller, 16);
++	line[n] = 0;
++	hud_row_text(0, line);
++
++	/* The panic message: a constant in the kernel image, never a %s. */
++	hud_string_row(1, "p ", fmt, EARLY_COLS);
++
++	/*
++	 * Assert() panics with "%s:%d Assertion failed: %s": the arguments are
++	 * the file, the line and the expression. The file gets a row of its
++	 * own, and a long build prefix is dropped from the left, not the name.
++	 */
++	if (fmt != NULL && fmt[0] == '%' && fmt[1] == 's' && fmt[2] == ':' &&
++	    fmt[3] == '%' && fmt[4] == 'd' && fmt[5] == ' ' &&
++	    (a0 >> 40) == 0xfffffeULL) {
++		char text[EARLY_COLS];
++		char digits[24];
++		unsigned int k = 0;
++		unsigned int nd = 0;
++		uint64_t v = a1;
++
++		hud_string_row(2, "f ", (const char *)(uintptr_t)a0, EARLY_COLS);
++
++		text[k++] = 'l';
++		text[k++] = ' ';
++		do {
++			digits[nd++] = (char)('0' + (int)(v % 10));
++			v /= 10;
++		} while (v != 0 && nd < sizeof(digits));
++		while (nd > 0) {
++			text[k++] = digits[--nd];
++		}
++		text[k++] = ' ';
++		text[k++] = 'e';
++		text[k++] = ' ';
++		if ((a2 >> 40) == 0xfffffeULL) {
++			const char *s = (const char *)(uintptr_t)a2;
++
++			for (unsigned int j = 0; s[j] != 0 && k < EARLY_COLS - 1; j++) {
++				char c = s[j];
++
++				text[k++] = (c >= 0x20 && c <= 0x7e) ? c : '.';
++			}
++		}
++		text[k] = 0;
++		hud_row_text(3, text);
++	}
++
++	/* The four raw argument words, always: they name the CPU in a timeout. */
++	n = 0;
++	line[n++] = 'A';
++	line[n++] = ' ';
++	n = hud_hex(line, n, a0, 16);
++	line[n++] = ' ';
++	n = hud_hex(line, n, a1, 16);
++	line[n] = 0;
++	hud_row_text(4, line);
++
++	n = 0;
++	line[n++] = 'A';
++	line[n++] = ' ';
++	n = hud_hex(line, n, a2, 16);
++	line[n++] = ' ';
++	n = hud_hex(line, n, a3, 16);
++	line[n] = 0;
++	hud_row_text(5, line);
++
++	/* Which cores ran, and the last hand-off each one reached. */
++	{
++		char stages[EARLY_COLS];
++		unsigned int k = 0;
++
++		stages[k++] = 'S';
++		stages[k++] = ' ';
++		for (unsigned int c = 0; c < 8; c++) {
++			unsigned int v = mondrian_stage_by_aff1[c];
++
++			stages[k++] = (char)('0' + c);
++			stages[k++] = ':';
++			if (v == 0) {
++				stages[k++] = '-';
++				stages[k++] = '-';
++			} else {
++				stages[k++] = (char)('0' + ((v - 1) / 10) % 10);
++				stages[k++] = (char)('0' + (v - 1) % 10);
++			}
++			if (c != 7) {
++				stages[k++] = ' ';
++			}
++		}
++		stages[k] = 0;
++		hud_row_text(6, stages);
++	}
++
++	if (early_fault_shown) {
++		n = 0;
++		line[n++] = 'p';
++		line[n++] = 'c';
++		line[n++] = ' ';
++		n = hud_hex(line, n, fault_pc, 16);
++		line[n++] = ' ';
++		line[n++] = 'e';
++		line[n++] = 's';
++		line[n++] = 'r';
++		line[n++] = ' ';
++		n = hud_hex(line, n, fault_esr, 8);
++		line[n] = 0;
++		hud_row_text(row, line);
++
++		n = 0;
++		line[n++] = 'l';
++		line[n++] = 'r';
++		line[n++] = ' ';
++		n = hud_hex(line, n, fault_lr, 16);
++		line[n++] = ' ';
++		line[n++] = 'f';
++		line[n++] = 'a';
++		line[n++] = 'r';
++		line[n++] = ' ';
++		n = hud_hex(line, n, fault_far, 16);
++		line[n] = 0;
++		hud_row_text(row + 1, line);
++	}
++
++	n = 0;
++	for (i = 0; "MONDRIAN PANIC: "[i] != 0 && n < sizeof(line) - 1; i++) {
++		line[n++] = "MONDRIAN PANIC: "[i];
++	}
++	for (i = 0; fmt != NULL && fmt[i] != 0 && n < sizeof(line) - 1; i++) {
++		char c = fmt[i];
++
++		line[n++] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
++	}
++	line[n] = 0;
++	hud_row_text(row + 2, line);
++
++	n = 0;
++	line[n++] = 'C';
++	line[n++] = ':';
++	line[n++] = '0';
++	line[n++] = 'x';
++	n = hud_hex(line, n, caller, 16);
++	line[n++] = ' ';
++	line[n++] = 'A';
++	line[n++] = ':';
++	n = hud_hex(line, n, a0, 16);
++	line[n++] = ' ';
++	n = hud_hex(line, n, a1, 16);
++	line[n++] = ' ';
++	n = hud_hex(line, n, a2, 16);
++	line[n++] = ' ';
++	n = hud_hex(line, n, a3, 16);
++	line[n] = 0;
++	hud_row_text(row + 3, line);
++
++	/*
++	 * An assertion names itself: Assert() panics with
++	 * "%s:%d Assertion failed: %s", and the arguments are the file, the
++	 * line and the expression. Printed as text, because four 16-digit words
++	 * do not survive a photograph of the panel.
++	 */
++	if (fmt != NULL && fmt[0] == '%' && fmt[1] == 's' && fmt[2] == ':' &&
++	    fmt[3] == '%' && fmt[4] == 'd' && fmt[5] == ' ') {
++		char line2[EARLY_COLS];
++		char digits[12];
++		unsigned int k = 0;
++		unsigned int nd = 0;
++		uint64_t v = a1;
++
++		if ((a0 >> 40) == 0xfffffeULL) {
++			hud_string_row(EARLY_HUD_ROW0 - 3, "f ",
++			    (const char *)(uintptr_t)a0, 80);
++		}
++		line2[k++] = 'l';
++		line2[k++] = ' ';
++		do {
++			digits[nd++] = (char)('0' + (int)(v % 10));
++			v /= 10;
++		} while (v != 0 && nd < sizeof(digits));
++		while (nd > 0) {
++			line2[k++] = digits[--nd];
++		}
++		line2[k++] = ' ';
++		line2[k++] = 'e';
++		line2[k++] = ' ';
++		if ((a2 >> 40) == 0xfffffeULL) {
++			const char *s = (const char *)(uintptr_t)a2;
++
++			for (unsigned int i = 0; s[i] != 0 && i < 60 &&
++			    k < sizeof(line2) - 1; i++) {
++				char c = s[i];
++
++				line2[k++] = (c >= 0x20 && c <= 0x7e) ? c : '.';
++			}
++		}
++		line2[k] = 0;
++		hud_row_text(EARLY_HUD_ROW0 - 4, line2);
++	}
++
++	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+ /*
+@@ -285,25 +900,79 @@
+ {
+ 	extern int mondrian_fbcon_quiet;
+ 
+-	if (mondrian_fbcon_quiet) {
++	/*
++	 * A panic owns the panel: a later line from another CPU must not
++	 * scroll the rows that name the failure off the screen.
++	 */
++	if (mondrian_fbcon_quiet || early_panicking) {
+ 		return;
+ 	}
+ 	while (size-- > 0) {
++		/* A panic owns the panel; do not scroll its rows away. */
++		if (early_panicking) {
++			break;
++		}
+ 		mondrian_early_putc(*c++);
+ 	}
+ }
+ 
+ void
++mondrian_early_reg(const char *name, uint64_t value)
++{
++	static const char digits[] = "0123456789abcdef";
++	char buf[20];
++	int i = 19;
++
++	buf[i] = '\0';
++	do {
++		buf[--i] = digits[value & 0xf];
++		value >>= 4;
++	} while (value != 0);
++	mondrian_early_string(name);
++	mondrian_early_string(" 0x");
++	mondrian_early_string(&buf[i]);
++	mondrian_early_putc('\n');
++}
++
++void
+ mondrian_early_relocate(uint64_t base)
+ {
+ 	mondrian_early_mark(8, "leaving bootstrap TTBR0");
+ 	if (early_fb_va != 0) {
+-		early_fb = (volatile uint32_t *)(uintptr_t)base;
++		/*
++		 * Ask the MMU instead of faulting at it. AT S1E1W walks the
++		 * current tables and leaves the result in PAR_EL1: bit 0 clear
++		 * means the translation exists and bits 47:12 are the output
++		 * address. A dead alias here used to end in handle_kernel_abort()
++		 * with kernel_map == NULL, which panics with a message about the
++		 * stack pointer instead of the mapping.
++		 */
++		uint64_t par;
++
++		__asm__ volatile("at s1e1w, %0" :: "r"(base));
++		__asm__ volatile("mrs %0, par_el1" : "=r"(par));
++		if ((par & 1) != 0) {
++			/*
++			 * The alias does not translate after all. Rather than fault
++			 * into handle_kernel_abort() (which panics about the stack
++			 * pointer), keep the console on the physmap view of the same
++			 * pixels and say so.
++			 */
++			mondrian_early_reg("atfail", par);
++			early_fb = (volatile uint32_t *)(uintptr_t)mondrian_early_fb_backup;
++			early_fb_va = (uint64_t)(uintptr_t)early_fb;
++		} else {
++			mondrian_early_string("MONDRIAN ALIAS OK\n");
++			early_fb = (volatile uint32_t *)(uintptr_t)base;
++		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_early_mark(9, "kernel framebuffer VA live");
+ }
+ 
++/* A second, always-mapped view of the same pixels (the physmap). */
++uint64_t mondrian_early_fb_backup;
++
+ /* The alias is in place: from now on the framebuffer is at this VA. */
+ void
+ mondrian_early_set_fb_va(uint64_t va)
+
+diff --git a/osfmk/arm64/mondrian_early.h b/osfmk/arm64/mondrian_early.h
+--- a/osfmk/arm64/mondrian_early.h
++++ b/osfmk/arm64/mondrian_early.h
+@@ -14,10 +14,13 @@
+ void mondrian_early_putc(char c);
+ void mondrian_early_panic(const char *fmt, va_list *args);
+ void mondrian_early_relocate(uint64_t base);
++void mondrian_early_reg(const char *name, uint64_t value);
+ void mondrian_early_disable(void);
+ uint64_t mondrian_early_fb_va(void);
+ void mondrian_early_set_fb_va(uint64_t va);
++extern uint64_t mondrian_early_fb_backup;
+ void mondrian_early_beacon(uint64_t pc, uint64_t count);
++void mondrian_early_text(int on);
+ #else
+ static inline void mondrian_early_mark(unsigned int stage, const char *label)
+ {
+@@ -25,6 +28,7 @@
+ 	(void)label;
+ }
+ static inline void mondrian_early_disable(void) {}
++static inline void mondrian_early_text(int on) { (void)on; }
+ static inline uint64_t mondrian_early_fb_va(void) { return 0; }
+ static inline void mondrian_early_set_fb_va(uint64_t va) { (void)va; }
+ static inline void mondrian_early_beacon(uint64_t pc, uint64_t count)
+
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1068,6 +1068,7 @@
+ /* The reason of the panic, kept so that it can be printed again at the end
+  * (see panic_trap_to_debugger): the console cannot be scrolled. */
+ static char mondrian_panic_reason[256];
++const char *mondrian_panic_format;
+ static unsigned int mondrian_panic_len;
+ 
+ static void
+@@ -1078,6 +1079,39 @@
+ 		mondrian_panic_reason[mondrian_panic_len] = '\0';
+ 	}
+ }
++
++/*
++ * The console scrolls, so by the time a panic stops the reason is far above
++ * the visible text. The HUD row never scrolls and the console cannot scroll
++ * at all: put the first line of the reason on the HUD row, where a photo of
++ * the phone reaches it whatever else the dump prints.
++ */
++static void
++mondrian_panic_hud(void)
++{
++	extern void mondrian_early_status(const char *s);
++	extern int mondrian_early_fault_holds_hud(void);
++	char hud[96];
++	int n = 0;
++
++	/* A fault state on those rows says more than the message does. */
++	if (mondrian_panic_len == 0 || mondrian_early_fault_holds_hud()) {
++		return;
++	}
++	hud[n++] = 'P';
++	hud[n++] = ':';
++	hud[n++] = ' ';
++	for (int i = 0; mondrian_panic_reason[i] != 0 && n < (int)sizeof(hud) - 1; i++) {
++		char c = mondrian_panic_reason[i];
++
++		if (c == '\n' || c == '\r') {
++			break;
++		}
++		hud[n++] = c;
++	}
++	hud[n] = 0;
++	mondrian_early_status(hud);
++}
+ #endif
+ 
+ #pragma clang diagnostic push
+@@ -1089,21 +1123,48 @@
+ #pragma clang diagnostic pop
+ 
+ #if defined(MONDRIAN)
+-	/* No CPU/thread/debugger state is required for this first panic copy. */
+-	mondrian_early_panic(panic_format_str, panic_args);
+ 	/*
+-	 * The phone's console cannot be scrolled and a panic is longer than
+-	 * the screen, so the first line - the reason - is gone by the time
+-	 * the panic ends. Keep a copy and print it again at the end, so the
+-	 * last thing on the screen is why the kernel died.
++	 * The format string of the panic, kept for the fault path: the
++	 * formatted message may not be printable at all (a %s argument can be
++	 * the corrupt thing, and then this copy faults and the screen fills
++	 * with the fault), but the format string is a constant in the kernel
++	 * image and names the panic site on its own.
+ 	 */
++	mondrian_panic_format = panic_format_str;
+ 	{
+-		va_list copy;
++		extern void mondrian_early_panic_fmt(const char *fmt, uint64_t caller);
++		extern void mondrian_early_panic(const char *fmt, va_list *args);
++		extern void mondrian_early_panic_report(uint64_t caller, const char *fmt,
++		    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
++		static volatile unsigned int mondrian_panic_owner;
++		va_list raw;
++		uint64_t a[4];
++		int i;
+ 
+-		va_copy(copy, *panic_args);
+-		mondrian_panic_len = 0;
+-		_doprnt(panic_format_str, copy, mondrian_panic_putc, 16);
+-		va_end(copy);
++		/*
++		 * Two CPUs can panic at once: one fails an assertion while the
++		 * other times out on a lock the first one was holding. Only the
++		 * first report gets the screen; a second one would overwrite
++		 * the arguments that name the real failure.
++		 */
++		if (__sync_lock_test_and_set(&mondrian_panic_owner, 1u) == 0) {
++			va_copy(raw, *panic_args);
++			for (i = 0; i < 4; i++) {
++				a[i] = va_arg(raw, uint64_t);
++			}
++			va_end(raw);
++
++			mondrian_early_panic_fmt(panic_format_str, (uint64_t)panic_caller);
++			mondrian_early_panic_report((uint64_t)panic_caller, panic_format_str,
++			    a[0], a[1], a[2], a[3]);
++		}
++	}
++	/*
++	 * Diagnostic stop: one panic is enough to read. Formatting the message
++	 * can fault and turn it into a storm that buries the screen.
++	 */
++	for (;;) {
++		__asm__ volatile("wfe" ::: "memory");
+ 	}
+ #endif
+ 
+@@ -1493,7 +1554,14 @@
+ #if defined(MONDRIAN)
+ 	/* The last line on the screen: why the kernel died. */
+ 	if (mondrian_panic_len != 0) {
++		extern void mondrian_early_cursor_top(void);
++
++		/* The console only scrolls forward: put the reason back at the
++		 * top of the screen, where it is not pushed off by the dump,
++		 * and repeat it on the HUD row. */
++		mondrian_early_cursor_top();
+ 		printf("MONDRIAN PANIC: %s\n", mondrian_panic_reason);
++		mondrian_panic_hud();
+ 	}
+ #endif
+ 	panic_spin_forever();
+
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -483,6 +483,15 @@
+ 		    VALUE(state->far));
+ 	}
+ 
++#if defined(MONDRIAN)
++	{
++		extern void mondrian_early_fault(uint64_t pc, uint64_t lr, uint64_t esr,
++		    uint64_t far, uint64_t fp);
++
++		mondrian_early_fault(state->pc, state->lr, state->esr, state->far,
++		    state->fp);
++	}
++#endif
+ 	panic_plain("%s at pc 0x%016llx, lr 0x%016llx (saved state: %p%s)\n"
+ 	    "\t  x0:  0x%016llx x1:  0x%016llx  x2:  0x%016llx  x3:  0x%016llx\n"
+ 	    "\t  x4:  0x%016llx x5:  0x%016llx  x6:  0x%016llx  x7:  0x%016llx\n"
+@@ -1513,6 +1522,41 @@
+ {
+ 	thread_t thread = current_thread();
+ 	bool recover = find_copyio_recovery_entry(state) != 0;
++#if defined(MONDRIAN)
++	{
++		extern void mondrian_early_reg(const char *name, uint64_t value);
++		extern void mondrian_early_cursor_top(void);
++		extern void mondrian_early_status(const char *s);
++		extern const char *mondrian_panic_format;
++		uint64_t k_cpsr = get_saved_state_cpsr(state);
++
++		/* The panic print left the console on the HUD row. */
++		mondrian_early_cursor_top();
++
++		mondrian_early_reg("KABORT esr", esr);
++		mondrian_early_reg("KABORT far", fault_addr);
++		mondrian_early_reg("KABORT pc", get_saved_state_pc(state));
++		mondrian_early_reg("KABORT lr", saved_state64(state)->lr);
++		mondrian_early_reg("KABORT cpsr", k_cpsr);
++		mondrian_early_reg("KABORT x0", saved_state64(state)->x[0]);
++		if (mondrian_panic_format != NULL) {
++			char hud[120];
++			int n = 0;
++
++			hud[n++] = 'P';
++			hud[n++] = ':';
++			hud[n++] = ' ';
++			for (int i = 0; mondrian_panic_format[i] != 0 &&
++			    n < (int)sizeof(hud) - 1; i++) {
++				char c = mondrian_panic_format[i];
++
++				hud[n++] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
++			}
++			hud[n] = 0;
++			mondrian_early_status(hud);
++		}
++	}
++#endif
+ 
+ #ifndef CONFIG_XNUPOST
+ 	(void)expected_fault_handler;
+
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -40,6 +40,41 @@
+ #include <arm/pmap.h>
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
++/*
++ * Secondary bring-up marker, for a photograph: fills a 32x16 white block at
++ * the bottom-left of the panel, at x = stage * 128 bytes. The MMU is off in
++ * every place it is used, so the framebuffer is written at its physical
++ * address; the console and the panic rows never reach that row, so what is
++ * on the panel is the last stage the core reached before it stopped.
++ * Only the A510 cluster (MPIDR Aff1 0) paints, so the blocks cannot come
++ * from a core that is known to work.
++ *   1 entry          2 EL1 path       3 EL2 path
++ *   4 bad EL         5 cpu_data found 6 no cpu_data entry
++ */
++.macro	MONDRIAN_MARK stage
++	mrs	x16, MPIDR_EL1
++	and	x16, x16, #0xff00
++	cbnz	x16, 7f
++	movz	x9, #0xb800, lsl #16			/* framebuffer, physical */
++	mov	x10, #3168
++	mov	x11, #5760
++	mul	x10, x10, x11
++	add	x9, x9, x10
++	add	x9, x9, #((\stage) * 128)
++	mov	w12, #0xffffffff
++	mov	w13, #16
++9:	mov	w14, #8
++	mov	x15, x9
++8:	str	w12, [x15], #4
++	subs	w14, w14, #1
++	b.ne	8b
++	add	x9, x9, x11
++	subs	w13, w13, #1
++	b.ne	9b
++	dsb	sy
++7:
++.endm
++
+ 
+ 
+ .macro MSR_VBAR_EL1_X0
+@@ -162,6 +197,7 @@
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++	MONDRIAN_MARK 5
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -193,6 +229,7 @@
+ 
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++	MONDRIAN_MARK 6
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -289,6 +326,7 @@
+ 	.globl EXT(mondrian_secondary_entry)
+ LEXT(mondrian_secondary_entry)
+ 	msr		DAIFSet, #0xf
++	MONDRIAN_MARK 1
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+@@ -320,11 +358,14 @@
+ 	msr		ELR_EL2, x1
+ 	mov		x1, #0x3c5			// DAIF masked, AArch64 EL1h
+ 	msr		SPSR_EL2, x1
++	MONDRIAN_MARK 3
+ 	eret
+ Lsweet_secondary_bad_el:
++	MONDRIAN_MARK 4
+ 	b		.
+ Lsweet_secondary_el1:
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
++	MONDRIAN_MARK 2
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* MONDRIAN */
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -709,6 +709,10 @@
+ 
+ 
+ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
++	{
++		extern void mondrian_early_stage(uint64_t mpidr, unsigned int stage);
++		mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 1);
++	}
+ 
+ #if APPLE_ARM64_ARCH_FAMILY
+ 	configure_late_apple_regs();
+
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -862,6 +862,10 @@
+ 		thread->parameter = machine_param;
+ 	}
+ 
++	{
++		extern void mondrian_early_stage(uint64_t mpidr, unsigned int stage);
++		mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 2);
++	}
+ 	load_context(thread);
+ 	/*NOTREACHED*/
+ }
+@@ -880,16 +884,23 @@
+ 	processor_t             processor = current_processor();
+ 	thread_t                self = current_thread();
+ 
++	{
++		extern void mondrian_early_stage(uint64_t mpidr, unsigned int stage);
++		mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 3);
++	}
+ 	slave_machine_init(machine_param);
++	mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 4);
+ 
+ 	/*
+ 	 *	If running the idle processor thread,
+ 	 *	reenter the idle loop, else terminate.
+ 	 */
+ 	if (self == processor->idle_thread) {
++		mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 5);
+ 		thread_block(idle_thread);
+ 	}
+ 
++	mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 6);
+ 	thread_terminate(self);
+ 	/*NOTREACHED*/
+ }
+
+diff --git a/osfmk/kern/lock_ticket.c b/osfmk/kern/lock_ticket.c
+--- a/osfmk/kern/lock_ticket.c
++++ b/osfmk/kern/lock_ticket.c
+@@ -149,8 +149,30 @@
+ {
+ 	thread_t self = current_thread();
+ 
++#if defined(MONDRIAN)
++	/* owner 0 means the lock reads as unlocked; anything else names the
++	 * thread the lock thinks holds it. Values first: the HUD row is 90
++	 * columns wide and the tail is what gets cut off. */
++	panic("LOCKNOTOWN me %u owner %u cpu %d lck %p self %p",
++	    self->ctid, lck->lck_ticket_owner, cpu_number(), lck, self);
++#else
+ 	panic("Ticket lock %p is unexpectedly not owned by thread %p", lck, self);
++#endif
++}
++
++#if defined(MONDRIAN)
++/* The unlock path of the same check: this one is not a missing lock but a
++ * lock released by (or twice by) the wrong thread. */
++__abortlike
++static void
++__lck_ticket_unlock_verify_panic(lck_ticket_t *lck)
++{
++	thread_t self = current_thread();
++
++	panic("LOCKUNLOCK me %u owner %u cpu %d lck %p self %p",
++	    self->ctid, lck->lck_ticket_owner, cpu_number(), lck, self);
+ }
++#endif
+ 
+ static inline void
+ hw_lck_ticket_verify(hw_lck_ticket_t *lck)
+@@ -171,11 +193,19 @@
+ #if DEVELOPMENT || DEBUG
+ #define HW_LCK_TICKET_VERIFY(lck)      hw_lck_ticket_verify(lck)
+ #define LCK_TICKET_VERIFY(lck)         lck_ticket_verify(lck)
++#if defined(MONDRIAN)
++#define LCK_TICKET_UNLOCK_VERIFY(l)    ({ \
++	if ((l)->lck_ticket_owner != current_thread()->ctid) {  \
++	        __lck_ticket_unlock_verify_panic(l);            \
++	}                                                       \
++})
++#else
+ #define LCK_TICKET_UNLOCK_VERIFY(l)    ({ \
+ 	if ((l)->lck_ticket_owner != current_thread()->ctid) {  \
+ 	        __lck_ticket_not_owned_panic(l);                \
+ 	}                                                       \
+ })
++#endif
+ #else
+ #define HW_LCK_TICKET_VERIFY(lck)      ((void)0)
+ #define LCK_TICKET_VERIFY(lck)         ((void)0)
+

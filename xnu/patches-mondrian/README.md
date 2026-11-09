@@ -34,6 +34,8 @@ The CI picks a series with the `board` input of `.github/workflows/xnu.yml`:
 | `0264`–`0266` | iteration and the ring: the userland hook carried as a kernel blob so a dylib change costs one kernel build (`0264`), the wedged-ring diagnostic that names the submission (`0265`), and the lap boundary closed the way kgsl closes it, with a 128 KiB ring and a fenced doorbell (`0266`) |
 | `0267`–`0269` | the geometry and its cost: `BOOT_LINE_LENGTH` raised to 1024 so a long measurement cmdline is not silently cut (`0267`), the canvas scaled through a column map built once and a lookup-free 32/25 block of 16-byte stores instead of a 64-bit divide per pixel (`0268`), and the fps line split into `clean avg`/`scale avg` so the next optimisation has a number to aim at (`0269`) |
 | `0270`–`0283` | the cadence: the part's report rates on the fps line (`0270`), the reports read on every look while a finger is down (`0271`), the canvas scale in 16-byte NEON lanes (`0272`), the interval between frames and the finer buckets (`0273`, `0275`), the vsync armed from a deadline chain and its clock printed (`0274`), one touch position per display tick (`0276`), a five-second-in-ten window without the panel copy and the point counts (`0277`, `0278`), the frame presented at the tick instead of on the renderer's thread (`0279`), the unattended drag (`0280`), the records each tick was handed (`0281`), two finished frames queued so a burst spreads over two ticks instead of holding one for two periods (`0282`), and the sweep's shape: horizontal, with the unlock swipe behind `mondriandragunlock=1` (`0283`) |
+| `0284`–`0288` | the CPU and the tick: the four A510s levelled through `l2-access-penalty` (`0284`), the `IOMFBDisplayRefresh` property the window server paces its link on (`0285`), the touch tick sampled after the drain so one event comes out per tick (`0286`), UI-priority threads taking an idle X2 first (`0287`), and the publish moved to the first report of the wake with the report thread woken before the panel copy (`0288`) |
+| `0289`–`0295` | what the live tree had and the series did not: the panic and fault report on the HUD rows, the secondary-core stage marks and the lock-owner panic (`0289`), the small-core scheduler made opt-in and its topology line (`0290`), the command-mode panel's per-frame CTL start and the host's panel capture (`0291`), the GPU buffer histogram and the on-demand `VMSTAT` line (`0292`), the USB gadget and the control channel (`0293`), the upstream-clang/SDK build gaps (`0294`), and the final physmap with the framebuffer alias and the opt-in panel console (`0295`) |
 
 `0085` is the IOSurface + IOMobileFramebuffer pair. Each patch's symptom and
 the trap behind it are in `NOTES.md`. The series count in "Applying it" below is
@@ -47,8 +49,9 @@ git clone --depth 1 --branch xnu-8796.141.3 \
 tools/apply-series.py xnu8796 --series xnu/patches-mondrian --machine MONDRIAN
 ```
 
-The CI **skips** a patch that does not apply and still reports success, so run
-the command above (or `tools/check-patches.sh`) before pushing. Its `NN/NN` line
+A patch that does not apply fails the CI run (the workflow's "No skipped
+patches" step greps dxb's log), but it costs a run; the command above (or
+`tools/check-patches.sh`) names it in seconds. Its `NN/NN` line
 is the count for the current series. Two traps it catches: `git apply` rejects a hunk
 that ends with added lines and no trailing context, and a patch touching a
 staged source (HFS, BearSSL, libpthread) only applies after its staging script
@@ -66,10 +69,7 @@ The patches that talk to the sweet phone's hardware. They are listed in
 `HARDWARE_PATCHES` of `tools/port-series.py`; `docs/MONDIAN_PORT.md` has the
 work items:
 
-* the touch (a Goodix on QUPv3 SPI),
-* the kernel-side keys and the dual-boot slot switch,
-* the USB stack (the SM8475 DWC3), which is what would make the log readable
-  without booting the viewer shim.
+* the kernel-side keys and the dual-boot slot switch.
 
 `tools/port-series.py` does the mechanical part of a port: it takes a patch from
 the sweet series, renames the board identifiers, drops the context lines that

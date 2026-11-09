@@ -1,0 +1,215 @@
+xnu 0290: the small-core scheduler is opt-in and says what it saw
+
+`small_cores` defaulted to 2, so every boot entered the scheduler experiment
+and a boot that only wanted the UI could not stay out of it. The default is 0
+(no pairing) and the levels are explicit: 2 pairs the cores, 3 lets the
+scheduler move threads to a faster core when it frees, 4 adds the running-
+thread kick.
+
+The boot prints one line with the topology the device tree gave - the
+capacity of every CPU, which ones are small, and the partner each was paired
+with - because arm_init runs too early to print and a wrong pairing is
+otherwise invisible.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -959,7 +959,13 @@
+  * sched_slow_secondaries in osfmk/kern/sched.h), so a faster core that comes
+  * free takes it. With small_cores=0 every core is alike, as before.
+  */
+-static uint32_t small_cores_apart = 2;          /* boot-arg small_cores */
++static uint32_t small_cores_apart = 0;          /* boot-arg small_cores */
++/*
++ * Off unless asked for: with a non-zero default every boot that does not
++ * name the level enters the scheduler experiment, and a boot that only
++ * wants the UI (small_cores omitted) must not. The planned final default
++ * is the best level that boots, once one does.
++ */
+ 
+ /* Three quarters of the fastest core's capacity: 1024 against 2386 is a
+  * small core, 2253 against 2386 is not. */
+@@ -970,6 +976,8 @@
+ }
+ 
+ static int ml_slow_core_partner[MAX_CPUS];      /* by cpu_id: its faster core, -1 if none */
++static uint32_t ml_cpu_capacity[MAX_CPUS];      /* capacity-dmips-mhz as the device tree had it */
++static uint32_t ml_cpu_capacity_fastest;
+ 
+ static void
+ ml_choose_slow_core_partners(void)
+@@ -1011,12 +1019,15 @@
+ static void
+ ml_pair_slow_processors(int cpu_id)
+ {
++	if (small_cores_apart < 2) {
++		return;
++	}
+ 	for (int i = 0; i < (int)topology_info.num_cpus; i++) {
+ 		int partner = ml_slow_core_partner[i];
+ 		processor_t slow, fast;
+ 
+ 		if (partner < 0) {
+-			if (i == cpu_id) {
++			if (i == cpu_id && topology_info.cpus[i].l2_access_penalty != 0) {
+ 				kprintf("MONDRIAN CPU: cpu %d (mpidr 0x%x) is small: "
+ 				    "no faster core left to pair it with\n", i,
+ 				    topology_info.cpus[i].phys_id);
+@@ -1032,7 +1043,8 @@
+ 		    slow->processor_primary == fast) {
+ 			continue;
+ 		}
+-		sched_slow_secondaries = small_cores_apart >= 2;
++		sched_slow_secondaries = small_cores_apart >= 3;
++		sched_slow_kick = small_cores_apart >= 4;
+ 		processor_set_primary(slow, fast);
+ 		kprintf("MONDRIAN CPU: cpu %d (mpidr 0x%x) is a slower core: "
+ 		    "the scheduler uses it after cpu %d (mpidr 0x%x)\n",
+@@ -1041,6 +1053,29 @@
+ 	}
+ }
+ 
++/*
++ * What the topology parse saw and did, for the console (arm_init is too early
++ * to print, so the numbers are kept and reported from the CPU start).
++ */
++void
++ml_small_cores_report(void)
++{
++	char line[256];
++	int used = 0;
++
++	used += snprintf(line + used, sizeof(line) - used, "MONDRIAN CPU: small_cores=%u fastest=%u cap",
++	    small_cores_apart, ml_cpu_capacity_fastest);
++	for (int i = 0; i < (int)topology_info.num_cpus && used < (int)sizeof(line) - 32; i++) {
++		used += snprintf(line + used, sizeof(line) - used, " %u%s", ml_cpu_capacity[i],
++		    topology_info.cpus[i].l2_access_penalty ? "*" : "");
++	}
++	used += snprintf(line + used, sizeof(line) - used, " partner");
++	for (int i = 0; i < (int)topology_info.num_cpus && used < (int)sizeof(line) - 8; i++) {
++		used += snprintf(line + used, sizeof(line) - used, " %d", ml_slow_core_partner[i]);
++	}
++	kprintf("%s\n", line);
++}
++
+ void
+ ml_parse_cpu_topology(void)
+ {
+@@ -1127,7 +1162,7 @@
+ 		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
+ 
+ 		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
+-		cpu_capacity[cpu->cpu_id] = (uint32_t)ml_readprop(child, "capacity-dmips-mhz", 0);
++		ml_cpu_capacity[cpu->cpu_id] = (uint32_t)ml_readprop(child, "capacity-dmips-mhz", 0);
+ 		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
+ 		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
+ 		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
+@@ -1249,12 +1284,13 @@
+ 		uint32_t fastest = 0;
+ 
+ 		for (int i = 0; i < (int)topology_info.num_cpus; i++) {
+-			if (cpu_capacity[i] > fastest) {
+-				fastest = cpu_capacity[i];
++			if (ml_cpu_capacity[i] > fastest) {
++				fastest = ml_cpu_capacity[i];
+ 			}
+ 		}
++		ml_cpu_capacity_fastest = fastest;
+ 		for (int i = 0; i < (int)topology_info.num_cpus; i++) {
+-			if (capacity_is_slow(cpu_capacity[i], fastest) &&
++			if (capacity_is_slow(ml_cpu_capacity[i], fastest) &&
+ 			    topology_info.cpus[i].l2_access_penalty == 0) {
+ 				/*
+ 				 * No kprintf here: this runs in arm_init, before
+
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2046,6 +2046,7 @@
+ 
+ int sched_allow_rt_smt = 1;
+ bool sched_slow_secondaries = false;
++bool sched_slow_kick = false;
+ int sched_avoid_cpu0 = SCHED_AVOID_CPU0;
+ int sched_allow_rt_steal = 1;
+ int sched_backup_cpu_timeout_count = 5; /* The maximum number of 10us delays to wait before using a backup cpu */
+@@ -2110,11 +2111,11 @@
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
+-	if (cprocessor->is_SMT == FALSE && !sched_slow_secondaries) {
++	if (cprocessor->is_SMT == FALSE) {
+ 		goto smt_balance_exit;
+ 	}
+ 
+-	if (sched_slow_secondaries) {
++	if (sched_slow_secondaries && sched_slow_kick) {
+ 		/*
+ 		 * A faster core is going idle: the thread of highest
+ 		 * priority running on a slower one (not a real-time one:
+@@ -2139,7 +2140,19 @@
+ 			}
+ 		}
+ 		if (ast_processor != PROCESSOR_NULL) {
++			extern void mondrian_early_status(const char *s);
++			static unsigned int mondrian_smt_kicks;
++			char hud[64];
++
++			snprintf(hud, sizeof(hud), "SMT a %u cpu%d -> cpu%d pri %d",
++			    ++mondrian_smt_kicks, cprocessor->cpu_id,
++			    ast_processor->cpu_id, ast_processor->current_pri);
++			mondrian_early_status(hud);
+ 			ipi_type = sched_ipi_action(ast_processor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++			snprintf(hud, sizeof(hud), "SMT b %u cpu%d -> cpu%d ipi %d",
++			    mondrian_smt_kicks, cprocessor->cpu_id,
++			    ast_processor->cpu_id, (int)ipi_type);
++			mondrian_early_status(hud);
+ 			if (ipi_type == SCHED_IPI_NONE) {
+ 				ast_processor = PROCESSOR_NULL;
+ 			}
+@@ -6551,6 +6564,10 @@
+ idle_thread(__assert_only void* parameter,
+     __unused wait_result_t result)
+ {
++	{
++		extern void mondrian_early_stage(uint64_t mpidr, unsigned int stage);
++		mondrian_early_stage(__builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL, 7);
++	}
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	assert(parameter == NULL);
+ 
+
+diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
+--- a/osfmk/kern/sched.h
++++ b/osfmk/kern/sched.h
+@@ -474,5 +474,8 @@
+  * slower core is moved to it.
+  */
+ extern bool sched_slow_secondaries;
++/* small_cores=3: also move running threads off a slower core when a faster
++ * one goes idle (the HUD markers live here while it is measured). */
++extern bool sched_slow_kick;
+ 
+ #endif  /* _KERN_SCHED_H_ */
+
+diff --git a/iokit/Kernel/arm/MondrianCPU.cpp b/iokit/Kernel/arm/MondrianCPU.cpp
+--- a/iokit/Kernel/arm/MondrianCPU.cpp
++++ b/iokit/Kernel/arm/MondrianCPU.cpp
+@@ -121,6 +121,8 @@
+ 	return true;
+ }
+ 
++extern "C" void ml_small_cores_report(void);
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ MondrianCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -130,6 +132,7 @@
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog("MONDRIAN CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, MONDRIAN_SMP_MAX_CPUS);
++	ml_small_cores_report();
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+

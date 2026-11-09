@@ -1,0 +1,83 @@
+xnu 0287: a UI-priority user thread takes the idle Cortex-X2 first
+
+The P cluster is three A710s and one X2 on this SoC, and choose_processor()
+treats them as equal: it takes the hint or the next idle core it finds. In an
+app-open stall that puts the threads that decide how the UI moves on the
+A710s. zizhan measured SpringBoard's main thread at 0.73 of a core on the
+A710s and 0.09 on the X2 (same SM8475), and sheng's fix for the same pattern
+took a heavy swipe from 40 to 55 fps (19960fa; zizhan 0014 is the port).
+
+The rule is the foreground band only: a user thread at or above
+mondrian_fast_pri (default BASEPRI_FOREGROUND, 0 disables) and below the
+realtime band returns an idle, recommended, non-urgent fast core if there is
+one. Kernel threads keep the normal choice. This board boots on physical core
+7 (BOARD_BOOT_CORE) and the ADT lists it first, so the X2 is logical cpu 0,
+not 7: mondrian_fast_cpu defaults to 0.
+
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -243,16 +243,19 @@
+ 
+ static bool
+ rt_runq_is_low_latency(processor_set_t pset)
+ {
+ 	return os_atomic_load(&SCHED(rt_runq)(pset)->constraint, relaxed) <= rt_constraint_threshold;
+ }
+ 
+ TUNABLE(bool, cpulimit_affects_quantum, "cpulimit_affects_quantum", true);
++
++TUNABLE(uint32_t, mondrian_fast_pri, "mondrian_fast_pri", BASEPRI_FOREGROUND);
++TUNABLE(uint32_t, mondrian_fast_cpu, "mondrian_fast_cpu", 0);
+ 
+ #define         DEFAULT_PREEMPTION_RATE         100             /* (1/s) */
+ TUNABLE(int, default_preemption_rate, "preempt", DEFAULT_PREEMPTION_RATE);
+ 
+ #define         DEFAULT_BG_PREEMPTION_RATE      400             /* (1/s) */
+ TUNABLE(int, default_bg_preemption_rate, "bg_preempt", DEFAULT_BG_PREEMPTION_RATE);
+ 
+ #define         MAX_UNSAFE_RT_QUANTA               100
+@@ -5080,16 +5083,43 @@
+ 	thread_t                thread)
+ {
+ 	processor_set_t pset = starting_pset;
+ 	processor_set_t nset;
+ 
+ 	assert(thread->sched_pri <= MAXPRI);
+ 
+ 	/*
++	 * A UI-priority user thread takes an idle Cortex-X2 first. The three
++	 * A710s and the X2 are one P cluster and the search below takes the
++	 * next idle core it finds, so a thread that matters is as likely to
++	 * land on an A710: measured on zizhan (same SM8475, X2 at cpu 7),
++	 * SpringBoard's main thread spent 0.73 of a core on the A710s and 0.09
++	 * on the X2 during an app-open stall, and keeping UI threads off the
++	 * little cores took a heavy swipe from 40 to 55 fps on sheng
++	 * (19960fa, the rule zizhan 0014 ports). This board boots on physical
++	 * core 7 and the ADT lists it first, so the X2 is logical cpu 0:
++	 * mondrian_fast_cpu is that id, mondrian_fast_pri=0 turns the rule off,
++	 * and realtime threads keep the normal choice (their deadline and
++	 * spill logic is not something a fixed core can be second-guessed on).
++	 */
++	if (mondrian_fast_pri != 0 && thread->sched_pri >= (int)mondrian_fast_pri &&
++	    thread->sched_pri < BASEPRI_RTQUEUES &&
++	    mondrian_fast_cpu < MAX_SCHED_CPUS && get_threadtask(thread) != kernel_task) {
++		processor_t fast = processor_array[mondrian_fast_cpu];
++
++		if (fast != PROCESSOR_NULL && fast->processor_set == pset &&
++		    fast->is_recommended &&
++		    bit_test(pset->recommended_bitmask & pset->cpu_state_map[PROCESSOR_IDLE], fast->cpu_id) &&
++		    !bit_test(pset->pending_AST_URGENT_cpu_mask, fast->cpu_id)) {
++			return fast;
++		}
++	}
++
++	/*
+ 	 * Prefer the hinted processor, when appropriate.
+ 	 */
+ 
+ 	/* Fold last processor hint from secondary processor to its primary */
+ 	if (processor != PROCESSOR_NULL) {
+ 		processor = processor->processor_primary;
+ 	}
+ 

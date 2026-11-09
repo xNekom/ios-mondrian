@@ -1,0 +1,193 @@
+xnu 0292: where the memory went, and what the compressor holds
+
+The GPU side keeps a size histogram of its live buffers (the `mem` command
+prints it), because a handful of multi-megabyte surfaces is invisible in a
+mapping count, and the surface pattern mode is a boot argument.
+
+The VM side gets one on-demand line (`MONDRIAN VMSTAT`): segments, swapped
+pages, source pages, swap used/total and the failure count. It separates "the
+compressor is holding the memory" from "the swapfile is", which need opposite
+fixes.
+
+diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -483,7 +483,13 @@
+ 
+ /*
+  * gpusurfpat=1: a surface adopted for the first time starts as 0xffffffff
+- * instead of whatever the allocator left there.
++ * instead of whatever the allocator left there; =2, as 0x00000000.
++ *
++ * The wallpaper's poster surface is a 1326x1326 one-byte surface that
++ * CollectionsPoster never draws (its renderer is Metal and this port draws
++ * through Mesa). Whatever the allocator left in it is what the panel shows
++ * behind the icons: with =1 the home screen and App Library came out flat
++ * white, and what the mask does with the layer under it is what =2 answers.
+  *
+  * `nonzero 0/4500` over a cleared Grid says the surface reads as zeros, but
+  * not why: a draw that never ran, a clear that wrote black, and a surface that
+@@ -495,7 +501,7 @@
+  * pattern back to DRAM before the GPU reads it.
+  */
+ static int
+-mondrian_uc_surfpat_on(void)
++mondrian_uc_surfpat_mode(void)
+ {
+ 	static int parsed, on;
+ 
+@@ -505,7 +511,7 @@
+ 			on = 0;
+ 		}
+ 	}
+-	return on != 0;
++	return on;
+ }
+ 
+ static void
+@@ -513,18 +519,30 @@
+ {
+ 	uint8_t *scratch;
+ 	uint64_t off;
++	int const mode = mondrian_uc_surfpat_mode();
++	uint64_t const size = buffer->size ? buffer->size : 1;
+ 
+ 	scratch = (uint8_t *)IOMalloc(0x4000);
+ 	if (scratch == NULL) {
+ 		return;
+ 	}
+-	memset(scratch, 0xff, 0x4000);
+ 	for (off = 0; off < buffer->size; off += 0x4000) {
+ 		uint64_t chunk = buffer->size - off;
+ 
+ 		if (chunk > 0x4000) {
+ 			chunk = 0x4000;
+ 		}
++		if (mode == 3) {
++			/*
++			 * A ramp over the whole buffer. The poster is one square
++			 * one-byte surface, so what the ramp shows is its rows.
++			 */
++			for (uint64_t i = 0; i < chunk; i++) {
++				scratch[i] = (uint8_t)(((off + i) * 255u) / size);
++			}
++		} else {
++			memset(scratch, mode == 2 ? 0x00 : 0xff, (size_t)chunk);
++		}
+ 		if (buffer->memory->writeBytes(off, scratch, chunk) != chunk) {
+ 			IOLog("MondrianGPU: surface pattern stopped at 0x%llx\n",
+ 			    (unsigned long long)off);
+@@ -538,6 +556,44 @@
+ static uint64_t mondrian_gpu_buffer_bytes;
+ static uint32_t mondrian_gpu_buffer_count;
+ 
++static uint64_t mondrian_gpu_hist_bytes[6];
++static uint32_t mondrian_gpu_hist_count[6];
++
++static int
++mondrian_gpu_hist_slot(uint64_t size)
++{
++	if (size < (64ull << 10)) {
++		return 0;
++	}
++	if (size < (1ull << 20)) {
++		return 1;
++	}
++	if (size < (4ull << 20)) {
++		return 2;
++	}
++	if (size < (8ull << 20)) {
++		return 3;
++	}
++	if (size < (16ull << 20)) {
++		return 4;
++	}
++	return 5;
++}
++
++extern "C" void
++mondrian_gpu_dump_hist(void)
++{
++	static const char *const names[6] = {
++		"<64K", "64K-1M", "1-4M", "4-8M", "8-16M", ">16M"
++	};
++
++	for (int i = 0; i < 6; i++) {
++		IOLog("MONDRIAN GPUMEM: %s %u buffers %llu bytes\n", names[i],
++		    mondrian_gpu_hist_count[i],
++		    (unsigned long long)mondrian_gpu_hist_bytes[i]);
++	}
++}
++
+ extern "C" uint64_t
+ mondrian_gpu_buffer_bytes_total(void)
+ {
+@@ -624,11 +680,17 @@
+ 	fBuffers[fBufferCount++] = buffer;
+ 	mondrian_gpu_buffer_bytes += size;
+ 	mondrian_gpu_buffer_count++;
++	{
++		int slot = mondrian_gpu_hist_slot(size);
++
++		mondrian_gpu_hist_bytes[slot] += size;
++		mondrian_gpu_hist_count[slot]++;
++	}
+ 	/*
+ 	 * Surface-sized only: a pattern test on a texture would say nothing
+ 	 * about the surface and would cost a flush of every buffer.
+ 	 */
+-	if (size >= 0x100000ull && mondrian_uc_surfpat_on()) {
++	if (size >= 0x100000ull && mondrian_uc_surfpat_mode() != 0) {
+ 		mondrian_uc_fill_pattern(buffer);
+ 		IOLog("MondrianGPU: surface pattern handle %u iova 0x%llx "
+ 		    "size %llu\n", buffer->handle,
+@@ -696,6 +758,12 @@
+ 	}
+ 	mondrian_gpu_buffer_bytes -= buffer->size;
+ 	mondrian_gpu_buffer_count--;
++	{
++		int slot = mondrian_gpu_hist_slot(buffer->size);
++
++		mondrian_gpu_hist_bytes[slot] -= buffer->size;
++		mondrian_gpu_hist_count[slot]--;
++	}
+ 	for (i = 0; i < fBufferCount; i++) {
+ 		if (fBuffers[i] == buffer) {
+ 			fBuffers[i] = fBuffers[--fBufferCount];
+
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -5009,6 +5009,31 @@
+  * Set up vm_config based on the vm_compressor_mode.
+  * Must run BEFORE the pageout thread starts up.
+  */
++/*
++ * MONDRIAN: the swap picture on demand. The MEM line says how much is lost
++ * when the UI freezes; these numbers say whether the compressor is holding
++ * it or whether the swapfile is taking it, which need opposite fixes.
++ */
++void
++mondrian_vm_stats(void)
++{
++	extern uint32_t c_segment_count, c_swappedout_count;
++	extern uint32_t c_segment_pages_compressed;
++	extern uint64_t vm_swap_get_total_space(void);
++	extern uint64_t vm_swap_get_used_space(void);
++	extern uint64_t vm_swap_get_failures;
++
++	printf("MONDRIAN VMSTAT: mode %d segs %u swapped %u src %u pages"
++	    " swap %llu/%llu used compressions %llu grabbed %llu failures %llu\n",
++	    vm_compressor_mode, c_segment_count, c_swappedout_count,
++	    c_segment_pages_compressed,
++	    (unsigned long long)vm_swap_get_used_space(),
++	    (unsigned long long)vm_swap_get_total_space(),
++	    (unsigned long long)vm_pageout_vminfo.vm_pageout_compressions,
++	    (unsigned long long)vm_pageout_vminfo.vm_compressor_pages_grabbed,
++	    (unsigned long long)vm_swap_get_failures);
++}
++
+ __startup_func
+ void
+ vm_config_init(void)
+

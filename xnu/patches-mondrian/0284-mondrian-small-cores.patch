@@ -1,0 +1,363 @@
+diff --git a/iokit/Kernel/arm/MondrianCPU.cpp b/iokit/Kernel/arm/MondrianCPU.cpp
+index 68ac11c..daeb629 100644
+--- a/iokit/Kernel/arm/MondrianCPU.cpp
++++ b/iokit/Kernel/arm/MondrianCPU.cpp
+@@ -144,9 +144,10 @@ MondrianCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
+-	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+-		panic("MONDRIAN CPU: expected boot MPIDR 0 and logical CPU 0");
++	/* The loader lists the core the kernel runs on first (tools/mkadt.py
++	 * orders by capacity; shim/loader.c starts the kernel on the X2). */
++	if (topology->boot_cpu->cpu_id != 0) {
++		panic("MONDRIAN CPU: expected the boot CPU to be the first ADT node");
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		MondrianCPU *cpu = __atomic_load_n(&mondrian_cpus[i], __ATOMIC_ACQUIRE);
+@@ -232,9 +233,10 @@ MondrianCPU::signalCPU(IOCPU *target)
+ kern_return_t
+ MondrianCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+-	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	const ml_topology_cpu_t *cpu = &topology->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 || cpu == topology->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("MONDRIAN CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 8572d1b..fad9128 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -57,6 +57,8 @@
+ #include <sys/codesign.h>
+ #include <sys/kdebug.h>
+ #include <kern/coalition.h>
++#include <kern/processor.h>
++#include <kern/sched.h>
+ #include <pexpert/device_tree.h>
+ 
+ #include <IOKit/IOPlatformExpert.h>
+@@ -940,6 +942,105 @@ ml_read_chip_revision(unsigned int *rev __unused)
+ #endif
+ }
+ 
++/*
++ * The slower cores of an asymmetric SoC.
++ *
++ * XNU already has a way to de-prioritise a core: a non-zero
++ * l2-access-penalty makes it the SMT sibling of a faster processor, and the
++ * scheduler then puts a thread on it only when no faster core is idle or
++ * running something of lower priority. What it does not have is room for
++ * more than one such core per primary, because its SMT model is two-way and
++ * its own code pairs every penalised core with the boot processor.
++ *
++ * This phone has four slow cores (the four A510s) and four fast ones (three
++ * A710s and the X2), so each slow core is paired with a fast core of its own.
++ * It stays a "secondary": the scheduler prefers the primaries, and a thread
++ * on a secondary goes back to the run queue at every rescheduling (see
++ * sched_slow_secondaries in osfmk/kern/sched.h), so a faster core that comes
++ * free takes it. With small_cores=0 every core is alike, as before.
++ */
++static uint32_t small_cores_apart = 2;          /* boot-arg small_cores */
++
++/* Three quarters of the fastest core's capacity: 1024 against 2386 is a
++ * small core, 2253 against 2386 is not. */
++static boolean_t
++capacity_is_slow(uint32_t capacity, uint32_t fastest)
++{
++	return capacity != 0 && fastest != 0 && capacity * 4 < fastest * 3;
++}
++
++static int ml_slow_core_partner[MAX_CPUS];      /* by cpu_id: its faster core, -1 if none */
++
++static void
++ml_choose_slow_core_partners(void)
++{
++	boolean_t taken[MAX_CPUS] = { false };
++
++	for (int i = 0; i < MAX_CPUS; i++) {
++		ml_slow_core_partner[i] = -1;
++	}
++	for (int i = 0; i < (int)topology_info.num_cpus; i++) {
++		int partner = -1;
++
++		if (topology_info.cpus[i].l2_access_penalty == 0) {
++			continue;
++		}
++		/* the last fast core not yet taken; the boot core only if there is no other */
++		for (int j = (int)topology_info.num_cpus - 1; j >= 0; j--) {
++			if (topology_info.cpus[j].l2_access_penalty != 0 || taken[j]) {
++				continue;
++			}
++			if (&topology_info.cpus[j] == topology_info.boot_cpu) {
++				if (partner < 0) {
++					partner = j;
++				}
++				continue;
++			}
++			partner = j;
++			break;
++		}
++		if (partner >= 0) {
++			taken[partner] = true;
++			ml_slow_core_partner[i] = partner;
++		}
++	}
++}
++
++/* At the registration of each processor: pairs it with its partner, if that
++ * one is registered too (whichever comes second does it). */
++static void
++ml_pair_slow_processors(int cpu_id)
++{
++	for (int i = 0; i < (int)topology_info.num_cpus; i++) {
++		int partner = ml_slow_core_partner[i];
++		processor_t slow, fast;
++
++		if (partner < 0) {
++			if (i == cpu_id) {
++				kprintf("MONDRIAN CPU: cpu %d (mpidr 0x%x) is small: "
++				    "no faster core left to pair it with\n", i,
++				    topology_info.cpus[i].phys_id);
++			}
++			continue;
++		}
++		if (i != cpu_id && partner != cpu_id) {
++			continue;
++		}
++		slow = processor_array[i];
++		fast = processor_array[partner];
++		if (slow == PROCESSOR_NULL || fast == PROCESSOR_NULL ||
++		    slow->processor_primary == fast) {
++			continue;
++		}
++		sched_slow_secondaries = small_cores_apart >= 2;
++		processor_set_primary(slow, fast);
++		kprintf("MONDRIAN CPU: cpu %d (mpidr 0x%x) is a slower core: "
++		    "the scheduler uses it after cpu %d (mpidr 0x%x)\n",
++		    i, topology_info.cpus[i].phys_id, partner,
++		    topology_info.cpus[partner].phys_id);
++	}
++}
++
+ void
+ ml_parse_cpu_topology(void)
+ {
+@@ -953,6 +1054,9 @@ ml_parse_cpu_topology(void)
+ 	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
+ 	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
++	uint32_t cpu_capacity[MAX_CPUS] = { 0 };
++
++	PE_parse_boot_argn("small_cores", &small_cores_apart, sizeof(small_cores_apart));
+ 
+ #if defined(MONDRIAN)
+ 	/* Opt in to SMP: cpus=N (N <= MONDRIAN_SMP_MAX_CPUS; cores 6-7 are the A76s). */
+@@ -1023,6 +1127,7 @@ ml_parse_cpu_topology(void)
+ 		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
+ 
+ 		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
++		cpu_capacity[cpu->cpu_id] = (uint32_t)ml_readprop(child, "capacity-dmips-mhz", 0);
+ 		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
+ 		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
+ 		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
+@@ -1131,6 +1236,35 @@ ml_parse_cpu_topology(void)
+ 	cluster_offsets[0] = 0;
+ #endif
+ 	assert(topology_info.boot_cpu != NULL);
++
++	/*
++	 * Mark the cores the device tree says are slower than the fastest one
++	 * (its own capacity-dmips-mhz: 1024 for this SoC's four A510s, 2253 for
++	 * the A710s and 2386 for the X2) as cores with an L2 access penalty:
++	 * the scheduler uses them after the faster ones, not instead of them.
++	 * That is what the 84%-of-frames-over-16.7ms problem was on the phone
++	 * this port took the idea from, without it.
++	 */
++	if (small_cores_apart) {
++		uint32_t fastest = 0;
++
++		for (int i = 0; i < (int)topology_info.num_cpus; i++) {
++			if (cpu_capacity[i] > fastest) {
++				fastest = cpu_capacity[i];
++			}
++		}
++		for (int i = 0; i < (int)topology_info.num_cpus; i++) {
++			if (capacity_is_slow(cpu_capacity[i], fastest) &&
++			    topology_info.cpus[i].l2_access_penalty == 0) {
++				/*
++				 * No kprintf here: this runs in arm_init, before
++				 * console_init(), and printf aborts.
++				 */
++				topology_info.cpus[i].l2_access_penalty = 1;
++			}
++		}
++	}
++	ml_choose_slow_core_partners();
+ 	ml_read_chip_revision(&topology_info.chip_revision);
+ 
+ 	/*
+@@ -1451,17 +1585,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+ 	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
+ 	if (!is_boot_cpu) {
+ 		processor_init(processor, this_cpu_datap->cpu_number, pset);
+-
+-		if (this_cpu_datap->cpu_l2_access_penalty) {
+-			/*
+-			 * Cores that have a non-zero L2 access penalty compared
+-			 * to the boot processor should be de-prioritized by the
+-			 * scheduler, so that threads use the cores with better L2
+-			 * preferentially.
+-			 */
+-			processor_set_primary(processor, master_processor);
+-		}
+ 	}
++	/*
++	 * Cores that have a non-zero L2 access penalty compared to the fastest
++	 * one are de-prioritized by the scheduler, so that threads use the
++	 * cores with better L2 preferentially. Each with a faster core of its
++	 * own, not all with the boot processor: see
++	 * ml_choose_slow_core_partners().
++	 */
++	ml_pair_slow_processors(this_cpu_datap->cpu_number);
+ 
+ 	*processor_out = processor;
+ 	*ipi_handler_out = cpu_signal_handler;
+diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
+index a5f68ad..3ef77c5 100644
+--- a/osfmk/kern/sched.h
++++ b/osfmk/kern/sched.h
+@@ -464,4 +464,15 @@ extern int sched_rt_n_backup_processors;
+ 
+ extern bool system_is_SMT;
+ 
++/*
++ * The "secondaries" are not the second threads of hyperthreaded cores but
++ * slower cores of their own, each paired with a faster one
++ * (ml_pair_slow_processors() in osfmk/arm64/machine_routines.c): the
++ * scheduler still prefers the primaries, but what runs on one core does not
++ * slow the other, so a secondary is not kept idle for its primary's sake,
++ * and when a primary goes idle the highest-priority thread running on a
++ * slower core is moved to it.
++ */
++extern bool sched_slow_secondaries;
++
+ #endif  /* _KERN_SCHED_H_ */
+diff --git a/osfmk/kern/sched_clutch.c b/osfmk/kern/sched_clutch.c
+index 3657d83..ded2ff4 100644
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -3204,7 +3204,7 @@ extern int sched_allow_rt_smt;
+ static bool
+ sched_clutch_thread_avoid_processor(processor_t processor, thread_t thread)
+ {
+-	if (processor->processor_primary != processor) {
++	if (processor->processor_primary != processor && !sched_slow_secondaries) {
+ 		/*
+ 		 * This is a secondary SMT processor.  If the primary is running
+ 		 * a realtime thread, only allow realtime threads on the secondary.
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..19a80b6 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2042,6 +2042,7 @@ sched_vm_group_maintenance(void)
+ #endif
+ 
+ int sched_allow_rt_smt = 1;
++bool sched_slow_secondaries = false;
+ int sched_avoid_cpu0 = SCHED_AVOID_CPU0;
+ int sched_allow_rt_steal = 1;
+ int sched_backup_cpu_timeout_count = 5; /* The maximum number of 10us delays to wait before using a backup cpu */
+@@ -2097,6 +2098,7 @@ void
+ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ {
+ 	processor_t ast_processor = NULL;
++	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
+ 
+ #if (DEVELOPMENT || DEBUG)
+ 	if (__improbable(sched_smt_balance == 0)) {
+@@ -2105,7 +2107,40 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ #endif
+ 
+ 	assert(cprocessor == current_processor());
+-	if (cprocessor->is_SMT == FALSE) {
++	if (cprocessor->is_SMT == FALSE && !sched_slow_secondaries) {
++		goto smt_balance_exit;
++	}
++
++	if (sched_slow_secondaries) {
++		/*
++		 * A faster core is going idle: the thread of highest
++		 * priority running on a slower one (not a real-time one:
++		 * those stay where they are) is sent here. That core is made
++		 * to reschedule; a thread on a secondary goes back to the run
++		 * queue then, and the idle primary is where it is put.
++		 */
++		integer_t highest = -1;
++
++		if (cprocessor->processor_primary != cprocessor) {
++			goto smt_balance_exit;
++		}
++		uint64_t running_slow = (cpset->cpu_state_map[PROCESSOR_RUNNING] &
++		    ~cpset->primary_map & ~cpset->pending_AST_URGENT_cpu_mask);
++		for (int cpuid = lsb_first(running_slow); cpuid >= 0; cpuid = lsb_next(running_slow, cpuid)) {
++			processor_t sprocessor = processor_array[cpuid];
++
++			if (sprocessor->current_pri < BASEPRI_RTQUEUES && sprocessor->current_pri > highest &&
++			    sprocessor->current_pri > MINPRI) {
++				highest = sprocessor->current_pri;
++				ast_processor = sprocessor;
++			}
++		}
++		if (ast_processor != PROCESSOR_NULL) {
++			ipi_type = sched_ipi_action(ast_processor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
++			if (ipi_type == SCHED_IPI_NONE) {
++				ast_processor = PROCESSOR_NULL;
++			}
++		}
+ 		goto smt_balance_exit;
+ 	}
+ 
+@@ -2120,7 +2155,6 @@ sched_SMT_balance(processor_t cprocessor, processor_set_t cpset)
+ 
+ 	processor_t sprocessor;
+ 
+-	sched_ipi_type_t ipi_type = SCHED_IPI_NONE;
+ 	uint64_t running_secondary_map = (cpset->cpu_state_map[PROCESSOR_RUNNING] &
+ 	    ~cpset->primary_map);
+ 	for (int cpuid = lsb_first(running_secondary_map); cpuid >= 0; cpuid = lsb_next(running_secondary_map, cpuid)) {
+@@ -2581,6 +2615,10 @@ restart:
+ 		bool is_yielding         = (*reason & AST_YIELD) == AST_YIELD;
+ 
+ 		bool needs_smt_rebalance = !is_yielding && thread->sched_pri < BASEPRI_RTQUEUES && processor->processor_primary != processor;
++		if (needs_smt_rebalance && sched_slow_secondaries) {
++			/* (a slower core of its own: worth leaving only for a faster core that is idle) */
++			needs_smt_rebalance = (pset->recommended_bitmask & pset->primary_map & pset->cpu_state_map[PROCESSOR_IDLE]) != 0;
++		}
+ 
+ 		bool affinity_mismatch   = thread->affinity_set != AFFINITY_SET_NULL && thread->affinity_set->aset_pset != pset;
+ 
+@@ -2705,7 +2743,7 @@ pick_new_rt_thread:
+ 
+ 				clear_pending_AST_bits(pset, processor, 3);
+ 
+-				if (processor->processor_secondary != NULL) {
++				if (processor->processor_secondary != NULL && !sched_slow_secondaries) {
+ 					processor_t sprocessor = processor->processor_secondary;
+ 					if ((sprocessor->state == PROCESSOR_RUNNING) || (sprocessor->state == PROCESSOR_DISPATCHING)) {
+ 						ipi_type = sched_ipi_action(sprocessor, NULL, SCHED_IPI_EVENT_SMT_REBAL);
+@@ -2774,7 +2812,8 @@ send_followup_ipi_before_idle:
+ 				goto restart;
+ 			}
+ 
+-			if ((processor->processor_primary != processor) && (processor->processor_primary->current_pri >= BASEPRI_RTQUEUES)) {
++			if ((processor->processor_primary != processor) && (processor->processor_primary->current_pri >= BASEPRI_RTQUEUES) &&
++			    !sched_slow_secondaries) {
+ 				/* secondary can only run realtime thread */
+ 				if (idle_reason == 0) {
+ 					idle_reason = 4;

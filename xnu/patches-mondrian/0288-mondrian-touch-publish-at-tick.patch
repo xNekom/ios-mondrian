@@ -1,0 +1,223 @@
+xnu 0288: the touch event is published in the first millisecond of the tick
+
+0286 samples the display tick after the drain so that one event comes out per
+tick, and that part works: `ev 60/s` at 14-19 ms spacings. But it also moved the
+publish to the end of the drain, and the framebuffer woke the report thread at
+the end of its tick, after the panel copy. The event then reached the UI 5-8 ms
+into the period, and the compositor's commit missed its slot: with the touch
+rate, the event rate and the panel tick all unchanged (348/s, 60/s, 60 Hz), the
+frames went from `late avg 5.7 ms, 15-18 ms apart` (60 fps) to `late avg 10 ms`
+with one frame every two to three periods, and the user saw it as jerks.
+
+The wake now goes out right after the clients are told and before the copy, so
+the report thread runs while the tick copies the panel, and the publish happens
+as soon as the first report of the wake is read. The rest of the drain still
+runs and its position belongs to the next tick, which keeps one event per tick
+and still gives a touch-down its own event.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1654,16 +1654,64 @@
+ {
+ 	if (mondrian_touch_send_cmd(0x90, 0x00) < 0 ||
+ 	    mondrian_touch_send_cmd(0x91, 0x81) < 0) {
+ 		printf("MONDRIAN TOUCH: coordinate mode failed\n");
+ 		return -1;
+ 	}
+ 	printf("MONDRIAN TOUCH: coordinate mode enabled\n");
+ 	return 0;
++}
++
++/*
++ * Publish the newest position once for the display tick that is current now.
++ * It is called as soon as the first report of a wake has been read, not after
++ * the whole drain: the UI commits once per touch event, and measured on the
++ * phone an event published after the four-read drain ran the compositor at 45
++ * fps where the same events published in the first millisecond of the period
++ * ran it at 60. The later reports of that drain belong to the next tick.
++ */
++static bool
++mondrian_touch_publish(uint32_t *emitted_tick, const uint8_t *now, uint8_t *was,
++    const int16_t *last_x, const int16_t *last_y, int16_t *sent_x, int16_t *sent_y,
++    uint32_t reports)
++{
++	uint32_t tick = mondrian_touch_ticks;
++
++	if (tick == *emitted_tick) {
++		return false;
++	}
++	*emitted_tick = tick;
++	for (int finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
++		if (now[finger]) {
++			mondrian_touch_event_gap();
++			mondrian_touch_events++;
++			mondrian_hid_touch(finger, 1, last_x[finger], last_y[finger]);
++			if (sent_x[finger] == last_x[finger] &&
++			    sent_y[finger] == last_y[finger]) {
++				mondrian_touch_repeats++;
++			}
++			sent_x[finger] = last_x[finger];
++			sent_y[finger] = last_y[finger];
++			if (reports < 30) {
++				printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
++				    reports, finger, last_x[finger], last_y[finger]);
++			}
++		} else if (was[finger]) {
++			mondrian_touch_event_gap();
++			mondrian_touch_events++;
++			mondrian_hid_touch(finger, 0, last_x[finger], last_y[finger]);
++			if (reports < 30) {
++				printf("MONDRIAN TOUCH: report %u finger %d up\n",
++				    reports, finger);
++			}
++		}
++		was[finger] = now[finger];
++	}
++	return true;
+ }
+ 
+ /*
+  * The part raises IRQ (GPIO21, active low) when a report is ready and drops it
+  * when the host writes one zero byte back to the report address. Poll the line
+  * instead of wiring GIC 305 for now: once per 10 ms tick is enough to prove the
+  * reports, and leaves the interrupt path for a later patch.
+  */
+@@ -1755,72 +1803,40 @@
+ 				}
+ 			}
+ 			/* One zero byte at the report address clears it and releases IRQ. */
+ 			(void)mondrian_goodix_write(mondrian_touch_data_addr, &zero, 1);
+ 			if (reports < 30) {
+ 				printf("MONDRIAN TOUCH: report %u %u point%s\n", reports,
+ 				    num, num == 1 ? "" : "s");
+ 			}
++			if (passes == 0) {
++				(void)mondrian_touch_publish(&emitted_tick, now, was,
++				    last_x, last_y, sent_x, sent_y, reports);
++			}
+ 		}
+ 		/*
+-		 * One event a finger, and only at a display tick. The UI redraws once
+-		 * per touch event (measured: panel swaps follow the reports answered), and
+-		 * the thread wakes about twice a frame, so answering every wake delivers
+-		 * 85-120 positions a second at 8 and 17 ms spacings (ring243: `ev gap avg
+-		 * 11.7 ms, 27 of them under 10 ms`). The content then advances two steps
+-		 * on some frames and one on others, which is a drag that jerks even when
+-		 * the frames themselves are even. Reading still happens on every wake;
+-		 * what a tick publishes is the newest position, once.
++		 * One event a finger, and only at a display tick: the UI redraws once
++		 * per touch event, and answering every wake delivered 85-120 positions
++		 * a second at 8 and 17 ms spacings, so the content advanced two steps
++		 * on some frames and one on others. Reading still happens on every
++		 * wake; what a tick publishes is the newest position, once.
++		 *
++		 * The tick is sampled after the first report, not at the top of the
++		 * loop: a vsync that arrives during the read then names the publish
++		 * after the tick the position belongs to. It used to be sampled after
++		 * the whole drain, which kept the count right but put every event 4-7
++		 * ms into the period, after the compositor's commit had missed it.
+ 		 */
+ 		/*
+-		 * Read the tick after the drain, not before it. The drain is up to
+-		 * four report reads and takes a few milliseconds; sampled at the top
+-		 * of the loop, a vsync that arrives in the middle left this publish
+-		 * named after the previous tick, and the next wake (a report, a few
+-		 * milliseconds later) then found the tick it had already missed and
+-		 * published a second event. Measured: events 6 ms apart followed by a
+-		 * 29 ms hole, 27 of 60 intervals under 10 ms in a drag, which commits
+-		 * the same content twice in one display tick and not at all in the
+-		 * next -- the rec0/rec2 the framebuffer was counting. The tick this
+-		 * event belongs to is the one current when the position is known.
++		 * No report this wake: publish the position the previous wake read,
++		 * so a finger that is down still moves on this tick.
+ 		 */
+-		tick = mondrian_touch_ticks;
+-		if (tick != emitted_tick) {
+-			emitted_tick = tick;
+-			for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
+-				if (now[finger]) {
+-					mondrian_touch_event_gap();
+-					mondrian_touch_events++;
+-					mondrian_hid_touch(finger, 1, last_x[finger],
+-					    last_y[finger]);
+-					if (sent_x[finger] == last_x[finger] &&
+-					    sent_y[finger] == last_y[finger]) {
+-						mondrian_touch_repeats++;
+-					}
+-					sent_x[finger] = last_x[finger];
+-					sent_y[finger] = last_y[finger];
+-					if (reports < 30) {
+-						printf("MONDRIAN TOUCH: report %u finger %d %d,%d\n",
+-						    reports, finger, last_x[finger],
+-						    last_y[finger]);
+-					}
+-				} else if (was[finger]) {
+-					mondrian_touch_event_gap();
+-					mondrian_touch_events++;
+-					mondrian_hid_touch(finger, 0, last_x[finger],
+-					    last_y[finger]);
+-					if (reports < 30) {
+-						printf("MONDRIAN TOUCH: report %u finger %d up\n",
+-						    reports, finger);
+-					}
+-				}
+-				was[finger] = now[finger];
+-			}
+-		}
++		(void)mondrian_touch_publish(&emitted_tick, now, was, last_x, last_y,
++		    sent_x, sent_y, reports);
+ 		if (reports < 30) {
+ 			mondrian_log_flush_now();
+ 		}
+ 		reports++;
+ 	}
+ }
+ 
+ /* brl_reset: 2 ms low, then brl_reset(delay=100)'s wait. The update entry
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -630,16 +630,24 @@
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(MONDRIAN_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	/*
++	 * The touch thread reads the part and publishes the position the UI
++	 * commits this period. Wake it now, after the clients and before the
++	 * copy below: woken at the end of the tick it published 3-4 ms later,
++	 * which was enough for the commit to miss the period (measured: 45 fps
++	 * against 60 with the same events at the tick).
++	 */
++	mondrian_touch_vsync();
++	/*
+ 	 * Arm the next tick against a fixed deadline. Re-arming with a delay
+ 	 * from here measured 17.7 ms a tick with a third of them at 20-33 ms
+ 	 * (ring242: `gap avg 17709`), because the callback's own duration was
+ 	 * part of the period and a slow one moved every later tick with it. A
+ 	 * deadline chain keeps the period at 1/HZ and, when a callback overruns,
+ 	 * skips the ticks that are already gone instead of firing them back to
+ 	 * back.
+ 	 */
+@@ -720,17 +728,16 @@
+ 	/*
+ 	 * The touch report thread is ticked from here: its own tsleep() deadline
+ 	 * never fires on this board, and the part reports at about 100 Hz.
+ 	 */
+ 	{
+ 		static uint32_t touched_last, repeated_last;
+ 		static uint32_t polls_last, events_last;
+ 
+-		mondrian_touch_vsync();
+ 		if ((count % MONDRIAN_FB_REFRESH_HZ) == 0) {
+ 			uint32_t now_reports = mondrian_touch_report_count();
+ 			uint32_t now_repeats = mondrian_touch_repeat_count();
+ 			uint32_t now_polls = mondrian_touch_poll_count();
+ 			uint32_t now_events = mondrian_touch_event_count();
+ 
+ 			fb->fTouchRate = now_reports - touched_last;
+ 			fb->fTouchRepeatRate = now_repeats - repeated_last;

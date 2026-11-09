@@ -1,0 +1,521 @@
+xnu 0291: start the command-mode panel's CTL on every frame
+
+The bootloader's own command line names the panel a command-mode one
+(`mdss_dsi_m11a_42_02_0a_dsc_cmd`): the controller fetches one frame when its
+CTL starts and holds it until the next start, so writing pixels is not enough
+and the panel changed only when something else started a frame. The driver now
+starts the active CTL per tick from MONDRIAN tick second `mondrianfb_kick`
+on, and reads INTF_FRAME_COUNT to say what the interface really sent.
+
+The same file carries the host's window into the panel: the display memory is
+sampled one half-scale RGB565 row at a time for the USB control channel, so a
+glitch is looked at instead of described.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -48,6 +48,80 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++/*
++ * The panel is a command-mode panel: the bootloader's own command line names
++ * it `msm_drm.dsi_display0=qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, and on this
++ * board `qcom,sde-ctl-off` puts CTL0 at 0x16000 and `qcom,sde-intf-off` puts
++ * INTF0 at 0x35000 in the MDP window at 0xae00000. A command-mode controller
++ * does not scan the framebuffer the way a video-mode one does: it fetches one
++ * frame when its CTL is started and holds that frame until the next start.
++ * Writing pixels is therefore not enough, and without a start per frame the
++ * panel changes only when something else starts one, which is the once-a-
++ * second refresh a hand sees. `mondrianfb_kick=N` starts the active CTL on
++ * every tick from second N on, and INTF_FRAME_COUNT (0x0AC, the register the
++ * vendor's `sde_hw_intf.c` reads) says what the interface really sent.
++ */
++#define MONDRIAN_MDP_PHYS        0xae00000ULL
++#define MONDRIAN_MDP_SIZE        0x40000
++#define MONDRIAN_DSI_PHYS        0xae94000ULL
++#define MONDRIAN_DSI_SIZE        0x4000
++#define MONDRIAN_CTL_OFF         0x16000
++#define MONDRIAN_CTL_STRIDE      0x1000
++#define MONDRIAN_CTL_N           6
++#define MONDRIAN_CTL_TOP         0x000
++#define MONDRIAN_CTL_FLUSH       0x018
++#define MONDRIAN_CTL_START       0x01C
++#define MONDRIAN_CTL_RESET       0x030
++#define MONDRIAN_CTL_INTF_ACTIVE 0x0F4
++#define MONDRIAN_INTF_OFF        0x35000
++#define MONDRIAN_INTF_STRIDE     0x1000
++#define MONDRIAN_INTF_N          4
++#define MONDRIAN_INTF_TIMING_EN  0x000
++#define MONDRIAN_INTF_CONFIG     0x004
++#define MONDRIAN_INTF_MDP_FRAME_COUNT 0x0A4
++#define MONDRIAN_INTF_FRAME_COUNT 0x0AC
++#define MONDRIAN_INTF_LINE_COUNT 0x0B0
++#define MONDRIAN_INTF_CMD_TRIGGER_EN 0x084
++#define MONDRIAN_INTF_PROG_FETCH  0x170
++#define MONDRIAN_INTF_STATUS      0x26C
++#define MONDRIAN_INTF_UNDERRUN    0x268
++#define MONDRIAN_INTF_TEAR_CHECK_EN 0x284
++#define MONDRIAN_INTF_TEAR_SYNC   0x288
++#define MONDRIAN_INTF_TEAR_RD_PTR 0x2A4
++#define MONDRIAN_INTF_TEAR_LINE   0x2B0
++#define MONDRIAN_INTF_AUTOREFRESH 0x2B4
++#define MONDRIAN_INTF_AUTOREFRESH_STATUS 0x2C0
++#define MONDRIAN_DSI1_OFF        0x2000   /* ctrl1 inside the DSI window */
++/* The pipes whose source address says what the DPU really fetches. */
++#define MONDRIAN_SSPP_N          8
++#define MONDRIAN_SSPP_SRC0       0x14
++#define MONDRIAN_SSPP_STRIDE     0x24
++#define MONDRIAN_SSPP_FORMAT     0x30
++/*
++ * `mondrianfb_test=1` paints a magenta band in the panel memory that moves
++ * one band-height down per tick. It runs in the kernel, so it separates the
++ * two halves of a slow screen: a band that glides answers that the display
++ * shows what this memory holds, and a band that jumps once a second answers
++ * that it does not.
++ */
++#define MONDRIAN_TEST_H          16
++#define MONDRIAN_TEST_COLOR      0xFFFF00FFu
++
++/* osfmk/arm/machine_routines.h, C linkage: this file is C++. */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++static inline uint32_t
++mondrian_mdp_rd(volatile uint32_t *base, uint32_t off)
++{
++	return base[off / 4];
++}
++
++static inline void
++mondrian_mdp_wr(volatile uint32_t *base, uint32_t off, uint32_t value)
++{
++	base[off / 4] = value;
++}
++
+ enum {
+ 	kMondrianFBGetLayerDefaultSurface  = 3,
+ 	kMondrianFBSwapBegin               = 4,
+@@ -365,6 +439,31 @@
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	bool          fQuietScreen;      /* mondrianfb_noconsole at start */
++	/*
++	 * The swaps say what the renderer did; these say whether the panel
++	 * memory the display scans changed at all. A screen that holds still
++	 * with 60 swaps a second is then either a renderer drawing the same
++	 * content or a copy that never lands, and the two need opposite fixes.
++	 */
++	uint32_t      fPanelSig;
++	uint32_t      fPanelChanges;
++	uint32_t      fPanelTicks;
++	/* The DPU window and what the interface sends, for mondrianfb_kick. */
++	volatile uint32_t *fMdp;
++	volatile uint32_t *fDsi;
++	uint32_t      fIntfFrames[MONDRIAN_INTF_N];
++	uint32_t      fCtlActiveMask;
++	bool          fKick;
++	uint32_t      fKickFrom;
++	uint32_t      fStep;
++	uint32_t      fStuck;
++	bool          fDsiDumped;
++	bool          fResetDone;
++	/* mondrianfb_test: the band, and the pixels it covers. */
++	bool          fTest;
++	bool          fTestShown;
++	uint32_t      fTestY;
++	uint32_t     *fTestSave;
+ 
+ 	/* The swap the next display tick presents, and how it went. */
+ 	uint8_t       fPendingRec[MONDRIAN_FB_SWAP_REC_SIZE];
+@@ -385,7 +484,14 @@
+ 	void present(const uint8_t *rec);
+ };
+ 
+-OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
++OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer)
++
++/*
++ * The host's window into the screen: the panel memory the display scans,
++ * sampled by mondrian_fb_capture_row(). The USB control channel uses it so a
++ * glitch is looked at instead of described.
++ */
++static AppleCLCD *gMondrianFB;
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+@@ -423,6 +529,22 @@
+ 	fFpsLog = false;
+ 	fConsolePaused = false;
+ 	fQuietScreen = false;
++	fMdp = NULL;
++	fDsi = NULL;
++	fCtlActiveMask = 0;
++	fKick = false;
++	fKickFrom = 0;
++	fStep = 0;
++	fStuck = 0;
++	fDsiDumped = false;
++	fResetDone = false;
++	fTest = false;
++	fTestShown = false;
++	fTestY = 0;
++	fTestSave = NULL;
++	for (unsigned i = 0; i < MONDRIAN_INTF_N; i++) {
++		fIntfFrames[i] = 0;
++	}
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+@@ -465,6 +587,7 @@
+ 	fSurface = mondrian_surface_create_vm(fCanvasWidth, fCanvasHeight,
+ 	    fCanvasWidth * 4, MONDRIAN_FB_FORMAT_BGRA);
+ 	fPixels = (uintptr_t)mondrian_early_fb_va();
++	gMondrianFB = this;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fPresentLock == NULL || fClients == NULL ||
+ 	    fSurface == NULL || fPixels == 0 ||
+@@ -542,6 +665,7 @@
+ 	}
+ 	/* The mode is the render target (canvas), not the panel scanout. */
+ 	mondrian_publish_modes(this, fCanvasWidth, fCanvasHeight);
++	mondrian_publish_refresh(this, MONDRIAN_FB_REFRESH_HZ);
+ 	registerService();
+ 	/*
+ 	 * mondrianfb_noscreen=1: leave the panel to the liveness marker. The
+@@ -581,6 +705,29 @@
+ 			IOLog("MONDRIAN FB: screen console off at start (mondrianfb_noconsole=1)\n");
+ 		}
+ 	}
++	{
++		int mdp = 1, kick = 1, test = 0;
++
++		(void)PE_parse_boot_argn("mondrianfb_mdp", &mdp, sizeof(mdp));
++		(void)PE_parse_boot_argn("mondrianfb_kick", &kick, sizeof(kick));
++		(void)PE_parse_boot_argn("mondrianfb_test", &test, sizeof(test));
++		if (mdp != 0) {
++			fMdp = (volatile uint32_t *)ml_io_map(MONDRIAN_MDP_PHYS, MONDRIAN_MDP_SIZE);
++			fDsi = (volatile uint32_t *)ml_io_map(MONDRIAN_DSI_PHYS, MONDRIAN_DSI_SIZE);
++			fKick = kick > 0;
++			fKickFrom = fKick ? (uint32_t)kick * MONDRIAN_FB_REFRESH_HZ : 0;
++			IOLog("MONDRIAN FB: mdp 0x%llx dsi 0x%llx kick %d from tick %u\n",
++			    (unsigned long long)fMdp, (unsigned long long)fDsi,
++			    fKick ? 1 : 0, fKickFrom);
++		}
++		if (fMdp != NULL && test != 0 && fRowBytes == fWidth * 4 && fHeight > MONDRIAN_TEST_H) {
++			fTestSave = (uint32_t *)IOMalloc((vm_size_t)fWidth * MONDRIAN_TEST_H * 4);
++			if (fTestSave != NULL) {
++				fTest = true;
++				IOLog("MONDRIAN FB: test band on, %ux%u\n", fWidth, MONDRIAN_TEST_H);
++			}
++		}
++	}
+ 	return true;
+ }
+ 
+@@ -697,6 +844,181 @@
+ 		}
+ 	}
+ 	/*
++	 * The band is drawn into the same memory the CTL fetches, after the
++	 * frame this tick has been copied and before the start, so the start
++	 * sends a frame that holds the band in its new place.
++	 */
++	if (fb->fTest && fb->fTestSave != NULL && fb->fRowBytes == fb->fWidth * 4 &&
++	    fb->fHeight > MONDRIAN_TEST_H) {
++		uint32_t *base = (uint32_t *)fb->fPixels;
++		uint32_t stride = fb->fRowBytes / 4;
++		uint32_t bytes = fb->fWidth * MONDRIAN_TEST_H * 4;
++
++		if (fb->fTestShown) {
++			memcpy(base + (size_t)fb->fTestY * stride, fb->fTestSave, bytes);
++		}
++		fb->fTestY = (fb->fTestY + MONDRIAN_TEST_H) % (fb->fHeight - MONDRIAN_TEST_H);
++		{
++			uint32_t *dst = base + (size_t)fb->fTestY * stride;
++
++			memcpy(fb->fTestSave, dst, bytes);
++			for (uint32_t i = 0; i < fb->fWidth * MONDRIAN_TEST_H; i++) {
++				dst[i] = MONDRIAN_TEST_COLOR;
++			}
++		}
++		fb->fTestShown = true;
++	}
++	/*
++	 * A command-mode panel needs a start per frame: the CTL fetches the
++	 * layers once when it is started and holds that frame until the next
++	 * start. Start it after the copy of this tick, so the fetch sees the
++	 * frame that was just written; the stores are Normal Non-cacheable and
++	 * the dsb makes them visible to the fetch engine before the kick.
++	 */
++	if (fb->fMdp != NULL && fb->fKick && count >= fb->fKickFrom) {
++		uint32_t intf = MONDRIAN_INTF_OFF + MONDRIAN_INTF_STRIDE;
++		uint32_t ctl = MONDRIAN_CTL_OFF;
++		uint32_t start = mondrian_mdp_rd(fb->fMdp, ctl + MONDRIAN_CTL_START);
++
++		/*
++		 * Clear, before the first start, the two things the bootloader
++		 * can have left that stop the interface after a few seconds:
++		 * the hardware autorefresh (bit 31 of this register) and the
++		 * tear check. The previous test cleared both only after the
++		 * freeze, when the stuck CTL no longer looked at them.
++		 */
++		if (fb->fStep == 0) {
++			uint32_t ar = mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_AUTOREFRESH);
++			uint32_t te = mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_TEAR_CHECK_EN);
++
++			fb->fStep = 1;
++			mondrian_mdp_wr(fb->fMdp, intf + MONDRIAN_INTF_AUTOREFRESH, ar & ~0x80000000u);
++			mondrian_mdp_wr(fb->fMdp, intf + MONDRIAN_INTF_TEAR_CHECK_EN, 0);
++			IOLog("MONDRIAN FB: pre kick afr 0x%x tear %u trigen 0x%x dsi trig 0x%x\n",
++			    ar, te,
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_CMD_TRIGGER_EN),
++			    fb->fDsi != NULL ? mondrian_mdp_rd(fb->fDsi, 0x080) : 0);
++		}
++		/*
++		 * A CTL that stays started for half a second has a frame that
++		 * never completed. The vendor recovers that state with a CTL
++		 * software reset; dump the DSI first, once, while it is wedged.
++		 */
++		if ((start & 1u) != 0) {
++			if (fb->fStuck < 0xffff) {
++				fb->fStuck++;
++			}
++		} else {
++			fb->fStuck = 0;
++		}
++		if (fb->fStuck == 30 && !fb->fDsiDumped) {
++			fb->fDsiDumped = true;
++			if (fb->fDsi != NULL) {
++				IOLog("MONDRIAN FB: wedged dsi ctl 0x%x st 0x%x fifo 0x%x ack 0x%x to 0x%x phy 0x%x trig 0x%x dma 0x%x s0 0x%x t0 0x%x\n",
++				    mondrian_mdp_rd(fb->fDsi, 0x000),
++				    mondrian_mdp_rd(fb->fDsi, 0x004),
++				    mondrian_mdp_rd(fb->fDsi, 0x008),
++				    mondrian_mdp_rd(fb->fDsi, 0x064),
++				    mondrian_mdp_rd(fb->fDsi, 0x0bc),
++				    mondrian_mdp_rd(fb->fDsi, 0x0b0),
++				    mondrian_mdp_rd(fb->fDsi, 0x080),
++				    mondrian_mdp_rd(fb->fDsi, 0x038),
++				    mondrian_mdp_rd(fb->fDsi, 0x054),
++				    mondrian_mdp_rd(fb->fDsi, 0x058));
++			}
++			IOLog("MONDRIAN FB: wedged intf st 0x%x ur 0x%x fc 0x%x lc 0x%x\n",
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_STATUS),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_UNDERRUN),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_FRAME_COUNT),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_LINE_COUNT));
++		}
++		if (fb->fStuck >= 30 && !fb->fResetDone) {
++			fb->fResetDone = true;
++			mondrian_mdp_wr(fb->fMdp, ctl + MONDRIAN_CTL_RESET, 1);
++			IOLog("MONDRIAN FB: ctl sw reset, start now 0x%x\n",
++			    mondrian_mdp_rd(fb->fMdp, ctl + MONDRIAN_CTL_START));
++		}
++		if (fb->fCtlActiveMask == 0) {
++			for (uint32_t c = 0; c < MONDRIAN_CTL_N; c++) {
++				uint32_t reg = MONDRIAN_CTL_OFF + c * MONDRIAN_CTL_STRIDE +
++				    MONDRIAN_CTL_INTF_ACTIVE;
++
++				if (mondrian_mdp_rd(fb->fMdp, reg) != 0) {
++					fb->fCtlActiveMask |= 1u << c;
++				}
++				IOLog("MONDRIAN FB: ctl%u top 0x%x active 0x%x start 0x%x\n", c,
++				    mondrian_mdp_rd(fb->fMdp, MONDRIAN_CTL_OFF + c * MONDRIAN_CTL_STRIDE + MONDRIAN_CTL_TOP),
++				    mondrian_mdp_rd(fb->fMdp, reg),
++				    mondrian_mdp_rd(fb->fMdp, MONDRIAN_CTL_OFF + c * MONDRIAN_CTL_STRIDE + MONDRIAN_CTL_START));
++			}
++			if (fb->fCtlActiveMask == 0) {
++				fb->fCtlActiveMask = 1;
++			}
++			IOLog("MONDRIAN FB: kick on, ctl mask 0x%x\n", fb->fCtlActiveMask);
++			{
++				static const uint32_t sspp[MONDRIAN_SSPP_N] = {
++					0x5000, 0x7000, 0x9000, 0xb000,
++					0x25000, 0x27000, 0x29000, 0x2b000,
++				};
++				uint32_t d = MONDRIAN_DSI1_OFF;
++
++				for (uint32_t i = 0; i < MONDRIAN_INTF_N; i++) {
++					uint32_t o = MONDRIAN_INTF_OFF + i * MONDRIAN_INTF_STRIDE;
++
++					IOLog("MONDRIAN FB: intf%u en 0x%x cfg 0x%x trig 0x%x fc 0x%x lc 0x%x\n", i,
++					    mondrian_mdp_rd(fb->fMdp, o + MONDRIAN_INTF_TIMING_EN),
++					    mondrian_mdp_rd(fb->fMdp, o + MONDRIAN_INTF_CONFIG),
++					    mondrian_mdp_rd(fb->fMdp, o + MONDRIAN_INTF_CMD_TRIGGER_EN),
++					    mondrian_mdp_rd(fb->fMdp, o + MONDRIAN_INTF_FRAME_COUNT),
++					    mondrian_mdp_rd(fb->fMdp, o + MONDRIAN_INTF_LINE_COUNT));
++				}
++				(void)d;
++				for (uint32_t i = 0; i < MONDRIAN_SSPP_N; i++) {
++					IOLog("MONDRIAN FB: sspp%u src0 0x%x stride 0x%x fmt 0x%x\n", i,
++					    mondrian_mdp_rd(fb->fMdp, sspp[i] + MONDRIAN_SSPP_SRC0),
++					    mondrian_mdp_rd(fb->fMdp, sspp[i] + MONDRIAN_SSPP_STRIDE),
++					    mondrian_mdp_rd(fb->fMdp, sspp[i] + MONDRIAN_SSPP_FORMAT));
++				}
++			}
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		mondrian_mdp_wr(fb->fMdp, ctl + MONDRIAN_CTL_FLUSH, 0xC00607FFu);
++		for (uint32_t c = 0; c < MONDRIAN_CTL_N; c++) {
++			if ((fb->fCtlActiveMask & (1u << c)) != 0) {
++				mondrian_mdp_wr(fb->fMdp,
++				    MONDRIAN_CTL_OFF + c * MONDRIAN_CTL_STRIDE + MONDRIAN_CTL_START, 1);
++			}
++		}
++	}
++	/*
++	 * Sample the panel memory once a tick and count the ticks whose sample
++	 * changed. 64 pixels is nothing next to a 18 MB frame, and it answers
++	 * the one question the swap counters cannot: does the memory the panel
++	 * scans move? `panel 60/60` with a still screen is the copy, `panel
++	 * 1/60` is the content.
++	 */
++	if (fb->fHeight != 0 && fb->fWidth != 0 && fb->fRowBytes != 0) {
++		uint32_t sig = 0x811c9dc5u;
++		uint32_t x = 0, y = 0;
++
++		for (uint32_t i = 0; i < 64; i++) {
++			const uint32_t *p = (const uint32_t *)(fb->fPixels +
++			    (uint64_t)y * fb->fRowBytes) + x;
++
++			sig = (sig ^ *p) * 16777619u;
++			y += fb->fHeight / 64u;
++			if (y >= fb->fHeight) {
++				y = 0;
++			}
++			x = (x + 37u) % fb->fWidth;
++		}
++		fb->fPanelTicks++;
++		if (sig != fb->fPanelSig) {
++			fb->fPanelSig = sig;
++			fb->fPanelChanges++;
++		}
++	}
++	/*
+ 	 * Liveness marker that needs neither the console nor printf: the panel
+ 	 * scans this memory by itself, so a block that moves twice a second
+ 	 * proves the kernel still runs when the log has stopped. It goes away
+@@ -852,6 +1174,45 @@
+ 		fb->fPresentGapTicks = fb->fPresentGapCount = 0;
+ 		fb->fPresentGapOver18 = fb->fPresentGapOver30 = 0;
+ 		fb->fQueueDrop = 0;
++		IOLog("MONDRIAN FB: panel %u/%u sampled ticks changed\n",
++		    fb->fPanelChanges, fb->fPanelTicks);
++		fb->fPanelChanges = 0;
++		fb->fPanelTicks = 0;
++		if (fb->fMdp != NULL) {
++			uint32_t f[MONDRIAN_INTF_N];
++			uint32_t intf = MONDRIAN_INTF_OFF + MONDRIAN_INTF_STRIDE;
++			uint32_t ctl = MONDRIAN_CTL_OFF;
++
++			for (unsigned i = 0; i < MONDRIAN_INTF_N; i++) {
++				f[i] = mondrian_mdp_rd(fb->fMdp,
++				    MONDRIAN_INTF_OFF + i * MONDRIAN_INTF_STRIDE +
++				    MONDRIAN_INTF_FRAME_COUNT);
++			}
++			IOLog("MONDRIAN FB: intf %u/%u %u/%u %u/%u %u/%u (+%d) kick %d step %u ctl 0x%x start 0x%x flush 0x%x\n",
++			    f[0], fb->fIntfFrames[0], f[1], fb->fIntfFrames[1],
++			    f[2], fb->fIntfFrames[2], f[3], fb->fIntfFrames[3],
++			    (int)(f[1] - fb->fIntfFrames[1]),
++			    (fb->fKick && count >= fb->fKickFrom) ? 1 : 0,
++			    fb->fStep, fb->fCtlActiveMask,
++			    mondrian_mdp_rd(fb->fMdp, ctl + MONDRIAN_CTL_START),
++			    mondrian_mdp_rd(fb->fMdp, ctl + MONDRIAN_CTL_FLUSH));
++			IOLog("MONDRIAN FB: intf1 st 0x%x ur %u mdpfc %u fc %u lc %u trig 0x%x pf 0x%x tear 0x%x/%u afr 0x%x/%u cfg 0x%x\n",
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_STATUS),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_UNDERRUN),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_MDP_FRAME_COUNT),
++			    f[1],
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_LINE_COUNT),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_CMD_TRIGGER_EN),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_PROG_FETCH),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_TEAR_CHECK_EN),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_TEAR_LINE),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_AUTOREFRESH),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_AUTOREFRESH_STATUS),
++			    mondrian_mdp_rd(fb->fMdp, intf + MONDRIAN_INTF_CONFIG));
++			for (unsigned i = 0; i < MONDRIAN_INTF_N; i++) {
++				fb->fIntfFrames[i] = f[i];
++			}
++		}
+ 		fb->fTickRec[0] = fb->fTickRec[1] = 0;
+ 		fb->fTickRec[2] = fb->fTickRec[3] = 0;
+ 	}
+@@ -1296,6 +1657,22 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
++		/*
++		 * The straight copy below places these at the canvas coordinates the
++		 * record carries. Whether that is what the caller meant decides the
++		 * switch that looked clipped and every widget that looked offset, so
++		 * name the geometry of the first frames after the UI comes up.
++		 */
++		{
++			static uint32_t logged;
++
++			if (logged < 400) {
++				logged++;
++				IOLog("MONDRIAN FB: layer %u surface %u %ux%u dst %d,%d %dx%d canvas %u\n",
++				    layer, id, s->width, s->height, dx, dy, w, h,
++				    (s->width == fCanvasWidth && s->height == fCanvasHeight) ? 1u : 0u);
++			}
++		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+@@ -1566,4 +1943,54 @@
+ 	}
+ 	return ret;
+ }
++
++/*
++ * One row of the panel at half scale in RGB565, for the host. The panel is
++ * BGRA in memory (MONDRIAN_FB_FORMAT_BGRA), so byte 0 is blue. Half scale is
++ * 720 pixels, 1440 bytes: one datagram with the header.
++ */
++extern "C" uint32_t
++mondrian_fb_capture_row(uint32_t y, uint8_t *dst, uint32_t dstLen)
++{
++	AppleCLCD *fb = gMondrianFB;
++	uint32_t half, i;
++
++	if (fb == NULL || fb->fPixels == 0 || fb->fRowBytes == 0 ||
++	    (y >= fb->fHeight) || (fb->fWidth < 2)) {
++		return 0;
++	}
++	half = fb->fWidth / 2;
++	if (dstLen < half * 2) {
++		return 0;
++	}
++	const uint32_t *src = (const uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++	uint16_t *out = (uint16_t *)dst;
++
++	for (i = 0; i < half; i++) {
++		uint32_t p = src[i * 2];
++		uint32_t b = (p >> 3) & 0x1f;
++		uint32_t g = (p >> 10) & 0x3f;
++		uint32_t r = (p >> 19) & 0x1f;
++
++		out[i] = (uint16_t)((r << 11) | (g << 5) | b);
++	}
++	return half * 2;
++}
++
++extern "C" uint32_t
++mondrian_fb_capture_rows(void)
++{
++	AppleCLCD *fb = gMondrianFB;
++
++	return (fb != NULL && fb->fPixels != 0) ? fb->fHeight : 0;
++}
++
++extern "C" uint32_t
++mondrian_fb_capture_width(void)
++{
++	AppleCLCD *fb = gMondrianFB;
++
++	return (fb != NULL && fb->fPixels != 0) ? fb->fWidth / 2 : 0;
++}
++
+ #endif /* MONDRIAN */
+

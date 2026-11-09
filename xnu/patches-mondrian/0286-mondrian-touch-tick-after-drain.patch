@@ -1,0 +1,66 @@
+xnu 0286: the touch tick is the one current after the reports are read
+
+The report thread sampled the display tick at the top of its loop and then spent
+up to four report reads (a few milliseconds) draining the part. A vsync that
+arrived during the drain left that publish named after the previous tick, and
+the next wake -- a report, a few milliseconds later -- found the tick it had
+already missed and published a second event for it. Measured in a drag (ring3):
+events 6 ms apart followed by a 29 ms hole, 27 of 60 intervals under 10 ms, and
+in the same second 18 display ticks with two finished frames and 18 with none
+(the framebuffer's rec0/rec2). The UI redraws once per touch event, so the pair
+describes the same content twice in one tick and nothing in the next.
+
+Sampling the tick after the drain makes the publish belong to the tick the
+position was read in, and one event comes out per tick.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -1690,17 +1690,16 @@
+ 		sent_y[i] = (int16_t)-1;
+ 	}
+ 	for (;;) {
+ 		int passes;
+ 		uint32_t tick;
+ 
+ 		(void)tsleep((caddr_t)&mondrian_touch_data_addr, PZERO - 1, "mtouch", 1);
+ 		mondrian_touch_polls++;
+-		tick = mondrian_touch_ticks;
+ 		/*
+ 		 * Drain what the part has queued. Its line stays low while a report
+ 		 * waits and one zero byte at the report address releases it, so a
+ 		 * tick that read a single report threw away the rest of a stream the
+ 		 * part sends at about 100 Hz. The reports of one tick are coalesced
+ 		 * into one event a finger below: what the UI wants is the position
+ 		 * this vsync, not every sample the part made.
+ 		 */
+@@ -1767,16 +1766,29 @@
+ 		 * per touch event (measured: panel swaps follow the reports answered), and
+ 		 * the thread wakes about twice a frame, so answering every wake delivers
+ 		 * 85-120 positions a second at 8 and 17 ms spacings (ring243: `ev gap avg
+ 		 * 11.7 ms, 27 of them under 10 ms`). The content then advances two steps
+ 		 * on some frames and one on others, which is a drag that jerks even when
+ 		 * the frames themselves are even. Reading still happens on every wake;
+ 		 * what a tick publishes is the newest position, once.
+ 		 */
++		/*
++		 * Read the tick after the drain, not before it. The drain is up to
++		 * four report reads and takes a few milliseconds; sampled at the top
++		 * of the loop, a vsync that arrives in the middle left this publish
++		 * named after the previous tick, and the next wake (a report, a few
++		 * milliseconds later) then found the tick it had already missed and
++		 * published a second event. Measured: events 6 ms apart followed by a
++		 * 29 ms hole, 27 of 60 intervals under 10 ms in a drag, which commits
++		 * the same content twice in one display tick and not at all in the
++		 * next -- the rec0/rec2 the framebuffer was counting. The tick this
++		 * event belongs to is the one current when the position is known.
++		 */
++		tick = mondrian_touch_ticks;
+ 		if (tick != emitted_tick) {
+ 			emitted_tick = tick;
+ 			for (finger = 0; finger < MONDRIAN_TOUCH_FINGERS; finger++) {
+ 				if (now[finger]) {
+ 					mondrian_touch_event_gap();
+ 					mondrian_touch_events++;
+ 					mondrian_hid_touch(finger, 1, last_x[finger],
+ 					    last_y[finger]);

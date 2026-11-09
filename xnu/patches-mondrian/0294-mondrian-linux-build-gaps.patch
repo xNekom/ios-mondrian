@@ -1,0 +1,276 @@
+xnu 0294: build the kernel with an upstream clang and no Apple SDK
+
+Upstream clang has none of the XNU signature builtins: every kalloc_type view
+turns into a data view, kalloc_type_view_copy() keeps none of them, and the
+iterator's assert then panics in kernel_bootstrap before the ring is armed.
+The builtins fall back to a data-only summary and both iterators return when
+there is no view to sort, which keeps kalloc_type() working without the
+type-metadata fast paths.
+
+The Linux iig emits the declarations but not every DriverKit definition, so
+the kernel links `IOUserClient::CreateActionKernelCompletion` from the tree
+instead of the generated file. `XNU_SKIP_SYMBOLSETS=1` skips the kext symbol
+sets, which this kernel-only build never links. XCRUN/PAX/PLUTIL/codesign come
+from PATH. The crypto assembly uses the vN.4s syntax with upstream clang too,
+because the qN form is Apple's assembler syntax. The profiling runtime and
+__cxa_atexit get link shims.
+
+diff --git a/makedefs/MakeInc.cmd b/makedefs/MakeInc.cmd
+--- a/makedefs/MakeInc.cmd
++++ b/makedefs/MakeInc.cmd
+@@ -100,12 +100,12 @@
+ 	_v =
+ 	_vstdout =
+ 	_vstderr =
+-	XCRUN = /usr/bin/xcrun -verbose
++	XCRUN ?= xcrun -verbose
+ else
+ 	_v = @
+ 	_vstdout = > /dev/null
+ 	_vstderr = 2> /dev/null
+-	XCRUN = /usr/bin/xcrun
++	XCRUN ?= xcrun
+ endif
+ 
+ VERBOSE_GENERATED_MAKE_FRAGMENTS = NO
+@@ -285,7 +285,7 @@
+ CHMOD = /bin/chmod
+ FIND = /usr/bin/find
+ XARGS = /usr/bin/xargs
+-PAX = /bin/pax
++PAX ?= pax
+ BASENAME = /usr/bin/basename
+ DIRNAME = /usr/bin/dirname
+ TR = /usr/bin/tr
+@@ -293,7 +293,7 @@
+ SLEEP = /bin/sleep
+ AWK = /usr/bin/awk
+ SED = /usr/bin/sed
+-PLUTIL = /usr/bin/plutil
++PLUTIL ?= plutil
+ PATCH = /usr/bin/patch
+ GREP = /usr/bin/grep
+ 
+@@ -317,7 +317,7 @@
+ 	export HOST_GM4		:= $(shell $(XCRUN) -sdk $(HOST_SDKROOT) -find gm4)
+ endif
+ ifeq ($(origin HOST_CODESIGN),undefined)
+-	export HOST_CODESIGN	:= /usr/bin/codesign
++	export HOST_CODESIGN	:= codesign
+ endif
+ ifeq ($(origin HOST_CODESIGN_ALLOCATE),undefined)
+ 	export HOST_CODESIGN_ALLOCATE	:= $(shell $(XCRUN) -sdk $(HOST_SDKROOT) -find codesign_allocate)
+
+diff --git a/config/Makefile b/config/Makefile
+--- a/config/Makefile
++++ b/config/Makefile
+@@ -182,7 +182,13 @@
+ 	@$(LOG_INSTALL) "$*"
+ 	$(_v)$(INSTALL) $(INSTALL_FLAGS) $< $@
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The Linux iig emits a different set of DriverKit _Invoke overloads and OSAction
++# subclasses than Apple's iig, so kextsymboltool's export/import check cannot
++# agree with the kernel symbol table. Symbol sets only feed kext linking, which
++# this kernel-only build never does; take the same branch as an xnu_libraries
++# build, which skips them too.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ do_build_all:: build_symbol_set_plists
+ do_config_all:: build_symbol_sets
+
+diff --git a/san/coverage/Makefile b/san/coverage/Makefile
+--- a/san/coverage/Makefile
++++ b/san/coverage/Makefile
+@@ -48,7 +48,10 @@
+ # Kcov System.kext plugin
+ #
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The kernel-only Linux build has no allsymbols when config_all runs,
++# and kext symbol sets only feed kext linking, which it never does.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ #
+ # Primary build will always install kext without exported runtime.
+
+diff --git a/san/memory/Makefile b/san/memory/Makefile
+--- a/san/memory/Makefile
++++ b/san/memory/Makefile
+@@ -46,7 +46,10 @@
+ # Kasan System.kext plugin
+ #
+ 
+-ifneq ($(RC_ProjectName),xnu_libraries)
++ifeq ($(XNU_SKIP_SYMBOLSETS),1)
++# The kernel-only Linux build has no allsymbols when config_all runs,
++# and kext symbol sets only feed kext linking, which it never does.
++else ifneq ($(RC_ProjectName),xnu_libraries)
+ 
+ #
+ # Primary build will always install kext without exported runtime.
+
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -653,6 +653,17 @@
+ }
+ #endif /* PRIVATE_WIFI_ONLY */
+ 
++/*
++ * Apple's iig emits the DriverKit-facing forwarders and the TYPE(...) OSAction
++ * factories into the generated .iig.cpp. The Linux iig generates the
++ * declarations but not every definition, and the kernel links this one.
++ */
++kern_return_t
++IOUserClient::CreateActionKernelCompletion(size_t referenceSize, OSAction ** action)
++{
++	return OSAction::Create(this, 0, 0, referenceSize, action);
++}
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ kern_return_t
+
+diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
+--- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
++++ b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
+@@ -28,7 +28,12 @@
+ // #include <Availability.h>
+ #include <sys/cdefs.h>
+ 
+-#if defined(__clang__) && ((defined(__apple_build_version__) && __apple_build_version__ > 5010000))
++/* The vN.4s crypto syntax needs a clang new enough to parse it: every clang
++ * since Apple's 5010000, including upstream LLVM clang, which does not
++ * define __apple_build_version__ at all. The qN form in the other branch is
++ * Apple's assembler syntax and upstream LLVM rejects it. */
++#if defined(__clang__) && (!defined(__apple_build_version__) || \
++    (__apple_build_version__ > 5010000))
+ #define __USES_V_CRYPTO_INTRINSICS 1
+ #else
+ #define __USES_V_CRYPTO_INTRINSICS 0
+
+diff --git a/osfmk/kern/kalloc.c b/osfmk/kern/kalloc.c
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -1784,6 +1784,17 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_FIXED);
+ 	assert(kt_count < KALLOC_TYPE_SIZE_MASK);
++	/*
++	 * Without __builtin_xnu_type_signature every view is a data view, and
++	 * kalloc_type_view_copy() keeps none of them: all of them go to
++	 * KHEAP_DATA_BUFFERS. There is then nothing to sort and no typed zone to
++	 * create, and the iterator below assumes at least one view (its
++	 * assert(c_idx == p_idx) fails when the loop never runs; measured as a
++	 * panic in kernel_bootstrap, before the console ring is armed).
++	 */
++	if (kt_count == 0) {
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint16_t);
+@@ -1904,6 +1915,10 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_VAR);
+ 	assert(kt_count < UINT32_MAX);
++	/* The same for the variable-size views: none was kept. */
++	if (kt_count == 0) {
++		return;
++	}
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint32_t);
+
+diff --git a/osfmk/kern/kalloc.h b/osfmk/kern/kalloc.h
+--- a/osfmk/kern/kalloc.h
++++ b/osfmk/kern/kalloc.h
+@@ -743,6 +743,25 @@
+ 	    KT_SUMMARY_GRANULE_TO_IDX(KT_GRANULE_DUAL) |     \
+ 	    KT_SUMMARY_GRANULE_TO_IDX(KT_GRANULE_PAC))
+ 
++/*
++ * The XNU signature type system is an Apple clang extension: upstream clang
++ * has no __builtin_xnu_type_* functions. Fall back to a summary of data
++ * granules only, which keeps the in-tree static asserts that require a
++ * data-only type satisfied; signatures come out empty and pointer
++ * compatibility always passes, so the type-metadata fast paths (and their
++ * runtime checks) are gone, but the kernel builds and kalloc_type() still
++ * allocates.
++ */
++#if !__has_builtin(__builtin_xnu_type_summary)
++#define __builtin_xnu_type_summary(type) KT_SUMMARY_MASK_DATA
++#endif
++#if !__has_builtin(__builtin_xnu_type_signature)
++#define __builtin_xnu_type_signature(type) ""
++#endif
++#if !__has_builtin(__builtin_xnu_types_compatible)
++#define __builtin_xnu_types_compatible(t1, t2) (1)
++#endif
++
+ /*!
+  * @macro KT_SUMMARY_GRANULES
+  *
+
+diff --git a/osfmk/vm/vm_link_compat.c b/osfmk/vm/vm_link_compat.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/vm/vm_link_compat.c
+@@ -0,0 +1,41 @@
++/*
++ * Link shims for a non-Apple toolchain.
++ *
++ * bsd/pgo/profile_runtime.c calls the InstrProfiling helpers that Apple's
++ * compiler-rt supplies at link time; there is no such runtime here, so report
++ * an empty profile. __cxa_atexit is only referenced by the C++ static
++ * destructor registration in libkern's bootstrap object; the kernel builds
++ * with -fno-c++-static-destructors and never runs it.
++ */
++#include <stdint.h>
++
++uint64_t
++__llvm_profile_get_size_for_buffer_internal(
++	const char *DataBegin, const char *DataEnd,
++	const char *CountersBegin, const char *CountersEnd,
++	const char *NamesBegin, const char *NamesEnd)
++{
++	(void)DataBegin; (void)DataEnd;
++	(void)CountersBegin; (void)CountersEnd;
++	(void)NamesBegin; (void)NamesEnd;
++	return 0;
++}
++
++int
++__llvm_profile_write_buffer_internal(
++	char *Buffer, const char *DataBegin, const char *DataEnd,
++	const char *CountersBegin, const char *CountersEnd,
++	const char *NamesBegin, const char *NamesEnd)
++{
++	(void)Buffer; (void)DataBegin; (void)DataEnd;
++	(void)CountersBegin; (void)CountersEnd;
++	(void)NamesBegin; (void)NamesEnd;
++	return 0;
++}
++
++int
++__cxa_atexit(void (*func)(void *), void *arg, void *dso)
++{
++	(void)func; (void)arg; (void)dso;
++	return 0;
++}
+
+diff --git a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -290,6 +290,7 @@
+ osfmk/vm/vm_shared_region_pager.c	standard
+ osfmk/vm/vm_dyld_pager.c		standard
+ osfmk/vm/vm_swapfile_pager.c		standard
++osfmk/vm/vm_link_compat.c		standard
+ osfmk/vm/vm_tests.c			optional config_xnupost
+ osfmk/vm/vm_user.c			standard
+ osfmk/vm/vm32_user.c			standard
+

@@ -1,0 +1,60 @@
+xnu 0285: the refresh CoreAnimation paces its display link on
+
+The framebuffer published its mode list (TimingElements, 16.16 fixed point) and
+nothing else, so the window server's display link had no interval to be paced
+against. IOMFBDisplayRefresh is the property CoreAnimation reads: its minimum,
+maximum and step are 32.32 fixed point (seconds times 2^32), and only
+displayRefreshStepMachTime is in Mach absolute ticks. HakiOS measured the wrong
+unit on its own port: with ticks in all four fields CoreAnimation took the panel
+for a 26844 Hz one and paced every frame against that.
+
+The rate is MONDRIAN_FB_REFRESH_HZ, the same 60 the timing elements and the
+vsync timer already use, so the three descriptions of the display cannot drift
+apart.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -253,6 +253,42 @@
+ 	OSSafeReleaseNULL(color);
+ }
+ 
++/*
++ * The refresh CoreAnimation runs its display link on.
++ *
++ * IOMFBDisplayRefresh carries the interval three times and the step once:
++ * displayMinRefreshInterval, displayMaxRefreshInterval and displayRefreshStep
++ * are 32.32 fixed point (seconds times 2^32), and only
++ * displayRefreshStepMachTime is in Mach absolute ticks. HakiOS measured what
++ * the wrong unit does: with ticks in all four fields CoreAnimation took the
++ * panel for a 26844 Hz one and paced every frame against that (0dedaec6).
++ * The timing elements above say the same rate in 16.16, which is what the
++ * mode list wants; this is the property the window server's display link
++ * reads.
++ */
++static void
++mondrian_publish_refresh(IOService *fb, uint32_t hz)
++{
++	OSDictionary *refresh;
++	uint64_t interval, ticks = 0;
++
++	if (hz == 0) {
++		return;
++	}
++	refresh = OSDictionary::withCapacity(4);
++	if (refresh == NULL) {
++		return;
++	}
++	interval = (1ULL << 32) / hz;
++	nanoseconds_to_absolutetime(1000000000ULL / hz, &ticks);
++	mondrian_set_number(refresh, "displayMinRefreshInterval", interval);
++	mondrian_set_number(refresh, "displayMaxRefreshInterval", interval);
++	mondrian_set_number(refresh, "displayRefreshStep", interval);
++	mondrian_set_number(refresh, "displayRefreshStepMachTime", ticks);
++	fb->setProperty("IOMFBDisplayRefresh", refresh);
++	refresh->release();
++}
++
+ class IOMobileFramebufferUserClient;
+ 
+ /* Four pixels of the canvas, stored as one 16-byte write. */
