@@ -44,6 +44,7 @@ class Cpu:
     cluster: int       # cluster id, for the device tree
     freq: int          # clock-frequency, for the device tree
     l2: int            # l2-cache-id, for the device tree
+    capacity: int = 0  # capacity-dmips-mhz, the live FDT's own measure of speed
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,14 @@ class Board:
     # /reserved-memory (the ones marked no-map). The kernel must not
     # allocate it, so the tree says the memory is what is left.
     reserved: tuple = ()
+    # MPIDR Aff1 of the core the firmware gives the kernel. The device tree
+    # lists it first, so `state = running` names the core that is really
+    # running and `cpus=N` always includes it.
+    boot_core: int = 0
+    # MPIDR Aff1 of the core the firmware (and the shim) runs on. When it is
+    # not the boot core, the shim parks it and the device tree leaves it out:
+    # the kernel never starts a core it does not list.
+    fw_core: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -211,26 +220,19 @@ MONDRIAN = Board(
     #   first bank's firmware islands and the gap between the banks were both
     #   inside the old 1.12 GiB window.
     #
-    # 0xaa000000+0x36000000 (864 MiB): the base is 32 MiB aligned, so the
-    # early block mapping needs no ragged edge, and it clears the shim (ABL
-    # loads it at 0xa8000000; the build appends the LZ4 payload at _end,
-    # which today ends at 0xa8757a29). The end is the first carve-out above
-    # the panel (qheebsp_reserved_region at 0xe0000000), as before.
+    # 0x840000000+0x240000000 (9 GiB): the largest contiguous bank the live
+    # tree describes -- its 0x840000000+0xc0000000 (3 GiB) and
+    # 0x900000000+0x180000000 (6 GiB) regions are adjacent, with no carve-out
+    # inside. The 12 GiB of the phone are six regions: the low 1.66 GiB hold
+    # the firmware islands and the splash, the 885 MiB at 0x800000000 sit
+    # behind a 139 MiB hole, and 30 MiB are loose at 0x837b00000. XNU takes
+    # one contiguous window, so this is the one that buys iOS its memory.
     #
-    # These two numbers are not only the payload header: mkadt.py writes them
-    # into /chosen as dram-base/dram-size, and the shim passes the same
-    # window in boot_args. They have to agree. The 889 MiB attempt had the
-    # ADT say 0xa7400000/0x38b00000 while the shim said
-    # 0xa8758000/0x378a8000, and the kernel never reached early mark 21.
-    # A payload that grows past the base makes the shim raise it again and
-    # breaks that agreement: bump both numbers together, and the shim prints
-    # `WINDOW RAISED` when it has to.
-    #
-    # Keep the size at or above 0x30000000: the bootstrap VA window scales
-    # with the number of 256 MiB segments (two plus ten per segment,
-    # arm_vm_init.c) and a smaller window leaves the early page tables short.
-    phys_base=0xaa000000,
-    mem_size=0x36000000,
+    # The splash framebuffer (0xb8000000) is outside this window. The early
+    # console paints it through the explicit kernel VA alias that
+    # arm_vm_init installs for it, not through VA=PA (0295).
+    phys_base=0x840000000,
+    mem_size=0x240000000,
     # Pinned: the physmap slide comes from this seed, and with a random one
     # the boot is a coin flip (one run in three dies in pmap_map_bd). This
     # one is known to work with the window above (checked on the host).
@@ -293,10 +295,18 @@ MONDRIAN = Board(
     tt_l2_size=0x2000000,
     cpus=tuple(
         Cpu(aff1=i, cluster=0 if i < 4 else (1 if i < 7 else 2),
-            freq=3000000000 if i == 0 else (2500000000 if i < 4 else 1800000000),
-            l2=i)
+            # The EPSS top row each cluster's domain reports (the phone
+            # measured 1804/2496/2995 MHz), and the live device tree's own
+            # capacity-dmips-mhz: 1024 for the four A510s, 2253 for the three
+            # A710s, 2386 for the X2. The kernel sorts the clusters by the
+            # capacity and de-prioritises the slow ones (0284).
+            freq=1804000000 if i < 4 else (2496000000 if i < 7 else 2995000000),
+            l2=0 if i < 4 else i,
+            capacity=1024 if i < 4 else (2253 if i < 7 else 2386))
         for i in range(8)
     ),
+    boot_core=7,                 # the X2: the firmware's core 0 is an A510
+    fw_core=0,                   # where ABL (and the shim) run on this board
     ecid=0x4d4f4e445249414e,     # 'MONDRIAN', synthetic
     touch='goodix-spi',          # Goodix over QUPv3 SE4 SPI, not I2C
     keys='pm8008',               # PM8008 (PMR735A + PM8350B), not the PM6150

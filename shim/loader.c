@@ -230,6 +230,123 @@ blob_ok(const uint8_t *p)
 	       blob_u32(p + 4) == 1;
 }
 
+#if BOARD_BOOT_CORE
+/*
+ * The kernel on another core (BOARD_BOOT_CORE).
+ *
+ * The firmware runs on core 0, one of this SoC's four A510s, and the core
+ * the kernel's boot processor runs on is the one the scheduler keeps for
+ * what it cannot place better (and the one its real-time threads go to
+ * first). PSCI starts the kernel on the X2 instead, and this core stays
+ * here, parked: the kernel's device tree does not list it (tools/mkadt.py),
+ * so the kernel never tries to start it, and the machine runs on the seven
+ * cores that are left.
+ *
+ * Parking, not PSCI CPU_OFF: measured 2026-11-08, CPU_OFF from EL2 does not
+ * take this core down on this TZ. It returns, and the core is left running
+ * at EL2, where the only vectors are the shim's: the next interrupt goes
+ * somewhere no one planned, and the kernel later sees that core inside its
+ * own scheduler with no state of ours behind it. A parked core with DAIF
+ * masked takes nothing and touches nothing.
+ *
+ * The core that PSCI switches on has the reset state of one: no CPACR (the
+ * first NEON instruction traps), no vectors, no translation tables. It gets
+ * the ones the running core has, read back from the system registers, which
+ * is exactly the state the kernel is about to start in.
+ */
+#define PSCI_CPU_ON	0xC4000003UL
+
+static struct {
+	uint64_t stage;		/* 1: that core is entering the kernel */
+	uint64_t vbar, cpacr, mair, tcr, ttbr0, sctlr;
+	uint64_t entry, args;
+	uint64_t target;	/* MPIDR, for the photograph */
+} handoff __attribute__((aligned(64)));
+
+extern void kernel_handoff_entry(void);
+
+#define READ_SYSREG(name) ({ uint64_t _v; __asm__ volatile("mrs %0, " name : "=r"(_v)); _v; })
+
+static long
+psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = fn;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+	    "x14", "x15", "x16", "x17", "cc", "memory");
+	return (long)x0;
+}
+
+/* Everything below runs with the image cached (write-back), so the core that
+ * is switched on next must not find its copy of this before the cache line
+ * reaches the point of coherency. */
+static void
+dc_clean(const void *p, uint64_t len)
+{
+	uint64_t line = 4UL << ((READ_SYSREG("ctr_el0") >> 16) & 0xf);
+	uintptr_t a = (uintptr_t)p;
+
+	for (uintptr_t x = a & ~(line - 1); x < a + len; x += line)
+		__asm__ volatile("dc cvac, %0" : : "r"(x) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* x0 = boot_args (physical), as core 0 would have passed them.
+ *  1: that core took the kernel (this one is parked; does not return)
+ *  0: PSCI refused to start it, nothing was started
+ * -1: it started but never reached the entry point */
+static int
+loader_boot_on_core(uintptr_t entry_pa, uintptr_t ba_pa)
+{
+	uint64_t target = (uint64_t)BOARD_BOOT_CORE << 8;
+	uint64_t start, hz;
+	long rc;
+
+	handoff.stage = 0;
+	handoff.vbar = READ_SYSREG("vbar_el1");
+	handoff.cpacr = READ_SYSREG("cpacr_el1");
+	handoff.mair = READ_SYSREG("mair_el1");
+	handoff.tcr = READ_SYSREG("tcr_el1");
+	handoff.ttbr0 = READ_SYSREG("ttbr0_el1");
+	handoff.sctlr = READ_SYSREG("sctlr_el1");
+	handoff.entry = entry_pa;
+	handoff.args = ba_pa;
+	handoff.target = target;
+	dc_clean(&handoff, sizeof(handoff));
+
+	con_hex64("BOOTCPU", target);
+	rc = psci_call(PSCI_CPU_ON, target, (uintptr_t)&kernel_handoff_entry,
+	    (uintptr_t)&handoff);
+	con_hex64("CPUON", (uint64_t)rc);
+	if (rc != 0)
+		return 0;
+
+	/* Three seconds: PSCI answers before the core is even out of reset and
+	 * the kernel's own entry is the next instruction after the stub. */
+	hz = READ_SYSREG("cntfrq_el0");
+	start = READ_SYSREG("cntvct_el0");
+	while (!handoff.stage && READ_SYSREG("cntvct_el0") - start < 3 * hz)
+		__asm__ volatile("isb" ::: "memory");
+	con_hex64("STAGE", handoff.stage);
+	if (!handoff.stage)
+		return -1;
+
+	/*
+	 * The kernel owns the machine, and this core is not part of it: the
+	 * device tree does not list it. Park here with everything masked.
+	 * Not PSCI CPU_OFF: on this TZ it returns and leaves the core running
+	 * at EL2 with the shim's vectors (see the comment above).
+	 */
+	__asm__ volatile("msr daifset, #0xf" ::: "memory");
+	for (;;)
+		__asm__ volatile("wfi");
+}
+#endif /* BOARD_BOOT_CORE */
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -357,8 +474,44 @@ const char *loader_boot(uintptr_t dtb)
 	ba->Video.v_depth = 32;
 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
-	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
-		ba->CommandLine[i] = p->cmdline[i];
+	/*
+	 * The payload carries this board's command line, and it has to reach
+	 * XNU whole: boot_args.CommandLine holds 1024 bytes and PE_parse_boot_argn
+	 * keeps the first occurrence of every key. The bootloader's
+	 * /chosen/bootargs is only sometimes useful -- booted with `fastboot
+	 * boot`, ABL fills it with its own Android line (console=ttyMSM0...,
+	 * androidboot.*), which XNU does not parse and which is long enough to
+	 * push ours out of the buffer. Give the payload its room first and let
+	 * the bootloader's line take only what is left in front of it; a short
+	 * `fastboot boot --cmdline "..."` still comes first and overrides.
+	 */
+	{
+		uintptr_t bdata = 0;
+		uint32_t blen = 0;
+		uint32_t used = 0;
+		uint32_t plen = 0;
+		uint32_t room;
+
+		while (p->cmdline[plen] != 0 && plen < BOOT_LINE_LENGTH - 1) {
+			plen++;
+		}
+		room = plen < BOOT_LINE_LENGTH - 1 ? BOOT_LINE_LENGTH - 2 - plen : 0;
+		if (fdt_node_prop(dtb, "/chosen", "bootargs", &bdata, &blen) && blen > 0) {
+			const char *s = (const char *)bdata;
+
+			for (uint32_t i = 0; i < blen && s[i] != 0 && used < room; i++) {
+				ba->CommandLine[used++] = s[i];
+			}
+			if (used > 0 && ba->CommandLine[used - 1] != ' ') {
+				ba->CommandLine[used++] = ' ';
+			}
+		}
+		for (uint32_t i = 0; i < plen; i++) {
+			ba->CommandLine[used++] = p->cmdline[i];
+		}
+		ba->CommandLine[used] = 0;
+		con_str("CMDLINE", (const char *)ba->CommandLine);
+	}
 	ba->memSizeActual = mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
@@ -385,6 +538,27 @@ const char *loader_boot(uintptr_t dtb)
 	}
 #endif
 	con_str("XNU", "jumping (fbcon clears screen)");
+
+#if BOARD_BOOT_CORE
+	/*
+	 * Hand it to the core the board's kernel has to run on; this one goes
+	 * off. A refused start (PSCI) is a stop, not a fallback: the device tree
+	 * does not list this core, so booting the kernel here would leave it
+	 * without its own CPU node. A core that started and never arrived is not
+	 * entered twice either: two kernels on one phone is worse than a boot
+	 * that stops here.
+	 */
+	{
+		int handoff_rc = loader_boot_on_core(entry_pa, ba_pa);
+
+		if (handoff_rc < 0) {
+			return "the boot core started but never entered the kernel";
+		}
+		if (handoff_rc == 0) {
+			return "PSCI refused to start the boot core";
+		}
+	}
+#endif
 
 	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");

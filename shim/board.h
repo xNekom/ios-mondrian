@@ -30,29 +30,21 @@
 #define PTIMER_INTID		18
 #define SGI_INTID		1
 
-/* The window of RAM the kernel gets. It holds the splash framebuffer
- * (0xb8000000) and starts above the firmware's own memory at the bottom of
- * the bank (the hypervisor is at 0x80000000; the kernel image written over
- * it resets the phone).
+/* The window of RAM the kernel gets: the 9 GiB contiguous bank of the live
+ * device tree at 0x840000000 (its 0x840000000+0xc0000000 region plus the
+ * 0x900000000+0x180000000 one that follows it), with no firmware carve-out
+ * inside. The phone's 12 GiB are six regions; the others are the low 1.66 GiB
+ * that hold the firmware islands and the splash, 885 MiB behind a 139 MiB
+ * hole, and 30 MiB loose, so they cannot be added to a single window.
  *
- * The base here is the floor, not necessarily the base the kernel gets: ABL
- * loads this image at 0xa8000000, inside the free run below the panel, and the
- * loader wipes the window before it places anything in it. The shim therefore
- * starts the window at the end of this image (and of the device tree), which
- * costs about 8 MiB of the 140 MiB this floor wins over the old 0xb0000000.
+ * The splash framebuffer (0xb8000000) is outside this window: the kernel's
+ * early console paints it through the alias arm_vm_init installs for it.
  *
- * The end is 0xe0000000, the first firmware carve-out above the panel
- * (qheebsp_reserved_region). The live device tree says the RAM runs are
- * 0x80000000+0x6a000000 and 0xf4600000+0xba00000 and marks the islands below
- * 0xea000000 no-map, so a window that reaches past 0xe0000000 hands the VM
- * pages that the AP cannot touch: the first access is a synchronous external
- * abort, minutes into the boot. The device tree confirms the window is inside
- * a memory region; the shim prints both so a mismatch is visible on the
- * screen.
- *
- * The wipe below only touches what the device tree says is memory. */
-#define BOARD_MEM_BASE		0xaa000000UL
-#define BOARD_MEM_SIZE		0x36000000UL
+ * The image ABL loads (0xa8000000) is below the window, so the loader never
+ * has to raise the base here; the wipe only touches what the device tree says
+ * is memory. */
+#define BOARD_MEM_BASE		0x840000000UL
+#define BOARD_MEM_SIZE		0x240000000UL
 
 /* Internal UFS host (ufshc@1d84000). Same window as sweet, but this is a
  * UFS 3.1 controller, not the UFSHCI 2.1 sweet drives. */
@@ -71,6 +63,20 @@
 #define PAYLOAD_MAGIC		"MONDRIAN"
 
 #define NR_CPUS			8
+
+/* MPIDR Aff1 of the core the kernel is started on. The firmware runs on
+ * core 0, one of the four A510s (its MPIDR Aff1 is 0), and the loader hands
+ * the kernel to the X2 with PSCI CPU_ON (shim/loader.c).
+ *
+ * The firmware's core is NOT switched off: measured 2026-11-08, PSCI CPU_OFF
+ * from EL2 returns on this TZ and leaves the core running at EL2, where the
+ * next interrupt goes to the shim's vectors and the kernel later finds that
+ * core inside its own scheduler with no state behind it (or never at all, and
+ * the boot panics with "cpu=4 startup timeout"). The shim parks it instead,
+ * and the device tree leaves it out (tools/mkadt.py): the kernel runs on the
+ * seven cores that are left and never tries to start a core it does not know.
+ * Putting that core back later needs a mailbox the kernel can kick, not PSCI. */
+#define BOARD_BOOT_CORE		7
 
 /* The framebuffer of the board is a documented value of the platform, but
  * the device tree is always preferred when it names it. */
@@ -138,6 +144,10 @@ static const uint64_t board_reserved[BOARD_RESERVED_N][2] = {
 #define PAYLOAD_MAGIC		"SWEETXNU"
 
 #define NR_CPUS			8
+
+/* sweet keeps starting the kernel on the core the firmware runs it on: its
+ * port does not move it, and its device tree lists the cores as they are. */
+#define BOARD_BOOT_CORE		0
 
 /* The framebuffer of sweet was measured on the device (the ABL leaves it
  * at the cont_splash_region), so the constant may be used if the device

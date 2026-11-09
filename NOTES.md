@@ -56,23 +56,18 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   needs `TimingElements`/`ColorElements` and an `IOAcceleratorES` service
   (`0114`); the dylib forces activation and skips Setup, and GPU writes memory
   once `CP_SET_SECURE_MODE(0)` retires.
-- **Memory, the real blocker.** The window is 864 MiB
-  (`0xaa000000+0x36000000`) and iOS 16 wants more. Measured with `0296`:
-  free 14-26, speculative 4-10, wire 406-454, active 78-95, inactive 68-89
-  MiB — 616 MiB on the queues — and the compressor another 221-251 MiB;
-  purgeable/throttled/cleaned are empty, so nothing is stuck: the window is
-  full. `wire` is ~200 MiB of GPU surfaces plus the kernel, there is no swap
-  volume, and `VM_BASE` omitted `jetsam` (`0296` enables it; launchd's 50 MB
-  watermark had come back EINVAL). The high bank is the fix.
-- **A window above 4 GiB boots.** In QEMU the kernel reaches the panel driver
-  with its RAM at `0x100000000`, as far as the low window gets
-  (`docs/QEMU_TESTING.md`). The one casualty was `phystokv(0xb8000000)`: the
-  console fallback panics when the splash is outside the window, and is now
-  conditional (`0295`).
+- **Memory: the 9 GiB window.** iOS 16 boots to SpringBoard at
+  `0x840000000+0x240000000`: 208 processes, 5.2 GiB free (the 864 MiB window
+  had the page queues full). The phone's other 3 GiB are fragmented, so the
+  kernel keeps one contiguous window.
+- **The command line decides whether it boots.** A plain `fastboot boot` used
+  to reach BSD init without mounting the root: ABL's `/chosen/bootargs` filled
+  the 1024-byte `CommandLine` and pushed `rd=ufsroot0` out (see the traps).
 
 Current blockers, in order:
 
-1. **Memory.** The high bank is the fix; the work list is in `docs/MONDIAN_PORT.md`.
+1. **The GPU.** The compositor still shows glitches; the a7xx path and the
+   CP secure-mode handoff are in `docs/MONDIAN_GPU.md`.
 2. **Idle sleep and gestures.** The idle timer sleeps the display
    (`mondrianunlock=1` re-requests the unlock); the home swipe starts at the edge.
 3. **Buttons.** Power/volume-down on PMK8350 PON, volume-up on PM8350 GPIO6 not
@@ -107,15 +102,14 @@ volatile; `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
 and refuses `boot_a` unless `BOOT_A=1`. `tools/qemu-ios.py` boots the same
 payload; `--kernel` only feeds its decoder (`docs/QEMU_TESTING.md`).
 
-**Boot arguments have a hard end.** `BOOT_LINE_LENGTH` (1024 since `0267`)
-bounds the shim's payload header, `boot_args.CommandLine` and `kern.bootargs`,
-and an argument past it does not exist, silently (measured, ring225:
-`mondrianiconset=1` sat a few bytes past 608 and its pass never ran).
-
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
 log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
 CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
+With the kernel running, `usb=2` and `tools/usb-ring.py dump` read the whole
+ring over USB, and `reboot` returns to the bootloader. On Windows the phone
+reaches WSL through `usbipd attach --wsl --busid <id>` and `cdc_ether`; the
+kernel-side gadget is already there, only the host driver was missing.
 A previous boot is read by running the real kernel, then a dump kernel with
 `mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
 `mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
@@ -148,36 +142,42 @@ This device has **no `init_boot`**.
 
 ## Traps already paid for
 
-**The window of RAM.** `phys_base = 0xaa000000`, `mem_size = 0x36000000`
-(ends at `0xe0000000`, 864 MiB). Five rules, each paid for with a reset:
+**The window of RAM.** `phys_base = 0x840000000`, `mem_size = 0x240000000`
+(the clean 9 GiB run: the tree's 3 GiB and 6 GiB regions are adjacent, with no
+reservation inside). Rules that still cost resets:
 
-- it must contain the splash framebuffer (the early console maps `VA=PA`
-  inside the window) and start above firmware memory: the kernel goes to the
-  window's start, and overwriting `0x80000000+0x600000` resets the phone;
-- it must start above the shim, **including the appended LZ4 payload**, because
-  the loader wipes the window before it unpacks. `_end` is a runtime address,
-  not an offset (symbols are PC-relative), and the magic `LZ4P` is `0x50345a4c`
-  little-endian; reading it as `0x505a344c` left the base at `_end`, and the
-  wipe kept the header and ate the frame;
+- it must start above firmware memory and above the shim **including the
+  appended LZ4 payload**, because the loader wipes the window before it
+  unpacks. `_end` is a runtime address, not an offset (symbols are
+  PC-relative), and the magic `LZ4P` is `0x50345a4c` little-endian; reading it
+  as `0x505a344c` left the base at `_end`, and the wipe kept the header and
+  ate the frame;
 - the base must be 32 MiB aligned, and `boards.py`/`shim/board.h` must be the
   window the shim passes: `mkadt.py` writes the pair into `/chosen` as
   `dram-base`/`dram-size`, and the shim puts it in `boot_args`. At
   `0xa8758000` (889 MiB, ADT at `0xa7400000/0x38b00000`) the loader jumped and
   the kernel died in `start.s` before its first `MONDRIAN EARLY` mark;
 - it must end in memory that exists (XNU takes its first heap pages from the
-  *end*) and not **contain** a carve-out or hole: the VM hands out pages across
-  the window, and an access to one taken from `0xe0000000`+ aborts
-  (`Kernel data abort`, `far` inside the physmap of `qheebsp_reserved_region`).
+  *end*) and not **contain** a carve-out or hole: the VM hands out pages
+  across the window, and a page on a firmware island aborts (`Kernel data
+  abort`, `far` inside the physmap).
 
-The bootloader's device tree is *not* a floor: keeping it (ends `0xb72ac000`)
-cost 236 MiB and put the base 14 MiB under the splash, where the 16 MB kernel
-landed on the framebuffer. The early page tables run out below 768 MiB.
+The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S`
+no longer maps it `VA=PA` and `arm_vm_init` installs the explicit kernel VA
+alias for the early console (`0295`).
 
-The **physmap slide** comes
-from `/chosen/random-seed`, so a random seed makes the boot a coin flip
-(about one host boot in three dies); `boards.py` pins the seed and `ADT_SEED`
-overrides it. Do not use the biggest free hole (`0xbab00000+597 MB`): the
-framebuffer falls outside it.
+The **physmap slide** comes from `/chosen/random-seed`, so a random seed
+makes the boot a coin flip (about one host boot in three dies); `boards.py`
+pins the seed and `ADT_SEED` overrides it.
+
+**The kernel's command line is the payload's, not ABL's.** With `fastboot
+boot`, ABL fills `/chosen/bootargs` with its own Android line (~1 KiB), and
+`BOOT_LINE_LENGTH` is 1024: a shim that copies it first loses `rd=ufsroot0`
+and the rest of the payload (the same silent cut that hid
+`mondrianiconset=1` past 608 in ring225), so the kernel reaches BSD init and
+waits for a root that never appears. The shim now reserves the payload's room
+first and gives ABL's line what is left; `fastboot boot --cmdline "..."` still
+overrides.
 
 **Page size: 16 KiB, and the three pieces must agree.** `ID_AA64MMFR0_EL1`
 reports `TGran16=1` (measured 2026-10-23; the menu prints it as `tg16`), so

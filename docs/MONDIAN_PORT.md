@@ -138,27 +138,27 @@ Two rules cover the other failure mode, writing to the wrong place:
 
 ## The window of RAM
 
-The kernel gets `phys_base = 0xaa000000`, `mem_size = 0x36000000`: 864 MiB of
-real memory that ends at `0xe0000000`, above the splash and short of the first
-hole. The five rules behind those numbers and the measured memory map are in
-`NOTES.md` ("The window of RAM" and "Measured hardware facts"). The physmap
-slide comes from `/chosen/random-seed`, so the seed is pinned in
-`tools/boards.py`; the shim checks the window against the live device tree.
+The kernel gets `phys_base = 0x840000000`, `mem_size = 0x240000000`: the
+clean 9 GiB run of the live tree (its 3 GiB and 6 GiB `/memory` regions are
+adjacent, with no reservation inside). The phone's 12 GiB are six regions
+whose sum is 11.8 GiB; the rest is the low 1.66 GiB with the firmware
+carve-outs, 885 MiB behind a 139 MiB hole and 30 MiB loose, so one contiguous
+window cannot hold them all. The rules behind the window and the measured map
+are in `NOTES.md` ("The window of RAM" and "Measured hardware facts").
 
-**864 MiB is not enough for this userland.** Measured 2026-11-09: the page
-queues hold 616 MiB (free 14-26, speculative 4-10, wire 406-454, active 78-95,
-inactive 68-89) and the compressor holds 221-251 MiB more; purgeable,
-throttled and cleaned are empty, so nothing is stuck and the window is full.
-The wire is ~200 MiB of GPU surfaces; there is no swap volume to drain, and
-`0296` enables `CONFIG_JETSAM`, which `VM_BASE` had left out (opt-in works).
+The splash framebuffer is outside this window; the early console paints it
+through the explicit kernel VA alias `arm_vm_init` installs (`0295`).
 
-The device tree has a clean **9 GiB run** at `0x840000000+0x240000000` (two
-adjacent `/memory` regions, no reservation inside). The next step is the
-window in `tools/boards.py` and `shim/board.h`: `BOARD_MEM_BASE` already wins
-over the splash bank, and `start.s` maps the framebuffer block by hand, so the
-console survives. QEMU reaches vsync with 9 GiB exactly as with 864 MiB; what
-is left is the phone boot, blind because the shim console is on the panel, and
-the 9 GiB the shim wipes before the jump.
+**Measured 2026-11-09**: iOS 16 boots to SpringBoard on the 9 GiB window, 208
+processes and 5.2 GiB free. The 864 MiB window had the page queues full (616
+MiB) and the compressor at another 221-251 MiB. The high-window boot is
+slower: the shim wipes 9 GiB before the jump and iOS runs `fsck`/`mount_hfs`
+on the root after an unclean reset.
+
+**A plain `fastboot boot` boots it.** ABL's `/chosen/bootargs` (its Android
+line) used to fill the 1024-byte command line and push `rd=ufsroot0` out; the
+shim now reserves the payload's room first. `fastboot boot --cmdline "..."`
+still overrides: XNU keeps the first occurrence of each key.
 
 ## Page size
 
