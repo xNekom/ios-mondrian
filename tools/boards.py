@@ -317,18 +317,21 @@ MONDRIAN = Board(
     # The boot arguments are the ones sweet uses, with the framebuffer
     # arguments renamed for this board. serial=0 keeps the boot log off the
     # 115200-baud UART (it still goes to the ring, mondrianlog defaults on);
-    # all eight cores and the top EPSS row are the normal boot now.
+    # all eight cores, the EPSS governor and the USB gadget are the normal boot.
+    # No gpuperf: the GMU's default vote is index 2 (285 MHz), which the frame
+    # rate work measured is not the limit; index 13 (900 MHz) was a bring-up
+    # experiment and only keeps the GPU rail at the top OPP.
     # glenv=FD_MESA_DEBUG=nobin: freedreno's GL driver emits the a6xx
     # 7-dword CP_SET_BIN_DATA5 for a7xx too, and the a730 SQE parks on it
     # (docs/MONDIAN_GPU.md). The compositor renders off-screen, so binning
     # buys nothing.
-    cmdline=('debug=0xc serial=0 cpus=8 cpufreq=1 keepsyms=1 -noprogress '
+    cmdline=('debug=0xc serial=0 cpus=8 cpufreq=2 usb=2 keepsyms=1 -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
              'mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436 '
              'mondrian_ui_hook=15 glenv=FD_MESA_DEBUG=nobin '
-             'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 gpuperf=13 '
+             'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              'mondrianunlock=1'),
 )
 

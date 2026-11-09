@@ -10,9 +10,9 @@ Pro, SM8475) is the port being done here.
   in sync with the code.
 - Commit completed changes. Kernel builds go through GitHub Actions (`gh
   workflow run xnu.yml -f board=mondrian`); `tools/apply-series.py` and
-  `tools/check-patches.sh` validate a series locally in seconds, and the CI
-  silently skips a patch that does not apply. A local single-file cross-compile
-  is cheaper than a CI run.
+  `tools/check-patches.sh` validate a series locally in seconds, and a patch
+  that does not apply fails the CI run. A local single-file cross-compile is
+  cheaper than a CI run.
 - The board table lives in `tools/boards.py`; the shim has its own copy in
   `shim/board.h`. Change both together, and prefer reading the live device
   tree (the shim prints it) over guessing a number.
@@ -46,6 +46,13 @@ Pro, SM8475) is the port being done here.
   framebuffer and the UFS host from the device tree, and `mkadt.py` /
   `mkpayload.py` refuse a board whose values are still provisional
   (`--allow-provisional` is the deliberate way past that).
+- **A mondrian image must carry `usb=2`.** Without it `mondrian_usb_probe`
+  stops at the probe (`usb=1`): the phone boots to SpringBoard with no USB at
+  all — no console ring, no control channel — and the only way back to
+  fastboot is the hardware buttons. The board's command line in
+  `tools/boards.py` carries it and `mkpayload.py` refuses a mondrian payload
+  without it (`--allow-silent-boot` is the way past for a deliberate test);
+  never assemble that command line by hand.
 - Device bring-up uses temporary `fastboot boot` images. Preserve the Android
   installation and the partition backups. The iOS root goes into the existing
   `userdata` partition (no GPT changes). Keep bootloaders, recovery, modem,

@@ -206,6 +206,8 @@ if __name__ == '__main__':
     ap.add_argument('--facts', help='shim dtb dump to take the memory map from')
     ap.add_argument('--allow-provisional', action='store_true',
                     help='build even if the board still has guessed values')
+    ap.add_argument('--allow-silent-boot', action='store_true',
+                    help='mondrian: build without usb=2 (no ring, no control channel)')
     a = ap.parse_args()
     board = boards.get_board(a.board)
     if a.facts:
@@ -213,6 +215,14 @@ if __name__ == '__main__':
     if not a.allow_provisional:
         boards.require_measured(board, 'mkpayload.py')
     cmdline = a.cmdline if a.cmdline is not None else board.cmdline
+    # The only channel out of this phone is its USB gadget, and the gadget is
+    # gated on usb=2: with usb=1 `mondrian_usb_probe` runs the probe and no
+    # device ever enumerates, so the boot is silent (no ring, no control
+    # channel) and the buttons are the only way back to fastboot.
+    if a.board == 'mondrian' and 'usb=2' not in cmdline.split() and not a.allow_silent_boot:
+        sys.exit('mkpayload: a mondrian payload needs usb=2 in the command line; '
+                 'without it the boot has no USB at all (no ring, no control '
+                 'channel). Pass --allow-silent-boot for a deliberate test.')
     blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk, board)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():

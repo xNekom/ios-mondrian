@@ -39,11 +39,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   UFS probe, before `vfs_mountroot` (`0174`), so a failed mount leaves its
   error on disk.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
-  `usb=2` runs the gadget: an ECM Ethernet device at 192.168.7.2 with a control
-  channel on udp/5141. `tools/usb-ring.py` dumps the ring, photographs the
-  panel (`screen`), injects `tap`/`swipe`/`key`, prints the memory breakdown
-  (`mem`) and returns to the bootloader (`reboot`); `tools/ios-usbnet.sh` sets
-  the host up and streams udp/5140. No recovery dump and no buttons.
+  `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
+  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
+  `tap`/`swipe`/`key`, prints `mem`, returns to the bootloader (`reboot`);
+  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. No buttons.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
   containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
@@ -107,9 +106,10 @@ ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
 log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
 CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
 With the kernel running, `usb=2` and `tools/usb-ring.py dump` read the whole
-ring over USB, and `reboot` returns to the bootloader. On Windows the phone
-reaches WSL through `usbipd attach --wsl --busid <id>` and `cdc_ether`; the
-kernel-side gadget is already there, only the host driver was missing.
+ring over USB; `reboot` returns to the bootloader. On Windows the phone reaches
+WSL through `usbipd attach --wsl --busid <id>` and `cdc_ether`: the host driver
+was the missing half, and a detach/attach is a bus reset the gadget now
+survives (`0298`).
 A previous boot is read by running the real kernel, then a dump kernel with
 `mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
 `mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks

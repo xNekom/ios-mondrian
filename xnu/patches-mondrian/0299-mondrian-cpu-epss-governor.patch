@@ -1,0 +1,339 @@
+xnu 0299: the CPU rows follow load instead of sitting at the top
+
+cpufreq=1 pinned all three EPSS domains to their top row (1804/2496/2995 MHz)
+and nothing ever lowered them, so an idle phone still burned the top rail on
+every cluster. cpufreq=2 runs a governor: each domain's row follows the busy
+fraction of its cores, measured from the idle hook XNU already calls around
+WFI (processor_idle in ml_processor_info_t, installed by MondrianCPU) and
+sampled at 50 Hz. Load raises the row at once; decay is one row per tick, so a
+quiet phone reaches the bottom row in about two seconds. cpufreq=1 still means
+top and cpufreqrow=N pins row N for a one-boot experiment.
+
+The boot command line moves to cpufreq=2 (tools/boards.py).
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1913,9 +1913,9 @@
+ 		return;
+ 	}
+ 	{
+-		extern int mondrian_cpufreq_max(void);
+-
+-		(void)mondrian_cpufreq_max();
++		extern int mondrian_cpufreq_start(void);
++
++		(void)mondrian_cpufreq_start();
+ 	}
+ 	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
+ 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
+diff --git a/bsd/dev/mondrian_cpufreq.c b/bsd/dev/mondrian_cpufreq.c
+--- a/bsd/dev/mondrian_cpufreq.c
++++ b/bsd/dev/mondrian_cpufreq.c
+@@ -1,5 +1,5 @@
+ /*
+- * MONDRIAN: put the CPU clusters at their top EPSS row.
++ * MONDRIAN: the CPU clusters' EPSS rows.
+  *
+  * The bootloader leaves the cores at a modest row and expects the OS to ask
+  * for more. The SM8475 exposes qcom,cpufreq-hw-epss with three frequency
+@@ -7,15 +7,33 @@
+  * 4-byte rows at +0x100 and PERF_STATE at +0x320 (the same EPSS layout as
+  * HackiOS's hakios.cpufreq.c, whose base is 0x18591000 on the SM6375).
+  *
+- * With cpufreq=1, select the top row of every domain that has one of our
+- * cores. Nothing scales it back down: there is no XNU cpufreq driver yet.
++ * cpufreq=0 leaves the rows alone, cpufreq=1 pins every domain to its top row,
++ * and cpufreq=2 runs the governor. A row costs energy even when its cores are
++ * in WFI (the cluster sits at the top rail), so an idle SpringBoard must not
++ * keep three domains at 1804/2496/2995 MHz. cpufreqrow=N pins row N instead
++ * (0 is the slowest), which is the one-boot experiment.
++ *
++ * The governor runs every 50 ms on the boot CPU. Each domain's row follows the
++ * busy fraction of its cores, rounded to the nearest row: any new load raises
++ * it at once, and decay is one row per tick, so the phone drops to the bottom
++ * row about two seconds after it goes quiet. Busy time comes from the idle
++ * hook XNU already calls around WFI (processor_idle in ml_processor_info_t),
++ * which needs no scheduler accounting and no floating point.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern unsigned int ml_get_cpu_number_local(void);
++extern int hz;
++
++void mondrian_cpu_idle(cpu_id_t cpu, boolean_t enter, uint64_t *timeout);
++int mondrian_cpufreq_start(void);
+ 
+ #define MONDRIAN_EPSS_BASE		0x17d91000u
+ #define MONDRIAN_EPSS_DOMAIN_SIZE	0x1000u
+@@ -27,27 +45,183 @@
+ #define MONDRIAN_XO_KHZ			19200u
+ #define MONDRIAN_ALTERNATE_KHZ		300000u
+ 
++#define MONDRIAN_CPUFREQ_CPUS		8
++#define MONDRIAN_CPUFREQ_HZ		20	/* ticks a second */
++#define MONDRIAN_CPUFREQ_LOG_NS		1000000000ull
++
++typedef struct {
++	vm_offset_t base;
++	uint32_t rows;			/* usable LUT entries */
++	uint32_t row;			/* what PERF_STATE holds */
++	uint32_t khz[MONDRIAN_EPSS_ROWS];
++} mondrian_domain_t;
++
++static mondrian_domain_t md[MONDRIAN_EPSS_DOMAINS];
++static uint32_t md_governor;
++static uint64_t md_idle_enter[MONDRIAN_CPUFREQ_CPUS];
++static uint64_t md_idle_total[MONDRIAN_CPUFREQ_CPUS];
++static uint64_t md_idle_seen[MONDRIAN_CPUFREQ_CPUS];
++static uint64_t md_last;
++static uint64_t md_log_at[MONDRIAN_EPSS_DOMAINS];
++static uint32_t md_busy[MONDRIAN_EPSS_DOMAINS];	/* 0..256, smoothed */
++
++/* The idle hook: remember when each core enters and leaves WFI. */
++void
++mondrian_cpu_idle(cpu_id_t cpu __unused, boolean_t enter, uint64_t *timeout __unused)
++{
++	unsigned int id;
++	uint64_t now;
++
++	if (!md_governor) {
++		return;
++	}
++	id = ml_get_cpu_number_local();
++	if (id >= MONDRIAN_CPUFREQ_CPUS) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (enter) {
++		md_idle_enter[id] = now;
++	} else if (md_idle_enter[id] != 0) {
++		md_idle_total[id] += now - md_idle_enter[id];
++	}
++}
++
++static void
++md_apply(unsigned int d, uint32_t row, uint64_t now)
++{
++	uint64_t delta, ns;
++
++	if (row == md[d].row) {
++		return;
++	}
++	__builtin_arm_dsb(0xf);
++	*(volatile uint32_t *)(md[d].base + MONDRIAN_EPSS_PERF_STATE) = row;
++	__builtin_arm_dsb(0xf);
++	delta = now - md_log_at[d];
++	absolutetime_to_nanoseconds(delta, &ns);
++	if (ns >= MONDRIAN_CPUFREQ_LOG_NS) {
++		printf("MONDRIAN CPUFREQ: domain %u row %u -> %u (%u MHz)\n",
++		    d, md[d].row, row, md[d].khz[row] / 1000);
++		md_log_at[d] = now;
++	}
++	md[d].row = row;
++}
++
++static void
++md_tick(void)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint64_t now = mach_absolute_time();
++	uint64_t window = now - md_last;
++	unsigned int d;
++
++	if (topology == NULL || window == 0) {
++		return;
++	}
++	md_last = now;
++	for (d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++		uint64_t idle = 0, total;
++		uint32_t ncpu = 0, span, cur, target, busy;
++		unsigned int i;
++
++		if (md[d].base == 0 || md[d].rows < 2) {
++			continue;
++		}
++		for (i = 0; i < topology->num_cpus; i++) {
++			uint32_t cpu = topology->cpus[i].cpu_id;
++
++			if (topology->cpus[i].cluster_id != d ||
++			    cpu >= MONDRIAN_CPUFREQ_CPUS) {
++				continue;
++			}
++			ncpu++;
++			idle += md_idle_total[cpu] - md_idle_seen[cpu];
++			md_idle_seen[cpu] = md_idle_total[cpu];
++		}
++		if (ncpu == 0) {
++			continue;
++		}
++		total = (uint64_t)ncpu * window;
++		if (idle > total) {
++			idle = total;
++		}
++		busy = (uint32_t)(((total - idle) * 256 + total / 2) / total);
++		md_busy[d] = (md_busy[d] * 3 + busy) / 4;
++		span = md[d].rows - 1;
++		cur = md[d].row;
++		target = (md_busy[d] * span + 128) >> 8;
++		if (target > span) {
++			target = span;
++		}
++		if (target > cur) {
++			md_apply(d, target, now);	/* new load: at once */
++		} else if (target < cur) {
++			md_apply(d, cur - 1, now);	/* decay: one row a tick */
++		}
++	}
++}
++
++static void
++mondrian_cpufreq_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int ticks = MAX(hz / MONDRIAN_CPUFREQ_HZ, 1);
++
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "mondcpuf", ticks);
++		md_tick();
++	}
++}
++
++static void
++md_start_governor(void)
++{
++	thread_t thread;
++	kern_return_t kr;
++	unsigned int d, i;
++
++	md_last = mach_absolute_time();
++	for (i = 0; i < MONDRIAN_CPUFREQ_CPUS; i++) {
++		md_idle_seen[i] = md_idle_total[i];
++	}
++	for (d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++		md_busy[d] = 256;		/* start where the boot left it */
++		md_log_at[d] = 0;		/* log the first step down */
++	}
++	md_governor = 1;
++	kr = kernel_thread_start(mondrian_cpufreq_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("MONDRIAN CPUFREQ: governor, %d Hz\n", MONDRIAN_CPUFREQ_HZ);
++	} else {
++		md_governor = 0;
++		printf("MONDRIAN CPUFREQ: no governor thread 0x%x\n", kr);
++	}
++}
++
+ int
+-mondrian_cpufreq_max(void)
+-{
+-	int on = 1;
+-	int d;
+-
+-	PE_parse_boot_argn("cpufreq", &on, sizeof(on));
+-	if (!on) {
++mondrian_cpufreq_start(void)
++{
++	int mode = 0;
++	uint32_t pin = 0;
++	bool pinned = PE_parse_boot_argn("cpufreqrow", &pin, sizeof(pin));
++
++	(void)PE_parse_boot_argn("cpufreq", &mode, sizeof(mode));
++	if (mode <= 0 && !pinned) {
+ 		return 0;
+ 	}
+-
+-	for (d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++	for (unsigned int d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
+ 		vm_offset_t base = ml_io_map(
+-		    MONDRIAN_EPSS_BASE + (uint32_t)d * MONDRIAN_EPSS_DOMAIN_SIZE,
++		    MONDRIAN_EPSS_BASE + d * MONDRIAN_EPSS_DOMAIN_SIZE,
+ 		    MONDRIAN_EPSS_DOMAIN_SIZE);
+-		uint32_t best = 0, best_khz = 0, prev_khz = 0, i;
++		uint32_t prev_khz = 0, i;
+ 
+ 		if (base == 0) {
+-			printf("MONDRIAN CPUFREQ: domain %d not mapped\n", d);
++			printf("MONDRIAN CPUFREQ: domain %u not mapped\n", d);
+ 			continue;
+ 		}
++		md[d].base = base;
+ 		for (i = 0; i < MONDRIAN_EPSS_ROWS; i++) {
+ 			uint32_t v = *(volatile uint32_t *)(base + MONDRIAN_EPSS_LUT +
+ 			    i * MONDRIAN_EPSS_ROW);
+@@ -59,19 +233,36 @@
+ 				break;		/* the LUT repeats its last row */
+ 			}
+ 			prev_khz = khz;
+-			if (khz > best_khz) {
+-				best_khz = khz;
+-				best = i;
++			md[d].khz[i] = khz;
++			md[d].rows = i + 1;
++		}
++		md[d].row = *(volatile uint32_t *)(base + MONDRIAN_EPSS_PERF_STATE);
++		if (md[d].row >= md[d].rows) {
++			md[d].row = md[d].rows - 1;
++		}
++	}
++	if (pinned) {
++		for (unsigned int d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++			if (md[d].base != 0) {
++				uint32_t row = MIN(pin, md[d].rows - 1);
++				uint64_t now = mach_absolute_time();
++
++				md_log_at[d] = 0;
++				md_apply(d, row, now);
+ 			}
+ 		}
+-		{
+-			uint32_t old = *(volatile uint32_t *)(base + MONDRIAN_EPSS_PERF_STATE);
+-
+-			__builtin_arm_dsb(0xf);
+-			*(volatile uint32_t *)(base + MONDRIAN_EPSS_PERF_STATE) = best;
+-			__builtin_arm_dsb(0xf);
+-			printf("MONDRIAN CPUFREQ: domain %d row %u -> %u (%u MHz)\n",
+-			    d, old, best, best_khz / 1000);
++		return 0;
++	}
++	if (mode >= 2) {
++		md_start_governor();
++		return 0;
++	}
++	for (unsigned int d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++		if (md[d].base != 0) {
++			uint64_t now = mach_absolute_time();
++
++			md_log_at[d] = 0;
++			md_apply(d, md[d].rows - 1, now);
+ 		}
+ 	}
+ 	return 0;
+diff --git a/iokit/Kernel/arm/MondrianCPU.cpp b/iokit/Kernel/arm/MondrianCPU.cpp
+--- a/iokit/Kernel/arm/MondrianCPU.cpp
++++ b/iokit/Kernel/arm/MondrianCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void mondrian_secondary_entry(void);
+ extern "C" boolean_t mondrian_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void mondrian_cpu_idle(cpu_id_t cpu, boolean_t enter, uint64_t *timeout);
+ 
+ class MondrianCPU;
+ static MondrianCPU *mondrian_cpus[MAX_CPUS];
+@@ -93,6 +94,8 @@
+ 	info.phys_id = cpu->phys_id;
+ 	info.log_id = cpu->cpu_id;
+ 	info.cluster_id = cpu->cluster_id;
++	/* XNU calls this around WFI; the EPSS governor counts idle time on it. */
++	info.processor_idle = &mondrian_cpu_idle;
+ 	info.cluster_type = cpu->cluster_type;
+ 	info.l2_cache_id = cpu->l2_cache_id;
+ 	info.l2_cache_size = cpu->l2_cache_size;

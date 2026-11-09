@@ -184,10 +184,9 @@ and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
 The flattened HFS root is not a stock volume layout: launchd still expects a
 Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`. The volume
-is non-journaled, so a boot logs 10,000-13,000 `hfs_mark_inconsistent` lines and
-`suggestd` restart-loops (200-290 crashes, 800-950 execs); a boot still held
-60 fps during a drag with that churn, so it is not a proven cause of a UI stall
-(the corruption itself is in `NOTES.md`).
+is non-journaled: a boot logs 10,000-13,000 `hfs_mark_inconsistent` lines and
+`suggestd` restart-loops (200-290 crashes), and still held 60 fps during a
+drag, so it is not a proven cause of a UI stall (`NOTES.md`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error.
@@ -248,9 +247,10 @@ the dual-boot phases. The battery and the heat are their own work list:
 
 Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
-`tools/usb-ring.py` (ring dump, panel screenshot, synthetic touch/key, memory
-breakdown, reboot to the bootloader). `usb=1` probes only; USB3 and the PHY
-sequencing remain.
+`tools/usb-ring.py` (ring dump, panel screenshot, touch/key, memory, reboot).
+A read-only mass-storage interface over `userdata` (`0297`) is a work item:
+the host enumerates the disk but the first SCSI INQUIRY never returns. The
+storage IN endpoint is the next suspect; `usb=1` probes only, USB3/PHY remain.
 
 ## Getting the numbers off the device
 

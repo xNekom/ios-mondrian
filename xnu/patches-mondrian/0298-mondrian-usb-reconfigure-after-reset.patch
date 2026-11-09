@@ -1,0 +1,35 @@
+xnu 0298: the gadget re-arms its endpoints after a bus reset
+
+ud.configured survived a bus reset, so the next SET_CONFIGURATION returned
+early: the device enumerated (the control endpoint is serviced by the
+controller) but RX/TX stayed unarmed and no packet ever moved. Clear the flag
+before configuring and restart the TX queue.
+
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -522,6 +522,10 @@
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
++	lck_mtx_lock(ud.lock);
++	ud.tx_busy = false;
++	ud_tx_kick_locked();
++	lck_mtx_unlock(ud.lock);
+ 	printf("MONDR USB: ECM endpoints configured\n");
+ }
+ 
+@@ -556,6 +560,13 @@
+ 		printf("MONDR USB: address %u\n", value & 0x7f);
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
+ 		if (value == 1) {
++			/*
++			 * A bus reset (a usbipd detach/attach, a hub, a host
++			 * reboot) clears the controller's endpoints but not this
++			 * flag: program them again, or the device enumerates and
++			 * never moves a packet.
++			 */
++			ud.configured = false;
+ 			ud_configure();
+ 		}
+ 		printf("MONDR USB: configured (%u)\n", value);

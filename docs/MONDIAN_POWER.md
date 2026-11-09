@@ -69,20 +69,27 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
 1. **The GPU subdomain stays powered, clocked and held for the whole boot.**
    The probe votes the mx/cx/mxc/gfx rails (0x1a0), clears the CX and GX GDSC
    collapse bits, starts the GMU and the CP, and nothing releases any of it:
-   no IFPC, no GMU power collapse, no unvote, no hold drop. Either boot
-   without it (`gpu=0`) or add a release after `MondrianGPUStart()` that
-   unvotes the RPMh batch, sets `GDSC_SW_COLLAPSE` on both GDSCRs, stops the
-   SQE and drops the hold. The GPU is needed for the UI, so this is the
-   release path, not `gpu=0`.
+   no IFPC, no GMU power collapse, no unvote, no hold drop. The command line
+   also used to pin the GMU's default vote to index 13 (900 MHz); the board now
+   leaves kgsl's index 2 (285 MHz), which the frame-rate work measured is not
+   the limit. Either boot without the GPU (`gpu=0`) or add a release after
+   `MondrianGPUStart()` that unvotes the RPMh batch, sets `GDSC_SW_COLLAPSE` on
+   both GDSCRs, stops the SQE and drops the hold. The GPU is needed for the UI,
+   so this is the release path, not `gpu=0`.
 2. **The panel and MDSS are never blanked.** `MondrianFramebuffer.cpp` has no
    power-state or `RequestPowerChange` path, a 60 Hz vsync timer runs forever
    and every swap rescales the full canvas. Blanking needs the MDSS/DSI and
    backlight driver (`docs/MONDIAN_PORT.md` §3).
-3. **All eight cores sit at the top EPSS row** (1804 / 2496 / 2995 MHz) and
-   are never lowered; idle is WFI only, with no core power collapse and no
-   `cpu_idle_notify` consumer. `cpufreqrow=N` (write a low row in
-   `mondrian_cpufreq.c`) and `cpus=4` (keep the two big clusters in PSCI
-   reset) are the cheap experiments.
+3. **The EPSS rows are no longer pinned** (`0299`): `cpufreq=2` runs a
+   governor that follows each cluster's busy fraction from the idle hook
+   around WFI (`processor_idle`, sampled at 50 Hz), so a quiet cluster reaches
+   its bottom row in about two seconds. A 690 s SpringBoard boot logs domain 0
+   between rows 4 and 6 (806-1056 MHz) once the UI is idle; the top rows appear
+   only in short bursts. What remains is core power collapse:
+   idle is WFI only, with no `cpu_idle_notify` consumer beyond that accounting
+   (the A510 at Aff1 0 is parked with the firmware,
+   `docs/MONDIAN_PORT.md`). `cpufreqrow=N` pins row N for a one-boot
+   experiment and `cpus=4` stays the cheap check.
 
 Suspend (S2R) is a project of its own and would not cool anything today:
 nothing registers `IOPlatformSleepAction`, nothing calls
@@ -101,7 +108,8 @@ One change per boot, same `mondrianreset`, and read the ring
   still reports `gpucc cx … on`, the bootloader left the GPU up and this alone
   saves nothing.
 - `cpus=4`: `MONDRIAN CPU: requested=4 selected=4`.
-- no `cpufreq=1`: no `MONDRIAN CPUFREQ:` line.
+- no `cpufreq=2`: no `MONDRIAN CPUFREQ: governor` line; `cpufreq=0` leaves the
+  bootloader's rows alone and `cpufreqrow=N` prints the row it pinned.
 
 Temperature itself has no in-XNU reader. Measure it after a fixed-duration
 boot from Android recovery (`/sys/class/thermal/thermal_zone*/temp`,
