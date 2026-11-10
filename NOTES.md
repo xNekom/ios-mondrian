@@ -24,10 +24,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   which answers `Unrecognized command boot`. ABL spends one retry per boot,
   so after seven the slot reads `slot-unbootable:b:yes` and refuses every
   image; `fastboot set_active b` resets flag and budget without writing a
-  partition. To swap a RAM image, chain `fastboot reboot bootloader` and
-  `fastboot boot <img>`: it returns with USB alive, no button press. A reboot
-  from iOS (`usb-ring.py reboot`) reaches the bootloader with the PHY
-  unpowered, which looks like "fastboot is gone" and boots the OS.
+  partition. `fastboot reboot bootloader` re-enters fastboot with USB alive,
+  so a wedged fastboot session recovers without a power cycle; once `fastboot
+  boot` has started iOS there is no host path back, so a swap starts with
+  power + volume down.
 - **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
   shim, payload and kernel all run the granule iOS is built for:
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
