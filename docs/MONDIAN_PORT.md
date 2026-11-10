@@ -215,12 +215,13 @@ the boot splash. Three things had to line up: CoreAnimation waits 30 s for an
 (`0115`); SpringBoard blocks in `-[SBLockdownManager _setupActivationState]` on
 MobileActivation, and the dylib forces activation and skips Setup.
 
-Open: the 1125x2436 -> 1440x3200 upscale is nearest neighbour, which is the
-jagged text and icons (`0268`); the DPU SSPP scaler is the candidate and is not
-written. `0302`/`0303` blank the panel on the power key and on idle sleep
+Open: the UI is rendered at the panel's own 1440x3200 (480x1066 pt at scale 3);
+the `mondrianfb_canvas_w/h` scaler (`0268`) is an experiment knob, off because a
+smaller canvas made text soft and the UI oversized.
+`0302`/`0303` blank the panel on the power key and on idle sleep
 (fallback `mondrianfb_blank` seconds, default 1; a key or touch wakes the
-first frame), so the last frame no longer stays lit; brightness needs the DCS
-`0x51` path and the idle hook holds `UIApplication`'s timer, not boot-verified.
+first frame), so the last frame no longer stays lit; brightness and the Control
+Center sliders are the open work (`NOTES.md`).
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.

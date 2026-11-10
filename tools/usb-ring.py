@@ -201,7 +201,13 @@ def screen(path, rows, timeout):
     rows_got = max(got) + 1
     blank = b"\x00" * (width * 2)
     raw = bytearray()
-    for row in range(rows_got):
+    out_rows = 0
+    # The kernel halves the columns and keeps every row, so the reply is 2:1
+    # in pixels; keep every second row to write a PNG whose shape is the
+    # panel's. Without this the image is stretched twice as tall as the glass
+    # and a square icon measures 1:2.
+    for row in range(0, rows_got, 2):
+        out_rows += 1
         body = got.get(row, blank)
         if len(body) < width * 2:
             body = body + blank[:width * 2 - len(body)]
@@ -222,12 +228,12 @@ def screen(path, rows, timeout):
 
     import zlib
     png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, rows_got, 8, 2, 0, 0, 0))
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", width, out_rows, 8, 2, 0, 0, 0))
     png += chunk(b"IDAT", zlib.compress(bytes(raw), 6))
     png += chunk(b"IEND", b"")
     with open(path, "wb") as f:
         f.write(png)
-    print(f"{width}x{rows_got} rows {len(got)}/{rows_got} -> {path}")
+    print(f"{width}x{out_rows} from {rows_got} panel rows {len(got)}/{rows_got} -> {path}")
     return 0
 
 
@@ -240,8 +246,9 @@ def main():
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
-    parser.add_argument("--rows", type=int, default=1600,
-                        help="screen rows to fetch (half scale, default 1600)")
+    parser.add_argument("--rows", type=int, default=3200,
+                        help="panel rows to fetch (default 3200, the whole "
+                             "panel; the PNG keeps every second row)")
     args = parser.parse_args()
 
     if args.command == "dump":

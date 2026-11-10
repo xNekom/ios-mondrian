@@ -321,6 +321,9 @@ MONDRIAN = Board(
     # No gpuperf: the GMU's default vote is index 2 (285 MHz), which the frame
     # rate work measured is not the limit; index 13 (900 MHz) was a bring-up
     # experiment and only keeps the GPU rail at the top OPP.
+    # The panel is the canvas: 1440x3200 at scale 3 is 480x1066 pt. Rendering
+    # into a smaller 1125x2436 surface and upscaling it in swap() made the UI
+    # both soft and 7% oversized, which is what "the UI looks zoomed" was.
     # glenv=FD_MESA_DEBUG=nobin: freedreno's GL driver emits the a6xx
     # 7-dword CP_SET_BIN_DATA5 for a7xx too, and the a730 SQE parks on it
     # (docs/MONDIAN_GPU.md). The compositor renders off-screen, so binning
@@ -329,7 +332,6 @@ MONDRIAN = Board(
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
-             'mondrianfb_canvas_w=1125 mondrianfb_canvas_h=2436 '
              'mondrian_ui_hook=15 glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              'mondrianunlock=1'),

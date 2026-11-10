@@ -24,7 +24,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   which answers `Unrecognized command boot`. ABL spends one retry per boot,
   so after seven the slot reads `slot-unbootable:b:yes` and refuses every
   image; `fastboot set_active b` resets flag and budget without writing a
-  partition.
+  partition. To swap a RAM image, chain `fastboot reboot bootloader` and
+  `fastboot boot <img>`: it returns with USB alive, no button press. A reboot
+  from iOS (`usb-ring.py reboot`) reaches the bootloader with the PHY
+  unpowered, which looks like "fastboot is gone" and boots the OS.
 - **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
   shim, payload and kernel all run the granule iOS is built for:
   `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
@@ -41,7 +44,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
-  `tap`/`swipe`/`key`, prints `mem`, returns to the bootloader (`reboot`);
+  `tap`/`swipe`/`key`, prints `mem`, returns to the bootloader (`reboot`), and
+  `screen` writes a PNG of the whole panel with the glass's shape;
   `tools/ios-usbnet.sh` sets the host up and streams udp/5140. No buttons.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
@@ -49,9 +53,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
   path; `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen redraws at the panel's 60 fps on the
-  iPhone X's 1125x2436 canvas, and the compositor commits in bursts, so the
-  tick holds two finished records (`0282`). A static screen presents nothing:
-  `present 0/s` with the panel still scanning is idle, not stalled. CoreAnimation
+  panel's own 1440x3200 canvas (480x1066 pt at scale 3), and the compositor
+  commits in bursts, so the tick holds two finished records (`0282`). A static
+  screen presents nothing: `present 0/s` with the panel still scanning is idle,
+  not stalled. CoreAnimation
   needs `TimingElements`/`ColorElements` and an `IOAcceleratorES` service
   (`0114`); the dylib forces activation and skips Setup, and GPU writes memory
   once `CP_SET_SECURE_MODE(0)` retires.
@@ -106,10 +111,9 @@ ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
 log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
 CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
 With the kernel running, `usb=2` and `tools/usb-ring.py dump` read the whole
-ring over USB; `reboot` returns to the bootloader. On Windows the phone reaches
-WSL through `usbipd attach --wsl --busid <id>` and `cdc_ether`: the host driver
-was the missing half, and a detach/attach is a bus reset the gadget now
-survives (`0298`).
+ring over USB. On Windows the phone reaches WSL through `usbipd attach --wsl
+--busid <id>` and `cdc_ether`: the host driver was the missing half, and a
+detach/attach is a bus reset the gadget now survives (`0298`).
 A previous boot is read by running the real kernel, then a dump kernel with
 `mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
 `mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
@@ -221,10 +225,6 @@ DB (128 KiB) and RSC (64 KiB) were re-mapped per cmd-db lookup and rail vote,
 and the next `kmem_alloc(..., 131072, KMA_NOFAIL)` panicked in `io_map`. Map a
 window once (`0179`).
 
-**Contiguous memory comes in small runs.** With 4 KiB pages
-`kmem_alloc_contig(1 MiB)` never returned; 128 KiB did. Size descriptors to what
-the zone map can give (the UFS host asks for 144 KiB).
-
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels
 **appended to the shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked
@@ -252,11 +252,10 @@ raw file is resparsed and reading it back fails; flash a sparse image instead
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
 or `delay()`.
 
-**The console paints the kernel log and scrolls.** The early console drew only
-its own marks, so the boot looked frozen; `0210` paints the log, clears the
-panel once first and scrolls half a screen at the last text row. `0213` moves
-the painting into the log thread: from `console_write()` every line waited for
-the framebuffer, and two CPUs printing at once painted over each other's rows.
+**The console paints the kernel log and scrolls.** `0210` paints the log, clears
+the panel once first and scrolls half a screen at the last text row; `0213`
+moves the painting into the log thread (from `console_write()` every line waited
+for the framebuffer, and two CPUs painted over each other's rows).
 `0005` registers the fbcon unconditionally, so text lands on the ABL Apple logo
 from the first `printf`; the intended default is to leave the panel alone
 unless `mondrianfb_console=1` (the ring keeps every line). The shim's
