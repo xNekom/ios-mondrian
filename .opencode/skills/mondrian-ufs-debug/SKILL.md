@@ -34,6 +34,24 @@ UFS bug. Check the three boot traps first.
    at early mark N with IRQs masked; `0174` extends the marks through
    `bsd_init` and `vfs_mountroot`.
 
+## A boot that stops before the framebuffer
+
+The shim log still on the panel (`STAGE 0x00000001`, `XNU jumping (fbcon clears
+screen)`, never cleared) with no USB gadget is a mount that never finishes, not
+a driver bug: in this port the root is mounted before the framebuffer console
+exists. Two ways to get there, both measured:
+
+- **The HFS journal.** The `HFS_ENABLE_JOURNALING` sysctl does create one, and
+  every mount after that hangs before the framebuffer, with no userland left to
+  undo it. `mondriannojnl=1` mounts ignoring the journal. Do not reach for the
+  disable sysctl: `journal_close(NULL)` has no NULL check and panics.
+- **A volume left dirty by a mid-boot panic.** Same signature, and the ring is
+  not written either. Reflashing `backup/ios-root.simg` is the repair; `fsck_hfs`
+  on a copy of that image reports "appears to be OK", so it does not find this.
+
+`mondrianfb_noconsole=0` puts the kernel log on the panel, which is the only
+channel while the USB gadget is down.
+
 ## Established facts
 
 | fact | value |

@@ -10,32 +10,25 @@ learn; the work list, the hardware delta and the partition rules are in
 `docs/MONDIAN_PORT.md`. The upstream `sweet` port is the reference
 implementation and is not re-described here: `xnu/patches/` is its record.
 
-## State (2026-11-09)
+## State (2026-11-10)
 
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   console draws into the splash framebuffer the ABL leaves at **0xB8000000**
-  (1440x3200, stride 5760). Build the shim with `SMALL_SHIM=1`
-  (`tools/phone-deploy.sh` does): the full shim's `test_gic()` storms and the
-  phone shows IRQ lines and no kernel.
-- **Two loader modes, one slot budget.** `fastboot devices` answers in the
-  bootloader's fastboot (power + volume down), which accepts `fastboot boot`,
-  and in **fastbootd**, which the BCB command `boot-fastboot` selects and
-  which answers `Unrecognized command boot`. ABL spends one retry per boot,
-  so after seven the slot reads `slot-unbootable:b:yes` and refuses every
-  image; `fastboot set_active b` resets flag and budget without writing a
-  partition. `fastboot reboot bootloader` re-enters fastboot with USB alive,
-  so a wedged fastboot session recovers without a power cycle; once `fastboot
-  boot` has started iOS there is no host path back, so a swap starts with
-  power + volume down.
-- **16 KiB pages.** The SoC reports `TGran16=1` in `ID_AA64MMFR0_EL1`, so
-  shim, payload and kernel all run the granule iOS is built for:
-  `__ARM_16K_PG__`, `ARM_PGSHIFT` 14, 32 MiB L2 blocks, the Apple VA layout.
-- **Kernel.** Gets through `arm_init`, VM init, `kmem_range_init`, IOKit, the
-  scheduler and AMFI into `bsd_init`. The GIC is remapped after the VM takes
-  over; the vtimer PPI (27) needs its active state ended and its Group 1
-  secure modifier cleared (`0116`), and `0173` arms `CNTV_TVAL` before clearing
-  IMASK or the level-sensitive PPI re-enters for ever before the UFS probe.
+  (1440x3200, stride 5760). Build with `SMALL_SHIM=1` (`tools/phone-deploy.sh`
+  does); why is in the shim trap.
+- **Fastboot, and the only way back to it.** `fastboot devices` answers in the
+  bootloader's fastboot (power + volume down), which takes `fastboot boot`;
+  fastbootd refuses it, `fastboot reboot bootloader` keeps USB alive. ABL
+  spends one retry per boot, so after seven the slot reads
+  `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
+  resets flag and budget without writing a partition.
+  **Never reset the phone from iOS.** Measured twice: it lands in the
+  bootloader's charging screen with the phone off, which costs a manual
+  recovery and blocks every test until the battery is back; the BCB's
+  `bootloader`/`boot-fastboot` and IMEM 0x65c all boot the active slot.
+- **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
+  scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, HFS+ root
   mounted and `launchd` exec'd. The console ring is armed at the end of the
@@ -43,41 +36,36 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   error on disk.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
-  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
-  `tap`/`swipe`/`key`, prints `mem`, returns to the bootloader (`reboot`), and
-  `screen` writes a PNG of the whole panel with the glass's shape;
-  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. No buttons.
+  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`, a PNG
+  of the whole panel with the glass's shape), injects `tap`/`swipe`/`key` and
+  prints `mem`; `tools/ios-usbnet.sh` sets the host up and streams udp/5140.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
-  processes. `0112` injects the UI dylib per daemon (`mondrian_ui_hook`: 1
-  containermanagerd, 2 backboardd, 4 SpringBoard); `hook=7` loads all three.
-- **Writable root.** `0090` adds WRITE(10), SYNCHRONIZE CACHE and the write
-  path; `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The home screen redraws at the panel's 60 fps on the
-  panel's own 1440x3200 canvas (480x1066 pt at scale 3), and the compositor
-  commits in bursts, so the tick holds two finished records (`0282`). A static
-  screen presents nothing: `present 0/s` with the panel still scanning is idle,
-  not stalled. CoreAnimation
-  needs `TimingElements`/`ColorElements` and an `IOAcceleratorES` service
-  (`0114`); the dylib forces activation and skips Setup, and GPU writes memory
-  once `CP_SET_SECURE_MODE(0)` retires.
-- **Memory: the 9 GiB window.** iOS 16 boots to SpringBoard at
-  `0x840000000+0x240000000`: 208 processes, 5.2 GiB free (the 864 MiB window
-  had the page queues full). The phone's other 3 GiB are fragmented, so the
-  kernel keeps one contiguous window.
-- **The command line decides whether it boots.** A plain `fastboot boot` used
-  to reach BSD init without mounting the root: ABL's `/chosen/bootargs` filled
-  the 1024-byte `CommandLine` and pushed `rd=ufsroot0` out (see the traps).
+  processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
+- **Writable root.** `0090` adds WRITE(10) and the write path;
+  `DKIOCISWRITABLE` must agree or HFS disables writes.
+- **Display and UI.** The home screen redraws at the panel's 60 fps on its own
+  1440x3200 canvas (480x1066 pt at scale 3) and the compositor commits in
+  bursts, so the tick holds two records (`0282`); `present 0/s` with the panel
+  scanning is idle. CoreAnimation needs `TimingElements`/`ColorElements` and an
+  `IOAcceleratorES` service (`0114`).
 
 Current blockers, in order:
 
-1. **The GPU.** The compositor still shows glitches; the a7xx path and the
-   CP secure-mode handoff are in `docs/MONDIAN_GPU.md`.
-2. **Brightness.** The panel follows the power key and the finger (`0302`/
-   `0303`: black on the press, 1 s fallback, 5 s of grace after touch/wake,
-   the first frame after a key or touch wakes it); brightness needs the DCS
-   `0x51` path (`bl_ctrl_dcs`, max `0xfff`, inverted DBV).
-3. **Rest.** Audio, modem and cameras: the daemons that abort
-   (SiriTTSSynthesizer, KonaSynthesizer) want them.
+1. **The battery.** No charger code exists, so a boot runs the phone down until
+   power + volume down answers with the charging icon and no fastboot.
+   `mondrianadc=1` prints `MONDRIAN BATT: <mV>` from the PMIC's ADC; the charger
+   (PM8550B on SPMI) is not driven.
+2. **The compositor stops drawing.** Some boots never put a frame on the
+   glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
+   screen keeps the boot logo. That is the GPU write-target bug in
+   `docs/MONDIAN_GPU.md`, not the panel (the tick still runs at 60 Hz). A dirty
+   root volume gives the same symptom with no USB at all; see the journal trap.
+3. **Control Center is not broken: our diagnostics were.** `mondrianwin=1`
+   aborted SpringBoard on every open; without it the sheet draws full size, 0
+   crashes. Its slider still ignores taps, and the bottom of the panel shows
+   banded, stretched wallpaper.
+4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem and
+   cameras: what the aborting daemons want.
 
 ## Building and booting
 
@@ -153,14 +141,10 @@ reservation inside). Rules that still cost resets:
 - it must start above firmware memory and above the shim **including the
   appended LZ4 payload**, because the loader wipes the window before it
   unpacks. `_end` is a runtime address, not an offset (symbols are
-  PC-relative), and the magic `LZ4P` is `0x50345a4c` little-endian; reading it
-  as `0x505a344c` left the base at `_end`, and the wipe kept the header and
-  ate the frame;
+  PC-relative), and the `LZ4P` magic is `0x50345a4c` little-endian;
 - the base must be 32 MiB aligned, and `boards.py`/`shim/board.h` must be the
   window the shim passes: `mkadt.py` writes the pair into `/chosen` as
-  `dram-base`/`dram-size`, and the shim puts it in `boot_args`. At
-  `0xa8758000` (889 MiB, ADT at `0xa7400000/0x38b00000`) the loader jumped and
-  the kernel died in `start.s` before its first `MONDRIAN EARLY` mark;
+  `dram-base`/`dram-size`, and the shim puts it in `boot_args`;
 - it must end in memory that exists (XNU takes its first heap pages from the
   *end*) and not **contain** a carve-out or hole: the VM hands out pages
   across the window, and a page on a firmware island aborts (`Kernel data
@@ -196,22 +180,17 @@ time:
 
 The 4 KiB era left `0056`/`0057`/`0062` (commpage, zone map VA, 32 MiB low globals); they still apply.
 
-**Instructions the platform does not have.** The kernel was once built with
-`-march=armv8.5-a+crypto`, which emits 226 RCpc `ldapr`s; this board's cores do
-not implement RCpc or pointer authentication, so the phone raised an undefined
-instruction while QEMU's `-cpu max` (which implements every optional feature)
-did not. Build for the board's own ISA, and remember that QEMU emulating
-everything can hide exactly this class of bug.
+**Instructions the platform does not have.** Built once with
+`-march=armv8.5-a+crypto`, the kernel emitted 226 RCpc `ldapr`s; these cores
+have neither RCpc nor pointer authentication, so the phone raised an undefined
+instruction while QEMU's `-cpu max` did not.
 
 **QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is reported
 as an *undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg would
-give) — patch `0061` drops the write. The virtual timer only fires once the
-guest unmasks it for EL1 (`CNTV_CTL_EL1 = ENABLE | EL1IRQEN`, patch `0069`);
-`CNTV_*`, `CNTKCTL_EL1` and `DAIF` are all accepted. `0173` programs
-`CNTV_TVAL` before clearing IMASK: the loader leaves the compare expired and
-the level-sensitive PPI otherwise storms. There is no RTC service, so
-`IOKitInitializeTime()`'s 30 s `IORTC` wait never expires and has to be
-skipped on this board.
+give), so `0061` drops the write; the virtual timer fires only once the guest
+unmasks it for EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing
+IMASK or the level-sensitive PPI storms. There is no RTC service, so
+`IOKitInitializeTime()`'s 30 s `IORTC` wait has to be skipped on this board.
 
 **Anything mapped with `ml_io_map()` before `STARTUP_SUB_KMEM` dies.** It is a
 bootstrap mapping taken from `virtual_space_start`; once the VM owns that
@@ -220,10 +199,25 @@ address space the device is mapped nowhere and the next read is a bus abort
 `ml_io_map()` after the VM is up; the early framebuffer survives only because
 `0062` keeps a reserved low-global alias for it.
 
-**`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** The touch command
-DB (128 KiB) and RSC (64 KiB) were re-mapped per cmd-db lookup and rail vote,
-and the next `kmem_alloc(..., 131072, KMA_NOFAIL)` panicked in `io_map`. Map a
-window once (`0179`).
+**`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** Re-mapping a 128 KiB
+touch command DB per lookup and 4 MiB of SPMI channels for one byte both
+exhausted it, and the next `kmem_alloc` panicked in `io_map`: map the one 4 KiB
+window (`0179`), and remember it belongs to one APID - the next peripheral has
+to re-map or the byte lands in the previous page.
+
+**The HFS journal cannot be replayed, and a dirty volume looks like a dead
+kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and from
+then on every mount hangs *before* the framebuffer: the screen keeps the shim
+log (`STAGE`, `XNU jumping`) and the USB gadget never appears, so there is no
+ring and no userland left to undo it. `mondriannojnl=1` mounts ignoring the
+journal; the disable sysctl is not the way out, because `journal_close(NULL)`
+has no NULL check and panics. A volume left dirty by a mid-boot panic shows the
+same signature; reflashing `backup/ios-root.simg` is the repair.
+
+**`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
+entry that claims data and owns no blocks is rejected on every open (2 560
+times in one boot); a pristine image has none, so the hard resets write that
+damage. `hfs_zero_block_stub()` exempts the legal under-one-block case.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels
@@ -233,16 +227,12 @@ payload: that truncates it to a header promising 0 bytes and the shim answers
 `LOADER cannot unpack the payload`. `tools/check-shim-blob.py IMAGE` reads the
 header back.
 
-**Booting from UFS is not the same as booting from fastboot.** The ABL leaves
-the UFS powered when it boots normally and powers it down in fastboot; either
-way the kernel brings the host up itself (`0074`–`0076`).
-
 **The shim is not a no-op, and it can hide kernel bugs.** The full shim runs
 `test_gic()` before the jump: it arms `CNTV_TVAL`, storms until it gives up and
-leaves the UFS warm. Behind it the kernel looked healthy; with `SMALL_SHIM=1`
-the kernel arms the timer itself (`0173`) and wakes the UFS. Panel showing IRQ
-lines and no `MONDRIAN EARLY` means the shim, not the kernel (`nm
-shim/out/shim.elf | grep test_gic`).
+leaves the UFS warm. With `SMALL_SHIM=1` the kernel arms the timer itself
+(`0173`) and wakes the UFS, and `test_ufs()` faults on a boot from fastboot
+(host powered down), so that build also needs `SHIM_NO_UFS`. Panel showing IRQ
+lines and no `MONDRIAN EARLY` means the shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and reading it back fails; flash a sparse image instead
@@ -252,15 +242,12 @@ raw file is resparsed and reading it back fails; flash a sparse image instead
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
 or `delay()`.
 
-**The console paints the kernel log and scrolls.** `0210` paints the log, clears
-the panel once first and scrolls half a screen at the last text row; `0213`
-moves the painting into the log thread (from `console_write()` every line waited
-for the framebuffer, and two CPUs painted over each other's rows).
-`0005` registers the fbcon unconditionally, so text lands on the ABL Apple logo
-from the first `printf`; the intended default is to leave the panel alone
-unless `mondrianfb_console=1` (the ring keeps every line). The shim's
-`test_ufs()` faults on a boot that came from fastboot (host powered down):
-build with `SHIM_NO_UFS` (`LOGVIEW` implies it).
+**The console paints the kernel log and scrolls.** `0210` clears the panel once
+and scrolls half a screen at the last text row; `0213` moves the painting into
+the log thread. `0005` registers the fbcon unconditionally, so text lands on
+the ABL logo from the first `printf`; `mondrianfb_noconsole=1` keeps the panel
+for the UI, and `mondrianfb_noconsole=0` is the only log there is when USB is
+dead.
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
@@ -274,7 +261,9 @@ UFS 3.1 host at `0x1d84000`; the sweet driver's register names still exist but
 the UTRD is 16 dwords and the PRDT entries are 64-bit. The sequence that wakes
 it — GCC branch, transfer-list takeover, `hce 0x1 hcs 0x10f`, START STOP UNIT
 active on the well-known LUN `0xd0`, then TUR on LUN 0 — is in the
-`mondrian-ufs-debug` skill.
+`mondrian-ufs-debug` skill. The ABL leaves the UFS powered on a normal boot and
+powers it down in fastboot; the kernel brings the host up itself either way
+(`0074`-`0076`).
 
 Wait loops are spin counts, not `delay()`: a wait that never completes has to be
 non-fatal and dump `hcs/is/dbr` plus the UTRD.
@@ -322,6 +311,19 @@ mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and
 `mondrianfb_defer=0` are diagnostics; see `docs/MONDIAN_GPU.md`.
 
+**Brightness: one DMA path, one low page.** DCS `0x51` reaches an AMOLED panel
+only through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA: the command FIFO
+acks and changes nothing, and worse, a FIFO send wedges the DMA engine for the
+rest of the boot (`INT_CTRL` `0x500`, no `DMA_DONE`, `STATUS` 0) -- reset the
+command FIFO before the next send. Do not write `DSI_CTRL`: `CMD_MODE_EN` on
+this video-mode controller is what stopped the engine reporting completion.
+`DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window starts at `0x840000000`,
+so no allocator can serve it (IOKit's physical mask is ignored: pages at
+`0x846924000`); the last page of the splash carve-out, `0xbaaf0000`
+(`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>` sets
+the boot level (0xfff full scale) and `brightness-nits` 0 means "display
+asleep": honouring it left every boot at DBV `0x20` with a dead slider.
+
 ## Boot menu and dual boot
 
 `shim/menu.c` + `shim/menu_logos.h` (rasterized by `tools/gen-menu-logos.py`),
@@ -340,10 +342,8 @@ names the defect.
 
 ## Other ports worth reading
 
-- **`UniXNU/UniXNU`** — iOS and macOS on non-Apple arm64: the bootstrap-capacity
-  patch in `0001` and the UFS LU wake.
-- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, Adreno 630, the iOS 16.5
-  persona hook that `0106` redoes.
-- **`oosexgang/hakios-xnu-kernel`** — same `eagl.c`, one revision ahead (`docs/COREANIMATION_GLES.md`).
+- **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
+- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, the persona hook `0106`.
+- **`oosexgang/hakios-xnu-kernel`** — `eagl.c`, one revision ahead.
 - **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
-  local TLB flush, timer quiesce, `cpus=1`, home screen on SM6225, DWC3 clocks.
+  TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.
