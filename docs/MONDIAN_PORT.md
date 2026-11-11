@@ -263,9 +263,8 @@ fills the banks, the UFS host and the GIC from the same dump (`parse_facts`).
 
 ## Boot arguments
 
-The board table carries the default command line
-(`tools/boards.py`, `BOARDS['mondrian'].cmdline`); do not copy it here. What
-the less obvious ones do:
+The board table carries the default line (`tools/boards.py`,
+`BOARDS['mondrian'].cmdline`); do not copy it here. The less obvious ones:
 
 | Boot-arg | Effect |
 | --- | --- |
@@ -278,6 +277,7 @@ the less obvious ones do:
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen, re-requests it every minute, and holds the `UIApplication` idle timer |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
+| length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
 
 ## References
 

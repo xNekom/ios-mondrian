@@ -17,7 +17,7 @@ Payload layout (little endian, all offsets from payload start):
   0x030  u64   kernel_end_va  end of the highest segment (page aligned)
   0x038  u64   phys_base      kernel-managed RAM (same values as the ADT's dram-base/size)
   0x040  u64   mem_size
-  0x048  char  cmdline[1024]
+  0x048  char  cmdline[1024]   (keep it <= 607: see USERLAND_BOOTARGS)
   0x448  seg[nsegs] { u64 vmaddr, vmsize, file_off(in payload), file_size }
 
 --ramdisk appends IMAGE as one more segment right after the kernel and moves
@@ -35,6 +35,13 @@ import boards  # noqa: E402
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
 PAGE = 0x4000
 BOOT_LINE_LENGTH = 1024
+# 1024 is the kernel's field, not what a reader has: iOS userland asks for
+# kern.bootargs with a 608-byte buffer and the sysctl handler copies the whole
+# string (trunc = 0), so one byte over 607 is ENOMEM for every reader. watchdogd
+# reads it on every launch and aborts when the call fails, which launchd answers
+# with a respawn: a 622-byte command line cost ~28 watchdogd aborts in ten
+# minutes (measured). Keep the line short or the churn comes back.
+USERLAND_BOOTARGS = 607
 CMDLINE = 0x48
 SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x448
 
@@ -208,6 +215,9 @@ if __name__ == '__main__':
                     help='build even if the board still has guessed values')
     ap.add_argument('--allow-silent-boot', action='store_true',
                     help='mondrian: build without usb=2 (no ring, no control channel)')
+    ap.add_argument('--allow-long-cmdline', action='store_true',
+                    help='build even if the command line does not fit a 608-byte '
+                         'kern.bootargs reader (609+ bytes make watchdogd abort)')
     a = ap.parse_args()
     board = boards.get_board(a.board)
     if a.facts:
@@ -223,6 +233,12 @@ if __name__ == '__main__':
         sys.exit('mkpayload: a mondrian payload needs usb=2 in the command line; '
                  'without it the boot has no USB at all (no ring, no control '
                  'channel). Pass --allow-silent-boot for a deliberate test.')
+    if len(cmdline.encode()) > USERLAND_BOOTARGS and not a.allow_long_cmdline:
+        sys.exit(f'mkpayload: the command line is {len(cmdline.encode())} bytes; iOS '
+                 f'userland reads kern.bootargs into a 608-byte buffer, so anything over '
+                 f'{USERLAND_BOOTARGS} fails with ENOMEM and watchdogd aborts on every '
+                 f'launch. Pass --allow-long-cmdline only for a kernel-side flag that '
+                 f'has to be there.')
     blob, info = build(a.kernel, a.adt, cmdline, a.ramdisk, board)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
