@@ -51,8 +51,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   hand-written DSI brightness code read `1 frame in ~5000 ms` and put one frame
   every 5 s on the glass. Never wait on the DSI inside `present()`; the frame
   meter and this trap are in `docs/UI_PERFORMANCE.md`. CoreAnimation needs
-  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`);
-  Mesa 25.0.7 draws through freedreno.
+  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`).
 
 Current blockers, in order:
 
