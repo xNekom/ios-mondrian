@@ -39,6 +39,17 @@ to spoil it for the rest of the boot - 816 mV read once, the curve answered 1%,
 and the icon stayed there - so the reader range-checks vbat (3.0-4.4 V) and
 drops anything outside.
 
+One sample is not a level either: the pack sags with the load and 20 mV of that
+is three points of this curve, so the value is smoothed with alpha 1/4 and the
+published percentage keeps its number until the reading is two points away. A
+steady 3.86 V walked 68-71 % before that.
+
+`keys` on the USB channel answers with the button poller's state and one live
+read of both registers (`pon`, the volume-up pin), which tells a dead button
+from a dead bus: the poller shares the arbiter with the conversion, and a
+collision is a busy bus, not a fault — the code that treated one as fatal ended
+button polling for the rest of the boot.
+
 ### Reading the VADC
 
 `mondrian_spmi_adc_mv(sid, chan, div)` and the live `sa SID CHAN DIV` command

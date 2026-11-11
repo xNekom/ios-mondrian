@@ -191,18 +191,16 @@ level-sensitive PPI storms. With no RTC service, `IOKitInitializeTime()`'s 30 s
 kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
 authentication, so the phone faults where QEMU's `-cpu max` does not.
 
-**Anything mapped with `ml_io_map()` before `STARTUP_SUB_KMEM` dies.** It is a
-bootstrap mapping taken from `virtual_space_start`; once the VM owns that
-address space the device is mapped nowhere and the next read is a bus abort
-(`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`). `0087` re-maps GICD/GICR through
-`ml_io_map()` after the VM is up; the early framebuffer survives only because
-`0062` keeps a reserved low-global alias for it.
-
-**`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** Re-mapping a 128 KiB
-touch DB per lookup and 4 MiB of SPMI channels for one byte exhausted it and
-the next `kmem_alloc` panicked in `io_map`: map the one 4 KiB window (`0179`),
-and remember it belongs to one APID - the next peripheral has to re-map or the
-byte lands in the previous page.
+**`ml_io_map()` traps twice: it never unmaps, and an early mapping dies.** The
+I/O submap is 8 MiB, so re-mapping a 128 KiB touch DB per lookup and 4 MiB of
+SPMI channels for one byte exhausted it and the next `kmem_alloc` panicked in
+`io_map`: map the one 4 KiB window (`0179`), and remember it belongs to one
+APID -- the next peripheral re-maps or the byte lands in the previous page. And
+a mapping taken before `STARTUP_SUB_KMEM` comes from `virtual_space_start`: once
+the VM owns that space the device is mapped nowhere and the next read is a bus
+abort (`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`), which is why `0087` re-maps
+GICD/GICR after the VM is up and the early framebuffer survives only on `0062`'s
+reserved low-global alias.
 
 **The HFS journal cannot be replayed, and a dirty volume looks like a dead
 kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
@@ -332,8 +330,11 @@ map at `core+0x2000+4n`, owner table at `cnfg+4n`. `KPDPWR` is bit 7 (power),
 GPIO6 on peripheral page `0x8d`, level bit 0, held LOW. A PMIC gpio is its own
 page (`0x88 + index - 1`), and the PON node has no `__symbols__` label: find it
 by the `pon` compatible. Rising edges drive the menu. A refusal prints
-`spmi code N` (1 arbiter, 2 reg-names, 3 regions, 4 missing, 5 count, 6 pon,
-7 ppid, 8 apid, 9 gpios, 10 gpio ppid, 11 apid, 12 vol_up): one photo names it.
+`spmi code N` with N naming the failing step in `shim/spmi.c`: one photo names
+it. A failed transaction is a busy arbiter, not a broken bus -- the battery's
+conversion runs on it every 2 s -- and treating one collision as fatal ended
+button polling for the rest of the boot; `keys` prints the poller's state and
+one live read of both registers.
 
 **The APID table cannot be written from the AP.** It only holds what XBL gave
 EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no entry
