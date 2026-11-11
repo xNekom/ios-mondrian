@@ -22,11 +22,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   fastbootd refuses it, `fastboot reboot bootloader` keeps USB alive. ABL
   spends one retry per boot, so after seven the slot reads
   `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
-  resets flag and budget without writing a partition.
-  **Never reset the phone from iOS.** Measured twice: it lands in the
-  bootloader's charging screen with the phone off, which costs a manual
-  recovery and blocks every test until the battery is back; the BCB's
-  `bootloader`/`boot-fastboot` and IMEM 0x65c all boot the active slot.
+  resets flag and budget without writing a partition. From a running iOS the
+  ring's `reboot` is a way in with no buttons: it writes the BCB command
+  `bootloader`, flushes the ring and resets, and fastboot answers about 50 s
+  later, so poll `fastboot devices` for a minute. A reset that skips the BCB
+  write still lands in the bootloader's charging screen with the phone off,
+  which costs a manual recovery.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
