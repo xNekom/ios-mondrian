@@ -70,19 +70,17 @@ Current blockers, in order:
 
 ## Building and booting
 
-**Kernel.** `.github/workflows/xnu.yml` and both local builds
-(`tools/build-kernel-local.sh` on the Mac, `tools/wsl/build-kernel.sh` on
-Windows/WSL2, `docs/BUILD_LINUX.md`) fetch xnu-8796.141.3, reset the checkout
-and apply `xnu/patches-mondrian/`; a skipped patch fails the run (the
-workflow's "No skipped patches" step greps the log). Run `tools/apply-series.py`
-(or `tools/check-patches.sh`) after touching the series: it names the patch in
-seconds (`0161` was silently missing until 2026-10-28, `0157` carried its first
-hunk). **The series is the only source of truth:** a build whose hash changed
-resets that checkout, so a driver edited there and never exported is lost (the
-DSI brightness driver went that way on 2026-11-11; `docs/BUILD_LINUX.md`). A
-mondrian build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the
-user-client
-surface without the CP profile.
+**Kernel.** `.github/workflows/xnu.yml`, `tools/build-kernel-local.sh` (Mac) and
+`tools/wsl/build-kernel.sh` (Windows/WSL2, `docs/BUILD_LINUX.md`) fetch
+xnu-8796.141.3, reset the checkout and apply `xnu/patches-mondrian/`; a skipped
+patch fails the run. Run `tools/apply-series.py` (or `tools/check-patches.sh`)
+after touching the series: it names the patch in seconds (`0161` was silently
+missing until 2026-10-28, `0157` carried its first hunk). **The series is the
+only source of truth:** a build whose hash changed resets that checkout, so a
+driver edited there and never exported is lost (the DSI brightness driver went
+that way on 2026-11-11). A mondrian build also needs the local
+`mondrian_gmu_fw.h`; `0184` stubs the user-client surface without the CP
+profile.
 
 **Apple's clang builtins are load-bearing.** Without `__builtin_xnu_type_*`
 (`tools/wsl/patches/0002` stubs them) every kalloc_type view is a data view, none
