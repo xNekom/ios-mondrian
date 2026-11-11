@@ -105,7 +105,8 @@ A previous boot is read by running the real kernel, then a dump kernel
 (`mondriandump=1`, `mondriandumpmatch=`, `0099` splits the list).
 `mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
 above 20 visible after the console is off, so the last line on the panel names
-the function that hung.
+the function that hung. `mondrianreset=N` is a second clock: a boot that ends
+at about 45 s is that thread rebooting to fastboot, not a crash.
 
 ## Measured hardware facts
 
@@ -179,16 +180,16 @@ time:
 
 The 4 KiB era left `0056`/`0057`/`0062` (commpage, zone map VA, 32 MiB low globals); they still apply.
 
-**Instructions the platform does not have.** With `-march=armv8.5-a+crypto` the
-kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
-authentication, so the phone faults where QEMU's `-cpu max` does not.
-
 **QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is an
 *undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg gives), so
 `0061` drops the write; the virtual timer fires once the guest unmasks it for
 EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing IMASK or the
 level-sensitive PPI storms. With no RTC service, `IOKitInitializeTime()`'s 30 s
 `IORTC` wait is skipped on this board.
+
+**Instructions the platform does not have.** With `-march=armv8.5-a+crypto` the
+kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
+authentication, so the phone faults where QEMU's `-cpu max` does not.
 
 **Anything mapped with `ml_io_map()` before `STARTUP_SUB_KMEM` dies.** It is a
 bootstrap mapping taken from `virtual_space_start`; once the VM owns that
@@ -198,44 +199,45 @@ address space the device is mapped nowhere and the next read is a bus abort
 `0062` keeps a reserved low-global alias for it.
 
 **`ml_io_map()` never unmaps; the I/O submap is 8 MiB.** Re-mapping a 128 KiB
-touch command DB per lookup and 4 MiB of SPMI channels for one byte both
-exhausted it, and the next `kmem_alloc` panicked in `io_map`: map the one 4 KiB
-window (`0179`), and remember it belongs to one APID - the next peripheral has
-to re-map or the byte lands in the previous page.
+touch DB per lookup and 4 MiB of SPMI channels for one byte exhausted it and
+the next `kmem_alloc` panicked in `io_map`: map the one 4 KiB window (`0179`),
+and remember it belongs to one APID - the next peripheral has to re-map or the
+byte lands in the previous page.
 
 **The HFS journal cannot be replayed, and a dirty volume looks like a dead
 kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
-every mount hangs *before* the framebuffer: the screen keeps the shim log and
-the USB gadget never appears, so there is no ring and no userland left to undo
-it. `mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
-(`journal_close(NULL)` has no NULL check). A volume left dirty shows the same
-signature: reflashing `backup/ios-root.simg` is the repair, and `fsck.hfsplus
--fy` on a copy names what a rebuild has to fix.
+every mount hangs *before* the framebuffer: the screen keeps the shim log, the
+USB gadget never appears, so there is no ring and no userland left to undo it.
+`mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
+(`journal_close(NULL)` has no NULL check). Reflashing `backup/ios-root.simg` is
+the repair for a dirty volume, and `fsck.hfsplus -fy` on a copy names what a
+rebuild has to fix.
 
 **`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
 entry that claims data and owns no blocks is rejected on every open (2 560
-times in one boot); a pristine image has none, so the hard resets write that
-damage. `hfs_zero_block_stub()` exempts the legal under-one-block case.**The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
-`/chosen/linux,initrd-start` are not the payload. The payload travels
-**appended to the shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked
-by `shim/lz4.c`). Never write the blob over `shim/out/payload.bin`, the raw
-payload: that truncates it to a header promising 0 bytes and the shim answers
-`LOADER cannot unpack the payload`. `tools/check-shim-blob.py IMAGE` reads the
-header back.
+times in one boot), and the hard resets write that damage; the legal
+under-one-block case is exempt (`hfs_zero_block_stub()`).
+
+**The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
+`/chosen/linux,initrd-start` are not the payload: that travels **appended to the
+shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked by `shim/lz4.c`).
+Never write the blob over `shim/out/payload.bin`, the raw payload (a header
+promising 0 bytes, so `LOADER cannot unpack the payload`); the checker is
+`tools/check-shim-blob.py IMAGE`.
 
 **The shim is not a no-op, and it can hide kernel bugs.** The full shim runs
 `test_gic()` before the jump: it arms `CNTV_TVAL`, storms until it gives up and
 leaves the UFS warm. With `SMALL_SHIM=1` the kernel arms the timer itself
-(`0173`) and wakes the UFS, and `test_ufs()` faults on a boot from fastboot
-(host powered down), so that build also needs `SHIM_NO_UFS`. Panel showing IRQ
-lines and no `MONDRIAN EARLY` means the shim, not the kernel.
+(`0173`) and wakes the UFS, and `test_ufs()` faults on a fastboot boot, so that
+build also needs `SHIM_NO_UFS`. IRQ lines and no `MONDRIAN EARLY` means the
+shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and reading it back fails; flash a sparse image instead
-(`tools/mk-simg.py`). A recovery is not reachable either: `fastboot boot` of a
-100 MiB image fails with `Bad Buffer Size` and `fastboot reboot recovery` boots
-`boot_b`, so OrangeFox (which fits `recovery_b` exactly) needs a BCB
-`boot-recovery`; read a log with `mondriandump=1` instead.
+(`tools/mk-simg.py`). Recovery is not reachable either: `fastboot boot` of a
+100 MiB image fails `Bad Buffer Size` and `fastboot reboot recovery` boots
+`boot_b`, so OrangeFox needs a BCB `boot-recovery`; read a log with
+`mondriandump=1`.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
@@ -281,8 +283,8 @@ the property list is in `docs/MONDIAN_REFERENCE.md`), so it needs one
 and the ABL's scan is not a driver. The ABL leaves a 43 MiB splash carve-out at
 `0xb8000000` (`0x2b00000`) that the DPU scans; the kernel writes the same memory
 through the early WC alias. The boot arguments call it RAM: keep the frames off
-the free list (`mondrian_page_is_screen()`) or `vm_page_init`'s assert fires.
-`0083` does that; `0085` presents IOSurface swaps through `AppleCLCD` on
+the free list (`mondrian_page_is_screen()`) or `vm_page_init`'s assert fires
+(`0083`); `0085` presents IOSurface swaps through `AppleCLCD` on
 `/arm-io/disp0`.
 
 **A frozen interface is the bootloader's autorefresh.** It leaves
@@ -297,27 +299,26 @@ never completed.
 `CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`; the stores are Normal
 Non-cacheable. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
-`mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and
-`mondrianfb_defer=0` are diagnostics; see `docs/MONDIAN_GPU.md`.
+`mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and `mondrianfb_defer=0`
+are diagnostics (`docs/MONDIAN_GPU.md`).
 
 **Brightness: one DMA path, one low page.** DCS `0x51` reaches an AMOLED panel
 only through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA: the command FIFO
-acks and changes nothing, and a FIFO send wedges the DMA engine for the rest of
-the boot (`INT_CTRL` `0x500`, no `DMA_DONE`) -- reset the command FIFO before
-the next send. Do not write `DSI_CTRL`: `CMD_MODE_EN` on this video-mode
-controller stops the engine reporting completion. `DSI_DMA_CMD_OFFSET` is 32
-bits and the kernel window starts at `0x840000000`, so no allocator can serve
-it; the last page of the splash carve-out, `0xbaaf0000` (`shim/board.h`), is the
-only low page this port owns. `mondrianbl=<DBV>` sets the boot level (0xfff
-full scale), `mondrianblfmt` the byte order, `bl LEVEL [FMT [CMD]]` sets it at
-run time, and `brightness-nits` 0 means "display asleep": honouring it left
-every boot at DBV `0x20` with a dead slider.
+acks and changes nothing, and a FIFO send wedges the DMA engine for the boot
+(`INT_CTRL` `0x500`, no `DMA_DONE`) -- reset the FIFO before the next send. Do
+not write `DSI_CTRL`: `CMD_MODE_EN` on this video-mode controller stops the
+engine reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel
+window starts at `0x840000000`, so the last page of the splash carve-out,
+`0xbaaf0000` (`shim/board.h`), is the only low page this port owns.
+`mondrianbl=<DBV>` (0xfff full scale) and `bl LEVEL [FMT [CMD]]` set the level,
+`mondrianblfmt` the byte order; `brightness-nits` 0 means "display asleep", and
+honouring it left every boot at DBV `0x20` with a dead slider.
 
-**The battery's ADC read is about 100 ms of SPMI polling, so it is not a frame
-task.** `mondrian_spmi_battery_mv()` writes the seven ADC registers and waits
-for EOC up to 40 times; the old kernel called it every 2 s from
-`AppleCLCD::vsyncFired` and that wait is what `1 frame in ~5000 ms` was. `0304`
-reads it on its own thread; brightness is one pending-flag test per tick.
+**The battery's VADC read: sleep, never poll.** ADC7 has no polling mode, so a
+reader that polls the arbiter's EOC word takes the *previous* conversion (0.8 V
+to 11 V in one series), and `DATA0` is the low byte. `0304` waits, checks EOC
+and fault, publishes only a pair that agrees (`sav` prints one), and stays off
+the frame path: in `vsyncFired` that wait was `1 frame in ~5000 ms`.
 
 ## Boot menu and dual boot
 
@@ -332,19 +333,18 @@ GPIO6 on peripheral page `0x8d`, level bit 0, held LOW. A PMIC gpio is its own
 page (`0x88 + index - 1`), and the PON node has no `__symbols__` label: find it
 by the `pon` compatible. Rising edges drive the menu. A refusal prints
 `spmi code N` (1 arbiter, 2 reg-names, 3 regions, 4 missing, 5 count, 6 pon,
-7 ppid, 8 apid, 9 gpios, 10 gpio ppid, 11 gpio apid, 12 vol_up), so one photo
-names the defect.
+7 ppid, 8 apid, 9 gpios, 10 gpio ppid, 11 apid, 12 vol_up): one photo names it.
 
 **The APID table cannot be written from the AP.** It only holds what XBL gave
-EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no
-entry at all (`ppid 0x310`, PM8350B's SMB5) because `pmic_glink` on the ADSP
-reaches those. An `smw` write wedges the arbiter: the SPMI command thread never
-returns and the ADC tick dies with it, while ping still answers. Buttons.
+EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no entry
+at all (`ppid 0x310`, PM8350B's SMB5) because `pmic_glink` on the ADSP reaches
+it. An `smw` write wedges the arbiter: the SPMI thread never returns and the ADC
+tick dies with it, while ping still answers.
 
 ## Other ports worth reading
 
 - **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
-- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, persona hook `0106`;
-  **`oosexgang/hakios-xnu-kernel`** — `eagl.c`, one revision ahead.
+- **Bergamota / Chlorophyll / HackiOS**, **`oosexgang/hakios-xnu-kernel`** —
+  CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead.
 - **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
   TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.

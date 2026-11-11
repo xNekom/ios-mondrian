@@ -591,3 +591,25 @@ index 3201906..5c97004 100644
 +}
 +
  #endif /* MONDRIAN */
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index 5c97004..339b6a3 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -1101,10 +1101,16 @@ AppleCLCD::start(IOService *provider)
+ 		if (level > 4095) {
+ 			level = 4095;
+ 		}
++		int blon = 1;
++
+ 		fmt = (uint32_t)blfmt & 0x1b;
+ 		fBrightLevel = level;
+ 		fBrightFmt = fmt;
+-		fBrightPending = true;
++		(void)PE_parse_boot_argn("mondrianblon", &blon, sizeof(blon));
++		fBrightPending = blon != 0;
++		if (!fBrightPending) {
++			IOLog("MONDRIAN BL: disabled from the command line\n");
++		}
+ 		IOLog("MONDRIAN BL: %d of %u from the command line\n",
+ 		    (int)level, 4095);
+ 	}

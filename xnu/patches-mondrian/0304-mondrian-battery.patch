@@ -687,3 +687,325 @@ index 1a812fd..1298a20 100644
  
  iokit/Kernel/arm/MondrianCPU.cpp                                    optional iokitcpp
  iokit/Kernel/arm/MondrianEntitlements.cpp                           optional iokitcpp
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+index 69516e7..bd58de9 100644
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -61,6 +61,7 @@ extern void mondrian_battery_publish(uint32_t mv, int external, int charging);
+ #define MONDRIAN_SPMI_HZ	20	/* polls a second */
+ #define MONDRIAN_SPMI_RETRIES	2000
+ 
++#define MONDRIAN_SPMI_ADC_US	5000		/* one ADC7 conversion, and margin */
+ #define MONDRIAN_SPMI_CHNLS	0x0c500000u	/* 4 KiB per APID */
+ #define MONDRIAN_SPMI_CHNLS_SIZE 0x1000u
+ #define MONDRIAN_SPMI_VADC_PPID	0x0031u		/* pmk8350@0 vadc@3100 */
+@@ -73,7 +74,8 @@ extern void mondrian_battery_publish(uint32_t mv, int external, int charging);
+ #define MONDRIAN_SPMI_VBUS_SID	3
+ #define MONDRIAN_SPMI_VBUS_CHAN	0x11u		/* usb_in_v_div_16 */
+ #define MONDRIAN_SPMI_VBUS_DIV	16
+-#define MONDRIAN_SPMI_VBUS_MV	3800		/* above: charger present */
++#define MONDRIAN_SPMI_VBUS_ON	4300		/* above: a cable is present */
++#define MONDRIAN_SPMI_VBUS_OFF	4000		/* below: there is none */
+ #define MONDRIAN_SPMI_BATTERY_SECS 2
+ 
+ #define MONDRIAN_SPMI_KEY_POWER	0
+@@ -85,6 +87,8 @@ static uint32_t sp_count;
+ static uint32_t sp_obs_stride = 0x20, sp_map_off = 0x2000, sp_owner_off = 0;
+ static uint16_t sp_pon = 0xffffu, sp_gpio = 0xffffu;
+ static int sp_disabled;
++static bool sp_adc_reported;
++int sp_adc_trace;		/* the ring's "sav" sets it for one call */
+ static volatile uint32_t *sp_chan;	/* the adc's channel window, cached */
+ static uint16_t sp_chan_apid;
+ 
+@@ -183,6 +187,10 @@ sp_adc_wr(uint16_t apid, uint32_t off, uint32_t val)
+ 				printf("MONDRIAN SPMI: adc conversion fault\n");
+ 				return 0;
+ 			}
++			if (sp_adc_trace) {
++				printf("MONDRIAN SPMI: w 0x%02x = 0x%02x st 0x%02x\n",
++				    off, val, st);
++			}
+ 			return 1;
+ 		}
+ 		delay(1);
+@@ -201,11 +209,10 @@ sp_adc_wr(uint16_t apid, uint32_t off, uint32_t val)
+ int
+ mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div)
+ {
+-	uint8_t msb = 0, lsb = 0;
+-	volatile uint32_t *q;
++	uint8_t msb = 0, lsb = 0, st1 = 0;
+ 	uint16_t apid;
+-	uint32_t st = 0, v, code;
+-	unsigned retries, i;
++	uint32_t code;
++	unsigned retries;
+ 
+ 	if (sp_core == NULL || sp_cnfg == NULL || sp_obs == NULL) {
+ 		return -1;			/* sp_map printed its own error */
+@@ -219,6 +226,12 @@ mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div)
+ 		printf("MONDRIAN SPMI: no APID for the adc\n");
+ 		return -1;
+ 	}
++	if (!sp_adc_reported) {
++		sp_adc_reported = true;
++		printf("MONDRIAN SPMI: adc apid %u window 0x%llx\n", apid,
++		    (unsigned long long)MONDRIAN_SPMI_CHNLS +
++		    ((unsigned long long)apid << 12));
++	}
+ 	if (sp_adc_wr(apid, 0x40, sid & 0xffu) == 0 ||	/* ADC_APP_SID */
+ 	    sp_adc_wr(apid, 0x42, 0) == 0 ||
+ 	    sp_adc_wr(apid, 0x43, 0) == 0 ||
+@@ -229,55 +242,94 @@ mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div)
+ 		return -1;
+ 	}
+ 	/*
+-	 * One STATUS1 read is the fast path; a conversion that is not done
+-	 * yet re-reads it up to 40 times, a microsecond apart, until
+-	 * REQ_STS is clear with EOC set. Nothing else starts a conversion:
+-	 * writes 6 and 7 do.
++	 * ADC7 has no polling mode: mainline's adc7_do_conversion waits for the
++	 * end-of-conversion interrupt and reads STATUS1 only for its fault bit.
++	 * Polling the arbiter's status word returns the previous conversion's,
++	 * so the reader used to take a result that was still in flight -- that
++	 * is where 816 mV, 3.2 V and 11 V came from in the same series. Sleep
++	 * past one conversion (263 us in the datasheet, 5 ms here), then ask
++	 * STATUS1 whether a conversion finished and none is pending.
+ 	 */
+-	for (retries = 0; ; ) {
+-		q = (volatile uint32_t *)((char *)sp_obs +
+-		    ((uint32_t)apid << (sp_obs_stride == 0x80 ? 7 : 5)));
+-		q[0] = (1u << 27) | (0x08u << 4);	/* read STATUS1 */
+-		__asm__ volatile("dsb osh" ::: "memory");
+-		for (i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
+-			st = sp_rd(q, 0x08u);
+-			if (st & 1u) {
+-				break;
+-			}
+-			delay(1);
+-		}
+-		if (i == MONDRIAN_SPMI_RETRIES || (st & 0x0eu) != 0) {
++	delay(MONDRIAN_SPMI_ADC_US);
++	for (retries = 0; ; retries++) {
++		if (!sp_read(apid, 0x08, &st1)) {
+ 			return -1;
+ 		}
+-		v = sp_rd(q, 0x18u);
+-		if (v & 0x80u) {
+-			printf("MONDRIAN SPMI: adc conversion fault\n");
+-			return -1;
++		if (sp_adc_trace) {
++			printf("MONDRIAN SPMI: status1 0x%02x retry %u\n",
++			    st1, retries);
++		}
++		if (st1 & 0x80u) {			/* conversion fault */
++			if (retries == 2) {
++				printf("MONDRIAN SPMI: adc conversion fault\n");
++				return -1;
++			}
++			delay(MONDRIAN_SPMI_ADC_US);
++			continue;
+ 		}
+-		if ((v & 0x3u) == 1u) {
++		if ((st1 & 0x3u) == 1u) {		/* EOC set, REQ_STS clear */
+ 			break;
+ 		}
+-		delay(1);
+-		if (++retries == 40) {
++		if (retries == 2) {
+ 			return -1;
+ 		}
++		delay(MONDRIAN_SPMI_ADC_US);
+ 	}
+-	if (!sp_read(apid, 0x50, &msb) || !sp_read(apid, 0x51, &lsb)) {
++	/*
++	 * DATA0 (0x50) is the low byte and DATA1 (0x51) the high one, the
++	 * order the old kernel read them in: its code does (byte from 0x51)
++	 * << 8 | (byte from 0x50) at 0xfffffe00075d89c4. Reading them the
++	 * other way round turns a junk low byte into the high one, which is
++	 * how one sample lands at 11 V and the next at 3.2 V.
++	 */
++	if (!sp_read(apid, 0x50, &lsb) || !sp_read(apid, 0x51, &msb)) {
+ 		return -1;
+ 	}
+ 	code = ((uint32_t)msb << 8) | lsb;
++	if (sp_adc_trace) {
++		printf("MONDRIAN SPMI: data 0x%02x%02x code %u div %u\n",
++		    msb, lsb, code, div);
++	}
+ 	if (code == 0 || code == 0xffffu) {
+ 		return -1;
+ 	}
+ 	return (int)(((div * code * 1875u) + 14450u) / 28900u);
+ }
+ 
++/*
++ * Two conversions that agree are worth more than one smooth-looking wrong
++ * one: a result that has not landed yet is off by volts, not millivolts.
++ * Take up to four and keep the first pair within `span`; -1 when none agree.
++ */
++static int
++sp_adc_pair(uint32_t sid, uint32_t chan, uint32_t div, int span)
++{
++	int first = -1;
++
++	for (int i = 0; i < 4; i++) {
++		int mv = mondrian_spmi_adc_mv(sid, chan, div);
++
++		if (mv < 1) {
++			continue;
++		}
++		if (first < 0) {
++			first = mv;
++			continue;
++		}
++		if (mv > first - span && mv < first + span) {
++			return (first + mv) / 2;
++		}
++		first = mv;
++	}
++	return -1;
++}
++
+ /* vbat through the pack divider: 3.0-4.4 V, or -1 when the sample is bad. */
+ int
+ mondrian_spmi_battery_mv(void)
+ {
+-	int mv = mondrian_spmi_adc_mv(MONDRIAN_SPMI_VBAT_SID,
+-	    MONDRIAN_SPMI_VBAT_CHAN, MONDRIAN_SPMI_VBAT_DIV);
++	int mv = sp_adc_pair(MONDRIAN_SPMI_VBAT_SID,
++	    MONDRIAN_SPMI_VBAT_CHAN, MONDRIAN_SPMI_VBAT_DIV, 120);
+ 
+ 	if (mv < 1) {
+ 		return mv;			/* the ADC already said -1 */
+@@ -289,12 +341,16 @@ mondrian_spmi_battery_mv(void)
+ 	return -1;
+ }
+ 
+-/* The charger's side of the USB divider; no range check, any value is one. */
++/*
++ * The charger's side of the USB divider. The pair span is wide because the
++ * same conversion is 5 V, 0 V or 20 V depending on which channel the pmic
++ * answered with; the thread applies the 4.3 / 4.0 V hysteresis.
++ */
+ int
+ mondrian_spmi_vbus_mv(void)
+ {
+-	return mondrian_spmi_adc_mv(MONDRIAN_SPMI_VBUS_SID,
+-	    MONDRIAN_SPMI_VBUS_CHAN, MONDRIAN_SPMI_VBUS_DIV);
++	return sp_adc_pair(MONDRIAN_SPMI_VBUS_SID,
++	    MONDRIAN_SPMI_VBUS_CHAN, MONDRIAN_SPMI_VBUS_DIV, 800);
+ }
+ 
+ static void
+@@ -372,9 +428,22 @@ mondrian_battery_thread(__unused void *arg, __unused wait_result_t wait)
+ 		if (mv < 1) {
+ 			continue;
+ 		}
++		/*
++		 * A cable is present above 4.3 V and gone below 4.0 V; the gap
++		 * is deliberate, because one bad conversion used to flap the
++		 * status bar between charging and on battery twice a second.
++		 */
+ 		vbus = mondrian_spmi_vbus_mv();
+-		external = vbus > MONDRIAN_SPMI_VBUS_MV;
+-		mondrian_battery_publish((uint32_t)mv, external ? 1 : 0, 0);
++		if (vbus > MONDRIAN_SPMI_VBUS_ON) {
++			external = true;
++		} else if (vbus < MONDRIAN_SPMI_VBUS_OFF) {
++			external = false;
++		} else {
++			external = last_external;
++		}
++		/* On a USB cable the pack charges, however slowly. */
++		mondrian_battery_publish((uint32_t)mv, external ? 1 : 0,
++		    external ? 1 : 0);
+ 		if (external != last_external) {
+ 			last_external = external;
+ 			printf("MONDRIAN BATT: vbus %d mV, external %d\n",
+@@ -438,11 +507,17 @@ mondrian_spmi_probe(void)
+ 		return;
+ 	}
+ 	thread_deallocate(thread);
+-	if (kernel_thread_start(mondrian_battery_thread, NULL, &thread) != KERN_SUCCESS) {
++	int bat = 1;
++
++	if (PE_parse_boot_argn("mondrianbat", &bat, sizeof(bat)) && bat == 0) {
++		printf("MONDRIAN BATT: disabled from the command line\n");
++	} else if (kernel_thread_start(mondrian_battery_thread, NULL, &thread) !=
++	    KERN_SUCCESS) {
+ 		printf("MONDRIAN BATT: no battery thread\n");
+ 		return;
++	} else {
++		thread_deallocate(thread);
+ 	}
+-	thread_deallocate(thread);
+ 	printf("MONDRIAN SPMI: keys arb 0x%x APIDs %u pon %u gpio %u status 0x%02x/0x%02x\n",
+ 	    version, sp_count, sp_pon, sp_gpio, p, g);
+ }
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 6d3e927..b98777e 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1148,7 +1148,8 @@ static void
+ ud_cmd_adc(socket_t so, struct sockaddr_in *to, const char *cmd)
+ {
+ 	uint32_t sid = 3, chan = 0x8fu, div = 3;
+-	const char *p = cmd + 2;
++	extern int sp_adc_trace;
++	const char *p = cmd + (cmd[2] == 'v' ? 3 : 2);
+ 	char out[96];
+ 	int mv, n;
+ 
+@@ -1156,9 +1157,16 @@ ud_cmd_adc(socket_t so, struct sockaddr_in *to, const char *cmd)
+ 	    (p = ud_cmd_num(p, &chan)) != NULL) {
+ 		(void)ud_cmd_num(p, &div);
+ 	}
++	/*
++	 * "sav" is the same conversion with its internals on the ring: the
++	 * seven writes, STATUS1, the end-of-conversion word and both data
++	 * bytes. One boot with "sav" answers what the numbers cannot.
++	 */
++	sp_adc_trace = cmd[2] == 'v';
+ 	mv = mondrian_spmi_adc_mv(sid, chan, div);
+-	n = snprintf(out, sizeof(out), "sa sid %u chan 0x%03x div %u = %d mV\n",
+-	    sid, chan, div, mv);
++	sp_adc_trace = 0;
++	n = snprintf(out, sizeof(out), "sa%s sid %u chan 0x%03x div %u = %d mV\n",
++	    cmd[2] == 'v' ? "v" : "", sid, chan, div, mv);
+ 	ud_cmd_send(so, to, out, (size_t)n);
+ }
+ 
+@@ -1211,7 +1219,15 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 		{
+ 			struct sockaddr_in *peer = (struct sockaddr_in *)&from;
+ 
+-			if (n == 6 && memcmp(cmd, "RLS1", 4) == 0) {
++			/*
++			 * "sav" is "sa" with the conversion's internals on the
++			 * ring; it is matched here, before the chain, because
++			 * 0305 inserts its own branches after the "sa" test.
++			 */
++			if (strncmp(cmd, "sav", 3) == 0 &&
++			    (cmd[3] == 0 || cmd[3] == ' ')) {
++				ud_cmd_adc(so, peer, cmd);
++			} else if (n == 6 && memcmp(cmd, "RLS1", 4) == 0) {
+ 				uint16_t row = (uint16_t)((uint8_t)cmd[4] |
+ 				    ((uint16_t)(uint8_t)cmd[5] << 8));
+ 
+diff --git a/iokit/Kernel/arm/MondrianPower.cpp b/iokit/Kernel/arm/MondrianPower.cpp
+index 0e6663b..32cdba2 100644
+--- a/iokit/Kernel/arm/MondrianPower.cpp
++++ b/iokit/Kernel/arm/MondrianPower.cpp
+@@ -154,8 +154,8 @@ mondrian_legacy_number(OSDictionary *dict, const char *key, uint32_t value)
+ /*
+  * One sample in, one published state out. Every value is derived from that
+  * sample: there is no integration, no charger and no current measurement, so
+- * IsCharging stays false and FullyCharged mirrors external power. A repeated
+- * identical sample publishes and logs nothing.
++ * IsCharging mirrors external power and FullyCharged mirrors it too. A
++ * repeated identical sample publishes and logs nothing.
+  */
+ void
+ MondrianPowerSource::updateState(uint32_t mv, bool external, bool charging)

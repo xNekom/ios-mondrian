@@ -1,8 +1,8 @@
 # Battery, heat and idle
 
-The port boots to SpringBoard with the GPU drawing; what it does not have is a
-battery reading, and it gets hot. Both are measured here, not guessed. This is
-the work list for `docs/MONDIAN_PORT.md` §5.
+The port boots to SpringBoard with the GPU drawing, shows a battery level in the
+status bar, and still gets hot. What it cannot do is charge. Both are measured
+here, not guessed. This is the work list for `docs/MONDIAN_PORT.md` §5.
 
 ## Battery
 
@@ -12,9 +12,11 @@ temp alarm, PBS, pinctrl, BCL, haptics and AMOLED blocks; the charger is
 `PMIC_RTR_ADSP_APPS` rpmsg, and the percentage normally comes from ADSP
 firmware that XNU never starts (`docs/MONDIAN_REFERENCE.md`).
 
-What the AP can read over SPMI, through PMK8350's VADC (SID 0, peripheral
-`0x31`, register `0x3100`, mapping `0x0c42d000`; arbiter v7 layout in
-`shim/spmi.c`):
+What the AP can read over SPMI, through PMK8350's VADC (peripheral `0x31`,
+register base `0x3100`, mapping `0x0c42d000`; arbiter v7 layout in
+`shim/spmi.c`). The ADC itself sits on SID 0 and an `ADC_APP_SID` write picks
+the PMIC whose channel is converted - 3 for the PM8350B, which is why the codes
+below read `0x3xx`:
 
 | channel | ADC | channel code | prescale | use |
 | --- | --- | --- | --- | --- |
@@ -23,41 +25,57 @@ What the AP can read over SPMI, through PMK8350's VADC (SID 0, peripheral
 | `pm8350b_chg_temp` | — | `0x310` | — | `Temperature` |
 
 Pack capacity is **5160 mAh** (`M11A_5160mah` in the vendor model), not
-sweet's 5020. Charging state needs the PM8350B CHGR/QBG registers, which are
-not in the tree and are not documented by the vendor capture yet: publish
-`IsCharging = false` and `ExternalConnected` from `usb_in_v_div_16` until they
-are mapped.
+sweet's 5020.
 
-What iOS asks for: a subclass of `IOPMPowerSource` (matching is
-subclass-aware, so no `AppleSmartBattery` is needed) with
-`BatteryInstalled`, `CurrentCapacity`, `MaxCapacity`, `ExternalConnected`,
-`ExternalChargeCapable`, `IsCharging`, `AtWarnLevel`, `AtCriticalLevel`,
-`Voltage`, `Amperage`, `TimeRemaining` (-1 when unknown), `CycleCount`, and
-`Temperature` in centi-°C, flushed with `updateStatus()` so powerd gets
-`kIOPMMessageBatteryStatusHasChanged`. Sweet's working copy is
-`xnu/patches/0062-sweet-touch-power-battery.patch` (`SweetBattery.cpp`
-618-938 and `sweet_spmi.c` 472-599).
+What the port publishes (`MondrianPowerSource`, ticked from the framebuffer
+every 2 s): `BatteryInstalled`, `CurrentCapacity`/`MaxCapacity` **in mAh**,
+`ExternalConnected` from `usb_in_v_div_16`, and the `AppleRaw*` pair plus the
+legacy `IOBatteryInfo` dictionary, because that is what iOS 16's status bar
+reads. `IsCharging` stays false: nothing on this AP can see the charger.
 
-Order of work. The first draft of step 1 (`MondrianBattery.cpp`, an
-`IOPMPowerSource` subclass publishing 100 %/external before `registerService`,
-registered from `KernelConfigTables`) **compiled but did not boot**: with it
-the kernel returned to fastboot after 24 s, while the same kernel without it
-boots (A/B, same image, same blob). `IOPMPowerSource::init()` does create its
-dictionary, so the cause is not the obvious one and needs its own boot cycle;
-the patch was withdrawn from the series rather than shipped (a kernel that
-does not boot is worse than a missing battery). The code is in the history of
-this file's commit.
+`MaxCapacity = 100` with a 0..100 percentage looks right and is not what powerd
+uses; with the mAh pair the icon tracks the value. One bad ADC sample is enough
+to spoil it for the rest of the boot - 816 mV read once, the curve answered 1%,
+and the icon stayed there - so the reader range-checks vbat (3.0-4.4 V) and
+drops anything outside.
 
-1. Re-do step 1 with the failing path understood: match `IOResources` the way
-   `MondrianHIDButtons` does, publish after `registerService()` instead of
-   inside `start()`, and log at every step so the 24 s failure names itself.
-2. `bsd/dev/mondrian_spmi.c` with an observer for the three VADC channels
-   above; then the percentage replaces the static value.
-3. A read-only probe first prints `SPMI adc ppid apid type sub chsel st1 d0
-   d1` for SID 0 peripheral `0x31` (ADC5 user registers: STATUS1 `0x08`,
-   CH_SEL `0x0a`, DATA0/1) to see whether ABL left a `vbat_sns` conversion
-   live. ADC5 offsets come from mainline `qcom-spmi-adc5.c` and are not
-   verified on this part yet.
+### Reading the VADC
+
+`mondrian_spmi_adc_mv(sid, chan, div)` and the live `sa SID CHAN DIV` command
+over the USB channel share one path; `sav` is the same conversion with its
+internals on the ring (the seven writes, STATUS1, the data bytes). ADC7 has no
+polling mode, so the reader sleeps `MONDRIAN_SPMI_ADC_US` (5 ms) after the
+writes and then requires STATUS1 `EOC` set with `REQ_STS` clear and no fault
+bit: polling earlier returns the previous conversion, which is where 816 mV,
+3.2 V and 11 V in one series came from. `DATA0` (`0x50`) is the **low** byte and
+`DATA1` (`0x51`) the high one -- the old kernel builds `(byte 0x51) << 8 |
+(byte 0x50)`, and swapping them moves a junk low byte into the high one. A
+sample is published only when two conversions agree (120 mV for vbat, 800 for
+vbus). The divider is not a register: it comes from the channel's
+`qcom,pre-scaling`, 3 for `vbat_sns` and 16 for `usb_in_v_div_16`, and one code
+is 1875 mV / 28900. A cable counts as present above 4.3 V and gone below 4.0 V,
+the gap being what keeps the icon from flapping.
+
+### The charger is behind the ADSP
+
+`qcom,battery_charger` hangs off `qcom,pmic_glink`, and `pm8350b@3` in the live
+tree has no `chgr@1000` node at all. The AP's APID table has 540 entries and
+none is `ppid 0x310` (SMB5, SID 3, page 0x10); `sf 0x310` answers that over the
+USB channel. Adding the entry by hand is not a way in - `smw APID MAP OWNER`
+wedges the arbiter, measured twice, and the SPMI command thread never returns -
+so this AP cannot read the charge status or the input current limit, and cannot
+turn charging on. VBUS and vbat are the only charger facts available.
+
+What remains, in order:
+
+1. Measure whether the PMIC still charges after the jump from fastboot: vbat
+   with the panel blanked is the discriminator, and `sa 3 0x11 16` says whether
+   the cable carries 5 V.
+2. Publish `IsCharging` if that measurement shows a rise, and say plainly that
+   a PC port's 500 mA cannot feed a booted phone.
+3. A real charger driver means `pmic_glink` (ADSP firmware and an rpmsg
+   protocol), which is the same piece `docs/MONDIAN_REFERENCE.md` lists as
+   absent; nothing on the AP side substitutes for it.
 
 ## Heat
 
