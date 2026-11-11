@@ -61,6 +61,17 @@ kernel lands in `xnu/out/kernel.development.<board>`; the full log in
 `xnu/out/kernel-linux.log`. A patch that does not apply stops the build instead
 of producing a kernel missing it, which is the failure mode CI had with `0161`.
 
+Nothing else survives. A run whose series hash differs resets and cleans
+`$WORK/xnu` before replaying the series, so a driver edited there and never
+exported to a patch is gone at the next series change; only `$WORK/local` is
+copied back. Measured on 2026-11-11: the DSI command-DMA brightness driver
+(`MONDRIAN BL`, `kMondrianFBSetBrightness`, the `mondrianbl` boot argument) and
+the ring's debug commands (`bl`, `dcs`, `rd`, `dr`/`dw`, `bcb`, `smw`, `sr`/`sw`/
+`si`/`sf`, `sa`, `blob`) lived only in that tree and are missing from
+`xnu/patches-mondrian`, while `xnu/out/kernel.development.mondrian` still has
+them. Export the tree's work to patches before the next build, and check
+`tools/usb-ring.py`'s commands against the phone after it.
+
 Caches (the xnu tree, the fakeroot, the object directory) live in
 `~/.cache/ios-mondrian/xnu-linux`. Deleting `fakeroot/` forces a fresh
 `installhdrs`.

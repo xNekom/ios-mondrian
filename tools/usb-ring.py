@@ -11,8 +11,14 @@ The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
   tap X Y       one synthetic touch, panel pixels (1440x3200)
   swipe X1 Y1 X2 Y2 [MS]
                 a straight synthetic swipe, sampled every 8 ms
-  key N down|up 0 power, 1 volume up, 2 volume down, 3 home
+  key N down|up 0 power, 1 volume up, 2 volume down, 3 home,
+                4 brightness up, 5 brightness down
   screen [FILE] half-scale capture of the panel, as a PNG
+  fps [SECONDS] how often the panel's memory changes: the frames the glass shows
+  sa SID CHAN DIV
+                one PMK8350 VADC channel in mV (sid 3 = PM8350B; the
+                divider is the channel's qcom,pre-scaling, e.g. 3 for
+                vbat_sns <1 3> and 16 for usb_in_v_div_16 <1 16>)
   reboot        flush the ring, point the BCB at the bootloader and reset
 
 Why this exists: the live log on udp/5140 only carries what is written after
@@ -132,6 +138,66 @@ def dump(path, timeout):
     return 0
 
 
+def fps(seconds):
+    """Frames the glass actually shows: how often the panel's memory changes.
+
+    Sampled through the screen dump's row requests, so it needs no new kernel
+    code: a handful of rows spread over the panel, hashed, and counted when
+    the hash changes. Every counter on the phone answers a different
+    question -- `fps` counts swaps, `present` counts the driver's own
+    presents, and the compositor's rate only counts frames that end in the GL
+    shim's flush -- so this is the only one that reads the glass.
+    """
+    rows = (160, 400, 800, 1200, 1600, 2000, 2400, 2800)
+    s = open_socket(1.0)
+    start = time.monotonic()
+    end = start + seconds
+    last = None
+    changes = 0
+    samples = 0
+    worst = 0.0
+    last_change = None
+    try:
+        while time.monotonic() < end:
+            got = {}
+            for attempt in range(3):
+                missing = [row for row in rows if row not in got]
+                if not missing:
+                    break
+                for row in missing:
+                    s.sendto(b"RLS1" + struct.pack("<H", row), PHONE)
+                deadline = time.monotonic() + 0.05
+                while len(got) < len(rows) and time.monotonic() < deadline:
+                    try:
+                        data, _ = s.recvfrom(2048)
+                    except socket.timeout:
+                        break
+                    if len(data) < 6 or data[:4] != ROW_MAGIC:
+                        continue
+                    got[struct.unpack("<H", data[4:6])[0]] = data[6:]
+            if len(got) < len(rows):
+                # (a lost row is retried above; a gadget that answers none is
+                # a real fault and would never leave this loop)
+                print("no screen rows (is the gadget up?)", file=sys.stderr)
+                return 1
+            sig = hash(tuple(got[row] for row in rows))
+            now = time.monotonic()
+            samples += 1
+            if last is not None and sig != last:
+                changes += 1
+                if last_change is not None:
+                    worst = max(worst, now - last_change)
+                last_change = now
+            last = sig
+    finally:
+        s.close()
+    span = time.monotonic() - start
+    print(f"{changes} panel changes in {span:.2f} s, "
+          f"{changes / span:.1f} a second, {samples / span:.0f} samples a second, "
+          f"longest still {worst * 1000:.0f} ms")
+    return 0
+
+
 def touch(x1, y1, x2, y2, ms=0):
     """Panel pixels (1440x3200); ms=0 is a tap, otherwise a swipe."""
     s = open_socket(2.0)
@@ -141,7 +207,7 @@ def touch(x1, y1, x2, y2, ms=0):
 
 
 def key(code, down):
-    """0 power, 1 volume up, 2 volume down, 3 home."""
+    """0 power, 1 vol up, 2 vol down, 3 home, 4/5 brightness up/down."""
     s = open_socket(2.0)
     s.sendto(b"RLK1" + bytes((code, 1 if down else 0)), PHONE)
     s.close()
@@ -242,7 +308,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
                         choices=("dump", "pos", "reboot", "mem", "tap", "swipe",
-                                 "key", "screen"))
+                                 "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "bcb", "blob",
+                                 "fps"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -257,6 +324,8 @@ def main():
     if args.command == "screen":
         path = args.args[0] if args.args else "usb-screen.png"
         return screen(path, args.rows, args.timeout)
+    if args.command == "fps":
+        return fps(float(args.args[0]) if args.args else 5.0)
     if args.command == "pos":
         answer = simple("pos")
         if answer is None:
@@ -267,6 +336,33 @@ def main():
     if args.command == "mem":
         simple("mem")
         print("mem requested: the histogram goes to the live log (udp/5140)")
+        return 0
+    if args.command == "bl":
+        level = int(args.args[0])
+        fmt = int(args.args[1]) if len(args.args) > 1 else 0
+        cmd = int(args.args[2]) if len(args.args) > 2 else 0x51
+        print(simple(f"bl {level} {fmt} {cmd}") or b"")
+        print(f"brightness {level} of 4095, format {fmt}, dcs 0x{cmd:02x}")
+        return 0
+    if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "blob"):
+        answer = simple(" ".join([args.command] + list(args.args)))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command in ("rr", "ww"):
+        answer = simple(" ".join([args.command] + list(args.args)))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command == "dcs":
+        answer = simple("dcs " + " ".join(args.args))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command == "rd":
+        answer = simple("rd " + " ".join(args.args))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command == "bcb":
+        simple("bcb " + " ".join(args.args), 1.0)
+        print("bcb " + " ".join(args.args))
         return 0
     if args.command == "tap":
         x, y = int(args.args[0]), int(args.args[1])

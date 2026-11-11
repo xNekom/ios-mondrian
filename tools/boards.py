@@ -332,8 +332,17 @@ MONDRIAN = Board(
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
+             # The driver's fallback blank: seconds without a present, and the
+             # default of 1 turns the panel off the first second the compositor
+             # is quiet, which is every still screen. 0 keeps the last frame lit
+             # until the power key or the idle timer blinks it.
+             'mondrianfb_blank=0 '
              'mondrian_ui_hook=15 glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
+             # The panel comes up at this DBV (of 4095) on every boot: the
+             # hardware has no saved brightness of its own, and CoreBrightness
+             # starts from its own small value. A quarter of full scale.
+             'mondrianbl=1024 mondrianblfmt=8 '
              'mondrianunlock=1'),
 )
 

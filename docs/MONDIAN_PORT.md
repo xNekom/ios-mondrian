@@ -207,21 +207,20 @@ The panel is command mode, not a scanout the ABL keeps running: it needs one
 "Display"). `0083` reserves the panel memory and `0085` presents IOSurface
 swaps, so the lock screen and the home screen draw. `0084`'s colour bars were a
 one-off packing test, off since `0208`; `0210` paints the kernel log and clears
-the boot splash. Three things had to line up: CoreAnimation waits 30 s for an
-`IOAcceleratorES` service and draws nothing without `TimingElements`/
-`ColorElements` (`0114`); the panel must be written through the console alias
-(an `IOMemoryDescriptor` puts a device pager on managed pages and panics
-`pmap_remove_pv`), and the console is only stopped with `disableConsoleOutput`
-(`0115`); SpringBoard blocks in `-[SBLockdownManager _setupActivationState]` on
-MobileActivation, and the dylib forces activation and skips Setup.
+the boot splash. Three things had to line up: CoreAnimation needs
+`TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`); the
+panel is written through the console alias, which is only stopped with
+`disableConsoleOutput` (`0115`, an `IOMemoryDescriptor` there panics
+`pmap_remove_pv`); and the dylib forces activation past MobileActivation.
 
 Open: the UI is rendered at the panel's own 1440x3200 (480x1066 pt at scale 3);
 the `mondrianfb_canvas_w/h` scaler (`0268`) is an experiment knob, off because a
-smaller canvas made text soft and the UI oversized.
-`0302`/`0303` blank the panel on the power key and on idle sleep
-(fallback `mondrianfb_blank` seconds, default 1; a key or touch wakes the
-first frame), so the last frame no longer stays lit; brightness and the Control
-Center sliders are the open work (`NOTES.md`).
+smaller canvas made text soft and the UI oversized. Smoothness is its own
+document: `docs/UI_PERFORMANCE.md`.
+`0302`/`0303` blank the panel on the power key and on idle sleep; the driver's
+fallback timer (`mondrianfb_blank`) is 0 in the board cmdline, because at its
+default of 1 the panel went dark a second after the compositor went quiet.
+Brightness is open work again: its DSI driver was lost with the build tree.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
@@ -242,7 +241,9 @@ tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`) and
 drives the menu; `0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
 thread polls the PMK8350 PON and PM8350 GPIO6 and publishes both edges through
-`MondrianHIDButtons`. Dual-boot, battery and heat remain (`docs/MONDIAN_POWER.md`).
+`MondrianHIDButtons`. The level comes from the PMIC's VADC and shows on the
+status bar; nothing charges the phone, because the SMB5 is behind the ADSP.
+Dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 
@@ -257,10 +258,8 @@ storage IN endpoint is the next suspect; `usb=1` probes only, USB3/PHY remain.
 
 Boot the mutable shim (`BOARD=mondrian shim/build.sh`, `fastboot boot
 shim/out/shim-boot.img`); the panel prints `FACT` lines for the memory regions
-and the GIC/UFS nodes. Save them and pass the file to `mkadt.py --facts`;
-`tools/boards.py` fills the banks, the UFS host and the GIC from the same dump
-(`parse_facts`, `apply_facts`). `--altmem` selects the upper DDR bank (sweet
-uses it; mondrian boots from the low window).
+and the GIC/UFS nodes. Pass them to `mkadt.py --facts`; `tools/boards.py`
+fills the banks, the UFS host and the GIC from the same dump (`parse_facts`).
 
 ## Boot arguments
 

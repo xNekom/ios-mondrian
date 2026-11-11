@@ -36,36 +36,34 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   error on disk.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
-  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`, a PNG
-  of the whole panel with the glass's shape), injects `tap`/`swipe`/`key` and
-  prints `mem`; `tools/ios-usbnet.sh` sets the host up and streams udp/5140.
+  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
+  `tap`/`swipe`/`key`, measures the glass's frame rate (`fps`) and prints `mem`;
+  `tools/ios-usbnet.sh` sets the host up and streams udp/5140.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
-- **Writable root.** `0090` adds WRITE(10) and the write path;
-  `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The home screen redraws at the panel's 60 fps on its own
-  1440x3200 canvas (480x1066 pt at scale 3) and the compositor commits in
-  bursts, so the tick holds two records (`0282`); `present 0/s` with the panel
-  scanning is idle. CoreAnimation needs `TimingElements`/`ColorElements` and an
-  `IOAcceleratorES` service (`0114`).
+  `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
+  disables writes.
+- **Display and UI.** The home screen draws on its own 1440x3200 canvas
+  (480x1066 pt at scale 3) and the tick holds two records (`0282`). Measured at
+  the glass on 2026-11-11 (`usb-ring.py fps`): 0.2 panel changes a second while
+  a CoreAnimation animation and a swipe run, with every display link at 60 Hz,
+  so `present 0/s` is the compositor fault in `docs/UI_PERFORMANCE.md`, not an
+  idle screen. CoreAnimation needs `TimingElements`/`ColorElements` and an
+  `IOAcceleratorES` service (`0114`); Mesa 25.0.7 draws through freedreno.
 
 Current blockers, in order:
 
-1. **The battery.** No charger code exists, so a boot runs the phone down until
-   power + volume down answers with the charging icon and no fastboot.
-   `mondrianadc=1` prints `MONDRIAN BATT: <mV>` from the PMIC's ADC; the charger
-   (PM8550B on SPMI) is not driven.
+1. **The battery.** Nothing drives the charger: it has no APID in the AP's SPMI
+   table (trap below), so a boot runs the phone down. The level comes from the
+   PMK8350 VADC (`mondrian_spmi_adc_mv()`, `sa SID CHAN DIV` over USB).
 2. **The compositor stops drawing.** Some boots never put a frame on the
    glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
    screen keeps the boot logo. That is the GPU write-target bug in
    `docs/MONDIAN_GPU.md`, not the panel (the tick still runs at 60 Hz). A dirty
    root volume gives the same symptom with no USB at all; see the journal trap.
-3. **Control Center is not broken: our diagnostics were.** `mondrianwin=1`
-   aborted SpringBoard on every open; without it the sheet draws full size, 0
-   crashes. Its slider still ignores taps, and the bottom of the panel shows
-   banded, stretched wallpaper.
-4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem and
-   cameras: what the aborting daemons want.
+3. **Control Center.** `mondrianwin=1` aborted SpringBoard; without it the
+   sheet draws full size. The slider ignores taps and the bottom banding stays.
+4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting
 
@@ -76,23 +74,24 @@ and apply `xnu/patches-mondrian/`; a skipped patch fails the run (the
 workflow's "No skipped patches" step greps the log). Run `tools/apply-series.py`
 (or `tools/check-patches.sh`) after touching the series: it names the patch in
 seconds (`0161` was silently missing until 2026-10-28, `0157` carried its first
-hunk). A mondrian build also needs the local `mondrian_gmu_fw.h`; `0184` stubs
-the user-client surface without the CP profile. Artifacts and the KDK cache
-live outside the reboot-cleared temp directory, and `DXB_DIR` must not contain
-a space (`build.sh` uses it unquoted).
+hunk). **The series is the only source of truth:** a build whose hash changed
+resets that checkout, so a driver edited there and never exported to a patch is
+lost — measured 2026-11-11: the DSI brightness driver and the ring's
+`bl`/`dcs`/`blob` commands went that way (`docs/BUILD_LINUX.md`). A mondrian
+build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the user-client
+surface without the CP profile.
 
 **Apple's clang builtins are load-bearing.** Without `__builtin_xnu_type_*`
 (`tools/wsl/patches/0002` stubs them) every kalloc_type view is a data view, none
 is kept, the iterator that follows asserts (`kalloc.c:1264`) inside
 `kernel_bootstrap` (black panel, no ring), and `0008` returns when none was kept.
-
-**`iig` trap.** A newer Xcode's `iig` regenerates the DriverKit stubs wrong
-(`docs/MONDIAN_GPU.md`); seed them from a build made with Xcode 15.
+A newer Xcode's `iig` also regenerates the DriverKit stubs wrong; seed them from
+a build made with Xcode 15 (`docs/MONDIAN_GPU.md`).
 
 **Image and deploy.** `tools/phone-boot.sh` builds if needed and boots
 volatile; `tools/phone-deploy.sh` (push/install/backup/reboot) is the adb path
-and refuses `boot_a` unless `BOOT_A=1`. `tools/qemu-ios.py` boots the same
-payload; `--kernel` only feeds its decoder (`docs/QEMU_TESTING.md`).
+and refuses `boot_a` unless `BOOT_A=1`; `tools/qemu-ios.py` boots the same
+payload (`docs/QEMU_TESTING.md`).
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
@@ -102,8 +101,8 @@ With the kernel running, `usb=2` and `tools/usb-ring.py dump` read the whole
 ring over USB. On Windows the phone reaches WSL through `usbipd attach --wsl
 --busid <id>` and `cdc_ether`: the host driver was the missing half, and a
 detach/attach is a bus reset the gadget now survives (`0298`).
-A previous boot is read by running the real kernel, then a dump kernel with
-`mondriandump=1` and `mondriandumpmatch=` (`0099` splits the list).
+A previous boot is read by running the real kernel, then a dump kernel
+(`mondriandump=1`, `mondriandumpmatch=`, `0099` splits the list).
 `mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
 above 20 visible after the console is off, so the last line on the panel names
 the function that hung.
@@ -180,17 +179,16 @@ time:
 
 The 4 KiB era left `0056`/`0057`/`0062` (commpage, zone map VA, 32 MiB low globals); they still apply.
 
-**Instructions the platform does not have.** Built once with
-`-march=armv8.5-a+crypto`, the kernel emitted 226 RCpc `ldapr`s; these cores
-have neither RCpc nor pointer authentication, so the phone raised an undefined
-instruction while QEMU's `-cpu max` did not.
+**Instructions the platform does not have.** With `-march=armv8.5-a+crypto` the
+kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
+authentication, so the phone faults where QEMU's `-cpu max` does not.
 
-**QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is reported
-as an *undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg would
-give), so `0061` drops the write; the virtual timer fires only once the guest
-unmasks it for EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing
-IMASK or the level-sensitive PPI storms. There is no RTC service, so
-`IOKitInitializeTime()`'s 30 s `IORTC` wait has to be skipped on this board.
+**QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is an
+*undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg gives), so
+`0061` drops the write; the virtual timer fires once the guest unmasks it for
+EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing IMASK or the
+level-sensitive PPI storms. With no RTC service, `IOKitInitializeTime()`'s 30 s
+`IORTC` wait is skipped on this board.
 
 **Anything mapped with `ml_io_map()` before `STARTUP_SUB_KMEM` dies.** It is a
 bootstrap mapping taken from `virtual_space_start`; once the VM owns that
@@ -273,15 +271,12 @@ The write path is `0090` (WRITE(10), read-modify-write, SYNCHRONIZE CACHE).
 `nent * esz > BOUNCE_SIZE`, a 32-bit product a corrupt table can wrap; guard
 with `nent > BOUNCE_SIZE / esz`.
 
-**HFS+ corruption shows as `hfs_mark_inconsistent` on every metadata access.**
-`fsck.hfsplus -fy` on a copy of the 16 GiB root names the damage: overlapped
-extents, a bad volume bitmap and a wrong free-block count; repeat `-fn` until it
-says `appears to be OK`, then push the changed blocks back. The volume is
-non-journaled (`0x80000100`), so a hard reset dirties it again; once the damage
-reaches the allocation-block count (`Invalid number of allocation blocks`) the
-dump fails fsck and the root has to be rebuilt from a clean image. A zeroed
-extents node (block 2178, `0x882000`) means the same; the live GPT is the single
-`userdata`.
+**HFS+ corruption shows as `hfs_mark_inconsistent`.** `fsck.hfsplus -fy` on a
+copy of the 16 GiB root names the damage (overlapped extents, a bad volume
+bitmap, a wrong free-block count); repeat until it says `appears to be OK`,
+then push the changed blocks back. Once it complains about the allocation-block
+count or the extents node (block 2178, `0x882000`) is zeroed, rebuild the root
+from `backup/ios-root.simg`; the live GPT has a single `userdata`.
 
 ## Display
 
@@ -340,10 +335,16 @@ by the `pon` compatible. Rising edges drive the menu. A refusal prints
 7 ppid, 8 apid, 9 gpios, 10 gpio ppid, 11 gpio apid, 12 vol_up), so one photo
 names the defect.
 
+**The APID table cannot be written from the AP.** It only holds what XBL gave
+EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no
+entry at all (`ppid 0x310`, PM8350B's SMB5) because `pmic_glink` on the ADSP
+reaches those. An `smw` write wedges the arbiter: the SPMI command thread never
+returns and the ADC tick dies with it, while ping still answers. Buttons.
+
 ## Other ports worth reading
 
 - **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
-- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, the persona hook `0106`.
-- **`oosexgang/hakios-xnu-kernel`** — `eagl.c`, one revision ahead.
+- **Bergamota / Chlorophyll / HackiOS** — CPU fallback, persona hook `0106`;
+  **`oosexgang/hakios-xnu-kernel`** — `eagl.c`, one revision ahead.
 - **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
   TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.
