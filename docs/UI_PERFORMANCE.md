@@ -49,24 +49,30 @@ rasterization" note is stale.
 
 ## Three faults
 
-### 1. Interaction can produce no frame at all
+### 1. A synchronous DSI write in the flush path freezes the compositor
 
-The injector's events do reach SpringBoard: a ring `swipe` pushes the home
-screen into the App Library and back (screenshots 0.5 s apart show the
-transition at different points, and the HID service logs `1 client`). What the
-frames do not do is keep up: with a CoreAnimation animation running and a
-2.5 s swipe in flight, the panel's own memory changes 0.2 times a second
-(`tools/usb-ring.py fps`), and `present 0/s`, the compositor's rate and the
-swap counters all agree. Two frames of that transition, half a second apart,
-are enough to see it: the second still holds the black diagonal tear of the
-first.
+Every boot that carried the hand-written DSI command-DMA brightness code (it
+lived only in the local build tree, never in the series, and is gone) read
+`mondrian-gl: rate 1 frames in ~5000 ms` and `present 0/s`, while the panel's
+memory changed 0.2 times a second during a 2.5 s swipe: the transition advanced
+one frame per five seconds. Five seconds is a timeout, not a frame cost.
 
-That is the same fault as the boot that never puts a frame on the glass
-(`backboardd` commits a handful, then goes silent): not an input problem, and
-not a frame-cost problem -- fast frames do not matter when the compositor
-stops asking for them. The state to attack is `CA`'s own commit/present loop
-while a client animates; the display links tick at 60 Hz throughout, in
-`SpringBoard` and in `backboardd`.
+The same tree rebuilt from `xnu/patches-mondrian` alone, with that code absent,
+composites at **24 fps at rest and 60 fps while a swipe animates**, and the
+glass follows: two captures of the panel a second apart differ in 35 000
+pixels at rest, 942 000 during a 2.5 s swipe, and 0 once it settles. So CA's
+commit/present loop, the render server and the panel copy are all healthy on
+this hardware; what stops them is a blocking wait inside the flush or present
+path -- in the measured case, the DSI command-DMA brightness write.
+
+Treat `mondrian-gl: rate` as the frame-path probe: `N frames in ~1000 ms` is a
+healthy compositor, `1 frame in ~5000 ms` means something in that path is
+timing out. The UI hook prints the client side with `mondrianca=1`: one line a
+second from `SpringBoard` and `backboardd`,
+`ca begin N commit N slow N display N loop N`, where `loop` is a 20 Hz timer on
+the main run loop and holds 20 for as long as that loop is serviced. A healthy
+boot commits in bursts (3, 17, 1 a second) and the render server draws at 24 Hz
+between them.
 
 ### 2. The system burns three cores while the UI is idle
 
@@ -100,10 +106,12 @@ gone; the levers are the draw count and the copy-out path
 
 - **Measure the glass, not the counters.** `tools/usb-ring.py fps N` hashes
   eight panel rows over the ring about 30 times a second and counts the
-  changes: that is the frame rate the eye gets. Everything else answers a
-  narrower question -- `fps` counts swaps, `present` counts the driver's own
-  presents, `mondrian-gl: rate` only sees frames that end in the GL shim's
-  flush -- and all three read near zero while the panel visibly changes.
+  changes: that is the frame rate the eye gets. `fps` counts swaps, `present`
+  counts the driver's own presents and `mondrian-gl: rate` only sees frames
+  that end in the GL shim's flush, so each answers a narrower question. The row
+  sampler counts only what moves: a still screen reads 0 while the compositor
+  is healthy, so pair it with two `screen` captures and diff them (PIL is in
+  the WSL image) before calling a boot frozen.
 - **`glwait=0` wedges the board.** Booted 2026-11-11 with `glwait=0`: the
   gadget enumerated and answered for about a minute, then went silent (RX 0, no
   ARP, `fastboot devices` empty) with the kernel still running. Recovering
@@ -131,12 +139,13 @@ gone; the levers are the draw count and the copy-out path
    `MONDRIAN CPU: top name(pid) N% ... in Nms` every 5 s
    (`mondrian_sample.c`). That line is the decisive measurement for fault 2:
    launchd churn, crash reporting, or a kernel thread.
-2. **Where the compositor stops.** Fault 1 is now measured at the glass, so the
-   question is what ends `CA`'s commit/present loop while a client animates:
-   the client commit rate (`CA::Transaction::commit` from the UI hook), the
-   render server's frame work, and what it waits on between two frames. One
-   boot with the hook counting commits per second in `SpringBoard` splits
-   client from server; do not A/B the frame path until that is known.
-3. Only then A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`)
-   on a screen something is actually animating. `glwait=0` is off the table
-   (see the traps).
+2. **Brightness, as a patch and off the frame path.** The driver is missing
+   from the series, so a kernel built today has no `mondrianbl` and the panel
+   keeps whatever DBV the bootloader left. Write it back as a patch
+   (`xnu/patches-mondrian`) that talks to the DSI command DMA once at boot and
+   on request, completes from the interrupt instead of spinning, and never
+   waits inside `present()`/`frame_end`; then confirm `mondrian-gl: rate` is
+   still ~24-60 fps and `usb-ring.py fps` still changes while the UI moves.
+3. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
+   screen something is actually animating. `glwait=0` is off the table (see the
+   traps).

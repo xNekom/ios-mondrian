@@ -44,12 +44,15 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
   disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
-  (480x1066 pt at scale 3) and the tick holds two records (`0282`). Measured at
-  the glass on 2026-11-11 (`usb-ring.py fps`): 0.2 panel changes a second while
-  a CoreAnimation animation and a swipe run, with every display link at 60 Hz,
-  so `present 0/s` is the compositor fault in `docs/UI_PERFORMANCE.md`, not an
-  idle screen. CoreAnimation needs `TimingElements`/`ColorElements` and an
-  `IOAcceleratorES` service (`0114`); Mesa 25.0.7 draws through freedreno.
+  (480x1066 pt at scale 3) and the tick holds two records (`0282`). Measured
+  2026-11-11: a kernel built from the series alone composites at 24 fps at rest
+  and 60 while a swipe animates, and the panel follows (two captures a second
+  apart differ in 35 000 and 942 000 pixels); the boots that carried the
+  hand-written DSI brightness code read `1 frame in ~5000 ms` and put one frame
+  every 5 s on the glass. Never wait on the DSI inside `present()`; the frame
+  meter and this trap are in `docs/UI_PERFORMANCE.md`. CoreAnimation needs
+  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`);
+  Mesa 25.0.7 draws through freedreno.
 
 Current blockers, in order:
 

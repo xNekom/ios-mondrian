@@ -1,10 +1,12 @@
 /* Opt-in containermanagerd/backboardd diagnostics for the mondrian bring-up test. */
 #import <objc/objc.h>
 #import <objc/runtime.h>
+#import <objc/objc-exception.h>
 #import <objc/message.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOKit/IOKitLib.h>
 #import <execinfo.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -13,13 +15,29 @@
 #import <mach/thread_info.h>
 #import <dlfcn.h>
 
+/*
+ * libxpc, declared here: this toolchain's iPhoneOS SDK ships neither the
+ * headers nor libxpc.tbd.
+ */
+typedef struct _xpc_connection_s *xpc_connection_t;
+typedef struct _xpc_object_s *xpc_object_t;
+extern xpc_object_t xpc_connection_send_message_with_reply_sync(
+    xpc_connection_t connection, xpc_object_t message);
+extern const char *xpc_connection_get_name(xpc_connection_t connection);
+
+#include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <pthread.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/sysctl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -39,6 +57,129 @@ say(const char *message)
 	if (console_fd >= 0) {
 		(void)write(console_fd, message, len);
 	}
+}
+
+/*
+ * The peer of the synchronous BoardServices call that freezes SpringBoard.
+ * The main thread waits there and the stack cannot name the service, so every
+ * synchronous call reports before it starts and after it returns; a begin with
+ * no end is the one that never came back.
+ *
+ * This runs in every injected daemon, so it stays out of the others' way: an
+ * earlier version looked the peer up in backboardd too and crash-looped it
+ * (libxpc traps when the name is asked of a connection it considers
+ * unresolved). Only SpringBoard reports, and the others pass straight through.
+ */
+static uint32_t mondrian_xpc_logs;
+static int mondrian_xpc_enabled = -1;
+
+static void
+mondrian_xpc_line(const char *phase, const char *name, long ms)
+{
+	char line[224];
+	int n;
+
+	if (mondrian_xpc_logs >= 200) {
+		return;
+	}
+	mondrian_xpc_logs++;
+	if (ms < 0) {
+		n = snprintf(line, sizeof(line), "MONDRIAN XPC: %s %s\n",
+		    name, phase);
+	} else {
+		n = snprintf(line, sizeof(line), "MONDRIAN XPC: %s %s %ld ms\n",
+		    name, phase, ms);
+	}
+	if (n > 0) {
+		say(line);
+	}
+}
+
+static xpc_object_t
+mondrian_xpc_sync(xpc_connection_t connection, xpc_object_t message)
+{
+	static xpc_object_t (*real)(xpc_connection_t, xpc_object_t);
+	const char *name = "anon";
+	struct timespec began, ended;
+	long ms;
+	xpc_object_t reply;
+
+	if (real == NULL) {
+		real = (xpc_object_t (*)(xpc_connection_t, xpc_object_t))
+		    dlsym(RTLD_NEXT,
+		    "xpc_connection_send_message_with_reply_sync");
+		if (real == NULL) {
+			return NULL;
+		}
+	}
+	if (mondrian_xpc_enabled < 0) {
+		const char *me = getprogname();
+
+		mondrian_xpc_enabled = me != NULL &&
+		    strcmp(me, "SpringBoard") == 0;
+	}
+	if (!mondrian_xpc_enabled) {
+		return real(connection, message);
+	}
+	if (connection != NULL) {
+		const char *known = xpc_connection_get_name(connection);
+
+		if (known != NULL) {
+			name = known;
+		}
+	}
+	mondrian_xpc_line("begin", name, -1);
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	reply = real(connection, message);
+	clock_gettime(CLOCK_MONOTONIC, &ended);
+	ms = (ended.tv_sec - began.tv_sec) * 1000L +
+	    (ended.tv_nsec - began.tv_nsec) / 1000000L;
+	mondrian_xpc_line("end", name, ms);
+	return reply;
+}
+
+#if 0
+/*
+ * Kept for reference only: the interposer wraps a call that this port hangs
+ * inside, and the one boot that reached the lock screen ran without it, so it
+ * stays out of the way until the missing reply is understood.
+ */
+__attribute__((used)) static struct {
+	const void *replacement;
+	const void *replaced;
+} mondrian_interposers[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)mondrian_xpc_sync,
+	  (const void *)xpc_connection_send_message_with_reply_sync },
+};
+#endif
+
+/*
+ * The crash reporter records an uncaught NSException as `ns 2 code 0x6` and a
+ * backtrace that ends in abort(), which names nothing. The preprocessor sees
+ * the exception object before any handler, so the name and the reason land in
+ * the ring; it is bounded because a handled exception is normal control flow.
+ */
+static volatile int mondrian_exc_logs;
+
+static id
+mondrian_exc_pre(id exception)
+{
+	if (mondrian_exc_logs < 24) {
+		id reason = nil;
+		char line[320];
+
+		mondrian_exc_logs++;
+		if (exception != nil &&
+		    [exception respondsToSelector:sel_registerName("reason")]) {
+			reason = ((id (*)(id, SEL))objc_msgSend)(exception,
+			    sel_registerName("reason"));
+		}
+		snprintf(line, sizeof(line), "MONDRIAN UI: raised %s: %s\n",
+		    exception != nil ? object_getClassName(exception) : "?",
+		    reason != nil ? [(NSString *)reason UTF8String] : "(no reason)");
+		say(line);
+	}
+	return exception;
 }
 
 /*
@@ -256,6 +397,91 @@ sample_main_thread_once(mach_port_t target)
 	}
 }
 
+/*
+ * One full stack for the thread that waits on a synchronous XPC reply. The six
+ * hottest addresses stop at libxpc -- mach_msg, libdispatch, xpc -- and the
+ * caller above them is the frame that names the request, so it needs a longer
+ * walk than the hot list keeps. Bounded to eight dumps a boot.
+ */
+static int mondrian_stack_dumps;
+
+static int
+frame_is_xpc(uint64_t addr)
+{
+	Dl_info dl;
+
+	if (dladdr((void *)addr, &dl) == 0 || dl.dli_sname == NULL) {
+		return 0;
+	}
+	return strcmp(dl.dli_sname,
+	    "xpc_connection_send_message_with_reply_sync") == 0;
+}
+
+static void
+dump_xpc_stack(mach_port_t target)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	uint64_t frames[24];
+	uint64_t fp;
+	int n = 0, hit = 0, i;
+
+	if (mondrian_stack_dumps >= 8) {
+		return;
+	}
+	if (thread_get_state(target, ARM_THREAD_STATE64,
+	    (thread_state_t)&state, &count) != KERN_SUCCESS) {
+		return;
+	}
+	frames[n++] = state.__pc;
+	fp = state.__fp;
+	for (i = 0; i < 23 && fp >= 0x100000000ULL; i++) {
+		uint64_t frame[2];
+		vm_size_t out = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
+		    sizeof(frame), (vm_address_t)frame, &out) != KERN_SUCCESS ||
+		    out != sizeof(frame) || frame[1] == 0) {
+			break;
+		}
+		frames[n++] = frame[1];
+		fp = frame[0];
+	}
+	for (i = 0; i < n; i++) {
+		if (frame_is_xpc(frames[i])) {
+			hit = 1;
+		}
+	}
+	if (!hit) {
+		return;
+	}
+	mondrian_stack_dumps++;
+	say("MONDRIAN UI: xpc stack\n");
+	for (i = 0; i < n; i++) {
+		Dl_info dl;
+		char line[220];
+		char image[140];
+		const char *name = "?";
+
+		if (dladdr((void *)frames[i], &dl) != 0) {
+			if (dl.dli_sname != NULL &&
+			    strcmp(dl.dli_sname, "<redacted>") != 0) {
+				name = dl.dli_sname;
+			} else if (dl.dli_fname != NULL) {
+				const char *base = strrchr(dl.dli_fname, '/');
+
+				snprintf(image, sizeof(image), "%s+0x%llx",
+				    base != NULL ? base + 1 : dl.dli_fname,
+				    (unsigned long long)(frames[i] -
+				    (uint64_t)(uintptr_t)dl.dli_fbase));
+				name = image;
+			}
+		}
+		snprintf(line, sizeof(line), "MONDRIAN UI:   #%d %s\n", i, name);
+		say(line);
+	}
+}
+
 static void *
 sampler(void *unused)
 {
@@ -282,6 +508,7 @@ sampler(void *unused)
 			sample_main_thread_once(mondrian_target_thread);
 			usleep(1000);
 		}
+		dump_xpc_stack(mondrian_target_thread);
 		if (thread_info(mondrian_target_thread, THREAD_BASIC_INFO,
 		    (thread_info_t)&info, &icount) == KERN_SUCCESS) {
 			cpu = info.cpu_usage;
@@ -294,6 +521,7 @@ sampler(void *unused)
 		for (k = 0; k < 6 && mondrian_hot_count > 0; k++) {
 			int best = 0;
 			Dl_info dl;
+			char image[160];
 			const char *name = "?";
 
 			for (i = 1; i < mondrian_hot_count; i++) {
@@ -304,9 +532,27 @@ sampler(void *unused)
 			if (mondrian_hot[best].count < 2) {
 				break;
 			}
-			if (dladdr((void *)mondrian_hot[best].addr, &dl) != 0 &&
-			    dl.dli_sname != NULL) {
-				name = dl.dli_sname;
+			/*
+			 * The shared cache ships without symbols, so a frame in a
+			 * system library has no name: print the image it belongs to
+			 * and its offset instead, which still says where the thread
+			 * is waiting.
+			 */
+			if (dladdr((void *)mondrian_hot[best].addr, &dl) != 0) {
+				if (dl.dli_sname != NULL &&
+				    strcmp(dl.dli_sname, "<redacted>") != 0) {
+					name = dl.dli_sname;
+				} else if (dl.dli_fname != NULL) {
+					const char *base = strrchr(dl.dli_fname, '/');
+
+					snprintf(image, sizeof(image),
+					    "%s+0x%llx",
+					    base != NULL ? base + 1 : dl.dli_fname,
+					    (unsigned long long)
+					    (mondrian_hot[best].addr -
+					    (uint64_t)(uintptr_t)dl.dli_fbase));
+					name = image;
+				}
 			}
 			snprintf(line, sizeof(line), "MONDRIAN UI: hot %u %llx %s\n",
 			    mondrian_hot[best].count,
@@ -318,6 +564,398 @@ sampler(void *unused)
 	return NULL;
 }
 
+static int boot_arg_set(const char *name);
+static int boot_arg_int(const char *name, int fallback);
+
+/*
+ * The UI hangs off one clock: CoreAnimation's display link. The compositor
+ * and every app wait for its callback and only commit when it fires, so when
+ * a drag produces one frame instead of sixty, this is the first thing to
+ * measure rather than the last. A CADisplayLink of our own, on the same main
+ * run loop the app uses, counts the ticks per second and prints the period CA
+ * believes the panel has: zero ticks means the link never starts (the vsync
+ * plumbing), sixty ticks with no app frames means the app is not committing.
+ */
+static uint64_t mondrian_dl_total;
+static uint64_t mondrian_dl_total2;      /* the late link */
+static double   mondrian_dl_period;      /* link.duration */
+static double   mondrian_dl_target;      /* targetTimestamp - timestamp */
+static double   mondrian_dl_stamp;
+
+@interface MondrianDisplayLinkProbe : NSObject
+{
+@public
+	BOOL late;
+}
+- (void)arm;
+- (void)tick:(CADisplayLink *)link;
+@end
+
+@implementation MondrianDisplayLinkProbe
+/*
+ * Never from +load: creating the link asks the render server for the panel's
+ * vsync source, and during dyld load that connection does not exist yet, so
+ * the call blocks and with it the main thread (the symptom was SpringBoard
+ * stuck before the Apple logo, not a single frame). Four seconds in, from a
+ * helper thread, the cost of a hang is a quiet probe instead of a dead UI,
+ * and each step says where it stopped.
+ */
+- (void)arm
+{
+	CADisplayLink *link;
+	char line[112];
+	const char *what = late ? "late" : "early";
+
+	snprintf(line, sizeof(line), "MONDRIAN DL[%d]: %s creating\n", getpid(), what);
+	say(line);
+	link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+	if (link == nil) {
+		say("MONDRIAN DL: no display link\n");
+		return;
+	}
+	snprintf(line, sizeof(line), "MONDRIAN DL[%d]: %s created\n", getpid(), what);
+	say(line);
+	if ([link respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
+		link.preferredFramesPerSecond = 60;
+	}
+	[link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+	snprintf(line, sizeof(line), "MONDRIAN DL[%d]: %s armed\n", getpid(), what);
+	say(line);
+}
+
+- (void)tick:(CADisplayLink *)link
+{
+	if (late) {
+		mondrian_dl_total2++;
+	} else {
+		mondrian_dl_total++;
+	}
+	mondrian_dl_period = link.duration;
+	mondrian_dl_stamp = link.timestamp;
+	mondrian_dl_target = link.targetTimestamp - link.timestamp;
+}
+@end
+
+static MondrianDisplayLinkProbe *mondrian_dl_probe;
+static MondrianDisplayLinkProbe *mondrian_dl_probe2;
+
+static void *
+dl_arm(void *unused)
+{
+	(void)unused;
+	sleep(4);
+	[mondrian_dl_probe arm];
+	return NULL;
+}
+
+/*
+ * The same link, 120 s later, once SpringBoard is actually on screen. The
+ * early one is armed while the process is still loading; if the late one ticks
+ * and the early one does not, the problem is the moment, not the display.
+ */
+static void *
+dl_arm_late(void *unused)
+{
+	(void)unused;
+	sleep(120);
+	[mondrian_dl_probe2 arm];
+	return NULL;
+}
+
+/*
+ * When the link does not tick, the question stops being about CA and becomes
+ * "what is the main thread doing instead": the run loop is what delivers the
+ * tick, so a thread that waits two seconds in a synchronous call starves the
+ * link for those two seconds. Symbolicated stack, six dumps a boot.
+ */
+static int mondrian_dl_dumps;
+
+static void
+dl_dump_main(void)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	uint64_t frames[18];
+	uint64_t fp;
+	int n = 0;
+
+	if (mondrian_dl_dumps >= 8) {
+		return;
+	}
+	if (mondrian_main_thread == MACH_PORT_NULL ||
+	    thread_get_state(mondrian_main_thread, ARM_THREAD_STATE64,
+	    (thread_state_t)&state, &count) != KERN_SUCCESS) {
+		say("MONDRIAN DL: main thread state unavailable\n");
+		return;
+	}
+	mondrian_dl_dumps++;
+	say("MONDRIAN DL: main thread stack\n");
+	frames[n++] = state.__pc;
+	fp = state.__fp;
+	for (int i = 0; i < 17 && fp >= 0x100000000ULL; i++) {
+		uint64_t frame[2];
+		vm_size_t out = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
+		    sizeof(frame), (vm_address_t)frame, &out) != KERN_SUCCESS ||
+		    out != sizeof(frame) || frame[1] == 0) {
+			break;
+		}
+		frames[n++] = frame[1];
+		fp = frame[0];
+	}
+	for (int i = 0; i < n; i++) {
+		Dl_info dl;
+		char line[220];
+		char image[140];
+		const char *name = "?";
+
+		if (dladdr((void *)frames[i], &dl) != 0) {
+			if (dl.dli_sname != NULL &&
+			    strcmp(dl.dli_sname, "<redacted>") != 0) {
+				name = dl.dli_sname;
+			} else if (dl.dli_fname != NULL) {
+				const char *base = strrchr(dl.dli_fname, '/');
+
+				snprintf(image, sizeof(image), "%s+0x%llx",
+				    base != NULL ? base + 1 : dl.dli_fname,
+				    (unsigned long long)(frames[i] -
+				    (uint64_t)(uintptr_t)dl.dli_fbase));
+				name = image;
+			}
+		}
+		snprintf(line, sizeof(line), "MONDRIAN DL:   #%d %s\n", i, name);
+		say(line);
+	}
+}
+
+static struct timespec
+dl_now(void)
+{
+	struct timespec ts = { 0, 0 };
+
+	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts;
+}
+
+/*
+ * Thirty minutes at one sample every five seconds. Sixty seconds was not
+ * enough: on this port SpringBoard's startup alone outlasts the report, so the
+ * first version measured the loading phase and stopped before the UI settled.
+ */
+#define MONDRIAN_DL_SECONDS   5
+#define MONDRIAN_DL_SAMPLES   360
+
+static void *
+dl_report(void *unused)
+{
+	uint64_t last = 0;
+	uint64_t last2 = 0;
+	int dumps = 0;
+
+	(void)unused;
+	for (int i = 0; i < MONDRIAN_DL_SAMPLES; i++) {
+		char buf[256];
+		int n;
+		uint64_t rate, rate2;
+		struct timespec ts;
+
+		sleep(MONDRIAN_DL_SECONDS);
+		rate = mondrian_dl_total - last;
+		rate2 = mondrian_dl_total2 - last2;
+		ts = dl_now();
+		n = snprintf(buf, sizeof(buf),
+		    "MONDRIAN DL[%d]: early %llu late %llu ticks/%ds total %llu/%llu now %.3f stamp %.3f\n",
+		    getpid(), (unsigned long long)rate, (unsigned long long)rate2,
+		    MONDRIAN_DL_SECONDS, (unsigned long long)mondrian_dl_total,
+		    (unsigned long long)mondrian_dl_total2,
+		    (double)ts.tv_sec + ts.tv_nsec / 1e9, mondrian_dl_stamp);
+		if (n > 0) {
+			say(buf);
+		}
+		last = mondrian_dl_total;
+		last2 = mondrian_dl_total2;
+		/*
+		 * A quiet window is the interesting one; eight of them is more
+		 * than enough to tell a startup stall from a permanent one.
+		 */
+		if (rate == 0 && i > 2 && dumps < 8 && mondrian_dl_dumps < 8) {
+			dumps++;
+			dl_dump_main();
+		}
+	}
+	return NULL;
+}
+
+static void
+start_display_link_probe(void)
+{
+	pthread_t thread;
+
+	mondrian_dl_probe = [[MondrianDisplayLinkProbe alloc] init];
+	mondrian_dl_probe2 = [[MondrianDisplayLinkProbe alloc] init];
+	mondrian_dl_probe2->late = YES;
+	(void)pthread_create(&thread, NULL, dl_arm, NULL);
+	(void)pthread_create(&thread, NULL, dl_arm_late, NULL);
+	(void)pthread_create(&thread, NULL, dl_report, NULL);
+}
+
+/*
+ * Where a frame stops. A client that never opens a transaction and a render
+ * server that never draws look the same from the glass, and both read
+ * `present 0/s`; these hooks split them. CoreAnimation opens a transaction
+ * around every batch of layer changes an app makes and asks each layer to
+ * display while it flushes one, so the counts per second are the client's
+ * commit rate, not the server's draw rate.
+ */
+static volatile unsigned mondrian_ca_begins;
+static volatile unsigned mondrian_ca_commits;
+static volatile unsigned mondrian_ca_displays;
+static volatile unsigned mondrian_ca_slow;
+static volatile unsigned mondrian_loop_ticks;
+static void (*mondrian_ca_begin_orig)(id, SEL);
+static void (*mondrian_ca_commit_orig)(id, SEL);
+static void (*mondrian_ca_display_orig)(id, SEL);
+
+/*
+ * A timer on the main run loop, in the common modes the UI runs in. It says
+ * whether that run loop is being serviced at all: CoreAnimation's animations
+ * advance from a display link on the same loop, so a link that stops while
+ * this keeps firing means the fault is in the frame path, and both going quiet
+ * means the main thread itself is not running.
+ */
+static void
+mondrian_loop_timer(CFRunLoopTimerRef timer, void *info)
+{
+	(void)timer;
+	(void)info;
+	mondrian_loop_ticks++;
+}
+
+static void
+mondrian_start_loop_probe(void)
+{
+	CFRunLoopTimerRef timer;
+
+	timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.05, 0.05,
+	    0, 0, mondrian_loop_timer, NULL);
+	if (timer == NULL) {
+		say("MONDRIAN UI: loop timer failed\n");
+		return;
+	}
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
+	say("MONDRIAN UI: loop timer armed\n");
+}
+
+static void
+mondrian_ca_begin(id self, SEL cmd)
+{
+	mondrian_ca_begins++;
+	if (mondrian_ca_begin_orig != NULL) {
+		mondrian_ca_begin_orig(self, cmd);
+	}
+}
+
+static void
+mondrian_ca_commit(id self, SEL cmd)
+{
+	struct timespec began, ended;
+	long total;
+
+	mondrian_ca_commits++;
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	if (mondrian_ca_commit_orig != NULL) {
+		mondrian_ca_commit_orig(self, cmd);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &ended);
+	total = (long)(ended.tv_sec - began.tv_sec) * 1000 +
+	    (long)(ended.tv_nsec - began.tv_nsec) / 1000000;
+	if (total > 100) {
+		mondrian_ca_slow++;
+	}
+}
+
+static void
+mondrian_ca_display(id self, SEL cmd)
+{
+	mondrian_ca_displays++;
+	if (mondrian_ca_display_orig != NULL) {
+		mondrian_ca_display_orig(self, cmd);
+	}
+}
+
+static void *
+mondrian_ca_report(void *unused)
+{
+	unsigned begin = 0, commit = 0, display = 0, slow = 0, loop = 0;
+
+	(void)unused;
+	for (;;) {
+		char line[160];
+
+		sleep(1);
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: ca begin %u commit %u slow %u display %u "
+		    "loop %u in 1 s\n",
+		    mondrian_ca_begins - begin, mondrian_ca_commits - commit,
+		    mondrian_ca_slow - slow, mondrian_ca_displays - display,
+		    mondrian_loop_ticks - loop);
+		begin = mondrian_ca_begins;
+		commit = mondrian_ca_commits;
+		slow = mondrian_ca_slow;
+		display = mondrian_ca_displays;
+		loop = mondrian_loop_ticks;
+		say(line);
+	}
+	return NULL;
+}
+
+static void
+mondrian_ca_count(void)
+{
+	Class tx = objc_getClass("CATransaction");
+	Class layer = objc_getClass("CALayer");
+	Method m;
+	pthread_t thread;
+	const char *me = getprogname();
+
+	/*
+	 * The line is one per second per process and the hook runs in every
+	 * injected daemon, so only the two ends of the frame path report.
+	 */
+	if (me == NULL ||
+	    (strcmp(me, "SpringBoard") != 0 && strcmp(me, "backboardd") != 0)) {
+		return;
+	}
+
+	m = tx != Nil ? class_getClassMethod(tx, sel_registerName("begin")) : NULL;
+	if (m != NULL) {
+		mondrian_ca_begin_orig = (void (*)(id, SEL))
+		    method_setImplementation(m, (IMP)mondrian_ca_begin);
+	}
+	m = tx != Nil ? class_getClassMethod(tx, sel_registerName("commit")) : NULL;
+	if (m != NULL) {
+		mondrian_ca_commit_orig = (void (*)(id, SEL))
+		    method_setImplementation(m, (IMP)mondrian_ca_commit);
+	}
+	m = layer != Nil
+	    ? class_getInstanceMethod(layer, sel_registerName("displayIfNeeded")) : NULL;
+	if (m != NULL) {
+		mondrian_ca_display_orig = (void (*)(id, SEL))
+		    method_setImplementation(m, (IMP)mondrian_ca_display);
+	}
+	if (mondrian_ca_begin_orig == NULL && mondrian_ca_commit_orig == NULL &&
+	    mondrian_ca_display_orig == NULL) {
+		say("MONDRIAN UI: ca counters: nothing hooked\n");
+		return;
+	}
+	say("MONDRIAN UI: ca counters installed\n");
+	mondrian_start_loop_probe();
+	if (pthread_create(&thread, NULL, mondrian_ca_report, NULL) != 0) {
+		say("MONDRIAN UI: ca report thread failed\n");
+	}
+}
+
 static void
 start_heartbeat(void)
 {
@@ -325,7 +963,25 @@ start_heartbeat(void)
 
 	mondrian_main_thread = mach_thread_self();
 	(void)pthread_create(&thread, NULL, heartbeat, NULL);
-	(void)pthread_create(&thread, NULL, sampler, NULL);
+	start_display_link_probe();
+	/*
+	 * The stack sampler follows the busiest thread in the process with a
+	 * burst of 200 samples at 1 ms, every 5 s. That suspends the thread it
+	 * is measuring 200 times per burst, which is exactly what the frame
+	 * numbers are trying to see: keep it off unless asked for.
+	 * mondrianmain=1 (the main-thread walk below) is separate.
+	 */
+	if (boot_arg_set("mondrian_ui_sample=1")) {
+		(void)pthread_create(&thread, NULL, sampler, NULL);
+	}
+	/*
+	 * Counting commits and display passes splits the two halves of a
+	 * stopped screen; it is one method call per transaction while on, so it
+	 * stays behind its own boot argument.
+	 */
+	if (boot_arg_set("mondrianca=1")) {
+		mondrian_ca_count();
+	}
 }
 
 static int
@@ -807,6 +1463,10 @@ static int mondrian_unlock_enabled;
 static int mondrian_unlock2_enabled;
 static int mondrian_anim_enabled;
 static int mondrian_anim_started;
+/* The probe layer, so a 60 Hz link can drive it (boot-arg mondriananim=2). */
+static id mondrian_probe_layer;
+static volatile unsigned mondrian_probe_moves;
+static int mondrian_dock_mask;
 static int mondrian_lock_ticks;
 static volatile unsigned mondrian_home_ticks;
 static volatile unsigned mondrian_icon_after_wait;
@@ -1623,13 +2283,54 @@ mondrian_probe_tick(void)
 			}
 		}
 		attached = 1;
-		move = [objc_getClass("CABasicAnimation") animationWithKeyPath:@"position.x"];
-		[move setFromValue:[NSNumber numberWithDouble:60.0]];
-		[move setToValue:[NSNumber numberWithDouble:w - 60.0]];
-		[move setDuration:2.0];
-		[move setAutoreverses:YES];
-		[move setRepeatCount:1e9];
-		[dot addAnimation:move forKey:@"mondrian-move"];
+		mondrian_probe_layer = dot;
+		/*
+		 * `mondriananim=1` runs it as a CoreAnimation animation (the render
+		 * server owns the clock); `=2` moves it from the 60 Hz display link
+		 * in this process, which makes every tick a commit.
+		 */
+		if (mondrian_anim_enabled == 1) {
+			move = [objc_getClass("CABasicAnimation")
+			    animationWithKeyPath:@"position.x"];
+			[move setFromValue:[NSNumber numberWithDouble:60.0]];
+			[move setToValue:[NSNumber numberWithDouble:w - 60.0]];
+			[move setDuration:2.0];
+			[move setAutoreverses:YES];
+			[move setRepeatCount:1e9];
+			[dot addAnimation:move forKey:@"mondrian-move"];
+		}
+		/*
+		 * The probe is a CoreAnimation animation, so the render server runs it
+		 * on its own clock and the client does not have to commit a frame for it
+		 * to move. Reading the presentation layer back every tick therefore
+		 * separates the two halves of a stalled screen: a presentation position
+		 * that changes 60 times a second with a panel that does not means the
+		 * compositor or the present is late; one that changes once a second
+		 * means the animation clock itself is stopped, and no amount of drawing
+		 * would help.
+		 */
+		{
+			static unsigned present_ticks, present_moved;
+			static double present_last;
+			id present = ((id (*)(id, SEL))objc_msgSend)(dot,
+			    sel_registerName("presentationLayer"));
+			double x = present != NULL ?
+			    ((CGPoint (*)(id, SEL))objc_msgSend)(present,
+			    sel_registerName("position")).x : -1.0;
+
+			if (x != present_last) {
+				present_last = x;
+				present_moved++;
+			}
+			if (++present_ticks == 60) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: probe present %u/60 ticks moved x %.0f\n",
+				    present_moved, x);
+				say(line);
+				present_ticks = 0;
+				present_moved = 0;
+			}
+		}
 	}
 	if (red != NULL) {
 		CGColorRelease(red);
@@ -1711,6 +2412,235 @@ mondrian_log_device_state(void)
 }
 
 /*
+ * What the UI thinks the screen is. The Control Center lays itself out from
+ * the screen's point size, so a wrong bounds/scale pair shows up as modules
+ * of the wrong height long before it shows up as a drag that moves the whole
+ * panel (the sliders land in the home-gesture strip). One line per window
+ * plus the Control Center's container frames answers where the layout got its
+ * numbers: `mondriangeom=1`.
+ */
+static int
+mondrian_geom_identity(CATransform3D m)
+{
+	return m.m11 == 1.0 && m.m12 == 0.0 && m.m13 == 0.0 && m.m14 == 0.0 &&
+	    m.m21 == 0.0 && m.m22 == 1.0 && m.m23 == 0.0 && m.m24 == 0.0 &&
+	    m.m31 == 0.0 && m.m32 == 0.0 && m.m33 == 1.0 && m.m34 == 0.0 &&
+	    m.m41 == 0.0 && m.m42 == 0.0 && m.m43 == 0.0 && m.m44 == 1.0;
+}
+
+/*
+ * `mondriancct=1`: the Control Center's grid arrives on the glass about twice
+ * as tall as its own view frames, which is a layer transform the frames do
+ * not show. Walk the Control Center window, say every non-identity transform
+ * and animation, and put the model transforms back to identity: the grid is
+ * static, so nothing there needs one.
+ */
+static unsigned
+mondrian_cc_normalize(id view, unsigned depth, unsigned *changed)
+{
+	id kids, layer;
+	unsigned n, i;
+	char line[192];
+
+	if (view == nil || depth > 10) {
+		return 0;
+	}
+	layer = mondrian_send(view, "layer");
+	if (layer != nil) {
+		CATransform3D t = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("transform"));
+		CATransform3D s = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("sublayerTransform"));
+		id keys = mondrian_send(layer, "animationKeys");
+		unsigned k = keys != nil ? (unsigned)[(NSArray *)keys count] : 0;
+		const char *name = object_getClassName(layer);
+
+		if (!mondrian_geom_identity(t) || !mondrian_geom_identity(s) || k != 0) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: cc norm %s T[%.3f %.3f %.3f %.3f]"
+			    " S[%.3f %.3f %.3f %.3f] anim %u\n",
+			    name != NULL ? name : "?", t.m11, t.m22, t.m33, t.m44,
+			    s.m11, s.m22, s.m33, s.m44, k);
+			say(line);
+			(*changed)++;
+			if (!mondrian_geom_identity(t)) {
+				((void (*)(id, SEL, CATransform3D))objc_msgSend)(layer,
+				    sel_registerName("setTransform:"), CATransform3DIdentity);
+			}
+			if (!mondrian_geom_identity(s)) {
+				((void (*)(id, SEL, CATransform3D))objc_msgSend)(layer,
+				    sel_registerName("setSublayerTransform:"),
+				    CATransform3DIdentity);
+			}
+			if (k != 0) {
+				((void (*)(id, SEL))objc_msgSend)(layer,
+				    sel_registerName("removeAllAnimations"));
+			}
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_cc_normalize([(NSArray *)kids objectAtIndex:i], depth + 1, changed);
+	}
+	return *changed;
+}
+
+static void
+mondrian_geom_walk(id view, unsigned depth, unsigned *lines)
+{
+	CGRect frame;
+	id kids, layer;
+	unsigned n, i;
+	char line[224];
+	const char *name;
+
+	if (view == nil || depth > 6 || *lines >= 160) {
+		return;
+	}
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	name = object_getClassName(view);
+	(*lines)++;
+	n = depth < 10 ? depth : 10;
+	memset(line, ' ', n);
+	snprintf(line + n, sizeof(line) - n, "%s %.1fx%.1f at %.1f,%.1f\n",
+	    name != NULL ? name : "?", frame.size.width, frame.size.height,
+	    frame.origin.x, frame.origin.y);
+	say(line);
+	layer = mondrian_send(view, "layer");
+	if (layer != nil && depth <= 5) {
+		CATransform3D t = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("transform"));
+		CATransform3D s = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("sublayerTransform"));
+		id keys = mondrian_send(layer, "animationKeys");
+		unsigned k = keys != nil ? (unsigned)[(NSArray *)keys count] : 0;
+		const char *lname = object_getClassName(layer);
+
+		if (!mondrian_geom_identity(t) || !mondrian_geom_identity(s) || k != 0) {
+			memset(line, ' ', n + 1);
+			snprintf(line + n + 1, sizeof(line) - n - 1,
+			    "L %s T[%.3f %.3f %.3f %.3f] S[%.3f %.3f %.3f %.3f] anim %u\n",
+			    lname != NULL ? lname : "?", t.m11, t.m22, t.m33, t.m44,
+			    s.m11, s.m22, s.m33, s.m44, k);
+			say(line);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n && *lines < 160; i++) {
+		mondrian_geom_walk([(NSArray *)kids objectAtIndex:i], depth + 1, lines);
+	}
+}
+
+static void
+mondrian_log_screen_geometry(void)
+{
+	Class screen_cls = objc_getClass("UIScreen");
+	Class app_cls = objc_getClass("UIApplication");
+	id screen = nil;
+	id app = nil;
+	char line[256];
+	unsigned i;
+
+	if (screen_cls != Nil) {
+		Method method = class_getClassMethod(screen_cls,
+		    sel_registerName("mainScreen"));
+
+		if (method != NULL) {
+			screen = ((id (*)(id, SEL))method_getImplementation(method))(
+			    (id)screen_cls, sel_registerName("mainScreen"));
+		}
+	}
+	if (screen != nil) {
+		CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("bounds"));
+		CGRect native = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("nativeBounds"));
+		CGFloat scale = ((CGFloat (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("scale"));
+		CGFloat native_scale = ((CGFloat (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("nativeScale"));
+		id modes = mondrian_send(screen, "availableModes");
+		unsigned count = modes != nil ? (unsigned)[(NSArray *)modes count] : 0;
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: geom screen %.1fx%.1f at %.1f,%.1f scale %.3f"
+		    " native %.1fx%.1f scale %.3f modes %u\n",
+		    bounds.size.width, bounds.size.height, bounds.origin.x,
+		    bounds.origin.y, scale, native.size.width, native.size.height,
+		    native_scale, count);
+		say(line);
+		for (i = 0; i < count && i < 6; i++) {
+			id mode = [(NSArray *)modes objectAtIndex:i];
+			CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(mode,
+			    sel_registerName("size"));
+			CGSize pixels = CGSizeZero;
+
+			if ([mode respondsToSelector:sel_registerName("pixelSize")]) {
+				pixels = ((CGSize (*)(id, SEL))objc_msgSend)(mode,
+				    sel_registerName("pixelSize"));
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: geom mode %u %.1fx%.1f pixel %.1fx%.1f\n",
+			    i, size.width, size.height, pixels.width, pixels.height);
+			say(line);
+		}
+	}
+	if (app_cls != Nil) {
+		Method method = class_getClassMethod(app_cls,
+		    sel_registerName("sharedApplication"));
+
+		if (method != NULL) {
+			app = ((id (*)(id, SEL))method_getImplementation(method))(
+			    (id)app_cls, sel_registerName("sharedApplication"));
+		}
+	}
+	if (app == nil) {
+		return;
+	}
+	{
+		id windows = mondrian_send(app, "windows");
+		unsigned count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+
+		for (i = 0; i < count; i++) {
+			id window = [(NSArray *)windows objectAtIndex:i];
+			CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("frame"));
+			CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("bounds"));
+			BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("isHidden"));
+			CGFloat level = ((CGFloat (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("windowLevel"));
+			const char *name = object_getClassName(window);
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: geom window %u %s frame %.1fx%.1f at %.1f,%.1f"
+			    " bounds %.1fx%.1f level %.1f hidden %d\n",
+			    i, name != NULL ? name : "?", frame.size.width,
+			    frame.size.height, frame.origin.x, frame.origin.y,
+			    bounds.size.width, bounds.size.height, level, (int)hidden);
+			say(line);
+		}
+		for (i = 0; i < count; i++) {
+			id window = [(NSArray *)windows objectAtIndex:i];
+			const char *name = object_getClassName(window);
+			unsigned lines = 0;
+
+			if (name == NULL || (strstr(name, "ControlCenter") == NULL &&
+			    strstr(name, "CCUI") == NULL)) {
+				continue;
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: geom cc window %s\n", name);
+			say(line);
+			mondrian_geom_walk(window, 0, &lines);
+		}
+	}
+}
+
+/*
  * One probe, once, whatever the lock state: the home screen is built behind
  * the lock screen too, and the unlock is the flakiest step in this port
  * (ring221 never left the lock screen at all). Probing from both branches is
@@ -1746,6 +2676,14 @@ mondrian_layer_round(id layer, double radius)
 	}
 }
 
+/*
+ * `mondriandockmask=1`. A mask layer filled with a colour is rounded by its own
+ * corner radius, so no path is needed, and because the mask is applied to the
+ * material's layer the backdrop underneath is clipped with it -- which the
+ * radius alone and `clipsToBounds` did not do (measured: the bar stayed
+ * square). The mask is set once per layer, not every pass: creating one dirties
+ * the tree, and a material view recomposites its backdrop when it changes.
+ */
 static void
 mondrian_layer_mask_round(id layer, CGRect bounds, double radius)
 {
@@ -1759,12 +2697,6 @@ mondrian_layer_mask_round(id layer, CGRect bounds, double radius)
 	if (mask == NULL || colour == NULL) {
 		return;
 	}
-	/*
-	 * A mask layer filled with a colour is rounded by its own corner
-	 * radius, so no path is needed, and because the mask is applied to the
-	 * material's layer the backdrop layer underneath is clipped with it --
-	 * which `clipsToBounds` did not do (measured: the bar stayed square).
-	 */
 	[mask setFrame:bounds];
 	[mask setCornerRadius:radius];
 	[mask setBackgroundColor:[colour CGColor]];
@@ -1819,9 +2751,23 @@ mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
 			id sub = [(NSArray *)kids objectAtIndex:k];
 			CGRect sf = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
 			    sel_registerName("frame"));
-			CGRect bounds;
 			id sl;
 			double br;
+			CGRect bounds = CGRectZero;
+			id mask = nil;
+
+			/*
+			 * `mondriandockmask=1` rounds the material through a mask
+			 * layer instead of the radius on its own layer, which is the
+			 * only thing that clipped the blur (measured: the radius and
+			 * `clipsToBounds` left the bar square). It is a knob because a
+			 * mask forces the layer to be composited offscreen, so the
+			 * blur is paid on every frame the home screen draws: measure
+			 * it with `mondriananim=1` before making it the default.
+			 */
+			if (mondrian_dock_mask) {
+				mask = mondrian_send(sub, "mask");
+			}
 
 			if (subs_told < 6) {
 				char line[192];
@@ -1853,10 +2799,12 @@ mondrian_dock_walk(id view, unsigned depth, unsigned *seen)
 			 * it is 94 tall and wants its own.
 			 */
 			br = sf.size.height * 0.3;
-			bounds = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
-			    sel_registerName("bounds"));
 			mondrian_layer_round(sl, br);
-			mondrian_layer_mask_round(sl, bounds, br);
+			if (mondrian_dock_mask && mask == nil) {
+				bounds = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+				    sel_registerName("bounds"));
+				mondrian_layer_mask_round(sl, bounds, br);
+			}
 			done++;
 		}
 	}
@@ -1898,7 +2846,7 @@ mondrian_icon_probe_once(void)
 		return;
 	}
 	mondrian_icon_late_report();
-	if (mondrian_live_count == 0 && ++attempts < 10) {
+	if (mondrian_live_count == 0 && ++attempts < 45) {
 		return;
 	}
 	mondrian_icon_late_done = 1;
@@ -1937,6 +2885,152 @@ mondrian_icon_probe_once(void)
  * `lock screen up` for the whole boot after a single request -- so it is
  * repeated twice more, a minute apart, and the log says which attempt it was.
  */
+static unsigned mondrian_unlock_attempts;
+
+/*
+ * Window geometry and touch routing. A sheet that draws at the wrong size and
+ * a sheet that ignores touches are the same question - what frame does UIKit
+ * think the window has, and which window gets the point - so both are printed
+ * from here: the window list (frame, level, scene coordinate space, root view)
+ * and, for windows above the normal level (the ones that draw the sheets), the
+ * result of -hitTest:withEvent: for the first touches after the boot.
+ */
+static int mondrian_win_logs;
+static int mondrian_hit_logs;
+static id (*mondrian_hit_orig)(id, SEL, CGPoint, id);
+
+static void
+mondrian_dump_windows(const char *why)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	id app;
+	id windows;
+	unsigned count, i;
+	char line[288];
+
+	if (app_cls == Nil) {
+		return;
+	}
+	app = mondrian_send((id)app_cls, "sharedApplication");
+	if (app == nil) {
+		return;
+	}
+	windows = mondrian_send(app, "windows");
+	if (windows == nil) {
+		return;
+	}
+	count = (unsigned)[(NSArray *)windows count];
+	snprintf(line, sizeof(line), "MONDRIAN UI: %s windows %u\n", why, count);
+	say(line);
+	for (i = 0; i < count && i < 14; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+		const char *scene_name = "-";
+		const char *root_name = "-";
+		CGRect frame, bounds, scene_bounds = { { 0, 0 }, { 0, 0 } };
+		CGFloat level = 0.0;
+		CGFloat scale = 0.0;
+		BOOL hidden = 0;
+		id scene, root;
+
+		frame = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("frame"));
+		bounds = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("bounds"));
+		level = ((CGFloat (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("windowLevel"));
+		scale = ((CGFloat (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("contentScaleFactor"));
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("isHidden"));
+		scene = mondrian_send(window, "windowScene");
+		if (scene != nil) {
+			id space = mondrian_send(scene, "coordinateSpace");
+			scene_name = object_getClassName(scene);
+			if (space != nil) {
+				scene_bounds = ((CGRect (*)(id, SEL))objc_msgSend)(space,
+				    sel_registerName("bounds"));
+			}
+		}
+		root = mondrian_send(window, "rootViewController");
+		if (root != nil) {
+			root_name = object_getClassName(root);
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: win %u %s %.0fx%.0f at %.0f,%.0f b %.0fx%.0f"
+		    " lvl %.0f sc %.2f hid %d scene %s %.0fx%.0f root %s\n",
+		    i, name != NULL ? name : "?", frame.size.width,
+		    frame.size.height, frame.origin.x, frame.origin.y,
+		    bounds.size.width, bounds.size.height, level, scale, hidden,
+		    scene_name, scene_bounds.size.width, scene_bounds.size.height,
+		    root_name);
+		say(line);
+	}
+}
+
+/*
+ * Only the windows above the normal level are logged: those are the ones that
+ * draw the sheets (Control Center, Spotlight, the keyboard's window) and the
+ * ones a log of the main window's hits would drown. `nil` for the hit means
+ * the point fell outside that window - the answer when a sheet ignores a
+ * touch.
+ */
+static id
+mondrian_hit_test(id self, SEL cmd, CGPoint point, id event)
+{
+	id hit = mondrian_hit_orig != NULL ?
+	    mondrian_hit_orig(self, cmd, point, event) : nil;
+	CGFloat level = 0.0;
+
+	if (mondrian_hit_logs >= 48) {
+		return hit;
+	}
+	level = ((CGFloat (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("windowLevel"));
+	if (level == 0.0) {
+		return hit;
+	}
+	mondrian_hit_logs++;
+	{
+		char line[224];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: hit %s lvl %.0f at %.0f,%.0f -> %s\n",
+		    object_getClassName(self), level, point.x, point.y,
+		    hit != nil ? object_getClassName(hit) : "nil");
+		say(line);
+	}
+	return hit;
+}
+
+static void
+install_window_hooks(void)
+{
+	Class cls = objc_getClass("UIWindow");
+	Method m;
+
+	/*
+	 * Off by default, and on its own argument: the boot that opened Control
+	 * Center with it aborted SpringBoard 24 times, while the same build
+	 * without it draws the sheet with no crash. `mondrianwin=1` (the window
+	 * dump) stays separate, so the geometry can be read without this hook
+	 * in the touch path.
+	 */
+	if (!boot_arg_set("mondrianhit=1")) {
+		return;
+	}
+	if (cls != Nil) {
+		m = class_getInstanceMethod(cls, sel_registerName("hitTest:withEvent:"));
+		if (m != NULL) {
+			mondrian_hit_orig = (id (*)(id, SEL, CGPoint, id))
+			    method_setImplementation(m, (IMP)mondrian_hit_test);
+		}
+	}
+	say(mondrian_hit_orig != NULL ?
+	    "MONDRIAN UI: window hitTest hooked\n" :
+	    "MONDRIAN UI: window hitTest not hooked\n");
+}
+
 static void
 mondrian_lock_step(void *context)
 {
@@ -1950,6 +3044,8 @@ mondrian_lock_step(void *context)
 	id manager;
 	BOOL locked;
 	char line[96];
+	id app;
+	Method idle_method;
 
 	(void)context;
 	mondrian_lock_step_pending = 0;
@@ -1963,9 +3059,70 @@ mondrian_lock_step(void *context)
 	if (method == NULL) {
 		return;
 	}
-	if (((id (*)(id, SEL))method_getImplementation(method))((id)app_cls, app_sel) == nil) {
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls, app_sel);
+	if (app == nil) {
 		/* still starting: the next tick retries */
 		return;
+	}
+	if (boot_arg_set("mondrianwin=1")) {
+		static unsigned win_ticks;
+
+		if ((win_ticks++ % 5) == 1) {
+			mondrian_dump_windows("win tick");
+		}
+	} else if (mondrian_win_logs < 2) {
+		if ((mondrian_win_logs++ == 0) || (mondrian_lock_ticks % 5) == 0) {
+			mondrian_dump_windows("win early");
+		}
+	}
+	if (boot_arg_set("mondriangeom=1")) {
+		static unsigned geom_ticks;
+
+		if ((geom_ticks++ % 10) == 1) {
+			mondrian_log_screen_geometry();
+		}
+	}
+	if (boot_arg_set("mondriancct=1")) {
+		id windows = mondrian_send(app, "windows");
+		unsigned count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+		unsigned wi;
+
+		for (wi = 0; wi < count; wi++) {
+			id window = [(NSArray *)windows objectAtIndex:wi];
+			const char *name = object_getClassName(window);
+			unsigned changed = 0;
+
+			if (name == NULL || strstr(name, "ControlCenter") == NULL) {
+				continue;
+			}
+			if (((BOOL (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("isHidden"))) {
+				continue;
+			}
+			mondrian_cc_normalize(window, 0, &changed);
+			if (changed != 0) {
+				char line[96];
+
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: cc normalized %u layers\n", changed);
+				say(line);
+			}
+		}
+	}
+	/*
+	 * Keep the display awake. Nothing in this userland ever asks for it:
+	 * SpringBoard arms its idle timer a minute after the UI settles, the
+	 * backlight state goes off, and every CADisplayLink in the system stops
+	 * even though the panel keeps the last frame (measured: frames stop at
+	 * ts 138 s, fifty seconds after the unlock, and no touch brings them
+	 * back). The public property is the documented switch for it; setting
+	 * it every two seconds survives a userland that clears it.
+	 */
+	idle_method = class_getInstanceMethod(app_cls,
+	    sel_registerName("setIdleTimerDisabled:"));
+	if (idle_method != NULL) {
+		((void (*)(id, SEL, BOOL))method_getImplementation(idle_method))(
+		    app, sel_registerName("setIdleTimerDisabled:"), YES);
 	}
 	method = class_getClassMethod(cls, shared_sel);
 	if (method == NULL) {
@@ -2036,11 +3193,16 @@ mondrian_lock_step(void *context)
 		mondrian_log_device_state();
 	}
 	/*
-	 * A minute in, ask the icon views even if the unlock has not taken: the
-	 * report is read-only and a locked boot is still a boot that can say
-	 * whether the artwork exists.
+	 * A minute in and every step after it: the home screen tree is behind
+	 * the lock screen, and the artwork is wanted *there*. The paint pass
+	 * used to wait for the unlock, which put eight PNG reads and their
+	 * decode in the same two seconds as the unlock animation: the transition
+	 * then held 4-10 frames a second (ring252, the first ten seconds after
+	 * `lock screen gone`) while a drag on the lock screen held 1.3. Painting while
+	 * locked moves that work to a moment when nothing is moving. The report
+	 * is read-only until the tree has live views, so it is safe to ask early.
 	 */
-	if (mondrian_lock_ticks == 30) {
+	if (mondrian_lock_ticks >= 10) {
 		mondrian_icon_probe_once();
 	}
 	if (mondrian_lock_ticks == 12 && mondrian_anim_enabled && !mondrian_anim_started &&
@@ -2055,18 +3217,25 @@ mondrian_lock_step(void *context)
 		}
 		return;
 	}
-	if (mondrian_lock_ticks != 10 && mondrian_lock_ticks != 30 &&
-	    mondrian_lock_ticks != 50) {
-		return;			/* three attempts, twenty seconds apart */
+	/*
+	 * First attempt twenty seconds in, then one a minute: a display that
+	 * slept before the idle timer was disabled locks again, and the home
+	 * screen has to come back without a reboot.
+	 */
+	if (mondrian_lock_ticks < 10 ||
+	    (mondrian_lock_ticks > 10 && (mondrian_lock_ticks % 30) != 0)) {
+		return;
 	}
 	method = class_getInstanceMethod(cls, request_sel);
 	if (method != NULL) {
 		((void (*)(id, SEL))method_getImplementation(method))(manager, request_sel);
-		snprintf(line, sizeof(line),
-		    "MONDRIAN UI: unlock requested (lock screen view, attempt %u)\n",
-		    (mondrian_lock_ticks == 10) ? 1u
-		    : (mondrian_lock_ticks == 30) ? 2u : 3u);
-		say(line);
+		if (mondrian_unlock_attempts < 10) {
+			mondrian_unlock_attempts++;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: unlock requested (lock screen view, attempt %u)\n",
+			    mondrian_unlock_attempts);
+			say(line);
+		}
 	} else {
 		say("MONDRIAN UI: lockScreenViewControllerRequestsUnlock missing\n");
 	}
@@ -2126,7 +3295,17 @@ mondrian_unlock_run(void *unused)
 		mondrian_unlock_enabled = 1;
 	}
 	mondrian_unlock2_enabled = boot_arg_set("mondrianunlock2=1") != 0;
-	mondrian_anim_enabled = boot_arg_set("mondriananim=1") != 0;
+	mondrian_anim_enabled = boot_arg_int("mondriananim=", 0);
+	/*
+	 * The dock's mask is on: measured against a home screen drawing every frame
+	 * (`mondriananim=1`), it cost nothing at the panel -- 59.7 fps over 180 s,
+	 * 172 seconds at exactly 60, `pgap over30` 0.06 a second (ring257) against
+	 * 59.9 and 0.05 without it (ring256). It makes the renderer burstier (11
+	 * ticks a second got two records and 11 got none, against 60 one-record
+	 * ticks) and the two-deep queue absorbs exactly that. `mondriandockmask=0`
+	 * turns it off.
+	 */
+	mondrian_dock_mask = boot_arg_set("mondriandockmask=0") == 0;
 	{
 		unsigned stuck = 0;
 
@@ -2311,6 +3490,172 @@ install_activation_hooks(void)
 }
 
 /*
+ * The frame rate a display link asks for.
+ *
+ * UIKit runs the animations an application does in its own process (a home
+ * screen page settling after a swipe among them) from a CADisplayLink whose
+ * target is UIViewInProcessAnimationManager, and asks that link for 20..30 a
+ * second: on a ProMotion iPhone the lower rate saves power. This panel
+ * refreshes at 60 whatever is drawn, so the animation runs at half the panel
+ * and a page that settles looks like it steps -- measured on the SM8475 port
+ * this comes from (UniXNU-zizhan, 42629e5d): the same image, only the target
+ * name matched, went from 56.7 fps with the presentation interval at 16.59 ms
+ * to 95.3 fps at 8.33 ms. Its first version matched only the Objective-C
+ * spelling and did nothing, because the class in the device runtime is the
+ * Swift one, "UIKit.InProcessAnimationManager"; both are matched here.
+ *
+ * Only that link loses its rate. The clock's and the motion effects' keep
+ * theirs: run at the panel's rate they wake SpringBoard six times as often
+ * for nothing. mondrianlinkfull=0 keeps every rate (the A/B);
+ * mondrianlinksay=1 says every link made and every rate asked of one.
+ */
+typedef struct {
+	float minimum, maximum, preferred;
+} mondrian_frame_rate_range;
+
+static id (*mondrian_original_link_with_target)(id, SEL, id, SEL);
+static void (*mondrian_original_link_set_fps)(id, SEL, long);
+static void (*mondrian_original_link_set_range)(id, SEL,
+    mondrian_frame_rate_range);
+static int mondrian_link_full_rate = 1;
+static int mondrian_link_say;
+static unsigned mondrian_link_said;
+static char mondrian_link_full_key;
+
+static const char *
+mondrian_link_caller(const void *address, char *buffer, size_t size)
+{
+	Dl_info info;
+	const char *image;
+
+	if (dladdr(address, &info) == 0 || info.dli_fname == NULL) {
+		snprintf(buffer, size, "%p", address);
+		return buffer;
+	}
+	image = strrchr(info.dli_fname, '/') ? strrchr(info.dli_fname, '/') + 1 :
+	    info.dli_fname;
+	snprintf(buffer, size, "%s+%#lx", image,
+	    (unsigned long)((uintptr_t)address - (uintptr_t)info.dli_fbase));
+	return buffer;
+}
+
+static int
+mondrian_link_at_full_rate(id link)
+{
+	return mondrian_link_full_rate &&
+	    objc_getAssociatedObject(link, &mondrian_link_full_key) != nil;
+}
+
+static id
+mondrian_link_with_target(id self, SEL selector, id target, SEL action)
+{
+	id link = mondrian_original_link_with_target(self, selector, target,
+	    action);
+	char who[160];
+
+	if (link != NULL && target != NULL) {
+		const char *name = object_getClassName(target);
+
+		if (strcmp(name, "UIViewInProcessAnimationManager") == 0 ||
+		    strcmp(name, "UIKit.InProcessAnimationManager") == 0) {
+			objc_setAssociatedObject(link, &mondrian_link_full_key,
+			    (id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
+		}
+	}
+	if (mondrian_link_say && mondrian_link_said++ < 120) {
+		char line[260];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: display link %p made for -[%s %s] by %s\n",
+		    (void *)link, target ? object_getClassName(target) : "nil",
+		    action ? sel_getName(action) : "",
+		    mondrian_link_caller(__builtin_return_address(0), who,
+		    sizeof(who)));
+		say(line);
+	}
+	return link;
+}
+
+static void
+mondrian_link_set_fps(id self, SEL selector, long fps)
+{
+	char who[160];
+
+	if (mondrian_link_say && mondrian_link_said++ < 120) {
+		char line[200];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: display link %p asked for %ld a second%s by %s\n",
+		    (void *)self, fps,
+		    mondrian_link_at_full_rate(self) ? " (dropped)" : "",
+		    mondrian_link_caller(__builtin_return_address(0), who,
+		    sizeof(who)));
+		say(line);
+	}
+	mondrian_original_link_set_fps(self, selector,
+	    mondrian_link_at_full_rate(self) ? 0 : fps);
+}
+
+static void
+mondrian_link_set_range(id self, SEL selector,
+    mondrian_frame_rate_range range)
+{
+	char who[160];
+
+	if (mondrian_link_say && mondrian_link_said++ < 120) {
+		char line[220];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: display link %p asked for %.0f..%.0f, %.0f a "
+		    "second%s by %s\n", (void *)self, range.minimum,
+		    range.maximum, range.preferred,
+		    mondrian_link_at_full_rate(self) ? " (dropped)" : "",
+		    mondrian_link_caller(__builtin_return_address(0), who,
+		    sizeof(who)));
+		say(line);
+	}
+	if (mondrian_link_at_full_rate(self)) {
+		range = (mondrian_frame_rate_range){ 0, 0, 0 };
+	}
+	mondrian_original_link_set_range(self, selector, range);
+}
+
+static void
+install_display_link_rate_hooks(void)
+{
+	Class cls = objc_getClass("CADisplayLink");
+	Method with_target, fps, range;
+
+	if (cls == Nil) {
+		say("MONDRIAN UI: CADisplayLink not found; rates not hooked\n");
+		return;
+	}
+	mondrian_link_full_rate = boot_arg_set("mondrianlinkfull=0") == 0;
+	mondrian_link_say = boot_arg_set("mondrianlinksay=1") != 0;
+	with_target = class_getClassMethod(cls,
+	    @selector(displayLinkWithTarget:selector:));
+	if (with_target != NULL) {
+		mondrian_original_link_with_target =
+		    (id (*)(id, SEL, id, SEL))method_setImplementation(with_target,
+		    (IMP)mondrian_link_with_target);
+	}
+	fps = class_getInstanceMethod(cls, @selector(setPreferredFramesPerSecond:));
+	if (fps != NULL) {
+		mondrian_original_link_set_fps =
+		    (void (*)(id, SEL, long))method_setImplementation(fps,
+		    (IMP)mondrian_link_set_fps);
+	}
+	range = class_getInstanceMethod(cls, @selector(setPreferredFrameRateRange:));
+	if (range != NULL) {
+		mondrian_original_link_set_range =
+		    (void (*)(id, SEL, mondrian_frame_rate_range))
+		    method_setImplementation(range, (IMP)mondrian_link_set_range);
+	}
+	say("MONDRIAN UI: display link rates hooked (in-process animations at "
+	    "the panel's rate)\n");
+}
+
+/*
  * The GPU smoke test (tools/mondrian-gpu-test.c) is a second dylib, installed
  * as /usr/libexec/mondrian-gpu-test.dylib by tools/install-gpu-test.sh. Load
  * it here instead of adding a kernel boot argument: this hook runs in every
@@ -2331,6 +3676,484 @@ boot_arg_set(const char *name)
 	}
 	args[sizeof(args) - 1] = 0;
 	return strstr(args, name) != NULL;
+}
+
+/*
+ * Brightness. CoreBrightness never comes up on this port (the display publishes
+ * no IODisplay backlight node), so IOMobileFramebuffer's own brightness control
+ * stays disabled and iOS drops SwapSetBrightness with "Brightness control is
+ * not enabled": the swap record's brightness byte is never set. The level iOS
+ * wants is computed in SpringBoard instead, so take it there and hand it to the
+ * driver's selector 100, which writes the panel's DCS 0x51 at the next vsync.
+ *
+ * The level is not in SBBacklightController on iOS 16.7 (that class only
+ * carries the screen-on/off state); SBDisplayBrightnessController has it. Both
+ * are scanned, and the setter is matched by name and by type encoding rather
+ * than by a hardcoded selector, because reading a float argument as a double
+ * would send half the level's bits to the panel.
+ */
+static io_connect_t mondrian_bl_conn;
+static uint32_t mondrian_bl_sent = 0xffffffffu;
+static int mondrian_bl_logs;
+static double mondrian_bl_panel_w;
+static double mondrian_bl_panel_h;
+static void (*mondrian_bl_orig_1d)(id, SEL, double);
+static void (*mondrian_bl_orig_1f)(id, SEL, float);
+static void (*mondrian_bl_orig_2d)(id, SEL, double, long);
+static void (*mondrian_bl_orig_2f)(id, SEL, float, long);
+
+static int
+mondrian_bl_connect(void)
+{
+	io_service_t service;
+	io_connect_t conn;
+
+	if (mondrian_bl_conn != 0) {
+		return 1;
+	}
+	service = IOServiceGetMatchingService(0,
+	    IOServiceMatching("IOMobileFramebuffer"));
+	if (service == MACH_PORT_NULL) {
+		return 0;
+	}
+	if (IOServiceOpen(service, mach_task_self(), 0, &conn) != KERN_SUCCESS) {
+		IOObjectRelease(service);
+		say("MONDRIAN UI: brightness: no user client\n");
+		return 0;
+	}
+	IOObjectRelease(service);
+	mondrian_bl_conn = conn;
+	/*
+	 * GetDisplaySize: the panel's canvas in pixels, straight from the driver.
+	 * The reference-bounds hook needs it, and this is the only place the
+	 * connection is created.
+	 */
+	{
+		uint64_t out[2] = { 0, 0 };
+		uint32_t count = 2;
+
+		if (IOConnectCallScalarMethod(conn, 8, NULL, 0, out, &count) ==
+		    KERN_SUCCESS && count == 2 && out[0] > 0 && out[1] > 0) {
+			mondrian_bl_panel_w = (double)out[0];
+			mondrian_bl_panel_h = (double)out[1];
+		}
+	}
+	return 1;
+}
+
+static void
+mondrian_bl_apply(const char *who, double level)
+{
+	uint64_t in;
+	uint32_t v;
+
+	if (!(level >= 0.0)) {
+		return;
+	}
+	if (level > 1.0) {
+		level = 1.0;
+	}
+	v = (uint32_t)(level * 4095.0 + 0.5);
+	if (v == mondrian_bl_sent || !mondrian_bl_connect()) {
+		return;
+	}
+	mondrian_bl_sent = v;
+	in = v;
+	IOConnectCallScalarMethod(mondrian_bl_conn, 100, &in, 1, NULL, NULL);
+	if (mondrian_bl_logs < 24) {
+		char buf[128];
+
+		mondrian_bl_logs++;
+		snprintf(buf, sizeof(buf), "MONDRIAN UI: %s %.3f -> %u\n", who,
+		    level, v);
+		say(buf);
+	}
+}
+
+static void
+mondrian_bl_1d(id self, SEL cmd, double level)
+{
+	mondrian_bl_apply(sel_getName(cmd), level);
+	if (mondrian_bl_orig_1d != NULL) {
+		mondrian_bl_orig_1d(self, cmd, level);
+	}
+}
+
+static void
+mondrian_bl_1f(id self, SEL cmd, float level)
+{
+	mondrian_bl_apply(sel_getName(cmd), (double)level);
+	if (mondrian_bl_orig_1f != NULL) {
+		mondrian_bl_orig_1f(self, cmd, level);
+	}
+}
+
+static void
+mondrian_bl_2d(id self, SEL cmd, double level, long flag)
+{
+	mondrian_bl_apply(sel_getName(cmd), level);
+	if (mondrian_bl_orig_2d != NULL) {
+		mondrian_bl_orig_2d(self, cmd, level, flag);
+	}
+}
+
+static void
+mondrian_bl_2f(id self, SEL cmd, float level, long flag)
+{
+	mondrian_bl_apply(sel_getName(cmd), (double)level);
+	if (mondrian_bl_orig_2f != NULL) {
+		mondrian_bl_orig_2f(self, cmd, level, flag);
+	}
+}
+
+/*
+ * First argument of an Objective-C method, from its type encoding. The encoding
+ * carries the size of every element ("v24@0:8f16B20"), so the digits and the
+ * self/_cmd pair have to be skipped before the argument types start.
+ */
+static const char *
+mondrian_bl_args(const char *types)
+{
+	const char *p = types;
+
+	if (p == NULL || *p == 0) {
+		return NULL;
+	}
+	p++;                                    /* return type */
+	while (*p >= '0' && *p <= '9') {
+		p++;
+	}
+	if (*p != '@') {
+		return NULL;
+	}
+	p++;
+	while (*p >= '0' && *p <= '9') {
+		p++;
+	}
+	if (*p != ':') {
+		return NULL;
+	}
+	p++;
+	while (*p >= '0' && *p <= '9') {
+		p++;
+	}
+	return p;
+}
+
+static void
+mondrian_bl_try(Method m, const char *types)
+{
+	const char *a = mondrian_bl_args(types);
+	const char *b;
+
+	if (a == NULL || (*a != 'f' && *a != 'd')) {
+		return;
+	}
+	/* Second argument, if any: skip its size, then read its type. */
+	b = a + 1;
+	while (*b >= '0' && *b <= '9') {
+		b++;
+	}
+	if (*b == 0 && *a == 'd' && mondrian_bl_orig_1d == NULL) {
+		mondrian_bl_orig_1d = (void (*)(id, SEL, double))
+		    method_setImplementation(m, (IMP)mondrian_bl_1d);
+	} else if (*b == 0 && *a == 'f' && mondrian_bl_orig_1f == NULL) {
+		mondrian_bl_orig_1f = (void (*)(id, SEL, float))
+		    method_setImplementation(m, (IMP)mondrian_bl_1f);
+	} else if ((*b == 'B' || *b == 'q' || *b == 'c' || *b == 'i') &&
+	    *a == 'd' && mondrian_bl_orig_2d == NULL) {
+		mondrian_bl_orig_2d = (void (*)(id, SEL, double, long))
+		    method_setImplementation(m, (IMP)mondrian_bl_2d);
+	} else if ((*b == 'B' || *b == 'q' || *b == 'c' || *b == 'i') &&
+	    *a == 'f' && mondrian_bl_orig_2f == NULL) {
+		mondrian_bl_orig_2f = (void (*)(id, SEL, float, long))
+		    method_setImplementation(m, (IMP)mondrian_bl_2f);
+	} else {
+		return;
+	}
+}
+
+static void
+mondrian_bl_scan(const char *class_name, int dump)
+{
+	Class cls = objc_getClass(class_name);
+	unsigned int i, n = 0;
+	Method *methods;
+
+	if (cls == Nil) {
+		say("MONDRIAN UI: no class for the brightness level\n");
+		return;
+	}
+	methods = class_copyMethodList(cls, &n);
+	for (i = 0; i < n; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+		const char *types = method_getTypeEncoding(methods[i]);
+		char buf[200];
+
+		if (dump) {
+			snprintf(buf, sizeof(buf), "MONDRIAN UI: %s -%s %s\n",
+			    class_name, name, types != NULL ? types : "?");
+			say(buf);
+		}
+		if (strstr(name, "etBrightnessLevel") == NULL &&
+		    strstr(name, "etBacklightLevel") == NULL) {
+			continue;
+		}
+		if (!dump) {
+			snprintf(buf, sizeof(buf), "MONDRIAN UI: %s -%s %s\n",
+			    class_name, name, types != NULL ? types : "?");
+			say(buf);
+		}
+		mondrian_bl_try(methods[i], types);
+	}
+	free(methods);
+}
+
+static void
+install_brightness_hooks(void)
+{
+	mondrian_bl_scan("SBDisplayBrightnessController", 1);
+	mondrian_bl_scan("SBBacklightController", 0);
+	mondrian_bl_scan("SBBrightnessControl", 0);
+	say(mondrian_bl_orig_1d != NULL || mondrian_bl_orig_1f != NULL ||
+	    mondrian_bl_orig_2d != NULL || mondrian_bl_orig_2f != NULL ?
+	    "MONDRIAN UI: brightness level hooked\n" :
+	    "MONDRIAN UI: brightness level not hooked\n");
+}
+
+/*
+ * UI size. The panel is 1440x3200 (480x1066 pt at scale 3), and SpringBoard's
+ * own window uses that, but every sheet that lays itself out from UIKit's
+ * *reference* bounds - Control Center, Spotlight and its keyboard - comes out
+ * 375x812 pt instead: it draws into a 1125x2436 surface, which the compositor
+ * then puts in the panel's top-left corner, with a wide margin to the right and
+ * wallpaper below. -[UIScreen _referenceBounds] is the model's point size, not
+ * the screen's, so return the screen's: nativeBounds / scale, which is what the
+ * home screen already uses. nativeBounds is read instead of bounds so the
+ * replacement cannot recurse into the method it replaces.
+ */
+static CGRect (*mondrian_bl_orig_ref_bounds)(id, SEL);
+static CGRect (*mondrian_bl_orig_unjailed)(id, SEL);
+static uint64_t mondrian_bl_ref_logged;
+
+static CGRect
+mondrian_screen_reference_bounds(void)
+{
+	/*
+	 * The panel in points: the driver's canvas over the display's scale. No
+	 * call back into UIScreen here - nativeBounds, scale and mainScreen all
+	 * end up reading the reference bounds on this build, and re-entering the
+	 * method being replaced was a SpringBoard crash loop with no log line.
+	 * 3.0 is this panel's scale (1440x3200 px, 480x1066 pt), the same one the
+	 * home screen's own window uses.
+	 */
+	CGRect out = { { 0, 0 }, { 0, 0 } };
+
+	if (mondrian_bl_panel_w <= 0.0 || mondrian_bl_panel_h <= 0.0) {
+		/* The user client is not open yet: try again on the next call. */
+		(void)mondrian_bl_connect();
+	}
+	if (mondrian_bl_panel_w > 0.0 && mondrian_bl_panel_h > 0.0) {
+		out.size.width = mondrian_bl_panel_w / 3.0;
+		out.size.height = mondrian_bl_panel_h / 3.0;
+	}
+	return out;
+}
+
+/*
+ * Which of UIScreen's several "reference" rectangles a sheet actually reads is
+ * not obvious - the Control Center came out 375x812 pt while
+ * _unjailedReferenceBounds already answered 480x1067 - so every parameterless
+ * accessor in the family is hooked to the same replacement, and the first call
+ * of each logs what it used to answer. The replacement answers the panel, so a
+ * method that was right before stays right.
+ */
+#define MONDRIAN_SCREEN_ACCESSORS 8
+
+static const char *const mondrian_screen_names[MONDRIAN_SCREEN_ACCESSORS] = {
+	"_referenceBounds",
+	"_unjailedReferenceBounds",
+	"_mainSceneReferenceBounds",
+	"_sceneReferenceBounds",
+	"_fixedReferenceBounds",
+	"_dynamicReferenceBounds",
+	"_lock_referenceBounds",
+	"_lock_unjailedReferenceBounds",
+};
+
+static struct {
+	const char *name;
+	IMP         orig;
+	int         logged;
+} mondrian_screen_imps[MONDRIAN_SCREEN_ACCESSORS];
+
+static IMP
+mondrian_screen_original(SEL cmd)
+{
+	unsigned i;
+
+	for (i = 0; i < MONDRIAN_SCREEN_ACCESSORS; i++) {
+		if (mondrian_screen_imps[i].name != NULL &&
+		    strcmp(mondrian_screen_imps[i].name, sel_getName(cmd)) == 0) {
+			return mondrian_screen_imps[i].orig;
+		}
+	}
+	return NULL;
+}
+
+static CGRect
+mondrian_screen_bounds_family(id self, SEL cmd)
+{
+	CGRect real = mondrian_screen_reference_bounds();
+	const char *name = sel_getName(cmd);
+	unsigned i;
+
+	mondrian_bl_ref_logged++;      /* calls seen, for the report thread */
+	for (i = 0; i < MONDRIAN_SCREEN_ACCESSORS; i++) {
+		if (mondrian_screen_imps[i].name == NULL ||
+		    strcmp(mondrian_screen_imps[i].name, name) != 0 ||
+		    mondrian_screen_imps[i].logged != 0) {
+			continue;
+		}
+		mondrian_screen_imps[i].logged = 1;
+		if (mondrian_screen_imps[i].orig != NULL) {
+			CGRect was = ((CGRect (*)(id, SEL))
+			    mondrian_screen_imps[i].orig)(self, cmd);
+			char buf[192];
+
+			snprintf(buf, sizeof(buf),
+			    "MONDRIAN UI: %s %.0fx%.0f -> %.0fx%.0f\n", name,
+			    was.size.width, was.size.height, real.size.width,
+			    real.size.height);
+			say(buf);
+		}
+	}
+	if (real.size.width > 0.0 && real.size.height > 0.0) {
+		return real;
+	}
+	{
+		IMP orig = mondrian_screen_original(cmd);
+
+		if (orig != NULL) {
+			return ((CGRect (*)(id, SEL))orig)(self, cmd);
+		}
+	}
+	return real;
+}
+
+/*
+ * One late report of what UIKit thinks the display is, for the log.
+ *
+ * UIKit's screen accessors belong to the main thread: called from a thread of
+ * our own they raise an exception and the daemon dies (measured: SpringBoard
+ * aborted in a loop once the boot got fast enough for the report to land after
+ * UIKit was up). The report is therefore queued on the main queue, and an
+ * exception in it is caught rather than fatal.
+ */
+static void
+mondrian_screen_report(void *unused)
+{
+	Class cls = objc_getClass("UIScreen");
+	id screen;
+	CGRect bounds, native;
+	double scale;
+	unsigned i;
+	char buf[224];
+
+	(void)unused;
+	if (cls == Nil) {
+		return;
+	}
+	@try {
+		screen = ((id (*)(id, SEL))objc_msgSend)(cls,
+		    @selector(mainScreen));
+		if (screen == nil) {
+			return;
+		}
+		bounds = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("bounds"));
+		native = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("nativeBounds"));
+		scale = ((double (*)(id, SEL))objc_msgSend)(screen,
+		    sel_registerName("scale"));
+	} @catch (NSException *e) {
+		say("MONDRIAN UI: screen report skipped (exception)\n");
+		return;
+	}
+	snprintf(buf, sizeof(buf),
+	    "MONDRIAN UI: screen bounds %.1fx%.1f native %.0fx%.0f scale %.2f\n",
+	    bounds.size.width, bounds.size.height, native.size.width,
+	    native.size.height, scale);
+	say(buf);
+	for (i = 0; i < MONDRIAN_SCREEN_ACCESSORS; i++) {
+		SEL sel;
+		IMP imp;
+		CGRect was;
+
+		if (mondrian_screen_imps[i].name == NULL ||
+		    mondrian_screen_imps[i].orig == NULL) {
+			continue;
+		}
+		sel = sel_registerName(mondrian_screen_imps[i].name);
+		imp = mondrian_screen_imps[i].orig;
+		if (class_getInstanceMethod(cls, sel) == NULL) {
+			continue;
+		}
+		@try {
+			was = ((CGRect (*)(id, SEL))imp)(screen, sel);
+		} @catch (NSException *e) {
+			continue;
+		}
+		snprintf(buf, sizeof(buf), "MONDRIAN UI: %s was %.0fx%.0f\n",
+		    mondrian_screen_imps[i].name, was.size.width,
+		    was.size.height);
+		say(buf);
+	}
+}
+
+static void *
+mondrian_screen_report_thread(void *unused)
+{
+	(void)unused;
+	sleep(12);
+	dispatch_async_f(dispatch_get_main_queue(), NULL, mondrian_screen_report);
+	return NULL;
+}
+
+static void
+install_screen_size_hooks(void)
+{
+	Class cls = objc_getClass("UIScreen");
+	unsigned i;
+	pthread_t thread;
+
+	if (cls == Nil) {
+		return;
+	}
+	for (i = 0; i < MONDRIAN_SCREEN_ACCESSORS; i++) {
+		Method m;
+		SEL sel = sel_registerName(mondrian_screen_names[i]);
+
+		m = class_getInstanceMethod(cls, sel);
+		if (m == NULL) {
+			continue;
+		}
+		mondrian_screen_imps[i].name = mondrian_screen_names[i];
+		mondrian_screen_imps[i].orig = method_setImplementation(m,
+		    (IMP)mondrian_screen_bounds_family);
+		if (strcmp(mondrian_screen_names[i], "_referenceBounds") == 0) {
+			mondrian_bl_orig_ref_bounds =
+			    (CGRect (*)(id, SEL))mondrian_screen_imps[i].orig;
+		}
+		if (strcmp(mondrian_screen_names[i], "_unjailedReferenceBounds") == 0) {
+			mondrian_bl_orig_unjailed =
+			    (CGRect (*)(id, SEL))mondrian_screen_imps[i].orig;
+		}
+	}
+	say("MONDRIAN UI: screen bounds family hooked\n");
+	if (pthread_create(&thread, NULL, mondrian_screen_report_thread, NULL) != 0) {
+		say("MONDRIAN UI: screen report thread failed\n");
+	}
 }
 
 static void
@@ -2403,6 +4226,40 @@ static volatile double mondrian_link_timestamp;
 {
 	(void)link;
 	mondrian_link_ticks[self.which]++;
+	if (self.which == 0 && mondrian_link_ticks[0] <= 3) {
+		char line[112];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: link tick %llu anim %d layer %d\n",
+		    (unsigned long long)mondrian_link_ticks[0],
+		    mondrian_anim_enabled, mondrian_probe_layer != nil);
+		say(line);
+	}
+	/*
+	 * `mondriananim=2`: the probe is moved from here, once per display-link
+	 * tick, so every tick is a real commit from this client. `=1` leaves the
+	 * move to a CoreAnimation animation, which the render server runs on its
+	 * own; the two are different asks and the composite rate tells them apart.
+	 */
+	if (self.which == 0 && mondrian_anim_enabled == 2 &&
+	    mondrian_probe_layer != nil) {
+		static double t;
+		double x;
+
+		t += 1.0 / 60.0;
+		x = 60.0 + fmod(t * 480.0, 360.0);
+		((void (*)(id, SEL, CGPoint))objc_msgSend)(mondrian_probe_layer,
+		    sel_registerName("setPosition"), CGPointMake(x, 260.0));
+		mondrian_probe_moves++;
+		if ((mondrian_probe_moves % 30) == 0) {
+			char line[96];
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: probe moves %u\n",
+			    mondrian_probe_moves);
+			say(line);
+		}
+	}
 }
 
 - (void)timerTick:(NSTimer *)timer
@@ -2451,10 +4308,27 @@ mondrian_main_frame(uint64_t addr, char *out, size_t size)
 		snprintf(out, size, "-");
 		return;
 	}
-	if (dladdr((void *)addr, &info) != 0 && info.dli_sname != NULL) {
-		snprintf(out, size, "%s+%ld", info.dli_sname,
-		    (long)((char *)addr - (char *)info.dli_saddr));
-		return;
+	if (dladdr((void *)addr, &info) != 0) {
+		if (info.dli_sname != NULL &&
+		    strcmp(info.dli_sname, "<redacted>") != 0) {
+			snprintf(out, size, "%s+%ld", info.dli_sname,
+			    (long)((char *)addr - (char *)info.dli_saddr));
+			return;
+		}
+		/*
+		 * The shared cache ships no symbols, and dyld answers with the
+		 * literal "<redacted>": name the image and the offset instead,
+		 * which is what says who is waiting inside mach_msg.
+		 */
+		if (info.dli_fname != NULL) {
+			const char *base = strrchr(info.dli_fname, '/');
+
+			snprintf(out, size, "%s+0x%llx",
+			    base != NULL ? base + 1 : info.dli_fname,
+			    (unsigned long long)(addr -
+			    (uint64_t)(uintptr_t)info.dli_fbase));
+			return;
+		}
 	}
 	snprintf(out, size, "%llx", (unsigned long long)addr);
 }
@@ -2466,7 +4340,7 @@ mondrian_main_watch(void *unused)
 	for (int n = 0; n < 90; n++) {
 		arm_thread_state64_t state;
 		mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
-		char line[420], f[6][72];
+		char line[640], f[8][76];
 		uint64_t fp;
 		int used = 0;
 
@@ -2481,7 +4355,7 @@ mondrian_main_watch(void *unused)
 		mondrian_main_frame(state.__pc, f[0], sizeof(f[0]));
 		mondrian_main_frame(state.__lr, f[1], sizeof(f[1]));
 		fp = state.__fp;
-		for (int i = 2; i < 6 && fp >= 0x100000000ULL; i++) {
+		for (int i = 2; i < 8 && fp >= 0x100000000ULL; i++) {
 			uint64_t frame[2];
 			vm_size_t got = 0;
 
@@ -2508,6 +4382,92 @@ mondrian_main_watch(void *unused)
 			snprintf(p, left, "\n");
 		}
 		say(line);
+	}
+	return NULL;
+}
+
+/*
+ * Boot-arg mondrianbdt=1 (every process) or mondrianbdtpid=<pid> (that one):
+ * every thread of the process with a frame chain each, six samples two seconds
+ * apart. The compositor draws one frame every five seconds and calls none of
+ * the framebuffer's selectors in between, so the thread that owns that period
+ * is the one that says what the period is: a mach_msg with a five second
+ * timeout reads differently from a semaphore that a fence never signals, and
+ * from a thread that is not scheduled at all.
+ */
+static void *
+mondrian_threads_watch(void *unused)
+{
+	(void)unused;
+	for (int n = 0; n < 4; n++) {
+		thread_act_array_t list = NULL;
+		mach_msg_type_number_t count = 0;
+		char head[96];
+
+		/* The first sample waits for the UI to settle; the rest follow it. */
+		sleep(n == 0 ? 100 : 2);
+		if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS ||
+		    list == NULL) {
+			continue;
+		}
+		snprintf(head, sizeof(head),
+		    "MONDRIAN THR[%d]: sample %d, %u threads\n", getpid(), n,
+		    (unsigned)count);
+		say(head);
+		for (mach_msg_type_number_t i = 0; i < count; i++) {
+			arm_thread_state64_t state;
+			mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+			thread_identifier_info_data_t id;
+			mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
+			char line[512], f[6][80];
+			uint64_t fp;
+			int used = 2;
+
+			memset(&id, 0, sizeof(id));
+			if (thread_get_state(list[i], ARM_THREAD_STATE64,
+			    (thread_state_t)&state, &sc) != KERN_SUCCESS) {
+				mach_port_deallocate(mach_task_self(), list[i]);
+				continue;
+			}
+			mondrian_main_frame(state.__pc, f[0], sizeof(f[0]));
+			mondrian_main_frame(state.__lr, f[1], sizeof(f[1]));
+			fp = state.__fp;
+			for (int k = 2; k < 6 && fp >= 0x100000000ULL; k++) {
+				uint64_t frame[2];
+				vm_size_t got = 0;
+
+				if (vm_read_overwrite(mach_task_self(),
+				    (vm_address_t)fp, sizeof(frame),
+				    (vm_address_t)frame, &got) != KERN_SUCCESS ||
+				    got != sizeof(frame) || frame[1] == 0) {
+					break;
+				}
+				mondrian_main_frame(frame[1], f[k], sizeof(f[k]));
+				used = k + 1;
+				fp = frame[0];
+			}
+			(void)thread_info(list[i], THREAD_IDENTIFIER_INFO,
+			    (thread_info_t)&id, &ic);
+			{
+				char *p = line;
+				size_t left = sizeof(line);
+				int k = snprintf(p, left, "MONDRIAN THR[%d]: t %llu",
+				    getpid(), (unsigned long long)id.thread_id);
+
+				p += k;
+				left -= (size_t)k;
+				for (int j = 0; j < used && left > 8; j++) {
+					k = snprintf(p, left, " %s", f[j]);
+					p += k;
+					left -= (size_t)k;
+				}
+				snprintf(p, left, "\n");
+			}
+			say(line);
+			mach_port_deallocate(mach_task_self(), list[i]);
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)list,
+		    count * sizeof(*list));
 	}
 	return NULL;
 }
@@ -2572,8 +4532,18 @@ mondrian_link_probe(void)
 	static MondrianLinkTarget *main_target;
 	pthread_t thread;
 
-	if (!boot_arg_set("mondrianlink=1")) {
+	if (!boot_arg_set("mondrianlink=1") &&
+	    boot_arg_int("mondriananim=", 0) != 2) {
 		return;
+	}
+	/*
+	 * The unlock thread sets this at its own pace and this runs before it
+	 * may have, so the one boot argument both tests reads here is repeated:
+	 * without it the link is armed for a probe that the tick still refuses
+	 * to move (measured: no `probe moves` line at all).
+	 */
+	if (boot_arg_int("mondriananim=", 0) == 2) {
+		mondrian_anim_enabled = 2;
 	}
 	dispatch_async(dispatch_get_main_queue(), ^{
 		CADisplayLink *link;
@@ -2597,15 +4567,321 @@ mondrian_link_probe(void)
 		    forMode:NSRunLoopCommonModes];
 		say("MONDRIAN UI: timer armed\n");
 	});
-	if (pthread_create(&thread, NULL, mondrian_link_run, NULL) != 0) {
-		say("MONDRIAN UI: link own thread failed\n");
+	if (boot_arg_set("mondrianlink=1")) {
+		if (pthread_create(&thread, NULL, mondrian_link_run, NULL) != 0) {
+			say("MONDRIAN UI: link own thread failed\n");
+		}
+		if (pthread_create(&thread, NULL, mondrian_wait_run, NULL) != 0) {
+			say("MONDRIAN UI: wait thread failed\n");
+		}
+		if (pthread_create(&thread, NULL, mondrian_link_report, NULL) != 0) {
+			say("MONDRIAN UI: link report failed\n");
+		}
 	}
-	if (pthread_create(&thread, NULL, mondrian_wait_run, NULL) != 0) {
-		say("MONDRIAN UI: wait thread failed\n");
+}
+
+/*
+ * The root volume is HFS+ with no journal, and this port's bring-up habit is
+ * the hard reset, which leaves metadata half written: measured, the live
+ * volume grew files whose catalog entry claims data but owns no allocated
+ * blocks, and the kernel then refuses every open of them. One of those was
+ * what launchd_cache_loader reads to validate the dyld shared cache, and the
+ * agents that could not be started went with it. A pristine copy of the same
+ * image passes fsck_hfs and holds no such file, so the damage is what the
+ * resets write, not what the image shipped.
+ *
+ * This turns journaling on the way hfs.util does: two files at the volume root,
+ * then the HFS vfs sysctl that adopts them. The sysctl validates both block
+ * numbers before it writes anything, so a wrong guess is refused, not applied.
+ * It runs once per volume; afterwards the mount reports MNT_JOURNALED.
+ */
+#define MONDRIAN_HFS_ENABLE_JOURNALING  0x082969
+#define MONDRIAN_HFS_DISABLE_JOURNALING 0x031272
+#define MONDRIAN_JOURNAL_BYTES          (8 * 1024 * 1024)
+#ifndef CTL_VFS
+#define CTL_VFS                         5
+#endif
+#ifndef VFS_GENERIC
+#define VFS_GENERIC                     1
+#endif
+
+static void
+mondrian_jnl_log(const char *fmt, ...)
+{
+	char line[160];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	say(line);
+}
+
+static long
+mondrian_device_block(int fd, off_t size, off_t block)
+{
+	struct log2phys l2p;
+
+	memset(&l2p, 0, sizeof(l2p));
+	l2p.l2p_devoffset = 0;
+	l2p.l2p_contigbytes = size;
+	if (fcntl(fd, F_LOG2PHYS_EXT, &l2p) != 0) {
+		return -1;
 	}
-	if (pthread_create(&thread, NULL, mondrian_link_report, NULL) != 0) {
-		say("MONDRIAN UI: link report failed\n");
+	if (l2p.l2p_contigbytes < size) {
+		return -2;              /* fragmented: unusable as a journal */
 	}
+	return (long)(l2p.l2p_devoffset / block);
+}
+
+static void *
+mondrian_journal_thread(void *unused)
+{
+	struct statfs sfs;
+	struct vfsconf vfsconf;
+	char *zero;
+	int jnl_fd, jib_fd, mib[6], error;
+	long block, jnl_start, jib_start;
+	off_t done;
+
+	(void)unused;
+	if (geteuid() != 0 || statfs("/", &sfs) != 0) {
+		return NULL;
+	}
+	/*
+	 * Booting with mondriannojnl=1 leaves the journal closed (hfsmp->jnl
+	 * is NULL), and the disable-journal sysctl calls journal_close() on it
+	 * without a NULL check, so it panics the kernel: measured, that boot
+	 * never brought USB up. The volume keeps its journal bit and every
+	 * boot ignores it; the bit is not worth a panic to clear.
+	 */
+
+	if (sfs.f_flags & MNT_JOURNALED) {
+		say("MONDRIAN JNL: volume already journaled\n");
+		return NULL;
+	}
+	block = sfs.f_bsize;
+	if (block < 512 || chdir("/") != 0) {
+		return NULL;
+	}
+	(void)unlink("/.journal");
+	(void)unlink("/.journal_info_block");
+	zero = calloc(1, (size_t)block);
+	if (zero == NULL) {
+		return NULL;
+	}
+
+	jnl_fd = open("/.journal", O_CREAT | O_RDWR | O_TRUNC, 0600);
+	if (jnl_fd < 0) {
+		mondrian_jnl_log("MONDRIAN JNL: create failed errno %d\n", errno);
+		free(zero);
+		return NULL;
+	}
+	for (done = 0; done < MONDRIAN_JOURNAL_BYTES; done += block) {
+		if (write(jnl_fd, zero, (size_t)block) != (ssize_t)block) {
+			break;
+		}
+	}
+	(void)fsync(jnl_fd);
+	jnl_start = mondrian_device_block(jnl_fd,
+	    (off_t)MONDRIAN_JOURNAL_BYTES, block);
+	if (jnl_start < 0) {
+		mondrian_jnl_log("MONDRIAN JNL: journal unusable (%ld)\n", jnl_start);
+		close(jnl_fd);
+		(void)unlink("/.journal");
+		free(zero);
+		return NULL;
+	}
+
+	jib_fd = open("/.journal_info_block", O_CREAT | O_RDWR | O_TRUNC, 0600);
+	if (jib_fd < 0 || write(jib_fd, zero, (size_t)block) != (ssize_t)block) {
+		mondrian_jnl_log("MONDRIAN JNL: info block failed errno %d\n", errno);
+		if (jib_fd >= 0) {
+			close(jib_fd);
+			(void)unlink("/.journal_info_block");
+		}
+		close(jnl_fd);
+		(void)unlink("/.journal");
+		free(zero);
+		return NULL;
+	}
+	(void)fsync(jib_fd);
+	jib_start = mondrian_device_block(jib_fd, (off_t)block, block);
+	free(zero);
+	if (jib_start < 0) {
+		mondrian_jnl_log("MONDRIAN JNL: info block unusable (%ld)\n", jib_start);
+		close(jib_fd);
+		close(jnl_fd);
+		return NULL;
+	}
+
+	/*
+	 * The HFS vfs sysctl hangs off the filesystem's own node, so the second
+	 * element is the hfs type number, not VFS_GENERIC: with the generic one
+	 * the lookup ends in ENOENT.
+	 */
+	memset(&vfsconf, 0, sizeof(vfsconf));
+	if (getvfsbyname("hfs", &vfsconf) != 0) {
+		mondrian_jnl_log("MONDRIAN JNL: hfs not registered errno %d\n",
+		    errno);
+		close(jib_fd);
+		close(jnl_fd);
+		return NULL;
+	}
+	mib[0] = CTL_VFS;
+	mib[1] = vfsconf.vfc_typenum;
+	mib[2] = MONDRIAN_HFS_ENABLE_JOURNALING;
+	mib[3] = (int)jib_start;
+	mib[4] = (int)jnl_start;
+	mib[5] = MONDRIAN_JOURNAL_BYTES;
+	error = sysctl(mib, 6, NULL, NULL, NULL, 0);
+	if (error != 0) {
+		mondrian_jnl_log("MONDRIAN JNL: enable failed errno %d\n", errno);
+	} else {
+		mondrian_jnl_log("MONDRIAN JNL: journal on %d bytes at block %ld\n",
+		    MONDRIAN_JOURNAL_BYTES, jnl_start);
+	}
+	close(jib_fd);
+	close(jnl_fd);
+	return NULL;
+}
+
+
+/*
+ * cfprefsd never runs on this port: launchd finishes early boot and starts its
+ * run-at-load jobs, but the preferences daemon is demand launched, and nothing
+ * starts it -- measured, the process never exists, and backboardd's main thread
+ * then waits forever inside CoreFoundation's synchronous preferences call,
+ * which is what keeps the compositor from drawing. This asks launchd to start
+ * the job by name once, and reports what it answered, so the boot either shows
+ * the daemon in the sampler or says why it did not.
+ */
+static void
+mondrian_run(const char *what, char *const argv[])
+{
+	int status = -1;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		execv(what, argv);
+		_exit(127);
+	}
+	if (pid > 0 && waitpid(pid, &status, 0) == pid) {
+		mondrian_jnl_log("MONDRIAN RESCUE: %s -> %d\n", argv[1] != NULL ?
+		    argv[1] : what, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+	}
+}
+
+static void *
+mondrian_rescue_thread(void *unused)
+{
+	struct stat st;
+	char *kick[] = { "/bin/launchctl", "kickstart", "system/com.apple.cfprefsd",
+	    NULL };
+	char *print[] = { "/bin/launchctl", "print", "system/com.apple.cfprefsd",
+	    NULL };
+
+	(void)unused;
+	if (geteuid() != 0) {
+		return NULL;
+	}
+	mondrian_jnl_log("MONDRIAN RESCUE: env avoid-daemon %s\n",
+	    getenv("__CFPREFERENCES_AVOID_DAEMON") != NULL ? "present" : "absent");
+	if (stat("/System/Library/LaunchDaemons/com.apple.cfprefsd.plist",
+	    &st) == 0) {
+		mondrian_jnl_log("MONDRIAN RESCUE: cfprefsd.plist %lld bytes\n",
+		    (long long)st.st_size);
+	} else {
+		mondrian_jnl_log("MONDRIAN RESCUE: no cfprefsd.plist errno %d\n",
+		    errno);
+	}
+	sleep(6);
+	mondrian_run("/bin/launchctl", print);
+	mondrian_run("/bin/launchctl", kick);
+	sleep(4);
+	mondrian_jnl_log("MONDRIAN RESCUE: done\n");
+	return NULL;
+}
+
+
+/* Is "name=<n>" in the kernel's boot arguments? */
+static int
+boot_arg_int(const char *name, int fallback)
+{
+	char args[2048];
+	size_t size = sizeof(args);
+	const char *at;
+	char *end;
+	long value;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 ||
+	    size == 0) {
+		return fallback;
+	}
+	args[sizeof(args) - 1] = 0;
+	at = strstr(args, name);
+	if (at == NULL) {
+		return fallback;
+	}
+	at += __builtin_strlen(name);
+	value = strtol(at, &end, 0);
+	return end == at ? fallback : (int)value;
+}
+
+/*
+ * The materials the home screen is built from are the ones that freeze it:
+ * the dock's backdrop and the App Library's background both ask the render
+ * server for a snapshot of the screen, and on this port that snapshot takes
+ * seconds and comes back as garbage (a black dock, a striped App Library).
+ * Reduce Transparency is the system's own switch for those materials; set it
+ * before UIKit creates them and the blur is a flat colour instead.
+ *
+ * The preference is what AXSettings reads; the private setter is only called
+ * if AccessibilityUtilities happens to be loaded already, because dlopen()ing
+ * a framework inside SpringBoard's constructor is a good way to break a boot.
+ */
+static void
+mondrian_ax_apply(int mask)
+{
+	Boolean exists = false;
+	Boolean was;
+	BOOL (*api)(void);
+	int effective = -1;
+	void (*setter)(Boolean);
+	char line[176];
+
+	was = CFPreferencesGetAppBooleanValue(CFSTR("ReduceTransparencyEnabled"),
+	    CFSTR("com.apple.Accessibility"), &exists);
+	CFPreferencesSetAppValue(CFSTR("ReduceTransparencyEnabled"),
+	    (mask & 1) ? kCFBooleanTrue : kCFBooleanFalse,
+	    CFSTR("com.apple.Accessibility"));
+	(void)CFPreferencesAppSynchronize(CFSTR("com.apple.Accessibility"));
+	setter = (void (*)(Boolean))dlsym(RTLD_DEFAULT,
+	    "_AXSSetReduceTransparencyEnabled");
+	if (setter != NULL) {
+		setter((mask & 1) ? true : false);
+	}
+	api = (BOOL (*)(void))dlsym(RTLD_DEFAULT,
+	    "UIAccessibilityIsReduceTransparencyEnabled");
+	if (api != NULL) {
+		effective = api();
+	}
+	snprintf(line, sizeof(line),
+	    "MONDRIAN AX[%d]: transparency %d (was %d exists %d setter %d api %d)\n",
+	    getpid(), mask & 1, was, (int)exists, setter != NULL, effective);
+	say(line);
+}
+
+static void *
+mondrian_ax_thread(void *arg)
+{
+	int mask = (int)(intptr_t)arg;
+
+	sleep(5);
+	mondrian_ax_apply(mask);
+	sleep(15);
+	mondrian_ax_apply(mask);
+	return NULL;
 }
 
 __attribute__((constructor))
@@ -2614,19 +4890,68 @@ mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	NSSetUncaughtExceptionHandler(mondrian_uncaught);
+	(void)objc_setExceptionPreprocessor(mondrian_exc_pre);
 	install_number_length_hook();
 	say_pid("UI: dylib loaded");
+	/*
+	 * Before UIKit builds the home screen: the material switch has to be in
+	 * place when the dock and the App Library read it.
+	 */
+	{
+		int ax = boot_arg_int("mondrianax=", -1);
+
+		if (ax >= 0 && strcmp(getprogname(), "SpringBoard") == 0) {
+			pthread_t thread;
+
+			mondrian_ax_apply(ax);
+			if (pthread_create(&thread, NULL, mondrian_ax_thread,
+			    (void *)(intptr_t)ax) != 0) {
+				say("MONDRIAN AX: thread failed\n");
+			}
+		}
+	}
 	install_personas_hook();
 	install_display_diagnostic();
 	install_activation_hooks();
 	install_icon_probe();
 	install_idle_hooks();
+	install_display_link_rate_hooks();
+	install_brightness_hooks();
+	install_screen_size_hooks();
+	install_window_hooks();
 	start_heartbeat();
+	if (boot_arg_set("mondrianrescue=1")) {
+		pthread_t rescue;
+
+		if (pthread_create(&rescue, NULL, mondrian_rescue_thread, NULL) != 0) {
+			say("MONDRIAN RESCUE: thread failed\n");
+		}
+	}
+	if (boot_arg_set("mondrianjnl=1")) {
+		pthread_t jnl;
+
+		if (pthread_create(&jnl, NULL, mondrian_journal_thread, NULL) != 0) {
+			say("MONDRIAN JNL: thread failed\n");
+		}
+	}
 	if (boot_arg_set("mondrianmain=1")) {
 		pthread_t thread;
 
 		if (pthread_create(&thread, NULL, mondrian_main_watch, NULL) != 0) {
 			say("MONDRIAN UI: main watch failed\n");
+		}
+	}
+	{
+		int want = boot_arg_int("mondrianbdtpid=", 0);
+
+		if (boot_arg_set("mondrianbdt=1") ||
+		    (want != 0 && want == (int)getpid())) {
+			pthread_t thread;
+
+			if (pthread_create(&thread, NULL, mondrian_threads_watch,
+			    NULL) != 0) {
+				say("MONDRIAN UI: thread watch failed\n");
+			}
 		}
 	}
 	mondrian_link_probe();
