@@ -78,10 +78,10 @@ workflow's "No skipped patches" step greps the log). Run `tools/apply-series.py`
 (or `tools/check-patches.sh`) after touching the series: it names the patch in
 seconds (`0161` was silently missing until 2026-10-28, `0157` carried its first
 hunk). **The series is the only source of truth:** a build whose hash changed
-resets that checkout, so a driver edited there and never exported to a patch is
-lost — measured 2026-11-11: the DSI brightness driver and the ring's
-`bl`/`dcs`/`blob` commands went that way (`docs/BUILD_LINUX.md`). A mondrian
-build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the user-client
+resets that checkout, so a driver edited there and never exported is lost (the
+DSI brightness driver went that way on 2026-11-11; `docs/BUILD_LINUX.md`). A
+mondrian build also needs the local `mondrian_gmu_fw.h`; `0184` stubs the
+user-client
 surface without the CP profile.
 
 **Apple's clang builtins are load-bearing.** Without `__builtin_xnu_type_*`
