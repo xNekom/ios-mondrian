@@ -14,8 +14,13 @@ vbus and calls MondrianPowerSource::updateState() through
 mondrian_battery_publish(). Nothing in this patch touches swap(), present(),
 vsyncFired() or the vsync timer.
 
-A sample outside 3000-4400 mV is dropped before it can reach the status bar,
-and a repeated identical sample publishes and logs nothing. The power source
+A sample outside 3000-4600 mV is dropped before it can reach the status bar.
+The ceiling is 4600, not 4400: a full pack on the charger reads 4.42 V, and
+the lower bound rejected every sample of a charging phone, so nothing was ever
+published and iOS drew the empty battery icon it uses when it has no data at
+all. The cable is read before the level for the same reason, so a dropped vbat
+sample cannot freeze ExternalConnected for the rest of the boot.
+A repeated identical sample publishes and logs nothing. The power source
 is created lazily and attaches to the display, the parent the old kernel gave
 it, so a sample that arrives before AppleCLCD is registered publishes nothing
 and the next one retries. "sa [SID [CHAN [DIV]]]" on the USB control channel
@@ -84,7 +89,7 @@ index 31a992b..85da15e 100644
 +#define MONDRIAN_SPMI_VBAT_CHAN	0x8fu		/* ADC7 vbat_sns */
 +#define MONDRIAN_SPMI_VBAT_DIV	3		/* qcom,pre-scaling */
 +#define MONDRIAN_SPMI_VBAT_MIN	3000
-+#define MONDRIAN_SPMI_VBAT_MAX	4400
++#define MONDRIAN_SPMI_VBAT_MAX	4600		/* a full pack on the charger */
 +#define MONDRIAN_SPMI_VBUS_SID	3
 +#define MONDRIAN_SPMI_VBUS_CHAN	0x11u		/* usb_in_v_div_16 */
 +#define MONDRIAN_SPMI_VBUS_DIV	16
@@ -290,7 +295,7 @@ index 31a992b..85da15e 100644
 +	return -1;
 +}
 +
-+/* vbat through the pack divider: 3.0-4.4 V, or -1 when the sample is bad. */
++/* vbat through the pack divider: 3.0-4.6 V, or -1 when it is junk. */
 +int
 +mondrian_spmi_battery_mv(void)
 +{
@@ -399,17 +404,6 @@ index 31a992b..85da15e 100644
 +		bool external;
 +
 +		(void)tsleep(&chan, PZERO, "mbatt", ticks);
-+		mv = mondrian_spmi_battery_mv();
-+		if (mv < 1) {
-+			continue;
-+		}
-+		/*
-+		 * One sample is not a level. The pack sags and recovers with
-+		 * the load and 20 mV of that is three points of this curve, so
-+		 * smooth with alpha 1/4: a real step still shows in seconds.
-+		 */
-+		avg = avg == 0 ? mv : (avg * 3 + mv) / 4;
-+		mv = avg;
 +		/*
 +		 * A cable is present above 4.3 V and gone below 4.0 V; the gap
 +		 * is deliberate, because one bad conversion used to flap the
@@ -423,14 +417,25 @@ index 31a992b..85da15e 100644
 +		} else {
 +			external = last_external;
 +		}
-+		/* On a USB cable the pack charges, however slowly. */
-+		mondrian_battery_publish((uint32_t)mv, external ? 1 : 0,
-+		    external ? 1 : 0);
 +		if (external != last_external) {
 +			last_external = external;
 +			printf("MONDRIAN BATT: vbus %d mV, external %d\n",
 +			    vbus, external);
 +		}
++		mv = mondrian_spmi_battery_mv();
++		if (mv < 1) {
++			continue;
++		}
++		/*
++		 * One sample is not a level. The pack sags and recovers with
++		 * the load and 20 mV of that is three points of this curve, so
++		 * smooth with alpha 1/4: a real step still shows in seconds.
++		 */
++		avg = avg == 0 ? mv : (avg * 3 + mv) / 4;
++		mv = avg;
++		/* On a USB cable the pack charges, however slowly. */
++		mondrian_battery_publish((uint32_t)mv, external ? 1 : 0,
++		    external ? 1 : 0);
 +	}
 +}
 +

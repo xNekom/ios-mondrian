@@ -1,8 +1,10 @@
 # Battery, heat and idle
 
 The port boots to SpringBoard with the GPU drawing, shows a battery level in the
-status bar, and still gets hot. What it cannot do is charge. Both are measured
-here, not guessed. This is the work list for `docs/MONDIAN_PORT.md` §5.
+status bar, and still gets hot. Nothing on the AP turns charging on or off, so
+the level is a measurement and the charger is the bootloader's business. Both
+are measured here, not guessed. This is the work list for
+`docs/MONDIAN_PORT.md` §5.
 
 ## Battery
 
@@ -27,17 +29,23 @@ below read `0x3xx`:
 Pack capacity is **5160 mAh** (`M11A_5160mah` in the vendor model), not
 sweet's 5020.
 
-What the port publishes (`MondrianPowerSource`, ticked from the framebuffer
-every 2 s): `BatteryInstalled`, `CurrentCapacity`/`MaxCapacity` **in mAh**,
-`ExternalConnected` from `usb_in_v_div_16`, and the `AppleRaw*` pair plus the
-legacy `IOBatteryInfo` dictionary, because that is what iOS 16's status bar
-reads. `IsCharging` stays false: nothing on this AP can see the charger.
+What the port publishes (`MondrianPowerSource`, sampled once every 2 s by the
+SPMI thread): `BatteryInstalled`, `CurrentCapacity`/`MaxCapacity` **in mAh**,
+`ExternalConnected` and `IsCharging` from `usb_in_v_div_16` (a cable is the
+only charger fact the AP has; there is no charge-status register to read), and
+the `AppleRaw*` pair plus the legacy `IOBatteryInfo` dictionary, because that
+is what iOS 16's status bar reads.
 
 `MaxCapacity = 100` with a 0..100 percentage looks right and is not what powerd
 uses; with the mAh pair the icon tracks the value. One bad ADC sample is enough
 to spoil it for the rest of the boot - 816 mV read once, the curve answered 1%,
-and the icon stayed there - so the reader range-checks vbat (3.0-4.4 V) and
-drops anything outside.
+and the icon stayed there - so the reader range-checks vbat (3.0-4.6 V) and
+drops anything outside. The ceiling is 4.6 V, not the 4.4 V a single cell
+usually sees: a full pack on a charger reads 4.42 V, measured 2026-11-11, and
+at 4.4 every sample of a charging phone was dropped, nothing was published and
+the status bar drew the empty battery with the red sliver that means "no
+data". The cable is read before the level so a dropped vbat sample cannot
+freeze `ExternalConnected` either.
 
 One sample is not a level either: the pack sags with the load and 20 mV of that
 is three points of this curve, so the value is smoothed with alpha 1/4 and the
@@ -77,14 +85,15 @@ wedges the arbiter, measured twice, and the SPMI command thread never returns -
 so this AP cannot read the charge status or the input current limit, and cannot
 turn charging on. VBUS and vbat are the only charger facts available.
 
-What remains, in order:
+What remains:
 
-1. Measure whether the PMIC still charges after the jump from fastboot: vbat
-   with the panel blanked is the discriminator, and `sa 3 0x11 16` says whether
-   the cable carries 5 V.
-2. Publish `IsCharging` if that measurement shows a rise, and say plainly that
-   a PC port's 500 mA cannot feed a booted phone.
-3. A real charger driver means `pmic_glink` (ADSP firmware and an rpmsg
+1. The pack does reach full: measured 2026-11-11 with the cable in, iOS
+   running and the panel on, vbat sat at 4.42-4.43 V for minutes, which is a
+   full cell on a charger. Whether the AP is charging it or the charger the
+   bootloader set up is still running is not established; blank the panel,
+   watch vbat for ten minutes and pair it with `sa 3 0x11 16` to tell the two
+   apart.
+2. A real charger driver means `pmic_glink` (ADSP firmware and an rpmsg
    protocol), which is the same piece `docs/MONDIAN_REFERENCE.md` lists as
    absent; nothing on the AP side substitutes for it.
 
