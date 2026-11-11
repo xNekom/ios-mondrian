@@ -1,0 +1,593 @@
+xnu 0305: the panel's brightness, a DCS write on the frame that starts it
+
+The screen sits at whatever level the bootloader left it: iOS sets brightness
+through IOMobileFramebuffer, the port never sent it, and on this panel the
+backlight is a DCS long write (command 0x51, 12-bit DBV) that nothing
+produced. Both the value and the way it leaves come from the shipped kernel:
+AppleCLCD::vsyncFired was the only place that transmitted a level, the packet
+is three bytes, and it goes out as a DSI DMA from a command page in memory.
+
+The level, the format and the command byte live next to the DSI window.
+"bl LEVEL [FMT [CMD]]" on the USB control channel stores them and the next
+vsync sends them, so a slider costs one packet per frame instead of one per
+command. The write is the old sequence register for register: TPG FIFO reset,
+0x50000000 (0x54000000 when format bit 4 is set) into
+DSI_COMMAND_MODE_DMA_CTRL, the page's physical address into
+DSI_DMA_CMD_OFFSET, eight bytes on the wire, trigger, then a 100 ms wait for
+DMA done with one retry after the same reset.
+
+The command page has to be a low one, and it is not allocated. DSI_DMA_CMD_OFFSET
+is 32 bits wide and the kernel's window starts at 0x840000000, so no allocator
+can serve an address the engine can reach; the page is the last 64 KiB of the
+splash carve-out at 0xb8000000, the only memory below 4 GiB this port owns and
+one the panel never scans. mondrianblbuf still overrides it, and the
+write/read canary the old kernel used still refuses a page that is not RAM. No
+level is hardcoded either -- mondrianbl (default 1024 of 4095) and
+mondrianblfmt (default 8) choose the boot level, and the panel only receives it
+once the kick has started the interface under it.
+
+"dcs CMD [P0 [P1 [P2]]]" sends one packet from the control thread through the
+inline path instead of the frame's DMA (0x05 with no parameter, 0x39 with up
+to three), which is how a panel register is poked without waiting for a tick.
+Nothing in present() or swap() changed; in steady state the whole feature
+costs the frame path one bool test.
+
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 6d3e927..f94540a 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -54,6 +54,8 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div);
++extern void mondrian_fb_set_brightness(uint32_t level, uint32_t fmt, uint32_t cmd);
++extern int mondrian_fb_dcs(uint32_t cmd, const uint8_t *params, uint32_t n);
+ void mondrian_usb_probe(void);
+ static void mondrian_usb_gadget_start(vm_offset_t dwc);
+ 
+@@ -1162,6 +1164,79 @@ ud_cmd_adc(socket_t so, struct sockaddr_in *to, const char *cmd)
+ 	ud_cmd_send(so, to, out, (size_t)n);
+ }
+ 
++/*
++ * "bl [LEVEL [FMT [CMD]]]" sets the panel's brightness: the level and the
++ * two format bytes are stored and the next vsync sends them as one DCS long
++ * write, so a run of commands costs one packet per frame. The ring keeps the
++ * line the old kernel printed and the peer gets the same text, so a host that
++ * only reads the log and a script that waits for the answer both see it:
++ *   MONDR USB: brightness 2048 of 4095 fmt 8 dcs 0x51
++ * A level is required; the format defaults to 0 and the command to 0x51.
++ */
++static void
++ud_cmd_bl(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	uint32_t level, fmt = 0, dcs = 0x51;
++	const char *p = line + 2;
++	char out[96];
++	int n;
++
++	if ((p = ud_cmd_num(p, &level)) == NULL) {
++		n = snprintf(out, sizeof(out), "bl needs a level\n");
++		ud_cmd_send(so, to, out, (size_t)n);
++		printf("%s", out);
++		return;
++	}
++	if ((p = ud_cmd_num(p, &fmt)) != NULL) {
++		(void)ud_cmd_num(p, &dcs);
++	}
++	if (level > 4095) {
++		level = 4095;
++	}
++	mondrian_fb_set_brightness(level, fmt, dcs);
++	n = snprintf(out, sizeof(out),
++	    "MONDR USB: brightness %u of 4095 fmt %u dcs 0x%02x\n",
++	    level, fmt, dcs);
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
++/*
++ * "dcs CMD [P0 [P1 [P2]]]" sends one DCS packet from this thread, through the
++ * inline path rather than the frame's DMA: no parameter is a short write
++ * (0x05), one to three a long write (0x39). The reply counts the parameters,
++ * not the bytes on the wire, and goes to the ring and the peer alike:
++ *   MONDR USB: dcs 0x51 3 bytes
++ */
++static void
++ud_cmd_dcs(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	uint8_t params[3];
++	uint32_t c = 0, v = 0, n = 0, i;
++	const char *p = line + 3;
++	char out[96];
++	int len;
++
++	if ((p = ud_cmd_num(p, &c)) == NULL) {
++		len = snprintf(out, sizeof(out), "dcs needs a command byte\n");
++		ud_cmd_send(so, to, out, (size_t)len);
++		printf("%s", out);
++		return;
++	}
++	for (i = 0; i < 3; i++) {
++		if ((p = ud_cmd_num(p, &v)) == NULL) {
++			break;
++		}
++		params[i] = (uint8_t)v;
++		n++;
++	}
++	(void)mondrian_fb_dcs(c & 0xff, params, n);
++	len = snprintf(out, sizeof(out), "MONDR USB: dcs 0x%02x %u bytes\n",
++	    c & 0xff, n);
++	ud_cmd_send(so, to, out, (size_t)len);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1243,6 +1318,12 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strcmp(cmd, "sa") == 0 ||
+ 			    strncmp(cmd, "sa ", 3) == 0) {
+ 				ud_cmd_adc(so, peer, cmd);
++			} else if (strcmp(cmd, "bl") == 0 ||
++			    strncmp(cmd, "bl ", 3) == 0) {
++				ud_cmd_bl(so, peer, cmd);
++			} else if (strcmp(cmd, "dcs") == 0 ||
++			    strncmp(cmd, "dcs ", 4) == 0) {
++				ud_cmd_dcs(so, peer, cmd);
+ 			} else if (strcmp(cmd, "reboot") == 0) {
+ 				extern void mondrian_reboot_to_fastboot(void);
+ 
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index 3201906..5c97004 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -47,6 +47,8 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ /*
+  * The panel is a command-mode panel: the bootloader's own command line names
+@@ -92,6 +94,29 @@
+ #define MONDRIAN_INTF_AUTOREFRESH 0x2B4
+ #define MONDRIAN_INTF_AUTOREFRESH_STATUS 0x2C0
+ #define MONDRIAN_DSI1_OFF        0x2000   /* ctrl1 inside the DSI window */
++/*
++ * DSI controller registers, offsets from the window at MONDRIAN_DSI_PHYS;
++ * the names are the vendor's (dsi_ctrl_reg.h). Only the ones the DCS writes
++ * touch are here; the wedged-interface dump below reads its registers by
++ * offset, because it is a one-shot report of registers with no other use.
++ */
++#define MONDRIAN_DSI_STATUS              0x008   /* bit2 busy before, bit1 after */
++#define MONDRIAN_DSI_FIFO_STATUS         0x00c   /* logged only */
++#define MONDRIAN_DSI_VIDEO_MODE_CTRL     0x010   /* logged only */
++#define MONDRIAN_DSI_CMD_MODE_DMA_CTRL   0x03c   /* bit28 embedded, bit26 lpm */
++#define MONDRIAN_DSI_DMA_CMD_OFFSET      0x048   /* physical, 32-bit */
++#define MONDRIAN_DSI_DMA_CMD_LENGTH      0x04c   /* 4 or 8 */
++#define MONDRIAN_DSI_DMA_FIFO_CTRL       0x050
++#define MONDRIAN_DSI_ACK_ERR_STATUS      0x068   /* clear-on-read */
++#define MONDRIAN_DSI_TRIG_CTRL           0x084
++#define MONDRIAN_DSI_CMD_MODE_DMA_SW_TRIGGER 0x090
++#define MONDRIAN_DSI_CMD_DMA_DONE        0x110   /* bit0, write 1 to clear */
++#define MONDRIAN_DSI_TPG_CTRL            0x15c   /* 0x00030006 in flight */
++#define MONDRIAN_DSI_TPG_CMD_INIT_VAL    0x17c   /* inline packet words */
++#define MONDRIAN_DSI_TPG_DMA_FIFO_RESET  0x1ec
++/* The brightness command page: the last 64 KiB of the 0xb8000000 splash. */
++#define MONDRIAN_BL_SIZE                 0x4000
++#define MONDRIAN_BL_PHYS                 0xbaaf0000ULL
+ /* The pipes whose source address says what the DPU really fetches. */
+ #define MONDRIAN_SSPP_N          8
+ #define MONDRIAN_SSPP_SRC0       0x14
+@@ -477,6 +502,20 @@ public:
+ 	uint32_t      fStuck;
+ 	bool          fDsiDumped;
+ 	bool          fResetDone;
++	/*
++	 * Brightness: a DCS long write (0x51, 12-bit DBV) that only the vsync
++	 * sends, so a level set from the control channel waits for the next
++	 * tick, the one place known to be between frames. The command block is
++	 * the page the DSI DMA reads it from (fBrightBuf is the kernel VA the
++	 * kernel writes, fBrightPhys what DSI_DMA_CMD_OFFSET takes).
++	 */
++	uint32_t      fBrightLevel;
++	uint32_t      fBrightFmt;
++	uint32_t      fBrightCmd;
++	bool          fBrightPending;
++	uint32_t      fBrightApplies;
++	void         *fBrightBuf;
++	uint64_t      fBrightPhys;
+ 	/*
+ 	 * The display sleeps when CoreAnimation stops swapping; there is no
+ 	 * power call into this driver. A command-mode panel keeps the last
+@@ -528,6 +567,243 @@ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer)
+  */
+ static AppleCLCD *gMondrianFB;
+ 
++/*
++ * A command page that is not RAM takes one log line, not one per frame.
++ */
++static bool mondrian_bl_nobuf_logged;
++
++/*
++ * One DSI packet through the inline ("embedded") path, the one the control
++ * channel's `dcs` uses: the header and the payload go into
++ * DSI_TEST_PATTERN_GEN_CMD_INIT_VAL and the trigger register starts the
++ * engine, with no memory behind it. `type` is the DSI data type (0x05 short
++ * write, 0x39 long write, 0x06 read), `data` holds the DCS command byte
++ * first, and `len` is how many of its bytes go out: 1 or 2 make a 4-byte
++ * packet, 3 an 8-byte one. Both waits are bounded at 20 ms and a timeout is
++ * not an error, as in the old kernel.
++ */
++static int
++mondrian_dsi_packet(AppleCLCD *fb, uint32_t type, const uint8_t *data,
++    uint32_t len, bool lpm, uint32_t *ack)
++{
++	volatile uint32_t *dsi = fb->fDsi;
++	uint32_t hdr, payload, plen, a;
++
++	if (len > 3) {
++		return -1;
++	}
++	if (dsi == NULL) {
++		return -1;
++	}
++	if (len < 2) {
++		payload = 0;
++		plen = 4;
++		hdr = type | ((uint32_t)data[0] << 8);
++		if (type == 6) {
++			hdr |= 0x20000000;
++		}
++	} else {
++		plen = 8;
++		payload = (uint32_t)data[0] | ((uint32_t)data[1] << 8);
++		if (len == 3) {
++			payload |= (uint32_t)data[2] << 16;
++		}
++		hdr = type | (len << 8) | 0x40000000;
++	}
++
++	/* DSI_STATUS bit 2: the engine is still busy with the last packet. */
++	for (uint32_t i = 200; i != 0; i--) {
++		if ((mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS) & 4) == 0) {
++			break;
++		}
++		delay(100);
++	}
++
++	a = mondrian_mdp_rd(dsi, MONDRIAN_DSI_ACK_ERR_STATUS);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_ACK_ERR_STATUS, a);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CTRL, 0x00030006);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CMD_INIT_VAL, hdr);
++	if (len >= 2) {
++		mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CMD_INIT_VAL, payload);
++	}
++	if (plen == 4) {
++		mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CMD_INIT_VAL, 0);
++	}
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL,
++	    (mondrian_mdp_rd(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL) & 0xCAFFFFFFu) |
++	    (lpm ? 0x14000000u : 0x10000000u));
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH, plen);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TRIG_CTRL,
++	    (mondrian_mdp_rd(dsi, MONDRIAN_DSI_TRIG_CTRL) & 0xFFFFFFF0u) | 1);
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
++
++	/* DSI_STATUS bit 1: the engine is still busy, the packet not done. */
++	for (uint32_t i = 200; i != 0; i--) {
++		if ((mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS) & 2) == 0) {
++			break;
++		}
++		delay(100);
++	}
++
++	delay(5);
++	if (ack != NULL) {
++		*ack = mondrian_mdp_rd(dsi, MONDRIAN_DSI_ACK_ERR_STATUS);
++	}
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CTRL, 0);
++	return 0;
++}
++
++/*
++ * The brightness write, as a DSI DMA out of fBrightBuf: the DCS long write
++ * sits in memory (4-byte packet header 03 00 39 c0, then the command byte and
++ * the 12-bit level, 0xff pad) and DSI_DMA_CMD_OFFSET points the engine at it.
++ * The two lengths are the constants the old kernel used: three payload bytes,
++ * eight on the wire. `cmd` is the DCS command byte, `value` its 16-bit payload
++ * low byte first.
++ *
++ * Returns -1 without a DSI window or a command page, -2 when the DMA-done bit
++ * never arrives (100 ms), 0 once it did.
++ */
++static int
++mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
++{
++	volatile uint32_t *dsi = fb->fDsi;
++	volatile uint32_t *buf = (volatile uint32_t *)fb->fBrightBuf;
++	uint32_t save3c, save50, status, back, iv = 0, n;
++	bool done = false;
++	int rc;
++
++	if (dsi == NULL) {
++		return -1;
++	}
++	if (buf == NULL) {
++		if (!mondrian_bl_nobuf_logged) {
++			mondrian_bl_nobuf_logged = true;
++			IOLog("MONDRIAN BL: no command buffer\n");
++		}
++		return -1;
++	}
++
++	/*
++	 * The page has to be RAM the engine can read, not a hole that swallows
++	 * writes: write a word, read it back, clear it.
++	 */
++	buf[0x3c / 4] = 0xa5c3f00du;
++	__asm__ volatile("dsb sy" ::: "memory");
++	back = buf[0x3c / 4];
++	buf[0x3c / 4] = 0;
++	if (back != 0xa5c3f00du) {
++		IOLog("MONDRIAN BL: command page 0x%llx read back 0x%x, refused\n",
++		    (unsigned long long)fb->fBrightPhys, back);
++		return -1;
++	}
++
++	/* 64-byte block; the DMA reads the first 8 bytes. */
++	buf[0] = 0xc0390003u;
++	buf[1] = 0xff000000u | (cmd & 0xff) | ((value & 0xffff) << 8);
++	for (uint32_t i = 2; i < 16; i++) {
++		buf[i] = 0xffffffff;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CTRL, 0);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 1);
++	delay(10);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 0);
++
++	save3c = mondrian_mdp_rd(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL);
++	save50 = mondrian_mdp_rd(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL);
++
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL,
++	    ((fb->fBrightFmt & 0x10) ? 0x54000000u : 0x50000000u) |
++	    (save3c & 0x0AFFFFFFu));
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50 | 0x00110000u);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_OFFSET,
++	    (uint32_t)fb->fBrightPhys);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH, 8);
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_DMA_DONE, 1);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	status = mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS);
++	for (n = 0; ; n++) {
++		iv = mondrian_mdp_rd(dsi, MONDRIAN_DSI_CMD_DMA_DONE);
++		if ((iv & 1) != 0) {
++			done = true;
++			break;
++		}
++		delay(500);
++		if (n > 0xc6) {          /* 200 x 500 us, 100 ms */
++			break;
++		}
++	}
++
++	IOLog("MONDRIAN BL: dma len %u size %u phys 0x%llx int 0x%08x done %d\n",
++	    3, 8, (unsigned long long)fb->fBrightPhys, iv, done ? 1 : 0);
++	IOLog("MONDRIAN BL: status 0x%x -> 0x%x fifo 0x%x ack 0x%x to 0x%x "
++	    "vmode 0x%x off 0x%x len 0x%x\n",
++	    status, mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS),
++	    mondrian_mdp_rd(dsi, MONDRIAN_DSI_FIFO_STATUS),
++	    mondrian_mdp_rd(dsi, MONDRIAN_DSI_ACK_ERR_STATUS),
++	    mondrian_mdp_rd(dsi, 0x0c0),
++	    mondrian_mdp_rd(dsi, MONDRIAN_DSI_VIDEO_MODE_CTRL),
++	    mondrian_mdp_rd(dsi, MONDRIAN_DSI_DMA_CMD_OFFSET),
++	    mondrian_mdp_rd(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH));
++
++	if (done) {
++		mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_DMA_DONE, 1);
++		rc = 0;
++	} else {
++		rc = -2;
++	}
++
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL, save3c);
++	return rc;
++}
++
++/*
++ * Send the stored level: three DCS bytes, command first, the 12-bit DBV split
++ * by the format (bit0 swaps the byte order, bit1 inverts it), then the DMA.
++ * A failed transfer gets one retry after the TPG FIFO reset the old kernel
++ * used; the second failure is reported and dropped.
++ */
++static void
++mondrian_fb_brightness_apply(AppleCLCD *fb)
++{
++	uint32_t level = fb->fBrightLevel;
++	uint32_t fmt = fb->fBrightFmt;
++	uint32_t v, lsb, cmd, p0, p1, p2;
++	int rc;
++
++	v = level & 0xfff;
++	if ((fmt & 2) != 0) {
++		v ^= 0xfff;              /* inverted polarity panel */
++	}
++	lsb = (fmt & 1) << 3;        /* 0: high byte first, 8: low byte first */
++	cmd = fb->fBrightCmd != 0 ? fb->fBrightCmd : 0x51;
++	p0 = cmd & 0xff;
++	p1 = (v >> (lsb ^ 8)) & 0xff;
++	p2 = (v >> lsb) & 0xff;
++
++	IOLog("MONDRIAN BL: level %u fmt %d cmd 0x%02x dbv 0x%03x path dma\n",
++	    level, (int)fmt, cmd, v);
++	rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8));
++	if (rc != 0 && fb->fDsi != NULL) {
++		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_CTRL, 0);
++		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 1);
++		delay(10);
++		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 0);
++		rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8));
++	}
++	IOLog("MONDRIAN BL: sent rc %d ack 0x%08x\n", rc, 0);
++	fb->fBrightApplies++;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -779,6 +1055,59 @@ AppleCLCD::start(IOService *provider)
+ 			}
+ 		}
+ 	}
++	/*
++	 * The command page. The DCS write leaves as a DSI DMA and
++	 * DSI_DMA_CMD_OFFSET is 32 bits wide, while the kernel's window starts
++	 * at 0x840000000: no allocator can serve an address the engine can
++	 * reach. The splash carve-out the bootloader leaves below 4 GiB has a
++	 * page the panel never scans (its last 64 KiB), and that is the only
++	 * low page this port owns. mondrianblbuf overrides it. A missing page
++	 * is not fatal: the panel keeps the level it has and `bl` reports it.
++	 */
++	fBrightBuf = NULL;
++	fBrightPhys = 0;
++	fBrightApplies = 0;
++	fBrightLevel = 1024;
++	fBrightFmt = 0;
++	fBrightCmd = 0x51;
++	fBrightPending = false;
++	{
++		uint64_t pa = MONDRIAN_BL_PHYS;
++
++		(void)PE_parse_boot_argn("mondrianblbuf", &pa, sizeof(pa));
++		if (pa != 0 && (pa & 0x3ff) == 0) {
++			fBrightBuf = (void *)ml_io_map((vm_offset_t)pa, MONDRIAN_BL_SIZE);
++			if (fBrightBuf != NULL) {
++				fBrightPhys = pa;
++			}
++		}
++		if (fBrightBuf == NULL) {
++			IOLog("MONDRIAN BL: no command buffer at 0x%llx\n",
++			    (unsigned long long)pa);
++		}
++	}
++	/*
++	 * mondrianbl=N (default 1024 of 4095) and mondrianblfmt=N (default 8,
++	 * kept as fmt & 0x1b) start the panel at a level the boot chose; the
++	 * first tick after the kick sends it.
++	 */
++	{
++		int bl = 1024, blfmt = 8;
++		uint32_t level, fmt;
++
++		(void)PE_parse_boot_argn("mondrianbl", &bl, sizeof(bl));
++		(void)PE_parse_boot_argn("mondrianblfmt", &blfmt, sizeof(blfmt));
++		level = bl >= 0 ? (uint32_t)bl : 1024u;
++		if (level > 4095) {
++			level = 4095;
++		}
++		fmt = (uint32_t)blfmt & 0x1b;
++		fBrightLevel = level;
++		fBrightFmt = fmt;
++		fBrightPending = true;
++		IOLog("MONDRIAN BL: %d of %u from the command line\n",
++		    (int)level, 4095);
++	}
+ 	return true;
+ }
+ 
+@@ -1091,6 +1420,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 		}
+ 	}
++	/*
++	 * A pending brightness goes out on the tick that starts the frame: a
++	 * command-mode panel takes a DCS write between frames, and the level is
++	 * only worth sending once the interface that carries it has started.
++	 * Nothing else in the tick runs for this: one flag test per frame.
++	 */
++	if (fb->fBrightPending && fb->fDsi != NULL && fb->fKick &&
++	    count >= fb->fKickFrom) {
++		fb->fBrightPending = false;
++		mondrian_fb_brightness_apply(fb);
++	}
+ 	/*
+ 	 * Sample the panel memory once a tick and count the ticks whose sample
+ 	 * changed. 64 pixels is nothing next to a 18 MB frame, and it answers
+@@ -2216,4 +2556,66 @@ mondrian_fb_service(void)
+ 	return gMondrianFB;
+ }
+ 
++/*
++ * The control channel's `bl`: store the level and let the next tick send it,
++ * the way the old kernel's USB path did. Sending it on the calling thread
++ * would put a DSI DMA in the middle of a frame the compositor may be copying
++ * into, and a slider produces a run of levels of which only the last one
++ * matters.
++ */
++extern "C" void
++mondrian_fb_set_brightness(uint32_t level, uint32_t fmt, uint32_t cmd)
++{
++	AppleCLCD *fb = gMondrianFB;
++
++	if (fb == NULL || fb->fDsi == NULL) {
++		return;
++	}
++	if (level > 4095) {
++		level = 4095;
++	}
++	fb->fBrightLevel = level;
++	fb->fBrightFmt = fmt & 0x1b;
++	fb->fBrightCmd = (cmd != 0 && cmd < 0x100) ? cmd : 0x51;
++	fb->fBrightPending = true;
++}
++
++/*
++ * The control channel's `dcs`: one DCS packet from the calling thread, through
++ * the inline path rather than the frame's DMA, so a register can be poked
++ * without waiting for a tick. `params` are the bytes after the command: a
++ * short write (0x05) has none, a long write (0x39) up to three.
++ */
++extern "C" int
++mondrian_fb_dcs(uint32_t cmd, const uint8_t *params, uint32_t n)
++{
++	AppleCLCD *fb = gMondrianFB;
++	uint8_t buf[4];
++	uint32_t ack = 0;
++	int rc;
++
++	if (fb == NULL || fb->fDsi == NULL) {
++		return -1;
++	}
++	/* The old kernel refused a packet with no command byte, as does DSI. */
++	if (cmd == 0 || cmd > 0xff) {
++		return -1;
++	}
++	if (n > 3) {
++		n = 3;
++	}
++	if (params == NULL) {
++		n = 0;
++	}
++	buf[0] = (uint8_t)cmd;
++	buf[1] = n > 0 ? params[0] : 0;
++	buf[2] = n > 1 ? params[1] : 0;
++	buf[3] = n > 2 ? params[2] : 0;
++	rc = mondrian_dsi_packet(fb, n == 0 ? 0x05 : 0x39, buf, n + 1, false,
++	    &ack);
++	IOLog("MONDRIAN DCS: cmd 0x%02x n %u lpm %u rc %d ack 0x%08x\n",
++	    cmd & 0xff, n, 0, rc, ack);
++	return rc;
++}
++
+ #endif /* MONDRIAN */

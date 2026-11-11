@@ -46,19 +46,18 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
   (480x1066 pt at scale 3) and the tick holds two records (`0282`). Measured
-  2026-11-11: a kernel built from the series alone composites at 24 fps at rest
-  and 60 while a swipe animates, and the panel follows (two captures a second
-  apart differ in 35 000 and 942 000 pixels); the boots that carried the
-  hand-written DSI brightness code read `1 frame in ~5000 ms` and put one frame
-  every 5 s on the glass. Never wait on the DSI inside `present()`; the frame
-  meter and this trap are in `docs/UI_PERFORMANCE.md`. CoreAnimation needs
-  `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`).
+  2026-11-11: the series alone composites at 24 fps at rest and 60 while a swipe
+  animates, and the panel follows (two captures a second apart differ in 35 000
+  and 942 000 pixels). The frame meter is in `docs/UI_PERFORMANCE.md`.
+  CoreAnimation needs `TimingElements`/`ColorElements` and an `IOAcceleratorES`
+  service (`0114`).
 
 Current blockers, in order:
 
-1. **The battery.** Nothing drives the charger: it has no APID in the AP's SPMI
-   table (trap below), so a boot runs the phone down. The level comes from the
-   PMK8350 VADC (`mondrian_spmi_adc_mv()`, `sa SID CHAN DIV` over USB).
+1. **Charging.** Nothing drives the charger: it has no APID in the AP's SPMI
+   table (trap below), so a boot runs the phone down. The level is read from the
+   PMK8350 VADC and published as an `IOPMPowerSource` (`0304`; `sa SID CHAN DIV`
+   over USB prints one raw channel).
 2. **The compositor stops drawing.** Some boots never put a frame on the
    glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
    screen keeps the boot logo. That is the GPU write-target bug in
@@ -205,20 +204,18 @@ window (`0179`), and remember it belongs to one APID - the next peripheral has
 to re-map or the byte lands in the previous page.
 
 **The HFS journal cannot be replayed, and a dirty volume looks like a dead
-kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and from
-then on every mount hangs *before* the framebuffer: the screen keeps the shim
-log (`STAGE`, `XNU jumping`) and the USB gadget never appears, so there is no
-ring and no userland left to undo it. `mondriannojnl=1` mounts ignoring the
-journal; the disable sysctl is not the way out, because `journal_close(NULL)`
-has no NULL check and panics. A volume left dirty by a mid-boot panic shows the
-same signature; reflashing `backup/ios-root.simg` is the repair.
+kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
+every mount hangs *before* the framebuffer: the screen keeps the shim log and
+the USB gadget never appears, so there is no ring and no userland left to undo
+it. `mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
+(`journal_close(NULL)` has no NULL check). A volume left dirty shows the same
+signature: reflashing `backup/ios-root.simg` is the repair, and `fsck.hfsplus
+-fy` on a copy names what a rebuild has to fix.
 
 **`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
 entry that claims data and owns no blocks is rejected on every open (2 560
 times in one boot); a pristine image has none, so the hard resets write that
-damage. `hfs_zero_block_stub()` exempts the legal under-one-block case.
-
-**The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
+damage. `hfs_zero_block_stub()` exempts the legal under-one-block case.**The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload. The payload travels
 **appended to the shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked
 by `shim/lz4.c`). Never write the blob over `shim/out/payload.bin`, the raw
@@ -235,7 +232,10 @@ lines and no `MONDRIAN EARLY` means the shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and reading it back fails; flash a sparse image instead
-(`tools/mk-simg.py`), which fastboot sends in `-S` chunks.
+(`tools/mk-simg.py`). A recovery is not reachable either: `fastboot boot` of a
+100 MiB image fails with `Bad Buffer Size` and `fastboot reboot recovery` boots
+`boot_b`, so OrangeFox (which fits `recovery_b` exactly) needs a BCB
+`boot-recovery`; read a log with `mondriandump=1` instead.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
@@ -272,13 +272,6 @@ The write path is `0090` (WRITE(10), read-modify-write, SYNCHRONIZE CACHE).
 `nent * esz > BOUNCE_SIZE`, a 32-bit product a corrupt table can wrap; guard
 with `nent > BOUNCE_SIZE / esz`.
 
-**HFS+ corruption shows as `hfs_mark_inconsistent`.** `fsck.hfsplus -fy` on a
-copy of the 16 GiB root names the damage (overlapped extents, a bad volume
-bitmap, a wrong free-block count); repeat until it says `appears to be OK`,
-then push the changed blocks back. Once it complains about the allocation-block
-count or the extents node (block 2178, `0x882000`) is zeroed, rebuild the root
-from `backup/ios-root.simg`; the live GPT has a single `userdata`.
-
 ## Display
 
 The panel is **command mode** (`dsi_cmd_mode`, boot arg
@@ -309,16 +302,22 @@ mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 
 **Brightness: one DMA path, one low page.** DCS `0x51` reaches an AMOLED panel
 only through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA: the command FIFO
-acks and changes nothing, and worse, a FIFO send wedges the DMA engine for the
-rest of the boot (`INT_CTRL` `0x500`, no `DMA_DONE`, `STATUS` 0) -- reset the
-command FIFO before the next send. Do not write `DSI_CTRL`: `CMD_MODE_EN` on
-this video-mode controller is what stopped the engine reporting completion.
-`DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window starts at `0x840000000`,
-so no allocator can serve it (IOKit's physical mask is ignored: pages at
-`0x846924000`); the last page of the splash carve-out, `0xbaaf0000`
-(`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>` sets
-the boot level (0xfff full scale) and `brightness-nits` 0 means "display
-asleep": honouring it left every boot at DBV `0x20` with a dead slider.
+acks and changes nothing, and a FIFO send wedges the DMA engine for the rest of
+the boot (`INT_CTRL` `0x500`, no `DMA_DONE`) -- reset the command FIFO before
+the next send. Do not write `DSI_CTRL`: `CMD_MODE_EN` on this video-mode
+controller stops the engine reporting completion. `DSI_DMA_CMD_OFFSET` is 32
+bits and the kernel window starts at `0x840000000`, so no allocator can serve
+it; the last page of the splash carve-out, `0xbaaf0000` (`shim/board.h`), is the
+only low page this port owns. `mondrianbl=<DBV>` sets the boot level (0xfff
+full scale), `mondrianblfmt` the byte order, `bl LEVEL [FMT [CMD]]` sets it at
+run time, and `brightness-nits` 0 means "display asleep": honouring it left
+every boot at DBV `0x20` with a dead slider.
+
+**The battery's ADC read is about 100 ms of SPMI polling, so it is not a frame
+task.** `mondrian_spmi_battery_mv()` writes the seven ADC registers and waits
+for EOC up to 40 times; the old kernel called it every 2 s from
+`AppleCLCD::vsyncFired` and that wait is what `1 frame in ~5000 ms` was. `0304`
+reads it on its own thread; brightness is one pending-flag test per tick.
 
 ## Boot menu and dual boot
 

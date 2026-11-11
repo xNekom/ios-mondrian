@@ -27,7 +27,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 | Buttons | PM6150 PON / SPMI | **PM8008** (PMR735A + PM8350B); volume up on PM8350 GPIO6 |
 | Display | 1080x2400 LCD, DSC video mode, splash at 0x9c000000 | **1440x3200 AMOLED, DSI D-PHY, command mode** (one `CTL_START` a frame); splash at 0xb8000000 |
 | Memory | 0x80000000+2 GiB, 0x100000000+0xfcc00000 | `0x80000000+0x6a000000`, `0xf4600000+0xba00000` |
-| PMIC rails | PM6150 LDO11 (touch), fuel gauge | PM8008 rails, fuel gauge (not needed yet) |
+| PMIC rails | PM6150 LDO11 (touch), fuel gauge | PM8008 rails, VADC fuel gauge (`0304`) |
 
 ## What is already in this fork
 
@@ -214,13 +214,12 @@ panel is written through the console alias, which is only stopped with
 `pmap_remove_pv`); and the dylib forces activation past MobileActivation.
 
 Open: the UI is rendered at the panel's own 1440x3200 (480x1066 pt at scale 3);
-the `mondrianfb_canvas_w/h` scaler (`0268`) is an experiment knob, off because a
-smaller canvas made text soft and the UI oversized. Smoothness is its own
-document: `docs/UI_PERFORMANCE.md`.
-`0302`/`0303` blank the panel on the power key and on idle sleep; the driver's
-fallback timer (`mondrianfb_blank`) is 0 in the board cmdline, because at its
-default of 1 the panel went dark a second after the compositor went quiet.
-Brightness is open work again: its DSI driver was lost with the build tree.
+the `mondrianfb_canvas_w/h` scaler (`0268`) is off because a smaller canvas made
+text soft and the UI oversized; smoothness is in `docs/UI_PERFORMANCE.md`.
+`0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
+timer (`mondrianfb_blank`) is 0 in the board cmdline, because at its default of
+1 the panel went dark a second after the compositor went quiet. `0305` sets the
+brightness and `0304` the battery level, both off the frame path.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
@@ -241,18 +240,19 @@ tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`) and
 drives the menu; `0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
 thread polls the PMK8350 PON and PM8350 GPIO6 and publishes both edges through
-`MondrianHIDButtons`. The level comes from the PMIC's VADC and shows on the
-status bar; nothing charges the phone, because the SMB5 is behind the ADSP.
-Dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
+`MondrianHIDButtons`. `0304` publishes the pack level as an `IOPMPowerSource`
+from its own thread, and `0305` sends the panel brightness (`bl LEVEL` over
+USB) as a DCS long write. Nothing charges the phone, because the SMB5 is
+behind the ADSP; dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 
 Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
-`tools/usb-ring.py` (ring dump, panel screenshot, touch/key, memory, reboot).
+`tools/usb-ring.py` (see `README.md`).
 A read-only mass-storage interface over `userdata` (`0297`) is a work item:
-the host enumerates the disk but the first SCSI INQUIRY never returns. The
-storage IN endpoint is the next suspect; `usb=1` probes only, USB3/PHY remain.
+the host enumerates the disk but the first SCSI INQUIRY never returns, and the
+storage IN endpoint is the next suspect; `usb=1` probes only.
 
 ## Getting the numbers off the device
 

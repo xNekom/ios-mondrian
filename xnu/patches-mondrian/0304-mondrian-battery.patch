@@ -1,0 +1,689 @@
+xnu 0304: the battery, published off the frame path
+
+The status bar lost the battery when the old code was dropped: an SPMI VADC
+read on the PMK8350 (PPID 0x31, channel 0x8f vbat_sns, divider 3) and an
+IOPMPowerSource that turns one sample into a percentage from the 20-point
+curve, a capacity out of the 5160 mAh pack and the properties iOS 16 reads
+(AppleRawCurrentCapacity, the legacy IOBatteryInfo dictionary, updateStatus).
+
+The old kernel ran both inside AppleCLCD::vsyncFired, on every 120th tick --
+every 2 s, on the thread that presents frames, where a worst-case ADC read is
+about 100 ms of polling, i.e. six dropped frames. The cadence here is a thread
+of its own, started by mondrian_spmi_probe(): it sleeps 2 s, reads vbat and
+vbus and calls MondrianPowerSource::updateState() through
+mondrian_battery_publish(). Nothing in this patch touches swap(), present(),
+vsyncFired() or the vsync timer.
+
+A sample outside 3000-4400 mV is dropped before it can reach the status bar,
+and a repeated identical sample publishes and logs nothing. The power source
+is created lazily and attaches to the display, the parent the old kernel gave
+it, so a sample that arrives before AppleCLCD is registered publishes nothing
+and the next one retries. "sa [SID [CHAN [DIV]]]" on the USB control channel
+runs one conversion by hand and answers with the ring's old line, e.g.
+"sa sid 3 chan 0x08f div 3 = 4108 mV".
+
+FullyCharged mirrors external power and IsCharging is false, as before: there
+is no charger driver and the charger is behind the ADSP
+(docs/MONDIAN_POWER.md). Temperature is the constant 2500 and capacity is
+derived from the sample, not integrated.
+
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+index 31a992b..69516e7 100644
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -20,8 +20,18 @@
+  *     is bit 0 of RT_STATUS and the pin is pulled up, so it reads 0 held.
+  *
+  * The arbiter's APID for each peripheral is assigned at boot; scan the map
+- * instead of hardcoding an observer channel. mondriankeys=0 disables the
+- * thread for a boot that needs to rule it out.
++ * instead of hardcoding an observer channel. mondriankeys=0 disables both
++ * threads for a boot that needs to rule the SPMI half out.
++ *
++ * The same bus gives the battery its voltage. The VADC's APID is the map
++ * entry whose PPID is 0x31 (pmk8350@0 vadc@3100, SID 0); seven writes into
++ * the arbiter's channel window (0x0c500000 + apid * 0x1000) configure one
++ * conversion, the observer window carries STATUS1 and the 16-bit code back,
++ * and the code becomes millivolts with the channel's qcom,pre-scaling. A
++ * second thread samples vbat every 2 s and hands the result to the power
++ * source (iokit/Kernel/arm/MondrianPower.cpp); nothing here runs on a frame.
++ * `sa` on the USB control channel (mondrian_usb.c) runs one conversion on
++ * demand.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -34,6 +44,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int hz;
+ extern void mondrian_hid_key(int key, int down);
++extern void mondrian_battery_publish(uint32_t mv, int external, int charging);
+ 
+ #define MONDRIAN_SPMI_CORE	0x0c400000u
+ #define MONDRIAN_SPMI_CORE_SIZE	0x3000u
+@@ -50,6 +61,21 @@ extern void mondrian_hid_key(int key, int down);
+ #define MONDRIAN_SPMI_HZ	20	/* polls a second */
+ #define MONDRIAN_SPMI_RETRIES	2000
+ 
++#define MONDRIAN_SPMI_CHNLS	0x0c500000u	/* 4 KiB per APID */
++#define MONDRIAN_SPMI_CHNLS_SIZE 0x1000u
++#define MONDRIAN_SPMI_VADC_PPID	0x0031u		/* pmk8350@0 vadc@3100 */
++
++#define MONDRIAN_SPMI_VBAT_SID	3		/* PM8350B */
++#define MONDRIAN_SPMI_VBAT_CHAN	0x8fu		/* ADC7 vbat_sns */
++#define MONDRIAN_SPMI_VBAT_DIV	3		/* qcom,pre-scaling */
++#define MONDRIAN_SPMI_VBAT_MIN	3000
++#define MONDRIAN_SPMI_VBAT_MAX	4400
++#define MONDRIAN_SPMI_VBUS_SID	3
++#define MONDRIAN_SPMI_VBUS_CHAN	0x11u		/* usb_in_v_div_16 */
++#define MONDRIAN_SPMI_VBUS_DIV	16
++#define MONDRIAN_SPMI_VBUS_MV	3800		/* above: charger present */
++#define MONDRIAN_SPMI_BATTERY_SECS 2
++
+ #define MONDRIAN_SPMI_KEY_POWER	0
+ #define MONDRIAN_SPMI_KEY_VOLUP	1
+ #define MONDRIAN_SPMI_KEY_VOLDOWN 2
+@@ -59,6 +85,8 @@ static uint32_t sp_count;
+ static uint32_t sp_obs_stride = 0x20, sp_map_off = 0x2000, sp_owner_off = 0;
+ static uint16_t sp_pon = 0xffffu, sp_gpio = 0xffffu;
+ static int sp_disabled;
++static volatile uint32_t *sp_chan;	/* the adc's channel window, cached */
++static uint16_t sp_chan_apid;
+ 
+ static uint32_t
+ sp_rd(volatile uint32_t *base, uint32_t off)
+@@ -112,6 +140,163 @@ sp_find_apid(uint16_t ppid)
+ 	return found;
+ }
+ 
++/*
++ * The VADC's channel window, cached per APID like sp_write caches it: the
++ * window is 4 KiB at 0x0c500000 + apid * 0x1000 and holds the command at
++ * +0x00, the status at +0x08 and the data byte at +0x10.
++ */
++static volatile uint32_t *
++sp_chan_window(uint16_t apid)
++{
++	if (sp_chan == NULL || sp_chan_apid != apid) {
++		sp_chan = (volatile uint32_t *)ml_io_map(
++		    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++		    MONDRIAN_SPMI_CHNLS_SIZE);
++		if (sp_chan == NULL) {
++			printf("MONDRIAN SPMI: no window for apid %u\n", apid);
++			return NULL;
++		}
++		sp_chan_apid = apid;
++	}
++	return sp_chan;
++}
++
++/* One configuration write; 1 = done, 0 = failed (the message is printed). */
++static int
++sp_adc_wr(uint16_t apid, uint32_t off, uint32_t val)
++{
++	volatile uint32_t *q = sp_chan_window(apid);
++
++	if (q == NULL) {
++		printf("MONDRIAN SPMI: adc conversion fault\n");
++		return 0;
++	}
++	q[0x10 / 4] = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	q[0] = (off & 0xffu) << 4;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (uint32_t i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++		uint32_t st = q[0x08 / 4];
++
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				printf("MONDRIAN SPMI: adc conversion fault\n");
++				return 0;
++			}
++			return 1;
++		}
++		delay(1);
++	}
++	printf("MONDRIAN SPMI: adc config write failed\n");
++	return 0;
++}
++
++/*
++ * One VADC conversion, read out of the arbiter. sid selects the PMIC whose
++ * channels are converted (3 = PM8350B), chan the VADC channel (0x8f =
++ * vbat_sns, 0x11 = usb_in_v_div_16) and div the channel's qcom,pre-scaling
++ * (3 for vbat, 16 for the USB divider). The divider is applied here, not
++ * written to the PMIC. Returns millivolts, or -1.
++ */
++int
++mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div)
++{
++	uint8_t msb = 0, lsb = 0;
++	volatile uint32_t *q;
++	uint16_t apid;
++	uint32_t st = 0, v, code;
++	unsigned retries, i;
++
++	if (sp_core == NULL || sp_cnfg == NULL || sp_obs == NULL) {
++		return -1;			/* sp_map printed its own error */
++	}
++	if (sp_count == 0) {
++		printf("MONDRIAN SPMI: no APID for the adc\n");
++		return -1;
++	}
++	apid = sp_find_apid(MONDRIAN_SPMI_VADC_PPID);
++	if (apid == 0xffffu) {
++		printf("MONDRIAN SPMI: no APID for the adc\n");
++		return -1;
++	}
++	if (sp_adc_wr(apid, 0x40, sid & 0xffu) == 0 ||	/* ADC_APP_SID */
++	    sp_adc_wr(apid, 0x42, 0) == 0 ||
++	    sp_adc_wr(apid, 0x43, 0) == 0 ||
++	    sp_adc_wr(apid, 0x44, chan & 0xffu) == 0 ||	/* the channel */
++	    sp_adc_wr(apid, 0x45, 1) == 0 ||
++	    sp_adc_wr(apid, 0x46, 0x80u) == 0 ||
++	    sp_adc_wr(apid, 0x47, 0x80u) == 0) {
++		return -1;
++	}
++	/*
++	 * One STATUS1 read is the fast path; a conversion that is not done
++	 * yet re-reads it up to 40 times, a microsecond apart, until
++	 * REQ_STS is clear with EOC set. Nothing else starts a conversion:
++	 * writes 6 and 7 do.
++	 */
++	for (retries = 0; ; ) {
++		q = (volatile uint32_t *)((char *)sp_obs +
++		    ((uint32_t)apid << (sp_obs_stride == 0x80 ? 7 : 5)));
++		q[0] = (1u << 27) | (0x08u << 4);	/* read STATUS1 */
++		__asm__ volatile("dsb osh" ::: "memory");
++		for (i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++			st = sp_rd(q, 0x08u);
++			if (st & 1u) {
++				break;
++			}
++			delay(1);
++		}
++		if (i == MONDRIAN_SPMI_RETRIES || (st & 0x0eu) != 0) {
++			return -1;
++		}
++		v = sp_rd(q, 0x18u);
++		if (v & 0x80u) {
++			printf("MONDRIAN SPMI: adc conversion fault\n");
++			return -1;
++		}
++		if ((v & 0x3u) == 1u) {
++			break;
++		}
++		delay(1);
++		if (++retries == 40) {
++			return -1;
++		}
++	}
++	if (!sp_read(apid, 0x50, &msb) || !sp_read(apid, 0x51, &lsb)) {
++		return -1;
++	}
++	code = ((uint32_t)msb << 8) | lsb;
++	if (code == 0 || code == 0xffffu) {
++		return -1;
++	}
++	return (int)(((div * code * 1875u) + 14450u) / 28900u);
++}
++
++/* vbat through the pack divider: 3.0-4.4 V, or -1 when the sample is bad. */
++int
++mondrian_spmi_battery_mv(void)
++{
++	int mv = mondrian_spmi_adc_mv(MONDRIAN_SPMI_VBAT_SID,
++	    MONDRIAN_SPMI_VBAT_CHAN, MONDRIAN_SPMI_VBAT_DIV);
++
++	if (mv < 1) {
++		return mv;			/* the ADC already said -1 */
++	}
++	if (mv >= MONDRIAN_SPMI_VBAT_MIN && mv <= MONDRIAN_SPMI_VBAT_MAX) {
++		return mv;
++	}
++	printf("MONDRIAN SPMI: vbat %d mV out of range, dropped\n", mv);
++	return -1;
++}
++
++/* The charger's side of the USB divider; no range check, any value is one. */
++int
++mondrian_spmi_vbus_mv(void)
++{
++	return mondrian_spmi_adc_mv(MONDRIAN_SPMI_VBUS_SID,
++	    MONDRIAN_SPMI_VBUS_CHAN, MONDRIAN_SPMI_VBUS_DIV);
++}
++
+ static void
+ sp_key(int key, const char *name, bool now, bool was)
+ {
+@@ -164,6 +349,40 @@ mondrian_spmi_thread(__unused void *arg, __unused wait_result_t wait)
+ 	}
+ }
+ 
++/*
++ * The battery sample, 2 s apart and off the frame path. The old kernel ran
++ * the same two reads every 120 vsyncs from AppleCLCD::vsyncFired, where the
++ * worst case (about 100 ms of polling) is six dropped frames; here that time
++ * is spent on this thread and nowhere else. A failed sample publishes
++ * nothing and is retried on the next tick.
++ */
++static void
++mondrian_battery_thread(__unused void *arg, __unused wait_result_t wait)
++{
++	static int chan;
++	static bool last_external;
++	int ticks = MAX(hz * MONDRIAN_SPMI_BATTERY_SECS, 1);
++
++	for (;;) {
++		int mv, vbus;
++		bool external;
++
++		(void)tsleep(&chan, PZERO, "mbatt", ticks);
++		mv = mondrian_spmi_battery_mv();
++		if (mv < 1) {
++			continue;
++		}
++		vbus = mondrian_spmi_vbus_mv();
++		external = vbus > MONDRIAN_SPMI_VBUS_MV;
++		mondrian_battery_publish((uint32_t)mv, external ? 1 : 0, 0);
++		if (external != last_external) {
++			last_external = external;
++			printf("MONDRIAN BATT: vbus %d mV, external %d\n",
++			    vbus, external);
++		}
++	}
++}
++
+ void
+ mondrian_spmi_probe(void)
+ {
+@@ -219,6 +438,11 @@ mondrian_spmi_probe(void)
+ 		return;
+ 	}
+ 	thread_deallocate(thread);
++	if (kernel_thread_start(mondrian_battery_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("MONDRIAN BATT: no battery thread\n");
++		return;
++	}
++	thread_deallocate(thread);
+ 	printf("MONDRIAN SPMI: keys arb 0x%x APIDs %u pon %u gpio %u status 0x%02x/0x%02x\n",
+ 	    version, sp_count, sp_pon, sp_gpio, p, g);
+ }
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index d3e84c9..6d3e927 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -53,6 +53,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern int mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div);
+ void mondrian_usb_probe(void);
+ static void mondrian_usb_gadget_start(vm_offset_t dwc);
+ 
+@@ -1094,6 +1095,73 @@ ud_cmd_chunk(socket_t so, struct sockaddr_in *to, uint32_t offset)
+ 	ud_cmd_send(so, to, packet, (size_t)n + 8);
+ }
+ 
++/*
++ * One unsigned field of an "sa" line: decimal unless it is written 0x, and a
++ * leading zero is not octal. Returns the position after the field, or NULL
++ * when there is no field to read.
++ */
++static const char *
++ud_cmd_num(const char *p, uint32_t *out)
++{
++	uint32_t base = 10, v = 0;
++	bool any = false;
++
++	while (*p == ' ' || *p == '\t') {
++		p++;
++	}
++	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
++		base = 16;
++		p += 2;
++	}
++	for (;; p++) {
++		uint32_t d;
++
++		if (*p >= '0' && *p <= '9') {
++			d = (uint32_t)(*p - '0');
++		} else if (base == 16 && *p >= 'a' && *p <= 'f') {
++			d = (uint32_t)(*p - 'a' + 10);
++		} else if (base == 16 && *p >= 'A' && *p <= 'F') {
++			d = (uint32_t)(*p - 'A' + 10);
++		} else {
++			break;
++		}
++		v = v * base + d;
++		any = true;
++	}
++	if (!any) {
++		return NULL;
++	}
++	*out = v;
++	return p;
++}
++
++/*
++ * "sa [SID [CHAN [DIV]]]" runs one VADC conversion: sid 3 (PM8350B), chan
++ * 0x8f (vbat_sns) and div 3 when a field is left out, so plain "sa" reads
++ * the pack. The reply is the line the old ring printed, unchanged, so a
++ * script keeps working:
++ *   sa sid 3 chan 0x38f div 3 = 4108 mV
++ * A chan over 0xff reads the same channel as its low byte (the ADC masks
++ * it), but the reply echoes what was typed.
++ */
++static void
++ud_cmd_adc(socket_t so, struct sockaddr_in *to, const char *cmd)
++{
++	uint32_t sid = 3, chan = 0x8fu, div = 3;
++	const char *p = cmd + 2;
++	char out[96];
++	int mv, n;
++
++	if ((p = ud_cmd_num(p, &sid)) != NULL &&
++	    (p = ud_cmd_num(p, &chan)) != NULL) {
++		(void)ud_cmd_num(p, &div);
++	}
++	mv = mondrian_spmi_adc_mv(sid, chan, div);
++	n = snprintf(out, sizeof(out), "sa sid %u chan 0x%03x div %u = %d mV\n",
++	    sid, chan, div, mv);
++	ud_cmd_send(so, to, out, (size_t)n);
++}
++
+ static void
+ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1172,6 +1240,9 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				int len = snprintf(out, sizeof(out), "%llu\n",
+ 				    (unsigned long long)mondrian_log_position());
+ 				ud_cmd_send(so, peer, out, (size_t)len);
++			} else if (strcmp(cmd, "sa") == 0 ||
++			    strncmp(cmd, "sa ", 3) == 0) {
++				ud_cmd_adc(so, peer, cmd);
+ 			} else if (strcmp(cmd, "reboot") == 0) {
+ 				extern void mondrian_reboot_to_fastboot(void);
+ 
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index 4a9d78a..3201906 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -2205,4 +2205,15 @@ mondrian_fb_touch_activity(void)
+ 	}
+ }
+ 
++/*
++ * The battery's power source (MondrianPower.cpp) hangs off the display, the
++ * parent the old kernel gave it. It needs the object and nothing else from
++ * this file: no frame, swap or vsync path is involved.
++ */
++extern "C" IOService *
++mondrian_fb_service(void)
++{
++	return gMondrianFB;
++}
++
+ #endif /* MONDRIAN */
+diff --git a/iokit/Kernel/arm/MondrianPower.cpp b/iokit/Kernel/arm/MondrianPower.cpp
+new file mode 100644
+index 0000000..4b34aa3
+--- /dev/null
++++ b/iokit/Kernel/arm/MondrianPower.cpp
+@@ -0,0 +1,245 @@
++/*
++ * MONDRIAN: the battery, published as an IOPMPowerSource.
++ *
++ * The pack is 5160 mAh and the only thing the port can read is the PMK8350
++ * VADC's vbat_sns channel over SPMI (bsd/dev/mondrian_spmi.c); capacity is
++ * therefore derived from one voltage sample, and current, temperature and
++ * cycle count are constants. The curve below is the 20-point table the old
++ * kernel used, linear in between and clamped to 100 and 1.
++ *
++ * The old kernel ran the ADC read and this update inside AppleCLCD's 60 Hz
++ * vsyncFired -- on every 120th tick, i.e. every 2 s, on the thread that
++ * presents frames -- and a worst-case ADC read is about 100 ms of polling,
++ * which is six dropped frames. The sample belongs on a thread of its own:
++ * mondrian_spmi.c sleeps 2 s in mondrian_battery_thread and calls
++ * mondrian_battery_publish() here. Nothing in this file is on the frame
++ * path.
++ *
++ * The power source is created lazily on the first usable sample and attached
++ * to the display, the parent the old kernel's registry had. Attaching needs
++ * AppleCLCD registered, so a sample that arrives before the display is up
++ * publishes nothing and the next one retries.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(MONDRIAN)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSymbol.h>
++
++extern "C" IOService *mondrian_fb_service(void);
++
++#define MONDRIAN_BATT_MAH	5160u	/* the pack's design capacity */
++#define MONDRIAN_BATT_TEMP	2500u	/* no thermometer; a constant */
++
++/*
++ * Voltage to capacity, the old kernel's table: 4150 mV is full, 3450 mV the
++ * lowest point that is not empty, and anything below 3450 reads 1%. Integer
++ * division truncates, so the steps at the ends (4149 -> 99, 3449 -> 1) are
++ * the original behaviour, not rounding artefacts.
++ */
++static uint32_t
++mondrian_battery_percent(int mv)
++{
++	static const struct {
++		uint32_t mv, pct;
++	} curve[] = {
++		{ 4150, 100 }, { 4080, 95 }, { 4020, 90 }, { 3970, 85 },
++		{ 3930, 80 },  { 3900, 75 }, { 3870, 70 }, { 3840, 65 },
++		{ 3810, 60 },  { 3790, 55 }, { 3770, 50 }, { 3750, 45 },
++		{ 3730, 40 },  { 3710, 35 }, { 3690, 30 }, { 3670, 25 },
++		{ 3640, 20 },  { 3600, 15 }, { 3550, 10 }, { 3450, 5 },
++	};
++	const uint32_t n = sizeof(curve) / sizeof(curve[0]);
++	uint32_t i;
++
++	if (mv > (int)curve[0].mv - 1) {                /* 4150 and above */
++		return 100;
++	}
++	for (i = 1; i < n; i++) {
++		if (mv >= (int)curve[i].mv) {
++			break;
++		}
++	}
++	if (i == n) {                                   /* 3450 and below */
++		return 1;
++	}
++	return (uint32_t)((int)curve[i].pct +
++	    (int)((curve[i - 1].pct - curve[i].pct) * (uint32_t)(mv - curve[i].mv)) /
++	    (int)(curve[i - 1].mv - curve[i].mv));
++}
++
++class MondrianPowerSource : public IOPMPowerSource {
++	OSDeclareDefaultStructors(MondrianPowerSource);
++
++public:
++	bool init(void) APPLE_KEXT_OVERRIDE;
++	void putNumber(const char *key, uint32_t value);
++	void putBool(const char *key, bool value);
++	void updateState(uint32_t mv, bool external, bool charging);
++};
++
++OSDefineMetaClassAndStructors(MondrianPowerSource, IOPMPowerSource);
++
++bool
++MondrianPowerSource::init(void)
++{
++	if (!IOPMPowerSource::init()) {
++		return false;
++	}
++	setBatteryInstalled(true);
++	setExternalConnected(false);
++	setExternalChargeCapable(false);
++	setIsCharging(false);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(false);
++	setMaxCapacity(MONDRIAN_BATT_MAH);
++	setCurrentCapacity(0);
++	setVoltage(0);
++	setAmperage(0);
++	setTimeRemaining(-1);
++	setCycleCount(0);
++	return true;
++}
++
++/*
++ * The base class only offers setters for the keys it knows; the AppleRaw*
++ * ones that the status bar reads are arbitrary properties, so they go in
++ * through setPSProperty().
++ */
++void
++MondrianPowerSource::putNumber(const char *key, uint32_t value)
++{
++	const OSSymbol *sym = OSSymbol::withCString(key);
++	OSNumber *num = OSNumber::withNumber(value, 32);
++
++	if (sym != NULL && num != NULL) {
++		setPSProperty(sym, num);
++	}
++	if (num != NULL) {
++		num->release();
++	}
++	if (sym != NULL) {
++		sym->release();
++	}
++}
++
++void
++MondrianPowerSource::putBool(const char *key, bool value)
++{
++	const OSSymbol *sym = OSSymbol::withCString(key);
++
++	if (sym == NULL) {
++		return;
++	}
++	setPSProperty(sym, value ? kOSBooleanTrue : kOSBooleanFalse);
++	sym->release();
++}
++
++static void
++mondrian_legacy_number(OSDictionary *dict, const char *key, uint32_t value)
++{
++	OSNumber *num = OSNumber::withNumber(value, 32);
++
++	if (num != NULL) {
++		dict->setObject(key, num);
++		num->release();
++	}
++}
++
++/*
++ * One sample in, one published state out. Every value is derived from that
++ * sample: there is no integration, no charger and no current measurement, so
++ * IsCharging stays false and FullyCharged mirrors external power. A repeated
++ * identical sample publishes and logs nothing.
++ */
++void
++MondrianPowerSource::updateState(uint32_t mv, bool external, bool charging)
++{
++	uint32_t pct = mondrian_battery_percent((int)mv);
++	uint32_t cap = (pct * MONDRIAN_BATT_MAH + 50u) / 100u;
++	OSDictionary *info;
++
++	if (cap == currentCapacity() && mv == voltage() &&
++	    external == externalConnected() && charging == isCharging()) {
++		return;
++	}
++
++	setBatteryInstalled(true);
++	setCurrentCapacity(cap);
++	setMaxCapacity(MONDRIAN_BATT_MAH);
++	setExternalConnected(external);
++	setExternalChargeCapable(external);
++	setIsCharging(charging);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(false);
++	setVoltage(mv);
++	setAmperage(0);
++	setTimeRemaining(-1);
++	setCycleCount(0);
++
++	putNumber("AppleRawCurrentCapacity", cap);
++	putNumber("AppleRawMaxCapacity", MONDRIAN_BATT_MAH);
++	putNumber("DesignCapacity", MONDRIAN_BATT_MAH);
++	putNumber("InstantAmperage", 0);
++	putNumber("Temperature", MONDRIAN_BATT_TEMP);
++	putBool("AppleRawExternalConnected", external);
++	putBool("FullyCharged", external);
++
++	/* The legacy dictionary is what iOS 16's status bar actually reads. */
++	info = OSDictionary::withCapacity(6);
++	if (info != NULL) {
++		mondrian_legacy_number(info, "Current", cap);
++		mondrian_legacy_number(info, "Capacity", MONDRIAN_BATT_MAH);
++		mondrian_legacy_number(info, "Voltage", mv);
++		mondrian_legacy_number(info, "Amperage", 0);
++		mondrian_legacy_number(info, "Cycle Count", 0);
++		mondrian_legacy_number(info, "Flags",
++		    (charging ? 2u : 0u) | (external ? 1u : 0u) | 4u);
++		setLegacyIOBatteryInfo(info);
++		info->release();
++	}
++
++	updateStatus();
++	IOLog("MONDRIAN BATT: %u mV %u%% (%u/%u mAh), external %d charging %d\n",
++	    mv, pct, cap, MONDRIAN_BATT_MAH, external, charging);
++}
++
++/*
++ * Called once per sample from the SPMI battery thread: build the power source
++ * on the first call that finds the display, then just hand the numbers over.
++ */
++extern "C" void
++mondrian_battery_publish(unsigned int mv, int external, int charging)
++{
++	static MondrianPowerSource *ps;
++	IOService *provider;
++	const char *name;
++
++	if (ps == NULL) {
++		provider = mondrian_fb_service();
++		if (provider == NULL) {
++			return;
++		}
++		ps = OSTypeAlloc(MondrianPowerSource);
++		if (ps == NULL) {
++			return;
++		}
++		if (!ps->init() || !ps->attach(provider)) {
++			ps->release();
++			ps = NULL;
++			return;
++		}
++		ps->registerService();
++		name = provider->getName();
++		IOLog("MONDRIAN BATT: power source attached to %s\n",
++		    name != NULL ? name : "?");
++	}
++	ps->updateState(mv, external != 0, charging != 0);
++}
++
++#endif /* MONDRIAN */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 1a812fd..1298a20 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@ iokit/Kernel/arm/MondrianPlatformExpert.cpp                         optional iok
+ iokit/Kernel/arm/MondrianSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/MondrianFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/MondrianGPU.cpp                                   optional iokitcpp
++iokit/Kernel/arm/MondrianPower.cpp                                  optional iokitcpp
+ 
+ iokit/Kernel/arm/MondrianCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/MondrianEntitlements.cpp                           optional iokitcpp

@@ -151,19 +151,19 @@ gone; the levers are the draw count and the copy-out path
    `MONDRIAN CPU: top name(pid) N% ... in Nms` every 5 s
    (`mondrian_sample.c`). That line is the decisive measurement for fault 2:
    launchd churn, crash reporting, or a kernel thread.
-2. **Brightness, as a patch and off the frame path.** The driver is missing
-   from the series, so a kernel built today has no `mondrianbl` and the panel
-   keeps whatever DBV the bootloader left. Write it back as a patch
-   (`xnu/patches-mondrian`) that talks to the DSI command DMA once at boot and
-   on request, completes from the interrupt instead of spinning, and never
-   waits inside `present()`/`frame_end`; then confirm `mondrian-gl: rate` is
-   still ~24-60 fps and `usb-ring.py fps` still changes while the UI moves.
+2. **Brightness and the battery.** Done as `0305` and `0304`: the brightness is
+   one DCS long write out of a fixed low page, sent by the tick behind a pending
+   flag, and the battery is a 2 s thread that publishes an `IOPMPowerSource`, so
+   the frame path gained a bool test. Check it at the panel with
+   `usb-ring.py bl LEVEL` after a boot.
 3. **The crash loop, if the UI still feels slow.** A boot with the probe off
-   still logs ~160 crashes and ~800 execs: `watchdogd` (SIGTRAP, `pc == lr` in
-   its own libdispatch callback), the speech trio (`SiriTTSSynthesizer`,
-   `MacinTalkAUSP`, `KonaSynthesizer`) and `assetsd`. That churn is what the
-   remaining sluggishness is made of, not the frame path; measure from a touch
-   to the first `present` before optimizing draws.
+   still logs ~160 crashes and ~800 execs: `watchdogd` (SIGTRAP `0x600000001`,
+   `pc == lr` in its own libdispatch callback, every ~10 s), the speech trio
+   (`SiriTTSSynthesizer`, `MacinTalkAUSP`, `KonaSynthesizer`) and `assetsd`.
+   Pinning every cluster to its top row (`cpufreq=1`) does not move the frame
+   cost (median 19.9 ms against 20.0 ms), so the governor is not the limit: the
+   frame waits 13-15 ms for the GPU to finish drawing. Measure from a touch to
+   the first `present` before optimizing draws.
 4. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
    screen something is actually animating. `glwait=0` is off the table (see the
    traps).
