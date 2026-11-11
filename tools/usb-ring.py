@@ -341,8 +341,17 @@ def main():
         level = int(args.args[0])
         fmt = int(args.args[1]) if len(args.args) > 1 else 0
         cmd = int(args.args[2]) if len(args.args) > 2 else 0x51
-        print(simple(f"bl {level} {fmt} {cmd}") or b"")
-        print(f"brightness {level} of 4095, format {fmt}, dcs 0x{cmd:02x}")
+        #
+        # The kernel answers with its own line when it has a backlight driver;
+        # an empty answer is an unknown command, and printing a brightness
+        # anyway reads as success (a kernel without the driver looked fine).
+        #
+        answer = simple(f"bl {level} {fmt} {cmd}")
+        if not answer:
+            print("no answer: this kernel has no backlight driver",
+                file=sys.stderr)
+            return 1
+        print(answer.decode(errors="replace").strip())
         return 0
     if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "blob"):
         answer = simple(" ".join([args.command] + list(args.args)))
