@@ -90,10 +90,10 @@ samples on the same boot, with SpringBoard, backboardd and launchd all in
 
 110 crashes and ~800 execs in one boot is a process spawn every few seconds,
 each one reading dyld and HFS+ through a synchronous UFS driver, plus a crash
-report. This is also what a "slow static screen" is: with `fps 0` the screen
-does not redraw, so the delay is the wake/first-frame path competing with this
-loop, not a low frame rate. Measure from a physical touch to the first
-`present`, not in frames per second.
+report. It is also what a "slow static screen" is: a still screen legitimately
+draws nothing, so the delay a finger feels is the wake/first-frame path waiting
+behind this loop, not a low frame rate. Measure from a physical touch to the
+first `present`, not in frames per second.
 
 ### 3. The frame path is marginal
 
@@ -112,6 +112,18 @@ gone; the levers are the draw count and the copy-out path
   sampler counts only what moves: a still screen reads 0 while the compositor
   is healthy, so pair it with two `screen` captures and diff them (PIL is in
   the WSL image) before calling a boot frozen.
+- **The probe can kill the app it measures.** With `mondriananim=2` the probe
+  moved with `-setPosition:`; that lookup fails on this runtime (the
+  `mondriandnr=1` log reads `class CALayer sel setPosition present 0`, caller
+  `-[MondrianLinkTarget tick:]`), and an uncaught exception inside a
+  display-link callback takes SpringBoard with it -- which reads as "SpringBoard
+  crashes when leaving the lock screen", not as a probe bug. The move now uses
+  `-setFrame:`, the call the attach path already makes, and `mondriananim=0`
+  keeps the probe out of the frame path entirely. Any code that runs per
+  vsync must not be able to throw.
+- **A still screen legitimately reads 0.** With the probe off, `fps` reads 0 at
+  rest and 4-7 during a swipe while the compositor draws 24-43 fps; only two
+  captures settle whether frames reach the glass.
 - **`glwait=0` wedges the board.** Booted 2026-11-11 with `glwait=0`: the
   gadget enumerated and answered for about a minute, then went silent (RX 0, no
   ARP, `fastboot devices` empty) with the kernel still running. Recovering
@@ -146,6 +158,12 @@ gone; the levers are the draw count and the copy-out path
    on request, completes from the interrupt instead of spinning, and never
    waits inside `present()`/`frame_end`; then confirm `mondrian-gl: rate` is
    still ~24-60 fps and `usb-ring.py fps` still changes while the UI moves.
-3. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
+3. **The crash loop, if the UI still feels slow.** A boot with the probe off
+   still logs ~160 crashes and ~800 execs: `watchdogd` (SIGTRAP, `pc == lr` in
+   its own libdispatch callback), the speech trio (`SiriTTSSynthesizer`,
+   `MacinTalkAUSP`, `KonaSynthesizer`) and `assetsd`. That churn is what the
+   remaining sluggishness is made of, not the frame path; measure from a touch
+   to the first `present` before optimizing draws.
+4. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
    screen something is actually animating. `glwait=0` is off the table (see the
    traps).

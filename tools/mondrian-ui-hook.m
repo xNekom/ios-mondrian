@@ -254,6 +254,85 @@ install_number_length_hook(void)
 	}
 }
 
+/*
+ * A layer that does not answer -setPosition is not a layer that forgot the
+ * method: CALayer has it. The message either goes to memory that was freed and
+ * reused, or to a class that only pretends to be CALayer, and the receiver's
+ * address is what tells them apart. This hook logs the receiver, its real
+ * class, whether the method exists in that class and in its superclasses, and
+ * the caller as image + offset, before letting the original crash happen.
+ * Boot arg mondriandnr=1.
+ */
+static void (*mondrian_dnr_orig)(id, SEL, SEL);
+static volatile int mondrian_dnr_logs;
+
+static void
+mondrian_dnr(id self, SEL _cmd, SEL selector)
+{
+	Class cls = object_getClass(self);
+	const char *cname = cls != Nil ? class_getName(cls) : "?";
+	const char *sname = selector != NULL ? sel_getName(selector) : "?";
+	BOOL layerish;
+
+	layerish = cname != NULL && (strstr(cname, "Layer") != NULL ||
+	    strstr(cname, "CA") == cname);
+	if (mondrian_dnr_orig == NULL) {
+		return;
+	}
+	if (layerish && mondrian_dnr_logs < 8) {
+		void *frames[18];
+		int n, i;
+		char buf[224];
+
+		mondrian_dnr_logs++;
+		snprintf(buf, sizeof(buf),
+		    "MONDRIAN UI: dnr %p class %s sel %s present %d\n", self,
+		    cname, sname,
+		    class_getInstanceMethod(cls, selector) != NULL);
+		say(buf);
+		for (cls = class_getSuperclass(object_getClass(self)), i = 0;
+		    cls != Nil && i < 4; cls = class_getSuperclass(cls), i++) {
+			snprintf(buf, sizeof(buf), "MONDRIAN UI: dnr   super %s\n",
+			    class_getName(cls));
+			say(buf);
+		}
+		n = backtrace(frames, 18);
+		for (i = 0; i < n; i++) {
+			Dl_info info;
+
+			if (dladdr(frames[i], &info)) {
+				snprintf(buf, sizeof(buf),
+				    "MONDRIAN UI: dnr   #%d %s+0x%lx %s\n", i,
+				    info.dli_fname ?: "?",
+				    info.dli_fbase != NULL ?
+				    (unsigned long)((char *)frames[i] -
+				    (char *)info.dli_fbase) : 0,
+				    info.dli_sname ?: "");
+				say(buf);
+			}
+		}
+	}
+	mondrian_dnr_orig(self, _cmd, selector);
+}
+
+static void
+install_dnr_hook(void)
+{
+	Class cls = objc_getClass("NSObject");
+	Method m;
+
+	if (cls == Nil) {
+		return;
+	}
+	m = class_getInstanceMethod(cls,
+	    sel_registerName("doesNotRecognizeSelector:"));
+	if (m != NULL) {
+		mondrian_dnr_orig = (void (*)(id, SEL, SEL))
+		    method_setImplementation(m, (IMP)mondrian_dnr);
+		say("MONDRIAN UI: dnr hook installed\n");
+	}
+}
+
 static void
 say_pid(const char *what)
 {
@@ -2283,6 +2362,17 @@ mondrian_probe_tick(void)
 			}
 		}
 		attached = 1;
+		/*
+		 * The layer belongs to a window that the next screen change
+		 * destroys, and the display link keeps moving it after that; a
+		 * pointer into a freed tree is how the probe killed SpringBoard
+		 * on the way out of the lock screen. Hold a reference and drop
+		 * it only when a new window's tree has been adopted.
+		 */
+		if (dot != mondrian_probe_layer) {
+			[mondrian_probe_layer release];
+			[dot retain];
+		}
 		mondrian_probe_layer = dot;
 		/*
 		 * `mondriananim=1` runs it as a CoreAnimation animation (the render
@@ -4242,14 +4332,45 @@ static volatile double mondrian_link_timestamp;
 	 * own; the two are different asks and the composite rate tells them apart.
 	 */
 	if (self.which == 0 && mondrian_anim_enabled == 2 &&
-	    mondrian_probe_layer != nil) {
+	    mondrian_probe_layer != nil &&
+	    ((id (*)(id, SEL))objc_msgSend)(mondrian_probe_layer,
+	    sel_registerName("superlayer")) != nil) {
 		static double t;
+		static unsigned told;
 		double x;
 
+		/*
+		 * The move goes through -setFrame:, the same call the attach
+		 * path uses. -setPosition: raises "unrecognized selector" on
+		 * this runtime's layer even though the property exists, and an
+		 * uncaught exception in a display-link callback kills
+		 * SpringBoard, which is what the crash on leaving the lock
+		 * screen was. Report what the receiver really is once.
+		 */
+		if (told++ == 0) {
+			char line[192];
+			Class cls = object_getClass(mondrian_probe_layer);
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: probe layer %p class %s meta %d "
+			    "setPosition %d setFrame %d\n", mondrian_probe_layer,
+			    cls != Nil ? class_getName(cls) : "?",
+			    cls != Nil && class_isMetaClass(cls),
+			    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+			    mondrian_probe_layer,
+			    sel_registerName("respondsToSelector:"),
+			    sel_registerName("setPosition:")),
+			    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+			    mondrian_probe_layer,
+			    sel_registerName("respondsToSelector:"),
+			    sel_registerName("setFrame:")));
+			say(line);
+		}
 		t += 1.0 / 60.0;
 		x = 60.0 + fmod(t * 480.0, 360.0);
-		((void (*)(id, SEL, CGPoint))objc_msgSend)(mondrian_probe_layer,
-		    sel_registerName("setPosition"), CGPointMake(x, 260.0));
+		((void (*)(id, SEL, CGRect))objc_msgSend)(mondrian_probe_layer,
+		    sel_registerName("setFrame"), CGRectMake(x, 200.0, 120.0,
+		    120.0));
 		mondrian_probe_moves++;
 		if ((mondrian_probe_moves % 30) == 0) {
 			char line[96];
@@ -4892,6 +5013,9 @@ mondrian_install_ui_hooks(void)
 	NSSetUncaughtExceptionHandler(mondrian_uncaught);
 	(void)objc_setExceptionPreprocessor(mondrian_exc_pre);
 	install_number_length_hook();
+	if (boot_arg_set("mondriandnr=1")) {
+		install_dnr_hook();
+	}
 	say_pid("UI: dylib loaded");
 	/*
 	 * Before UIKit builds the home screen: the material switch has to be in
