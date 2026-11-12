@@ -24,8 +24,10 @@ Steps, in order (each one marked before it runs):
                        delay 5, off) over "wfile"; the probe rereads it on the
                        next call, so no restart and no boot
   kill PID
-  killname NAME        resolve the pid from the sampler's last "SMP" line
-                       (mondriansample=NAME,... must include it)
+  killname NAME        resolve the pid from the sampler's "SMP" lines; the
+                       three names in mondriansample= come every tick and
+                       the whole table every twelve, so a name outside the
+                       boot arg still resolves (slowly)
 
 The probe (tools/mondrian-probe.m) logs "MONDRIAN PROBE:" lines; this tool only
 marks and splits, so it works the same with the probe absent (the marks then
@@ -58,7 +60,15 @@ def mark(text):
 
 
 def sampler_pid(name, ring_text=None):
-    """The pid the kernel sampler printed for NAME, from the newest SMP line."""
+    """The pid the kernel sampler printed for NAME, from the newest line.
+
+    The sampler (xnu 0095) prints the name three ways and the target may
+    only be in one of them: ``| Name(pid) pc=`` for the three names in
+    ``mondriansample``, ``SMP Name[pid] tN pc`` for each of those, and the
+    whole process table as ``SMP procs N: Name(pid) Name(pid) ...`` every
+    twelve ticks.  A name outside the boot arg still resolves from the
+    table, which is why the boot line does not have to be changed.
+    """
     text = ring_text if ring_text is not None else run('dump', '-')
     if not text:
         return None
@@ -66,9 +76,18 @@ def sampler_pid(name, ring_text=None):
     for line in text.splitlines():
         if not line.startswith('SMP '):
             continue
-        for m in re.finditer(r'\| (\S+?)\((\d+)\)', line):
-            if m.group(1) == name:
-                found = int(m.group(2))
+        pairs = []
+        head, sep, body = line.partition(' | ')
+        m = re.match(r'SMP (\S+)\[(\d+)\]', head)
+        if m:
+            pairs.append((m.group(1), m.group(2)))
+        if sep:
+            pairs += re.findall(r'(\S+?)\((\d+)\)', body)
+        elif ' procs ' in head and ':' in head:
+            pairs += re.findall(r'(\S+?)\((\d+)\)', head.split(':', 1)[1])
+        for who, pid in pairs:
+            if who == name:
+                found = int(pid)
     return found
 
 
