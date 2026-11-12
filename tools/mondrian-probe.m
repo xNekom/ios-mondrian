@@ -68,11 +68,14 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#define _XOPEN_SOURCE 700
+#include <ucontext.h>
 #include <unistd.h>
 
 #import <Foundation/Foundation.h>
@@ -94,6 +97,7 @@ extern const char *xpc_connection_get_name(xpc_connection_t connection);
 extern xpc_object_t xpc_dictionary_create(const void *keys, const void *values,
     size_t count);
 extern char *xpc_copy_description(xpc_object_t object);
+extern pid_t xpc_connection_get_pid(xpc_connection_t connection);
 extern xpc_object_t xpc_dictionary_get_value(xpc_object_t object,
     const char *key);
 extern struct _xpc_type_s *xpc_get_type(xpc_object_t object);
@@ -118,6 +122,7 @@ static int console_fd = -1;
 static int lines;
 static int logged_mode = -1;
 static pthread_mutex_t say_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t in_crash;
 
 enum mode { MODE_PASS, MODE_EMPTY, MODE_ERROR, MODE_DELAY, MODE_OFF, MODE_QUIET };
 
@@ -141,6 +146,18 @@ say(const char *fmt, ...)
 		n = (int)sizeof(line) - 1;
 	}
 	lines++;
+	/*
+	 * From inside the crash handler the lock is not taken: the signal can arrive
+	 * while this very thread is between the trylock and the write, and a
+	 * handler that waits there prints nothing at all -- which is exactly how the
+	 * first attempt at catching the fault came back empty.
+	 */
+	if (in_crash) {
+		if (console_fd >= 0) {
+			(void)write(console_fd, line, (size_t)n);
+		}
+		return;
+	}
 	/*
 	 * The sampler thread must never wait on the app's main thread: the whole
 	 * point of a sample is that the main thread is stuck somewhere, and if it
@@ -397,7 +414,8 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 		 * back, which is a different fault from a reply the app mishandles.
 		 */
 		if (first) {
-			say("MONDRIAN PROBE: xpc sync on %s, before\n", name);
+			say("MONDRIAN PROBE: xpc sync on %s (pid %d), before\n", name,
+			    (int)xpc_connection_get_pid(connection));
 		}
 		reply = real_sync_send(connection, message);
 		if (first) {
@@ -696,6 +714,85 @@ log_thread(mach_port_t thread, int n)
 	}
 }
 
+/*
+ * NAME ANOTHER PROCESS'S ADDRESS
+ *
+ * The dyld shared cache is mapped at the same address in every process, so a
+ * pc read out of another process's thread state -- the kernel sampler prints
+ * those ("SMP name t2 pc 0x...") -- resolves here with dladdr. That turns
+ * "cfprefsd's three threads are all at 0x205b554f0" into a function name in the
+ * same boot, and into the library that called it, without the shared cache.
+ */
+static void
+symbolize(const char *args)
+{
+	const char *p = args;
+
+	for (int i = 0; i < 8; i++) {
+		char *end = NULL;
+		unsigned long long a;
+
+		while (*p == ' ' || *p == ',') {
+			p++;
+		}
+		if (*p == 0) {
+			return;
+		}
+		a = strtoull(p, &end, 0);
+		if (end == p) {
+			return;
+		}
+		p = end;
+		log_pc((uint64_t)a, "sym", i);
+	}
+}
+
+static void
+sample_threads(void);
+
+static void
+read_command(void)
+{
+	char buf[256];
+	int fd, n;
+
+	fd = open(CMD_PATH, O_RDONLY);
+	if (fd < 0) {
+		return;
+	}
+	n = (int)read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0) {
+		return;
+	}
+	buf[n] = 0;
+	if (strncmp(buf, "sym", 3) == 0) {
+		symbolize(buf + 3);
+		return;
+	}
+	/*
+	 * Two calibration commands, used once and kept because they answer questions
+	 * the ring cannot: "exit N" tells whether the kernel's exit line prints the
+	 * exit code or the terminating signal, and "raise N" tells whether a signal
+	 * this process raises itself reaches the handler above (a fault that is not
+	 * catchable at all -- a guard exception -- does not).
+	 */
+	if (strncmp(buf, "exit ", 5) == 0) {
+		int code = atoi(buf + 5);
+
+		say("MONDRIAN PROBE: self exit %d\n", code);
+		_exit(code);
+	}
+	if (strncmp(buf, "raise ", 6) == 0) {
+		int sig = atoi(buf + 6);
+
+		say("MONDRIAN PROBE: self raise %d\n", sig);
+		(void)raise(sig);
+		return;
+	}
+	sample_threads();
+}
+
 static void
 sample_threads(void)
 {
@@ -729,8 +826,8 @@ sampler_main(void *arg)
 	(void)arg;
 	for (;;) {
 		if (stat(CMD_PATH, &sb) == 0) {
+			read_command();
 			(void)unlink(CMD_PATH);
-			sample_threads();
 		}
 		usleep(200000);
 	}
@@ -738,8 +835,7 @@ sampler_main(void *arg)
 }
 
 static void
-start_sampler(void)
-{
+start_sampler(void){
 	static int started;
 	pthread_t tid;
 
@@ -755,6 +851,61 @@ start_sampler(void)
 		return;
 	}
 	say("MONDRIAN PROBE: sampler armed on %s\n", CMD_PATH);
+}
+
+/*
+ * THE LAST FRAMES BEFORE THE PROCESS DIES
+ *
+ * This app is killed by a signal (the kernel says "exit Preferences[pid]
+ * status 0xa", SIGBUS) and the port's crash printer has nothing to show for it,
+ * so the fault address and the stack at that instant are captured here. The
+ * handler prints the signal, its address and the faulting pc/lr, samples every
+ * thread once, and exits rather than returning: a fatal signal that is resumed
+ * faults forever and fills the ring with the same report.
+ */
+static void
+crash_handler(int sig, siginfo_t *si, void *uctx)
+{
+	ucontext_t *uc = (ucontext_t *)uctx;
+
+	if (in_crash) {
+		_exit(0);
+	}
+	in_crash = 1;
+	(void)write(STDOUT_FILENO, "MONDRIAN PROBE: fatal signal entered\n", 37);
+	if (uc != NULL) {
+		uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+		uint64_t lr = (uint64_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
+		uint64_t far = (uint64_t)uc->uc_mcontext->__es.__far;
+
+		say("MONDRIAN PROBE: SIGNAL %d code %d addr %p pc %p lr %p far %p\n",
+		    sig, si != NULL ? si->si_code : -1,
+		    si != NULL ? si->si_addr : NULL,
+		    (void *)(uintptr_t)pc, (void *)(uintptr_t)lr,
+		    (void *)(uintptr_t)far);
+		log_pc(pc, "sig", 0);
+	} else {
+		say("MONDRIAN PROBE: SIGNAL %d (no ucontext)\n", sig);
+	}
+	sample_threads();
+	say("MONDRIAN PROBE: after SIGNAL %d\n", sig);
+	_exit(0);
+}
+
+static void
+arm_crash_handler(void)
+{
+	static const int fatal[] = { SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGABRT, SIGTRAP };
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crash_handler;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+	sigemptyset(&sa.sa_mask);
+	for (unsigned i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++) {
+		(void)sigaction(fatal[i], &sa, NULL);
+	}
+	say("MONDRIAN PROBE: crash handler armed\n");
 }
 
 __attribute__((constructor)) static void
@@ -780,6 +931,7 @@ mondrian_probe_init(void)
 	say("MONDRIAN PROBE: pid %d, injected\n", (int)getpid());
 	main_thread_port = mach_thread_self();	/* the constructor runs on it */
 	NSSetUncaughtExceptionHandler(probe_exception);
+	arm_crash_handler();
 
 	hook_method("CLLocationManager", "init", K_OBJECT);
 	hook_method("CLLocationManager", "requestLocation", K_VOID);
