@@ -1,0 +1,306 @@
+xnu 0312: USB on a cold boot, from the bootloader's PHY to a live link
+
+`fastboot boot` inherits ABL's own fastboot USB stack, so the gadget works; a
+plain power-on leaves the eUSB2 PHY powered down and the DWC3 waiting for a PIPE
+clock from the USB3/DP PHY that this board has disabled (HS only). DCTL.CSftRst
+never cleared (0310 reports it), and the phone booted with no USB at all.
+
+Three steps, each measured on a cold boot:
+
+* the eUSB2 PHY is powered up with mainline's qcom init (phy-snps-eusb2.c): APB
+  access, POR, PLL dividers for the 19.2 MHz reference, the tx tuning, SIDDQ
+  clear. Its registers answer 0x09090909 until APB access is opened.
+* the wrapper takes the PIPE clock from UTMI, as dwc3-qcom's
+  dwc3_qcom_select_utmi_clk does: `QSCRATCH_GENERAL_CFG` 0x4 -> 0xd. With that
+  the reset clears in 1 ms where it used to stick for 500 ms (`0409`).
+* `mondrianusbfallback=<seconds>` covers the remaining case -- the gadget runs
+  and the host never enumerates -- by resetting to fastboot, where ABL's USB
+  does work. The countdown lives in the polled USB thread because kernel
+  `tsleep` timeouts stop waking once userland runs.
+
+Also reads `GCC_QUSB2PHY_PRIM_BCR` (reset 21 in the cape GCC, from the live
+device tree) before releasing the PHY.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -56,6 +56,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div);
++extern int hz;
+ extern int mondrian_root_write(const char *path, const void *data, unsigned len);
+ extern void mondrian_fb_set_brightness(uint32_t level, uint32_t fmt, uint32_t cmd);
+ extern int mondrian_fb_dcs(uint32_t cmd, const uint8_t *params, uint32_t n);
+@@ -79,6 +80,7 @@
+ #define QSCRATCH_PAGE_PA	(DWC3_PA + 0x000f8000UL)	/* QSCRATCH_PA rounded down */
+ #define QSCRATCH_OFF		(QSCRATCH_PA - QSCRATCH_PAGE_PA)
+ #define EUSB2_PA		0x088e3000UL
++#define GCC_QUSB2_PHY_PA	0x00122000UL	/* GCC_QUSB2PHY_PRIM_BCR (reset 21) */
+ 
+ /* GCC, SM8450 layout (Linux gcc-sm8450.c), offsets from the pages above. */
+ #define GCC_USB30_PRIM_BCR	0x000
+@@ -131,6 +133,9 @@
+ #define   UTMI_OTG_VBUS_VALID	(1u << 20)
+ #define   SW_SESSVLD_SEL	(1u << 28)
+ #define QSCRATCH_SS_PHY_CTRL	0x30
++#define   PIPE_UTMI_CLK_SEL	(1u << 0)	/* pipe clock from UTMI, no SS PHY */
++#define   PIPE3_PHYSTATUS_SW	(1u << 3)
++#define   PIPE_UTMI_CLK_DIS	(1u << 8)
+ #define   LANE0_PWR_PRESENT	(1u << 24)
+ 
+ #define CBCR_CLK_OFF		(1u << 31)
+@@ -903,6 +908,9 @@
+ 	}
+ }
+ 
++int ud_host_seen;	/* the host has sent at least one event */
++static uint32_t ud_fallback_ms;
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -910,6 +918,7 @@
+ 	for (;;) {
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
++			ud_host_seen = 1;
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+@@ -920,6 +929,13 @@
+ 				ud_event(ev);
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
++		}
++		if (!ud_host_seen && ud_fallback_ms != 0 && ticks > ud_fallback_ms) {
++			extern void mondrian_reboot_to_fastboot(void);
++
++			printf("MONDR USBFALLBACK: no host after %u ms, resetting to fastboot\n",
++			    ud_fallback_ms);
++			mondrian_reboot_to_fastboot();
+ 		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("MONDR USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+@@ -1531,6 +1547,94 @@
+ 	}
+ }
+ 
++/*
++ * The eUSB2 PHY is what gives the DWC3 its clock, and nothing but the
++ * bootloader's fastboot path initializes it here: on a cold boot the core's
++ * DCTL.CSftRst never self-clears, so the phone comes up with no USB. The
++ * device tree says the PHY's ref clock and reset both come from the cape GCC
++ * (clock 31, reset 21), and its registers only answer once APB access is
++ * open -- before that every read returns 0x09090909.
++ *
++ * The sequence and every tuning value are mainline's qcom init
++ * (drivers/phy/phy-snps-eusb2.c, qcom_snps_eusb2_hsphy_init).
++ */
++#define EUSB2_APB_ACCESS	0x0130		/* APB_LOGIC_RESET, bit 2 */
++#define EUSB2_CFG_CTRL_1	0x0058		/* PLL CPBIAS */
++#define EUSB2_CFG_CTRL_4	0x0068		/* PLL INT / GMP */
++#define EUSB2_CFG_CTRL_5	0x006c		/* PLL PROP / VREF */
++#define EUSB2_CFG_CTRL_6	0x0070		/* PLL VCO */
++#define EUSB2_CFG_CTRL_8	0x0078		/* tx HS vref / crossover */
++#define EUSB2_CFG_CTRL_9	0x007c		/* tx pre-emphasis / rise / impedance */
++
++static void
++eusb2_mask(vm_offset_t phy, uint32_t off, uint32_t mask, uint32_t set)
++{
++	uint32_t v = usb_rd(phy, off);
++
++	*(volatile uint32_t *)(phy + off) = (v & ~mask) | (set & mask);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	(void)usb_rd(phy, off);
++}
++
++static void
++eusb2_init(vm_offset_t phy, int div38)
++{
++	eusb2_mask(phy, EUSB2_APB_ACCESS, 0x4u, 0x4u);		/* APB access */
++	eusb2_mask(phy, EUSB2_CFG0, 0x2u, 0x2u);		/* CMN_CTRL_OVERRIDE_EN */
++	eusb2_mask(phy, EUSB2_UTMI_CTRL5, 0x2u, 0x2u);		/* POR */
++	eusb2_mask(phy, EUSB2_HS_PHY_COMMON0, 0x9u, 0x9u);	/* PHY_ENABLE|RETENABLEN */
++	eusb2_mask(phy, EUSB2_CMN_CTRL0, 0x40u, 0);		/* TESTBURNIN off */
++	eusb2_mask(phy, EUSB2_FSEL_SEL, 0x1u, 0x1u);
++	eusb2_mask(phy, EUSB2_HS_PHY_COMMON0, 0x7fu << 4, (div38 ? 4u : 0u) << 4);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_1, 0xfeu, 0);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_4, 0xfcu, 8u << 2);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_4, 0x3u, 1u);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_5, 0x1fu, 0x10u);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_6, 0x7u, 0);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_5, 0xc0u, 0x40u);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_2, 0xffu, div38 ? 0xc8u : 0x90u);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_3, 0x0fu, div38 ? 0x0u : 0x1u);
++	eusb2_mask(phy, EUSB2_HS_PHY_CTRL2, 0x10u, 0x10u);	/* VBUS_DET_EXT_SEL */
++	eusb2_mask(phy, EUSB2_CFG_CTRL_9, 0x7u, 0);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_9, 0x60u, 2u << 5);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_9, 0x18u, 1u << 3);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_8, 0x38u, 3u << 3);
++	eusb2_mask(phy, EUSB2_CFG_CTRL_8, 0xc0u, 0);
++	eusb2_mask(phy, EUSB2_HS_PHY_CTRL2, 0xcu, 0xcu);	/* SUSPEND_N_SEL|N */
++	eusb2_mask(phy, EUSB2_UTMI_CTRL0, 0x1u, 0x1u);		/* SLEEPM */
++	eusb2_mask(phy, EUSB2_HS_PHY_COMMON0, 0x2u, 0x2u);	/* SIDDQ_SEL */
++	eusb2_mask(phy, EUSB2_HS_PHY_COMMON0, 0x4u, 0);		/* SIDDQ = 0 */
++	eusb2_mask(phy, EUSB2_UTMI_CTRL5, 0x2u, 0);		/* POR = 0 */
++	eusb2_mask(phy, EUSB2_HS_PHY_CTRL2, 0x8u, 0);
++	eusb2_mask(phy, EUSB2_CFG0, 0x2u, 0);
++}
++
++/*
++ * Wait out the deadline and go to the bootloader. The reset itself is the same
++ * one the USB `reboot` order uses: the PMIC restart reason over SPMI, then
++ * PSCI, so ABL comes up in fastboot with its own USB initialized.
++ */
++static void
++mondrian_usb_fallback(__unused void *arg, __unused wait_result_t wr)
++{
++	extern void mondrian_reboot_to_fastboot(void);
++	int seconds = 0;
++
++	if (!PE_parse_boot_argn("mondrianusbfallback", &seconds, sizeof(seconds)) ||
++	    seconds <= 0) {
++		return;
++	}
++	for (int i = 0; i < seconds; i++) {
++		tsleep(&seconds, PUSER, "mondrianfb", hz);
++		if (ud_host_seen) {
++			printf("MONDR USBFALLBACK: host seen, watchdog stands down\n");
++			return;
++		}
++	}
++	printf("MONDR USBFALLBACK: no USB after %d s, resetting to fastboot\n", seconds);
++	mondrian_reboot_to_fastboot();
++}
++
+ static void
+ mondrian_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -1592,9 +1696,106 @@
+ 		    attempt, done ? "done" : "STUCK", i, dwc_rd(GCTL),
+ 		    dwc_rd(0xc118), dwc_rd(DCFG));
+ 	}
++	/*
++	 * Last attempt: the core's pipe clock. The device tree has the USB3/DP
++	 * combo PHY disabled (HS only), and Linux then points the wrapper at the
++	 * UTMI clock instead -- dwc3_qcom_select_utmi_clk(): raise CLK_DIS, set
++	 * SEL and PHYSTATUS_SW, drop CLK_DIS. With SEL clear the core waits for
++	 * a PIPE clock that no PHY is producing, and DCTL.CSftRst never clears.
++	 * The fastboot handoff hides it because ABL leaves the combo PHY running.
++	 */
++	if (!done) {
++		vm_offset_t qs = ml_io_map(QSCRATCH_PAGE_PA, PAGE_SIZE_4K);
++
++		/*
++		 * The clock is only half of it: the PHY has to be powered up as
++		 * well, or the core runs and the link stays suspended (DSTS
++		 * 0x00820001) because nothing asserts the pull-up on D+.
++		 */
++		if (phy != 0) {
++			eusb2_init(phy, 0);
++			printf("MONDR USB: eusb2 after init 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x\n",
++			    usb_rd(phy, EUSB2_HS_PHY_COMMON0),
++			    usb_rd(phy, EUSB2_CFG_CTRL_2), usb_rd(phy, EUSB2_CFG_CTRL_3));
++		}
++
++		if (qs != 0) {
++			volatile uint32_t *cfg = (volatile uint32_t *)(qs + QSCRATCH_OFF +
++			    QSCRATCH_GENERAL_CFG);
++			uint32_t before = usb_rd(qs, QSCRATCH_OFF + QSCRATCH_GENERAL_CFG);
++
++			*cfg = before | PIPE_UTMI_CLK_DIS;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			delay(1000);
++			*cfg = usb_rd(qs, QSCRATCH_OFF + QSCRATCH_GENERAL_CFG) |
++			    PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			delay(1000);
++			*cfg = usb_rd(qs, QSCRATCH_OFF + QSCRATCH_GENERAL_CFG) &
++			    ~PIPE_UTMI_CLK_DIS;
++			__asm__ volatile ("dsb osh" ::: "memory");
++			delay(1000);
++			printf("MONDR USB: QSCRATCH general 0x%08x -> 0x%08x (UTMI pipe clock)\n",
++			    before, usb_rd(qs, QSCRATCH_OFF + QSCRATCH_GENERAL_CFG));
++		}
++		dwc_wr(GCTL, dwc_rd(GCTL) | 1u);
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		done = (dwc_rd(DCTL) & DCTL_CSFTRST) ? FALSE : TRUE;
++		printf("MONDR USB: reset with the UTMI pipe clock %s after %d ms, GCTL 0x%08x GSTS 0x%08x\n",
++		    done ? "done" : "STUCK", i, dwc_rd(GCTL), dwc_rd(0xc118));
++	}
++
++	if (!done && phy != 0) {
++		vm_offset_t qb = ml_io_map(GCC_QUSB2_PHY_PA, PAGE_SIZE_4K);
++
++		if (qb != 0) {
++			printf("MONDR USB: QUSB2PHY_PRIM_BCR 0x%08x before release\n",
++			    usb_rd(qb, 0));
++			*(volatile uint32_t *)qb = 0;		/* release the PHY */
++			__asm__ volatile ("dsb osh" ::: "memory");
++			delay(20000);				/* mainline: 50 ms class */
++			printf("MONDR USB: QUSB2PHY_PRIM_BCR 0x%08x after release\n",
++			    usb_rd(qb, 0));
++		}
++		eusb2_init(phy, 0);
++		printf("MONDR USB: eusb2 after init 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x 0xb8 0x%08x\n",
++		    usb_rd(phy, EUSB2_HS_PHY_COMMON0), usb_rd(phy, EUSB2_CFG_CTRL_2),
++		    usb_rd(phy, EUSB2_CFG_CTRL_3), usb_rd(phy, EUSB2_FSEL_SEL));
++		dwc_wr(GCTL, dwc_rd(GCTL) | 1u);
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		done = (dwc_rd(DCTL) & DCTL_CSFTRST) ? FALSE : TRUE;
++		printf("MONDR USB: reset after PHY bring-up %s after %d ms, GCTL 0x%08x GSTS 0x%08x\n",
++		    done ? "done" : "STUCK", i, dwc_rd(GCTL), dwc_rd(0xc118));
++	}
+ 	if (!done) {
+ 		printf("MONDR USBFALLBACK: no gadget this boot; the DWC3 core has no PHY "
+ 		    "clock, which only a fastboot handoff provides\n");
++		/*
++		 * A boot without USB cannot be reached from the host, and until
++		 * the PHY/clock bring-up is complete the only way out is a key
++		 * press. `mondrianusbfallback=<seconds>` turns that into a reset
++		 * to fastboot, where ABL's own USB works, so an unattended test
++		 * loop never strands the phone.
++		 */
++		int fallback = 0;
++
++		if (PE_parse_boot_argn("mondrianusbfallback", &fallback, sizeof(fallback)) &&
++		    fallback > 0) {
++			extern void mondrian_reboot_to_fastboot(void);
++			thread_t t;
++
++			printf("MONDR USBFALLBACK: to fastboot in %d s\n", fallback);
++			if (kernel_thread_start((thread_continue_t)mondrian_usb_fallback,
++			    NULL, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++			}
++		}
+ 		return;
+ 	}
+ 
+@@ -1639,6 +1840,20 @@
+ 		delay(1000);
+ 	}
+ 	printf("MONDR USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	{
++		int fallback = 0;
++
++		if (PE_parse_boot_argn("mondrianusbfallback", &fallback, sizeof(fallback)) &&
++		    fallback > 0) {
++			/*
++			 * Counted by the polled USB thread, not by tsleep: kernel
++			 * timeouts stop waking once userland runs (trap below).
++			 */
++			ud_fallback_ms = (uint32_t)fallback * 1000u;
++			printf("MONDR USBFALLBACK: watchdog %d s\n", fallback);
++		}
++	}
++
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

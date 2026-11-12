@@ -39,10 +39,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
   `tap`/`swipe`/`key`, measures the glass's frame rate (`fps`) and prints `mem`;
-  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. The gadget needs
-  the fastboot handoff: a cold boot has no PHY clock, `DCTL.CSftRst` never
-  clears (`0310`) and there is no USB, so boot iOS with `fastboot boot` and keep
-  `boot_b` for OrangeFox, whose Linux drivers bring their own clocks up.
+  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. A cold boot used
+  to have no USB: `0312` makes the DWC3 reset (eUSB2 PHY powered, PIPE clock
+  from UTMI) but the link does not train, because the NXP repeater on I2C is
+  only initialized by ABL's fastboot; `mondrianusbfallback=N` returns to
+  fastboot when that happens, and `fastboot boot` is the path with USB.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
   `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
@@ -100,15 +101,14 @@ payload (`docs/QEMU_TESTING.md`).
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
 ring that `0174` arms before `vfs_mountroot`, and the same ring is the last
 4 MiB of `userdata` behind a `MONDLOG` header, so a boot with no USB still has
-its log: dump that tail from OrangeFox (`bs=4096 skip=$((sectors/8 - 1025))
-count=1025`) and drop the 512-byte header. With the kernel running, `usb=2` and
-`tools/usb-ring.py dump` read it over USB (`usbipd attach --wsl --busid <id>`
-first, `cdc_ether` on the host; `0298` survives a detach). A photo can show an
-earlier boot with `mondrianfb_noconsole=1`: the ring is the truth. A previous
-boot is printed by a dump kernel (`mondriandump=1`), `mondrianstop=N` halts at
-early mark N (`0174` keeps marks above 20 visible after the console is off),
-and `mondrianreset=N` is a second clock: a boot that ends at about 45 s is that
-thread rebooting to fastboot, not a crash.
+its log: dump that tail from OrangeFox and drop the 512-byte header. With the
+kernel running, `tools/usb-ring.py dump` reads it over USB (`usbipd attach
+--wsl` first; `0298` survives a detach). A photo can show an earlier boot with
+`mondrianfb_noconsole=1`: the ring is the truth. A previous boot is printed by a
+dump kernel (`mondriandump=1`), `mondrianstop=N` halts at early mark N (`0174`
+keeps marks above 20 visible after the console is off), and `mondrianreset=N`
+is a second clock: a boot that ends at about 45 s is that thread rebooting to
+fastboot, not a crash.
 
 ## Measured hardware facts
 
