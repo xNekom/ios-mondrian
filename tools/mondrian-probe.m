@@ -78,6 +78,7 @@
 #include <sys/stat.h>
 #define _XOPEN_SOURCE 700
 #include <ucontext.h>
+#include <dirent.h>
 #include <unistd.h>
 
 #import <Foundation/Foundation.h>
@@ -749,6 +750,78 @@ symbolize(const char *args)
 	}
 }
 
+/*
+ * THE ROOT, BEFORE IT IS ERASED
+ *
+ * A volume that has to be restored from a backup takes whatever was installed
+ * into it since with it, and the phone has no shell: "ls DIR" and
+ * "cat FILE [BYTES]" are the only way to read the live root, through the same
+ * control channel. cat writes raw to the console ring in 480-byte pieces, so
+ * the ring's 4 MiB is the transfer budget -- enough for a manifest, not for a
+ * dylib (a build output is on the host anyway).
+ */
+static void
+list_dir(const char *path)
+{
+	DIR *d = opendir(path);
+	struct dirent *e;
+	int n = 0;
+
+	if (d == NULL) {
+		say("MONDRIAN PROBE: ls %s: cannot open\n", path);
+		return;
+	}
+	say("MONDRIAN PROBE: ls %s\n", path);
+	while ((e = readdir(d)) != NULL && n < 60) {
+		char full[256];
+		struct stat st;
+
+		snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+		if (stat(full, &st) != 0) {
+			continue;
+		}
+		n++;
+		say("MONDRIAN PROBE: ls %s %s %lld %o\n", path, e->d_name,
+		    (long long)st.st_size, st.st_mode & 07777);
+	}
+	closedir(d);
+	say("MONDRIAN PROBE: ls %s %d entries\n", path, n);
+}
+
+static void
+cat_file(const char *args)
+{
+	char path[200];
+	char buf[480];
+	long want = 4096;
+	int fd, n;
+	char *sp;
+
+	strlcpy(path, args, sizeof(path));
+	sp = strchr(path, ' ');
+	if (sp != NULL) {
+		*sp = 0;
+		want = atol(sp + 1);
+	}
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		say("MONDRIAN PROBE: cat %s: cannot open\n", path);
+		return;
+	}
+	say("MONDRIAN PROBE: cat %s begin\n", path);
+	while (want > 0 && (n = (int)read(fd, buf, sizeof(buf))) > 0) {
+		if (in_crash) {
+			break;
+		}
+		if (console_fd >= 0) {
+			(void)write(console_fd, buf, (size_t)n);
+		}
+		want -= n;
+	}
+	close(fd);
+	say("\nMONDRIAN PROBE: cat %s end\n", path);
+}
+
 static void
 sample_threads(void);
 
@@ -790,6 +863,14 @@ read_command(void)
 
 		say("MONDRIAN PROBE: self raise %d\n", sig);
 		(void)raise(sig);
+		return;
+	}
+	if (strncmp(buf, "ls ", 3) == 0) {
+		list_dir(buf + 3);
+		return;
+	}
+	if (strncmp(buf, "cat ", 4) == 0) {
+		cat_file(buf + 4);
 		return;
 	}
 	sample_threads();

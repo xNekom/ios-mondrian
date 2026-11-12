@@ -197,6 +197,13 @@ USB gadget: `tools/ios-usbnet.sh` sets the host up, `tools/usb-ring.py` dumps
 the ring, screenshots the panel, injects input, writes a file into the mounted
 root and reboots; `tools/phone-log.sh` reads the ring through the recovery.
 
+**A root that has been through many hard resets is damaged, and apps fail
+randomly because of it** (`hfs_mark_inconsistent` in `NOTES.md`). The repair is
+a restore: `tools/flash-root.sh backup/ios-root.simg`, then re-apply the userland
+with `tools/ios-root-tweaks.py` (it also renames `_PanicOnCrash` in
+`launchd.plist`, which a restore undoes). Check a spare copy first:
+`simg2img backup/ios-root.simg /tmp/x.img && fsck.hfsplus -n /tmp/x.img`.
+
 A hook change does not need the image round trip: a kernel build with
 `out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
 (`tools/gen-glblob.py`); `glblob=1` writes them into `/private/var/vm` at mount,

@@ -152,9 +152,8 @@ reservation inside). Rules that still cost resets:
   across the window, and a page on a firmware island aborts (`Kernel data
   abort`, `far` inside the physmap).
 
-The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S`
-no longer maps it `VA=PA` and `arm_vm_init` installs the explicit kernel VA
-alias for the early console (`0295`).
+The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `arm_vm_init`
+installs the explicit kernel VA alias for the early console (`0295`).
 
 The **physmap slide** comes from `/chosen/random-seed`, so a random seed
 makes the boot a coin flip (about one host boot in three dies); `boards.py`
@@ -209,14 +208,16 @@ kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
 every mount hangs *before* the framebuffer: the screen keeps the shim log, the
 USB gadget never appears, so there is no ring and no userland left to undo it.
 `mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
-(`journal_close(NULL)` has no NULL check). Reflashing `backup/ios-root.simg` is
-the repair for a dirty volume, and `fsck.hfsplus -fy` on a copy names what a
-rebuild has to fix.
+(`journal_close(NULL)` has no NULL check). `fsck.hfsplus -fy` on a copy names
+what a rebuild has to fix.
 
-**`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
-entry that claims data and owns no blocks is rejected on every open (2 560
-times in one boot), and the hard resets write that damage; the legal
-under-one-block case is exempt (`hfs_zero_block_stub()`).
+**`hfs_mark_inconsistent` is the port eating its own root, and it breaks apps.**
+A catalog entry that claims data and owns no blocks makes every open fail with
+`EINVAL`; the hard resets write that damage (the legal under-one-block case is
+exempt: `hfs_zero_block_stub()`). Measured 330 in one boot. An app that reads its
+plists at launch then hangs in `CFPreferences` on `cfprefsd`, which never saw the
+request, and the watchdog kills it -- that was Date & Time, not `locationd`.
+Restore the root before debugging a random crash (`README.md` has the procedure).
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload: that travels **appended to the
@@ -332,8 +333,7 @@ by the `pon` compatible. Rising edges drive the menu. A refusal prints
 `spmi code N` with N naming the failing step in `shim/spmi.c`: one photo names
 it. A failed transaction is a busy arbiter, not a broken bus -- the battery's
 conversion runs on it every 2 s -- and treating one collision as fatal ended
-button polling for the rest of the boot; `keys` prints the poller's state and
-one live read of both registers.
+button polling for the rest of the boot; `keys` prints the poller's state.
 
 **The APID table cannot be written from the AP.** It only holds what XBL gave
 EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no entry
