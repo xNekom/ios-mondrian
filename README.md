@@ -193,9 +193,9 @@ python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
 existing `.simg`, so remake the sparse file by hand. A definite write follows
 the graded protocol in `docs/MONDIAN_PORT.md`. With `usb=2` the kernel runs a
-USB gadget: `tools/ios-usbnet.sh` sets the host up and `tools/usb-ring.py`
-dumps the ring, screenshots the panel, injects input and reboots to the
-bootloader; `tools/phone-log.sh` reads the ring through the recovery.
+USB gadget: `tools/ios-usbnet.sh` sets the host up, `tools/usb-ring.py` dumps
+the ring, screenshots the panel, injects input, writes a file into the mounted
+root and reboots; `tools/phone-log.sh` reads the ring through the recovery.
 
 A hook change does not need the image round trip: a kernel build with
 `out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs

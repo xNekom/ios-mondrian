@@ -13,7 +13,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 sdk=$(xcrun --sdk iphoneos --show-sdk-path)
 mkdir -p "$(dirname "$out")"
 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
-	-dynamiclib -Os -fno-common -fvisibility=hidden \
+	-dynamiclib -Os -fno-common -fblocks -fvisibility=hidden \
 	-install_name /private/var/vm/mondrian-probe.dylib \
 	-o "$out" "$root/tools/mondrian-probe.m" \
 	-Wl,-undefined,dynamic_lookup -framework Foundation

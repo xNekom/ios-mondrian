@@ -1,24 +1,46 @@
 /*
  * /private/var/vm/mondrian-probe.dylib: what the Settings app needs to open a
- * pane on this port.
+ * pane on this port, and what it does when it does not get it.
  *
- * The report was "General > Date & Time never opens". What actually happens is
- * a hang inside the push: the row highlights, no further touch is taken, and
- * the panel keeps showing the list. The process sampler (mondriansample) puts
- * the app's main thread here:
+ * The report was "General > Date & Time never opens": the row highlights, no
+ * further touch is taken, and the panel keeps showing the list. The process
+ * sampler puts the app's main thread in a synchronous response wait:
  *
  *   libsystem_kernel mach_msg <- libdispatch _dispatch_mach_send_and_wait...
  *   <- libxpc xpc_connection_send_message_with_reply_sync <- Foundation
- *   <- CoreLocation +0x33ec0 / +0xb710 / +0xca6c
- *   <- GeneralSettingsUI (the pushed pane's own setup)
+ *   <- CoreLocation <- GeneralSettingsUI (the pushed pane's own setup)
  *   <- Preferences (the push)
  *
- * i.e. the pane's setup asks CoreLocation something and waits for a reply from
- * locationd that never arrives. Nothing in that chain is an Objective-C method,
- * so the instrument here is the XPC call itself: interpose
- * xpc_connection_send_message_with_reply_sync, print the service name and the
- * caller, and answer a location service with an empty reply so the pane takes
- * its "no location" path instead of waiting forever.
+ * so the pane asks CoreLocation something and waits for locationd, which on
+ * this port starts and never answers. Nothing in that chain is an Objective-C
+ * method, so the instrument is the XPC call itself.
+ *
+ * WHAT IT DOES, AND WHY IT IS CONFIGURABLE
+ *
+ * A boot is expensive, so the behaviour is chosen at run time instead of being
+ * compiled in: /private/var/vm/mondrian-probe.cfg holds one line, reread on
+ * every call (these calls are rare), and the host rewrites it over the USB
+ * control channel ("wfile") while the phone runs. The variants:
+ *
+ *   pass       observe only: log the request and the reply (the default)
+ *   empty      answer with an empty dictionary
+ *   error      answer with XPC_ERROR_CONNECTION_INVALID
+ *   delay N    wait N seconds and then pass through
+ *   off        do not intercept at all
+ *
+ * One boot can therefore answer "which reply shape opens the pane" and "what
+ * does the pane do with a bad answer", instead of one boot per guess.
+ *
+ * WHAT IT LOGS
+ *
+ *   MONDRIAN PROBE: xpc sync com.apple.locationd.private req {...}
+ *   MONDRIAN PROBE: xpc sync com.apple.locationd.private reply {...}
+ *   MONDRIAN PROBE: xpc get key <name> -> <type>
+ *
+ * The request and the reply are printed with xpc_copy_description, and the
+ * reply of the call under test is remembered so the getters the app calls on
+ * it name the keys it actually needs. That is the observation that turns the
+ * next boot into a fix: the keys, not a guess at them.
  *
  * WHO LOADS IT
  *
@@ -26,11 +48,12 @@
  *   mondrian_probe_proc=Preferences, inject
  *   DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-probe.dylib into the exec of
  *   that process. glblob=1 writes that file from the kernel image at boot, so
- *   no userdata flash is involved (xnu patch 0306, tools/gen-glblob.py).
+ *   no userdata flash is involved (xnu patch 0306, tools/gen-glblob.py);
+ *   "wfile" replaces it afterwards (xnu patch 0311).
  *
  * It also points the app's stderr at the console ring (an app's stderr is
- * /dev/null, which is why an exception never said anything) and logs every
- * navigation push.
+ * /dev/null, which is why an exception never said anything) and logs the
+ * navigation pushes.
  */
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -47,7 +70,12 @@
 /*
  * libxpc, declared here: this toolchain's iPhoneOS SDK ships neither the
  * headers nor libxpc.tbd (the same reason tools/mondrian-ui-hook.m does it).
+ *
+ * xpc_get_type returns a pointer to a type object, so a type is named by
+ * comparing against the exported ones; the error objects are structs whose
+ * address is the object (that is what XPC_ERROR_CONNECTION_INVALID is).
  */
+struct _xpc_type_s;
 typedef struct _xpc_connection_s *xpc_connection_t;
 typedef struct _xpc_object_s *xpc_object_t;
 extern xpc_object_t xpc_connection_send_message_with_reply_sync(
@@ -55,16 +83,42 @@ extern xpc_object_t xpc_connection_send_message_with_reply_sync(
 extern const char *xpc_connection_get_name(xpc_connection_t connection);
 extern xpc_object_t xpc_dictionary_create(const void *keys, const void *values,
     size_t count);
+extern char *xpc_copy_description(xpc_object_t object);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t object,
+    const char *key);
+extern struct _xpc_type_s *xpc_get_type(xpc_object_t object);
+extern bool xpc_dictionary_apply(xpc_object_t object,
+    bool (^applier)(const char *key, xpc_object_t value));
+extern struct _xpc_type_s _xpc_type_dictionary;
+extern struct _xpc_type_s _xpc_type_array;
+extern struct _xpc_type_s _xpc_type_string;
+extern struct _xpc_type_s _xpc_type_int64;
+extern struct _xpc_type_s _xpc_type_uint64;
+extern struct _xpc_type_s _xpc_type_bool;
+extern struct _xpc_type_s _xpc_type_double;
+extern struct _xpc_type_s _xpc_type_error;
+extern struct _xpc_type_s _xpc_type_null;
+extern struct _xpc_object_s _xpc_error_connection_invalid;
+
+#define CFG_PATH    "/private/var/vm/mondrian-probe.cfg"
+#define PROBE_PROC  "Preferences"
 
 static int console_fd = -1;
+static int lines;
+static int logged_mode = -1;
+
+enum mode { MODE_PASS, MODE_EMPTY, MODE_ERROR, MODE_DELAY, MODE_OFF };
 
 static void
 say(const char *fmt, ...)
 {
-	char line[240];
+	char line[400];
 	va_list ap;
 	int n;
 
+	if (lines >= 400) {
+		return;
+	}
 	va_start(ap, fmt);
 	n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
@@ -74,31 +128,249 @@ say(const char *fmt, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = (int)sizeof(line) - 1;
 	}
+	lines++;
 	if (console_fd >= 0) {
 		(void)write(console_fd, line, (size_t)n);
 	}
 }
 
 /*
- * The synchronous XPC path. A caller that blocks here shows up in the sampler
- * as mach_msg <- libdispatch <- libxpc; printing the service name and the
- * caller's PC names the request without needing CoreLocation's symbol table,
- * which the shared cache does not carry.
+ * The variant, read from a file the host can rewrite while the phone runs. A
+ * missing or unreadable file is "pass": observing never changes what the app
+ * sees, so the default is safe for a boot that only wants the log.
  */
-static xpc_object_t
-probe_sync(xpc_connection_t connection, xpc_object_t message)
+static void
+read_config(enum mode *mode, int *delay_s)
+{
+	char buf[64];
+	int fd, n;
+
+	*mode = MODE_PASS;
+	*delay_s = 0;
+	fd = open(CFG_PATH, O_RDONLY);
+	if (fd < 0) {
+		return;
+	}
+	n = (int)read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0) {
+		return;
+	}
+	buf[n] = 0;
+	if (strncmp(buf, "empty", 5) == 0) {
+		*mode = MODE_EMPTY;
+	} else if (strncmp(buf, "error", 5) == 0) {
+		*mode = MODE_ERROR;
+	} else if (strncmp(buf, "delay", 5) == 0) {
+		*mode = MODE_DELAY;
+		*delay_s = atoi(buf + 5);
+		if (*delay_s < 0) {
+			*delay_s = 0;
+		}
+	} else if (strncmp(buf, "off", 3) == 0) {
+		*mode = MODE_OFF;
+	}
+}
+
+static const char *
+mode_name(enum mode mode)
+{
+	switch (mode) {
+	case MODE_EMPTY: return "empty";
+	case MODE_ERROR: return "error";
+	case MODE_DELAY: return "delay";
+	case MODE_OFF:   return "off";
+	default:         return "pass";
+	}
+}
+
+/*
+ * The replies under test, so a getter can tell whether it is looking at one.
+ * Small and fixed: the app hands the dictionary straight to its own code.
+ */
+#define MAX_REPLIES 8
+static xpc_object_t replies[MAX_REPLIES];
+static int reply_next;
+
+static void
+remember_reply(xpc_object_t reply)
+{
+	replies[reply_next] = reply;
+	reply_next = (reply_next + 1) % MAX_REPLIES;
+}
+
+static int
+is_ours(xpc_object_t object)
+{
+	int i;
+
+	for (i = 0; i < MAX_REPLIES; i++) {
+		if (replies[i] == object) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static const char *
+type_name(xpc_object_t object)
+{
+	struct _xpc_type_s *t;
+
+	if (object == NULL) {
+		return "null";
+	}
+	t = xpc_get_type(object);
+	if (t == &_xpc_type_dictionary) {
+		return "dictionary";
+	}
+	if (t == &_xpc_type_array) {
+		return "array";
+	}
+	if (t == &_xpc_type_string) {
+		return "string";
+	}
+	if (t == &_xpc_type_int64) {
+		return "int64";
+	}
+	if (t == &_xpc_type_uint64) {
+		return "uint64";
+	}
+	if (t == &_xpc_type_bool) {
+		return "bool";
+	}
+	if (t == &_xpc_type_double) {
+		return "double";
+	}
+	if (t == &_xpc_type_error) {
+		return "error";
+	}
+	if (t == &_xpc_type_null) {
+		return "null";
+	}
+	return "other";
+}
+
+static void
+print_keys(const char *what, xpc_object_t object)
+{
+	__block int n = 0;
+
+	if (object == NULL) {
+		say("MONDRIAN PROBE: %s (null)\n", what);
+		return;
+	}
+	if (xpc_get_type(object) != &_xpc_type_dictionary) {
+		say("MONDRIAN PROBE: %s type %s\n", what, type_name(object));
+		return;
+	}
+	xpc_dictionary_apply(object, ^bool(const char *key, xpc_object_t value) {
+		if (n++ < 24) {
+			say("MONDRIAN PROBE: %s key %s (%s)\n", what, key,
+			    type_name(value));
+		} else if (n == 25) {
+			say("MONDRIAN PROBE: %s more keys follow\n", what);
+		}
+		return true;
+	});
+	if (n == 0) {
+		say("MONDRIAN PROBE: %s has no keys\n", what);
+	}
+}
+
+static bool
+probe_sync_wanted(xpc_connection_t connection, const char **name_out)
 {
 	const char *name = connection != NULL ?
 	    xpc_connection_get_name(connection) : NULL;
-	void *caller = __builtin_return_address(0);
 
-	say("MONDRIAN PROBE: xpc sync %s from %p\n", name != NULL ? name : "(null)",
-	    caller);
-	if (name != NULL && strstr(name, "location") != NULL) {
-		say("MONDRIAN PROBE: xpc sync %s answered empty\n", name);
-		return xpc_dictionary_create(NULL, NULL, 0);
+	*name_out = name != NULL ? name : "(null)";
+	return name != NULL && strstr(name, "location") != NULL;
+}
+
+static xpc_object_t
+probe_sync(xpc_connection_t connection, xpc_object_t message)
+{
+	enum mode mode;
+	int delay_s;
+	const char *name;
+	xpc_object_t reply;
+	char *desc;
+
+	if (!probe_sync_wanted(connection, &name)) {
+		return xpc_connection_send_message_with_reply_sync(connection,
+		    message);
 	}
-	return xpc_connection_send_message_with_reply_sync(connection, message);
+
+	read_config(&mode, &delay_s);
+	if (mode != logged_mode) {
+		logged_mode = mode;
+		say("MONDRIAN PROBE: mode %s (pid %d)\n", mode_name(mode),
+		    (int)getpid());
+	}
+	desc = xpc_copy_description(message);
+	say("MONDRIAN PROBE: xpc sync %s req %.320s\n", name,
+	    desc != NULL ? desc : "(no description)");
+	free(desc);
+
+	if (mode == MODE_OFF) {
+		return xpc_connection_send_message_with_reply_sync(connection,
+		    message);
+	}
+	if (mode == MODE_EMPTY) {
+		reply = xpc_dictionary_create(NULL, NULL, 0);
+		remember_reply(reply);
+		say("MONDRIAN PROBE: xpc sync %s answered empty\n", name);
+		return reply;
+	}
+	if (mode == MODE_ERROR) {
+		say("MONDRIAN PROBE: xpc sync %s answered error\n", name);
+		return (xpc_object_t)&_xpc_error_connection_invalid;
+	}
+	if (mode == MODE_DELAY && delay_s > 0) {
+		say("MONDRIAN PROBE: xpc sync %s sleeping %d s\n", name, delay_s);
+		sleep((unsigned)delay_s);
+	}
+
+	reply = xpc_connection_send_message_with_reply_sync(connection, message);
+	desc = reply != NULL ? xpc_copy_description(reply) : NULL;
+	say("MONDRIAN PROBE: xpc sync %s reply %.320s\n", name,
+	    desc != NULL ? desc : "(null)");
+	free(desc);
+	if (reply != NULL && xpc_get_type(reply) == &_xpc_type_dictionary) {
+		remember_reply(reply);
+		print_keys("reply", reply);
+	}
+	return reply;
+}
+
+/*
+ * The getter, wrapped only for the replies under test: a global wrap would tax
+ * every xpc call in the app and answer nothing more. This is the half that
+ * names the keys the pane needs when locationd never sends a dictionary.
+ */
+typedef xpc_object_t (*get_value_fn)(xpc_object_t, const char *);
+
+static get_value_fn real_get_value;
+
+static xpc_object_t
+probe_get_value(xpc_object_t object, const char *key)
+{
+	xpc_object_t value;
+
+	if (real_get_value == NULL) {
+		real_get_value = (get_value_fn)dlsym(RTLD_NEXT,
+		    "xpc_dictionary_get_value");
+	}
+	if (real_get_value == NULL) {
+		return NULL;
+	}
+	value = real_get_value(object, key);
+	if (is_ours(object) && key != NULL) {
+		say("MONDRIAN PROBE: xpc get key %s -> %s\n", key,
+		    value != NULL ? type_name(value) : "missing");
+	}
+	return value;
 }
 
 #define DYLD_INTERPOSE(_replacement, _replacee)                              \
@@ -111,7 +383,7 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 		(const void *)(unsigned long)&_replacee,                     \
 	}
 
-DYLD_INTERPOSE(probe_sync, xpc_connection_send_message_with_reply_sync);
+DYLD_INTERPOSE(probe_get_value, xpc_dictionary_get_value);
 
 /*
  * Logging hooks on CoreLocation's Objective-C surface: the pane's request may
@@ -214,7 +486,15 @@ __attribute__((constructor)) static void
 mondrian_probe_init(void)
 {
 	Class uinc;
+	const char *me = getprogname();
 
+	/*
+	 * The kernel injects this into one process, but a copied image or a
+	 * second target must not turn the other daemons into a log source.
+	 */
+	if (me != NULL && strcmp(me, PROBE_PROC) != 0) {
+		return;
+	}
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (console_fd >= 0) {
 		dup2(console_fd, STDOUT_FILENO);

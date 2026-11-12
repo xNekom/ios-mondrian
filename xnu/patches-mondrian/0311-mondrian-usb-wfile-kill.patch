@@ -1,0 +1,298 @@
+xnu 0311: the control channel can replace a file and kill a process
+
+The USB control channel could drive a boot -- taps, keys, screenshots, reads of
+the ring -- but not change it: the only writer of a file under the mounted root
+was glblob=1 at mount, so replacing the Settings probe meant a kernel build and
+a 16 GiB userdata flash, and the questions a single boot can answer were fixed
+before it started.
+
+"wfile PATH LEN" takes the bytes as "RLW1" + little-endian u32 offset + data
+datagrams and writes the file once the contiguous prefix covers LEN; "wstat"
+reports how much has arrived, so a host whose datagram was dropped resends
+instead of starting over blind. The write truncates the target, so nothing may
+have it mapped: "kill PID" comes with it, which also makes "what does this
+system do when this daemon is absent" answerable inside the same boot, with
+launchd's own restart throttle in the ring.
+
+"say TEXT" prints "MONDRIAN MARK: TEXT". A run of taps and variants then
+carries its own labels and the host reads the lines between two marks
+afterwards: one boot answers a matrix of questions instead of one question.
+
+The writer is mondrian_root_write() in mondrian_ufs.c, which glblob uses too,
+so "write a file into the mounted root" has one implementation.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 5d3d073..08fa592 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2003,15 +2003,17 @@ out:
+ }
+ 
+ /*
+- * Boot argument glblob=1: write the CoreAnimation dylibs that this build of the
+- * kernel carries into /private/var/vm, which is the writable copy the injector
+- * prefers over /usr/libexec (the root is mounted read-only). A userland change
+- * then costs one `fastboot boot` instead of a 16 GiB userdata flash; the blobs
+- * come from tools/gen-glblob.py and are generated into bsd/dev at build time,
+- * so a kernel built without them simply does not take this path.
++ * Write one whole file into the mounted root from memory. The USB control
++ * channel ("wfile") uses it to replace a file without a kernel build: kill
++ * whatever has it mapped, write, and launchd brings the process back with the
++ * new copy. A file that a process has mapped must never be truncated under it,
++ * which is why the caller kills first, and why this is not used for a file
++ * that is live.
+  */
+-static int
+-mondrian_glblob_one(const char *path, const unsigned char *data, unsigned len)
++int mondrian_root_write(const char *path, const void *data, unsigned len);
++
++int
++mondrian_root_write(const char *path, const void *data, unsigned len)
+ {
+ 	vnode_t vp = NULLVP;
+ 	vfs_context_t ctx = vfs_context_kernel();
+@@ -2022,13 +2024,28 @@ mondrian_glblob_one(const char *path, const unsigned char *data, unsigned len)
+ 	}
+ 	error = vnode_open(path, (O_CREAT | FWRITE | O_TRUNC), 0755, 0, &vp, ctx);
+ 	if (error == 0) {
+-		/* The blob is const data in the kernel image: vn_rdwr reads it. */
+ 		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0,
+ 		    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
+ 		    vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
+ 		(void)VNOP_FSYNC(vp, MNT_WAIT, ctx);
+ 		vnode_close(vp, FWRITE, ctx);
+ 	}
++	return error;
++}
++
++/*
++ * Boot argument glblob=1: write the CoreAnimation dylibs that this build of the
++ * kernel carries into /private/var/vm, which is the writable copy the injector
++ * prefers over /usr/libexec (the root is mounted read-only). A userland change
++ * then costs one `fastboot boot` instead of a 16 GiB userdata flash; the blobs
++ * come from tools/gen-glblob.py and are generated into bsd/dev at build time,
++ * so a kernel built without them simply does not take this path.
++ */
++static int
++mondrian_glblob_one(const char *path, const unsigned char *data, unsigned len)
++{
++	int error = mondrian_root_write(path, data, len);
++
+ 	printf("MONDRIAN GLBLOB: %s %u bytes -> %d\n", path, len, error);
+ 	return error;
+ }
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 8c551de..70d687a 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -50,10 +50,13 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <sys/proc.h>
++#include <sys/signalvar.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern int mondrian_spmi_adc_mv(uint32_t sid, uint32_t chan, uint32_t div);
++extern int mondrian_root_write(const char *path, const void *data, unsigned len);
+ extern void mondrian_fb_set_brightness(uint32_t level, uint32_t fmt, uint32_t cmd);
+ extern int mondrian_fb_dcs(uint32_t cmd, const uint8_t *params, uint32_t n);
+ void mondrian_usb_probe(void);
+@@ -1247,11 +1250,150 @@ ud_cmd_dcs(socket_t so, struct sockaddr_in *to, const char *line)
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "wfile PATH LEN": the LEN bytes follow as "RLW1" + little-endian u32 offset
++ * + data datagrams, and the file is written when the last byte of the range
++ * has landed. This is how a file in the root is replaced without a kernel
++ * build and without a userdata flash. Because the write truncates, the target
++ * must not be mapped: kill its process first (`kill PID`), write, and launchd
++ * brings the process back with the new copy.
++ *
++ * "wstat" reports how much has arrived, so the host can resend a file whose
++ * datagrams the gadget dropped instead of starting over blind.
++ */
++#define UD_WFILE_MAX    (1u << 20)
++
++static unsigned char *ud_wfile_buf;
++static uint32_t ud_wfile_len;
++static uint32_t ud_wfile_got;
++static char     ud_wfile_path[96];
++static int      ud_wfile_active;
++
++static void
++ud_cmd_wfile(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	char out[160];
++	const char *path = line + 5;
++	const char *p;
++	uint32_t len = 0;
++	size_t path_len;
++	int n;
++
++	while (*path == ' ' || *path == '\t') {
++		path++;
++	}
++	for (p = path; *p != 0 && *p != ' ' && *p != '\t'; p++) {
++		;
++	}
++	path_len = (size_t)(p - path);
++	if (path_len == 0 || path_len >= sizeof(ud_wfile_path)) {
++		n = snprintf(out, sizeof(out), "wfile needs a path\n");
++		ud_cmd_send(so, to, out, (size_t)n);
++		return;
++	}
++	if (ud_cmd_num(p, &len) == NULL || len == 0 || len > UD_WFILE_MAX) {
++		n = snprintf(out, sizeof(out), "wfile needs a length up to %u\n",
++		    UD_WFILE_MAX);
++		ud_cmd_send(so, to, out, (size_t)n);
++		return;
++	}
++	if (ud_wfile_buf == NULL) {
++		vm_offset_t buf = 0;
++
++		if (kmem_alloc_contig(kernel_map, &buf, UD_WFILE_MAX, PAGE_MASK,
++		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			n = snprintf(out, sizeof(out), "wfile has no memory\n");
++			ud_cmd_send(so, to, out, (size_t)n);
++			return;
++		}
++		ud_wfile_buf = (unsigned char *)(uintptr_t)buf;
++	}
++	memcpy(ud_wfile_path, path, path_len);
++	ud_wfile_path[path_len] = 0;
++	ud_wfile_len = len;
++	ud_wfile_got = 0;
++	ud_wfile_active = 1;
++	n = snprintf(out, sizeof(out), "wfile %s %u ready\n", ud_wfile_path,
++	    ud_wfile_len);
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("MONDR USB: wfile %s %u bytes\n", ud_wfile_path, ud_wfile_len);
++}
++
++static void
++ud_cmd_wdata(socket_t so, struct sockaddr_in *to, const char *packet, size_t n)
++{
++	uint32_t offset, data;
++
++	if (n < 8) {
++		return;
++	}
++	memcpy(&offset, packet + 4, sizeof(offset));
++	data = (uint32_t)n - 8;
++	/*
++	 * Only the contiguous prefix counts: a datagram that arrives ahead of a
++	 * hole must not make the file look complete, and the host retransmits
++	 * from the start, which the "already here" case below absorbs.
++	 */
++	if (offset > ud_wfile_got || offset >= ud_wfile_len ||
++	    data > ud_wfile_len - offset) {
++		return;
++	}
++	memcpy(ud_wfile_buf + offset, packet + 8, data);
++	if (offset + data > ud_wfile_got) {
++		ud_wfile_got = offset + data;
++	}
++	if (ud_wfile_got >= ud_wfile_len) {
++		char out[160];
++		int error, m;
++
++		ud_wfile_active = 0;
++		error = mondrian_root_write(ud_wfile_path, ud_wfile_buf,
++		    ud_wfile_len);
++		m = snprintf(out, sizeof(out), "wfile %s %u bytes -> %d\n",
++		    ud_wfile_path, ud_wfile_len, error);
++		ud_cmd_send(so, to, out, (size_t)m);
++		printf("MONDRIAN WFILE: %s %u bytes -> %d\n", ud_wfile_path,
++		    ud_wfile_len, error);
++	}
++}
++
++/*
++ * "kill PID": the signal the control channel needs to relaunch a daemon that
++ * has a replaced file mapped, and to prove what the system does when a service
++ * is absent. launchd applies its own restart throttle, which is worth seeing.
++ */
++static void
++ud_cmd_kill(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	char out[96];
++	uint32_t pid = 0;
++	proc_t p;
++	int n, error = ESRCH;
++
++	(void)ud_cmd_num(line + 4, &pid);
++	if (pid != 0) {
++		p = proc_find((int)pid);
++		if (p != PROC_NULL) {
++			psignal(p, SIGKILL);
++			proc_rele(p);
++			error = 0;
++		}
++	}
++	n = snprintf(out, sizeof(out), "kill %u -> %d\n", pid, error);
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("MONDR USB: %s", out);
++}
++
+ static void
+ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	socket_t so = NULL;
+-	char cmd[64];
++	/*
++	 * A "RLW1" datagram carries up to about 1.4 KB, so the buffer is one
++	 * Ethernet frame, not the 64 bytes the text commands need.
++	 */
++	static char cmd[1600];
+ 
+ 	for (;;) {
+ 		if (so == NULL) {
+@@ -1301,7 +1443,10 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			 * ring; it is matched here, before the chain, because
+ 			 * 0305 inserts its own branches after the "sa" test.
+ 			 */
+-			if (strncmp(cmd, "sav", 3) == 0 &&
++			if (n >= 8 && ud_wfile_active &&
++			    memcmp(cmd, "RLW1", 4) == 0) {
++				ud_cmd_wdata(so, peer, cmd, n);
++			} else if (strncmp(cmd, "sav", 3) == 0 &&
+ 			    (cmd[3] == 0 || cmd[3] == ' ')) {
+ 				ud_cmd_adc(so, peer, cmd);
+ 			} else if (strcmp(cmd, "keys") == 0) {
+@@ -1338,6 +1483,12 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    (unsigned long long)vm_compressor_pages_compressed());
+ 				mondrian_vm_stats();
+ 				mondrian_gpu_dump_hist();
++			} else if (strcmp(cmd, "wstat") == 0) {
++				char out[64];
++				int len = snprintf(out, sizeof(out),
++				    "wstat %u %u\n", ud_wfile_got, ud_wfile_len);
++
++				ud_cmd_send(so, peer, out, (size_t)len);
+ 			} else if (strcmp(cmd, "pos") == 0) {
+ 				char out[32];
+ 				int len = snprintf(out, sizeof(out), "%llu\n",
+@@ -1352,6 +1503,19 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strcmp(cmd, "dcs") == 0 ||
+ 			    strncmp(cmd, "dcs ", 4) == 0) {
+ 				ud_cmd_dcs(so, peer, cmd);
++			} else if (strncmp(cmd, "wfile ", 6) == 0) {
++				ud_cmd_wfile(so, peer, cmd);
++			} else if (strncmp(cmd, "kill ", 5) == 0) {
++				ud_cmd_kill(so, peer, cmd);
++			} else if (strncmp(cmd, "say ", 4) == 0) {
++				/*
++				 * A mark in the ring, so a run of taps and
++				 * variants carries its own labels: the host
++				 * writes the step before it acts and reads the
++				 * lines between marks afterwards.
++				 */
++				printf("MONDRIAN MARK: %s\n", cmd + 4);
++				ud_cmd_send(so, peer, "ok\n", 3);
+ 			} else if (strcmp(cmd, "reboot") == 0) {
+ 				extern void mondrian_reboot_to_fastboot(void);
+ 
