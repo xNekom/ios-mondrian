@@ -34,9 +34,9 @@ The shim also prints the tree it was handed at boot; when shim output and
 |------|-----|
 | `ufshc@1d84000` | UFS host: `reg` base, `interrupts`, clocks. Confirms `0x1d84000` |
 | `/reserved-memory` | ~38 carve-outs. Anything here is *not* free RAM; overlapping one corrupts firmware or the hypervisor |
-| `cont_splash_region` | the ABL's linear framebuffer, `0xB8000000` + `0x2B00000`. This is the current display path |
-| `qcom,mdss_mdp@ae00000` | display controller. Not used while the splash buffer is alive |
-| panel node (`mdss_dsi_m11a_42_02_0a_dsc_cmd`) | timings/format; only needed if MDSS/DSI is ever driven |
+| `cont_splash_region` | the ABL's linear framebuffer, `0xB8000000` + `0x2B00000`. The DPU scans it and the kernel writes it; the panel is command mode and needs a `CTL_START` per frame (`NOTES.md`, "Display") |
+| `qcom,mdss_mdp@ae00000` | display controller. Its SSPPs scan `cont_splash_region`; the command-mode interface is kicked from `MondrianFramebuffer.cpp` |
+| panel node (`mdss_dsi_m11a_42_02_0a_dsc_cmd`) | `dsi_cmd_mode`; its timings/format and TE settings decide when a frame reaches the glass |
 | `gcc` / clock controllers | the UFS clock branch (`0x870`) had to be enabled by hand |
 | TLMM | pin registers at `0x0f100000 + 0x1000*n`; the node's 16 MB region at `0x0f000000` starts with a 1 MB hole |
 | SPMI/PMIC | touch rail, battery: not started |
@@ -55,12 +55,13 @@ The shim also prints the tree it was handed at boot; when shim output and
   INTIDs are SPI + 32. Copy the DT number into XNU and the handler never
   runs, with no error anywhere.
 - **`cont_splash_region` vs reserved-memory.** The splash buffer is memory the
-  ABL still scans out from. It must be skipped by the VM allocator (patch
-  `0083`) *and* described in the ADT (`mondrian-fbcon`) so the console can map
-  it. Describing it in one place only is the bug that shows up as a screen
-  full of noise.
+  DPU scans and the kernel writes; the ABL's own scan is an autorefresh that
+  stops the interface until it is cleared (`NOTES.md`, "Display"). It must be
+  skipped by the VM allocator (patch `0083`) *and* described in the ADT
+  (`mondrian-fbcon`) so the console can map it. Describing it in one place only
+  is the bug that shows up as a screen full of noise.
 - **Overlap by arithmetic.** Check carve-outs by interval overlap against the
-  kernel window (`0xB0000000` + `0x46000000`), not by name. Two carve-outs can
+  kernel window (`0xAA000000` + `0x36000000`), not by name. Two carve-outs can
   share a page boundary.
 - **Provisional values.** A number marked TODO in `tools/boards.py` is a guess.
   `mkadt.py` / `mkpayload.py` refuse it; `--allow-provisional` exists so the

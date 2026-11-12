@@ -59,10 +59,12 @@ Pro, SM8475) is the port being done here.
   persist and the backups intact, and confirm each destructive step with the
   user before running it.
 - Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
-- Project skills live in `.opencode/skills/<id>/SKILL.md` and encode the traps
-  that have already cost time (console-photo triage, arm64 board porting, the
-  patch stack + CI, Qualcomm device trees, mondrian UFS). Update the relevant
-  one when a new trap is paid for; load it before re-deriving it.
+- Project skills live in `.github/skills/<id>/SKILL.md` (Copilot's Agent Skills
+  path; `.opencode/opencode.json` points OpenCode at the same directory, so
+  there is exactly one copy) and encode the traps that have already cost time
+  (console-photo triage, arm64 board porting, the patch stack + CI, Qualcomm
+  device trees, mondrian UFS). Update the relevant one when a new trap is paid
+  for; load it before re-deriving it.
 
 ## Documentation rules (hard requirements)
 

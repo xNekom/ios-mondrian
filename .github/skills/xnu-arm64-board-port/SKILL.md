@@ -20,9 +20,10 @@ before code.
 
 - mondrian runs **PAGE_SHIFT 14** (16 KiB), the granule iOS userland and its
   dyld shared cache are built for. Do not mix numbers from a 4 KiB build.
-- The kernel's usable window is `0xB0000000` + `0x46000000`. It cannot shrink
-  much below `0x3a000000`: the physmap of the window has to fit inside the
-  window itself.
+- The kernel's usable window is `0xAA000000` + `0x36000000` (864 MiB, ending at
+  `0xe0000000`, above the splash and short of the first hole). Its five
+  constraints are in `NOTES.md` ("The window of RAM"); the early page tables
+  run out below 768 MiB.
 - The early framebuffer is aliased into the **low globals** region, whose size
   is `pmap`'s `low_global_vr_size` (sweet reserves `0x2000000` for that alias).
   A too-small value shows up as a fault on the first console write, not at
