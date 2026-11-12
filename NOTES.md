@@ -232,9 +232,9 @@ shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
-`fastboot boot` refuses a recovery image and the `recovery` partition never
-boots: OrangeFox lives in `boot` (`fastboot flash boot_b
-ofox-boot-b-complete.img`), and the shim image on `boot_b` brings iOS back.
+`fastboot boot` refuses a recovery image, and `boot-recovery` boots the active
+`boot` slot instead of `recovery_a/b`: OrangeFox lives in `boot` (`fastboot
+flash boot_b ofox-boot-b-complete.img`) and the shim image brings iOS back.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
