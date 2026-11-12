@@ -198,11 +198,11 @@ the ring, screenshots the panel, injects input, writes a file into the mounted
 root and reboots; `tools/phone-log.sh` reads the ring through the recovery.
 
 **A root that has been through many hard resets is damaged, and apps fail
-randomly because of it** (`hfs_mark_inconsistent` in `NOTES.md`). The repair is
-a restore: `tools/flash-root.sh backup/ios-root.simg`, then re-apply the userland
+randomly because of it** (`hfs_mark_inconsistent` in `NOTES.md`). The repair is a
+restore: `tools/flash-root.sh backup/ios-root.simg`, then re-apply the userland
 with `tools/ios-root-tweaks.py` (it also renames `_PanicOnCrash` in
-`launchd.plist`, which a restore undoes). Check a spare copy first:
-`simg2img backup/ios-root.simg /tmp/x.img && fsck.hfsplus -n /tmp/x.img`.
+`launchd.plist`, which a restore undoes). Check a spare copy first with
+`simg2img` and `fsck.hfsplus -n`.
 
 A hook change does not need the image round trip: a kernel build with
 `out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
@@ -211,7 +211,6 @@ the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1
-fastboot boot out/boot-mondrian.img    # photograph; power+vol-down to leave
 tools/phone-log.sh out/boot-mondrian.img ring.txt
 ```
 
@@ -230,7 +229,6 @@ tools/phone-log.sh out/boot-mondrian.img ring.txt
 | `tools/apply-series.py`, `check-patches.sh`, `port-series.py` | apply, validate and port patch series |
 | `tools/mkiosroot.sh`, `ios-root-tweaks.py` | build the HFS+ iOS root from the IPSW images |
 | `tools/phone-boot.sh`, `phone-deploy.sh`, `flash-root.sh` | volatile boot, boot-partition deploy, root flash |
-| `tools/ios-log-pull.sh`, `ios-log.py`, `ios-crash.py` | read and symbolicate the persistent kernel log |
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
 | `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
