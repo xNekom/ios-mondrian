@@ -19,6 +19,7 @@ Steps, in order (each one marked before it runs):
   swipe X1 Y1 X2 Y2 [MS]
   key CODE down|up     0 power, 1 volume up, 2 volume down, 3 home
   sleep SECONDS
+  shot NAME            a PNG of the panel into out/matrix-NAME.png
   mark TEXT            a label of its own (for a control run)
   cfg MODE             rewrite the probe's variant (pass, empty, error,
                        delay 5, off) over "wfile"; the probe rereads it on the
@@ -43,6 +44,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 USB_RING = os.path.join(HERE, 'usb-ring.py')
+OUT = os.path.join(HERE, '..', 'out')
 PROBE_CFG = '/private/var/vm/mondrian-probe.cfg'
 MARK = 'MONDRIAN MARK: '
 
@@ -122,6 +124,13 @@ def do_step(step, args, ring):
     if kind == 'sleep':
         mark(f'sleep {rest[0]}')
         time.sleep(float(rest[0]))
+        return True
+    if kind == 'shot':
+        name = rest[0] if rest else 'step'
+        mark(f'shot {name}')
+        # The screenshot goes to the host, not the ring: what the panel shows
+        # at each mark is the other half of what the log says.
+        print(run('screen', os.path.join(OUT, f'matrix-{name}.png')))
         return True
     if kind == 'cfg':
         mode = ' '.join(rest)

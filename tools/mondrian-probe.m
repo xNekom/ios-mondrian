@@ -288,6 +288,28 @@ probe_sync_wanted(xpc_connection_t connection, const char **name_out)
 	return name != NULL && strstr(name, "location") != NULL;
 }
 
+/*
+ * The replaced call has to be reached through the next image in the search
+ * order: dyld rewrites the symbol table of every image, this one included, so a
+ * direct call from here would run this function again until the stack is gone.
+ */
+typedef xpc_object_t (*sync_fn)(xpc_connection_t, xpc_object_t);
+
+static sync_fn real_sync;
+
+static xpc_object_t
+real_sync_send(xpc_connection_t connection, xpc_object_t message)
+{
+	if (real_sync == NULL) {
+		real_sync = (sync_fn)dlsym(RTLD_NEXT,
+		    "xpc_connection_send_message_with_reply_sync");
+	}
+	if (real_sync == NULL) {
+		return NULL;
+	}
+	return real_sync(connection, message);
+}
+
 static xpc_object_t
 probe_sync(xpc_connection_t connection, xpc_object_t message)
 {
@@ -298,8 +320,7 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 	char *desc;
 
 	if (!probe_sync_wanted(connection, &name)) {
-		return xpc_connection_send_message_with_reply_sync(connection,
-		    message);
+		return real_sync_send(connection, message);
 	}
 
 	read_config(&mode, &delay_s);
@@ -314,8 +335,7 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 	free(desc);
 
 	if (mode == MODE_OFF) {
-		return xpc_connection_send_message_with_reply_sync(connection,
-		    message);
+		return real_sync_send(connection, message);
 	}
 	if (mode == MODE_EMPTY) {
 		reply = xpc_dictionary_create(NULL, NULL, 0);
@@ -332,7 +352,7 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 		sleep((unsigned)delay_s);
 	}
 
-	reply = xpc_connection_send_message_with_reply_sync(connection, message);
+	reply = real_sync_send(connection, message);
 	desc = reply != NULL ? xpc_copy_description(reply) : NULL;
 	say("MONDRIAN PROBE: xpc sync %s reply %.320s\n", name,
 	    desc != NULL ? desc : "(null)");
@@ -384,6 +404,12 @@ probe_get_value(xpc_object_t object, const char *key)
 	}
 
 DYLD_INTERPOSE(probe_get_value, xpc_dictionary_get_value);
+/*
+ * The call the pane blocks in. Without this line the whole variant machinery
+ * above is unreferenced static code and the linker drops it: the boot then logs
+ * the Objective-C hooks and nothing about the request that never answers.
+ */
+DYLD_INTERPOSE(probe_sync, xpc_connection_send_message_with_reply_sync);
 
 /*
  * Logging hooks on CoreLocation's Objective-C surface: the pane's request may
