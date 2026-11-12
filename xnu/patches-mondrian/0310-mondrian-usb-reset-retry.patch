@@ -1,0 +1,93 @@
+xnu 0310: a DWC3 reset that says why it failed
+
+The gadget only comes up when ABL has already initialized the controller, which
+is what `fastboot boot` inherits; a cold start of the same image -- power key,
+or `fastboot reboot` into the slot -- leaves DCTL.CSftRst set for ever and the
+phone boots with no USB at all, so the only way out is a key press.
+
+The soft reset is now the one Linux issues (read DCTL, set CSftRst, clear
+RUN_STOP, write back) with `GCTL.DsblClkGtng` set first, retried twice more with
+the two other differences the fastboot handoff shows (GUSB2PHYCFG without the
+suspend LPM bit, and the SS PHY parked), and each attempt is printed with the
+registers that matter. A boot where all of them stick says so instead of dying
+silently.
+
+Measured 2026-11-12 on cold boots: GCTL 0x00102000 (the fastboot handoff leaves
+0x00102001) and `soft reset STUCK after 500 ms`; the eUSB2 PHY answers
+0x09090909 until APB access is opened, so it has no usable state to read there.
+The PHY bring-up itself is not in this patch: writing those registers without
+the PHY clock hangs the bus, and the core needs the clock the bootloader would
+have left running.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -120,6 +120,7 @@
+ #define EUSB2_CFG0		0x0094
+ #define EUSB2_CMN_CTRL0		0x0098
+ #define EUSB2_FSEL_SEL		0x00b8
++#define EUSB2_APB_ACCESS	0x0130		/* open APB access before any r/w */
+ 
+ /* QSCRATCH: Qualcomm wrapper registers. */
+ #define QSCRATCH_GENERAL_CFG	0x08
+@@ -1384,15 +1385,52 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("MONDR USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++	/*
++	 * The PHY is only read: writing it on a cold boot hangs the AHB bus,
++	 * because the block is not clocked there (a cold boot of this image
++	 * once stopped dead inside the GPU bring-up before reaching this
++	 * point). Its registers answer 0x09090909 until APB access is opened
++	 * by whoever initializes it, which is ABL in the fastboot case.
++	 */
++	vm_offset_t phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++
++	if (phy != 0) {
++		printf("MONDR USB: eusb2 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x 0xb8 0x%08x 0x130 0x%08x\n",
++		    usb_rd(phy, EUSB2_HS_PHY_COMMON0), usb_rd(phy, EUSB2_CFG_CTRL_2),
++		    usb_rd(phy, EUSB2_CFG_CTRL_3), usb_rd(phy, EUSB2_FSEL_SEL),
++		    usb_rd(phy, EUSB2_APB_ACCESS));
++	}
++
++	/*
++	 * Device controller soft reset, the way Linux does it: read DCTL, set
++	 * CSftRst, clear RUN_STOP, write it back. GCTL.DsblClkGtng goes first --
++	 * Linux sets it before every core reset, and only a fastboot handoff
++	 * has it set here -- and the reset is retried with the other two
++	 * differences that handoff shows: GUSB2PHYCFG without the suspend LPM
++	 * bit, and the SS PHY parked. One cold boot then answers all of them.
++	 */
++	dwc_wr(GCTL, dwc_rd(GCTL) | 1u);
++	int i = 0;
++	boolean_t done = FALSE;
++
++	for (int attempt = 0; attempt < 4 && !done; attempt++) {
++		if (attempt == 2) {
++			dwc_wr(0xc200, dwc_rd(0xc200) & ~(1u << 8));	/* GUSB2PHYCFG: no LPM */
++			dwc_wr(0xc2c0, dwc_rd(0xc2c0) | (1u << 17));	/* SS PHY parked */
++			dwc_wr(GCTL, dwc_rd(GCTL) | 1u);
++		}
++		dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		done = (dwc_rd(DCTL) & DCTL_CSFTRST) ? FALSE : TRUE;
++		printf("MONDR USB: reset attempt %d %s after %d ms, GCTL 0x%08x GSTS 0x%08x DCFG 0x%08x\n",
++		    attempt, done ? "done" : "STUCK", i, dwc_rd(GCTL),
++		    dwc_rd(0xc118), dwc_rd(DCFG));
++	}
++	if (!done) {
++		printf("MONDR USBFALLBACK: no gadget this boot; the DWC3 core has no PHY "
++		    "clock, which only a fastboot handoff provides\n");
+ 		return;
+ 	}
+ 

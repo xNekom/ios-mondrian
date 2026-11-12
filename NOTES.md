@@ -39,7 +39,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
   `tap`/`swipe`/`key`, measures the glass's frame rate (`fps`) and prints `mem`;
-  `tools/ios-usbnet.sh` sets the host up and streams udp/5140.
+  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. The gadget needs
+  the fastboot handoff: a cold boot has no PHY clock, `DCTL.CSftRst` never
+  clears (`0310`) and there is no USB, so boot iOS with `fastboot boot` and keep
+  `boot_b` for OrangeFox, whose Linux drivers bring their own clocks up.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
   `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
@@ -55,9 +58,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 Current blockers, in order:
 
 1. **Charging.** Nothing drives the charger: it has no APID in the AP's SPMI
-   table (trap below), so a boot runs the phone down. The level is read from the
-   PMK8350 VADC and published as an `IOPMPowerSource` (`0304`; `sa SID CHAN DIV`
-   over USB prints one raw channel).
+   table (trap below), so a boot runs the phone down. The level comes from the
+   PMK8350 VADC (`0304`), and voltage overstates it: 3.80 V reads 58 % where
+   Android's coulomb counter says 36 % (1683 mAh of `charge_full` 4952), so
+   the percentage needs that counter and the AP cannot reach it yet.
 2. **The compositor stops drawing.** Some boots never put a frame on the
    glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
    screen keeps the boot logo. That is the GPU write-target bug in
@@ -94,19 +98,17 @@ and refuses `boot_a` unless `BOOT_A=1`; `tools/qemu-ios.py` boots the same
 payload (`docs/QEMU_TESTING.md`).
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
-ring that `0174` arms before `vfs_mountroot`, so a failed mount still leaves the
-log on disk. `mondrianfb_noconsole=1` stops painting the panel at the first
-CoreAnimation swap, so a photo can show an earlier boot: the ring is the truth.
-With the kernel running, `usb=2` and `tools/usb-ring.py dump` read the whole
-ring over USB. On Windows the phone reaches WSL through `usbipd attach --wsl
---busid <id>` and `cdc_ether`: the host driver was the missing half, and a
-detach/attach is a bus reset the gadget now survives (`0298`).
-A previous boot is read by running the real kernel, then a dump kernel
-(`mondriandump=1`, `mondriandumpmatch=`, `0099` splits the list).
-`mondrianstop=N` halts at early mark N with IRQs masked, and `0174` keeps marks
-above 20 visible after the console is off, so the last line on the panel names
-the function that hung. `mondrianreset=N` is a second clock: a boot that ends
-at about 45 s is that thread rebooting to fastboot, not a crash.
+ring that `0174` arms before `vfs_mountroot`, and the same ring is the last
+4 MiB of `userdata` behind a `MONDLOG` header, so a boot with no USB still has
+its log: dump that tail from OrangeFox (`bs=4096 skip=$((sectors/8 - 1025))
+count=1025`) and drop the 512-byte header. With the kernel running, `usb=2` and
+`tools/usb-ring.py dump` read it over USB (`usbipd attach --wsl --busid <id>`
+first, `cdc_ether` on the host; `0298` survives a detach). A photo can show an
+earlier boot with `mondrianfb_noconsole=1`: the ring is the truth. A previous
+boot is printed by a dump kernel (`mondriandump=1`), `mondrianstop=N` halts at
+early mark N (`0174` keeps marks above 20 visible after the console is off),
+and `mondrianreset=N` is a second clock: a boot that ends at about 45 s is that
+thread rebooting to fastboot, not a crash.
 
 ## Measured hardware facts
 
@@ -298,17 +300,16 @@ mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and `mondrianfb_defer=0`
 are diagnostics (`docs/MONDIAN_GPU.md`).
 
-**Brightness: one DMA path, one low page.** DCS `0x51` reaches an AMOLED panel
-only through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA: the command FIFO
-acks and changes nothing, and a FIFO send wedges the DMA engine for the boot
-(`INT_CTRL` `0x500`, no `DMA_DONE`) -- reset the FIFO before the next send. Do
-not write `DSI_CTRL`: `CMD_MODE_EN` on this video-mode controller stops the
-engine reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel
-window starts at `0x840000000`, so the last page of the splash carve-out,
-`0xbaaf0000` (`shim/board.h`), is the only low page this port owns.
-`mondrianbl=<DBV>` (0xfff full scale) and `bl LEVEL [FMT [CMD]]` set the level,
-`mondrianblfmt` the byte order; `brightness-nits` 0 means "display asleep", and
-honouring it left every boot at DBV `0x20` with a dead slider.
+**Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
+through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA (a FIFO send wedges the
+engine for the boot: `INT_CTRL` `0x500`, no `DMA_DONE`; reset the FIFO before
+the next send), and `DSI_CTRL.CMD_MODE_EN` on this video-mode controller stops
+it reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window
+starts at `0x840000000`, so the last page of the splash carve-out, `0xbaaf0000`
+(`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>`
+(0xfff full scale) and `bl LEVEL [FMT [CMD]]` set the level, `mondrianblfmt`
+the byte order; `brightness-nits` 0 means "display asleep", and honouring it
+left every boot at DBV `0x20` with a dead slider.
 
 **The battery's VADC read: sleep, never poll.** ADC7 has no polling mode, so a
 reader that polls the arbiter's EOC word takes the *previous* conversion (0.8 V
