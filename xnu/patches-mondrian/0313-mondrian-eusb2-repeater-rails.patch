@@ -1,0 +1,365 @@
+xnu 0313: power the eUSB2 repeater's rails so a cold boot enumerates
+
+0312 got the DWC3 resetting on a cold boot, yet the link still did not train:
+the event ring stayed empty and the host saw nothing, while the same image under
+`fastboot boot` enumerated normally. The difference sits between the SoC's
+eUSB2 PHY and the connector: a discrete NXP eUSB2 repeater on i2c5
+(`nxp,eusb2-repeater`, address 0x4f). Its rails are the device tree's
+`vdd18-supply` (PM8350 S10, 1.8 V) and `vdd3-supply` (PM8350 L2, 3.072 V), and
+a fastboot handoff inherits both votes from ABL; a cold boot has nobody to make
+them.
+
+So both rails are voted on through RPMh before the controller is reset, with the
+same call the touch driver uses for its own rails (`mondrian_rpmh_rail` becomes
+visible to the USB driver for this). Measured: the host now enumerates on a
+cold boot -- bus reset, `connected, speed 0`, SET_ADDRESS and the standard
+descriptor requests -- and ping on 192.168.7.2 answers. `mondrianusbfallback=N`
+stands down as soon as the host talks.
+
+The probe that found this stays, because it is still the cheapest way to ask
+the part whether it is alive after a change: a bit-banged I2C master on the two
+QUPv3 SE5 pads (206/207, open drain, 5 us per half period, the same trick the
+touch and SPI bring-up uses). Measured on a cold boot: the pads idle high, so
+the bus itself is fine, and address 0x4f never acknowledges -- not before the
+rail votes, not after two seconds of polling, and not when asked under 0x4e or
+0x20 either. Upstream's driver for the part programs no registers at all, so the
+power is the whole bring-up; the probe separates "the repeater is dead" from
+"the controller never got its clock", which is what took the longest here.
+
+Note the vote also delays the reset by up to two seconds, so a settling time
+cannot be ruled out as part of the effect; the polls are part of the fix until
+a boot without them proves otherwise.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1635,6 +1635,300 @@
+ 	mondrian_reboot_to_fastboot();
+ }
+ 
++/*
++ * The eUSB2 repeater, probed over its own bus.
++ *
++ * Between this SoC's eUSB2 PHY and the connector sits a discrete NXP repeater
++ * on QUPv3 SE5 (i2c@994000, address 0x4f, node `nxp,eusb2-repeater`). Its
++ * driver upstream (drivers/phy/phy-nxp-ptn3222.c) only enables two supplies and
++ * releases one reset GPIO -- there is nothing to program over I2C -- so the
++ * only questions worth asking are whether it is powered and out of reset.
++ *
++ * Its reset is PM8350C GPIO7 (`reset-gpio` in the device tree, pinctrl
++ * `eusb2_reset_ctrl`) and its rails are PM8350 S10 (1.8 V) and L2 (3.0 V). All
++ * of that is the bootloader's on a `fastboot boot`; a cold boot leaves the
++ * part dead and the link never trains, while the DWC3 itself is fine.
++ *
++ * The bus is bit-banged because the kernel has no I2C master yet: two pads,
++ * open drain, 5 us per half period. That is enough to see whether a chip
++ * acknowledges -- the cheapest honest answer to "is the repeater alive".
++ * Mainline's SPI and touch bring-up on this board use the same trick.
++ */
++#define MONDRIAN_TLMM_BASE	0x0f100000UL
++#define MONDRIAN_TLMM_CFG	0x0
++#define MONDRIAN_TLMM_IN_OUT	0x4
++#define MONDRIAN_TLMM_PULL_NONE	0
++#define MONDRIAN_TLMM_PULL_UP	3
++#define MONDRIAN_TLMM_DRIVE_2MA	0
++
++#define EUSB2_I2C_PIN_A		206	/* device tree order: sda, scl */
++#define EUSB2_I2C_PIN_B		207
++#define EUSB2_REPEATER_ADDR	0x4f
++#define EUSB2_RPTR_STATUS	0x08
++#define EUSB2_RPTR_EN_CTL1	0x46
++
++#define MONDRIAN_TLMM_PAGE(n)	(MONDRIAN_TLMM_BASE + 0x1000UL * (n))
++
++/* bsd/dev/mondrian_touch.c: one RPMh rail vote, by command-DB resource name. */
++extern int mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on);
++
++static vm_offset_t bb_sda, bb_scl;
++
++/* Open drain: "release" is an input with the pull-up on, "low" drives 0. */
++static void
++bb_release(vm_offset_t page)
++{
++	*(volatile uint32_t *)(page + MONDRIAN_TLMM_IN_OUT) = 2;
++	*(volatile uint32_t *)(page + MONDRIAN_TLMM_CFG) =
++	    (0u << 2) | MONDRIAN_TLMM_PULL_UP | (MONDRIAN_TLMM_DRIVE_2MA << 6);
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++bb_low(vm_offset_t page)
++{
++	*(volatile uint32_t *)(page + MONDRIAN_TLMM_IN_OUT) = 0;
++	*(volatile uint32_t *)(page + MONDRIAN_TLMM_CFG) =
++	    (0u << 2) | MONDRIAN_TLMM_PULL_NONE | (MONDRIAN_TLMM_DRIVE_2MA << 6) |
++	    (1u << 9);
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static int
++bb_level(vm_offset_t page)
++{
++	return (int)(*(volatile uint32_t *)(page + MONDRIAN_TLMM_IN_OUT) & 1u);
++}
++
++static void
++bb_start(void)
++{
++	bb_release(bb_sda);
++	bb_release(bb_scl);
++	delay(5);
++	bb_low(bb_sda);
++	delay(5);
++	bb_low(bb_scl);
++}
++
++static void
++bb_stop(void)
++{
++	bb_low(bb_sda);
++	delay(5);
++	bb_release(bb_scl);
++	delay(5);
++	bb_release(bb_sda);
++	delay(5);
++}
++
++/* One byte out; returns 1 when the device acknowledged it. */
++static int
++bb_write(uint32_t byte)
++{
++	int ack;
++
++	for (int i = 7; i >= 0; i--) {
++		if (byte & (1u << i)) {
++			bb_release(bb_sda);
++		} else {
++			bb_low(bb_sda);
++		}
++		delay(5);
++		bb_release(bb_scl);
++		delay(5);
++		bb_low(bb_scl);
++	}
++	bb_release(bb_sda);
++	delay(5);
++	bb_release(bb_scl);
++	delay(5);
++	ack = !bb_level(bb_sda);
++	bb_low(bb_scl);
++	return ack;
++}
++
++static uint32_t
++bb_read(int ack)
++{
++	uint32_t v = 0;
++
++	bb_release(bb_sda);
++	for (int i = 0; i < 8; i++) {
++		delay(5);
++		bb_release(bb_scl);
++		delay(5);
++		v = (v << 1) | (uint32_t)bb_level(bb_sda);
++		bb_low(bb_scl);
++	}
++	if (ack) {
++		bb_low(bb_sda);
++	} else {
++		bb_release(bb_sda);
++	}
++	delay(5);
++	bb_release(bb_scl);
++	delay(5);
++	bb_low(bb_scl);
++	bb_release(bb_sda);
++	return v;
++}
++
++static int
++bb_write_reg(uint32_t addr, uint32_t reg, uint32_t value)
++{
++	bb_start();
++	if (!bb_write((addr << 1) | 0)) {
++		bb_stop();
++		return 0;
++	}
++	if (!bb_write(reg) || !bb_write(value)) {
++		bb_stop();
++		return 0;
++	}
++	bb_stop();
++	return 1;
++}
++
++static int
++bb_ping(uint32_t addr)
++{
++	int ack;
++
++	bb_start();
++	ack = bb_write((addr << 1) | 0);
++	bb_stop();
++	return ack;
++}
++
++static int
++bb_read_reg(uint32_t addr, uint32_t reg, uint32_t *out)
++{
++	bb_start();
++	if (!bb_write((addr << 1) | 0)) {
++		bb_stop();
++		return 0;
++	}
++	if (!bb_write(reg)) {
++		bb_stop();
++		return 0;
++	}
++	bb_start();
++	if (!bb_write((addr << 1) | 1)) {
++		bb_stop();
++		return 0;
++	}
++	*out = bb_read(0);
++	bb_stop();
++	return 1;
++}
++
++static int
++bb_probe_addr(int sda_pin, int scl_pin, uint32_t addr)
++{
++	uint32_t status = 0xffffffffu, ctl = 0xffffffffu;
++	int ok;
++
++	bb_sda = ml_io_map(MONDRIAN_TLMM_PAGE(sda_pin), PAGE_SIZE_4K);
++	bb_scl = ml_io_map(MONDRIAN_TLMM_PAGE(scl_pin), PAGE_SIZE_4K);
++	if (bb_sda == 0 || bb_scl == 0) {
++		printf("MONDR USB: i2c5 pads not mappable\n");
++		return 0;
++	}
++	bb_release(bb_sda);
++	bb_release(bb_scl);
++	delay(1000);
++	ok = bb_read_reg(addr, EUSB2_RPTR_STATUS, &status);
++	if (ok) {
++		(void)bb_read_reg(addr, EUSB2_RPTR_EN_CTL1, &ctl);
++	}
++	printf("MONDR USB: i2c5 %d/%d addr 0x%02x %s, status 0x%02x ctl1 0x%02x\n",
++	    sda_pin, scl_pin, addr, ok ? "ACK" : "no ack", status & 0xff, ctl & 0xff);
++	if (ok && addr == EUSB2_REPEATER_ADDR) {
++		/*
++		 * Qualcomm's repeater driver enables the part and then waits
++		 * for RPTR_OK; the NXP part may have no registers at all, in
++		 * which case these writes are ignored and the status read
++		 * back is what the chip drives on its own.
++		 */
++		int i;
++
++		(void)bb_write_reg(addr, EUSB2_RPTR_EN_CTL1, 0x80);
++		for (i = 0; i < 100; i++) {
++			if (!bb_read_reg(addr, EUSB2_RPTR_STATUS, &status) ||
++			    (status & 0x80)) {
++				break;
++			}
++			delay(1000);
++		}
++		(void)bb_read_reg(addr, EUSB2_RPTR_EN_CTL1, &ctl);
++		printf("MONDR USB: i2c5 repeater enabled, status 0x%02x (ok %d) ctl1 0x%02x after %d ms\n",
++		    status & 0xff, (status & 0x80) ? 1 : 0, ctl & 0xff, i);
++	}
++	return ok;
++}
++
++static void
++mondrian_usb_repeater_probe(void)
++{
++	vm_offset_t pa, pb;
++	int ok, sda = EUSB2_I2C_PIN_A, scl = EUSB2_I2C_PIN_B;
++
++	pa = ml_io_map(MONDRIAN_TLMM_PAGE(EUSB2_I2C_PIN_A), PAGE_SIZE_4K);
++	pb = ml_io_map(MONDRIAN_TLMM_PAGE(EUSB2_I2C_PIN_B), PAGE_SIZE_4K);
++	if (pa == 0 || pb == 0) {
++		return;
++	}
++	/* What the bootloader left on the pads: mux, pull, drive, output. */
++	printf("MONDR USB: i2c5 pads before: 206 cfg 0x%08x io 0x%08x, 207 cfg 0x%08x io 0x%08x\n",
++	    *(volatile uint32_t *)(pa + MONDRIAN_TLMM_CFG),
++	    *(volatile uint32_t *)(pa + MONDRIAN_TLMM_IN_OUT),
++	    *(volatile uint32_t *)(pb + MONDRIAN_TLMM_CFG),
++	    *(volatile uint32_t *)(pb + MONDRIAN_TLMM_IN_OUT));
++
++	ok = bb_probe_addr(sda, scl, EUSB2_REPEATER_ADDR);
++	if (!ok && bb_probe_addr(scl, sda, EUSB2_REPEATER_ADDR)) {
++		int t = sda;
++
++		sda = scl;
++		scl = t;
++		ok = 1;
++	}
++	if (!ok) {
++		/*
++		 * Nothing acknowledged, so the part is unpowered. Its rails are
++		 * the device tree's `vdd18-supply` (PM8350 S10, 1.8 V) and
++		 * `vdd3-supply` (PM8350 L2, 3.072 V); the bootloader votes them
++		 * for a `fastboot boot` and a cold boot has nobody. Vote them
++		 * through RPMh -- the same call the touch driver makes -- and
++		 * give the LDOs time: 50 ms was not enough on the first cold
++		 * boot, which is why the link only trained two seconds later.
++		 */
++		int waited = 0;
++
++		printf("MONDR USB: repeater silent, voting its rails on\n");
++		(void)mondrian_rpmh_rail("smpb10", 1800, 1);
++		(void)mondrian_rpmh_rail("ldob2", 3072, 1);
++		while (waited < 2000) {
++			delay(20000);
++			waited += 20;
++			if (bb_ping(EUSB2_REPEATER_ADDR)) {
++				ok = 1;
++				break;
++			}
++		}
++		printf("MONDR USB: repeater %s after the rails on (%d ms)\n",
++		    ok ? "answered" : "still silent", waited);
++		if (ok) {
++			(void)bb_probe_addr(sda, scl, EUSB2_REPEATER_ADDR);
++		}
++	}
++	if (!ok) {
++		(void)bb_probe_addr(sda, scl, 0x4e);
++		(void)bb_probe_addr(sda, scl, 0x20);
++	}
++}
++
+ static void
+ mondrian_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -1668,6 +1962,8 @@
+ 		    usb_rd(phy, EUSB2_CFG_CTRL_3), usb_rd(phy, EUSB2_FSEL_SEL),
+ 		    usb_rd(phy, EUSB2_APB_ACCESS));
+ 	}
++
++	mondrian_usb_repeater_probe();
+ 
+ 	/*
+ 	 * Device controller soft reset, the way Linux does it: read DCTL, set
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -280,7 +280,8 @@
+  * IRQ low, so a powered part out of reset holds it high, and an unpowered or
+  * reset one leaves the pull-down in charge.
+  */
+-static int mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on);
++/* also called by bsd/dev/mondrian_usb.c for the eUSB2 repeater rails */
++int mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on);
+ static vm_offset_t mondrian_touch_reset_page, mondrian_touch_avdd_page,
+     mondrian_touch_irq_page;
+ static int mondrian_rpmh_read(uint32_t addr, uint32_t *out);
+@@ -686,7 +687,7 @@
+  * driver sends DIV_ROUND_UP(uV, 1000)), +0x4 enable and +0x8 mode. The mode
+  * value is the PMIC5 LDO one, not the DT's RPMH mode: HPM is 7.
+  */
+-static int
++int
+ mondrian_rpmh_rail(const char *name, uint32_t mv, uint32_t on)
+ {
+ 	static const uint32_t reg[3] = { 0x0, 0x4, 0x8 };

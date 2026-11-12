@@ -39,11 +39,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
   `tap`/`swipe`/`key`, measures the glass's frame rate (`fps`) and prints `mem`;
-  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. A cold boot used
-  to have no USB: `0312` makes the DWC3 reset (eUSB2 PHY powered, PIPE clock
-  from UTMI) but the link does not train, because the NXP repeater on I2C is
-  only initialized by ABL's fastboot; `mondrianusbfallback=N` returns to
-  fastboot when that happens, and `fastboot boot` is the path with USB.
+  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. A cold boot now
+  enumerates: `0312` makes the DWC3 reset (PHY powered, PIPE clock from UTMI)
+  and `0313` votes the eUSB2 repeater's rails, which only ABL's fastboot did
+  before. The repeater answers nothing on i2c5 even when powered, so the rails
+  are the whole bring-up; `mondrianusbfallback=N` still returns to fastboot.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
   `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
