@@ -1,0 +1,146 @@
+xnu 0309: the restart reason the bootloader actually reads
+
+`reboot` on the USB channel sometimes landed in fastboot and sometimes booted
+the active slot; `mondrianreset=NN` failed the same way. The reset writes
+`0x77665500` to the IMEM restart reason at `0x146aa000 + 0x65c` and then asks
+PSCI for `SYSTEM_RESET`, which is the interface the older Qualcomm kernels used
+and the one this port copied.
+
+The bootloader on this SoC does not read IMEM here. It reads the PMIC's
+seven-bit cell at `pmk8350@0/sdam@7100/restart@48`, and the values are 1 for
+recovery and 2 for the bootloader: `qcom-reboot-reason.ko` (`nvmem_cell_write`
+of one byte, the cell declared `bits = <1 7>` in the live device tree) is what
+maps the reboot command onto it, and `adb reboot bootloader` from the vendor
+kernel lands in fastboot in about six seconds where this port used to boot the
+slot. The IMEM word stays, written with its own encoding, for a bootloader that
+predates the cell.
+
+Measured 2026-11-12: with the cell written, `reboot` on the ring reached
+fastboot in two seconds; the AFID for the cell is found by PPID `0x71` in the
+arbiter's map, and the write goes through the same channel window the ADC
+configuration uses.
+
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -65,6 +65,8 @@
+ #define MONDRIAN_SPMI_CHNLS	0x0c500000u	/* 4 KiB per APID */
+ #define MONDRIAN_SPMI_CHNLS_SIZE 0x1000u
+ #define MONDRIAN_SPMI_VADC_PPID	0x0031u		/* pmk8350@0 vadc@3100 */
++#define MONDRIAN_SPMI_SDAM_PPID	0x0071u		/* pmk8350@0 sdam@7100 */
++#define MONDRIAN_SPMI_SDAM_REASON 0x48u		/* restart reason, bits 7:1 */
+ 
+ #define MONDRIAN_SPMI_VBAT_SID	3		/* PM8350B */
+ #define MONDRIAN_SPMI_VBAT_CHAN	0x8fu		/* ADC7 vbat_sns */
+@@ -197,6 +199,61 @@
+ 	}
+ 	printf("MONDRIAN SPMI: adc config write failed\n");
+ 	return 0;
++}
++
++/*
++ * The restart reason the bootloader obeys is the PMIC's, not IMEM's:
++ * qcom-reboot-reason writes one byte into the seven-bit cell at
++ * pmk8350@0/sdam@7100/restart@48, and the codes there are 1 for recovery and
++ * 2 for the bootloader. Writing the IMEM word alone leaves that cell at its
++ * ordinary value, so a "reset to fastboot" boots the active slot instead --
++ * which is the whole reason the reset looked unreliable.
++ *
++ * The window is mapped here instead of through sp_chan_window because the
++ * battery thread owns that cache and may be mid-conversion.
++ */
++int
++mondrian_spmi_set_restart_reason(uint8_t reason)
++{
++	uint16_t apid = sp_find_apid(MONDRIAN_SPMI_SDAM_PPID);
++	volatile uint32_t *q;
++	uint8_t cur = 0, val;
++	uint32_t st = 0, i;
++
++	if (apid == 0xffffu) {
++		printf("MONDRIAN SPMI: no apid for the restart reason\n");
++		return 0;
++	}
++	if (!sp_read(apid, MONDRIAN_SPMI_SDAM_REASON, &cur)) {
++		printf("MONDRIAN SPMI: restart reason read failed\n");
++		return 0;
++	}
++	val = (uint8_t)((cur & 0x01u) | (uint8_t)((reason & 0x7fu) << 1));
++	q = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12), MONDRIAN_SPMI_CHNLS_SIZE);
++	if (q == NULL) {
++		printf("MONDRIAN SPMI: no window for apid %u\n", apid);
++		return 0;
++	}
++	q[0x10 / 4] = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	q[0] = MONDRIAN_SPMI_SDAM_REASON << 4;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++		st = q[0x08 / 4];
++		if (st & 1u) {
++			break;
++		}
++		delay(1);
++	}
++	if (!(st & 1u) || (st & 0x0eu)) {
++		printf("MONDRIAN SPMI: restart reason write failed, status 0x%02x\n", st);
++		return 0;
++	}
++	(void)sp_read(apid, MONDRIAN_SPMI_SDAM_REASON, &cur);
++	printf("MONDRIAN SPMI: restart reason %u, register 0x%02x (status 0x%02x)\n",
++	    reason, cur, st);
++	return 1;
+ }
+ 
+ /*
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1505,15 +1505,26 @@
+ }
+ 
+ static void
+-mondrian_reset_to_bootloader(void)
+-{
++mondrian_reset_to_bootloader(int recovery)
++{
++	extern int mondrian_spmi_set_restart_reason(uint8_t reason);
+ 	vm_offset_t imem = ml_io_map(0x146aa000, 0x1000);
+ 
++	/*
++	 * The PMIC's restart reason is what the bootloader reads (0309):
++	 * 2 sends it to fastboot, 1 to recovery. The IMEM word is the older
++	 * interface -- 0x77665500 fastboot, 0x77665502 recovery -- and it is
++	 * kept because a bootloader revision that predates the SDAM cell may
++	 * still look there.
++	 */
+ 	if (imem != 0) {
+-		*(volatile uint32_t *)(imem + 0x65c) = 0x77665500u;
++		*(volatile uint32_t *)(imem + 0x65c) =
++		    recovery ? 0x77665502u : 0x77665500u;
+ 		__builtin_arm_dsb(0xf);
+ 	}
+-	printf("MONDRIAN RESET: PSCI system reset, restart reason set\n");
++	(void)mondrian_spmi_set_restart_reason(recovery ? 1 : 2);
++	printf("MONDRIAN RESET: PSCI system reset to %s\n",
++	    recovery ? "recovery" : "fastboot");
+ 	(void)mondrian_smc(0x84000009ull);      /* PSCI_SYSTEM_RESET */
+ }
+ 
+@@ -1535,7 +1546,7 @@
+ 	 * does not accept "fastboot boot". */
+ 	(void)mondrian_ufs_bcb_set("bootloader");
+ 	mondrian_log_flush_now();
+-	mondrian_reset_to_bootloader();
++	mondrian_reset_to_bootloader(0);
+ }
+ 
+ /*
+@@ -1571,7 +1582,7 @@
+ 	mondrian_log_flush_now();
+ 	(void)mondrian_ufs_bcb_set(reset_to_recovery ? "boot-recovery" : "boot-fastboot");
+ 	mondrian_log_flush_now();
+-	mondrian_reset_to_bootloader();
++	mondrian_reset_to_bootloader(reset_to_recovery);
+ 	mondrian_log_flush_now();
+ 	printf("MONDRIAN RESET: PSCI returned, hanging\n");
+ 	(void)ml_set_interrupts_enabled(FALSE);

@@ -23,11 +23,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   spends one retry per boot, so after seven the slot reads
   `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
   resets flag and budget without writing a partition. From a running iOS the
-  ring's `reboot` is a way in with no buttons: it writes the BCB command
-  `bootloader`, flushes the ring and resets, and fastboot answers about 50 s
-  later, so poll `fastboot devices` for a minute. A reset that skips the BCB
-  write still lands in the bootloader's charging screen with the phone off,
-  which costs a manual recovery.
+  ring's `reboot` is the way in with no buttons: it writes the PMK8350 restart
+  reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader, 1 = recovery,
+  `0309`), flushes the ring and resets, and fastboot answers about 2 s later.
+  The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
+  so a reset that only writes those boots the active slot instead.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
@@ -232,9 +232,8 @@ shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
-`fastboot boot` refuses a recovery image, and `boot-recovery` boots the active
-`boot` slot instead of `recovery_a/b`: OrangeFox lives in `boot` (`fastboot
-flash boot_b ofox-boot-b-complete.img`) and the shim image brings iOS back.
+OrangeFox lives in `boot` (`fastboot flash boot_b ofox-boot-b-complete.img`);
+`boot-recovery` starts the active `boot` slot, so `recovery_a/b` never boot.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
