@@ -49,6 +49,10 @@ exists. Two ways to get there, both measured:
   not written either. Reflashing `backup/ios-root.simg` is the repair; `fsck_hfs`
   on a copy of that image reports "appears to be OK", so it does not find this.
 
+A cold boot brings its own USB: `0312` resets the DWC3 and `0313` votes the
+eUSB2 repeater's rails, so "no gadget at 192.168.7.2" is not the PHY any more.
+Read the panel first: a mount that has not finished has no gadget either.
+
 `mondrianfb_noconsole=0` puts the kernel log on the panel, which is the only
 channel while the USB gadget is down.
 
