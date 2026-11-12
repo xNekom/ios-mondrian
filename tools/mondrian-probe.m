@@ -27,6 +27,8 @@
  *   error      answer with XPC_ERROR_CONNECTION_INVALID
  *   delay N    wait N seconds and then pass through
  *   off        do not intercept at all
+ *   quiet      pass every call through without looking at it: the control run
+ *              that keeps only the stack sampler
  *
  * One boot can therefore answer "which reply shape opens the pane" and "what
  * does the pane do with a bad answer", instead of one boot per guess.
@@ -52,17 +54,25 @@
  *   "wfile" replaces it afterwards (xnu patch 0311).
  *
  * It also points the app's stderr at the console ring (an app's stderr is
- * /dev/null, which is why an exception never said anything) and logs the
- * navigation pushes.
+ * /dev/null, which is why an exception never said anything), logs the
+ * navigation pushes, and arms a sampler: `wfile` any content to
+ * /private/var/vm/mondrian-probe.cmd and every thread of the process reports its
+ * frames, named with dladdr. A hang leaves no other record -- runningboard kills
+ * a blocked app with SIGKILL and there is no crash report -- so the stack is the
+ * measurement.
  */
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <mach/mach.h>
+#include <mach/thread_act.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #import <Foundation/Foundation.h>
@@ -101,13 +111,15 @@ extern struct _xpc_type_s _xpc_type_null;
 extern struct _xpc_object_s _xpc_error_connection_invalid;
 
 #define CFG_PATH    "/private/var/vm/mondrian-probe.cfg"
+#define CMD_PATH    "/private/var/vm/mondrian-probe.cmd"
 #define PROBE_PROC  "Preferences"
 
 static int console_fd = -1;
 static int lines;
 static int logged_mode = -1;
+static pthread_mutex_t say_lock = PTHREAD_MUTEX_INITIALIZER;
 
-enum mode { MODE_PASS, MODE_EMPTY, MODE_ERROR, MODE_DELAY, MODE_OFF };
+enum mode { MODE_PASS, MODE_EMPTY, MODE_ERROR, MODE_DELAY, MODE_OFF, MODE_QUIET };
 
 static void
 say(const char *fmt, ...)
@@ -116,7 +128,7 @@ say(const char *fmt, ...)
 	va_list ap;
 	int n;
 
-	if (lines >= 400) {
+	if (lines >= 2000) {
 		return;
 	}
 	va_start(ap, fmt);
@@ -129,9 +141,18 @@ say(const char *fmt, ...)
 		n = (int)sizeof(line) - 1;
 	}
 	lines++;
+	/*
+	 * The sampler thread must never wait on the app's main thread: the whole
+	 * point of a sample is that the main thread is stuck somewhere, and if it
+	 * is stuck holding this lock a plain lock would hang the sampler too.
+	 */
+	if (pthread_mutex_trylock(&say_lock) != 0) {
+		return;
+	}
 	if (console_fd >= 0) {
 		(void)write(console_fd, line, (size_t)n);
 	}
+	pthread_mutex_unlock(&say_lock);
 }
 
 /*
@@ -169,6 +190,8 @@ read_config(enum mode *mode, int *delay_s)
 		}
 	} else if (strncmp(buf, "off", 3) == 0) {
 		*mode = MODE_OFF;
+	} else if (strncmp(buf, "quiet", 5) == 0) {
+		*mode = MODE_QUIET;
 	}
 }
 
@@ -180,6 +203,7 @@ mode_name(enum mode mode)
 	case MODE_ERROR: return "error";
 	case MODE_DELAY: return "delay";
 	case MODE_OFF:   return "off";
+	case MODE_QUIET: return "quiet";
 	default:         return "pass";
 	}
 }
@@ -298,22 +322,23 @@ probe_sync_wanted(xpc_connection_t connection, const char **name_out)
 static char seen_names[MAX_NAMES][64];
 static int seen_count;
 
-static void
+/* First sighting of a service name: 1, so the caller can time the call. */
+static int
 note_name(const char *name)
 {
 	int i;
 
 	for (i = 0; i < seen_count; i++) {
 		if (strcmp(seen_names[i], name) == 0) {
-			return;
+			return 0;
 		}
 	}
 	if (seen_count >= MAX_NAMES || strlen(name) >= sizeof(seen_names[0])) {
-		return;
+		return 0;
 	}
 	strcpy(seen_names[seen_count], name);
 	seen_count++;
-	say("MONDRIAN PROBE: xpc sync on %s, passing through\n", name);
+	return 1;
 }
 
 /*
@@ -324,6 +349,8 @@ note_name(const char *name)
 typedef xpc_object_t (*sync_fn)(xpc_connection_t, xpc_object_t);
 
 static sync_fn real_sync;
+
+static void start_sampler(void);
 
 static xpc_object_t
 real_sync_send(xpc_connection_t connection, xpc_object_t message)
@@ -346,15 +373,41 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 	const char *name;
 	xpc_object_t reply;
 	char *desc;
-
-	if (!probe_sync_wanted(connection, &name)) {
-		if (strcmp(name, "(null)") != 0) {
-			note_name(name);
-		}
+	read_config(&mode, &delay_s);
+	/*
+	 * `quiet` is the control run: the interposition is still installed, but it
+	 * looks at nothing and logs nothing, so the app sees what it would see
+	 * without this dylib while the stack sampler stays armed.
+	 */
+	if (mode == MODE_QUIET) {
 		return real_sync_send(connection, message);
 	}
+	/*
+	 * The sampler thread is created here, on the first sync call, and not in
+	 * the constructor: a thread started while dyld and UIKit are still
+	 * initialising is one more thing to rule out when an app never draws.
+	 */
+	start_sampler();
+	if (!probe_sync_wanted(connection, &name)) {
+		int first = strcmp(name, "(null)") != 0 ? note_name(name) : 0;
 
-	read_config(&mode, &delay_s);
+		/*
+		 * The two lines around the call are the measurement when a daemon
+		 * does not answer: a name with "before" and no "after" never came
+		 * back, which is a different fault from a reply the app mishandles.
+		 */
+		if (first) {
+			say("MONDRIAN PROBE: xpc sync on %s, before\n", name);
+		}
+		reply = real_sync_send(connection, message);
+		if (first) {
+			say("MONDRIAN PROBE: xpc sync on %s, after (%s)\n", name,
+			    reply == NULL ? "null" :
+			    xpc_get_type(reply) == &_xpc_type_error ? "error" : "value");
+		}
+		return reply;
+	}
+
 	if (mode != logged_mode) {
 		logged_mode = mode;
 		say("MONDRIAN PROBE: mode %s (pid %d)\n", mode_name(mode),
@@ -539,6 +592,171 @@ probe_exception(NSException *e)
 	    e != nil ? [[e reason] UTF8String] : "?");
 }
 
+/*
+ * STACK SAMPLES ON DEMAND
+ *
+ * The pane that hangs shows nothing: no exception, no XPC line, and the app is
+ * killed silently (runningboard answers a blocked main thread with SIGKILL, so
+ * there is not even a crash report to read). What is left is where the threads
+ * are, and that has to come from inside the wedged process.
+ *
+ * Writing /private/var/vm/mondrian-probe.cmd over the USB channel makes this
+ * thread sample every thread of the process once and print the frames, each one
+ * named with dladdr (the images are already loaded, so no symbols are needed on
+ * the host and no boot is spent). The main thread is the interesting one: its
+ * innermost frame names the call it is stuck in, and the frames above it name
+ * the caller that asked for it.
+ */
+static mach_port_t main_thread_port;
+
+static void
+log_pc(uint64_t pc, const char *what, int frame)
+{
+	Dl_info info;
+	const char *img = NULL;
+	const char *sym = NULL;
+
+	memset(&info, 0, sizeof(info));
+	if (dladdr((void *)(uintptr_t)pc, &info) != 0) {
+		sym = info.dli_sname;
+		img = info.dli_fname;
+	}
+	if (img != NULL) {
+		const char *slash = strrchr(img, '/');
+
+		img = slash != NULL ? slash + 1 : img;
+	}
+	if (sym != NULL) {
+		say("MONDRIAN PROBE: %s f%d %p %s %s+%#lx\n", what, frame,
+		    (void *)(uintptr_t)pc, img != NULL ? img : "?", sym,
+		    (unsigned long)(pc - (uint64_t)(uintptr_t)info.dli_saddr));
+	} else {
+		say("MONDRIAN PROBE: %s f%d %p %s+%#lx\n", what, frame,
+		    (void *)(uintptr_t)pc, img != NULL ? img : "?",
+		    (unsigned long)(pc - (uint64_t)(uintptr_t)info.dli_fbase));
+	}
+}
+
+/* Reading a stale frame pointer has to fail, not fault: vm_read_overwrite. */
+static bool
+read_frame(uint64_t at, uint64_t *fp_out, uint64_t *lr_out)
+{
+	uint64_t frame[2];
+	vm_size_t got = 0;
+
+	if (vm_read_overwrite(mach_task_self(), (vm_address_t)at, sizeof(frame),
+	    (vm_address_t)(uintptr_t)frame, &got) != KERN_SUCCESS ||
+	    got != sizeof(frame)) {
+		return false;
+	}
+	*fp_out = frame[0];
+	*lr_out = frame[1];
+	return true;
+}
+
+static void
+log_thread(mach_port_t thread, int n)
+{
+	arm_thread_state64_t st;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	uint64_t pc, lr, fp, sp, cur;
+	char what[16];
+	int frame;
+
+	if (thread_get_state(thread, ARM_THREAD_STATE64,
+	    (thread_state_t)&st, &count) != KERN_SUCCESS) {
+		return;
+	}
+	pc = arm_thread_state64_get_pc(st);
+	lr = arm_thread_state64_get_lr(st);
+	fp = arm_thread_state64_get_fp(st);
+	sp = arm_thread_state64_get_sp(st);
+	snprintf(what, sizeof(what), "t%d", n);
+	say("MONDRIAN PROBE: %s pc %p lr %p sp %p\n", what, (void *)(uintptr_t)pc,
+	    (void *)(uintptr_t)lr, (void *)(uintptr_t)sp);
+	log_pc(pc, what, 0);
+	if (lr != 0) {
+		log_pc(lr, what, 1);
+	}
+	cur = fp;
+	for (frame = 2; frame < 14 && cur != 0; frame++) {
+		uint64_t next;
+
+		if ((cur & 7) != 0 || cur < sp || cur - sp > (64u << 20)) {
+			break;
+		}
+		if (!read_frame(cur, &next, &lr) || lr == 0) {
+			break;
+		}
+		log_pc(lr, what, frame);
+		if (next <= cur) {
+			break;
+		}
+		cur = next;
+	}
+}
+
+static void
+sample_threads(void)
+{
+	thread_act_array_t list = NULL;
+	mach_msg_type_number_t n = 0;
+	mach_msg_type_number_t i;
+
+	say("MONDRIAN PROBE: sample begin pid %d\n", (int)getpid());
+	if (main_thread_port != MACH_PORT_NULL) {
+		log_thread(main_thread_port, 0);
+	}
+	if (task_threads(mach_task_self(), &list, &n) == KERN_SUCCESS && list != NULL) {
+		say("MONDRIAN PROBE: %u threads\n", (unsigned)n);
+		for (i = 0; i < n && i < 12; i++) {
+			if (list[i] == main_thread_port) {
+				continue;
+			}
+			log_thread(list[i], (int)i + 1);
+		}
+		vm_deallocate(mach_task_self(), (vm_address_t)list,
+		    n * sizeof(*list));
+	}
+	say("MONDRIAN PROBE: sample end\n");
+}
+
+static void *
+sampler_main(void *arg)
+{
+	struct stat sb;
+
+	(void)arg;
+	for (;;) {
+		if (stat(CMD_PATH, &sb) == 0) {
+			(void)unlink(CMD_PATH);
+			sample_threads();
+		}
+		usleep(200000);
+	}
+	return NULL;
+}
+
+static void
+start_sampler(void)
+{
+	static int started;
+	pthread_t tid;
+
+	if (started) {
+		return;
+	}
+	started = 1;
+	if (main_thread_port == MACH_PORT_NULL) {
+		main_thread_port = mach_thread_self();
+	}
+	if (pthread_create(&tid, NULL, sampler_main, NULL) != 0) {
+		say("MONDRIAN PROBE: sampler thread failed\n");
+		return;
+	}
+	say("MONDRIAN PROBE: sampler armed on %s\n", CMD_PATH);
+}
+
 __attribute__((constructor)) static void
 mondrian_probe_init(void)
 {
@@ -560,6 +778,7 @@ mondrian_probe_init(void)
 	}
 
 	say("MONDRIAN PROBE: pid %d, injected\n", (int)getpid());
+	main_thread_port = mach_thread_self();	/* the constructor runs on it */
 	NSSetUncaughtExceptionHandler(probe_exception);
 
 	hook_method("CLLocationManager", "init", K_OBJECT);

@@ -7,13 +7,13 @@ the action, the action is one of the host-side controls, and the whole ring is
 dumped once at the end and split on the marks. One boot answers a matrix of
 questions instead of one.
 
-  tools/settings-matrix.py tap 720 1500 \\
-      --step mark "General" tap 700 640 \\
-      --step cfg empty tap 700 520 \\
-      --step cfg pass --step killname locationd \\
-      --step tap 700 520 --dump matrix-ring.txt
+  tools/settings-matrix.py \\
+      --step tap 700 1500 --step mark "General" --step tap 700 640 \\
+      --step sample 6 2 --step killname locationd \\
+      --dump matrix-ring.txt
 
-Steps, in order (each one marked before it runs):
+Steps run in the order given, one verb per --step (each one marked before it
+runs, so the ring splits on what was about to happen):
 
   tap X Y              one touch, panel pixels (1440x3200)
   swipe X1 Y1 X2 Y2 [MS]
@@ -24,6 +24,8 @@ Steps, in order (each one marked before it runs):
   cfg MODE             rewrite the probe's variant (pass, empty, error,
                        delay 5, off) over "wfile"; the probe rereads it on the
                        next call, so no restart and no boot
+  sample [COUNT [GAP]] every thread of the app reports its frames, COUNT times
+                       GAP seconds apart (the probe's on-demand stack sampler)
   kill PID
   killname NAME        resolve the pid from the sampler's "SMP" lines; the
                        three names in mondriansample= come every tick and
@@ -46,6 +48,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 USB_RING = os.path.join(HERE, 'usb-ring.py')
 OUT = os.path.join(HERE, '..', 'out')
 PROBE_CFG = '/private/var/vm/mondrian-probe.cfg'
+PROBE_CMD = '/private/var/vm/mondrian-probe.cmd'
 MARK = 'MONDRIAN MARK: '
 
 
@@ -103,6 +106,17 @@ def write_cfg(mode):
         os.unlink(path)
 
 
+def write_cmd(text='sample'):
+    """The probe samples every thread of the app when this file appears."""
+    fd, path = tempfile.mkstemp(prefix='mondrian-cmd-')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(text.strip() + '\n')
+        return run('wfile', PROBE_CMD, path)
+    finally:
+        os.unlink(path)
+
+
 def do_step(step, args, ring):
     kind, rest = step, args
     if kind == 'mark':
@@ -136,6 +150,14 @@ def do_step(step, args, ring):
         mode = ' '.join(rest)
         mark(f'cfg {mode}')
         print(write_cfg(mode))
+        return True
+    if kind == 'sample':
+        count = int(rest[0]) if rest else 1
+        gap = float(rest[1]) if len(rest) > 1 else 2.0
+        mark(f'sample {count}x{gap}')
+        for _ in range(count):
+            print(write_cmd())
+            time.sleep(gap)
         return True
     if kind == 'kill':
         mark(f'kill {rest[0]}')
