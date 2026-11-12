@@ -55,11 +55,13 @@
  *
  * It also points the app's stderr at the console ring (an app's stderr is
  * /dev/null, which is why an exception never said anything), logs the
- * navigation pushes, and arms a sampler: `wfile` any content to
+ * navigation pushes, and arms two instruments. A sampler: `wfile` anything to
  * /private/var/vm/mondrian-probe.cmd and every thread of the process reports its
- * frames, named with dladdr. A hang leaves no other record -- runningboard kills
- * a blocked app with SIGKILL and there is no crash report -- so the stack is the
- * measurement.
+ * frames, named with dladdr; `wfile` "sym ADDR..." instead names addresses that
+ * belong to *another* process, because the dyld shared cache is mapped at the
+ * same place everywhere. And a fatal-signal handler, which prints the fault
+ * address and a full sample before exiting -- when it runs at all: it never
+ * does for the fault this app dies of, which is the point.
  */
 #include <dlfcn.h>
 #include <fcntl.h>
