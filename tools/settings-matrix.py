@@ -143,6 +143,15 @@ def do_step(step, args, ring):
         return True
     if kind == 'killname':
         pid = sampler_pid(rest[0], ring)
+        # The whole process table is printed every twelve sampler ticks, so a
+        # name outside mondriansample= can take a minute to appear; poll instead
+        # of failing the step and costing the boot.
+        for _ in range(8):
+            if pid is not None:
+                break
+            print(f'killname {rest[0]}: waiting for the sampler line')
+            time.sleep(15)
+            pid = sampler_pid(rest[0])
         if pid is None:
             print(f'killname {rest[0]}: no pid in the sampler line',
                   file=sys.stderr)

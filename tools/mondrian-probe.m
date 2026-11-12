@@ -289,6 +289,34 @@ probe_sync_wanted(xpc_connection_t connection, const char **name_out)
 }
 
 /*
+ * A call on another service still says which one: the blocked call is known
+ * from a stack sample, but one boot can also answer "was it even locationd?"
+ * without a second boot. Each name is reported once, so a busy app cannot
+ * drown the ring.
+ */
+#define MAX_NAMES 8
+static char seen_names[MAX_NAMES][64];
+static int seen_count;
+
+static void
+note_name(const char *name)
+{
+	int i;
+
+	for (i = 0; i < seen_count; i++) {
+		if (strcmp(seen_names[i], name) == 0) {
+			return;
+		}
+	}
+	if (seen_count >= MAX_NAMES || strlen(name) >= sizeof(seen_names[0])) {
+		return;
+	}
+	strcpy(seen_names[seen_count], name);
+	seen_count++;
+	say("MONDRIAN PROBE: xpc sync on %s, passing through\n", name);
+}
+
+/*
  * The replaced call has to be reached through the next image in the search
  * order: dyld rewrites the symbol table of every image, this one included, so a
  * direct call from here would run this function again until the stack is gone.
@@ -320,6 +348,9 @@ probe_sync(xpc_connection_t connection, xpc_object_t message)
 	char *desc;
 
 	if (!probe_sync_wanted(connection, &name)) {
+		if (strcmp(name, "(null)") != 0) {
+			note_name(name);
+		}
 		return real_sync_send(connection, message);
 	}
 
