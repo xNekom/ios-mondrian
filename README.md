@@ -181,9 +181,9 @@ tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
-# boot_b pairs with the kernel-less `recovery` ramdisk: restore
-# backup/boot_b-as-found.img before `fastboot reboot recovery`; a refused boot
-# is usually the slot's spent retry budget (`fastboot set_active b`).
+# OrangeFox lives in `boot_b` (`fastboot flash boot_b
+# ofox-boot-b-complete.img`), and the shim image brings iOS back. A refused
+# `fastboot boot` is usually the slot's spent retry budget (`set_active b`).
 tools/build-mondrian-ui-hook.sh out/gpu/mondrian-ui-hook.dylib
 # a kernel build embeds it (tools/gen-glblob.py); glblob=1 boots that copy
 sudo tools/install-ui-hook.sh ios16-root.img DYLIB   # or burn it into the image

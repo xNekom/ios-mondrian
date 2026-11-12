@@ -231,11 +231,10 @@ build also needs `SHIM_NO_UFS`. IRQ lines and no `MONDRIAN EARLY` means the
 shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
-raw file is resparsed and reading it back fails; flash a sparse image instead
-(`tools/mk-simg.py`). Recovery is not reachable either: `fastboot boot` of a
-100 MiB image fails `Bad Buffer Size` and `fastboot reboot recovery` boots
-`boot_b`, so OrangeFox needs a BCB `boot-recovery`; read a log with
-`mondriandump=1`.
+raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
+`fastboot boot` refuses a recovery image and the `recovery` partition never
+boots: OrangeFox lives in `boot` (`fastboot flash boot_b
+ofox-boot-b-complete.img`), and the shim image on `boot_b` brings iOS back.
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
