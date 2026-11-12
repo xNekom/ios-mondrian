@@ -20,6 +20,7 @@ The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
                 divider is the channel's qcom,pre-scaling, e.g. 3 for
                 vbat_sns <1 3> and 16 for usb_in_v_div_16 <1 16>)
   reboot        flush the ring, point the BCB at the bootloader and reset
+  poweroff      flush the ring, let the gadget go and switch the SoC off
 
 Why this exists: the live log on udp/5140 only carries what is written after
 it starts, a frozen UI used to force a power cycle plus a recovery dump to
@@ -307,7 +308,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=("dump", "pos", "reboot", "mem", "tap", "swipe",
+                        choices=("dump", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob",
                                  "fps"))
     parser.add_argument("args", nargs="*")
@@ -389,6 +390,10 @@ def main():
         down = args.args[1] not in ("up", "0", "false")
         key(code, down)
         print(f"key {code} {'down' if down else 'up'}")
+        return 0
+    if args.command == "poweroff":
+        simple("poweroff", 5.0)
+        print("poweroff sent")
         return 0
     simple("reboot", 5.0)
     print("reboot sent")

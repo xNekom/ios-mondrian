@@ -1,0 +1,61 @@
+xnu 0308: the host can switch the phone off
+
+Stopping a boot from the host had no answer. The power key only blanks the
+display (`MONDRIAN FB: panel blank (power key)`) because the panel driver
+consumes it, so iOS never shows "slide to power off"; `reboot` sends the phone to
+the bootloader instead of off; and the kernel had `PSCI_SYSTEM_RESET` only. A
+test unit that runs unattended therefore keeps drawing power until somebody
+presses a button.
+
+`poweroff` on the USB command channel flushes the ring, lets the gadget go
+(0307) and asks PSCI for `SYSTEM_OFF`. The boot control block is left alone, so
+the next start -- a key press or a cable replug -- is a normal boot. The word
+itself is the same one `tools/usb-ring.py` now offers.
+
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1480,6 +1480,30 @@
+ 	return x0;
+ }
+ 
++/*
++ * Power the SoC off from the host. Until this existed the only way to stop a
++ * running boot was a key press: the display blanks on the power key and the
++ * reset order goes to the bootloader, neither of which leaves the phone off.
++ * Flush the ring, let the gadget go (0307) and ask PSCI for SYSTEM_OFF; the
++ * boot control block is not touched, so the next start is a normal boot.
++ */
++void
++mondrian_poweroff(void)
++{
++	extern void mondrian_usb_stop(void);
++
++	mondrian_log_flush_now();
++	mondrian_usb_stop();
++	mondrian_log_flush_now();
++	printf("MONDRIAN POWEROFF: PSCI system off\n");
++	(void)mondrian_smc(0x84000008ull);      /* PSCI_SYSTEM_OFF */
++	printf("MONDRIAN POWEROFF: PSCI returned, hanging\n");
++	(void)ml_set_interrupts_enabled(FALSE);
++	for (;;) {
++		;
++	}
++}
++
+ static void
+ mondrian_reset_to_bootloader(void)
+ {
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1356,6 +1356,11 @@
+ 
+ 				printf("MONDR USB: reboot requested by the host\n");
+ 				mondrian_reboot_to_fastboot();
++			} else if (strcmp(cmd, "poweroff") == 0) {
++				extern void mondrian_poweroff(void);
++
++				printf("MONDR USB: poweroff requested by the host\n");
++				mondrian_poweroff();
+ 			}
+ 		}
+ 	}

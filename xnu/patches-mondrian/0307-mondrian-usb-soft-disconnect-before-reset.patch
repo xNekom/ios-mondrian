@@ -1,0 +1,75 @@
+xnu 0307: the gadget lets go of the port before a reset
+
+The USB command channel's `reboot` went to the bootloader twice out of five
+times and left the phone with no USB at all -- a black screen, no fastboot, no
+ring, nothing to do but hold the buttons (measured 2026-11-12). The reset
+itself is two instructions: the restart reason and PSCI_SYSTEM_RESET. What is
+still true at that moment is the gadget: DCTL.RUN_STOP is set, the event
+interrupt is armed and RX/TX may be mid-burst, so the controller is dropped
+while it owns the port. The bootloader then reinitialises the DWC3 and its
+fastboot does not enumerate.
+
+Clear DEVTEN and RUN_STOP first and wait, bounded, until DSTS reports the
+device suspended, so the port is idle and the bootloader starts from a quiet
+controller. When usb=0 nothing is mapped and the helper returns at once; the
+reset path is otherwise unchanged, so a boot that reaches the ring is
+unaffected.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -289,6 +289,7 @@
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+ #define DSTS_DEVCTRLHLT (1u << 22)
++#define DSTS_SUSPEND    (1u << 0)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+@@ -1444,4 +1445,33 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * Called on the way to a reset. The gadget is still running and may be in the
++ * middle of a burst when PSCI drops the SoC; the bootloader then brings the
++ * controller up again and, if the port was left mid-transfer, its fastboot
++ * never enumerates: the phone reboots to a black screen with no USB at all
++ * (measured twice out of five `reboot` requests). Clear the event interrupt
++ * and run/stop first and wait until the controller reports the device as
++ * suspended, so the port is idle when the bootloader takes it.
++ */
++void
++mondrian_usb_stop(void)
++{
++	int i;
++
++	if (ud.dwc == 0) {
++		return;
++	}
++	dwc_wr(DEVTEN, 0);
++	if (dwc_rd(DCTL) & DCTL_RUN_STOP) {
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		for (i = 0; i < 200 && !(dwc_rd(DSTS) & DSTS_SUSPEND); i++) {
++			delay(1000);
++		}
++	}
++	printf("MONDR USB: stopped before reset (DCTL 0x%08x DSTS 0x%08x after %d ms)\n",
++	    dwc_rd(DCTL), dwc_rd(DSTS), i);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1502,7 +1502,11 @@
+ void
+ mondrian_reboot_to_fastboot(void)
+ {
++	extern void mondrian_usb_stop(void);
++
+ 	mondrian_log_flush_now();
++	/* The gadget must be idle before the SoC reset (0307). */
++	mondrian_usb_stop();
+ 	/* "bootloader", not "boot-fastboot": the latter is fastbootd, which
+ 	 * does not accept "fastboot boot". */
+ 	(void)mondrian_ufs_bcb_set("bootloader");

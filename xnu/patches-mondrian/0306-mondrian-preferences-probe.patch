@@ -1,0 +1,124 @@
+xnu 0306: the Settings app can be watched from inside
+
+Tapping General > Date & Time in the Settings app marks the row and then nothing
+happens: the pane never arrives, the app's main thread sits idle in
+CFRunLoopRun, and the list stops taking further touches. Measured with the
+process sampler: the same is true with the GL shim forced onto its CPU copy path
+(glcopy=1), so the renderer is not the reason, and the SystemConfiguration
+thread seen earlier exists before the row is ever touched. What is left is the
+app's own decision: PSListController pushes nothing when it cannot resolve the
+specifier's detail class, and only the process can say which of the two happened.
+
+mondrian_probe=1 injects /private/var/vm/mondrian-probe.dylib into the app named
+by mondrian_probe_proc (default Preferences) and prints three things to the
+console ring: the classes the pane needs at load, the row and detail class of
+every selection, and the controller every showController:animated: is given
+("nil" included). A selection with no showController, or a showController with
+nil, is the answer; a real controller that never becomes visible moves the
+question to the controller's own view load.
+
+The dylib travels the way the UI hook does (0264): glblob=1 writes it out of the
+kernel image into /private/var/vm, so a probe change costs one kernel build and
+one `fastboot boot` rather than a userdata flash. Without glblob or without the
+file the injection is refused and the boot is unchanged. tools/gen-glblob.py
+takes it as an optional fourth input and the Linux build passes it when
+out/gpu/mondrian-probe.dylib exists; tools/build-mondrian-probe.sh builds it
+(tools/mondrian-probe.c).
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5674,6 +5674,41 @@
+ 	}
+ 	return true;
+ }
++/*
++ * mondrian_probe=1 injects /private/var/vm/mondrian-probe.dylib into one named
++ * app (mondrian_probe_proc, default "Preferences"), so a pane that does nothing
++ * can be explained from inside the process: a row that selects but never pushes
++ * means the specifier's controller class did not resolve, and only the app can
++ * say which. glblob=1 writes that file out of the kernel image at boot, so
++ * watching a build costs one kernel build and one `fastboot boot`.
++ */
++static bool
++mondrian_probe_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	char proc[32];
++	const char *name;
++	const char probe[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-probe.dylib";
++
++	if (!PE_parse_boot_argn("mondrian_probe", &enabled, sizeof(enabled)) ||
++	    !enabled || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	if (!PE_parse_boot_argn("mondrian_probe_proc", proc, sizeof(proc))) {
++		strlcpy(proc, "Preferences", sizeof(proc));
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(probe) > size) {
++		return false;
++	}
++	if (imgp->ip_ndp->ni_cnd.cn_namelen != strlen(proc) ||
++	    strncmp(name, proc, strlen(proc)) != 0) {
++		return false;
++	}
++	strlcpy(env, probe, size);
++	return true;
++}
++
+ #endif
+ 
+ __attribute__((noinline))
+@@ -5850,11 +5885,17 @@
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
+-	/* Inject only into the two diagnostic targets, and only when opted in. */
++	/* Inject only into the diagnostic targets, and only when opted in. */
+ 	{
+ 		char inject_env[128];
++		const char *injected = NULL;
+ 
+ 		if (mondrian_ui_hook_env(imgp, inject_env, sizeof(inject_env))) {
++			injected = "UI hook";
++		} else if (mondrian_probe_env(imgp, inject_env, sizeof(inject_env))) {
++			injected = "probe";
++		}
++		if (injected != NULL) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
+ 			if (error) {
+ 				goto bad;
+@@ -5865,7 +5906,7 @@
+ 			}
+ 			imgp->ip_argspace -= new_ptr_size;
+ 			imgp->ip_envc++;
+-			printf("MONDRIAN exec: injected UI hook\n");
++			printf("MONDRIAN exec: injected %s\n", injected);
+ 		}
+ 	}
+ #endif
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1258,6 +1258,7 @@
+ static int mondrian_glblob_hook_done;
+ static int mondrian_glblob_gl_done;
+ static int mondrian_glblob_inject_done;
++static int mondrian_glblob_probe_done;
+ static uint64_t mondrian_log_paint_chars;
+ static uint64_t mondrian_log_paint_us;
+ static uint64_t mondrian_log_paint_next_log;
+@@ -1604,8 +1605,13 @@
+ 		    mondrian_glblob_one("/private/var/vm/mondrian-inject.dylib",
+ 		    mondrian_inject_dylib, mondrian_inject_dylib_len) == 0;
+ 	}
++	if (!mondrian_glblob_probe_done) {
++		mondrian_glblob_probe_done = mondrian_probe_dylib_len == 0 ||
++		    mondrian_glblob_one("/private/var/vm/mondrian-probe.dylib",
++		    mondrian_probe_dylib, mondrian_probe_dylib_len) == 0;
++	}
+ 	if (mondrian_glblob_hook_done && mondrian_glblob_gl_done &&
+-	    mondrian_glblob_inject_done) {
++	    mondrian_glblob_inject_done && mondrian_glblob_probe_done) {
+ 		mondrian_glblob_pending = 0;
+ 	}
+ #endif
