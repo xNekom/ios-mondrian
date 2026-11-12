@@ -207,12 +207,9 @@ with `tools/ios-root-tweaks.py` (it also renames `_PanicOnCrash` in
 A hook change does not need the image round trip: a kernel build with
 `out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
 (`tools/gen-glblob.py`); `glblob=1` writes them into `/private/var/vm` at mount,
-the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`.
-
-```sh
-tools/phone-deploy.sh logview          # shim with LOGVIEW=1
-tools/phone-log.sh out/boot-mondrian.img ring.txt
-```
+the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`. A
+boot with no USB still has its log: `tools/phone-deploy.sh logview`, then
+`tools/phone-log.sh out/boot-mondrian.img ring.txt`.
 
 ## Repository layout
 
@@ -222,8 +219,7 @@ tools/phone-log.sh out/boot-mondrian.img ring.txt
 | `xnu/patches/` | the XNU patch series for sweet, plus staging scripts for libpthread, HFS and BearSSL |
 | `xnu/patches-mondrian/` | the XNU patch series for mondrian (see its README for the state of each patch) |
 | `.github/workflows/xnu.yml` | kernel CI build (`board` input) |
-| `tools/build-kernel-local.sh` | the same build on this Mac (same pinned dxb tree and series) |
-| `tools/wsl/` | the same build on Windows/WSL2 without a Mac (`docs/BUILD_LINUX.md`) |
+| `tools/build-kernel-local.sh`, `tools/wsl/` | the same build on this Mac or on Windows/WSL2 (`docs/BUILD_LINUX.md`) |
 | `tools/boards.py` | the board table: MMIO, memory, CPU topology, page size, boot args |
 | `tools/mkadt.py`, `mkpayload.py` | generate the Apple Device Tree / pack kernel + ADT + boot args |
 | `tools/apply-series.py`, `check-patches.sh`, `port-series.py` | apply, validate and port patch series |
@@ -231,8 +227,7 @@ tools/phone-log.sh out/boot-mondrian.img ring.txt
 | `tools/phone-boot.sh`, `phone-deploy.sh`, `flash-root.sh` | volatile boot, boot-partition deploy, root flash |
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
-| `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
-| `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
+| `docs/MONDIAN_PORT.md`, `docs/MONDIAN_TOUCH.md` | the port plan for the POCO F5 Pro, and the touch bring-up |
 | `docs/BUILD_LINUX.md` | building the kernel on Windows/WSL2, with no Mac |
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
 
