@@ -13,6 +13,7 @@
 #include "fdt.h"
 #include "loader.h"
 #include "lz4.h"
+#include "mmu.h"
 
 #define BOOT_LINE_LENGTH	1024
 #define PAGE_16K		0x4000UL
@@ -67,6 +68,19 @@ static void zero64(uintptr_t dst, uint64_t n)
 		d[i] = 0;
 }
 
+/* The same, with 16-byte stores: under the non-cacheable wipe map the
+ * interconnect merges them into full-width bursts, and a wider store is a
+ * wider burst. */
+static void zero64_wide(uintptr_t dst, uint64_t n)
+{
+	uintptr_t p = dst, e = dst + (n & ~15UL);
+
+	for (; p < e; p += 16)
+		__asm__ volatile("stp xzr, xzr, [%0]" : : "r"(p) : "memory");
+	for (; p < dst + n; p += 8)
+		*(volatile uint64_t *)p = 0;
+}
+
 /* The memory regions of the phone, from the device tree. */
 static uint64_t mem_regs[64];
 static int n_mem_regs;
@@ -89,8 +103,20 @@ static void wipe_window(uint64_t base, uint64_t size)
 {
 	const uint64_t chunk = 0x10000;	/* 64 KiB at a time */
 	uint64_t end = base + size;
+	uint64_t next = base + 0x20000000UL;
+	int fast;
 
-	con_hex2("WIPE", "from=", (uint32_t)base, "to=", (uint32_t)end);
+	con_hex64("WIPE", base);
+	con_hex64("WIPEND", end);
+	/*
+	 * With the MMU off this loop is minutes of Device-nGnRnE stores (the
+	 * kernel enters 15 ms after arm_init, so the wipe is the boot). The
+	 * temporary non-cacheable map makes the stores merge and the loop
+	 * costs seconds; if it cannot be built the old path still runs.
+	 */
+	fast = mmu_wipe_begin(base, end, mem_regs, n_mem_regs) == 0;
+	con_str("WIPEMAP", fast ? "normal non-cacheable" : "device (slow)");
+
 	for (int i = 0; i < n_mem_regs; i++) {
 		uint64_t rb = mem_regs[i * 2], rs = mem_regs[i * 2 + 1];
 		uint64_t a = rb > base ? rb : base;
@@ -109,10 +135,21 @@ static void wipe_window(uint64_t base, uint64_t size)
 				if (board_reserved[k][0] < q &&
 				    board_reserved[k][0] + board_reserved[k][1] > p)
 					skip = 1;		/* the secure world */
-			if (!skip)
-				zero64(p, q - p);
+			if (!skip) {
+				if (fast)
+					zero64_wide(p, q - p);
+				else
+					zero64(p, q - p);
+			}
+			/* Every 512 MiB, so a wipe that stalls says where. */
+			if (p >= next) {
+				next = p + 0x20000000UL;
+				con_hex64("WIPE", p);
+				con_skip();
+			}
 		}
 	}
+	mmu_wipe_end();
 	con_str("WIPE", "done");
 }
 
@@ -347,9 +384,58 @@ loader_boot_on_core(uintptr_t entry_pa, uintptr_t ba_pa)
 }
 #endif /* BOARD_BOOT_CORE */
 
+extern uint64_t shim_start_ticks;
+
+static uint64_t
+shim_ticks(void)
+{
+	uint64_t t;
+
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+	return t;
+}
+
+static uint32_t
+shim_ms(uint64_t from)
+{
+	return (uint32_t)((shim_ticks() - from) * 10 / 192000);	/* 19.2 MHz */
+}
+
+static uint32_t
+shim_uint(char *out, uint32_t value)
+{
+	char tmp[12];
+	uint32_t n = 0, i;
+
+	do {
+		tmp[n++] = (char)('0' + value % 10);
+		value /= 10;
+	} while (value != 0);
+	for (i = 0; i < n; i++) {
+		out[i] = tmp[n - 1 - i];
+	}
+	return n;
+}
+
+/* Append " key=<value>" to the command line. String literals as arguments keep
+ * the shim free of data relocations, which its position independence forbids. */
+static void
+shim_arg(char *dst, uint32_t *used, const char *key, uint32_t value)
+{
+	while (*key != 0 && *used < BOOT_LINE_LENGTH - 2) {
+		dst[(*used)++] = *key++;
+	}
+	/* A 32-bit value is at most ten digits. */
+	if (*used < BOOT_LINE_LENGTH - 12) {
+		*used += shim_uint(dst + *used, value);
+	}
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uint64_t t_loader = shim_ticks();
+	uint32_t ms_wipe = 0, ms_unpack = 0, ms_jump = 0, ms_pre;
 
 #if BOARD_WIPE
 	/*
@@ -358,6 +444,7 @@ const char *loader_boot(uintptr_t dtb)
 	 */
 	if (win_base && win_size)
 		wipe_window(win_base, win_size);
+	ms_wipe = shim_ms(t_loader);
 #endif
 
 	/* The payload the build appended to this image, unpacked in place. */
@@ -386,6 +473,7 @@ const char *loader_boot(uintptr_t dtb)
 			return "no room to unpack the payload";
 		long n = lz4_decompress_frame(b + BLOB_DATA, comp,
 					      (uint8_t *)(uintptr_t)scratch, raw);
+		ms_unpack = shim_ms(t_loader);
 		if (n < 0 || (uint64_t)n != raw) {
 			con_hex2("BADUNP", "n=", (uint32_t)n, "raw=", (uint32_t)raw);
 			return "cannot unpack the payload";
@@ -484,6 +572,14 @@ const char *loader_boot(uintptr_t dtb)
 	 * push ours out of the buffer. Give the payload its room first and let
 	 * the bootloader's line take only what is left in front of it; a short
 	 * `fastboot boot --cmdline "..."` still comes first and overrides.
+	 *
+	 * The 1024 is the kernel's, not the reader's: iOS userland asks for
+	 * kern.bootargs with a 608-byte buffer and XNU copies the whole string
+	 * (sysctl_io_string, trunc = 0), so a longer line is ENOMEM for every
+	 * daemon that reads it -- watchdogd reads it on each launch and aborts
+	 * when the call fails, and launchd answers with a respawn. Measured: an
+	 * Android line plus a 526-byte payload line came to 939 bytes and cost
+	 * four watchdogd aborts in the first ninety seconds.
 	 */
 	{
 		uintptr_t bdata = 0;
@@ -492,10 +588,23 @@ const char *loader_boot(uintptr_t dtb)
 		uint32_t plen = 0;
 		uint32_t room;
 
+		/*
+		 * The tail of the line belongs to the shim's own marks: `room` is
+		 * what the bootloader's Android line may take, and it has to leave
+		 * both the payload's line and 128 bytes for shim0..3. Without the
+		 * reservation the marks never reached the kernel (measured: no
+		 * `shim ms` line in the ring) and, when the Android line is long,
+		 * neither does the end of the payload's own line.
+		 */
+#define CMDLINE_SHIM_ROOM 128u
+#define CMDLINE_USERLAND_MAX 607u
 		while (p->cmdline[plen] != 0 && plen < BOOT_LINE_LENGTH - 1) {
 			plen++;
 		}
-		room = plen < BOOT_LINE_LENGTH - 1 ? BOOT_LINE_LENGTH - 2 - plen : 0;
+		room = 0;
+		if (plen + CMDLINE_SHIM_ROOM < CMDLINE_USERLAND_MAX) {
+			room = CMDLINE_USERLAND_MAX - plen - CMDLINE_SHIM_ROOM;
+		}
 		if (fdt_node_prop(dtb, "/chosen", "bootargs", &bdata, &blen) && blen > 0) {
 			const char *s = (const char *)bdata;
 
@@ -509,6 +618,17 @@ const char *loader_boot(uintptr_t dtb)
 		for (uint32_t i = 0; i < plen; i++) {
 			ba->CommandLine[used++] = p->cmdline[i];
 		}
+		/*
+		 * The shim's own phases, in milliseconds: before the loader, the
+		 * window wipe, the unpack, and everything up to the jump. The
+		 * kernel prints them with the rest of the boot stamps.
+		 */
+		ms_jump = shim_ms(t_loader);
+		ms_pre = shim_ms(shim_start_ticks);
+		shim_arg(ba->CommandLine, &used, " shim0=", ms_pre);
+		shim_arg(ba->CommandLine, &used, " shim1=", ms_wipe);
+		shim_arg(ba->CommandLine, &used, " shim2=", ms_unpack);
+		shim_arg(ba->CommandLine, &used, " shim3=", ms_jump);
 		ba->CommandLine[used] = 0;
 		con_str("CMDLINE", (const char *)ba->CommandLine);
 	}

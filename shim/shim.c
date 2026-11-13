@@ -713,9 +713,16 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+/* When the shim's own C code started: the loader reports the phases of the
+ * boot in the ring through the boot args, so the minutes a boot spends before
+ * the kernel are attributed instead of guessed. */
+uint64_t shim_start_ticks;
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
+
+	shim_start_ticks = now();
 
 	/* The console first, on the address the board documents: if anything
 	 * goes wrong while reading the device tree, the screen still shows

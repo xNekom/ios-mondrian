@@ -66,6 +66,89 @@ secondary_entry:
 	b	4b
 
 /*
+ * The kernel on the boot core the board names (BOARD_BOOT_CORE, the X2),
+ * started by PSCI CPU_ON from the core the firmware runs on. x0 = the
+ * handoff block (shim/loader.c): the state the firmware left on this core
+ * before it ever jumped to the shim, read from the running core. With the
+ * MMU off, every reference below is the same physical address.
+ *
+ * A core that PSCI has just switched on has none of it: CPACR_EL1 is 0, so
+ * the first NEON instruction in the kernel would trap; VBAR_EL1 is 0, so an
+ * early fault would be lost; and the identity table the kernel starts on is
+ * only reachable through TTBR0/TCR/MAIR/SCTLR.
+ *
+ * The firmware hands a CPU_ON core to EL2, not EL1 (the port's secondary
+ * entry, mondrian_secondary_entry, drops it the same way). At EL2 the writes
+ * below would configure EL1 and nothing else: SCTLR_EL1.M does not turn the
+ * MMU on, SPSel selects SP_EL2, and the kernel would then run untranslated
+ * at EL2, where every kernel VA is unmapped (panic with cpsr 0x...9, EL2h).
+ * So the first thing here is the EL2 -> EL1 transition, never the reverse.
+ */
+	.balign	64
+	.globl	kernel_handoff_entry
+kernel_handoff_entry:
+	msr	daifset, #0xf
+	mrs	x9, currentel
+	cmp	x9, #0x8			/* EL2? */
+	b.ne	kernel_handoff_el1
+	adr	x1, _sec_stacks
+	add	x1, x1, #0x8000
+	mov	sp, x1				/* SP_EL2, for the eret path */
+	adr	x1, vectors
+	msr	vbar_el2, x1
+	mov	x1, #(1 << 31)			/* HCR_EL2: AArch64 EL1, no stage 2 */
+	msr	hcr_el2, x1
+	msr	vttbr_el2, xzr
+	msr	cptr_el2, xzr
+	msr	mdcr_el2, xzr
+	mov	x1, #3				/* CNTHCTL_EL2: EL1 timer access */
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	mrs	x1, icc_sre_el2
+	orr	x1, x1, #1			/* ICC_SRE_EL2: system register access */
+	orr	x1, x1, #8
+	msr	icc_sre_el2, x1
+	movz	x1, #0x0800			/* SCTLR_EL1: MMU and caches off */
+	movk	x1, #0x30d0, lsl #16
+	msr	sctlr_el1, x1
+	isb
+	adr	x1, kernel_handoff_el1
+	msr	elr_el2, x1
+	mov	x1, #0x3c5			/* EL1h, DAIF masked */
+	msr	spsr_el2, x1
+	eret
+
+kernel_handoff_el1:
+	msr	daifset, #0xf
+	msr	spsel, #1
+	adr	x1, _sec_stacks
+	add	x1, x1, #0x8000
+	mov	sp, x1
+	ldr	x1, [x0, #8]		/* vbar_el1: the shim's vectors */
+	msr	vbar_el1, x1
+	ldr	x1, [x0, #16]		/* cpacr_el1: FP/SIMD allowed */
+	msr	cpacr_el1, x1
+	ldr	x1, [x0, #24]		/* mair_el1 */
+	msr	mair_el1, x1
+	ldr	x1, [x0, #32]		/* tcr_el1 */
+	msr	tcr_el1, x1
+	ldr	x1, [x0, #40]		/* ttbr0_el1: the shim's table */
+	msr	ttbr0_el1, x1
+	dsb	sy
+	tlbi	vmalle1
+	dsb	nsh
+	isb
+	ldr	x1, [x0, #48]		/* sctlr_el1: MMU and caches on */
+	msr	sctlr_el1, x1
+	isb
+	mov	x1, #1
+	str	x1, [x0, #0]		/* stage: about to enter the kernel */
+	dsb	sy
+	ldr	x2, [x0, #56]		/* the kernel's entry point */
+	ldr	x0, [x0, #64]		/* its boot_args, in x0 as core 0 had */
+	br	x2
+
+/*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
  * and jumps to the common path, which saves x0-x28 and calls
  * exc_handler(slot, regs). IRQs return; everything else ends in the
