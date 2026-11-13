@@ -2583,6 +2583,109 @@ typedef struct {
 	CGFloat right;
 } mondrian_insets;
 
+/*
+ * The slider modules are the ones whose touches stop at
+ * `CCUIContentModuleContentContainerView`: the container is in the tree and
+ * takes the hit, its content is what the finger never reaches. Walk that
+ * subtree alone, deep, and say of every UIControl whether it is enabled and
+ * whether anything is wired to it.
+ */
+static void
+mondrian_deep_walk(id view, unsigned depth, CGPoint space, unsigned *lines)
+{
+	CGRect frame, bounds;
+	CGPoint here;
+	id kids;
+	unsigned n, i;
+	char line[256];
+	const char *name;
+	char extra[64] = "";
+	BOOL control;
+
+	if (view == nil || depth > 12 || *lines >= 140) {
+		return;
+	}
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+	name = object_getClassName(view);
+	here.x = space.x + frame.origin.x;
+	here.y = space.y + frame.origin.y;
+	control = [[view class] isSubclassOfClass:objc_getClass("UIControl")];
+	if (control) {
+		id targets = mondrian_send(view, "allTargets");
+		unsigned long events = ((unsigned long (*)(id, SEL))objc_msgSend)(
+		    view, sel_registerName("allControlEvents"));
+
+		snprintf(extra, sizeof(extra), " ctl en %d ev %lu tg %u",
+		    (int)((BOOL (*)(id, SEL))objc_msgSend)(view,
+			sel_registerName("isEnabled")), events,
+		    targets != nil ? (unsigned)[(NSSet *)targets count] : 0);
+	}
+	(*lines)++;
+	{
+		unsigned indent = depth < 12 ? depth : 12;
+
+		memset(line, ' ', indent);
+		snprintf(line + indent, sizeof(line) - indent,
+		    "%s %.1fx%.1f abs %.1f,%.1f b %.1f,%.1f ui %d hid %d a %.2f%s\n",
+		    name != NULL ? name : "?", frame.size.width, frame.size.height,
+		    here.x, here.y, bounds.origin.x, bounds.origin.y,
+		    (int)((BOOL (*)(id, SEL))objc_msgSend)(view,
+			sel_registerName("isUserInteractionEnabled")),
+		    (int)((BOOL (*)(id, SEL))objc_msgSend)(view,
+			sel_registerName("isHidden")),
+		    (double)((CGFloat (*)(id, SEL))objc_msgSend)(view,
+			sel_registerName("alpha")), extra);
+	}
+	say(line);
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	space.x = here.x - bounds.origin.x;
+	space.y = here.y - bounds.origin.y;
+	for (i = 0; i < n && *lines < 140; i++) {
+		mondrian_deep_walk([(NSArray *)kids objectAtIndex:i], depth + 1,
+		    space, lines);
+	}
+}
+
+/*
+ * Find the module content containers the sheet holds and walk each one.
+ */
+static unsigned
+mondrian_deep_find(id view, unsigned depth, CGPoint space, unsigned found)
+{
+	CGRect frame;
+	id kids;
+	unsigned n, i;
+	const char *name = object_getClassName(view);
+
+	if (view == nil || depth > 9 || found >= 3) {
+		return found;
+	}
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	if (name != NULL && strstr(name, "ContentModuleContent") != NULL) {
+		unsigned lines = 0;
+		char line[224];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: deep %s %.0fx%.0f abs %.0f,%.0f\n", name,
+		    frame.size.width, frame.size.height,
+		    space.x + frame.origin.x, space.y + frame.origin.y);
+		say(line);
+		mondrian_deep_walk(view, 0, space, &lines);
+		return found + 1;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	space.x += frame.origin.x;
+	space.y += frame.origin.y;
+	for (i = 0; i < n; i++) {
+		found = mondrian_deep_find([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, space, found);
+	}
+	return found;
+}
+
 static void
 mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 {
@@ -2727,50 +2830,6 @@ mondrian_cc_module(id view, unsigned depth, CGPoint space,
 		}
 	}
 	return nil;
-}
-
-/*
- * `mondriangeom=1` also asks the sheet where three points land, from the main
- * thread: the touch path itself must not be wrapped (that aborted
- * SpringBoard), but calling -hitTest:withEvent: on the sheet's window is an
- * ordinary question with an ordinary answer. The points are the middle of the
- * connectivity module, the middle of the brightness slider and a gap between
- * modules, so a `nil` or a background view is all it takes to know the touch
- * never reaches the modules.
- */
-static void
-mondrian_cc_hits(id window)
-{
-	static const CGPoint points[3] = { { 122.0, 222.0 }, { 261.0, 408.0 },
-	    { 385.0, 600.0 } };
-	dispatch_semaphore_t sem;
-
-	[(id)window retain];
-	sem = dispatch_semaphore_create(0);
-	if (sem == NULL) {
-		return;
-	}
-	dispatch_async(dispatch_get_main_queue(), ^{
-		unsigned i;
-
-		for (i = 0; i < 3; i++) {
-			id hit = ((id (*)(id, SEL, CGPoint, id))objc_msgSend)(window,
-			    sel_registerName("hitTest:withEvent:"), points[i], nil);
-			char line[224];
-			BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(window,
-			    sel_registerName("isHidden"));
-
-			snprintf(line, sizeof(line),
-			    "MONDRIAN UI: cc hit %.0f,%.0f hid %d -> %s\n",
-			    points[i].x, points[i].y, (int)hidden,
-			    hit != nil ? object_getClassName(hit) : "nil");
-			say(line);
-		}
-		dispatch_semaphore_signal(sem);
-	});
-	dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-	    2000000000LL));
-	[(id)window release];
 }
 
 static void
@@ -2918,7 +2977,7 @@ mondrian_log_screen_geometry(void)
 			    "MONDRIAN UI: geom cc window %s\n", name);
 			say(line);
 			mondrian_geom_walk(window, 0, &lines, CGPointZero);
-			mondrian_cc_hits(window);
+			mondrian_deep_find(window, 0, CGPointZero, 0);
 			if (boot_arg_set("mondriancctest=1")) {
 				mondrian_cc_activate(window);
 			}
@@ -3261,6 +3320,79 @@ mondrian_dump_windows(const char *why)
  * be measured live are measured by calling hitTest on the sheet's window from
  * the geometry thread, never by wrapping it.
  */
+
+/*
+ * `mondriantouch=1`: where the events SpringBoard receives end up.
+ * -[UIApplication sendEvent:] is called once per event, not once per view, so
+ * wrapping it is cheap where wrapping hitTest was not. One line per touch: its
+ * phase, the point, the window UIKit gives it to, and the view it lands on --
+ * `nil` for the view is what a sheet that swallows touches looks like.
+ */
+static void (*mondrian_send_event_orig)(id, SEL, id);
+static unsigned mondrian_touch_logs;
+
+static void
+mondrian_send_event(id self, SEL cmd, id event)
+{
+	if (mondrian_send_event_orig != NULL) {
+		mondrian_send_event_orig(self, cmd, event);
+	}
+	if (event == nil || mondrian_touch_logs >= 200) {
+		return;
+	}
+	mondrian_touch_logs++;
+	{
+		Class touch_cls = objc_getClass("UITouch");
+		id touch = nil;
+		char line[256];
+		CGPoint at = { 0.0, 0.0 };
+		const char *wclass = "nil";
+		const char *vclass = "nil";
+		long phase = -1;
+
+		if (touch_cls != Nil) {
+			id touches = mondrian_send(event, "allTouches");
+
+			if (touches != nil && [(NSSet *)touches count] > 0) {
+				touch = [(NSSet *)touches anyObject];
+			}
+		}
+		if (touch != nil) {
+			id win, view;
+
+			phase = (long)((long (*)(id, SEL))objc_msgSend)(touch,
+			    sel_registerName("phase"));
+			at = ((CGPoint (*)(id, SEL, id))objc_msgSend)(touch,
+			    sel_registerName("locationInView:"), nil);
+			win = mondrian_send(touch, "window");
+			view = mondrian_send(touch, "view");
+			wclass = win != nil ? object_getClassName(win) : "nil";
+			vclass = view != nil ? object_getClassName(view) : "nil";
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: touch %u phase %ld at %.1f,%.1f window %s view %s\n",
+		    mondrian_touch_logs, phase, at.x, at.y, wclass, vclass);
+		say(line);
+	}
+}
+
+static void
+install_touch_probe(void)
+{
+	Class cls = objc_getClass("UIApplication");
+	Method m;
+
+	if (!boot_arg_set("mondriantouch=1") || cls == Nil) {
+		return;
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("sendEvent:"));
+	if (m == NULL) {
+		return;
+	}
+	mondrian_send_event_orig = (void (*)(id, SEL, id))
+	    method_setImplementation(m, (IMP)mondrian_send_event);
+	say("MONDRIAN UI: touch probe installed\n");
+}
 
 static void
 mondrian_lock_step(void *context)
@@ -5382,7 +5514,7 @@ mondrian_install_ui_hooks(void)
 	}
 	install_personas_hook();
 	/* The build tag: a boot that logs it proves which hook it is running. */
-	say("MONDRIAN UI: hook tag cc5\n");
+	say("MONDRIAN UI: hook tag cc6\n");
 	install_display_diagnostic();
 	install_activation_hooks();
 	install_icon_probe();
@@ -5390,6 +5522,7 @@ mondrian_install_ui_hooks(void)
 	install_display_link_rate_hooks();
 	install_brightness_hooks();
 	install_screen_size_hooks();
+	install_touch_probe();
 	start_heartbeat();
 	if (boot_arg_set("mondrianrescue=1")) {
 		pthread_t rescue;
