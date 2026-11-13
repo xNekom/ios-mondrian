@@ -2576,29 +2576,57 @@ mondrian_cc_normalize(id view, unsigned depth, unsigned *changed)
 	return *changed;
 }
 
+typedef struct {
+	CGFloat top;
+	CGFloat left;
+	CGFloat bottom;
+	CGFloat right;
+} mondrian_insets;
+
 static void
-mondrian_geom_walk(id view, unsigned depth, unsigned *lines)
+mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 {
-	CGRect frame;
+	CGRect frame, bounds;
+	CGPoint here;
 	id kids, layer;
 	unsigned n, i;
 	char line[224];
 	const char *name;
 
-	if (view == nil || depth > 6 || *lines >= 160) {
+	if (view == nil || depth > 9 || *lines >= 420) {
 		return;
 	}
 	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+	here.x = space.x + frame.origin.x;
+	here.y = space.y + frame.origin.y;
 	name = object_getClassName(view);
 	(*lines)++;
 	n = depth < 10 ? depth : 10;
 	memset(line, ' ', n);
-	snprintf(line + n, sizeof(line) - n, "%s %.1fx%.1f at %.1f,%.1f\n",
+	snprintf(line + n, sizeof(line) - n,
+	    "%s %.1fx%.1f at %.1f,%.1f abs %.1f,%.1f b %.1f,%.1f\n",
 	    name != NULL ? name : "?", frame.size.width, frame.size.height,
-	    frame.origin.x, frame.origin.y);
+	    frame.origin.x, frame.origin.y, here.x, here.y,
+	    bounds.origin.x, bounds.origin.y);
 	say(line);
+	if (name != NULL && strstr(name, "ScrollView") != NULL) {
+		CGSize content = ((CGSize (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("contentSize"));
+		CGPoint offset = ((CGPoint (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("contentOffset"));
+		mondrian_insets inset = ((mondrian_insets (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("contentInset"));
+
+		memset(line, ' ', n + 1);
+		snprintf(line + n + 1, sizeof(line) - n - 1,
+		    "content %.1fx%.1f offset %.1f,%.1f inset %.1f,%.1f,%.1f,%.1f\n",
+		    content.width, content.height, offset.x, offset.y,
+		    inset.top, inset.left, inset.bottom, inset.right);
+		say(line);
+	}
 	layer = mondrian_send(view, "layer");
-	if (layer != nil && depth <= 5) {
+	if (layer != nil && depth <= 7) {
 		CATransform3D t = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
 		    sel_registerName("transform"));
 		CATransform3D s = ((CATransform3D (*)(id, SEL))objc_msgSend)(layer,
@@ -2618,9 +2646,85 @@ mondrian_geom_walk(id view, unsigned depth, unsigned *lines)
 	}
 	kids = mondrian_send(view, "subviews");
 	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
-	for (i = 0; i < n && *lines < 160; i++) {
-		mondrian_geom_walk([(NSArray *)kids objectAtIndex:i], depth + 1, lines);
+	space.x = here.x - bounds.origin.x;
+	space.y = here.y - bounds.origin.y;
+	for (i = 0; i < n && *lines < 420; i++) {
+		mondrian_geom_walk([(NSArray *)kids objectAtIndex:i], depth + 1,
+		    lines, space);
 	}
+}
+
+/*
+ * `mondriancctest=1`: press the first module the sheet holds, without a touch
+ * on the glass. A module that reacts to -sendActionsForControlEvents: says the
+ * input path is what swallows the touches; a module that does nothing says its
+ * action is what is missing, and the touch path is innocent.
+ */
+static id
+mondrian_cc_module(id view, unsigned depth, CGPoint space,
+    unsigned *count)
+{
+	CGRect frame;
+	id kids;
+	unsigned n, i;
+	const char *name = object_getClassName(view);
+
+	if (view == nil || depth > 9) {
+		return nil;
+	}
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	if (name != NULL && (strstr(name, "TemplateView") != NULL ||
+	    strstr(name, "ButtonModule") != NULL) &&
+	    [view respondsToSelector:sel_registerName("sendActionsForControlEvents:")]) {
+		char line[224];
+
+		(*count)++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: cc module %u %s %.1fx%.1f abs %.1f,%.1f\n",
+		    *count, name, frame.size.width, frame.size.height,
+		    space.x + frame.origin.x, space.y + frame.origin.y);
+		say(line);
+		return view;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	space.x += frame.origin.x;
+	space.y += frame.origin.y;
+	for (i = 0; i < n; i++) {
+		id found = mondrian_cc_module([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, space, count);
+
+		if (found != nil) {
+			return found;
+		}
+	}
+	return nil;
+}
+
+static void
+mondrian_cc_activate(id window)
+{
+	static int dumps;
+	static int fired;
+	unsigned count = 0;
+	id module;
+	char line[224];
+
+	if (fired != 0 || ++dumps < 3) {
+		return;
+	}
+	module = mondrian_cc_module(window, 0, CGPointZero, &count);
+	if (module == nil) {
+		/* Not laid out yet: keep looking on the next dump. */
+		dumps = 2;
+		return;
+	}
+	fired = 1;
+	snprintf(line, sizeof(line), "MONDRIAN UI: cc activate %s\n",
+	    object_getClassName(module));
+	say(line);
+	((void (*)(id, SEL, unsigned long))objc_msgSend)(module,
+	    sel_registerName("sendActionsForControlEvents:"), 1UL << 6);
 }
 
 static void
@@ -2725,7 +2829,10 @@ mondrian_log_screen_geometry(void)
 			snprintf(line, sizeof(line),
 			    "MONDRIAN UI: geom cc window %s\n", name);
 			say(line);
-			mondrian_geom_walk(window, 0, &lines);
+			mondrian_geom_walk(window, 0, &lines, CGPointZero);
+			if (boot_arg_set("mondriancctest=1")) {
+				mondrian_cc_activate(window);
+			}
 		}
 	}
 }
@@ -2978,16 +3085,13 @@ mondrian_icon_probe_once(void)
 static unsigned mondrian_unlock_attempts;
 
 /*
- * Window geometry and touch routing. A sheet that draws at the wrong size and
- * a sheet that ignores touches are the same question - what frame does UIKit
- * think the window has, and which window gets the point - so both are printed
- * from here: the window list (frame, level, scene coordinate space, root view)
- * and, for windows above the normal level (the ones that draw the sheets), the
- * result of -hitTest:withEvent: for the first touches after the boot.
+ * Window geometry. A sheet that draws at the wrong size and a sheet that ignores
+ * touches are the same question - what frame does UIKit think the window has -
+ * so the window list is printed from here (frame, level, scene coordinate
+ * space, root view): `mondrianwin=1`, and the Control Center's own tree every
+ * five seconds with `mondriangeom=1`.
  */
 static int mondrian_win_logs;
-static int mondrian_hit_logs;
-static id (*mondrian_hit_orig)(id, SEL, CGPoint, id);
 
 static void
 mondrian_dump_windows(const char *why)
@@ -3059,67 +3163,15 @@ mondrian_dump_windows(const char *why)
 }
 
 /*
- * Only the windows above the normal level are logged: those are the ones that
- * draw the sheets (Control Center, Spotlight, the keyboard's window) and the
- * ones a log of the main window's hits would drown. `nil` for the hit means
- * the point fell outside that window - the answer when a sheet ignores a
- * touch.
+ * There is no hook in the touch path any more. Patching
+ * -[UIWindow hitTest:withEvent:] put the log inside every point test UIKit
+ * makes and aborted SpringBoard (sig 6) within a handful of touches, with the
+ * sheet gone and only the spinner left on the glass; the answer it was after -
+ * where a point lands in the Control Center - comes from the frames instead
+ * (the walking dump prints each view's absolute rect), and the ones that must
+ * be measured live are measured by calling hitTest on the sheet's window from
+ * the geometry thread, never by wrapping it.
  */
-static id
-mondrian_hit_test(id self, SEL cmd, CGPoint point, id event)
-{
-	id hit = mondrian_hit_orig != NULL ?
-	    mondrian_hit_orig(self, cmd, point, event) : nil;
-	CGFloat level = 0.0;
-
-	if (mondrian_hit_logs >= 48) {
-		return hit;
-	}
-	level = ((CGFloat (*)(id, SEL))objc_msgSend)(self,
-	    sel_registerName("windowLevel"));
-	if (level == 0.0) {
-		return hit;
-	}
-	mondrian_hit_logs++;
-	{
-		char line[224];
-
-		snprintf(line, sizeof(line),
-		    "MONDRIAN UI: hit %s lvl %.0f at %.0f,%.0f -> %s\n",
-		    object_getClassName(self), level, point.x, point.y,
-		    hit != nil ? object_getClassName(hit) : "nil");
-		say(line);
-	}
-	return hit;
-}
-
-static void
-install_window_hooks(void)
-{
-	Class cls = objc_getClass("UIWindow");
-	Method m;
-
-	/*
-	 * Off by default, and on its own argument: the boot that opened Control
-	 * Center with it aborted SpringBoard 24 times, while the same build
-	 * without it draws the sheet with no crash. `mondrianwin=1` (the window
-	 * dump) stays separate, so the geometry can be read without this hook
-	 * in the touch path.
-	 */
-	if (!boot_arg_set("mondrianhit=1")) {
-		return;
-	}
-	if (cls != Nil) {
-		m = class_getInstanceMethod(cls, sel_registerName("hitTest:withEvent:"));
-		if (m != NULL) {
-			mondrian_hit_orig = (id (*)(id, SEL, CGPoint, id))
-			    method_setImplementation(m, (IMP)mondrian_hit_test);
-		}
-	}
-	say(mondrian_hit_orig != NULL ?
-	    "MONDRIAN UI: window hitTest hooked\n" :
-	    "MONDRIAN UI: window hitTest not hooked\n");
-}
 
 static void
 mondrian_lock_step(void *context)
@@ -5247,7 +5299,6 @@ mondrian_install_ui_hooks(void)
 	install_display_link_rate_hooks();
 	install_brightness_hooks();
 	install_screen_size_hooks();
-	install_window_hooks();
 	start_heartbeat();
 	if (boot_arg_set("mondrianrescue=1")) {
 		pthread_t rescue;
