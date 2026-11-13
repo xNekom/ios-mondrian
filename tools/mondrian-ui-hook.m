@@ -34,6 +34,9 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
     const char *service_name, mach_port_t *service_port);
 
 #include <crt_externs.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -5504,9 +5507,15 @@ mondrian_threads_watch(void *unused)
 
 	if (strcmp(getprogname(), "runningboardd") == 0 ||
 	    strcmp(getprogname(), "launchd") == 0) {
-		settle = 30;
-		rounds = 12;
-		gap = 8;
+		/*
+		 * The spawn request arrives when an app is asked for, not at a
+		 * fixed time, so these two are sampled across the whole window in
+		 * which a launch happens: launchd because it is the last link,
+		 * runningboardd because it waits on it.
+		 */
+		settle = 20;
+		rounds = 40;
+		gap = 10;
 	} else if (strcmp(getprogname(), "SpringBoard") != 0 &&
 	    strcmp(getprogname(), "backboardd") != 0) {
 		settle = 25;
@@ -6959,6 +6968,167 @@ mondrian_probe_app(const char *tag)
 	mondrian_probe_processes(tag);
 }
 
+/*
+ * Name an offset inside a binary on the device. A thread dumped from another
+ * process prints as `<image>+0x<offset>` because the frame walk only has
+ * addresses, and an offset below the lowest Objective-C method (launchd+0x5898)
+ * has no name at all. The binary carries a symbol table even when nothing else
+ * can name it: read it here and print the nearest symbol below the offset.
+ */
+static void
+mondrian_symbol_file(const char *path, uint64_t off)
+{
+	struct mach_header_64 *hdr;
+	struct load_command *cmd;
+	struct symtab_command *sym = NULL;
+	uint64_t text_vmaddr = 0;
+	struct nlist_64 *nl;
+	const char *strs;
+	const char *best = NULL;
+	uint64_t best_val = 0, want;
+	struct stat st;
+	void *map;
+	int fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(*hdr)) {
+		if (fd >= 0) {
+			close(fd);
+		}
+		mondrian_probe_fmt("MONDRIAN SYMFILE: %s unreadable\n", path);
+		return;
+	}
+	map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		mondrian_probe_fmt("MONDRIAN SYMFILE: %s map failed\n", path);
+		return;
+	}
+	hdr = (struct mach_header_64 *)map;
+	if (hdr->magic != MH_MAGIC_64) {
+		mondrian_probe_fmt("MONDRIAN SYMFILE: %s not a 64-bit Mach-O\n", path);
+		munmap(map, (size_t)st.st_size);
+		return;
+	}
+	cmd = (struct load_command *)((char *)map + sizeof(*hdr));
+	for (uint32_t i = 0; i < hdr->ncmds; i++) {
+		if (cmd->cmd == LC_SEGMENT_64) {
+			struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
+
+			if (strcmp(seg->segname, "__TEXT") == 0) {
+				text_vmaddr = seg->vmaddr;
+			}
+		} else if (cmd->cmd == LC_SYMTAB) {
+			sym = (struct symtab_command *)cmd;
+		}
+		if (cmd->cmdsize == 0) {
+			break;
+		}
+		cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
+	}
+	if (sym == NULL || sym->symoff == 0 || sym->nsyms == 0) {
+		mondrian_probe_fmt("MONDRIAN SYMFILE: %s has no symbol table\n", path);
+		munmap(map, (size_t)st.st_size);
+		return;
+	}
+	want = text_vmaddr + off;
+	nl = (struct nlist_64 *)((char *)map + sym->symoff);
+	strs = (char *)map + sym->stroff;
+	for (uint32_t i = 0; i < sym->nsyms; i++) {
+		const char *name;
+
+		if ((nl[i].n_type & 0x0e) != 0x0e || nl[i].n_un.n_strx == 0 ||
+		    nl[i].n_value == 0 || nl[i].n_value > want) {
+			continue;
+		}
+		if (nl[i].n_value < best_val) {
+			continue;
+		}
+		name = strs + nl[i].n_un.n_strx;
+		/*
+		 * Every C symbol in a Mach-O starts with '_', so only an empty
+		 * name is filtered here: skipping the underscore hid launchd's
+		 * whole symbol table.
+		 */
+		if (name[0] == '\0') {
+			continue;
+		}
+		best = name;
+		best_val = nl[i].n_value;
+	}
+	if (best != NULL) {
+		char line[224];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN SYMFILE: %s+0x%llx -> %s+0x%llx\n", path,
+		    (unsigned long long)off, best,
+		    (unsigned long long)(want - best_val));
+		say(line);
+	} else {
+		mondrian_probe_fmt(
+		    "MONDRIAN SYMFILE: %s+0x%llx -> no symbol below\n", path,
+		    (unsigned long long)off);
+	}
+	munmap(map, (size_t)st.st_size);
+}
+
+static void *
+mondrian_symbol_probe(void *unused)
+{
+	int off = boot_arg_int("mondriansym=", 0);
+
+	(void)unused;
+	if (off <= 0) {
+		return NULL;
+	}
+	sleep(60);
+	mondrian_symbol_file("/sbin/launchd", (uint64_t)off);
+	return NULL;
+}
+
+static void *
+mondrian_launchctl_test(void *unused)
+{
+	char *argv[] = { (char *)"launchctl", (char *)"list", NULL };
+	extern char **environ;
+	posix_spawn_file_actions_t actions;
+	int out, rc, status = 0;
+	pid_t pid = 0;
+
+	(void)unused;
+	sleep(90);
+	/*
+	 * runningboardd waits on launchd's job API and launchd looks idle, so the
+	 * question is whether that API answers at all from another client. The
+	 * console is where the answer lands: stdout goes to /dev/console, which the
+	 * kernel copies into the ring, and a call that hangs leaves no status.
+	 */
+	out = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (out < 0) {
+		say("MONDRIAN LAUNCHCTL: no console\n");
+		return NULL;
+	}
+	if (posix_spawn_file_actions_init(&actions) != 0) {
+		close(out);
+		return NULL;
+	}
+	(void)posix_spawn_file_actions_adddup2(&actions, out, STDOUT_FILENO);
+	(void)posix_spawn_file_actions_adddup2(&actions, out, STDERR_FILENO);
+	say("MONDRIAN LAUNCHCTL: list start\n");
+	errno = 0;
+	rc = posix_spawn(&pid, "/bin/launchctl", &actions, NULL, argv, environ);
+	mondrian_probe_fmt("MONDRIAN LAUNCHCTL: spawn rc %d errno %d pid %d\n",
+	    rc, errno, (int)pid);
+	posix_spawn_file_actions_destroy(&actions);
+	close(out);
+	if (rc == 0) {
+		(void)waitpid(pid, &status, 0);
+		mondrian_probe_fmt("MONDRIAN LAUNCHCTL: list done status 0x%x\n",
+		    status);
+	}
+	return NULL;
+}
+
 static void *
 mondrian_installd_test(void *unused)
 {
@@ -7292,7 +7462,7 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc32 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc36 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
@@ -7348,7 +7518,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc32 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc36 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
@@ -7421,6 +7591,27 @@ mondrian_install_ui_hooks(void)
 
 		if (pthread_create(&app, NULL, mondrian_backboard_probe, NULL) == 0) {
 			pthread_detach(app);
+		}
+	}
+	/*
+	 * Does launchd answer its own job API from another client? runningboardd
+	 * waits on it while launchd looks idle, and only a call from a process
+	 * that is not runningboardd tells the two apart.
+	 */
+	if (boot_arg_int("mondriansym=", 0) > 0 &&
+	    strcmp(getprogname(), "SpringBoard") == 0) {
+		pthread_t sym;
+
+		if (pthread_create(&sym, NULL, mondrian_symbol_probe, NULL) == 0) {
+			pthread_detach(sym);
+		}
+	}
+	if (boot_arg_set("mondrianlaunchctl=1") &&
+	    strcmp(getprogname(), "SpringBoard") == 0) {
+		pthread_t lc;
+
+		if (pthread_create(&lc, NULL, mondrian_launchctl_test, NULL) == 0) {
+			pthread_detach(lc);
 		}
 	}
 	start_heartbeat();
