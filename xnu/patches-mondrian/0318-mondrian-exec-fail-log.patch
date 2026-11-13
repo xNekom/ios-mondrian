@@ -1,0 +1,52 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -4667,6 +4667,24 @@
+ 	}
+ 
+ 	assert(exec_failure_reason == NULL);
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * A successful exec prints its line (0316); one that is refused before
++	 * that point leaves no trace, and a chain that silently drops the spawn
++	 * looks exactly like one that was never asked for. Print the failures
++	 * with the path and the error so the two can be told apart.
++	 */
++	if (error != 0) {
++		char mondrian_epath[160];
++		size_t mondrian_elen = 0;
++
++		if (copyinstr(uap->path, mondrian_epath, sizeof(mondrian_epath),
++		    &mondrian_elen) == 0) {
++			printf("MONDRIAN EXECFAIL %s err %d pid %d\n",
++			    mondrian_epath, error, proc_getpid(p));
++		}
++	}
++#endif
+ 	return error;
+ }
+ 
+@@ -5222,6 +5240,24 @@
+ 		ipc_importance_release(inherit);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * A successful exec prints its line (0316); one that is refused before
++	 * that point leaves no trace, and a chain that silently drops the spawn
++	 * looks exactly like one that was never asked for. Print the failures
++	 * with the path and the error so the two can be told apart.
++	 */
++	if (error != 0) {
++		char mondrian_epath[160];
++		size_t mondrian_elen = 0;
++
++		if (copyinstr(uap->fname, mondrian_epath, sizeof(mondrian_epath),
++		    &mondrian_elen) == 0) {
++			printf("MONDRIAN EXECFAIL %s err %d pid %d\n",
++			    mondrian_epath, error, proc_getpid(p));
++		}
++	}
++#endif
+ 	return error;
+ }
+ 

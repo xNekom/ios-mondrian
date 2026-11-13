@@ -1,0 +1,25 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5631,6 +5631,12 @@
+  * the hook while the launch path is under test (mask 0x10).
+  */
+ #define MONDRIAN_HOOK_RUNNINGBOARDD     0x10
++/*
++ * runningboardd's spawn request is answered by launchd, and a launch that
++ * never spawns has no other process left to blame. launchd carries the
++ * hook only to be sampled; the hook installs nothing else there.
++ */
++#define MONDRIAN_HOOK_LAUNCHD           0x20
+ 
+ static bool
+ mondrian_ui_hook_in_vm(void)
+@@ -5693,6 +5699,9 @@
+ 	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("runningboardd") - 1 &&
+ 	    strncmp(name, "runningboardd", sizeof("runningboardd") - 1) == 0) {
+ 		wanted = MONDRIAN_HOOK_RUNNINGBOARDD;
++	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("launchd") - 1 &&
++	    strncmp(name, "launchd", sizeof("launchd") - 1) == 0) {
++		wanted = MONDRIAN_HOOK_LAUNCHD;
+ 	}
+ 	if (wanted == 0 || (targets & wanted) == 0) {
+ 		return false;

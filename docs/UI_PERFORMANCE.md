@@ -9,6 +9,34 @@ Every number comes from a ring dump (`tools/usb-ring.py dump`); the lines are
 already printed by the kernel and the injector, so a measurement costs one boot
 and no rebuild.
 
+## When the screen stops presenting
+
+A boot that reaches SpringBoard and then stops drawing is not always a frame
+budget problem: the compositor only presents when something changes, so `fps 0`
+on a still screen is normal, and what matters is whether a touch brings a frame.
+
+- **An app launch that times out freezes the compositor.** Measured chain, all
+  in the ring: SpringBoard's launch thread waits on an `os_unfair_lock` inside
+  `-[FBProcess bootstrapLock:]`, entered from
+  `FBProcessManager _bootstrap_consumeLock_addProcess:synchronously:`; the
+  thread that holds it is in `-[FBProcess _bootstrapAndExec]` waiting for the
+  XPC reply to `-[RBSConnection executeLaunchRequest:...]`; runningboardd is in
+  `AppServerSupport`, waiting for launchd. Nothing reaches `posix_spawn`, so no
+  `exec` of the app appears and no `MONDRIAN EXECFAIL` either. The lock stays
+  held, and the UI stays in the launch transition: `fps 0` from then on. The
+  launch probe therefore only runs with `mondrianprobe=1`; a boot without it is
+  a boot whose screen keeps working.
+- **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
+  copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
+  the kernel rewrites it, so they load the previous build. A hook change reaches
+  them one boot later; a build with no guard for launchd takes the boot down to
+  two processes.
+- **A panel capture is not a screenshot.** `usb-ring.py screen` reads the
+  buffer the kernel console HUD (`0289`) writes, so rows such as `KABORT` and
+  `P:` appear there even when the current boot logged none. The compositor's
+  frame goes through its own surface (`MONDRIAN FB: layer 0 surface N`), so the
+  capture shows the console, not the glass.
+
 ## The frame budget
 
 `MONDRIAN FB: fps` prints once a second and `mondrian-gl: frame` every 20th

@@ -33,6 +33,7 @@ extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
     const char *service_name, mach_port_t *service_port);
 
+#include <crt_externs.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -5281,6 +5282,20 @@ mondrian_symbolicate_pc(uint64_t pc, const char *tag)
 	}
 	for (int i = 0; i < num && n < cap; i++) {
 		Class cls = classes[i];
+		const char *image = class_getImageName(cls);
+		const char *want = strrchr(info.dli_fname, '/');
+		const char *have = image != NULL ? strrchr(image, '/') : NULL;
+
+		/*
+		 * Only the target image's classes can own one of its offsets.
+		 * class_getImageName is not always the full path dladdr returns,
+		 * so compare the last component.
+		 */
+		want = want != NULL ? want + 1 : info.dli_fname;
+		have = have != NULL ? have + 1 : image;
+		if (have == NULL || strcmp(have, want) != 0) {
+			continue;
+		}
 
 		for (int meta = 0; meta < 2 && n < cap; meta++) {
 			Class target = meta ? object_getClass((id)cls) : cls;
@@ -5310,6 +5325,12 @@ mondrian_symbolicate_pc(uint64_t pc, const char *tag)
 	}
 	free(classes);
 	if (n <= 0) {
+		const char *name = strrchr(info.dli_fname, '/');
+
+		mondrian_probe_fmt(
+		    "MONDRIAN SYM[%d]: %s %s+0x%llx -> no classes in that image (%d scanned)\n",
+		    getpid(), tag, name != NULL ? name + 1 : info.dli_fname,
+		    (unsigned long long)off, num);
 		free(spans);
 		return;
 	}
@@ -5368,8 +5389,14 @@ mondrian_dump_threads(const char *tag)
 		mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
 		thread_identifier_info_data_t id;
 		mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
-		char line[512], f[6][80];
-		uint64_t fp, addrs[6];
+		/*
+		 * Six frames were not enough to tell a thread that waits on a
+		 * lock from the thread that took it: the outer launch frames
+		 * sit below the six that were dumped. Walk deep enough to see
+		 * a second acquisition of the same lock on the same thread.
+		 */
+		char line[1600], f[16][80];
+		uint64_t fp, addrs[16];
 		int used = 2;
 
 		memset(&id, 0, sizeof(id));
@@ -5383,7 +5410,7 @@ mondrian_dump_threads(const char *tag)
 		addrs[0] = state.__pc;
 		addrs[1] = state.__lr;
 		fp = state.__fp;
-		for (int k = 2; k < 6 && fp >= 0x100000000ULL; k++) {
+		for (int k = 2; k < 16 && fp >= 0x100000000ULL; k++) {
 			uint64_t frame[2];
 			vm_size_t got = 0;
 
@@ -5418,12 +5445,23 @@ mondrian_dump_threads(const char *tag)
 		say(line);
 		/*
 		 * A thread parked on a lock is the interesting one: name the
-		 * method that owns the wait so the deadlock has an owner.
+		 * method that owns the wait so the deadlock has an owner. A
+		 * thread already inside FrontBoard is the other candidate for
+		 * the owner of that lock, so it gets named too.
 		 */
-		if (strstr(f[0], "__ulock_wait") != NULL ||
-		    strstr(f[0], "semaphore_wait") != NULL) {
-			for (int j = 1; j < used; j++) {
-				mondrian_symbolicate_pc(addrs[j], tag);
+		{
+			int front = 0;
+
+			for (int j = 0; j < used; j++) {
+				if (strstr(f[j], "FrontBoard") != NULL) {
+					front = 1;
+				}
+			}
+			if (front || strstr(f[0], "__ulock_wait") != NULL ||
+			    strstr(f[0], "semaphore_wait") != NULL) {
+				for (int j = 1; j < used; j++) {
+					mondrian_symbolicate_pc(addrs[j], tag);
+				}
 			}
 		}
 		mach_port_deallocate(mach_task_self(), list[i]);
@@ -5436,9 +5474,27 @@ static void *
 mondrian_threads_watch(void *unused)
 {
 	(void)unused;
-	for (int n = 0; n < 4; n++) {
-		/* The first sample waits for the UI to settle; the rest follow it. */
-		sleep(n == 0 ? 100 : 2);
+	/*
+	 * The first sample waits for the UI to settle; the rest follow it. An
+	 * app that never finishes booting starts hanging early, and FrontBoard
+	 * may kill it before a daemon-length wait ends, so an app gets its
+	 * first dump much sooner. runningboardd is the process on trial for a
+	 * launch that never spawns, so it is sampled across the whole window
+	 * in which the request arrives.
+	 */
+	int settle = 100, rounds = 4, gap = 2;
+
+	if (strcmp(getprogname(), "runningboardd") == 0 ||
+	    strcmp(getprogname(), "launchd") == 0) {
+		settle = 30;
+		rounds = 12;
+		gap = 8;
+	} else if (strcmp(getprogname(), "SpringBoard") != 0 &&
+	    strcmp(getprogname(), "backboardd") != 0) {
+		settle = 25;
+	}
+	for (int n = 0; n < rounds; n++) {
+		sleep(n == 0 ? settle : gap);
 		mondrian_dump_threads("sample");
 	}
 	return NULL;
@@ -6775,6 +6831,77 @@ mondrian_probe_app(const char *tag)
 		} @catch (id exception) {
 			mondrian_probe_fmt("MONDRIAN APP[%s]: rbs probe raised\n", tag);
 		}
+		/*
+		 * The handle above may come from RBSConnection's cache. A pid that
+		 * cannot exist must go to runningboardd, so this one says whether
+		 * the server answers at all.
+		 */
+		@try {
+			Class ident_cls = (id)objc_getClass("RBSProcessIdentifier");
+			Class hcls = (id)objc_getClass("RBSProcessHandle");
+			id ident = nil, ghost = nil;
+			NSError *gerr = nil;
+
+			(void)gettimeofday(&before, NULL);
+			if (ident_cls != nil && [ident_cls respondsToSelector:
+			    @selector(identifierWithPid:)]) {
+				ident = ((id (*)(id, SEL, int))objc_msgSend)(
+				    ident_cls, sel_registerName("identifierWithPid:"),
+				    99999);
+			}
+			if (hcls != nil && ident != nil && [hcls respondsToSelector:
+			    @selector(handleForIdentifier:error:)]) {
+				ghost = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+				    hcls, sel_registerName("handleForIdentifier:error:"),
+				    ident, &gerr);
+			}
+			(void)gettimeofday(&after, NULL);
+			mondrian_probe_fmt(
+			    "MONDRIAN APP[%s]: rbs ghost %s %ld ms error %s\n", tag,
+			    ghost != nil ? "yes" : "nil",
+			    (long)((after.tv_sec - before.tv_sec) * 1000 +
+			    (after.tv_usec - before.tv_usec) / 1000),
+			    gerr != nil ? [[gerr description] UTF8String] : "-");
+		} @catch (id exception) {
+			mondrian_probe_fmt("MONDRIAN APP[%s]: rbs ghost raised\n", tag);
+		}
+		/*
+		 * The app's data container is the one dependency left that a launch
+		 * cannot skip: containermanagerd is asked before the spawn. The
+		 * proxy answers this from the daemon, not from its own cache.
+		 */
+		@try {
+			Class proxy_cls = objc_getClass("LSApplicationProxy");
+			id proxy = nil;
+
+			if (proxy_cls != Nil && [proxy_cls respondsToSelector:
+			    @selector(applicationProxyForIdentifier:)]) {
+				proxy = ((id (*)(id, SEL, id))objc_msgSend)(
+				    (id)proxy_cls,
+				    sel_registerName("applicationProxyForIdentifier:"),
+				    @"com.apple.Preferences");
+			}
+			if (proxy != nil && [proxy respondsToSelector:
+			    @selector(dataContainerURL)]) {
+				id url = nil;
+
+				(void)gettimeofday(&before, NULL);
+				url = ((id (*)(id, SEL))objc_msgSend)(proxy,
+				    sel_registerName("dataContainerURL"));
+				(void)gettimeofday(&after, NULL);
+				mondrian_probe_fmt(
+				    "MONDRIAN APP[%s]: container url %s %ld ms %s\n",
+				    tag, url != nil ? "yes" : "nil",
+				    (long)((after.tv_sec - before.tv_sec) * 1000 +
+				    (after.tv_usec - before.tv_usec) / 1000),
+				    url != nil ? [[url description] UTF8String] : "-");
+			} else {
+				mondrian_probe_fmt(
+				    "MONDRIAN APP[%s]: container url api missing\n", tag);
+			}
+		} @catch (id exception) {
+			mondrian_probe_fmt("MONDRIAN APP[%s]: container url raised\n", tag);
+		}
 		if (launch != NULL) {
 			int lrc;
 			char message[192];
@@ -7135,6 +7262,44 @@ static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	/*
+	 * Two processes only report, because the UI hooks break the boot in
+	 * either of them: launchd is the reaper and xpcproxy is what executes
+	 * every app job. runningboardd's spawn request is waiting for launchd's
+	 * answer while no app appears, and xpcproxy's argv says whether that
+	 * request ever reached the spawn at all.
+	 */
+	if (strcmp(getprogname(), "launchd") == 0 ||
+	    strcmp(getprogname(), "xpcproxy") == 0) {
+		char tag[160];
+
+		snprintf(tag, sizeof(tag),
+		    "MONDRIAN UI: hook tag cc31 uid %d prog %s\n",
+		    (int)geteuid(), getprogname());
+		say(tag);
+		if (strcmp(getprogname(), "xpcproxy") == 0) {
+			int argc = *_NSGetArgc();
+			char **argv = *_NSGetArgv();
+			char line[400];
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN XPCPROXY: argc %d a0 %s a1 %s a2 %s\n",
+			    argc, argc > 0 && argv[0] != NULL ? argv[0] : "-",
+			    argc > 1 && argv[1] != NULL ? argv[1] : "-",
+			    argc > 2 && argv[2] != NULL ? argv[2] : "-");
+			say(line);
+			return;
+		}
+		if (boot_arg_set("mondrianbdt=1")) {
+			pthread_t thread;
+
+			if (pthread_create(&thread, NULL, mondrian_threads_watch,
+			    NULL) == 0) {
+				pthread_detach(thread);
+			}
+		}
+		return;
+	}
 	NSSetUncaughtExceptionHandler(mondrian_uncaught);
 	(void)objc_setExceptionPreprocessor(mondrian_exc_pre);
 	install_number_length_hook();
@@ -7165,7 +7330,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc23 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc31 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
@@ -7197,9 +7362,13 @@ mondrian_install_ui_hooks(void)
 		 * The app-launch probe runs once per boot, after the home screen
 		 * has settled, and watches FrontBoard's process set for five
 		 * minutes so a tap made at any point is caught with the processes
-		 * it created.
+		 * it created. Its launch times out and leaves FrontBoard's
+		 * bootstrap lock held, after which the compositor stops
+		 * presenting: a boot with the probe is a boot whose screen goes
+		 * black on its own, so it runs only when asked for.
 		 */
-		if (pthread_create(&launch, NULL, mondrian_launch_thread, NULL) == 0) {
+		if (boot_arg_set("mondrianprobe=1") &&
+		    pthread_create(&launch, NULL, mondrian_launch_thread, NULL) == 0) {
 			pthread_detach(launch);
 		}
 	}
@@ -7208,7 +7377,8 @@ mondrian_install_ui_hooks(void)
 	 * installd at the same time the SpringBoard probe does, so the two
 	 * answers line up.
 	 */
-	if (geteuid() == 0 && strcmp(getprogname(), "containermanagerd") == 0) {
+	if (boot_arg_set("mondrianprobe=1") && geteuid() == 0 &&
+	    strcmp(getprogname(), "containermanagerd") == 0) {
 		pthread_t inst;
 
 		if (pthread_create(&inst, NULL, mondrian_installd_test, NULL) == 0) {
@@ -7220,7 +7390,8 @@ mondrian_install_ui_hooks(void)
 	 * here answers "did FrontBoard refuse SpringBoard, or is the launch path
 	 * broken for everyone".
 	 */
-	if (geteuid() == 501 && strcmp(getprogname(), "backboardd") == 0) {
+	if (boot_arg_set("mondrianprobe=1") && geteuid() == 501 &&
+	    strcmp(getprogname(), "backboardd") == 0) {
 		pthread_t app;
 
 		if (pthread_create(&app, NULL, mondrian_backboard_probe, NULL) == 0) {
