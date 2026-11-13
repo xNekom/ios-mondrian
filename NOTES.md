@@ -49,27 +49,27 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
   disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
-  (480x1066 pt at scale 3) and the tick holds two records (`0282`). Measured
-  2026-11-11: the series alone composites at 24 fps at rest and 60 while a swipe
-  animates, and the panel follows (two captures a second apart differ in 35 000
-  and 942 000 pixels). The frame meter is in `docs/UI_PERFORMANCE.md`.
+  (480x1066 pt at scale 3) and the tick holds two records (`0282`).
   CoreAnimation needs `TimingElements`/`ColorElements` and an `IOAcceleratorES`
-  service (`0114`).
+  service (`0114`); `docs/UI_PERFORMANCE.md` has the frame meter.
 
 Current blockers, in order:
 
-1. **Charge level.** Charging works on its own (the charger sits behind the ADSP
-   and keeps +1.27 A flowing, measured through `ichg_fb`), but its coulomb
-   counter is out of the AP's reach: the level is a voltage table (`0304`),
-   which overstates it (3.80 V reads 58 % where Android said 36 %).
-2. **The compositor draws.** Not reproduced since the secure-mode switch: 8 cold
-   boots (2026-11-13) enumerated in ~27 s each, drew the home screen and
-   answered a tap. `fps 0` at rest is a still screen; a tap proves a boot.
-3. **Control Center.** Its grid is 430 pt wide whatever the screen is
-   (`CCUIModuleCollectionView` at x=0 in a 480 pt `CCUIScrollView`: 37 pt left,
-   87 right); widening it breaks the present, so it stays. The sheet opens but
-   nothing in it reacts (not a tap on Wi-Fi, not a drag on brightness), and a
-   vertical drag dismissed it until `mondriancg=1` cut the sheet's own gestures.
+1. **Charge level.** Charging works by itself (the charger sits behind the ADSP
+   and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
+   of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
+   reads 58 % where Android said 36 %).
+2. **The compositor draws.** Not seen since the secure-mode switch: 8 cold boots
+   (2026-11-13) enumerated in ~27 s each, drew the home screen and answered a
+   tap. `fps 0` at rest is a still screen; a tap proves a boot.
+3. **Control Center.** The grid is laid out for a 375 pt model in a 480 pt panel:
+   `CCUIModuleCollectionView` is 430 pt wide at x=0 in the `CCUIScrollView`
+   (37 pt left, 87 right; 77 pt modules, 16 pt gaps); widening it breaks the
+   present, so it stays. Buttons work (a tap lands on `CCUIRoundButton`; airplane
+   turns orange), sliders do not: the touch begins on
+   `CCUIContentModuleContentContainerView` and is gone 200 ms later, the scroll
+   view's touch delay handing it to its pan (`mondriancg=1` off). Never wrap a
+   touch path: `hitTest:withEvent:` aborts SpringBoard, `sendEvent:` is safe.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting

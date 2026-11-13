@@ -3340,7 +3340,6 @@ mondrian_send_event(id self, SEL cmd, id event)
 	if (event == nil || mondrian_touch_logs >= 200) {
 		return;
 	}
-	mondrian_touch_logs++;
 	{
 		Class touch_cls = objc_getClass("UITouch");
 		id touch = nil;
@@ -3369,6 +3368,11 @@ mondrian_send_event(id self, SEL cmd, id event)
 			wclass = win != nil ? object_getClassName(win) : "nil";
 			vclass = view != nil ? object_getClassName(view) : "nil";
 		}
+		/* A drag is a hundred moves; the phases that matter are the ends. */
+		if (phase == 1) {
+			return;
+		}
+		mondrian_touch_logs++;
 		snprintf(line, sizeof(line),
 		    "MONDRIAN UI: touch %u phase %ld at %.1f,%.1f window %s view %s\n",
 		    mondrian_touch_logs, phase, at.x, at.y, wclass, vclass);
@@ -4603,12 +4607,13 @@ mondrian_cc_retry_thread(void *unused)
 }
 
 /*
- * A vertical drag anywhere in Control Center dismisses the sheet, so the
- * brightness and volume sliders cannot be used at all: the drag never reaches
- * the slider's pan recogniser. Two views can eat it -- the sheet's own scroll
- * view and the swipe affordance under it -- and neither has anything to do on a
- * panel this tall (the grid fits without scrolling). Opt-in `mondriancg=1`
- * until a boot says which one was the thief.
+ * A vertical drag inside Control Center never reaches the sliders: the touch
+ * begins on the module and is gone 200 ms later (the sendEvent log shows
+ * `touch.view` going nil in the middle of the drag), which is the scroll view's
+ * touch delay handing the touch to its pan instead. The sheet does not scroll on
+ * a panel this tall (its grid fits), and its swipe affordance has to keep
+ * working or the sheet cannot be pulled down at all, so only the delay and the
+ * scrolling go: `mondriancg=1`.
  */
 static void
 mondrian_cc_gestures_pass(void)
@@ -4642,13 +4647,11 @@ mondrian_cc_gestures_pass(void)
 			id v = [(NSArray *)kids objectAtIndex:k];
 			const char *c = object_getClassName(v);
 
-			if (c != NULL && strstr(c, "SBBarSwipeAffordance") != NULL) {
-				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
-				    sel_registerName("setUserInteractionEnabled:"), NO);
-			}
 			if (c != NULL && strstr(c, "CCUIScrollView") != NULL) {
 				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
 				    sel_registerName("setScrollEnabled:"), NO);
+				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
+				    sel_registerName("setDelaysContentTouches:"), NO);
 			}
 		}
 	}
