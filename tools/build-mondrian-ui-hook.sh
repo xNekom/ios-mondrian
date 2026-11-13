@@ -9,7 +9,7 @@ mkdir -p "$(dirname "$out")"
 xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
 	-dynamiclib -Os -fno-common -fvisibility=hidden \
 	-install_name /usr/libexec/mondrian-ui-hook.dylib \
-	-o "$out" "$root/tools/mondrian-ui-hook.m" -lobjc -framework CoreFoundation -framework Foundation -framework QuartzCore -framework CoreGraphics
+	-o "$out" "$root/tools/mondrian-ui-hook.m" -lobjc -Wl,-undefined,dynamic_lookup -framework CoreFoundation -framework Foundation -framework QuartzCore -framework CoreGraphics -framework IOKit
 codesign --force --sign - --timestamp=none "$out"
 codesign --verify --strict "$out"
 file "$out"

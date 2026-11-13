@@ -88,6 +88,18 @@ if grep -q "mondrian-drm" "$src/meson.build"; then
 			exit 1
 		fi
 	fi
+	# The framebuffer-fetch barrier is later still (see fd6_draw.cc in the
+	# patch): a tree that already has the warm-up needs it on its own.
+	if ! grep -q 'prev_draw_read_fb' \
+	    "$src/src/gallium/drivers/freedreno/freedreno_batch.h"; then
+		echo "== applying the framebuffer-fetch barrier"
+		if ! sed -n '/^--- a\/src\/gallium\/drivers\/freedreno\/freedreno_batch.h/,$p' \
+		    "$patchfile" | patch -p1 -d "$src" --batch --forward \
+		    --no-backup-if-mismatch; then
+			echo "error: could not apply the incremental framebuffer-fetch patch" >&2
+			exit 1
+		fi
+	fi
 else
 	echo "== patching $(basename "$src")"
 	if ! patch -p1 -d "$src" --batch --forward --no-backup-if-mismatch \

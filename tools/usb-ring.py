@@ -19,16 +19,6 @@ The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
                 one PMK8350 VADC channel in mV (sid 3 = PM8350B; the
                 divider is the channel's qcom,pre-scaling, e.g. 3 for
                 vbat_sns <1 3> and 16 for usb_in_v_div_16 <1 16>)
-  keys          the power and volume key poller's state, one live read
-  say TEXT      a mark in the ring ("MONDRIAN MARK: TEXT"), so a run of
-                steps labels its own log lines
-  wfile REMOTE LOCAL
-                write LOCAL over REMOTE inside the mounted root, without a
-                kernel build and without flashing userdata; the target must
-                not be mapped, so kill its process first
-  wstat         how many bytes of the last wfile arrived
-  kill PID      SIGKILL that process (relaunch a daemon after its file was
-                replaced, or prove what the system does without it)
   reboot        flush the ring, point the BCB at the bootloader and reset
   poweroff      flush the ring, let the gadget go and switch the SoC off
 
@@ -143,12 +133,6 @@ def dump(path, timeout):
         at = max(at, offset + len(body))
     if at < total:
         holes += total - at
-    # "-" is stdout, so a caller can pipeline the ring without a temp file.
-    if path == "-":
-        sys.stdout.write(bytes(ring).decode("utf-8", errors="replace"))
-        print(f"{len(ring)} bytes, {len(chunks)} datagrams, {holes} bytes missing",
-              file=sys.stderr)
-        return 0
     with open(path, "wb") as f:
         f.write(ring)
     print(f"{len(ring)} bytes, {len(chunks)} datagrams, {holes} bytes missing -> {path}")
@@ -228,81 +212,6 @@ def key(code, down):
     s = open_socket(2.0)
     s.sendto(b"RLK1" + bytes((code, 1 if down else 0)), PHONE)
     s.close()
-
-
-WCHUNK = 1000
-
-
-def wfile(remote, local, timeout=20.0):
-    """Write LOCAL over REMOTE in the mounted root, a datagram at a time.
-
-    The kernel answers "wfile PATH LEN ready", takes "RLW1" + u32 offset +
-    data, and writes the file once the contiguous prefix covers LEN. Datagrams
-    are dropped when they arrive faster than the gadget drains them, so the
-    progress is read back with "wstat" and a run that lost one resends the
-    whole file (the offsets make that idempotent).
-    """
-    with open(local, "rb") as f:
-        data = f.read()
-    if not data:
-        print(f"{local} is empty", file=sys.stderr)
-        return 1
-
-    s = open_socket(timeout)
-    try:
-        s.sendto(f"wfile {remote} {len(data)}".encode(), PHONE)
-        try:
-            answer, _ = s.recvfrom(2048)
-        except socket.timeout:
-            print("no answer to wfile (does this kernel have it?)",
-                  file=sys.stderr)
-            return 1
-        text = answer.decode(errors="replace").strip()
-        print(text)
-        if " ready" not in text:
-            return 1
-
-        for attempt in range(3):
-            answered = None
-            for offset in range(0, len(data), WCHUNK):
-                s.sendto(b"RLW1" + struct.pack("<I", offset) +
-                         data[offset:offset + WCHUNK], PHONE)
-                time.sleep(0.001)
-            # The write answer comes from the datagram that completed the
-            # range, so drain everything before asking for the count.
-            deadline = time.time() + 3.0
-            while time.time() < deadline:
-                try:
-                    answer, _ = s.recvfrom(2048)
-                except socket.timeout:
-                    break
-                text = answer.decode(errors="replace").strip()
-                if text.startswith("wfile ") and "->" in text:
-                    print(text)
-                    return 0 if text.endswith("-> 0") else 1
-                if text.startswith("wstat "):
-                    answered = text
-            s.sendto(b"wstat", PHONE)
-            try:
-                answer, _ = s.recvfrom(2048)
-                answered = answer.decode(errors="replace").strip()
-            except socket.timeout:
-                answered = answered or "wstat (no answer)"
-            print(f"attempt {attempt + 1}: {answered}")
-            if answered.startswith("wstat ") and \
-                    answered.split()[1] == str(len(data)):
-                print("all bytes arrived but no write answer",
-                      file=sys.stderr)
-        return 1
-    finally:
-        s.close()
-
-
-def wstat():
-    answer = simple("wstat")
-    print(answer.decode(errors="replace").strip() if answer else "no answer")
-    return 0
-
 
 
 ROW_MAGIC = b"RLP1"
@@ -400,8 +309,8 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
                         choices=("dump", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
-                                 "key", "screen", "bl", "dcs", "sa", "sav", "keys",
-                                 "say", "wfile", "wstat", "kill", "fps"))
+                                 "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob",
+                                 "fps"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -445,7 +354,11 @@ def main():
             return 1
         print(answer.decode(errors="replace").strip())
         return 0
-    if args.command in ("sa", "sav", "keys"):
+    if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob"):
+        answer = simple(" ".join([args.command] + list(args.args)))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command in ("rr", "ww"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
@@ -453,21 +366,14 @@ def main():
         answer = simple("dcs " + " ".join(args.args))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
-    if args.command == "say":
-        answer = simple("say " + " ".join(args.args))
+    if args.command == "rd":
+        answer = simple("rd " + " ".join(args.args))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
-    if args.command == "kill":
-        answer = simple("kill " + args.args[0])
-        print(answer.decode(errors="replace").strip() if answer else "no answer")
+    if args.command == "bcb":
+        simple("bcb " + " ".join(args.args), 1.0)
+        print("bcb " + " ".join(args.args))
         return 0
-    if args.command == "wstat":
-        return wstat()
-    if args.command == "wfile":
-        if len(args.args) != 2:
-            print("usage: wfile REMOTE LOCAL", file=sys.stderr)
-            return 2
-        return wfile(args.args[0], args.args[1])
     if args.command == "tap":
         x, y = int(args.args[0]), int(args.args[1])
         touch(x, y, x, y, 0)

@@ -92,8 +92,7 @@ export SDKVERSION="$MACOS_VERSION" HOST_OS_VERSION="$MACOS_VERSION" PLATFORM=Mac
 # it).
 SERIES_STATE=$WORK/.series-state
 SERIES_HASH=$(
-	cat "$SERIES"/*.patch tools/wsl/patches/*.patch 2>/dev/null |
-		sha256sum | cut -d' ' -f1
+	cat "$SERIES"/*.patch | sha256sum | cut -d' ' -f1
 )
 
 if [ ! -d "$XNU/.git" ]; then
@@ -147,15 +146,9 @@ if [ "${SKIP_SERIES:-0}" != 1 ]; then
 			die "$(basename "$p") does not apply; the kernel would be missing it"
 	done
 
-	# The portability patches are ours (rebased on this xnu tag); the series
-	# above is the project's and never changes for Linux.
-	if compgen -G "tools/wsl/patches/*.patch" >/dev/null; then
-		say "applying tools/wsl/patches"
-		for p in tools/wsl/patches/*.patch; do
-			git -C "$XNU" apply --whitespace=nowarn "$PWD/$p" ||
-				die "$(basename "$p") does not apply to $XNU_TAG"
-		done
-	fi
+	# The Linux portability patches (host tools, kalloc builtins, link shims)
+	# are part of the series now: 0294-mondrian-linux-build-gaps.patch and the
+	# ones that follow it. A tree built from the tag needs nothing extra.
 	printf '%s\n' "$SERIES_HASH" >"$SERIES_STATE"
 fi
 
