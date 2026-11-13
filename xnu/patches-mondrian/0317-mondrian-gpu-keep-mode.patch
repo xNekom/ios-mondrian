@@ -1,0 +1,98 @@
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -3857,6 +3857,39 @@
+  * already up, so this is a no-op; it exists for gpukeep=0, kgsl's
+  * submit-time toggle and the default until the measured death above.
+  */
++/*
++ * kgsl's power modes, at run time: 0 raises the GMU keepalive around each
++ * register access and drops it after (the GPU collapses while idle), 1 holds
++ * it (the default; the first client submission may be minutes away), 2 never
++ * raises it. The probe reads the mode, so one boot can drop the keepalive on a
++ * live system and see whether anything touches the GPU while it is collapsed.
++ */
++int
++mondrian_gpu_keep_mode(void)
++{
++	return mondrian_uc_keep;
++}
++
++void
++mondrian_gpu_keep_set(int mode)
++{
++	int was = mondrian_uc_keep;
++
++	mondrian_uc_keep = mode;
++	if (mondrian_uc_gmu == 0) {
++		return;
++	}
++	if (mode == 1) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1u);
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay(2000);
++	} else if (mode != 1 && was == 1) {
++		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0u);
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	printf("MONDRIAN GPU: keep mode %d -> %d\n", was, mode);
++}
++
+ static uint32_t mondrian_uc_keep_depth;
+ 
+ static void
+@@ -3869,6 +3902,13 @@
+ 		if (mondrian_uc_keep_depth++ == 0) {
+ 			mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1u);
+ 			__asm__ volatile("dsb sy" ::: "memory");
++			/*
++			 * The GMU raises the keepalive asynchronously: the next access to
++			 * a core register before it acts hangs the CPU that issued it.
++			 * kgsl waits on the GMU's own status; this is the cheap version
++			 * until that status register is trusted.
++			 */
++			delay(2000);
+ 		}
+ 		return;
+ 	}
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1238,6 +1238,29 @@
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "gpukeep" prints the GPU keepalive mode and "gpukeep 0|1|2" sets it, so the
++ * collapse can be tried on a running system instead of at boot (where the
++ * first client access arrives before anything has drawn).
++ */
++static void
++ud_cmd_gpukeep(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_gpu_keep_mode(void);
++	extern void mondrian_gpu_keep_set(int mode);
++	uint32_t mode = 0;
++	char out[64];
++	int n;
++
++	if (line[7] == ' ' && ud_cmd_num(line + 8, &mode) != NULL) {
++		mondrian_gpu_keep_set((int)mode);
++	}
++	n = snprintf(out, sizeof(out), "gpukeep %d\n",
++	    mondrian_gpu_keep_mode());
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -1608,6 +1631,9 @@
+ 			} else if (strcmp(cmd, "rtc") == 0 ||
+ 			    strncmp(cmd, "rtc ", 4) == 0) {
+ 				ud_cmd_rtc(so, peer, cmd);
++			} else if (strcmp(cmd, "gpukeep") == 0 ||
++			    strncmp(cmd, "gpukeep ", 8) == 0) {
++				ud_cmd_gpukeep(so, peer, cmd);
+ 			} else if (strcmp(cmd, "execdeny") == 0 ||
+ 			    strncmp(cmd, "execdeny ", 9) == 0) {
+ 				ud_cmd_execdeny(so, peer, cmd);

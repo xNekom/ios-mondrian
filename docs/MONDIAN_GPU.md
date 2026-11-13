@@ -721,6 +721,11 @@ them has Metal. That is the path this port follows.
   `MSM_PARAM_TIMESTAMP`, which Mesa asks for as soon as it opens the device —
   so `gpukeep=0` also brackets every such access the way kgsl does in
   `gen7_irq_handler` (`adreno_gen7.c`). `gpukeep=2` never raises it, the A/B.
+  `0317` moves the mode to run time (`gpukeep 0|1|2` on the USB channel) and
+  waits 2 ms after a raise, which is how the release was tested on a live system
+  (`docs/MONDIAN_POWER.md`, "Heat"): the hold can come down without a reboot, but
+  a blank-triggered drop faults, so the submit path has to bracket its ring
+  writes first.
 - **The IFPC bracket is not what the draw needed.** `0203` leaves kgsl's
   `0x101`/`0x100`/IB1LIST bracket off by default (`mondrian_uc_nomark = 1`), so
   the boot that first drew ran without it; `gpunomark=0` turns it back on for

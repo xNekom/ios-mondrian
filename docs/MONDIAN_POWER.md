@@ -114,6 +114,22 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
    `MondrianGPUStart()` that unvotes the RPMh batch, sets `GDSC_SW_COLLAPSE` on
    both GDSCRs, stops the SQE and drops the hold. The GPU is needed for the UI,
    so this is the release path, not `gpu=0`.
+
+   Two attempts, and what each proved (`0317`, `docs/MONDIAN_GPU.md`):
+
+   - **Dropping the hold on a running system works.** `0317` adds
+     `gpukeep 0|1|2` on the USB channel; `gpukeep 0` (kgsl's raise-before and
+     drop-after, plus a 2 ms wait after the raise) survives 45 s idle and still
+     draws a Control Center frame. The boot-time death of `gpukeep=0` is the
+     first client access, not the mode itself.
+   - **Dropping it when the panel blanks does not.** A release tied to the blank
+     faults within seconds: submissions keep arriving while the panel is black
+     (`MONDRIAN GPU: uc prog seq ...` still prints after the blank), one of their
+     writes reaches a collapsed core, and the CPU takes a data abort (console
+     `KDBRT: esr 0x96000047`, `far 0xffffffa0...`) with the panel stuck black
+     until a reset. The release has to bracket the *submit* path -- every ring
+     write as well, not only the client's register reads -- before a timer, a
+     blank or a frame may drop the hold.
 2. **Brightness, and the MDSS idle path.** Measured 2026-11-09: the power key
    reaches SpringBoard and the compositor stops presenting (`present 0/s`,
    `panel 0/60 sampled ticks changed`). `0302` turns that into a black panel;
