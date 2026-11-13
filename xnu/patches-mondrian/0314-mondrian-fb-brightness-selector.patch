@@ -1,0 +1,54 @@
+xnu 0314: the level iOS asks for has a way into the driver
+
+SpringBoard computes the brightness (CoreBrightness never comes up here) and
+hands it to IOMobileFramebuffer, but no selector in this user client ever
+accepted a level: the hook's call to 100 was answered as an unknown selector
+and the panel stayed where the bootloader left it. Selector 100 now takes
+setBrightness(level [, fmt [, cmd]]) and stores it; the packet leaves from the
+next vsync like the boot level does.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -160,6 +160,13 @@
+ 	kMondrianFBNotifications           = 72,
+ 	kMondrianFBGetCurrentAbsoluteTime  = 77,
+ 	kMondrianFBGetBlock                = 79,
++	/*
++	 * A level in 0..4095 (the panel's 12-bit DBV), the optional format
++	 * byte and the DCS command; 0x51 is "write display brightness".
++	 * The write leaves on the next vsync, so a slider costs one packet
++	 * per frame rather than one per value.
++	 */
++	kMondrianFBSetBrightness           = 100,
+ };
+ 
+ #define MONDRIAN_FB_SWAP_REC_SIZE          0x46c
+@@ -804,6 +811,10 @@
+ 	fb->fBrightApplies++;
+ }
+ 
++/* Defined below; the user client's brightness selector calls it. */
++extern "C" void mondrian_fb_set_brightness(uint32_t level,
++    uint32_t fmt, uint32_t cmd);
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -2408,6 +2419,17 @@
+ 			    args->scalarInput[0] ? "on" : "off");
+ 		}
+ 		break;
++	case kMondrianFBSetBrightness:
++		/*
++		 * MondrianFramebuffer's 100: setBrightness(level [, fmt [, cmd]]).
++		 * Nothing else in this driver ever wrote the panel's level, so a
++		 * slider above had no way to reach it.
++		 */
++		mondrian_fb_set_brightness(
++		    args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0,
++		    args->scalarInputCount > 1 ? (uint32_t)args->scalarInput[1] : 8,
++		    args->scalarInputCount > 2 ? (uint32_t)args->scalarInput[2] : 0x51);
++		break;
+ 	case kMondrianFBSwapWait:
+ 	default:
+ 		break;

@@ -307,9 +307,9 @@ the next send), and `DSI_CTRL.CMD_MODE_EN` on this video-mode controller stops
 it reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window
 starts at `0x840000000`, so the last page of the splash carve-out, `0xbaaf0000`
 (`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>`
-(0xfff full scale) and `bl LEVEL [FMT [CMD]]` set the level, `mondrianblfmt`
-the byte order; `brightness-nits` 0 means "display asleep", and honouring it
-left every boot at DBV `0x20` with a dead slider.
+(0xfff full scale), `bl LEVEL [FMT [CMD]]` and `IOMobileFramebuffer` selector 100
+(`0314`) set the level, `mondrianblfmt` the byte order; `brightness-nits` 0 means
+"display asleep", and honouring it left every boot at DBV `0x20` with a dead slider.
 
 **The battery's VADC read: sleep, never poll.** ADC7 has no polling mode, so a
 reader that polls the arbiter's EOC word takes the *previous* conversion (0.8 V
