@@ -25,7 +25,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   resets flag and budget without writing a partition. From a running iOS the
   ring's `reboot` is the way in with no buttons: it writes the PMK8350 restart
   reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader, 1 = recovery,
-  `0309`), flushes the ring and resets, and fastboot answers about 2 s later.
+  `0309`), flushes the ring and resets; fastboot answers about 2 s later.
   The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
   so a reset that only writes those boots the active slot instead.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
@@ -58,11 +58,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **Charging.** Nothing drives the charger: it has no APID in the AP's SPMI
-   table (trap below), so a boot runs the phone down. The level comes from the
-   PMK8350 VADC (`0304`), and voltage overstates it: 3.80 V reads 58 % where
-   Android's coulomb counter says 36 % (1683 mAh of `charge_full` 4952), so
-   the percentage needs that counter and the AP cannot reach it yet.
+1. **Charge level.** Charging works on its own (the charger sits behind the ADSP
+   and keeps +1.27 A flowing, measured through `ichg_fb`), but its coulomb
+   counter is out of the AP's reach: the level comes from the PMK8350 VADC
+   (`0304`) and a voltage table, which overstates it (3.80 V reads 58 % where
+   Android said 36 %, 1683 mAh of `charge_full` 4952).
 2. **The compositor stops drawing.** Some boots never put a frame on the
    glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
    screen keeps the boot logo. That is the GPU write-target bug in
