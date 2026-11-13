@@ -48,9 +48,14 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   late in the boot. `cpfence=mem` was booted and changes nothing (same stuck
   sequence, same zeros), so the fence opcode is not the difference either: the CP
   parks at the end of one specific submission, before the fence packet, with
-  `int 0x0` and no `CP_HW_FAULT`. The next datum is `CP_STAT`, `CP_ME_STATUS`
-  and `CP_IB1_BASE/SIZE` read while it is parked, which name the buffer it
-  parked in.
+  `int 0x0` and no `CP_HW_FAULT`. `cpevent=4` (CACHE_FLUSH_TS, the event mainline
+  and Mesa use) was booted as well and is identical. `0323` prints the ring dwords
+  behind the cursor and they name it: `70460004 08000031 00300834 00000000
+  000007d0` is `CP_EVENT_WRITE`, CACHE_CLEAN, to page `+0x800` + slot 13 (the
+  fence of sequence 1997) with value 2000, sitting in the ring unexecuted. So the
+  packet is present, its destination is right and the same dword took the
+  bring-up canary: what differs is the user IB in front of it, which is the next
+  thing to dump.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches
