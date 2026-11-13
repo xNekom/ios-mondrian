@@ -193,23 +193,20 @@ python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
 existing `.simg`, so remake the sparse file by hand. A definite write follows
 the graded protocol in `docs/MONDIAN_PORT.md`. With `usb=2` the kernel runs a
-USB gadget: `tools/ios-usbnet.sh` sets the host up, `tools/usb-ring.py` dumps
-the ring, screenshots the panel, injects input, writes a file into the mounted
-root and reboots; `tools/phone-log.sh` reads the ring through the recovery.
-
-**A root that has been through many hard resets is damaged, and apps fail
-randomly because of it** (`hfs_mark_inconsistent` in `NOTES.md`). The repair is a
-restore: `tools/flash-root.sh backup/ios-root.simg`, then re-apply the userland
-with `tools/ios-root-tweaks.py` (it also renames `_PanicOnCrash` in
-`launchd.plist`, which a restore undoes). Check a spare copy first with
-`simg2img` and `fsck.hfsplus -n`.
+USB gadget: `tools/ios-usbnet.sh` sets the host up and `tools/usb-ring.py`
+dumps the ring, screenshots the panel, injects input and reboots to the
+bootloader; `tools/phone-log.sh` reads the ring through the recovery.
 
 A hook change does not need the image round trip: a kernel build with
 `out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
 (`tools/gen-glblob.py`); `glblob=1` writes them into `/private/var/vm` at mount,
-the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`. A
-boot with no USB still has its log: `tools/phone-deploy.sh logview`, then
-`tools/phone-log.sh out/boot-mondrian.img ring.txt`.
+the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`.
+
+```sh
+tools/phone-deploy.sh logview          # shim with LOGVIEW=1
+fastboot boot out/boot-mondrian.img    # photograph; power+vol-down to leave
+tools/phone-log.sh out/boot-mondrian.img ring.txt
+```
 
 ## Repository layout
 
@@ -219,15 +216,18 @@ boot with no USB still has its log: `tools/phone-deploy.sh logview`, then
 | `xnu/patches/` | the XNU patch series for sweet, plus staging scripts for libpthread, HFS and BearSSL |
 | `xnu/patches-mondrian/` | the XNU patch series for mondrian (see its README for the state of each patch) |
 | `.github/workflows/xnu.yml` | kernel CI build (`board` input) |
-| `tools/build-kernel-local.sh`, `tools/wsl/` | the same build on this Mac or on Windows/WSL2 (`docs/BUILD_LINUX.md`) |
+| `tools/build-kernel-local.sh` | the same build on this Mac (same pinned dxb tree and series) |
+| `tools/wsl/` | the same build on Windows/WSL2 without a Mac (`docs/BUILD_LINUX.md`) |
 | `tools/boards.py` | the board table: MMIO, memory, CPU topology, page size, boot args |
 | `tools/mkadt.py`, `mkpayload.py` | generate the Apple Device Tree / pack kernel + ADT + boot args |
 | `tools/apply-series.py`, `check-patches.sh`, `port-series.py` | apply, validate and port patch series |
 | `tools/mkiosroot.sh`, `ios-root-tweaks.py` | build the HFS+ iOS root from the IPSW images |
 | `tools/phone-boot.sh`, `phone-deploy.sh`, `flash-root.sh` | volatile boot, boot-partition deploy, root flash |
+| `tools/ios-log-pull.sh`, `ios-log.py`, `ios-crash.py` | read and symbolicate the persistent kernel log |
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
-| `docs/MONDIAN_PORT.md`, `docs/MONDIAN_TOUCH.md` | the port plan for the POCO F5 Pro, and the touch bring-up |
+| `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
+| `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
 | `docs/BUILD_LINUX.md` | building the kernel on Windows/WSL2, with no Mac |
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
 

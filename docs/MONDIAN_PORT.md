@@ -247,12 +247,12 @@ behind the ADSP; dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 
-Done, cold boot included: the DWC3 gadget (`usb=2`) enumerates as an ECM
-device at 192.168.7.2 whatever started the boot, because `0313` votes the
-eUSB2 repeater's rails (`NOTES.md`); udp/5141 drives the debug loop from
-`tools/usb-ring.py` and no button combo is needed. The read-only mass-storage
-interface (`0297`) is a work item: the host enumerates the disk but the first
-SCSI INQUIRY never returns, and the storage IN endpoint is the next suspect.
+Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
+Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
+`tools/usb-ring.py` (see `README.md`).
+A read-only mass-storage interface over `userdata` (`0297`) is a work item:
+the host enumerates the disk but the first SCSI INQUIRY never returns, and the
+storage IN endpoint is the next suspect; `usb=1` probes only.
 
 ## Getting the numbers off the device
 

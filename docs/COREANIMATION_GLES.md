@@ -1,12 +1,15 @@
 # CoreAnimation on the GPU (OpenGL ES)
 
-**Running on hardware and drawing through Mesa, with no CPU copy.**
+**Running on hardware and drawing through Mesa.**
 In `backboardd` the injector loads, all seven `-[EAGLContext ...]` methods are replaced, both
-`CA::OGL::GLESContext` hooks install, and a Mesa `FD725` context is created. CoreAnimation's
-frames reach the GPU and are drawn in place into the display's IOSurface: `1 drawn in place, 0
-pictures copied out`, a steady frame in 9 ms. What is left is pacing (the display swaps at most 20
-times a second) and the texture uploads that fail, both in `docs/MONDIAN_GPU.md`. Three measured
-traps, in the order they were paid for:
+`CA::OGL::GLESContext` hooks install, and a Mesa context is created. `GL_RENDERER` reads `FD725`,
+so Mesa's freedreno backend rasterises on the Adreno; OSMesa is only the off-screen surface.
+CoreAnimation's frames reach the GL path and are drawn in place into the display's IOSurface:
+`1 drawn in place, 0 pictures copied out`, a steady frame in 9 ms. The GPU's buffer is not what
+the panel scans, so OSMesa copies it into the CPU-side surface: that is the `copying out` cost on
+the frames that show one (10-13 ms, `docs/UI_PERFORMANCE.md`). What is left is pacing and the
+texture uploads that fail, both in `docs/MONDIAN_GPU.md`. The traps, in
+the order they were paid for:
 
 - **The ES profile of OSMesa faults on this driver.** `OSMesaCreateContextAttribs` with the ES
   profile (mapped to `API_OPENGLES2` by `tools/mesa/mondrian-darwin.patch`) creates a context
@@ -28,7 +31,11 @@ traps, in the order they were paid for:
   `/private/var` is a later mount and is writable (the pager makes its swap file in
   `/private/var/vm`). The write retries until that mount exists (12 s measured), and the injector
   prefers `/private/var/vm/mondrian-gl.dylib` over `/usr/libexec/mondrian-gl.dylib`, which only a
-  flash can change. A userland change is therefore one `fastboot boot`, not a 14 GB flash.
+  flash can change. The kernel therefore carries `mondrian-gl.dylib` and
+  `mondrian-inject.dylib` and writes them there at boot (`glblob=1`, `0220`,
+  `tools/gen-glblob.py`), so a change to either is one `fastboot boot`. **Mesa is not carried**:
+  `libOSMesa.8.dylib` (14 MB) only changes with `tools/wsl/push-root.sh --dylib … --mesa …`,
+  which needs the phone in recovery and a fresh base dump.
 - **`OSMesaMakeCurrent` overwrote the EAGLContext with the smoke test's red triangle.**
   The Mesa smoke test (`tools/mondrian-mesa-test.c`) freed its 256 KiB window but left its
   OSMesa context current on that memory. The next `calloc` — the 31408-byte `struct eagl` — was
@@ -49,6 +56,27 @@ traps, in the order they were paid for:
   one of our contexts, so every field read as zero and `glCreateShader` went to Mesa's no-op
   dispatch (0, no GL error). `eagl_resolve()` matches the argument against the live contexts and
   falls back to the most recent one, saying so once.
+- **A draw that reads the framebuffer read pixels of another tile.** A shader with
+  `gl_LastFragData` (the shadows under the home screen's labels, a vibrant layer's colour matrix,
+  the luma boost) reads what earlier draws in the same submission wrote — through UCHE, which
+  does not see the colour cache. `FLUSH_PER_OVERLAP` orders those primitives among themselves but
+  not against the draws before the mode was on, so the first triangle of each such quad took
+  whatever the tile held: pieces of other icons, a vibrant box black, the wallpaper in bands.
+  Flushing from the shim (`glflushdraws`, `glfbflush`) only moved the window and cost a submission
+  per frame; the fix belongs in the driver, and `tools/mesa/mondrian-darwin.patch` has it: a
+  `FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE` barrier before the first draw that reads the
+  framebuffer after one that did not (`fd6_draw.cc`, `prev_draw_read_fb` in `freedreno_batch.h`).
+- **The eight-times downsample that starts a backdrop's blur is not tinted by the layer that asked
+  for it.** CoreAnimation's own four- and six-sample downsamples multiply the picture by nothing;
+  the colour of the corners is the layer's opacity, which it applies where the layer is laid on
+  the screen (`ds8`, `box_fragment`). Tinted, everything made of the backdrop — the blur, the
+  luminance curve, the colour matrix — worked on a picture as dark as that layer (0.45 for a
+  translucent badge) and a vibrant box over a bright wallpaper came out black.
+- **Nobody draws the wallpaper.** The poster is a 1326x1326 one-byte surface that
+  `CollectionsPoster` renders with Metal; this port has no Metal, so the surface keeps whatever
+  the allocator left there. `gpusurfpat=1|2|3` (`MondrianGPU.cpp`) fills a freshly adopted
+  surface with white, black or a ramp to prove it; the bands over the lock screen's wallpaper are
+  that memory, not a mis-sampled texture.
 
 The rest of this file is the design. CoreAnimation draws through Mesa into the display's IOSurface
 with no copy; the no-copy path below is what does it.

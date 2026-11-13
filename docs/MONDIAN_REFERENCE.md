@@ -34,9 +34,12 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
 
 ## Brightness and display
 
-- Panel: `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd` (DSC, command mode, 1440x3200
-  at 120 Hz; the iPhone X userland/CA target 60), from the
-  kernel command line.
+- Panel: `qcom,mdss_dsi_m11a_42_02_0a_dsc_cmd`, `dsi-panel-type =
+  dsi_cmd_mode` (bootloader arg `msm_drm.dsi_display0=...`): 1440x3200, DSC
+  8bpp, timing nodes at 60/90/120 Hz, `te-using-te-pin`, `te-check-enable`,
+  `te-pin-select=1`, `mdp-trigger=none`, `dma-trigger=trigger_sw`,
+  `dsi-ctrl-num=0`. A command-mode panel needs one `CTL_START` per frame; the
+  iPhone X userland and CA target 60.
 - Brightness is `bl_ctrl_dcs`: a DCS command to the panel, scale 0..4095
   (`/sys/class/backlight/panel0-backlight`), not a PWM.
 - AMOLED rails: `qcom,qpnp-amoled-regulator`, `oledb@fa00` (5.0-8.0 V).

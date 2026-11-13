@@ -18,10 +18,11 @@ input:
 | `patches/` | sweet (Redmi Note 10 Pro, SM7150) | `SWEET` |
 | `patches-mondrian/` | mondrian (POCO F5 Pro, SM8475) | `MONDRIAN` |
 
-Think before spending a CI run: the workflow **skips** a patch that does not
-apply and still reports success. `tools/apply-series.py` applies a series to a
-fresh tree locally in seconds, and `tools/check-patches.sh` checks it against
-the cached tree in `research/`; both name the patch that does not apply.
+Think before spending a CI run: a patch that does not apply fails the run (a
+"No skipped patches" step greps the build log), but that costs minutes.
+`tools/apply-series.py` applies a series to a fresh tree locally in seconds, and
+`tools/check-patches.sh` checks it against the cached tree in `research/`; both
+name the patch that does not apply.
 
 Fetch the latest build:
 

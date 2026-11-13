@@ -55,14 +55,15 @@ them has Metal. That is the path this port follows.
   `a730_sqe.fw`, `a730_gmu.bin`, `a730_zap.mdt/.b02` from the vendor
   firmware. The references are a6xx: the a7xx registers, GMU/HFI, ZAP and
   SQE preamble are the new work.
-- Display: today `mondrianfb` (the ABL framebuffer, 60 Hz). The GPU path needs
-  the MDP/DSI and the IOSurface/`IOMobileFramebuffer` presentation (topaz's
+- Display: `mondrianfb` writes the panel and kicks its command-mode DSI
+  interface at 60 Hz; the DPU scans the ABL's splash carve-out. The GPU path
+  needs the IOSurface/`IOMobileFramebuffer` presentation (topaz's
   `SweetSurface`), with the iPhone X 1125x2436 canvas on the 1440x3200 panel.
   The panel is **120 Hz**, but the iPhone X userland and CoreAnimation run at
   60 (no ProMotion): 60 is the first target, 120 only by forcing the display
   link/ProMotion.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
-  the AMFI/dyld policy that lets the GPU-backed GLES context load
+  the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
 
 ## Measured bring-up state
@@ -1001,6 +1002,28 @@ them has Metal. That is the path this port follows.
   name a surface that has already been drawn into again (and `drop` stayed 0, so
   a third slot would never have been used).
 
+  Measuring any of that needs something that draws, and the home screen does not
+  move by itself: it has one page, so a horizontal drag on it pans nothing and
+  `fps` reads 0 while the pipeline is fine. That is the same trap as a static
+  lock screen, and it is what rings 248-250 and 253 measured -- boots that had
+  unlocked to a page with nothing on it to move. `mondriananim=1` is the harness:
+  one animated layer of the hook's own in SpringBoard's window, so the icons, the
+  dock and its blur are redrawn every frame for as long as the boot lasts.
+  Measured that way (180 s from the unlock): **59.9 fps, 173 of those seconds
+  at exactly 60, `drop 0`, `pgap over30` 0.05 a second, and `rec1 60` on every
+  tick** -- one record per tick, presented at the tick it was made for. At 60
+  fps a swap is 1.5-2.8 ms of copy, 1.2-1.8 ms of scale and 0.3-0.5 ms of cache
+  clean, and a swap that arrives after the last vsync is 8-12 ms late at the
+  median (16-17 ms worst). That is the number to regress against; a boot with a
+  finger on it measures whatever the finger found.
+
+  The artwork used to be painted after the unlock, which put eight PNG reads and
+  their decode inside the unlock animation: the transition then held 4-10 frames
+  a second (ring252, the first ten seconds after `lock screen gone`) while a drag
+  on the lock screen held 1.3. The home screen tree is behind the lock screen, so
+  the pass runs from the first step after twenty seconds instead, and the
+  transition's first second reads 61 fps with no frame held.
+
   Where the artwork goes, when it is injected by hand -- and why it cannot be
   SpringBoard's own view. `-[SBIconView iconImageView]` answers without an image
   in this userland, and the descendant that takes `-setImage:` is the *label's*
@@ -1017,16 +1040,39 @@ them has Metal. That is the path this port follows.
   `icon Photos own 1 image 1 contents 1` -- the view is still ours, still holds
   the image, and the layer has contents for the first time on this port.
 
-- **A sleeping display stops every CADisplayLink.** Two minutes after the UI
-  settles iOS auto-locks: the display sleeps, the link probe's `dur` drops to
-  0, every link stops (measured: the last line says `ts 146` in a 240 s boot)
-  and the framebuffer keeps the last frame, so the screen shows a frozen lock
-  screen while `MONDRIAN TIMER` keeps its rate. `mondrianwake=N` does not fix
-  it: it presses the power key, which locks a lit device as often as it wakes a
-  dark one. The fix is in the userland hook -- `-[SBUserAgent
-  setIdleTimerDisabled:forReason:]` forced to `YES` -- and with it the display
-  stayed up for the whole 171 s boot (`link pid 57 ... dur 16 ts 171` at the
-  end) instead of dying at 146 s. Leaving the lock screen is the harder half:
+- **The panel is command mode, and the kernel kicks it.** A store into the
+  framebuffer memory never reaches the panel: the DSI interface takes one
+  `CTL_START` per frame, which is why a frozen display is not a dark one. The
+  ABL leaves the DPU scanning a 43 MiB splash carve-out at `0xb8000000`
+  (`0x2b00000`), measured as SSPP0 and SSPP1 `src0 0xb8000000`,
+  stride `0x1680`, `fmt 0x237ff`, and the kernel writes the same memory
+  through the early WC alias. The trap -- the bootloader's
+  `INTF_TEAR_AUTOREFRESH_CONFIG = 0x8000003c` and `INTF_TEAR_CHECK_EN`, which
+  must be cleared before the first start of the session -- is in `NOTES.md`
+  ("Display"). CTL0 is the active controller (`ctl0 top 0x100002d active 0x2`),
+  INTF1 the interface, and `INTF_DSI_CMD_MODE_TRIGGER_EN` is `0x084`.
+  DSI0 is at `0xae94000`; the registers worth reading are
+  `STATUS0` `0x004` (`CMD_MODE_ENGINE_BUSY`, `CMD_MODE_MDP_BUSY`, `DSI_BUSY`),
+  `FIFO_STATUS` `0x008` bit 7 (`CMD_MDP_FIFO_UNDERFLOW`), `CMD_DMA_CTRL`
+  `0x038`, `CMD_MDP_STREAM0_CTRL` `0x054`, `CMD_MDP_STREAM0_TOTAL` `0x058`,
+  `ACK_ERR_STATUS` `0x064`, `TRIG_CTRL` `0x080`, `DLN0_PHY_ERR` `0x0b0`,
+  `TIMEOUT_STATUS` `0x0bc`, `RESET` `0x114` and `CLK_STATUS` `0x11c`. A wedged
+  interface reads `STATUS0 0x1f5` (busy bits set); that is a diagnostic, not
+  the idle value.
+- **A sleeping display stops every CADisplayLink, and the fix is the
+  `UIApplication` idle timer.** About fifty seconds after the unlock,
+  SpringBoard arms its idle timer and the backlight state goes off; this tree
+  has no backlight device (`backboardd` logs
+  `path IODeviceTree:/backlight -> none`), so every link in the system stops,
+  the framebuffer keeps the last frame, and frames stay at 0/s while the panel
+  is still kicked at 60 (measured: 138 s uptime, unlock at 88 s; NSTimers keep
+  their rate). The hook first wrapped `-[SBUserAgent
+  setIdleTimerDisabled:forReason:]`, which nothing ever calls; it now sets
+  `-[UIApplication setIdleTimerDisabled:YES]` on the shared application every
+  2 s from the lock step, and re-requests the unlock every 60 s while the lock
+  screen is up instead of three times. Not boot-verified. `mondrianwake=N`
+  does not fix it: it presses the power key, which locks a lit device as often
+  as it wakes a dark one. Leaving the lock screen is the harder half:
   `-[SBLockScreenManager unlockUIFromSource:withOptions:]` returns 0 for every
   call and each refused call counts as a failed attempt, which after thirteen
   of them left the screen saying "iPhone is not available" and refusing
@@ -1037,12 +1083,13 @@ them has Metal. That is the path this port follows.
   `docs/lockout-reset.md`) and `SBDeviceLockFailedAttempts` counts the
   refusals; a hook that writes `SBDeviceLockBlocked` = `true` puts the device
   into that state by itself. Write `false` and `SBDeviceLockFailedAttempts` 0,
-  and unlock once through the entry point the swipe uses
-  (`-lockScreenViewControllerRequestsUnlock`), not in a loop. Three traps come
-  with this hook. `+[SBLockScreenManager sharedInstance]` must not run before
-  `+[UIApplication sharedApplication]` exists: from the dylib initializer it
-  asserts ("Unexpectedly created SBLockScreenManager before UIApplication
-  instance was created") and terminates SpringBoard, eleven times in one boot.
+  and unlock through the entry point the swipe uses
+  (`-lockScreenViewControllerRequestsUnlock`); that request is repeated once a
+  minute while the lock screen is still up, unlike the refused path above.
+  Three traps come with this hook. `+[SBLockScreenManager sharedInstance]` must
+  not run before `+[UIApplication sharedApplication]` exists: from the dylib
+  initializer it asserts ("Unexpectedly created SBLockScreenManager before
+  UIApplication instance was created") and terminates SpringBoard.
   Every `SBLockScreenManager` call must run on the main queue: from a thread of
   the hook's own it traps in libdispatch ("BUG IN CLIENT OF LIBDISPATCH:
   Assertion failed: Block was expected to execute on queue
@@ -1244,30 +1291,32 @@ renderer.
 
 ## Boot time
 
-The eight cores already start (`cpus=8`, all `PSCI CPU_ON rc=0`). The remaining
-cost is CPU frequency, the boot CPU and debug I/O:
+The seven cores the ADT lists already start (`cpus=8` selects all of them; the
+A510 at Aff1 0 stays parked with the firmware). The remaining cost is CPU
+frequency and debug I/O:
 
-- **`bootcpu`**: `cpufreq` is in (`0154`: 1804/2496/2995 MHz on the three
-  domains); the boot CPU is still 0 (a little core). HackiOS boots with
-  `cpus=8 bootcpu=7 cpufreq=1`. The live SM8475 tree has
+- **`bootcpu`**: the loader starts the kernel on the X2 (physical core 7) and
+  `boot_core=7` in `tools/boards.py` orders the ADT so it is logical cpu 0, so
+  the `bootcpu` tunable is not needed. `cpufreq` is in (`0154`:
+  1804/2496/2995 MHz on the three domains). The live SM8475 tree has
   `qcom,cpufreq-hw-epss` at **0x17d91000/0x17d92000/0x17d93000**,
-  `qcom,lut-row-size=4`; HackiOS's own base is 0x18591000, so only the base and
-  the domain table change. The topaz 0094 is the SM6225 variant. Port the
-  `bootcpu` half.
+  `qcom,lut-row-size=4`; HackiOS's own base is 0x18591000.
 - **`IOAcceleratorES`**: topaz's 0138 (an empty `IOAcceleratorES`) saves ~30 s
   at every backboardd start; check what the mondrian's `0114` publishes.
 - **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
   frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
 - **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
   CoreAnimation into a smaller surface and scales it to the panel in `swap()`.
-  It is no longer a way around the CPU rasterizer (that trick stopped paying
-  once the GPU drew) but the geometry the icon bitmaps require: 1125x2436 =
-  the iPhone X's 375x812 pt, the size SpringBoard's `CPMemoryPool` was built
-  for. The scaled copy walks a column map built once, four pixels per 16-byte
-  write (`0268`), and the fps line reports `clean avg` and `scale avg` so the
-  next change has a number to aim at (`0269`); the earlier DDA versions measured
-  9-13 ms of scale a swap plus 18-31 ms for the memcpy-cached one (see the icon
-  section).
+  The board does not set them: a 1125x2436 canvas is the iPhone X's 375x812 pt,
+  but on this panel it makes text soft and the UI 7% oversized compared with
+  drawing at the panel's own 1440x3200 (480x1066 pt, which is what iPhone 14 Pro
+  Max-class apps expect). The scaled copy walks a column map built once,
+  four pixels per 16-byte write (`0268`), and the fps line reports `clean avg`
+  and `scale avg` so the next change has a number to aim at (`0269`); the
+  earlier DDA versions measured 9-13 ms of scale a swap plus 18-31 ms for the
+  memcpy-cached one (see the icon section). The 32/25 block is nearest
+  neighbour, so text and icon edges come out jagged; the DPU SSPP scaler is the
+  candidate fix and is not written.
   Use `mondrianreset=150`: a 45 s reset cuts the boot before the first swap.
   The CP tests hard-reset a non-journaled HFS; after several resets the next
   mount can take longer than 60 s (the ring stops at the UFS GPT with one
@@ -1285,15 +1334,18 @@ cost is CPU frequency, the boot CPU and debug I/O:
 - **First boot**: a freshly flashed data volume needs one long first boot to
   create the containers and the `mobileactivationd` data ark; later boots reach
   the lock screen. Do not reflash to change a dylib: update it in place.
-- **GPU**: CoreAnimation draws on the GPU (see "Milestones"); the CPU renderer
-  is the fallback when `MondrianGPU` is absent (`gpu=0`).
+- **GPU**: the CoreAnimation GLES path is `mondrian-gl` over Mesa `libOSMesa`;
+  `GL_RENDERER` reads `FD725`, so freedreno rasterises on the Adreno and OSMesa
+  copies the result into the CPU-side surface; a GL flush costs 10-12 ms on
+  some frames (`docs/UI_PERFORMANCE.md`).
 
 ## Milestones
 
-Done: GPU memory, command submission and the Mesa `FD725` context; CoreAnimation
-GLES drawn by the GPU with the no-copy IOSurface presenter, a lock-screen frame
-in 25-47 draws, and a burst of frames 11-17 ms apart.
-Open: the display link the compositor waits for (nothing registers the
-framebuffer's vsync, selector 9, and the clock stands still between ticks), the
+Done: GPU memory, command submission and the Mesa `FD725` context; the
+command-mode panel is kicked from the kernel at 60 fps, and the lock screen and
+the home screen draw -- 59.9 fps over 180 s with no frame held (`mondriananim=1`).
+
+Open: the jagged 1125x2436 -> 1440x3200 upscale (the DPU SSPP scaler is the
+candidate), the idle-timer sleep (the hook's fix is not boot-verified), the
 wallpaper (the poster extension draws no frame), the panel's report rate
-(`0xC0`), `bootcpu`/`cpufreq`, the release kernel and the boot-time measurements.
+(`0xC0`), `cpufreq`, the release kernel and the boot-time measurements.
