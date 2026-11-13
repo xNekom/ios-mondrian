@@ -307,6 +307,11 @@ struct eagl {
 		unsigned used;          /* the frame it was last used in */
 	} chains[VBLUR_CHAINS];
 	bool vblur_bound;               /* a draw of ours has textures of its own on units 2 to 5 */
+	GLuint written[64];             /* textures drawn into since the last submit (glflushdraws=2) */
+	unsigned written_count;
+	bool reads_picture;             /* the draw plain_draw_begin() just set up reads the picture it draws into */
+	bool picture_read;              /* the last draw read it (fetch_flush()) */
+	unsigned fetch_flushes;         /* submits those reads cost (see fetch_flush()) */
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -336,6 +341,11 @@ struct eagl {
 	unsigned most_calls, most_triangles;
 	const char *sources[64];        /* the text of the shaders being made, by name modulo this */
 	bool fragment[64];              /* ... and which of the two kinds each is */
+	bool shader_fetch[64];          /* ... and whether its text reads the picture it draws into */
+	GLuint shader_fetch_id[64];     /* ... by this name (the arrays are modulo this) */
+	GLuint fetch_programs[128];     /* the programs whose fragment shader reads the picture */
+	unsigned fetch_program_count;
+	bool program_reads_picture;     /* the program in use is one of those (flush_before_draw()) */
 	unsigned plain_said;
 };
 
@@ -441,6 +451,7 @@ static int fetch_offered = 1;
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
 static void clear_now(struct eagl *e);
+static void fetch_flush(struct eagl *e);
 
 static void
 eagl_enter(struct eagl *e, unsigned offset)
@@ -1481,6 +1492,29 @@ frame_end(struct eagl *e, bool finished)
 	after = now_us();
 	e->in_frame = false;
 	e->frames++;
+	{
+		/*
+		 * Composites a second, which the per-frame line above cannot answer: it
+		 * stops after the fortieth frame, so a log read as "one frame a second"
+		 * may only be the interval the printer chose. This line is a rate, one a
+		 * second, whatever the printer does.
+		 */
+		static uint64_t rate_start_us;
+		static uint32_t rate_frames;
+
+		if (rate_start_us == 0) {
+			rate_start_us = after;
+			rate_frames = e->frames;
+		} else if (after - rate_start_us >= 1000000ULL) {
+			uint64_t span = after - rate_start_us;
+			uint32_t done = e->frames - rate_frames;
+
+			say("mondrian-gl: rate %u frames in %llu ms, %.1f a second\n",
+			    done, span / 1000, (double)done * 1000000.0 / (double)span);
+			rate_start_us = after;
+			rate_frames = e->frames;
+		}
+	}
 	if (latency_lines) {
 		/* "tl: g FRAME began US ended US DRAWS": microseconds of mach_absolute_time (tools/latency.py) */
 		say("tl: g %u began %llu ended %llu %u\n", e->frames, e->began, after, e->draws);
@@ -2035,6 +2069,12 @@ static const char masking_fragment[] =
  *   for four and for six samples are of that kind; for this one the OpenGL ES renderer has none.)
  *   Drawn as it was given, one sample in the middle, four pixels of the sixty-four made the one:
  *   what is blurred after that shimmers when it moves.
+ *   The corners' colour is NOT multiplied in: CoreAnimation's own shaders for four and for six
+ *   samples do not, and the colour there is the layer's opacity, which it applies where the layer
+ *   is laid on the screen, not where the backdrop is captured. Multiplied in, everything the
+ *   backdrop is made of (the blur, the luminance curve, the colour matrix) works on a picture as
+ *   dark as the layer that asked for it -- 0.45 for a translucent minus over a jiggling icon -- and
+ *   a vibrant box over a bright wallpaper comes out black.
  */
 static const char box_fragment[] =
     "#version 120\n"
@@ -2050,7 +2090,7 @@ static const char box_fragment[] =
     "    sum += texture2D(texture0, middle + places[i]) + texture2D(texture0, middle - places[i]);\n"
     "    sum += texture2D(texture0, middle + places[i] * vec2(1., -1.)) + texture2D(texture0, middle + places[i] * vec2(-1., 1.));\n"
     "  }\n"
-    "  gl_FragColor = color * sum * .0625;\n"
+    "  gl_FragColor = sum * .0625;\n"
     "}\n";
 
 /*
@@ -3028,6 +3068,7 @@ group_flatten(struct eagl *e, GLuint texture, struct group_texture *g)
 
 	g->state = GROUP_NONE;
 	group_flattened++;
+	fetch_flush(e);
 	flat[3] = alpha;
 	for (int i = 0; i < 3; i++) {
 		flat[i] = clamp01(g->colours[16 + i] * alpha);
@@ -3249,6 +3290,109 @@ group_draw_end(struct eagl *e, const GLint enabled[4])
 	glUseProgram(e->program);
 }
 
+/*
+ * glfbflush=0: leave it as it was, with every draw that reads the picture the one it draws into
+ * left to the driver.
+ *
+ * A draw that reads the picture (a vibrant layer's colour matrix over what is behind, the blur
+ * whose radius varies, the luma boost and the EDR scale) reads what earlier draws in the same
+ * submission wrote. On this driver that read came back with pixels of another tile -- fragments
+ * of other icons inside the blurred glass, changing while the glass moved -- until the batch was
+ * ended before it: what the earlier draws wrote is then in memory, not only in the colour cache
+ * the read does not see. One submit per run of such draws, which is what a frame costs here.
+ */
+static int fetch_flush_on = 1;
+static unsigned fetch_flushes_told;
+
+/*
+ * glflushdraws=0 (the default): nothing.
+ * glflushdraws=1: end the submission before every draw, which is the valve for a frame whose
+ *   pieces read pixels another draw wrote and see the old ones (a black band where the lock
+ *   screen's clock was, a blurred strip built of pieces of an older frame).
+ * glflushdraws=2: only before a draw that samples the texture it draws into, which is what
+ *   CoreAnimation does when it takes the picture it has just made (the strip it blurs, the
+ *   group it flattens) -- one submit for those, not for every draw.
+ */
+static int flush_draws;
+
+static void
+flush_before_draw(struct eagl *e)
+{
+	if (flush_draws == 0) {
+		return;
+	}
+	if (flush_draws == 1) {
+		glFlush();
+		e->written_count = 0;
+		e->fetch_flushes++;
+		return;
+	}
+	/*
+	 * 2: the draw reads a texture something has been drawn into since the last submit, or its
+	 * shader reads the picture it draws into (gl_LastFragData, EXT_shader_framebuffer_fetch).
+	 * On this driver that read comes back with what was in memory before those draws:
+	 * CoreAnimation's snapshot of the screen (the strip it blurs, the group it flattens) came
+	 * out black, and the piece drawn back was a black rectangle over what it covered; a shader
+	 * that reads the picture saw pixels of another tile, or none at all.
+	 */
+	if (e->program_reads_picture) {
+		glFlush();
+		e->written_count = 0;
+		e->fetch_flushes++;
+		return;
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		if (e->bound[i] == 0) {
+			continue;
+		}
+		for (unsigned k = 0; k < e->written_count; k++) {
+			if (e->written[k] == e->bound[i]) {
+				glFlush();
+				e->written_count = 0;
+				e->fetch_flushes++;
+				return;
+			}
+		}
+	}
+}
+
+static void
+written_mark(struct eagl *e, GLuint texture)
+{
+	if (texture == 0) {
+		return;
+	}
+	for (unsigned k = 0; k < e->written_count; k++) {
+		if (e->written[k] == texture) {
+			return;
+		}
+	}
+	if (e->written_count >= sizeof(e->written) / sizeof(e->written[0])) {
+		glFlush();                      /* (a submit is always safe, and it empties the list) */
+		e->written_count = 0;
+		return;
+	}
+	e->written[e->written_count++] = texture;
+}
+
+static void
+fetch_flush(struct eagl *e)
+{
+	if (e->picture_read) {
+		return;
+	}
+	e->picture_read = true;
+	if (!fetch_flush_on) {
+		return;
+	}
+	glFlush();
+	if (fetch_flushes_told++ < 4) {
+		say("mondrian-gl: a draw that reads the picture follows one that does not: flushed first (%u)\n",
+		    e->fetch_flushes);
+	}
+	e->fetch_flushes++;
+}
+
 static bool
 plain_draw_begin(struct eagl *e, GLint enabled[4])
 {
@@ -3297,6 +3441,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 			census_draw(e, function, CENSUS_NOT_DRAWN);
 			return false;
 		}
+		e->reads_picture = true;
 		census_draw(e, function, CENSUS_BOOST);
 		glUseProgram(program);
 		glUniformMatrix4fv(e->boost_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
@@ -3350,6 +3495,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		}
 		apply = e->edr_fetch && factors[0] == factors[0] && factors[1] == factors[1] && factors[0] > 0 &&
 		    factors[1] > 0 && factors[0] < 1e30f && factors[1] < 1e30f;
+		e->reads_picture = true;
 		census_draw(e, function, CENSUS_EDR);
 		glUseProgram(program);
 		glUniformMatrix4fv(e->edr_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
@@ -3413,6 +3559,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		trace_function_met = 1;
 	}
 	e->blended = 0;
+	e->reads_picture = false;
 	if (e->bound[0] != 0 && plain_draws != 3 && function < 90 && ((function == FUNCTION_VIBRANT_MATRIX && fetch_offered) ||
 	    function == FUNCTION_MATRIX_PREMULTIPLIED) && function_given[function] == 20) {
 		bool vibrant = function == FUNCTION_VIBRANT_MATRIX;
@@ -3446,6 +3593,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		set_texture_size(program, e->bound[0], e);
 		glUniformMatrix4fv(vibrant ? e->vibrant_matrix : e->masking_matrix, 1, 0, e->matrix != NULL ? e->matrix : identity);
 		glUniform4fv(vibrant ? e->vibrant_colours : e->masking_colours, 5, function_values[function]);
+		e->reads_picture = true;
 		if (vibrant && glIsEnabled(GL_BLEND)) {
 			e->blended = 1;                 /* the program has blended already */
 			glDisable(GL_BLEND);
@@ -3462,6 +3610,7 @@ plain_draw_begin(struct eagl *e, GLint enabled[4])
 		struct vblur_chain *chain = vblur_chain_of(e, e->bound[0], false);
 
 		if (chain != NULL && chain->made > 0 && vblur_draw_begin(e, chain, enabled)) {
+			e->reads_picture = true;
 			census_draw(e, function, CENSUS_VBLUR);
 			return true;
 		}
@@ -3588,6 +3737,13 @@ my_glUseProgram(void *context, GLuint program)
 		eagl_trace("glUseProgram(%u)\n", program);
 	}
 	e->program = program;
+	e->program_reads_picture = false;
+	for (unsigned i = 0; i < e->fetch_program_count; i++) {
+		if (e->fetch_programs[i] == program) {
+			e->program_reads_picture = true;
+			break;
+		}
+	}
 	glUseProgram(program);
 	EAGL_LEAVE(e, MONDIAN_GL_USE_PROGRAM);
 }
@@ -3697,14 +3853,21 @@ my_glDrawArrays(void *context, GLenum mode, GLint first, GLsizei count)
 	if (trace_placing) {
 		trace_placed_draw(e, mode, 0, NULL, first, count);
 	}
+	flush_before_draw(e);
 	if (group_draw_begin(e, enabled)) {
 		glDrawArrays(mode, first, count);
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (plain && e->reads_picture) {
+			fetch_flush(e);                 /* (before the draw, not after it: see fetch_flush()) */
+		}
 		glDrawArrays(mode, first, count);
 		if (plain) {
 			plain_draw_end(e, enabled);
+		}
+		if (!(plain && e->reads_picture)) {
+			e->picture_read = false;
 		}
 	}
 	if (trace_listed) {
@@ -3785,14 +3948,21 @@ my_glDrawElements(void *context, GLenum mode, GLsizei count, GLenum type, const 
 	if (trace_placing) {
 		trace_placed_draw(e, mode, type, indices, 0, count);
 	}
+	flush_before_draw(e);
 	if (group_draw_begin(e, enabled)) {
 		glDrawElements(mode, count, type, indices);
 		group_draw_end(e, enabled);
 	} else {
 		plain = plain_draw_begin(e, enabled);
+		if (plain && e->reads_picture) {
+			fetch_flush(e);
+		}
 		glDrawElements(mode, count, type, indices);
 		if (plain) {
 			plain_draw_end(e, enabled);
+		}
+		if (!(plain && e->reads_picture)) {
+			e->picture_read = false;
 		}
 	}
 	if (trace_listed) {
@@ -3909,6 +4079,7 @@ my_glFlush(void *context)
 	mark_draw();
 	began = now_us();
 	glFlush();
+	e->written_count = 0;
 	e->flushing += now_us() - began;
 	frame_end(e, false);
 	EAGL_LEAVE(e, MONDIAN_GL_FLUSH);
@@ -4140,6 +4311,7 @@ my_glBindFramebuffer(void *context, GLenum target, GLuint framebuffer)
 			glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
 			e->colour = (GLuint)name;
+			written_mark(e, e->colour);
 		}
 	}
 	EAGL_LEAVE(e, MONDIAN_GL_BIND_FRAMEBUFFER);
@@ -4154,6 +4326,7 @@ my_glFramebufferTexture2D(void *context, GLenum target, GLenum attachment, GLenu
 	clear_now(e);
 	if (attachment == GL_COLOR_ATTACHMENT0 && target != GL_READ_FRAMEBUFFER) {
 		e->colour = texture;
+		written_mark(e, texture);
 	}
 	if (eagl_tracing) {
 		eagl_trace("glFramebufferTexture2D(%#x, %#x, %#x, %u, %d)\n", target, attachment, to, texture, level);
@@ -4316,6 +4489,8 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		size += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
 	}
 	if ((text = calloc(1, 2 * size + 64)) == NULL) {
+		e->shader_fetch_id[shader % 64] = shader;
+		e->shader_fetch[shader % 64] = false;
 		glShaderSource(shader, count, strings, lengths);
 		return;
 	}
@@ -4339,7 +4514,11 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		fetch = strstr(text, "gl_LastFragData") != NULL;
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
 		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
+	} else {
+		fetch = false;
 	}
+	e->shader_fetch_id[shader % 64] = shader;
+	e->shader_fetch[shader % 64] = fetch;
 	{
 		const char *previous = e->sources[shader % 64];
 
@@ -4409,6 +4588,28 @@ my_glLinkProgram(void *context, GLuint program)
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
 		say("mondrian-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
 	}
+	if (good) {
+		GLuint attached[8];
+		GLsizei attached_count = 0, i;
+		bool reads = false, known = false;
+
+		glGetAttachedShaders(program, 8, &attached_count, attached);
+		for (i = 0; i < attached_count; i++) {
+			GLuint shader = attached[i];
+
+			if (e->shader_fetch_id[shader % 64] == shader && e->shader_fetch[shader % 64]) {
+				reads = true;
+			}
+		}
+		for (i = 0; i < (GLsizei)e->fetch_program_count; i++) {
+			if (e->fetch_programs[i] == program) {
+				known = true;
+			}
+		}
+		if (reads && !known && e->fetch_program_count < sizeof(e->fetch_programs) / sizeof(e->fetch_programs[0])) {
+			e->fetch_programs[e->fetch_program_count++] = program;
+		}
+	}
 	EAGL_LEAVE(e, MONDIAN_GL_LINK_PROGRAM);
 }
 
@@ -4420,6 +4621,12 @@ my_glDeleteProgram(void *context, GLuint name)
 
 	EAGL_ENTER(e, MONDIAN_GL_DELETE_PROGRAM);
 	if (glIsProgram(name)) {
+		for (unsigned i = 0; i < e->fetch_program_count; i++) {
+			if (e->fetch_programs[i] == name) {
+				e->fetch_programs[i] = e->fetch_programs[--e->fetch_program_count];
+				break;
+			}
+		}
 		glDeleteProgram(name);
 	} else {
 		glDeleteShader(name);
@@ -4481,6 +4688,17 @@ gpu_self_test(void)
 	done = 1;
 	while (glGetError() != 0) {
 	}
+	/*
+	 * The caller's context is CoreAnimation's: whatever framebuffer and
+	 * viewport are bound here belong to the frame it was assembling, and a
+	 * test that leaves its own behind makes the next frame land in a 64x64
+	 * texture or in a 64x64 corner -- a compositor that commits and draws
+	 * nothing the panel can show. Both are restored at the end.
+	 */
+	GLint prev_fbo = 0, prev_viewport[4] = { 0, 0, 0, 0 };
+
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+	glGetIntegerv(GL_VIEWPORT, prev_viewport);
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
@@ -4570,12 +4788,13 @@ gpu_self_test(void)
 		    (int)ok, drawn[0], drawn[1], drawn[2], drawn[3], draw_error);
 		glDisableVertexAttribArray(0);
 		glUseProgram(0);
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
 		glDeleteProgram(program);
 		glDeleteShader(vs);
 		glDeleteShader(fs);
 	}
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fbo);
+	glViewport(prev_viewport[0], prev_viewport[1], prev_viewport[2], prev_viewport[3]);
 	glDeleteFramebuffers(1, &fbo);
 	glDeleteTextures(1, &texture);
 }
@@ -4940,6 +5159,10 @@ install(void)
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
 		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
+		fetch_flush_on = strstr(arguments, "glfbflush=0") == NULL;
+		if ((argument = strstr(arguments, "glflushdraws=")) != NULL) {
+			flush_draws = (int)strtoul(argument + 13, NULL, 10);
+		}
 		group_vibrant_on = strstr(arguments, "glgroup=0") == NULL;
 		if ((argument = strstr(arguments, "gltrace_place=")) != NULL) {
 			char *end = (char *)argument + 14;
