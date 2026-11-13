@@ -54,8 +54,20 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   000007d0` is `CP_EVENT_WRITE`, CACHE_CLEAN, to page `+0x800` + slot 13 (the
   fence of sequence 1997) with value 2000, sitting in the ring unexecuted. So the
   packet is present, its destination is right and the same dword took the
-  bring-up canary: what differs is the user IB in front of it, which is the next
-  thing to dump.
+  bring-up canary. The driver's `0323`/`0324` ring dumps and
+  `tools/decode-pm4.py` name what it is: every one of those submissions is
+  `CP_INDIRECT_BUFFER_PFE` to iova `0x400000`, size 9, then its fence — that is
+  `mondrian_cp_ib`, the driver's own buffer, so the ring was full of the
+  **bring-up stress loop** (2 000 back-to-back submissions) and not of Mesa.
+  When one of them stops being answered the driver marks the GPU as stopped
+  (`gpu stopped answering, submissions refused`) and every later Mesa submit
+  returns `-5`, which is the black layer.
+- **`cpstress=0` is the default for a usable boot.** With the stress loop skipped
+  the same boot has *zero* `flush_submit_list` errors, the fence gate never
+  fires, and `fps` ramps to 60 with the home screen on the glass. The loop is a
+  bring-up diagnostic (it proves ordering across two ring laps); it must not run
+  in an image that is meant to be used, and `tools/boards.py` carries the
+  argument.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches

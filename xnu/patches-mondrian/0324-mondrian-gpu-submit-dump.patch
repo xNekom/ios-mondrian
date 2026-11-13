@@ -1,0 +1,25 @@
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4907,8 +4907,11 @@
+ 					 * The registers of a parked CP must not be
+ 					 * touched from here (a read is what froze
+ 					 * boots), but the ring is system memory: the
+-					 * dwords just before the cursor are the packet
+-					 * the CP fetched and did not execute.
++					 * dwords before the cursor are the submission
++					 * the CP fetched and did not execute, from its
++					 * own packets down to the fence. 128 dwords
++					 * covers a whole submit at the sizes measured
++					 * (171 to 260), and the buffer is 32K dwords.
+ 					 */
+ 					if (told == 1 && mondrian_cp_ring.va != 0) {
+ 						volatile uint32_t *ring =
+@@ -4917,7 +4920,7 @@
+ 						uint32_t at = mondrian_uc_at;
+ 						unsigned int i;
+ 
+-						for (i = 32; i > 0; i -= 8) {
++						for (i = 128; i > 0; i -= 8) {
+ 							uint32_t o = (at - i) &
+ 							    (MONDRIAN_UC_RING_DWORDS - 1u);
+ 
