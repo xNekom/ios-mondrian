@@ -60,16 +60,16 @@ Current blockers, in order:
 
 1. **Charge level.** Charging works on its own (the charger sits behind the ADSP
    and keeps +1.27 A flowing, measured through `ichg_fb`), but its coulomb
-   counter is out of the AP's reach: the level comes from the PMK8350 VADC
-   (`0304`) and a voltage table, which overstates it (3.80 V reads 58 % where
-   Android said 36 %, 1683 mAh of `charge_full` 4952).
-2. **The compositor draws.** Not reproduced since the secure-mode switch: 8
-   consecutive cold boots (measured 2026-11-13) enumerated over USB in ~27 s,
-   drew the home screen and answered a tap on Settings. `fps 0` at rest is a
-   still screen, not a stall: read `drawn in place` before blaming the GPU
-   (`docs/MONDIAN_GPU.md`), and a tap is what makes a boot prove itself.
-3. **Control Center.** `mondrianwin=1` aborted SpringBoard; without it the
-   sheet draws full size. The slider ignores taps and the bottom banding stays.
+   counter is out of the AP's reach: the level is a voltage table (`0304`),
+   which overstates it (3.80 V reads 58 % where Android said 36 %).
+2. **The compositor draws.** Not reproduced since the secure-mode switch: 8 cold
+   boots (2026-11-13) enumerated in ~27 s each, drew the home screen and
+   answered a tap. `fps 0` at rest is a still screen; a tap proves a boot.
+3. **Control Center.** Its grid is 430 pt wide whatever the screen is
+   (`CCUIModuleCollectionView` at x=0 in a 480 pt `CCUIScrollView`: 37 pt left,
+   87 right); widening it breaks the present, so it stays. The sheet opens but
+   nothing in it reacts (not a tap on Wi-Fi, not a drag on brightness), and a
+   vertical drag dismissed it until `mondriancg=1` cut the sheet's own gestures.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting

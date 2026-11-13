@@ -4210,6 +4210,189 @@ mondrian_screen_report_thread(void *unused)
 	return NULL;
 }
 
+/*
+ * `mondriangeom=1` used to dump from the lock screen's step, which stops
+ * running once the phone is unlocked -- and Control Center is opened after the
+ * unlock, so the sheet that lays itself out wrong was never described. This
+ * thread keeps dumping every five seconds: the screen's bounds and scale, every
+ * window, and the Control Center's own frames with their transforms, so
+ * whatever is on the glass when the dump is read is what the lines describe.
+ */
+static void *
+mondrian_geom_report_thread(void *unused)
+{
+	(void)unused;
+
+	/*
+	 * Called straight from this thread, not through the main queue: on this
+	 * port SpringBoard's main run loop spends long stretches blocked, and a
+	 * dispatch_async dump waits for it -- which is exactly how the first
+	 * version of this thread produced no lines at all. Everything it reads
+	 * (bounds, frames, transforms) is a property read.
+	 */
+	for (unsigned i = 0; i < 90; i++) {
+		sleep(5);
+		mondrian_log_screen_geometry();
+	}
+	return NULL;
+}
+
+/*
+ * Control Center's module grid is a fixed 430 pt wide whatever the screen is.
+ * On this panel (480 pt) it sits at x=0 inside a full-width scroll view, which
+ * leaves 37 pt on the left and 87 on the right, and the frames the sheet lays
+ * out stop matching the pixels it draws -- the brightness and volume sliders
+ * then take touches where they are not. Widen whatever the grid's scroll view
+ * hosts to the scroll view's own width and let CCUI lay it out again. Opt-in
+ * until a boot proves it (`mondrianccw=1`).
+ */
+static void (*mondrian_ccsv_orig)(id, SEL);
+static int mondrian_ccsv_busy;
+
+static void
+mondrian_ccsv_widen(id view, CGSize host)
+{
+	id kids;
+	unsigned n, i;
+	CGRect f;
+
+	if (view == nil) {
+		return;
+	}
+	f = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	if (f.size.width + 0.5 < host.width) {
+		f.size.width = host.width;
+		f.origin.x = 0;
+		((void (*)(id, SEL, CGRect))objc_msgSend)(view,
+		    sel_registerName("setFrame:"), f);
+		((void (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("setNeedsLayout"));
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_ccsv_widen([(NSArray *)kids objectAtIndex:i], host);
+	}
+}
+
+static void
+mondrian_ccsv_layout(id self, SEL cmd)
+{
+	CGRect b;
+	id kids;
+	unsigned n, i;
+
+	if (mondrian_ccsv_orig != NULL) {
+		mondrian_ccsv_orig(self, cmd);
+	}
+	if (mondrian_ccsv_busy != 0 || !boot_arg_set("mondrianccw=1")) {
+		return;
+	}
+	mondrian_ccsv_busy = 1;
+	b = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
+	kids = mondrian_send(self, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_ccsv_widen([(NSArray *)kids objectAtIndex:i], b.size);
+	}
+	mondrian_ccsv_busy = 0;
+}
+
+static void
+install_cc_width_hook(void)
+{
+	Class cls = objc_getClass("CCUIScrollView");
+	Method m;
+
+	if (cls == Nil || mondrian_ccsv_orig != NULL) {
+		return;
+	}
+	m = class_getInstanceMethod(cls, sel_registerName("layoutSubviews"));
+	if (m == NULL) {
+		return;
+	}
+	mondrian_ccsv_orig = (void (*)(id, SEL))
+	    method_setImplementation(m, (IMP)mondrian_ccsv_layout);
+	say("MONDRIAN UI: cc width hook installed\n");
+}
+
+/* The framework loads with SpringBoard, but not always before this runs. */
+static void *
+mondrian_cc_retry_thread(void *unused)
+{
+	(void)unused;
+
+	for (unsigned i = 0; i < 40 && mondrian_ccsv_orig == NULL; i++) {
+		sleep(2);
+		install_cc_width_hook();
+	}
+	return NULL;
+}
+
+/*
+ * A vertical drag anywhere in Control Center dismisses the sheet, so the
+ * brightness and volume sliders cannot be used at all: the drag never reaches
+ * the slider's pan recogniser. Two views can eat it -- the sheet's own scroll
+ * view and the swipe affordance under it -- and neither has anything to do on a
+ * panel this tall (the grid fits without scrolling). Opt-in `mondriancg=1`
+ * until a boot says which one was the thief.
+ */
+static void
+mondrian_cc_gestures_pass(void)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	Method shared;
+	id app, windows;
+	unsigned n, i;
+
+	if (!boot_arg_set("mondriancg=1") || app_cls == Nil) {
+		return;
+	}
+	shared = class_getClassMethod(app_cls, sel_registerName("sharedApplication"));
+	if (shared == NULL) {
+		return;
+	}
+	app = ((id (*)(id, SEL))method_getImplementation(shared))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	n = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < n; i++) {
+		id win = [(NSArray *)windows objectAtIndex:i];
+		const char *wclass = object_getClassName(win);
+		id kids;
+
+		if (wclass == NULL || strstr(wclass, "ControlCenter") == NULL) {
+			continue;
+		}
+		kids = mondrian_send(win, "subviews");
+		for (unsigned k = 0; k < (kids != nil ? (unsigned)[(NSArray *)kids count] : 0); k++) {
+			id v = [(NSArray *)kids objectAtIndex:k];
+			const char *c = object_getClassName(v);
+
+			if (c != NULL && strstr(c, "SBBarSwipeAffordance") != NULL) {
+				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
+				    sel_registerName("setUserInteractionEnabled:"), NO);
+			}
+			if (c != NULL && strstr(c, "CCUIScrollView") != NULL) {
+				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
+				    sel_registerName("setScrollEnabled:"), NO);
+			}
+		}
+	}
+}
+
+static void *
+mondrian_cc_gesture_thread(void *unused)
+{
+	(void)unused;
+
+	for (unsigned i = 0; i < 240; i++) {
+		sleep(1);
+		mondrian_cc_gestures_pass();
+	}
+	return NULL;
+}
+
 static void
 install_screen_size_hooks(void)
 {
@@ -4243,6 +4426,28 @@ install_screen_size_hooks(void)
 	say("MONDRIAN UI: screen bounds family hooked\n");
 	if (pthread_create(&thread, NULL, mondrian_screen_report_thread, NULL) != 0) {
 		say("MONDRIAN UI: screen report thread failed\n");
+	}
+	if (boot_arg_set("mondriangeom=1")) {
+		pthread_t geom;
+
+		if (pthread_create(&geom, NULL, mondrian_geom_report_thread, NULL) != 0) {
+			say("MONDRIAN UI: geometry thread failed\n");
+		}
+	}
+	install_cc_width_hook();
+	if (mondrian_ccsv_orig == NULL) {
+		pthread_t cc;
+
+		if (pthread_create(&cc, NULL, mondrian_cc_retry_thread, NULL) != 0) {
+			say("MONDRIAN UI: cc retry thread failed\n");
+		}
+	}
+	if (boot_arg_set("mondriancg=1")) {
+		pthread_t cg;
+
+		if (pthread_create(&cg, NULL, mondrian_cc_gesture_thread, NULL) != 0) {
+			say("MONDRIAN UI: cc gesture thread failed\n");
+		}
 	}
 }
 
