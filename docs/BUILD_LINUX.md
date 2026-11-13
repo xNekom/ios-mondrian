@@ -274,3 +274,5 @@ recovery with adb; `--flash` is the only path when fsck had to repair the dump
 | `Skipping patch .../00NN-` | the series does not apply to the pinned xnu tag; run `tools/apply-series.py` |
 | `No rule to make target .../config/allsymbols` | the cached tree predates `0007`; delete `$WORK/.series-state` and rebuild |
 | kernel built but wrong page size | the board's `0001` patch and `tools/boards.py` disagree |
+| `Error reading sparse file` partway through `flash userdata` | `fastboot` here is `platform-tools/fastboot.exe` (a symlink in `/usr/local/bin`), so it cannot read `/root` or a `/mnt/c` cwd (UNC) and it re-chunks the sparse image itself: `-S` must exceed the image's largest sparse chunk (64 MiB in `backup/ios-root.simg`), so use `-S 512M` and a Windows path |
+| `fastboot devices` empty while `usbipd list` still shows the bootloader | the USB link wedged after a partial write; power-cycle into fastboot (Vol-down + Power) and repeat the same command |

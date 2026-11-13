@@ -25,10 +25,19 @@ extern xpc_object_t xpc_connection_send_message_with_reply_sync(
     xpc_connection_t connection, xpc_object_t message);
 extern const char *xpc_connection_get_name(xpc_connection_t connection);
 
+/*
+ * The bootstrap namespace lives in libSystem and the SDK ships no servers/
+ * headers: the two entry points this probe needs are declared here.
+ */
+extern mach_port_t bootstrap_port;
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
+    const char *service_name, mach_port_t *service_port);
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -5219,79 +5228,218 @@ mondrian_main_watch(void *unused)
  * timeout reads differently from a semaphore that a fence never signals, and
  * from a thread that is not scheduled at all.
  */
+/*
+ * The dyld cache ships no symbols, so a stuck thread reads as
+ * "FrontBoard+0x1fad4". The class and method lists are in memory, though:
+ * every Objective-C method knows its IMP, so sorting the IMPs of the image
+ * turns the offset into the method that contains it. That is enough to name
+ * the lock the launch is waiting on.
+ */
+struct mondrian_method_span {
+	uint64_t off;
+	char name[160];
+};
+
+static void mondrian_probe_fmt(const char *fmt, ...);
+
+static int
+mondrian_method_span_cmp(const void *pa, const void *pb)
+{
+	const struct mondrian_method_span *a = pa, *b = pb;
+
+	return a->off < b->off ? -1 : (a->off > b->off ? 1 : 0);
+}
+
+static void
+mondrian_symbolicate_pc(uint64_t pc, const char *tag)
+{
+	struct mondrian_method_span *spans = NULL;
+	Class *classes = NULL;
+	Dl_info info;
+	int num, n = 0, cap = 0;
+	uint64_t off, base;
+
+	if (pc == 0 || dladdr((void *)pc, &info) == 0 || info.dli_fbase == NULL) {
+		return;
+	}
+	base = (uint64_t)(uintptr_t)info.dli_fbase;
+	off = pc - base;
+	num = objc_getClassList(NULL, 0);
+	if (num <= 0) {
+		return;
+	}
+	classes = malloc(sizeof(Class) * (size_t)num);
+	if (classes == NULL) {
+		return;
+	}
+	num = objc_getClassList(classes, num);
+	cap = num * 6 + 256;
+	spans = malloc(sizeof(*spans) * (size_t)cap);
+	if (spans == NULL) {
+		free(classes);
+		return;
+	}
+	for (int i = 0; i < num && n < cap; i++) {
+		Class cls = classes[i];
+
+		for (int meta = 0; meta < 2 && n < cap; meta++) {
+			Class target = meta ? object_getClass((id)cls) : cls;
+			unsigned mc = 0;
+			Method *methods = class_copyMethodList(target, &mc);
+
+			if (methods == NULL) {
+				continue;
+			}
+			for (unsigned k = 0; k < mc && n < cap; k++) {
+				IMP imp = method_getImplementation(methods[k]);
+				Dl_info mi;
+
+				if (dladdr((void *)imp, &mi) == 0 ||
+				    mi.dli_fbase != info.dli_fbase) {
+					continue;
+				}
+				spans[n].off = (uint64_t)(uintptr_t)imp - base;
+				snprintf(spans[n].name, sizeof(spans[n].name),
+				    "%s[%s %s]", meta ? "+" : "-",
+				    class_getName(cls),
+				    sel_getName(method_getName(methods[k])));
+				n++;
+			}
+			free(methods);
+		}
+	}
+	free(classes);
+	if (n <= 0) {
+		free(spans);
+		return;
+	}
+	qsort(spans, (size_t)n, sizeof(*spans), mondrian_method_span_cmp);
+	{
+		int lo = 0, hi = n - 1, best = -1;
+
+		while (lo <= hi) {
+			int mid = (lo + hi) / 2;
+
+			if (spans[mid].off <= off) {
+				best = mid;
+				lo = mid + 1;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		if (best >= 0) {
+			const char *name = strrchr(info.dli_fname, '/');
+
+			mondrian_probe_fmt(
+			    "MONDRIAN SYM[%d]: %s %s+0x%llx -> %s+0x%llx\n",
+			    getpid(), tag,
+			    name != NULL ? name + 1 : info.dli_fname,
+			    (unsigned long long)off, spans[best].name,
+			    (unsigned long long)(off - spans[best].off));
+		} else {
+			const char *name = strrchr(info.dli_fname, '/');
+
+			mondrian_probe_fmt(
+			    "MONDRIAN SYM[%d]: %s %s+0x%llx -> no method below (%d)\n",
+			    getpid(), tag,
+			    name != NULL ? name + 1 : info.dli_fname,
+			    (unsigned long long)off, n);
+		}
+	}
+	free(spans);
+}
+
+static void
+mondrian_dump_threads(const char *tag)
+{
+	thread_act_array_t list = NULL;
+	mach_msg_type_number_t count = 0;
+	char head[96];
+
+	if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS ||
+	    list == NULL) {
+		return;
+	}
+	snprintf(head, sizeof(head), "MONDRIAN THR[%d]: %s, %u threads\n",
+	    getpid(), tag, (unsigned)count);
+	say(head);
+	for (mach_msg_type_number_t i = 0; i < count; i++) {
+		arm_thread_state64_t state;
+		mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+		thread_identifier_info_data_t id;
+		mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
+		char line[512], f[6][80];
+		uint64_t fp, addrs[6];
+		int used = 2;
+
+		memset(&id, 0, sizeof(id));
+		if (thread_get_state(list[i], ARM_THREAD_STATE64,
+		    (thread_state_t)&state, &sc) != KERN_SUCCESS) {
+			mach_port_deallocate(mach_task_self(), list[i]);
+			continue;
+		}
+		mondrian_main_frame(state.__pc, f[0], sizeof(f[0]));
+		mondrian_main_frame(state.__lr, f[1], sizeof(f[1]));
+		addrs[0] = state.__pc;
+		addrs[1] = state.__lr;
+		fp = state.__fp;
+		for (int k = 2; k < 6 && fp >= 0x100000000ULL; k++) {
+			uint64_t frame[2];
+			vm_size_t got = 0;
+
+			if (vm_read_overwrite(mach_task_self(),
+			    (vm_address_t)fp, sizeof(frame),
+			    (vm_address_t)frame, &got) != KERN_SUCCESS ||
+			    got != sizeof(frame) || frame[1] == 0) {
+				break;
+			}
+			mondrian_main_frame(frame[1], f[k], sizeof(f[k]));
+			addrs[k] = frame[1];
+			used = k + 1;
+			fp = frame[0];
+		}
+		(void)thread_info(list[i], THREAD_IDENTIFIER_INFO,
+		    (thread_info_t)&id, &ic);
+		{
+			char *p = line;
+			size_t left = sizeof(line);
+			int k = snprintf(p, left, "MONDRIAN THR[%d]: t %llu",
+			    getpid(), (unsigned long long)id.thread_id);
+
+			p += k;
+			left -= (size_t)k;
+			for (int j = 0; j < used && left > 8; j++) {
+				k = snprintf(p, left, " %s", f[j]);
+				p += k;
+				left -= (size_t)k;
+			}
+			snprintf(p, left, "\n");
+		}
+		say(line);
+		/*
+		 * A thread parked on a lock is the interesting one: name the
+		 * method that owns the wait so the deadlock has an owner.
+		 */
+		if (strstr(f[0], "__ulock_wait") != NULL ||
+		    strstr(f[0], "semaphore_wait") != NULL) {
+			for (int j = 1; j < used; j++) {
+				mondrian_symbolicate_pc(addrs[j], tag);
+			}
+		}
+		mach_port_deallocate(mach_task_self(), list[i]);
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)list,
+	    count * sizeof(*list));
+}
+
 static void *
 mondrian_threads_watch(void *unused)
 {
 	(void)unused;
 	for (int n = 0; n < 4; n++) {
-		thread_act_array_t list = NULL;
-		mach_msg_type_number_t count = 0;
-		char head[96];
-
 		/* The first sample waits for the UI to settle; the rest follow it. */
 		sleep(n == 0 ? 100 : 2);
-		if (task_threads(mach_task_self(), &list, &count) != KERN_SUCCESS ||
-		    list == NULL) {
-			continue;
-		}
-		snprintf(head, sizeof(head),
-		    "MONDRIAN THR[%d]: sample %d, %u threads\n", getpid(), n,
-		    (unsigned)count);
-		say(head);
-		for (mach_msg_type_number_t i = 0; i < count; i++) {
-			arm_thread_state64_t state;
-			mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
-			thread_identifier_info_data_t id;
-			mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
-			char line[512], f[6][80];
-			uint64_t fp;
-			int used = 2;
-
-			memset(&id, 0, sizeof(id));
-			if (thread_get_state(list[i], ARM_THREAD_STATE64,
-			    (thread_state_t)&state, &sc) != KERN_SUCCESS) {
-				mach_port_deallocate(mach_task_self(), list[i]);
-				continue;
-			}
-			mondrian_main_frame(state.__pc, f[0], sizeof(f[0]));
-			mondrian_main_frame(state.__lr, f[1], sizeof(f[1]));
-			fp = state.__fp;
-			for (int k = 2; k < 6 && fp >= 0x100000000ULL; k++) {
-				uint64_t frame[2];
-				vm_size_t got = 0;
-
-				if (vm_read_overwrite(mach_task_self(),
-				    (vm_address_t)fp, sizeof(frame),
-				    (vm_address_t)frame, &got) != KERN_SUCCESS ||
-				    got != sizeof(frame) || frame[1] == 0) {
-					break;
-				}
-				mondrian_main_frame(frame[1], f[k], sizeof(f[k]));
-				used = k + 1;
-				fp = frame[0];
-			}
-			(void)thread_info(list[i], THREAD_IDENTIFIER_INFO,
-			    (thread_info_t)&id, &ic);
-			{
-				char *p = line;
-				size_t left = sizeof(line);
-				int k = snprintf(p, left, "MONDRIAN THR[%d]: t %llu",
-				    getpid(), (unsigned long long)id.thread_id);
-
-				p += k;
-				left -= (size_t)k;
-				for (int j = 0; j < used && left > 8; j++) {
-					k = snprintf(p, left, " %s", f[j]);
-					p += k;
-					left -= (size_t)k;
-				}
-				snprintf(p, left, "\n");
-			}
-			say(line);
-			mach_port_deallocate(mach_task_self(), list[i]);
-		}
-		vm_deallocate(mach_task_self(), (vm_address_t)list,
-		    count * sizeof(*list));
+		mondrian_dump_threads("sample");
 	}
 	return NULL;
 }
@@ -6249,6 +6397,739 @@ mondrian_net_thread(void *unused)
 	return NULL;
 }
 
+/*
+ * App launch probe.
+ *
+ * The last thing between the home screen and a usable phone is the launch
+ * pipeline, and it fails where nothing is logged: SpringBoard shows the
+ * snapshot and no app binary execs. This runs inside SpringBoard and answers
+ * the whole chain in one boot -- the file itself, what LaunchServices thinks
+ * of it, whether this process can exec it, what launchd's own log says, what
+ * the workspace request returns, and which processes FrontBoard holds. Every
+ * selector is guarded and the body is wrapped in @try: a probe that takes
+ * SpringBoard down with it is worse than no probe.
+ */
+static void
+mondrian_probe_fmt(const char *fmt, ...)
+{
+	char line[352];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	say(line);
+}
+
+/* -[obj selector] for a zero-argument object getter, nil when absent. */
+static id
+mondrian_probe_call(id object, const char *selector)
+{
+	SEL sel;
+
+	if (object == nil) {
+		return nil;
+	}
+	sel = sel_registerName(selector);
+	if (![object respondsToSelector:sel]) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)(object, sel);
+}
+
+/* +[Class selector] for a shared-instance style class getter. */
+static id
+mondrian_probe_class_call(const char *class_name, const char *selector)
+{
+	Class cls = objc_getClass(class_name);
+	SEL sel;
+
+	if (cls == Nil) {
+		return nil;
+	}
+	sel = sel_registerName(selector);
+	if (![cls respondsToSelector:sel]) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)((id)cls, sel);
+}
+
+/* A guarded BOOL getter: -1 when the receiver cannot answer. */
+static int
+mondrian_probe_bool(id object, const char *selector)
+{
+	SEL sel;
+
+	if (object == nil) {
+		return -1;
+	}
+	sel = sel_registerName(selector);
+	if (![object respondsToSelector:sel]) {
+		return -1;
+	}
+	return ((BOOL (*)(id, SEL))objc_msgSend)(object, sel) ? 1 : 0;
+}
+
+static const char *
+mondrian_probe_string(id object, const char *selector)
+{
+	id value = mondrian_probe_call(object, selector);
+
+	if (value == nil) {
+		return "-";
+	}
+	if ([value isKindOfClass:[NSString class]]) {
+		return [value UTF8String];
+	}
+	if ([value respondsToSelector:@selector(absoluteString)]) {
+		return [[value performSelector:@selector(absoluteString)] UTF8String];
+	}
+	return [[value description] UTF8String];
+}
+
+/* A guarded int getter (-[FBProcess pid] and friends): -1 when absent. */
+static int
+mondrian_probe_int(id object, const char *selector)
+{
+	SEL sel;
+
+	if (object == nil) {
+		return -1;
+	}
+	sel = sel_registerName(selector);
+	if (![object respondsToSelector:sel]) {
+		return -1;
+	}
+	return ((int (*)(id, SEL))objc_msgSend)(object, sel);
+}
+
+/*
+ * launchd keeps its own log on the writable root. Reading it here is the only
+ * way to see what launchd says about a spawn that never reaches the kernel's
+ * exec path. The whole file is scanned: the interesting line is the app job's,
+ * and the tail is full of commcenter lookup noise.
+ */
+static void
+mondrian_probe_launchd_log(void)
+{
+	static const char path[] = "/private/var/log/com.apple.xpc.launchd/launchd.log";
+	const char *inst[12], *app[12], *fail[16], *tail[15], *deny[16], *head[20];
+	char *buf, *line, *next;
+	int fd, got, i;
+	int inst_n = 0, app_n = 0, fail_n = 0, tail_n = 0, deny_n = 0, head_n = 0;
+	long size;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: launchd.log open errno %d\n", errno);
+		return;
+	}
+	size = (long)lseek(fd, 0, SEEK_END);
+	(void)lseek(fd, 0, SEEK_SET);
+	if (size <= 0 || size > (16L * 1024 * 1024)) {
+		(void)close(fd);
+		mondrian_probe_fmt("MONDRIAN LAUNCH: launchd.log size %ld\n", size);
+		return;
+	}
+	buf = malloc((size_t)size + 1);
+	if (buf == NULL) {
+		(void)close(fd);
+		mondrian_probe_fmt("MONDRIAN LAUNCH: launchd.log no memory\n");
+		return;
+	}
+	got = 0;
+	while (got < size) {
+		int n = (int)read(fd, buf + got, (size_t)(size - got));
+
+		if (n <= 0) {
+			break;
+		}
+		got += n;
+	}
+	(void)close(fd);
+	buf[got] = '\0';
+
+	line = buf;
+	while (line != NULL && *line != '\0') {
+		next = strchr(line, '\n');
+		if (next != NULL) {
+			*next++ = '\0';
+		}
+		tail[tail_n % 15] = line;
+		tail_n++;
+		if (head_n < 20) {
+			head[head_n++] = line;
+		}
+		if (strstr(line, "installd") != NULL) {
+			inst[inst_n % 12] = line;
+			inst_n++;
+		} else if (strstr(line, "UIKitApplication") != NULL ||
+		    strstr(line, "Preferences") != NULL) {
+			app[app_n % 12] = line;
+			app_n++;
+		} else if (strstr(line, "could not exec") != NULL ||
+		    strstr(line, "Exited with code") != NULL ||
+		    strstr(line, "Service only ran") != NULL ||
+		    strstr(line, "failed to exec") != NULL ||
+		    strstr(line, "unknown user") != NULL ||
+		    strstr(line, "Sandbox") != NULL) {
+			fail[fail_n % 16] = line;
+			fail_n++;
+		} else if (strstr(line, "denied") != NULL ||
+		    strstr(line, "entitle") != NULL ||
+		    strstr(line, "policy") != NULL ||
+		    strstr(line, "not allowed") != NULL ||
+		    strstr(line, "Invalid") != NULL ||
+		    strstr(line, "invalid") != NULL) {
+			deny[deny_n % 16] = line;
+			deny_n++;
+		}
+		line = next;
+	}
+	mondrian_probe_fmt(
+	    "MONDRIAN LAUNCH: log %ld bytes installd %d app %d fail %d deny %d\n",
+	    size, inst_n, app_n, fail_n, deny_n);
+	for (i = 0; i < head_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: head | %s\n", head[i]);
+	}
+	for (i = inst_n > 12 ? inst_n - 12 : 0; i < inst_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: ist | %s\n", inst[i % 12]);
+	}
+	for (i = app_n > 12 ? app_n - 12 : 0; i < app_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: app | %s\n", app[i % 12]);
+	}
+	for (i = fail_n > 16 ? fail_n - 16 : 0; i < fail_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: fail | %s\n", fail[i % 16]);
+	}
+	for (i = deny_n > 16 ? deny_n - 16 : 0; i < deny_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: deny | %s\n", deny[i % 16]);
+	}
+	/* The raw tail: whatever launchd wrote last, unfiltered. */
+	for (i = tail_n > 15 ? tail_n - 15 : 0; i < tail_n; i++) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: tail | %s\n", tail[i % 15]);
+	}
+	free(buf);
+}
+
+/* The whole process table, compact: this is how lsd/runningboardd are checked. */
+static void
+mondrian_probe_proclist(void)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	struct kinfo_proc *list;
+	size_t size = 0;
+	char line[320];
+	size_t used = 0;
+	int n, i, lines = 0;
+
+	if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: proclist size errno %d\n", errno);
+		return;
+	}
+	list = malloc(size);
+	if (list == NULL) {
+		return;
+	}
+	if (sysctl(mib, 4, list, &size, NULL, 0) != 0) {
+		free(list);
+		mondrian_probe_fmt("MONDRIAN LAUNCH: proclist read errno %d\n", errno);
+		return;
+	}
+	n = (int)(size / sizeof(struct kinfo_proc));
+	mondrian_probe_fmt("MONDRIAN LAUNCH: proclist %d\n", n);
+	line[0] = '\0';
+	for (i = 0; i < n; i++) {
+		char entry[40];
+		int len = snprintf(entry, sizeof(entry), "%s(%d) ",
+		    list[i].kp_proc.p_comm, list[i].kp_proc.p_pid);
+
+		if (len <= 0) {
+			continue;
+		}
+		if (used + (size_t)len >= sizeof(line) - 1) {
+			mondrian_probe_fmt("MONDRIAN LAUNCH: proc | %s\n", line);
+			used = 0;
+			line[0] = '\0';
+			if (++lines >= 20) {
+				break;
+			}
+		}
+		memcpy(line + used, entry, (size_t)len);
+		used += (size_t)len;
+		line[used] = '\0';
+	}
+	if (used > 0 && lines < 20) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: proc | %s\n", line);
+	}
+	free(list);
+}
+
+/*
+ * The launch path asks installd for the app and the daemon is absent from the
+ * process table although its Mach service answers. The lookup above asks
+ * launchd for it; this second answer, a direct spawn from a root process,
+ * separates "launchd will not start it" from "the binary cannot run here".
+ *
+ * The same thread then asks for an app from outside SpringBoard: if a root
+ * daemon's request also times out, the gap is below SpringBoard's state
+ * machine; if it works, the request path is fine and SpringBoard is what
+ * drops it.
+ */
+static void mondrian_probe_processes(const char *when);
+
+/*
+ * The launch call blocks for its whole timeout, and the interesting thread is
+ * the one that is supposed to answer it, not this one. Sample every thread
+ * while the caller is stuck so the frame that waits is on the record.
+ */
+static void *
+mondrian_launch_sampler(void *unused)
+{
+	(void)unused;
+	usleep(3000 * 1000);
+	mondrian_dump_threads("launch wait");
+	return NULL;
+}
+
+/*
+ * One launch attempt through the public SpringBoardServices entry point, with
+ * the error text and the time it took. Called from three processes: SpringBoard
+ * (the path the icon uses), backboardd (a plain user-501 daemon) and
+ * containermanagerd (root). The three answers say where the request dies.
+ */
+static void
+mondrian_probe_app(const char *tag)
+{
+	static const char path[] = "/Applications/Preferences.app/Preferences";
+	struct stat st;
+	void *handle;
+
+	if (stat(path, &st) == 0) {
+		mondrian_probe_fmt("MONDRIAN APP[%s]: %lld bytes mode %o\n", tag,
+		    (long long)st.st_size, (unsigned)(st.st_mode & 07777));
+	}
+	handle = dlopen(
+	    "/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+	    RTLD_LAZY);
+	if (handle != NULL) {
+		int (*launch)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))
+		    dlsym(handle, "SBSLaunchApplicationWithIdentifier");
+		CFStringRef (*errtxt)(int) = (CFStringRef (*)(int))
+		    dlsym(handle, "SBSApplicationLaunchingErrorString");
+		struct timeval before, after;
+
+		/*
+		 * The two services a launch waits on, asked in this process
+		 * before the launch: LaunchServices (a bundle nobody has asked
+		 * for yet, so the answer cannot be an in-process cache) and
+		 * RunningBoard (a plain process handle). Whichever hangs names
+		 * the layer that never answers.
+		 */
+		@try {
+			Class proxy_cls = objc_getClass("LSApplicationProxy");
+			id proxy = nil;
+
+			(void)gettimeofday(&before, NULL);
+			if (proxy_cls != Nil && [proxy_cls respondsToSelector:
+			    @selector(applicationProxyForIdentifier:)]) {
+				proxy = ((id (*)(id, SEL, id))objc_msgSend)(
+				    (id)proxy_cls,
+				    sel_registerName("applicationProxyForIdentifier:"),
+				    @"com.apple.mobiletimer");
+			}
+			(void)gettimeofday(&after, NULL);
+			mondrian_probe_fmt(
+			    "MONDRIAN APP[%s]: lsd proxy %s %ld ms\n", tag,
+			    proxy != nil ? "yes" : "nil",
+			    (long)((after.tv_sec - before.tv_sec) * 1000 +
+			    (after.tv_usec - before.tv_usec) / 1000));
+		} @catch (id exception) {
+			mondrian_probe_fmt("MONDRIAN APP[%s]: lsd probe raised\n", tag);
+		}
+		@try {
+			Class ident_cls = (id)objc_getClass("RBSProcessIdentifier");
+			Class hcls = (id)objc_getClass("RBSProcessHandle");
+			id ident = nil, rhandle = nil;
+			NSError *rerr = nil;
+
+			(void)gettimeofday(&before, NULL);
+			if (ident_cls != nil && [ident_cls respondsToSelector:
+			    @selector(identifierWithPid:)]) {
+				ident = ((id (*)(id, SEL, int))objc_msgSend)(
+				    ident_cls, sel_registerName("identifierWithPid:"),
+				    (int)getpid());
+			}
+			if (hcls != nil && ident != nil && [hcls respondsToSelector:
+			    @selector(handleForIdentifier:error:)]) {
+				rhandle = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+				    hcls, sel_registerName("handleForIdentifier:error:"),
+				    ident, &rerr);
+			}
+			(void)gettimeofday(&after, NULL);
+			mondrian_probe_fmt(
+			    "MONDRIAN APP[%s]: rbs handle %s %ld ms error %s\n", tag,
+			    rhandle != nil ? "yes" : "nil",
+			    (long)((after.tv_sec - before.tv_sec) * 1000 +
+			    (after.tv_usec - before.tv_usec) / 1000),
+			    rerr != nil ? [[rerr description] UTF8String] : "-");
+		} @catch (id exception) {
+			mondrian_probe_fmt("MONDRIAN APP[%s]: rbs probe raised\n", tag);
+		}
+		if (launch != NULL) {
+			int lrc;
+			char message[192];
+			pthread_t sampler;
+
+			/* Dump the process' threads while this call is blocked. */
+			if (pthread_create(&sampler, NULL, mondrian_launch_sampler,
+			    NULL) == 0) {
+				pthread_detach(sampler);
+			}
+			(void)gettimeofday(&before, NULL);
+			errno = 0;
+			lrc = launch(CFSTR("com.apple.Preferences"), false);
+			(void)gettimeofday(&after, NULL);
+			message[0] = '\0';
+			if (errtxt != NULL && lrc != 0) {
+				CFStringRef text = errtxt(lrc);
+
+				if (text != NULL) {
+					(void)CFStringGetCString(text, message,
+					    sizeof(message), kCFStringEncodingUTF8);
+				}
+			}
+			mondrian_probe_fmt(
+			    "MONDRIAN APP[%s]: SBSLaunch rc %d errno %d %ld ms -> %s\n",
+			    tag, lrc, errno,
+			    (long)((after.tv_sec - before.tv_sec) * 1000 +
+			    (after.tv_usec - before.tv_usec) / 1000),
+			    message[0] != '\0' ? message : "-");
+		} else {
+			mondrian_probe_fmt("MONDRIAN APP[%s]: no symbol\n", tag);
+		}
+	} else {
+		mondrian_probe_fmt("MONDRIAN APP[%s]: no framework\n", tag);
+	}
+	sleep(2);
+	mondrian_probe_processes(tag);
+}
+
+static void *
+mondrian_installd_test(void *unused)
+{
+	char *argv[] = { (char *)"installd", NULL };
+	extern char **environ;
+	pid_t pid = 0;
+	int rc;
+
+	(void)unused;
+	sleep(40);
+	errno = 0;
+	rc = posix_spawn(&pid, "/usr/libexec/installd", NULL, NULL, argv, environ);
+	mondrian_probe_fmt("MONDRIAN INSTALLD: posix_spawn rc %d errno %d pid %d\n",
+	    rc, errno, (int)pid);
+	sleep(3);
+	mondrian_probe_proclist();
+	mondrian_probe_app("root");
+	return NULL;
+}
+
+/*
+ * backboardd runs as the mobile user and is not SpringBoard. Its launch answer
+ * is the control for "FrontBoard refuses this requestor" against "the launch
+ * path is broken for every requestor".
+ */
+static void *
+mondrian_backboard_probe(void *unused)
+{
+	(void)unused;
+	sleep(100);
+	mondrian_probe_app("backboardd");
+	return NULL;
+}
+
+/* FrontBoard's live process set, one line per process, capped. */
+static void
+mondrian_probe_processes(const char *when)
+{
+	id manager = nil;
+	id all;
+	Class cls = objc_getClass("FBProcessManager");
+
+	if (cls != Nil && [cls respondsToSelector:@selector(sharedInstance)]) {
+		manager = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+		    sel_registerName("sharedInstance"));
+	}
+	all = mondrian_probe_call(manager, "allProcesses");
+	mondrian_probe_fmt("MONDRIAN LAUNCH: %s processes %lu\n", when,
+	    (unsigned long)(all != nil && [all respondsToSelector:@selector(count)] ?
+	    [all count] : 0));
+	if (all != nil && [all respondsToSelector:@selector(allObjects)]) {
+		NSArray *list = [all performSelector:@selector(allObjects)];
+		NSUInteger i, count = [list count];
+
+		for (i = 0; i < count && i < 14; i++) {
+			id process = [list objectAtIndex:i];
+
+			mondrian_probe_fmt("MONDRIAN LAUNCH: %s proc %s pid %d\n", when,
+			    mondrian_probe_string(process, "name"),
+			    mondrian_probe_int(process, "pid"));
+		}
+	}
+}
+
+static void
+mondrian_probe_launch(void)
+{
+	static const char path[] = "/Applications/Preferences.app/Preferences";
+	struct stat st;
+	unsigned char magic[4] = { 0, 0, 0, 0 };
+	int opened, got, err, i;
+	pid_t pid = 0;
+	int rc, status = 0;
+
+	@try {
+		(void)stat(path, &st);
+		mondrian_probe_fmt(
+		    "MONDRIAN LAUNCH: file exists %d exec %d size %lld mode %o\n",
+		    [[NSFileManager defaultManager] fileExistsAtPath:
+		    [NSString stringWithUTF8String:path]] ? 1 : 0,
+		    [[NSFileManager defaultManager] isExecutableFileAtPath:
+		    [NSString stringWithUTF8String:path]] ? 1 : 0,
+		    (long long)st.st_size, (unsigned)(st.st_mode & 07777));
+		opened = open(path, O_RDONLY);
+		err = errno;
+		got = -1;
+		if (opened >= 0) {
+			got = (int)read(opened, magic, sizeof(magic));
+			err = errno;
+			(void)close(opened);
+		}
+		mondrian_probe_fmt(
+		    "MONDRIAN LAUNCH: read open %d n %d errno %d magic %02x%02x%02x%02x\n",
+		    opened >= 0 ? 1 : 0, got, err, magic[0], magic[1], magic[2],
+		    magic[3]);
+	} @catch (id exception) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: file probe raised\n");
+	}
+
+	@try {
+		id lock_manager = mondrian_probe_class_call("SBLockScreenManager",
+		    "sharedInstance");
+		id lock_state = mondrian_probe_class_call("SBLockStateAggregator",
+		    "sharedInstance");
+
+		mondrian_probe_fmt("MONDRIAN LAUNCH: locked %d state %d\n",
+		    mondrian_probe_bool(lock_manager, "isUILocked"),
+		    mondrian_probe_int(lock_state, "lockState"));
+	} @catch (id exception) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: lock probe raised\n");
+	}
+
+	/*
+	 * Who answers. launchd starts an on-demand job when its Mach service is
+	 * looked up, so the com.apple.mobile.installd entry both measures the
+	 * service and asks launchd for the daemon the launch path is missing.
+	 */
+	{
+		static const char *const names[] = {
+			"com.apple.runningboard",
+			"com.apple.mobile.installd",
+			"com.apple.springboard.services",
+			"com.apple.backboard.hid-services.xpc",
+			"com.apple.backboard.system-app-server",
+			"com.apple.iohideventsystem",
+			"com.apple.frontboard.systemappservices",
+		};
+		unsigned i;
+
+		for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+			mach_port_t port = MACH_PORT_NULL;
+			kern_return_t kr = bootstrap_look_up(bootstrap_port,
+			    names[i], &port);
+
+			mondrian_probe_fmt(
+			    "MONDRIAN LAUNCH: lookup %s kr %d port %u\n",
+			    names[i], (int)kr, (unsigned)port);
+			if (port != MACH_PORT_NULL) {
+				(void)mach_port_deallocate(mach_task_self(), port);
+			}
+		}
+	}
+
+	/* RunningBoard's own query path, the one FrontBoard uses. */
+	@try {
+		id ident_cls = (id)objc_getClass("RBSProcessIdentifier");
+		id handle_cls = (id)objc_getClass("RBSProcessHandle");
+		id ident = nil;
+		id handle = nil;
+		NSError *rbs_error = nil;
+
+		if (ident_cls != nil &&
+		    [ident_cls respondsToSelector:@selector(identifierWithPid:)]) {
+			ident = ((id (*)(id, SEL, int))objc_msgSend)(ident_cls,
+			    sel_registerName("identifierWithPid:"), 26);
+		}
+		if (handle_cls != nil && ident != nil &&
+		    [handle_cls respondsToSelector:
+		    @selector(handleForIdentifier:error:)]) {
+			handle = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+			    handle_cls, sel_registerName("handleForIdentifier:error:"),
+			    ident, &rbs_error);
+		}
+		mondrian_probe_fmt("MONDRIAN LAUNCH: RBS handle %s error %s\n",
+		    handle != nil ? "yes" : "nil",
+		    rbs_error != nil ? [[rbs_error description] UTF8String] : "-");
+	} @catch (id exception) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: RBS probe raised\n");
+	}
+
+	{
+		Class proxy_cls = objc_getClass("LSApplicationProxy");
+		id proxy = nil;
+
+		if (proxy_cls != Nil &&
+		    [proxy_cls respondsToSelector:
+		    @selector(applicationProxyForIdentifier:)]) {
+			proxy = ((id (*)(id, SEL, id))objc_msgSend)((id)proxy_cls,
+			    sel_registerName("applicationProxyForIdentifier:"),
+			    @"com.apple.Preferences");
+		}
+		mondrian_probe_fmt(
+		    "MONDRIAN LAUNCH: proxy %s installed %d placeholder %d type %s\n",
+		    proxy != nil ? "yes" : "nil",
+		    mondrian_probe_bool(proxy, "isInstalled"),
+		    mondrian_probe_bool(proxy, "isPlaceholder"),
+		    mondrian_probe_string(proxy, "applicationType"));
+		mondrian_probe_fmt("MONDRIAN LAUNCH: proxy url %s\n",
+		    mondrian_probe_string(proxy, "bundleURL"));
+	}
+
+	/*
+	 * The launch request goes before anything else spawns the app: with a
+	 * Preferences already running the workspace answers no for the wrong
+	 * reason, which is what the first version of this probe measured.
+	 */
+	@try {
+		Class workspace_cls = objc_getClass("LSApplicationWorkspace");
+		id workspace = nil;
+		SEL sel = sel_registerName("openApplicationWithBundleID:");
+		BOOL opened_app = NO;
+
+		if (workspace_cls != Nil &&
+		    [workspace_cls respondsToSelector:@selector(defaultWorkspace)]) {
+			workspace = ((id (*)(id, SEL))objc_msgSend)((id)workspace_cls,
+			    sel_registerName("defaultWorkspace"));
+		}
+		if (workspace != nil && [workspace respondsToSelector:sel]) {
+			opened_app = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
+			    sel, @"com.apple.Preferences");
+		}
+		mondrian_probe_fmt("MONDRIAN LAUNCH: workspace %s open -> %d\n",
+		    workspace != nil ? "yes" : "nil", opened_app ? 1 : 0);
+	} @catch (id exception) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: workspace raised\n");
+	}
+	sleep(3);
+	mondrian_probe_processes("workspace");
+
+	/*
+	 * SpringBoardServices is the C entry point the icon path ends in; its
+	 * return value says whether the request was accepted at all. The same
+	 * helper the other two processes use dumps every thread while the call
+	 * is blocked, so the frame that waits is on the record.
+	 */
+	mondrian_probe_app("springboard");
+	sleep(3);
+	mondrian_probe_processes("sbslaunch");
+
+	/*
+	 * Control: this process execs the binary itself. It worked in the first
+	 * probe, so it separates "the kernel refuses the app" from "the launch
+	 * pipeline never asks".
+	 */
+	{
+		char *argv[] = { (char *)"Preferences", NULL };
+		extern char **environ;
+
+		errno = 0;
+		rc = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+		mondrian_probe_fmt("MONDRIAN LAUNCH: posix_spawn rc %d errno %d pid %d\n",
+		    rc, errno, (int)pid);
+		if (rc == 0) {
+			for (i = 0; i < 20; i++) {
+				if (waitpid(pid, &status, WNOHANG) == pid) {
+					break;
+				}
+				usleep(250000);
+			}
+			mondrian_probe_fmt(
+			    "MONDRIAN LAUNCH: spawn status 0x%x after %d ms\n",
+			    status, i * 250);
+		}
+	}
+}
+
+/*
+ * One boot, two passes: the passive half at boot (file, launchd log, direct
+ * spawn, workspace) and the process set every 15 s for five minutes, so a tap
+ * made at any point is caught with the processes it created.
+ */
+static void *
+mondrian_launch_thread(void *unused)
+{
+	unsigned last = 0;
+	int i;
+
+	(void)unused;
+	sleep(60);
+	mondrian_probe_fmt("MONDRIAN LAUNCH: probe begins\n");
+	mondrian_probe_fmt("MONDRIAN LAUNCH: insert %s\n",
+	    getenv("DYLD_INSERT_LIBRARIES") != NULL ?
+	    getenv("DYLD_INSERT_LIBRARIES") : "-");
+	@try {
+		mondrian_probe_proclist();
+		mondrian_probe_launch();
+		/*
+		 * The log is read *after* the launch attempts: the app job's lines
+		 * (spawn scheduled, xpcproxy, exec failure) are written by launchd
+		 * while the request is being handled, so an earlier read only shows
+		 * the boot's daemons.
+		 */
+		mondrian_probe_launchd_log();
+		/* A second table after the lookups: did launchd start installd? */
+		mondrian_probe_proclist();
+	} @catch (id exception) {
+		mondrian_probe_fmt("MONDRIAN LAUNCH: probe raised\n");
+	}
+	for (i = 0; i < 20; i++) {
+		@try {
+			id manager = nil;
+			id all;
+			Class cls = objc_getClass("FBProcessManager");
+			unsigned count = 0;
+
+			if (cls != Nil &&
+			    [cls respondsToSelector:@selector(sharedInstance)]) {
+				manager = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+				    sel_registerName("sharedInstance"));
+			}
+			all = mondrian_probe_call(manager, "allProcesses");
+			if (all != nil && [all respondsToSelector:@selector(count)]) {
+				count = (unsigned)[all count];
+			}
+			if (i == 0 || count != last) {
+				last = count;
+				mondrian_probe_processes("watch");
+			}
+		} @catch (id exception) {
+			mondrian_probe_fmt("MONDRIAN LAUNCH: watch raised\n");
+		}
+		sleep(15);
+	}
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -6284,24 +7165,66 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc11 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc23 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
-	install_display_diagnostic();
-	install_activation_hooks();
-	install_icon_probe();
-	install_idle_hooks();
-	install_display_link_rate_hooks();
-	install_brightness_hooks();
-	install_screen_size_hooks();
-	install_touch_probe();
+	/*
+	 * mondrianbare=1 keeps the probe and the network link but installs none
+	 * of the SpringBoard swizzles. One boot with it answers whether FrontBoard
+	 * deadlocks on its own or because of a hook in that path.
+	 */
+	if (!boot_arg_set("mondrianbare=1")) {
+		install_display_diagnostic();
+		install_activation_hooks();
+		install_icon_probe();
+		install_idle_hooks();
+		install_display_link_rate_hooks();
+		install_brightness_hooks();
+		install_screen_size_hooks();
+		install_touch_probe();
+	} else {
+		say("MONDRIAN UI: bare mode, swizzles skipped\n");
+	}
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
-		pthread_t tz;
+		pthread_t tz, launch;
 
 		/* The zone file is written by a root daemon; Foundation re-reads it. */
 		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
 			pthread_detach(tz);
+		}
+		/*
+		 * The app-launch probe runs once per boot, after the home screen
+		 * has settled, and watches FrontBoard's process set for five
+		 * minutes so a tap made at any point is caught with the processes
+		 * it created.
+		 */
+		if (pthread_create(&launch, NULL, mondrian_launch_thread, NULL) == 0) {
+			pthread_detach(launch);
+		}
+	}
+	/*
+	 * A root daemon whose launch path is the one that hangs: ask for
+	 * installd at the same time the SpringBoard probe does, so the two
+	 * answers line up.
+	 */
+	if (geteuid() == 0 && strcmp(getprogname(), "containermanagerd") == 0) {
+		pthread_t inst;
+
+		if (pthread_create(&inst, NULL, mondrian_installd_test, NULL) == 0) {
+			pthread_detach(inst);
+		}
+	}
+	/*
+	 * A user-501 process that is not SpringBoard: the same launch call from
+	 * here answers "did FrontBoard refuse SpringBoard, or is the launch path
+	 * broken for everyone".
+	 */
+	if (geteuid() == 501 && strcmp(getprogname(), "backboardd") == 0) {
+		pthread_t app;
+
+		if (pthread_create(&app, NULL, mondrian_backboard_probe, NULL) == 0) {
+			pthread_detach(app);
 		}
 	}
 	start_heartbeat();

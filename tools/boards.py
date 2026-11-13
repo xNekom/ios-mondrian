@@ -351,6 +351,21 @@ MONDRIAN = Board(
              # processes. Not a number: PE_parse_boot_argn would store one as
              # a binary integer instead of a string.
              'mondriankill=quiet '
+             # glblob=1: the kernel carries the UI hook and the CoreAnimation
+             # dylibs and writes them into /private/var/vm at boot, so a hook
+             # change costs one kernel build and one `fastboot boot` instead of
+             # a userdata flash. Without it the boot silently runs the copy the
+             # previous boot left there (the existence check cannot tell them
+             # apart).
+             'glblob=1 '
+             # 0: no kernel timer resets to fastboot. A reset is a debugging
+             # aid and must be asked for explicitly.
+             'mondrianreset=0 '
+             # The private unlock API starts an appearance transition the
+             # switcher never closes ("Unbalanced calls ... for
+             # SBSwitcherViewController"), and every app launch then queues
+             # behind it. A swipe unlocks; 0 keeps the hook out of the state
+             # machine. Set to 0 only to test that hypothesis.
              'mondrianunlock=1'),
 )
 
