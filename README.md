@@ -193,14 +193,14 @@ python3 tools/mk-simg.py ios16-root.img ios16-root.simg
 Editing the image only needs root for the mount; `flash-root.sh` reuses an
 existing `.simg`, so remake the sparse file by hand. A definite write follows
 the graded protocol in `docs/MONDIAN_PORT.md`. With `usb=2` the kernel runs a
-USB gadget: `tools/ios-usbnet.sh` sets the host up and `tools/usb-ring.py`
+USB gadget: `tools/ios-usbnet.sh` gives the link 192.168.7.1 and NATs it (the
+hook adds the phone's route, so the cable is its Internet); `tools/usb-ring.py`
 dumps the ring, screenshots the panel, injects input and reboots to the
-bootloader; `tools/phone-log.sh` reads the ring through the recovery.
+bootloader, and `tools/phone-log.sh` reads the ring through the recovery.
 
-A hook change does not need the image round trip: a kernel build with
-`out/gpu/mondrian-ui-hook.dylib` present embeds the GL, injector and hook dylibs
-(`tools/gen-glblob.py`); `glblob=1` writes them into `/private/var/vm` at mount,
-the next boot runs that copy, and `kern_exec` prefers it over `/usr/libexec`.
+A hook change needs no image round trip: a kernel build with
+`out/gpu/mondrian-ui-hook.dylib` present embeds it (`tools/gen-glblob.py`);
+`glblob=1` writes it into `/private/var/vm`, and `kern_exec` prefers that copy.
 
 ```sh
 tools/phone-deploy.sh logview          # shim with LOGVIEW=1

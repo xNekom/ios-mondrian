@@ -309,7 +309,7 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
                         choices=("dump", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
-                                 "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob",
+                                 "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "fps"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
@@ -354,7 +354,8 @@ def main():
             return 1
         print(answer.decode(errors="replace").strip())
         return 0
-    if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob"):
+    if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob",
+                        "rtc"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0

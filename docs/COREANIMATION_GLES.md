@@ -77,6 +77,10 @@ the order they were paid for:
   the allocator left there. `gpusurfpat=1|2|3` (`MondrianGPU.cpp`) fills a freshly adopted
   surface with white, black or a ramp to prove it; the bands over the lock screen's wallpaper are
   that memory, not a mis-sampled texture.
+- **The Control Center shows that poster through its sheet.** The sheet's `MTMaterialView`
+  spans the whole window (480x1067 pt, measured from the view tree), so the bright bokeh in its
+  lower third is the poster's content, not a band in the material, and the home screen behind it
+  is a different, plain gradient. Fixing that look means fixing the wallpaper, not the backdrop.
 
 The rest of this file is the design. CoreAnimation draws through Mesa into the display's IOSurface
 with no copy; the no-copy path below is what does it.

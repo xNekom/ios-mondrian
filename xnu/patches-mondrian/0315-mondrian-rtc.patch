@@ -1,0 +1,416 @@
+xnu 0315: the clock the phone already has, and a way to set it
+
+The port boots with the calendar at the epoch: there is no IORTC service, so
+IOKitInitializeTime() only had the host's `mondriantime=` word to go on, and
+nothing passed it. The board does have a clock -- the PMK8350 RTC at
+rtc@6100, readable over SPMI since the port measured 467613 s there once --
+but its value is 1975 because nothing has ever set it.
+
+mondrian_spmi.c now maps the arbiter on first use (the clock asks before the
+root mount, and the probe used to be the only mapper), reads the RTC through
+the observer window with a carry re-read, and writes it with the same
+channel-window byte transaction the SDAM restart reason has used for every
+reboot. The write refuses a peripheral the AP does not own and an armed
+alarm, so the only case it changes the PMIC is a clock that is the AP's to
+set. The clock takes the RTC when it is a plausible date (2020..2100) and
+`mondrianrtc=0` keeps the old behaviour; `mondriantime=` still wins.
+
+"rtc" on the USB channel prints the raw seconds and "rtc set SECONDS" writes
+them and moves the running clock, so a host with the right time fixes the
+phone in one command instead of rebuilding an image.
+
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -67,6 +67,19 @@
+ #define MONDRIAN_SPMI_VADC_PPID	0x0031u		/* pmk8350@0 vadc@3100 */
+ #define MONDRIAN_SPMI_SDAM_PPID	0x0071u		/* pmk8350@0 sdam@7100 */
+ #define MONDRIAN_SPMI_SDAM_REASON 0x48u		/* restart reason, bits 7:1 */
++/*
++ * The PMK8350 RTC (rtc@6100) is two SPMI peripherals: the time registers in
++ * the 0x61 page and the alarm in 0x62, the same split Linux's rtc-pm8xxx
++ * sees through its 16-bit regmap. The port read 467613 s from it once, so
++ * the bus answers; the value is just not a wall clock until someone sets it.
++ */
++#define MONDRIAN_SPMI_RTC_PPID		0x0061u
++#define MONDRIAN_SPMI_RTC_ALARM_PPID	0x0062u
++#define MONDRIAN_SPMI_RTC_WRITE		0x40u	/* four bytes, LSB first */
++#define MONDRIAN_SPMI_RTC_CTRL		0x46u	/* bit 7: RTC enable */
++#define MONDRIAN_SPMI_RTC_READ		0x48u	/* four bytes, LSB first */
++#define MONDRIAN_SPMI_RTC_ALARM_CTRL	0x46u	/* bit 7: alarm enable */
++#define MONDRIAN_SPMI_RTC_ENABLE	0x80u
+ 
+ #define MONDRIAN_SPMI_VBAT_SID	3		/* PM8350B */
+ #define MONDRIAN_SPMI_VBAT_CHAN	0x8fu		/* ADC7 vbat_sns */
+@@ -86,6 +99,8 @@
+ 
+ static volatile uint32_t *sp_core, *sp_cnfg, *sp_obs;
+ static uint32_t sp_count;
++static uint32_t sp_version;
++static bool sp_rtc_reported;
+ static uint32_t sp_obs_stride = 0x20, sp_map_off = 0x2000, sp_owner_off = 0;
+ static uint16_t sp_pon = 0xffffu, sp_gpio = 0xffffu;
+ static int sp_disabled;
+@@ -543,26 +558,30 @@
+ 	}
+ }
+ 
+-void
+-mondrian_spmi_probe(void)
++/*
++ * The arbiter's windows and the APID count, mapped once. IOKitInitializeTime()
++ * reads the RTC from bsd_init before mondrian_spmi_probe() runs (the root
++ * mount is later), so the mapping is made on first use and every later caller
++ * -- the probe, the clock, the USB command -- shares it. A failed setup is
++ * remembered: asking ml_io_map again would leak another 4 KiB of io_submap.
++ */
++static int
++sp_ensure(void)
+ {
+ 	uint32_t version;
+-	uint8_t p = 0, g = 0;
+-	int enable = 1;
+-	thread_t thread;
+ 
+-	if (PE_parse_boot_argn("mondriankeys", &enable, sizeof(enable)) && enable == 0) {
+-		printf("MONDRIAN SPMI: keys disabled by mondriankeys=0\n");
+-		return;
++	if (sp_core != NULL && sp_cnfg != NULL && sp_obs != NULL) {
++		return sp_count != 0 && sp_count <= MONDRIAN_SPMI_COUNT_MAX;
+ 	}
+ 	sp_core = (volatile uint32_t *)ml_io_map(MONDRIAN_SPMI_CORE, MONDRIAN_SPMI_CORE_SIZE);
+ 	sp_cnfg = (volatile uint32_t *)ml_io_map(MONDRIAN_SPMI_CNFG, MONDRIAN_SPMI_CNFG_SIZE);
+ 	sp_obs = (volatile uint32_t *)ml_io_map(MONDRIAN_SPMI_OBS, MONDRIAN_SPMI_OBS_SIZE);
+ 	if (sp_core == NULL || sp_cnfg == NULL || sp_obs == NULL) {
+ 		printf("MONDRIAN SPMI: mapping failed\n");
+-		return;
++		return 0;
+ 	}
+ 	version = sp_rd(sp_core, 0);
++	sp_version = version;
+ 	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+ 	if (version >= 0x70000000u) {
+ 		sp_obs_stride = 0x20;
+@@ -574,12 +593,45 @@
+ 		sp_owner_off = 0x700;
+ 	} else {
+ 		printf("MONDRIAN SPMI: unsupported arbiter 0x%x\n", version);
+-		return;
++		return 0;
+ 	}
+ 	if (sp_count == 0 || sp_count > MONDRIAN_SPMI_COUNT_MAX) {
+ 		printf("MONDRIAN SPMI: bad APID count %u\n", sp_count);
++		return 0;
++	}
++	return 1;
++}
++
++/*
++ * The APID's owner bits: 0 is the AP. Writing a peripheral another processor
++ * owns is what wedged the arbiter when the charger was tried, so the RTC
++ * write refuses anything that is not ours.
++ */
++static uint32_t
++sp_apid_owner(uint16_t apid)
++{
++	if (sp_cnfg == NULL) {
++		return 7;
++	}
++	return sp_rd(sp_cnfg, sp_owner_off + 4u * apid) & 7u;
++}
++
++void
++mondrian_spmi_probe(void)
++{
++	uint32_t version;
++	uint8_t p = 0, g = 0;
++	int enable = 1;
++	thread_t thread;
++
++	if (PE_parse_boot_argn("mondriankeys", &enable, sizeof(enable)) && enable == 0) {
++		printf("MONDRIAN SPMI: keys disabled by mondriankeys=0\n");
+ 		return;
+ 	}
++	if (!sp_ensure()) {
++		return;
++	}
++	version = sp_version;
+ 	sp_pon = sp_find_apid(MONDRIAN_SPMI_PON_PPID);
+ 	sp_gpio = sp_find_apid(MONDRIAN_SPMI_GPIO_PPID);
+ 	if (sp_pon == 0xffffu || sp_gpio == 0xffffu) {
+@@ -612,3 +664,148 @@
+ 	printf("MONDRIAN SPMI: keys arb 0x%x APIDs %u pon %u gpio %u status 0x%02x/0x%02x\n",
+ 	    version, sp_count, sp_pon, sp_gpio, p, g);
+ }
++
++/*
++ * One byte into an AP-owned peripheral's channel window, the same transaction
++ * mondrian_spmi_set_restart_reason() uses for the SDAM: data at +0x10, the
++ * register in the command at +0x00, completion and fault in the status at
++ * +0x08. 1 = done.
++ */
++static int
++sp_chan_write(volatile uint32_t *q, uint32_t off, uint32_t val)
++{
++	uint32_t st = 0;
++
++	q[0x10 / 4] = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	q[0] = (off & 0xffu) << 4;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (uint32_t i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++		st = q[0x08 / 4];
++		if (st & 1u) {
++			return (st & 0x0eu) == 0;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++/*
++ * The RTC's seconds: four bytes at 0x48, LSB first, read one at a time
++ * through the observer window (the same path as the keys). The LSB is read
++ * again to catch a carry between the four transactions, which is what
++ * rtc-pm8xxx does.
++ */
++int
++mondrian_spmi_rtc_read(uint32_t *secs)
++{
++	uint16_t apid;
++	uint8_t b[4], lsb;
++	uint32_t v;
++
++	if (secs == NULL || !sp_ensure()) {
++		return 0;
++	}
++	apid = sp_find_apid(MONDRIAN_SPMI_RTC_PPID);
++	if (apid == 0xffffu) {
++		if (!sp_rtc_reported) {
++			sp_rtc_reported = true;
++			printf("MONDRIAN RTC: no APID for peripheral 0x61\n");
++		}
++		return 0;
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		if (!sp_read(apid, MONDRIAN_SPMI_RTC_READ + i, &b[i])) {
++			return 0;
++		}
++	}
++	if (!sp_read(apid, MONDRIAN_SPMI_RTC_READ, &lsb)) {
++		return 0;
++	}
++	if (lsb < b[0]) {
++		for (uint32_t i = 0; i < 4; i++) {
++			if (!sp_read(apid, MONDRIAN_SPMI_RTC_READ + i, &b[i])) {
++				return 0;
++			}
++		}
++	}
++	v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
++	    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++	if (!sp_rtc_reported) {
++		sp_rtc_reported = true;
++		printf("MONDRIAN RTC: apid %u raw %u owner %u\n", apid, v,
++		    sp_apid_owner(apid));
++	}
++	*secs = v;
++	return 1;
++}
++
++/*
++ * Setting the RTC, in Linux rtc-pm8xxx's order: alarm out of the way, RTC
++ * disabled, LSB 0, bytes 1..3, LSB, RTC enabled. The alarm is only checked,
++ * not cleared: if it is armed, the time is left alone and the reason is
++ * printed. The write goes through the channel window of the APID the map
++ * says is the AP's; any other owner is refused before a byte is sent.
++ */
++int
++mondrian_spmi_rtc_write(uint32_t secs)
++{
++	uint16_t apid, alarm_apid;
++	volatile uint32_t *q;
++	uint8_t ctrl = 0, alarm = 0;
++
++	if (!sp_ensure()) {
++		return 0;
++	}
++	apid = sp_find_apid(MONDRIAN_SPMI_RTC_PPID);
++	if (apid == 0xffffu) {
++		printf("MONDRIAN RTC: no APID to write\n");
++		return 0;
++	}
++	if (sp_apid_owner(apid) != 0) {
++		printf("MONDRIAN RTC: peripheral 0x61 is owned by %u, not the AP\n",
++		    sp_apid_owner(apid));
++		return 0;
++	}
++	alarm_apid = sp_find_apid(MONDRIAN_SPMI_RTC_ALARM_PPID);
++	if (alarm_apid != 0xffffu && sp_apid_owner(alarm_apid) == 0 &&
++	    sp_read(alarm_apid, MONDRIAN_SPMI_RTC_ALARM_CTRL, &alarm) &&
++	    (alarm & MONDRIAN_SPMI_RTC_ENABLE) != 0) {
++		printf("MONDRIAN RTC: alarm enabled (0x%02x), time not touched\n",
++		    alarm);
++		return 0;
++	}
++	if (!sp_read(apid, MONDRIAN_SPMI_RTC_CTRL, &ctrl)) {
++		printf("MONDRIAN RTC: control read failed\n");
++		return 0;
++	}
++	q = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++	    MONDRIAN_SPMI_CHNLS_SIZE);
++	if (q == NULL) {
++		printf("MONDRIAN RTC: no window for apid %u\n", apid);
++		return 0;
++	}
++	if (!sp_chan_write(q, MONDRIAN_SPMI_RTC_CTRL,
++	    ctrl & ~MONDRIAN_SPMI_RTC_ENABLE) ||
++	    !sp_chan_write(q, MONDRIAN_SPMI_RTC_WRITE, 0)) {
++		printf("MONDRIAN RTC: disable failed\n");
++		return 0;
++	}
++	for (uint32_t i = 1; i < 4; i++) {
++		if (!sp_chan_write(q, MONDRIAN_SPMI_RTC_WRITE + i,
++		    (secs >> (8 * i)) & 0xffu)) {
++			printf("MONDRIAN RTC: byte %u failed\n", i);
++			return 0;
++		}
++	}
++	if (!sp_chan_write(q, MONDRIAN_SPMI_RTC_WRITE, secs & 0xffu) ||
++	    !sp_chan_write(q, MONDRIAN_SPMI_RTC_CTRL,
++	    ctrl | MONDRIAN_SPMI_RTC_ENABLE)) {
++		printf("MONDRIAN RTC: enable failed\n");
++		return 0;
++	}
++	printf("MONDRIAN RTC: wrote %u (ctrl 0x%02x -> 0x%02x)\n", secs,
++	    ctrl, ctrl | MONDRIAN_SPMI_RTC_ENABLE);
++	return 1;
++}
+--- a/bsd/dev/mondrian_clock.c
++++ b/bsd/dev/mondrian_clock.c
+@@ -19,8 +19,13 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern uint64_t ml_get_timebase(void);
++extern int mondrian_spmi_rtc_read(uint32_t *secs);
+ 
+-static uint64_t mondrian_utc_epoch;     /* 0 = no mondriantime argument */
++#define MONDRIAN_UTC_MIN	1577836800ull	/* 2020-01-01 */
++#define MONDRIAN_UTC_MAX	4102444800ull	/* 2100-01-01 */
++
++static uint64_t mondrian_utc_epoch;     /* 0 = neither source has answered */
++static int mondrian_rtc_bad;
+ static uint64_t mondrian_utc_ticks;     /* mach_absolute_time() when armed */
+ static uint64_t mondrian_utc_hz;        /* timebase; never 0 once armed */
+ 
+@@ -28,6 +33,9 @@
+ mondrian_utc_arm(void)
+ {
+ 	uint64_t v = 0;
++	uint32_t rtc = 0;
++	int rtc_on = 1;
++	const char *src = "the command line";
+ 
+ 	if (mondrian_utc_hz == 0) {
+ 		mondrian_utc_hz = ml_get_timebase();
+@@ -39,16 +47,37 @@
+ 		return;
+ 	}
+ 	/*
++	 * The board's only clock is the PMK8350 RTC (rtc@6100), read over SPMI
++	 * by mondrian_spmi.c. It was left at 467613 s (1975) by whatever wrote
++	 * it last, so a value outside 2020..2100 is not a wall clock: say so
++	 * once and let the command line have its chance. `mondrianrtc=0`
++	 * skips the read for a boot that must not touch the bus this early.
++	 *
+ 	 * PE_parse_boot_argn parses the value as a number into the destination
+ 	 * (argnumcpy), it does not copy the string: pass a uint64_t, not a
+ 	 * char buffer. Keep trying on every call: the first PEGetUTCTimeOfDay
+ 	 * can happen before the argument is reachable.
+ 	 */
+-	if (!PE_parse_boot_argn("mondriantime", &v, sizeof(v)) || v == 0) {
++	if (PE_parse_boot_argn("mondriantime", &v, sizeof(v)) && v != 0) {
++		src = "the command line";
++	} else if (PE_parse_boot_argn("mondrianrtc", &rtc_on, sizeof(rtc_on)) &&
++	    rtc_on == 0) {
++		v = 0;                  /* left at the epoch on purpose */
++	} else if (mondrian_spmi_rtc_read(&rtc)) {
++		if (rtc >= MONDRIAN_UTC_MIN && rtc < MONDRIAN_UTC_MAX) {
++			v = rtc;
++			src = "the RTC";
++		} else if (!mondrian_rtc_bad) {
++			mondrian_rtc_bad = 1;
++			printf("MONDRIAN CLOCK: rtc %u is not a wall clock\n", rtc);
++		}
++	}
++	if (v == 0) {
+ 		return;
+ 	}
+ 	mondrian_utc_epoch = v;
+ 	mondrian_utc_ticks = mach_absolute_time();
++	printf("MONDRIAN CLOCK: %llu from %s\n", (unsigned long long)v, src);
+ }
+ 
+ static uint64_t
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1202,6 +1202,49 @@
+  *   MONDR USB: brightness 2048 of 4095 fmt 8 dcs 0x51
+  * A level is required; the format defaults to 0 and the command to 0x51.
+  */
++/*
++ * "rtc" reads the PMK8350 RTC and "rtc set SECONDS" writes it, then moves the
++ * running clock to the same value so the status bar and every later
++ * gettimeofday follow without a reboot. The host knows the real time; the
++ * phone's RTC was left at 1975, and no network exists yet to supply one.
++ */
++static void
++ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_spmi_rtc_read(uint32_t *secs);
++	extern int mondrian_spmi_rtc_write(uint32_t secs);
++	uint32_t secs = 0;
++	char out[128];
++	int n;
++
++	if (strncmp(line, "rtc set ", 8) == 0) {
++		if (ud_cmd_num(line + 8, &secs) == NULL) {
++			n = snprintf(out, sizeof(out), "rtc set needs seconds\n");
++		} else if (mondrian_spmi_rtc_write(secs)) {
++			clock_set_calendar_microtime((clock_sec_t)secs, 0);
++			n = snprintf(out, sizeof(out), "rtc set %u\n", secs);
++		} else {
++			/*
++			 * The PMK8350 keeps time for the secure world, which does
++			 * not hand the AP the time peripheral (measured: the
++			 * owner is 4), so the write is refused. The running clock
++			 * still moves, which is what the status bar shows:
++			 * clock_set_calendar_microtime() ends in
++			 * PESetUTCTimeOfDay() -> mondrian_pe_set_utc().
++			 */
++			clock_set_calendar_microtime((clock_sec_t)secs, 0);
++			n = snprintf(out, sizeof(out),
++			    "rtc set %u not ours; clock set\n", secs);
++		}
++	} else if (!mondrian_spmi_rtc_read(&secs)) {
++		n = snprintf(out, sizeof(out), "rtc read failed\n");
++	} else {
++		n = snprintf(out, sizeof(out), "rtc %u\n", secs);
++	}
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_bl(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -1532,6 +1575,9 @@
+ 				 */
+ 				printf("MONDRIAN MARK: %s\n", cmd + 4);
+ 				ud_cmd_send(so, peer, "ok\n", 3);
++			} else if (strcmp(cmd, "rtc") == 0 ||
++			    strncmp(cmd, "rtc ", 4) == 0) {
++				ud_cmd_rtc(so, peer, cmd);
+ 			} else if (strcmp(cmd, "reboot") == 0) {
+ 				extern void mondrian_reboot_to_fastboot(void);
+ 

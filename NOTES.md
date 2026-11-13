@@ -37,17 +37,23 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   error on disk.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
-  `tools/usb-ring.py` dumps the ring, photographs the panel (`screen`), injects
-  `tap`/`swipe`/`key`, measures the glass's frame rate (`fps`) and prints `mem`;
-  `tools/ios-usbnet.sh` sets the host up and streams udp/5140. A cold boot now
-  enumerates: `0312` makes the DWC3 reset (PHY powered, PIPE clock from UTMI)
-  and `0313` votes the eUSB2 repeater's rails, which only ABL's fastboot did
-  before. The repeater answers nothing on i2c5 even when powered, so the rails
-  are the whole bring-up; `mondrianusbfallback=N` still returns to fastboot.
+  `tools/usb-ring.py` dumps the ring, photographs the panel, injects input and
+  reboots to the bootloader. `tools/ios-usbnet.sh` sets the host up, NATs the
+  link and streams udp/5140; names resolve only once the hook publishes
+  `State:/Network/Service/mondrian-usb/{IPv4,DNS}` in configd's store -- iOS
+  never reads `/etc/resolv.conf`, so TCP answered while DNS did not. A cold boot
+  now enumerates: `0312` makes the DWC3 reset (PHY powered, PIPE clock from
+  UTMI) and `0313` votes the eUSB2 repeater's rails. The repeater answers
+  nothing on i2c5 even when powered; `mondrianusbfallback=N` returns to fastboot.
+- **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) reads 268 671 s
+  (1975) and belongs to another processor (owner 4), so a write is refused:
+  `mondriantime=<seconds>` seeds the date and `rtc set SECONDS` moves the running
+  clock (`0315`). Nothing sets the zone, so iOS uses `America/Los_Angeles`; the
+  hook points `/var/db/timezone/localtime` at `Europe/Madrid` and resets
+  `NSTimeZone`.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
-  processes and `0112` injects the UI dylib per daemon (`mondrian_ui_hook`).
-  `0090` adds WRITE(10) and the write path; `DKIOCISWRITABLE` must agree or HFS
-  disables writes.
+  processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
+  `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
   (480x1066 pt at scale 3) and the tick holds two records (`0282`).
   CoreAnimation needs `TimingElements`/`ColorElements` and an `IOAcceleratorES`
@@ -59,18 +65,15 @@ Current blockers, in order:
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
    reads 58 % where Android said 36 %).
-2. **The compositor draws.** Not seen since the secure-mode switch: 8 cold boots
-   (2026-11-13) enumerated in ~27 s each, drew the home screen and answered a
-   tap. `fps 0` at rest is a still screen; a tap proves a boot.
-3. **Control Center.** The grid is 430 pt wide whatever the screen is (a 375 pt
+2. **Control Center.** The grid is 430 pt wide whatever the screen is (a 375 pt
    model: `CCUIModuleCollectionView` at x=0 in the `CCUIScrollView`, 77 pt
    modules, 16 pt gaps). Widening it breaks the present; centring it with a left
    and right `contentInset` works, but only from the main queue -- writing that
    inset inside `-layoutSubviews` re-enters the sheet's layout and freezes the
-   panel. Buttons work (a tap lands on `CCUIRoundButton`); the brightness slider
-   arrives with interaction off and its module never calls a setter, so the hook
-   wakes it and bridges it to the panel. Volume is MediaRemoteUI's: dead.
-4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
+   panel. The brightness slider arrives with interaction off and its module never
+   calls a setter, so the hook wakes it and bridges it to the panel; the volume
+   slider is MediaRemoteUI's and is dimmed until there is audio.
+3. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting
 
@@ -180,14 +183,11 @@ time:
 | `LOADER ramdisk overlaps kernel memory` | `virt_base` must sit one L2 block (32 MiB) below the text, so the kernel image reaches past a fixed 32 MiB scratch offset and the ramdisk copy overwrites the payload it reads from | `shim/loader.c` (unpack at the top of the window) |
 | no console at all after the shim | the granule is `BOARD_PG_SHIFT`: TCR TG0/TG1, 2048-entry tables, 32 MiB blocks | `shim/board.h`, `shim/mmu.c` |
 
-The 4 KiB era left `0056`/`0057`/`0062` (commpage, zone map VA, 32 MiB low globals); they still apply.
-
 **QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is an
 *undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg gives), so
 `0061` drops the write; the virtual timer fires once the guest unmasks it for
 EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing IMASK or the
-level-sensitive PPI storms. With no RTC service, `IOKitInitializeTime()`'s 30 s
-`IORTC` wait is skipped on this board.
+level-sensitive PPI storms.
 
 **Instructions the platform does not have.** With `-march=armv8.5-a+crypto` the
 kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer

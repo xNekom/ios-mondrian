@@ -39,6 +39,10 @@ extern const char *xpc_connection_get_name(xpc_connection_t connection);
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 
 /*
  * The daemons' stderr is /dev/null, so the traces go to the system console:
@@ -4705,16 +4709,41 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 		return 0;
 	}
 	if (name != NULL && strstr(name, "SliderView") != NULL) {
-		BOOL enabled = ((BOOL (*)(id, SEL))objc_msgSend)(view,
-		    sel_registerName("isUserInteractionEnabled"));
-
-		if (!enabled) {
-			((void (*)(id, SEL, BOOL))objc_msgSend)(view,
-			    sel_registerName("setUserInteractionEnabled:"), YES);
-			woken++;
-		}
 		if (strstr(name, "CCUI") != NULL) {
+			BOOL enabled = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("isUserInteractionEnabled"));
+
+			if (!enabled) {
+				((void (*)(id, SEL, BOOL))objc_msgSend)(view,
+				    sel_registerName("setUserInteractionEnabled:"), YES);
+				woken++;
+			}
 			mondrian_cc_bridge_slider(view);
+		} else {
+			/*
+			 * MediaRemoteUI's volume slider: its module talks to the
+			 * media stack, which this port does not have, so a drag
+			 * moves the control and changes nothing. Dim it and keep
+			 * the finger off it until audio exists; a slider that
+			 * answers but does nothing reads as a broken phone.
+			 *
+			 * The module owns a second, hidden slider for its
+			 * expanded state; dimming that one makes it appear at the
+			 * sheet's right edge (measured), so only a visible one is
+			 * touched.
+			 */
+			BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("isHidden"));
+			double alpha = ((double (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("alpha"));
+
+			if (!hidden && alpha > 0.05) {
+				((void (*)(id, SEL, BOOL))objc_msgSend)(view,
+				    sel_registerName("setUserInteractionEnabled:"),
+				    NO);
+				((void (*)(id, SEL, double))objc_msgSend)(view,
+				    sel_registerName("setAlpha:"), 0.35);
+			}
 		}
 	}
 	kids = mondrian_send(view, "subviews");
@@ -4724,6 +4753,47 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 		    [(NSArray *)kids objectAtIndex:i], depth + 1);
 	}
 	return woken;
+}
+
+/*
+ * One dump of the whole sheet, once per boot, on the frame that first sees it:
+ * the banding question is whether the sheet's material covers the screen or
+ * stops short, and that is a frame, not a colour. Depth 12 with 70 lines was
+ * enough to reach the grid on this layout (a cap of 9 hid the sliders).
+ */
+static unsigned mondrian_cc_dump_lines;
+
+static void
+mondrian_cc_dump(id view, unsigned depth)
+{
+	const char *name = object_getClassName(view);
+	id kids;
+	unsigned n, i;
+
+	if (view == nil || depth > 12 || mondrian_cc_dump_lines > 70) {
+		return;
+	}
+	{
+		BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("isHidden"));
+		double alpha = ((double (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("alpha"));
+		CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("frame"));
+		char line[192];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN CC %u %s %.0f,%.0f %.0fx%.0f h%d a%.2f\n",
+		    depth, name != NULL ? name : "?", f.origin.x, f.origin.y,
+		    f.size.width, f.size.height, hidden ? 1 : 0, alpha);
+		say(line);
+		mondrian_cc_dump_lines++;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_cc_dump([(NSArray *)kids objectAtIndex:i], depth + 1);
+	}
 }
 
 static void
@@ -4773,6 +4843,17 @@ mondrian_cc_main_pass(void)
 		if (!hidden) {
 			unsigned woken = mondrian_cc_wake_sliders(win, 0);
 
+			if (mondrian_cc_dump_lines == 0) {
+				CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(win,
+				    sel_registerName("bounds"));
+				char line[128];
+
+				snprintf(line, sizeof(line),
+				    "MONDRIAN CC window %s %.0fx%.0f\n", wclass,
+				    b.size.width, b.size.height);
+				say(line);
+				mondrian_cc_dump(win, 0);
+			}
 			if (woken != 0 && told_woken == 0) {
 				told_woken = 1;
 				say("MONDRIAN UI: cc sliders woken\n");
@@ -5627,6 +5708,547 @@ mondrian_ax_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * The iOS SDK trims <net/route.h>, so the routing-message layout is written
+ * here. It is the stable ABI of route_output(): a fixed 84-byte header (the
+ * rt_metrics block included) followed by the sockaddrs the rtm_addrs bits
+ * name, in bit order.
+ */
+struct mondrian_rtmsg {
+	struct {
+		unsigned short msglen;
+		unsigned char version;
+		unsigned char type;
+		unsigned short index;
+		int flags;
+		int addrs;
+		int pid;
+		int seq;
+		int err;
+		int use;
+		unsigned int inits;
+		struct {
+			unsigned int locks;
+			unsigned int mtu;
+			unsigned int hopcount;
+			int expire;
+			unsigned int recvpipe;
+			unsigned int sendpipe;
+			unsigned int ssthresh;
+			unsigned int rtt;
+			unsigned int rttvar;
+			unsigned int pksent;
+			unsigned int state;
+			unsigned int filler[3];
+		} rmx;
+	} hdr;
+	struct sockaddr_in dst;
+	struct sockaddr_in gw;
+	struct sockaddr_in mask;
+};
+
+#define MONDRIAN_RTM_VERSION	5
+#define MONDRIAN_RTM_ADD	0x1
+#define MONDRIAN_RTA_DST	0x1
+#define MONDRIAN_RTA_GATEWAY	0x2
+#define MONDRIAN_RTA_NETMASK	0x4
+#define MONDRIAN_RTF_UP		0x1
+#define MONDRIAN_RTF_GATEWAY	0x2
+#define MONDRIAN_RTF_STATIC	0x800
+
+static const char *const mondrian_net_logs[] = {
+	"/private/var/tmp/mondrian-net.txt",
+	"/private/tmp/mondrian-net.txt",
+};
+
+static void
+mondrian_net_note(const char *line)
+{
+	unsigned i;
+	int wrote = 0;
+
+	/*
+	 * A root daemon's write to /dev/console stops reaching the ring once the
+	 * UI owns the console (measured: the same process's constructor line is
+	 * there, its 5 s thread line is not, while SpringBoard's thread lines
+	 * are). So the line also goes to a file that SpringBoard relays into the
+	 * ring, which is why it is readable in a dump.
+	 */
+	for (i = 0; i < sizeof(mondrian_net_logs) / sizeof(mondrian_net_logs[0]);
+	    i++) {
+		int f = open(mondrian_net_logs[i],
+		    O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		if (f >= 0) {
+			(void)write(f, line, strlen(line));
+			close(f);
+			wrote = 1;
+			break;
+		}
+	}
+	(void)wrote;
+	say(line);
+}
+
+/*
+ * The USB link is an Ethernet interface with 192.168.7.2/24 and no default
+ * route: the kernel sets the address for the debug channel and stops there.
+ * Behind the host's NAT at 192.168.7.1 the phone reaches the Internet over
+ * the cable, which is the only network a boot without WiFi or a modem has.
+ * The route goes in from a process that is root (containermanagerd); the
+ * resolver file is written too, and the two probes say whether the route
+ * works and whether getaddrinfo gets an answer, which separates "no route"
+ * from "no DNS" in one boot.
+ */
+static void
+mondrian_net_setup(void)
+{
+	int s, err = 0;
+	struct mondrian_rtmsg m;
+	char line[128];
+	int f;
+
+	s = socket(PF_ROUTE, SOCK_RAW, 0);
+	if (s < 0) {
+		mondrian_net_note("MONDRIAN NET: no route socket\n");
+	} else {
+		bzero(&m, sizeof(m));
+		m.hdr.msglen = sizeof(m);
+		m.hdr.version = MONDRIAN_RTM_VERSION;
+		m.hdr.type = MONDRIAN_RTM_ADD;
+		m.hdr.flags = MONDRIAN_RTF_UP | MONDRIAN_RTF_GATEWAY |
+		    MONDRIAN_RTF_STATIC;
+		m.hdr.addrs = MONDRIAN_RTA_DST | MONDRIAN_RTA_GATEWAY |
+		    MONDRIAN_RTA_NETMASK;
+		m.hdr.seq = 1;
+		m.dst.sin_len = sizeof(m.dst);
+		m.dst.sin_family = AF_INET;
+		m.dst.sin_addr.s_addr = htonl(0);               /* default */
+		m.gw.sin_len = sizeof(m.gw);
+		m.gw.sin_family = AF_INET;
+		m.gw.sin_addr.s_addr = htonl(0xc0a80701);       /* .7.1 */
+		m.mask.sin_len = sizeof(m.mask);
+		m.mask.sin_family = AF_INET;
+		m.mask.sin_addr.s_addr = htonl(0);
+		if (write(s, &m, sizeof(m)) < 0) {
+			err = errno;
+		}
+		close(s);
+		snprintf(line, sizeof(line),
+		    "MONDRIAN NET: default route 192.168.7.1 err %d\n", err);
+		mondrian_net_note(line);
+	}
+	f = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (f < 0) {
+		f = open("/private/var/run/resolv.conf",
+		    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	}
+	if (f >= 0) {
+		static const char dns[] = "nameserver 1.1.1.1\n"
+		    "nameserver 8.8.8.8\n";
+
+		(void)write(f, dns, sizeof(dns) - 1);
+		close(f);
+		mondrian_net_note("MONDRIAN NET: resolv.conf written\n");
+	} else {
+		snprintf(line, sizeof(line), "MONDRIAN NET: no resolv.conf (%d)\n",
+		    errno);
+		mondrian_net_note(line);
+	}
+}
+
+/*
+ * iOS never reads /etc/resolv.conf: configd owns the resolver and hands it to
+ * mDNSResponder through the dynamic store, and the same store tells CFNetwork
+ * which interface is the primary one. A link configd did not create gets
+ * neither -- it sees ue0's address but no service -- so the boot had TCP
+ * (`tcp 1.1.1.1:80 err 0`, measured) and no name resolution (`getaddrinfo`
+ * returned EAI_NONAME). Publish the service, its servers and the global
+ * primary service; configd forwards them and mDNSResponder answers.
+ *
+ * The keys are the literal property names, so CFSTR works and no
+ * SystemConfiguration symbol has to resolve at load time.
+ */
+static void
+mondrian_net_publish(void)
+{
+	typedef const void *(*create_f)(CFAllocatorRef, CFStringRef, const void *,
+	    const void *);
+	typedef unsigned char (*set_f)(const void *, CFStringRef, const void *);
+	void *handle;
+	create_f create;
+	set_f set_value;
+	const void *store;
+	CFMutableArrayRef addrs = NULL, masks = NULL, servers = NULL;
+	CFMutableDictionaryRef service = NULL, dns = NULL, global = NULL;
+	CFMutableDictionaryRef iface = NULL;
+	unsigned ok = 0;
+
+	handle = dlopen("/System/Library/Frameworks/SystemConfiguration.framework"
+	    "/SystemConfiguration", RTLD_LAZY);
+	if (handle == NULL) {
+		mondrian_net_note("MONDRIAN NET: no SystemConfiguration\n");
+		return;
+	}
+	create = (create_f)dlsym(handle, "SCDynamicStoreCreate");
+	set_value = (set_f)dlsym(handle, "SCDynamicStoreSetValue");
+	if (create == NULL || set_value == NULL) {
+		mondrian_net_note("MONDRIAN NET: no SCDynamicStore\n");
+		return;
+	}
+	store = create(NULL, CFSTR("mondrian-net"), NULL, NULL);
+	if (store == NULL) {
+		mondrian_net_note("MONDRIAN NET: no dynamic store\n");
+		return;
+	}
+	addrs = CFArrayCreateMutable(NULL, 1, &kCFTypeArrayCallBacks);
+	masks = CFArrayCreateMutable(NULL, 1, &kCFTypeArrayCallBacks);
+	servers = CFArrayCreateMutable(NULL, 2, &kCFTypeArrayCallBacks);
+	service = CFDictionaryCreateMutable(NULL, 4, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	dns = CFDictionaryCreateMutable(NULL, 1, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	global = CFDictionaryCreateMutable(NULL, 3, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	iface = CFDictionaryCreateMutable(NULL, 3, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (addrs == NULL || masks == NULL || servers == NULL || service == NULL ||
+	    dns == NULL || global == NULL || iface == NULL) {
+		mondrian_net_note("MONDRIAN NET: no CF objects\n");
+		return;
+	}
+	CFArrayAppendValue(addrs, CFSTR("192.168.7.2"));
+	CFArrayAppendValue(masks, CFSTR("255.255.255.0"));
+	CFArrayAppendValue(servers, CFSTR("1.1.1.1"));
+	CFArrayAppendValue(servers, CFSTR("8.8.8.8"));
+
+	CFDictionarySetValue(service, CFSTR("Addresses"), addrs);
+	CFDictionarySetValue(service, CFSTR("SubnetMasks"), masks);
+	CFDictionarySetValue(service, CFSTR("Router"), CFSTR("192.168.7.1"));
+	CFDictionarySetValue(service, CFSTR("InterfaceName"), CFSTR("ue0"));
+	CFDictionarySetValue(dns, CFSTR("ServerAddresses"), servers);
+	CFDictionarySetValue(global, CFSTR("PrimaryService"),
+	    CFSTR("mondrian-usb"));
+	CFDictionarySetValue(global, CFSTR("PrimaryInterface"), CFSTR("ue0"));
+	CFDictionarySetValue(global, CFSTR("Router"), CFSTR("192.168.7.1"));
+	CFDictionarySetValue(iface, CFSTR("Addresses"), addrs);
+	CFDictionarySetValue(iface, CFSTR("SubnetMasks"), masks);
+
+	ok += set_value(store, CFSTR("State:/Network/Interface/ue0/IPv4"), iface);
+	ok += set_value(store, CFSTR("State:/Network/Service/mondrian-usb/IPv4"),
+	    service);
+	ok += set_value(store, CFSTR("State:/Network/Service/mondrian-usb/DNS"),
+	    dns);
+	ok += set_value(store, CFSTR("State:/Network/Global/IPv4"), global);
+	ok += set_value(store, CFSTR("State:/Network/Global/DNS"), dns);
+	if (ok != 5) {
+		char line[128];
+
+		snprintf(line, sizeof(line), "MONDRIAN NET: store keys %u of 5\n",
+		    ok);
+		mondrian_net_note(line);
+	}
+}
+
+/*
+ * Does UDP leave the phone at all? A bare A query for example.com to
+ * 1.1.1.1:53 separates "the resolver is not configured" from "port 53 is
+ * filtered": 0 is NOERROR, 3 NXDOMAIN, -1 no reply.
+ */
+static int
+mondrian_dns_query(void)
+{
+	static const char name[] = "example.com";
+	unsigned char q[96], a[512];
+	struct sockaddr_in to;
+	struct timeval tv;
+	fd_set rfds;
+	size_t len = 12;
+	const char *p = name;
+	int s, n, rcode = -1;
+
+	s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) {
+		return -2;
+	}
+	bzero(q, sizeof(q));
+	q[0] = 0x12;
+	q[1] = 0x34;
+	q[2] = 0x01;                    /* recursion desired */
+	q[5] = 0x01;                    /* one question */
+	for (;;) {
+		const char *dot = strchr(p, '.');
+		size_t l = dot != NULL ? (size_t)(dot - p) : strlen(p);
+
+		q[len++] = (unsigned char)l;
+		memcpy(q + len, p, l);
+		len += l;
+		if (dot == NULL) {
+			break;
+		}
+		p = dot + 1;
+	}
+	q[len++] = 0x00;                /* end of name */
+	q[len++] = 0x00;
+	q[len++] = 0x01;                /* type A */
+	q[len++] = 0x00;
+	q[len++] = 0x01;                /* class IN */
+
+	bzero(&to, sizeof(to));
+	to.sin_len = sizeof(to);
+	to.sin_family = AF_INET;
+	to.sin_port = htons(53);
+	to.sin_addr.s_addr = htonl(0x01010101);
+	if (sendto(s, q, len, 0, (struct sockaddr *)&to, sizeof(to)) < 0) {
+		close(s);
+		return -3;
+	}
+	FD_ZERO(&rfds);
+	FD_SET(s, &rfds);
+	tv.tv_sec = 3;
+	tv.tv_usec = 0;
+	if (select(s + 1, &rfds, NULL, NULL, &tv) == 1) {
+		n = (int)recv(s, a, sizeof(a), 0);
+
+		if (n >= 12 && a[0] == 0x12 && a[1] == 0x34) {
+			rcode = a[3] & 0x0f;
+		}
+	}
+	close(s);
+	return rcode;
+}
+
+static int
+mondrian_net_probe(void)
+{
+	struct sockaddr_in a;
+	struct timeval tv;
+	fd_set wfds;
+	char line[128];
+	int s, err = -1;
+
+	s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s >= 0) {
+		int rc;
+
+		fcntl(s, F_SETFL, O_NONBLOCK);
+		bzero(&a, sizeof(a));
+		a.sin_len = sizeof(a);
+		a.sin_family = AF_INET;
+		a.sin_port = htons(80);
+		a.sin_addr.s_addr = htonl(0x01010101);          /* 1.1.1.1 */
+		rc = connect(s, (struct sockaddr *)&a, sizeof(a));
+		if (rc == 0) {
+			err = 0;
+		} else if (errno == EINPROGRESS) {
+			FD_ZERO(&wfds);
+			FD_SET(s, &wfds);
+			tv.tv_sec = 3;
+			tv.tv_usec = 0;
+			if (select(s + 1, NULL, &wfds, NULL, &tv) == 1) {
+				socklen_t len = sizeof(err);
+
+				(void)getsockopt(s, SOL_SOCKET, SO_ERROR, &err,
+				    &len);
+			} else {
+				err = ETIMEDOUT;
+			}
+		} else {
+			err = errno;
+		}
+		close(s);
+	}
+	snprintf(line, sizeof(line), "MONDRIAN NET: tcp 1.1.1.1:80 err %d\n", err);
+	mondrian_net_note(line);
+	{
+		struct addrinfo hints, *res = NULL;
+		int rc, udp;
+
+		bzero(&hints, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		rc = getaddrinfo("example.com", "80", &hints, &res);
+		udp = mondrian_dns_query();
+		snprintf(line, sizeof(line),
+		    "MONDRIAN NET: dns example.com rc %d udp %d\n", rc, udp);
+		mondrian_net_note(line);
+		if (res != NULL) {
+			freeaddrinfo(res);
+		}
+		if (err == 0 && rc != 0) {
+			err = 1;        /* names still unresolved */
+		}
+	}
+	return err;
+}
+
+/*
+ * The clock is right and the zone is not: with no location fix iOS keeps
+ * Cupertino (UTC-8), so Madrid shows 02:24 when it is 11:24. The zone database
+ * ships in the root; nothing selects one. Point the localtime symlink at
+ * Europe/Madrid and let Foundation re-read it. Measured: the path the link
+ * carries decides what the status bar prints, and NSTimeZone caches it until
+ * `resetSystemTimeZone`.
+ */
+static void
+mondrian_tz_set(void)
+{
+	static const char *const dirs[] = {
+		"/var/db/timezone/zoneinfo",
+		"/usr/share/zoneinfo",
+	};
+	char target[160], now[160], line[256];
+	const char *dir = NULL;
+	ssize_t n;
+	unsigned i;
+
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		snprintf(target, sizeof(target), "%s/Europe/Madrid", dirs[i]);
+		if (access(target, R_OK) == 0) {
+			dir = dirs[i];
+			break;
+		}
+	}
+	n = readlink("/var/db/timezone/localtime", now, sizeof(now) - 1);
+	now[n >= 0 ? (size_t)n : 0] = '\0';
+	if (dir == NULL) {
+		snprintf(line, sizeof(line),
+		    "MONDRIAN TZ: no Europe/Madrid under timezone\n");
+		mondrian_net_note(line);
+		return;
+	}
+	if (strcmp(now, target) == 0) {
+		return;
+	}
+	snprintf(line, sizeof(line), "MONDRIAN TZ: localtime %s -> %s\n",
+	    n >= 0 ? now : "(none)", target);
+	mondrian_net_note(line);
+	(void)unlink("/private/var/db/timezone/localtime");
+	(void)symlink(target, "/private/var/db/timezone/localtime");
+}
+
+/*
+ * A Foundation that already read the old zone keeps it: the status bar is
+ * formatted once per minute and would go on printing Cupertino.
+ */
+static void
+mondrian_tz_announce(void)
+{
+	static const char name[] = "NSSystemTimeZoneDidChangeNotification";
+	Class tz = objc_getClass("NSTimeZone");
+	Class center_cls = objc_getClass("NSNotificationCenter");
+	Class string_cls = objc_getClass("NSString");
+	Method reset;
+	id center, note;
+
+	if (tz != Nil) {
+		reset = class_getClassMethod(tz, sel_registerName("resetSystemTimeZone"));
+		if (reset != NULL) {
+			((void (*)(id, SEL))method_getImplementation(reset))((id)tz,
+			    sel_registerName("resetSystemTimeZone"));
+		}
+	}
+	if (center_cls == Nil || string_cls == Nil) {
+		return;
+	}
+	center = ((id (*)(id, SEL))objc_msgSend)((id)center_cls,
+	    sel_registerName("defaultCenter"));
+	note = ((id (*)(id, SEL, const char *))objc_msgSend)((id)string_cls,
+	    sel_registerName("stringWithUTF8String:"), name);
+	if (center != nil && note != nil) {
+		((void (*)(id, SEL, id, id))objc_msgSend)(center,
+		    sel_registerName("postNotificationName:object:"), note, nil);
+		say("MONDRIAN TZ: announced\n");
+	}
+}
+
+static void
+mondrian_net_relay_pass(void)
+{
+	static off_t offset;
+	char buf[2048];
+	ssize_t n;
+	unsigned i;
+	int f = -1;
+
+	for (i = 0; i < sizeof(mondrian_net_logs) / sizeof(mondrian_net_logs[0]);
+	    i++) {
+		f = open(mondrian_net_logs[i], O_RDONLY);
+		if (f >= 0) {
+			break;
+		}
+	}
+	if (f < 0) {
+		return;
+	}
+	if (lseek(f, offset, SEEK_SET) < 0) {
+		close(f);
+		return;
+	}
+	n = read(f, buf, sizeof(buf) - 1);
+	close(f);
+	if (n <= 0) {
+		return;
+	}
+	offset += n;
+	buf[n] = '\0';
+	say(buf);
+}
+
+static void *
+mondrian_tz_thread(void *unused)
+{
+	int i;
+
+	(void)unused;
+	sleep(35);
+	dispatch_async(dispatch_get_main_queue(), ^{
+		mondrian_tz_announce();
+	});
+	/* Six minutes of relay covers the boot and the host's first attach. */
+	for (i = 0; i < 60; i++) {
+		sleep(6);
+		mondrian_net_relay_pass();
+	}
+	return NULL;
+}
+
+static void *
+mondrian_net_thread(void *unused)
+{
+	char line[128];
+	int attempt, err = -1;
+
+	(void)unused;
+
+	sleep(5);
+	if (geteuid() != 0) {
+		return NULL;
+	}
+	snprintf(line, sizeof(line), "MONDRIAN NET: setup uid %d prog %s\n",
+	    (int)geteuid(), getprogname());
+	say(line);
+	mondrian_tz_set();
+	mondrian_net_setup();
+	/*
+	 * The link only exists once the host attaches the phone, which happens
+	 * after the boot has finished, so one probe at startup says nothing.
+	 * Probe again every 20 s until both TCP and DNS answer, and stop there:
+	 * the first success is the answer and the lines stay in the ring.
+	 */
+	for (attempt = 0; attempt < 45; attempt++) {
+		sleep(attempt == 0 ? 3 : 20);
+		if (attempt % 4 == 0) {
+			mondrian_net_publish();
+		}
+		err = mondrian_net_probe();
+		if (err == 0) {
+			break;
+		}
+	}
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -5658,7 +6280,14 @@ mondrian_install_ui_hooks(void)
 	}
 	install_personas_hook();
 	/* The build tag: a boot that logs it proves which hook it is running. */
-	say("MONDRIAN UI: hook tag cc6\n");
+	{
+		char tag[128];
+
+		snprintf(tag, sizeof(tag),
+		    "MONDRIAN UI: hook tag cc11 uid %d prog %s\n",
+		    (int)geteuid(), getprogname());
+		say(tag);
+	}
 	install_display_diagnostic();
 	install_activation_hooks();
 	install_icon_probe();
@@ -5667,7 +6296,22 @@ mondrian_install_ui_hooks(void)
 	install_brightness_hooks();
 	install_screen_size_hooks();
 	install_touch_probe();
+	if (strcmp(getprogname(), "SpringBoard") == 0) {
+		pthread_t tz;
+
+		/* The zone file is written by a root daemon; Foundation re-reads it. */
+		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
+			pthread_detach(tz);
+		}
+	}
 	start_heartbeat();
+	if (!boot_arg_set("mondriannet=0")) {
+		pthread_t net;
+
+		if (pthread_create(&net, NULL, mondrian_net_thread, NULL) != 0) {
+			say("MONDRIAN NET: thread failed\n");
+		}
+	}
 	if (boot_arg_set("mondrianrescue=1")) {
 		pthread_t rescue;
 
