@@ -3356,6 +3356,24 @@ mondrian_dump_windows(const char *why)
 }
 
 /*
+ * What is on the glass, asked from UIKit rather than from the panel buffer.
+ * `usb-ring.py screen` reads the console HUD's memory, so it cannot say
+ * whether the composited frame is the lock screen, the home screen or nothing;
+ * the window list can, and it costs one boot. `mondrianwin=1`, SpringBoard
+ * only, once the UI has settled.
+ */
+static void *
+mondrian_window_watch(void *unused)
+{
+	(void)unused;
+	sleep(100);
+	mondrian_dump_windows("win watch");
+	sleep(10);
+	mondrian_dump_windows("win watch");
+	return NULL;
+}
+
+/*
  * There is no hook in the touch path any more. Patching
  * -[UIWindow hitTest:withEvent:] put the log inside every point test UIKit
  * makes and aborted SpringBoard (sig 6) within a handful of touches, with the
@@ -7274,7 +7292,7 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc31 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc32 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
@@ -7330,7 +7348,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc31 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc32 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
@@ -7357,6 +7375,13 @@ mondrian_install_ui_hooks(void)
 		/* The zone file is written by a root daemon; Foundation re-reads it. */
 		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
 			pthread_detach(tz);
+		}
+		if (boot_arg_set("mondrianwin=1")) {
+			pthread_t win;
+
+			if (pthread_create(&win, NULL, mondrian_window_watch, NULL) == 0) {
+				pthread_detach(win);
+			}
 		}
 		/*
 		 * The app-launch probe runs once per boot, after the home screen

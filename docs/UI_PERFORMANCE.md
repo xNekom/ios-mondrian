@@ -26,6 +26,15 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   held, and the UI stays in the launch transition: `fps 0` from then on. The
   launch probe therefore only runs with `mondrianprobe=1`; a boot without it is
   a boot whose screen keeps working.
+- **A black screen with only console text is a black frame, not a missing
+  frame.** The copy of the layer into the panel runs (`mode copy`, `panel n/60`
+  follows the content), so the glass shows whatever the layer holds. When the
+  GLES path stops submitting, that layer is black and the only text left is what
+  the kernel HUD wrote. Measured on one such boot: 2 323
+  `MESA: error: msm_dump_submit` plus 56 `flush_submit_list:135: submit
+  failed: -5`, while the driver reported `uc retired 0 of 2000`: the ring stopped
+  retiring, so every later frame is empty. `mondrian-gl: rate` falls to 0.0 a
+  second and `fps` follows it. This is a GPU problem, not a compositor one.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches
