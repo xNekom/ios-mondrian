@@ -34,7 +34,11 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   `MESA: error: msm_dump_submit` plus 56 `flush_submit_list:135: submit
   failed: -5`, while the driver reported `uc retired 0 of 2000`: the ring stopped
   retiring, so every later frame is empty. `mondrian-gl: rate` falls to 0.0 a
-  second and `fps` follows it. This is a GPU problem, not a compositor one.
+  second and `fps` follows it. This is a GPU problem, not a compositor one. The
+  `-5` is the driver's own gate timing out: `uc fence gate seq 2001 waits for
+  1953 … rptr 0x4669 wptr 0x4669 int 0x0`, and `0322`'s fence-page dump shows
+  every slot reading 0 while the CP had consumed the ring, so the fence the gate
+  waits for never appears where the driver looks and the ring stays full.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches
