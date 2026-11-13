@@ -67,8 +67,8 @@ Current blockers, in order:
    (37 pt left, 87 right; 77 pt modules, 16 pt gaps); widening it breaks the
    present, so it stays. Buttons work (a tap lands on `CCUIRoundButton`; airplane
    turns orange). The brightness slider ships with `userInteractionEnabled` NO and
-   its module never calls the brightness controller, so `mondriancg=1` re-enables
-   it and bridges its value to the panel; the volume slider is MediaRemoteUI's and
+   its module never calls the brightness controller, so the hook re-enables it
+   and bridges its value to the panel; the volume slider is MediaRemoteUI's and
    still dead. Never wrap a touch path: `hitTest:withEvent:` aborts SpringBoard.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 

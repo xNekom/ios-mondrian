@@ -4647,21 +4647,22 @@ mondrian_cc_retry_thread(void *unused)
 }
 
 /*
- * A vertical drag inside Control Center never reaches the sliders: the touch
- * begins on the module and is gone 200 ms later (the sendEvent log shows
- * `touch.view` going nil in the middle of the drag), which is the scroll view's
- * touch delay handing the touch to its pan instead. The sheet does not scroll on
- * a panel this tall (its grid fits), and its swipe affordance has to keep
- * working or the sheet cannot be pulled down at all, so only the delay and the
- * scrolling go: `mondriancg=1`.
- */
-/*
- * The sliders are the sheet's own controls and one of them arrives dead: the
- * brightness slider is `CCUIContinuousSliderView ... ui 0`, user interaction
- * off, while the volume slider next to it is enabled and wired (valueChanged,
- * one target). Nothing in the tree explains the difference, so the pass turns
- * interaction back on for every Control Center slider and lets the module's own
- * action do the work.
+ * The sheet's sliders need three small corrections, all applied from here once a
+ * second while the sheet is open:
+ *
+ * - a vertical drag never reached them: the touch began on the module and was
+ *   gone 200 ms later (the sendEvent log shows `touch.view` going nil in the
+ *   middle of the drag), the scroll view's touch delay handing it to its pan.
+ *   The sheet does not scroll on a panel this tall -- its grid fits -- so the
+ *   scrolling and the delay go, and the swipe affordance stays live or the
+ *   sheet cannot be pulled down at all;
+ * - the brightness slider arrives with `userInteractionEnabled` off
+ *   (`CCUIContinuousSliderView ... ui 0`) while the volume slider next to it is
+ *   enabled, so interaction is turned back on;
+ * - its module never calls a brightness setter, so each Control Center slider
+ *   gets one target of ours that hands its value to the panel.
+ *
+ * Always on: it only ever touches a visible Control Center window.
  */
 /*
  * A Control Center slider moves but nothing follows it: the module controller
@@ -4780,7 +4781,7 @@ mondrian_cc_gestures_pass(void)
 	id app, windows;
 	unsigned n, i;
 
-	if (!boot_arg_set("mondriancg=1") || app_cls == Nil) {
+	if (app_cls == Nil) {
 		return;
 	}
 	shared = class_getClassMethod(app_cls, sel_registerName("sharedApplication"));
@@ -4886,7 +4887,7 @@ install_screen_size_hooks(void)
 			say("MONDRIAN UI: cc retry thread failed\n");
 		}
 	}
-	if (boot_arg_set("mondriancg=1")) {
+	if (strcmp(getprogname(), "SpringBoard") == 0) {
 		pthread_t cg;
 
 		if (pthread_create(&cg, NULL, mondrian_cc_gesture_thread, NULL) != 0) {
