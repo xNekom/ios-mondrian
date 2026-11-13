@@ -25,6 +25,16 @@ Pro, SM8475) is the port being done here.
   secure-mode switch, and `CP_SET_SECURE_MODE` for the trusted→nonsecure
   transition all came from a patch or a driver that already solved them. A
   boot cycle costs minutes; the answer is often one search away.
+- **Instrument before you poke (policy, 2026-11-13).** A boot costs five minutes
+  and a wrong conclusion costs more. One dump that answers the whole question --
+  full view depth, `userInteractionEnabled`/`hidden`/`alpha` per view, and
+  `-[UIApplication sendEvent:]` for where a touch actually lands -- settles in
+  one boot what a dozen narrow probes cannot. Guard every generic selector sent
+  from a dump with `respondsToSelector:` (one unguarded `contentSize` on
+  `_UIScrollViewScrollIndicator` aborted SpringBoard and cost the boot), never
+  trust a truncation (a depth cap of nine made the Control Center look empty
+  when its content hangs below ten), and pick touch targets from the frames,
+  not from the pixels.
 - **Hardware safety outranks persistence (policy, 2026-10-25).** This phone is
   a dedicated test unit: the high-level partitions may be erased and flashed
   freely — including `userdata`, which holds the iOS root — without a

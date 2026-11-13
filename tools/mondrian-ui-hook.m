@@ -4663,6 +4663,82 @@ mondrian_cc_retry_thread(void *unused)
  * interaction back on for every Control Center slider and lets the module's own
  * action do the work.
  */
+/*
+ * A Control Center slider moves but nothing follows it: the module controller
+ * never calls the brightness controller (no `MONDRIAN UI: <setter> ...` line
+ * after a drag), so the only thing that changes is the control's own paint.
+ * The level has to reach the panel anyway -- CoreBrightness never comes up on
+ * this port -- so each sheet slider gets one target of ours that reads its
+ * value and hands it to the panel, the same way the brightness hook does. The
+ * volume slider is MediaRemoteUI's and is left alone: it needs the media stack,
+ * not this bridge.
+ */
+@interface MondrianCCSliderTarget : NSObject
+- (void)mondrianSliderChanged:(id)sender;
+@end
+
+static void
+mondrian_cc_slider_value(id slider)
+{
+	SEL sel = sel_registerName("value");
+	Method m = class_getInstanceMethod(object_getClass(slider), sel);
+	const char *types = m != NULL ? method_getTypeEncoding(m) : NULL;
+	const char *name = object_getClassName(slider);
+	double level;
+	char line[192];
+
+	if (types == NULL) {
+		return;
+	}
+	if (types[0] == 'f') {
+		level = (double)((float (*)(id, SEL))objc_msgSend)(slider, sel);
+	} else if (types[0] == 'd') {
+		level = ((double (*)(id, SEL))objc_msgSend)(slider, sel);
+	} else {
+		return;
+	}
+	snprintf(line, sizeof(line), "MONDRIAN UI: cc slider %s %.3f\n",
+	    name != NULL ? name : "?", level);
+	say(line);
+	mondrian_bl_apply("cc slider", level);
+}
+
+@implementation MondrianCCSliderTarget
+- (void)mondrianSliderChanged:(id)sender
+{
+	mondrian_cc_slider_value(sender);
+}
+@end
+
+static void
+mondrian_cc_bridge_slider(id slider)
+{
+	static void *seen[8];
+	static MondrianCCSliderTarget *target;
+	unsigned i;
+
+	for (i = 0; i < sizeof(seen) / sizeof(seen[0]); i++) {
+		if (seen[i] == (void *)slider) {
+			return;
+		}
+	}
+	if (target == nil) {
+		target = [[MondrianCCSliderTarget alloc] init];
+	}
+	if (target == nil) {
+		return;
+	}
+	((void (*)(id, SEL, id, SEL, unsigned long))objc_msgSend)(slider,
+	    sel_registerName("addTarget:action:forControlEvents:"), target,
+	    sel_registerName("mondrianSliderChanged:"), 1UL << 12);
+	for (i = 0; i < sizeof(seen) / sizeof(seen[0]); i++) {
+		if (seen[i] == NULL) {
+			seen[i] = (void *)slider;
+			break;
+		}
+	}
+}
+
 static unsigned
 mondrian_cc_wake_sliders(id view, unsigned depth)
 {
@@ -4682,6 +4758,9 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 			    sel_registerName("setUserInteractionEnabled:"), YES);
 			woken++;
 		}
+		if (strstr(name, "CCUI") != NULL) {
+			mondrian_cc_bridge_slider(view);
+		}
 	}
 	kids = mondrian_send(view, "subviews");
 	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
@@ -4695,12 +4774,11 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 static void
 mondrian_cc_gestures_pass(void)
 {
-	static unsigned open_passes;
+	static int told_woken;
 	Class app_cls = objc_getClass("UIApplication");
 	Method shared;
 	id app, windows;
 	unsigned n, i;
-	static int told_woken;
 
 	if (!boot_arg_set("mondriancg=1") || app_cls == Nil) {
 		return;

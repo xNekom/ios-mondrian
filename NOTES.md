@@ -66,10 +66,10 @@ Current blockers, in order:
    `CCUIModuleCollectionView` is 430 pt wide at x=0 in the `CCUIScrollView`
    (37 pt left, 87 right; 77 pt modules, 16 pt gaps); widening it breaks the
    present, so it stays. Buttons work (a tap lands on `CCUIRoundButton`; airplane
-   turns orange), sliders do not: the touch begins on
-   `CCUIContentModuleContentContainerView` and is gone 200 ms later, the scroll
-   view's touch delay handing it to its pan (`mondriancg=1` off). Never wrap a
-   touch path: `hitTest:withEvent:` aborts SpringBoard, `sendEvent:` is safe.
+   turns orange). The brightness slider ships with `userInteractionEnabled` NO and
+   its module never calls the brightness controller, so `mondriancg=1` re-enables
+   it and bridges its value to the panel; the volume slider is MediaRemoteUI's and
+   still dead. Never wrap a touch path: `hitTest:withEvent:` aborts SpringBoard.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting
