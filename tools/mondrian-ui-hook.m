@@ -4555,62 +4555,46 @@ mondrian_geom_report_thread(void *unused)
 }
 
 /*
- * Control Center's module grid is a fixed 430 pt wide whatever the screen is.
- * On this panel (480 pt) it sits at x=0 inside a full-width scroll view, which
- * leaves 37 pt on the left and 87 on the right, and the frames the sheet lays
- * out stop matching the pixels it draws -- the brightness and volume sliders
- * then take touches where they are not. Widen whatever the grid's scroll view
- * hosts to the scroll view's own width and let CCUI lay it out again. Opt-in
- * until a boot proves it (`mondrianccw=1`).
+ * Control Center's module grid is 430 pt wide whatever the screen is. On this
+ * panel (480 pt) it sits at x=0 inside a full-width scroll view, which leaves
+ * 37 pt on the left and 87 on the right: the sheet is not centred. Widening the
+ * grid was the obvious fix and broke the present (partial frames, one boot), so
+ * the whole sheet is shifted instead -- a left and right content inset of half
+ * the slack, which moves the drawing without touching a single frame.
  */
 static void (*mondrian_ccsv_orig)(id, SEL);
 static int mondrian_ccsv_busy;
 
 static void
-mondrian_ccsv_widen(id view, CGSize host)
-{
-	id kids;
-	unsigned n, i;
-	CGRect f;
-
-	if (view == nil) {
-		return;
-	}
-	f = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
-	if (f.size.width + 0.5 < host.width) {
-		f.size.width = host.width;
-		f.origin.x = 0;
-		((void (*)(id, SEL, CGRect))objc_msgSend)(view,
-		    sel_registerName("setFrame:"), f);
-		((void (*)(id, SEL))objc_msgSend)(view,
-		    sel_registerName("setNeedsLayout"));
-	}
-	kids = mondrian_send(view, "subviews");
-	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
-	for (i = 0; i < n; i++) {
-		mondrian_ccsv_widen([(NSArray *)kids objectAtIndex:i], host);
-	}
-}
-
-static void
 mondrian_ccsv_layout(id self, SEL cmd)
 {
 	CGRect b;
-	id kids;
-	unsigned n, i;
+	CGSize content;
+	mondrian_insets inset;
+	CGFloat pad;
 
 	if (mondrian_ccsv_orig != NULL) {
 		mondrian_ccsv_orig(self, cmd);
 	}
-	if (mondrian_ccsv_busy != 0 || !boot_arg_set("mondrianccw=1")) {
+	if (mondrian_ccsv_busy != 0) {
+		return;
+	}
+	b = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
+	content = ((CGSize (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("contentSize"));
+	if (b.size.width < 1.0 || content.width < 1.0 ||
+	    content.width + 1.0 >= b.size.width) {
 		return;
 	}
 	mondrian_ccsv_busy = 1;
-	b = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
-	kids = mondrian_send(self, "subviews");
-	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
-	for (i = 0; i < n; i++) {
-		mondrian_ccsv_widen([(NSArray *)kids objectAtIndex:i], b.size);
+	pad = (b.size.width - content.width) / 2.0;
+	inset = ((mondrian_insets (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("contentInset"));
+	if (inset.left != pad || inset.right != pad) {
+		inset.left = pad;
+		inset.right = pad;
+		((void (*)(id, SEL, mondrian_insets))objc_msgSend)(self,
+		    sel_registerName("setContentInset:"), inset);
 	}
 	mondrian_ccsv_busy = 0;
 }
@@ -4697,6 +4681,13 @@ mondrian_cc_slider_value(id slider)
 		level = ((double (*)(id, SEL))objc_msgSend)(slider, sel);
 	} else {
 		return;
+	}
+	/*
+	 * A DBV of 0 is a black panel, which reads as a dead phone: the sheet's
+	 * own minimum is where a finger stops, not where the light does.
+	 */
+	if (level < 0.05) {
+		level = 0.05;
 	}
 	snprintf(line, sizeof(line), "MONDRIAN UI: cc slider %s %.3f\n",
 	    name != NULL ? name : "?", level);
