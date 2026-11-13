@@ -39,6 +39,18 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   1953 … rptr 0x4669 wptr 0x4669 int 0x0`, and `0322`'s fence-page dump shows
   every slot reading 0 while the CP had consumed the ring, so the fence the gate
   waits for never appears where the driver looks and the ring stays full.
+- **The fence path itself works, and this is the ladder that rules things out.**
+  At bring-up the same page takes both writes: `cp memwrite … canary 0x600dc0de
+  fence 0x600dc0df` into memptr `+0x800` / `+0x810`, and `cp ib … canary
+  0x1b00dead fence 0x1b00deae`. The page's first word is the CP's own read
+  pointer and it keeps tracking the write pointer (`uc prog seq 1984 … sh
+  0x3e10` with `rptr 0x3e10 wptr 0x3e10`), so the CP still writes into that page
+  late in the boot. `cpfence=mem` was booted and changes nothing (same stuck
+  sequence, same zeros), so the fence opcode is not the difference either: the CP
+  parks at the end of one specific submission, before the fence packet, with
+  `int 0x0` and no `CP_HW_FAULT`. The next datum is `CP_STAT`, `CP_ME_STATUS`
+  and `CP_IB1_BASE/SIZE` read while it is parked, which name the buffer it
+  parked in.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches
