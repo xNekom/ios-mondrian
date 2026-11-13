@@ -2605,12 +2605,18 @@ mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 	n = depth < 10 ? depth : 10;
 	memset(line, ' ', n);
 	snprintf(line + n, sizeof(line) - n,
-	    "%s %.1fx%.1f at %.1f,%.1f abs %.1f,%.1f b %.1f,%.1f\n",
+	    "%s %.1fx%.1f abs %.1f,%.1f b %.1f,%.1f ui %d hid %d a %.2f\n",
 	    name != NULL ? name : "?", frame.size.width, frame.size.height,
-	    frame.origin.x, frame.origin.y, here.x, here.y,
-	    bounds.origin.x, bounds.origin.y);
+	    here.x, here.y, bounds.origin.x, bounds.origin.y,
+	    (int)((BOOL (*)(id, SEL))objc_msgSend)(view,
+		sel_registerName("isUserInteractionEnabled")),
+	    (int)((BOOL (*)(id, SEL))objc_msgSend)(view,
+		sel_registerName("isHidden")),
+	    (double)((CGFloat (*)(id, SEL))objc_msgSend)(view,
+		sel_registerName("alpha")));
 	say(line);
-	if (name != NULL && strstr(name, "ScrollView") != NULL) {
+	if (name != NULL && strstr(name, "ScrollView") != NULL &&
+	    [view respondsToSelector:sel_registerName("contentSize")]) {
 		CGSize content = ((CGSize (*)(id, SEL))objc_msgSend)(view,
 		    sel_registerName("contentSize"));
 		CGPoint offset = ((CGPoint (*)(id, SEL))objc_msgSend)(view,
@@ -2646,6 +2652,28 @@ mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 	}
 	kids = mondrian_send(view, "subviews");
 	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	if (name != NULL && strstr(name, "ModuleContainer") != NULL &&
+	    frame.size.width >= 160.0) {
+		id sublayers = layer != nil ? mondrian_send(layer, "sublayers") : nil;
+		unsigned lc = sublayers != nil ?
+		    (unsigned)[(NSArray *)sublayers count] : 0;
+		char line2[224];
+
+		snprintf(line2, sizeof(line2),
+		    "MONDRIAN UI: geom module %s %.0fx%.0f kids %u"
+		    " layer %s sublayers %u\n", name, frame.size.width,
+		    frame.size.height, n,
+		    layer != nil ? object_getClassName(layer) : "nil", lc);
+		say(line2);
+		for (i = 0; i < lc && i < 6; i++) {
+			id sl = [(NSArray *)sublayers objectAtIndex:i];
+
+			snprintf(line2, sizeof(line2),
+			    "MONDRIAN UI: geom module layer %u %s\n", i,
+			    object_getClassName(sl));
+			say(line2);
+		}
+	}
 	space.x = here.x - bounds.origin.x;
 	space.y = here.y - bounds.origin.y;
 	for (i = 0; i < n && *lines < 420; i++) {
@@ -2699,6 +2727,50 @@ mondrian_cc_module(id view, unsigned depth, CGPoint space,
 		}
 	}
 	return nil;
+}
+
+/*
+ * `mondriangeom=1` also asks the sheet where three points land, from the main
+ * thread: the touch path itself must not be wrapped (that aborted
+ * SpringBoard), but calling -hitTest:withEvent: on the sheet's window is an
+ * ordinary question with an ordinary answer. The points are the middle of the
+ * connectivity module, the middle of the brightness slider and a gap between
+ * modules, so a `nil` or a background view is all it takes to know the touch
+ * never reaches the modules.
+ */
+static void
+mondrian_cc_hits(id window)
+{
+	static const CGPoint points[3] = { { 122.0, 222.0 }, { 261.0, 408.0 },
+	    { 385.0, 600.0 } };
+	dispatch_semaphore_t sem;
+
+	[(id)window retain];
+	sem = dispatch_semaphore_create(0);
+	if (sem == NULL) {
+		return;
+	}
+	dispatch_async(dispatch_get_main_queue(), ^{
+		unsigned i;
+
+		for (i = 0; i < 3; i++) {
+			id hit = ((id (*)(id, SEL, CGPoint, id))objc_msgSend)(window,
+			    sel_registerName("hitTest:withEvent:"), points[i], nil);
+			char line[224];
+			BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("isHidden"));
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: cc hit %.0f,%.0f hid %d -> %s\n",
+			    points[i].x, points[i].y, (int)hidden,
+			    hit != nil ? object_getClassName(hit) : "nil");
+			say(line);
+		}
+		dispatch_semaphore_signal(sem);
+	});
+	dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+	    2000000000LL));
+	[(id)window release];
 }
 
 static void
@@ -2821,15 +2893,32 @@ mondrian_log_screen_geometry(void)
 			id window = [(NSArray *)windows objectAtIndex:i];
 			const char *name = object_getClassName(window);
 			unsigned lines = 0;
+			BOOL hidden;
 
 			if (name == NULL || (strstr(name, "ControlCenter") == NULL &&
 			    strstr(name, "CCUI") == NULL)) {
+				continue;
+			}
+			/*
+			 * SpringBoard keeps a hidden Control Center window around
+			 * before the sheet is ever shown; walking that one answers
+			 * nothing (its modules are not built and its hit tests are
+			 * nil by definition).
+			 */
+			hidden = ((BOOL (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("isHidden"));
+			if (hidden) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: geom cc window %s hidden\n",
+				    name);
+				say(line);
 				continue;
 			}
 			snprintf(line, sizeof(line),
 			    "MONDRIAN UI: geom cc window %s\n", name);
 			say(line);
 			mondrian_geom_walk(window, 0, &lines, CGPointZero);
+			mondrian_cc_hits(window);
 			if (boot_arg_set("mondriancctest=1")) {
 				mondrian_cc_activate(window);
 			}
@@ -5292,6 +5381,8 @@ mondrian_install_ui_hooks(void)
 		}
 	}
 	install_personas_hook();
+	/* The build tag: a boot that logs it proves which hook it is running. */
+	say("MONDRIAN UI: hook tag cc5\n");
 	install_display_diagnostic();
 	install_activation_hooks();
 	install_icon_probe();
