@@ -62,14 +62,14 @@ Current blockers, in order:
 2. **The compositor draws.** Not seen since the secure-mode switch: 8 cold boots
    (2026-11-13) enumerated in ~27 s each, drew the home screen and answered a
    tap. `fps 0` at rest is a still screen; a tap proves a boot.
-3. **Control Center.** The grid is laid out for a 375 pt model in a 480 pt panel:
-   `CCUIModuleCollectionView` is 430 pt wide at x=0 in the `CCUIScrollView`
-   (37 pt left, 87 right; 77 pt modules, 16 pt gaps); widening it breaks the
-   present, so it stays. Buttons work (a tap lands on `CCUIRoundButton`; airplane
-   turns orange). The brightness slider ships with `userInteractionEnabled` NO and
-   its module never calls the brightness controller, so the hook re-enables it
-   and bridges its value to the panel; the volume slider is MediaRemoteUI's and
-   still dead. Never wrap a touch path: `hitTest:withEvent:` aborts SpringBoard.
+3. **Control Center.** The grid is 430 pt wide whatever the screen is (a 375 pt
+   model: `CCUIModuleCollectionView` at x=0 in the `CCUIScrollView`, 77 pt
+   modules, 16 pt gaps). Widening it breaks the present; centring it with a left
+   and right `contentInset` works, but only from the main queue -- writing that
+   inset inside `-layoutSubviews` re-enters the sheet's layout and freezes the
+   panel. Buttons work (a tap lands on `CCUIRoundButton`); the brightness slider
+   arrives with interaction off and its module never calls a setter, so the hook
+   wakes it and bridges it to the panel. Volume is MediaRemoteUI's: dead.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
 
 ## Building and booting

@@ -4561,73 +4561,36 @@ mondrian_geom_report_thread(void *unused)
  * grid was the obvious fix and broke the present (partial frames, one boot), so
  * the whole sheet is shifted instead -- a left and right content inset of half
  * the slack, which moves the drawing without touching a single frame.
+ *
+ * The inset is written from the main-queue pass below, never from
+ * -layoutSubviews: a write there re-enters the layout the sheet is running and
+ * the sheet spends its time laying out (measured: a frozen panel).
  */
-static void (*mondrian_ccsv_orig)(id, SEL);
-static int mondrian_ccsv_busy;
-
 static void
-mondrian_ccsv_layout(id self, SEL cmd)
+mondrian_cc_centre(id scroll)
 {
 	CGRect b;
 	CGSize content;
 	mondrian_insets inset;
 	CGFloat pad;
 
-	if (mondrian_ccsv_orig != NULL) {
-		mondrian_ccsv_orig(self, cmd);
-	}
-	if (mondrian_ccsv_busy != 0) {
-		return;
-	}
-	b = ((CGRect (*)(id, SEL))objc_msgSend)(self, sel_registerName("bounds"));
-	content = ((CGSize (*)(id, SEL))objc_msgSend)(self,
+	b = ((CGRect (*)(id, SEL))objc_msgSend)(scroll, sel_registerName("bounds"));
+	content = ((CGSize (*)(id, SEL))objc_msgSend)(scroll,
 	    sel_registerName("contentSize"));
 	if (b.size.width < 1.0 || content.width < 1.0 ||
 	    content.width + 1.0 >= b.size.width) {
 		return;
 	}
-	mondrian_ccsv_busy = 1;
 	pad = (b.size.width - content.width) / 2.0;
-	inset = ((mondrian_insets (*)(id, SEL))objc_msgSend)(self,
+	inset = ((mondrian_insets (*)(id, SEL))objc_msgSend)(scroll,
 	    sel_registerName("contentInset"));
-	if (inset.left != pad || inset.right != pad) {
-		inset.left = pad;
-		inset.right = pad;
-		((void (*)(id, SEL, mondrian_insets))objc_msgSend)(self,
-		    sel_registerName("setContentInset:"), inset);
-	}
-	mondrian_ccsv_busy = 0;
-}
-
-static void
-install_cc_width_hook(void)
-{
-	Class cls = objc_getClass("CCUIScrollView");
-	Method m;
-
-	if (cls == Nil || mondrian_ccsv_orig != NULL) {
+	if (inset.left == pad && inset.right == pad) {
 		return;
 	}
-	m = class_getInstanceMethod(cls, sel_registerName("layoutSubviews"));
-	if (m == NULL) {
-		return;
-	}
-	mondrian_ccsv_orig = (void (*)(id, SEL))
-	    method_setImplementation(m, (IMP)mondrian_ccsv_layout);
-	say("MONDRIAN UI: cc width hook installed\n");
-}
-
-/* The framework loads with SpringBoard, but not always before this runs. */
-static void *
-mondrian_cc_retry_thread(void *unused)
-{
-	(void)unused;
-
-	for (unsigned i = 0; i < 40 && mondrian_ccsv_orig == NULL; i++) {
-		sleep(2);
-		install_cc_width_hook();
-	}
-	return NULL;
+	inset.left = pad;
+	inset.right = pad;
+	((void (*)(id, SEL, mondrian_insets))objc_msgSend)(scroll,
+	    sel_registerName("setContentInset:"), inset);
 }
 
 /*
@@ -4764,7 +4727,7 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 }
 
 static void
-mondrian_cc_gestures_pass(void)
+mondrian_cc_main_pass(void)
 {
 	static int told_woken;
 	Class app_cls = objc_getClass("UIApplication");
@@ -4804,6 +4767,7 @@ mondrian_cc_gestures_pass(void)
 				    sel_registerName("setScrollEnabled:"), NO);
 				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
 				    sel_registerName("setDelaysContentTouches:"), NO);
+				mondrian_cc_centre(v);
 			}
 		}
 		if (!hidden) {
@@ -4817,12 +4781,37 @@ mondrian_cc_gestures_pass(void)
 	}
 }
 
+static int mondrian_cc_pass_pending;
+
+/*
+ * Every UIKit change the sheet needs happens on the main thread: the pass only
+ * dispatches, and only when the previous one has finished, so a blocked main
+ * thread does not collect a queue of work it will run late.
+ */
+static void
+mondrian_cc_gestures_pass(void)
+{
+	if (mondrian_cc_pass_pending != 0) {
+		return;
+	}
+	mondrian_cc_pass_pending = 1;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		mondrian_cc_main_pass();
+		mondrian_cc_pass_pending = 0;
+	});
+}
+
 static void *
 mondrian_cc_gesture_thread(void *unused)
 {
 	(void)unused;
 
-	for (unsigned i = 0; i < 240; i++) {
+	/*
+	 * Forever, not for four minutes: the sheet builds new slider views every
+	 * time it is opened, and they arrive with interaction off. A pass that
+	 * stops leaves the next opening with a dead slider.
+	 */
+	for (;;) {
 		sleep(1);
 		mondrian_cc_gestures_pass();
 	}
@@ -4868,14 +4857,6 @@ install_screen_size_hooks(void)
 
 		if (pthread_create(&geom, NULL, mondrian_geom_report_thread, NULL) != 0) {
 			say("MONDRIAN UI: geometry thread failed\n");
-		}
-	}
-	install_cc_width_hook();
-	if (mondrian_ccsv_orig == NULL) {
-		pthread_t cc;
-
-		if (pthread_create(&cc, NULL, mondrian_cc_retry_thread, NULL) != 0) {
-			say("MONDRIAN UI: cc retry thread failed\n");
 		}
 	}
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
