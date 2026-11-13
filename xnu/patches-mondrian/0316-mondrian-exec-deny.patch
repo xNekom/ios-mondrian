@@ -1,0 +1,173 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7380,6 +7380,48 @@
+ 	string_size = strlcpy(path, exec_path, string_size);
+ 	return string_size;
+ }
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++/*
++ * Processes whose exec fails with EACCES, set once at boot from
++ * `mondriankill=<names>` (the value `quiet` selects the built-in list) and
++ * replaceable at run time from the USB channel (`kill <names>`, `kill off`).
++ * Names are '\0'-separated in place. The counters next to it are printed by
++ * the battery thread, so one boot says how much churn a change removed.
++ */
++char mondrian_exec_kill_list[224];
++
++#define MONDRIAN_EXEC_QUIET \
++	"calaccessd,SiriTTSSynthesizerAU,MacinTalkAUSP,KonaSynthesizer," \
++	"watchdogd,bluetoothd,fairplayd.H2,aggregated"
++
++static int
++mondrian_exec_kill_armed(const char *name)
++{
++	char *e;
++
++	for (e = mondrian_exec_kill_list; *e != '\0'; e += strlen(e) + 1) {
++		if (name != NULL && strcmp(e, name) == 0) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++void
++mondrian_exec_kill_set(const char *list)
++{
++	char *e;
++
++	strlcpy(mondrian_exec_kill_list, list != NULL ? list : "",
++	    sizeof(mondrian_exec_kill_list));
++	for (e = mondrian_exec_kill_list; *e != '\0'; e++) {
++		if (*e == ',') {
++			*e = '\0';
++		}
++	}
++}
++#endif
++
+ static void
+ exec_resettextvp(proc_t p, struct image_params *imgp)
+ {
+@@ -7582,6 +7624,29 @@
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++			{
++				extern unsigned mondrian_proc_execs;
++				extern unsigned mondrian_proc_denied;
++				static int kill_boot;
++				char arg[224];
++
++				if (!kill_boot) {
++					kill_boot = 1;
++					if (PE_parse_boot_argn("mondriankill", arg,
++					    sizeof(arg))) {
++						mondrian_exec_kill_set(
++						    strcmp(arg, "quiet") == 0 ?
++						    MONDRIAN_EXEC_QUIET : arg);
++					}
++				}
++				mondrian_proc_execs++;
++				if (mondrian_exec_kill_armed(p->p_name)) {
++					mondrian_proc_denied++;
++					printf("MONDRIAN EXEC: denied %s\n", p->p_name);
++					error = EACCES;
++					goto done;
++				}
++			}
+ 			/* MONDRIAN runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
+ #else
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -832,12 +832,17 @@
+  * header (offset = pc - mh). Called from proc_prepareexit on the exiting
+  * (crashing) thread.
+  */
++unsigned mondrian_proc_execs;
++unsigned mondrian_proc_crashes;
++unsigned mondrian_proc_denied;
++
+ void mondrian_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+ static void mondrian_crash_strings(const char *name);
+ 
+ void
+ mondrian_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+ {
++	mondrian_proc_crashes++;
+ 	thread_t thread = current_thread();
+ 	task_t task = current_task();
+ 	arm_saved_state_t *ss = find_user_regs(thread);
+--- a/iokit/Kernel/arm/MondrianPower.cpp
++++ b/iokit/Kernel/arm/MondrianPower.cpp
+@@ -33,6 +33,11 @@
+ 
+ extern "C" IOService *mondrian_fb_service(void);
+ 
++/* Counted by the BSD side (kern_exec.c and the crash report below). */
++extern "C" unsigned mondrian_proc_execs;
++extern "C" unsigned mondrian_proc_crashes;
++extern "C" unsigned mondrian_proc_denied;
++
+ #define MONDRIAN_BATT_MAH	5160u	/* the pack's design capacity */
+ #define MONDRIAN_BATT_TEMP	2500u	/* no thermometer; a constant */
+ 
+@@ -221,6 +226,8 @@
+ 	updateStatus();
+ 	IOLog("MONDRIAN BATT: %u mV %u%% (%u/%u mAh), external %d charging %d\n",
+ 	    mv, pct, cap, MONDRIAN_BATT_MAH, external, charging);
++	IOLog("MONDRIAN PROC: exec %u crash %u denied %u\n", mondrian_proc_execs,
++	    mondrian_proc_crashes, mondrian_proc_denied);
+ }
+ 
+ /*
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1208,6 +1208,36 @@
+  * gettimeofday follow without a reboot. The host knows the real time; the
+  * phone's RTC was left at 1975, and no network exists yet to supply one.
+  */
++/*
++ * "execdeny" prints the exec deny list, "execdeny off" empties it and
++ * "execdeny NAME[,NAME]" replaces it. The counters are cumulative, so one boot
++ * can run with the crash-loop jobs refused and then without them and compare
++ * the two rates. (Not `kill`: that already takes a pid.)
++ */
++static void
++ud_cmd_execdeny(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern char mondrian_exec_kill_list[];
++	extern void mondrian_exec_kill_set(const char *);
++	char out[256];
++	char *e;
++	size_t n = 0;
++	int i;
++
++	if (strncmp(line, "execdeny ", 9) == 0 && line[9] != '\0') {
++		mondrian_exec_kill_set(strcmp(line + 9, "off") == 0 ? "" :
++		    line + 9);
++	}
++	n = (size_t)snprintf(out, sizeof(out), "execdeny");
++	for (e = mondrian_exec_kill_list; *e != '\0' && n < sizeof(out) - 40;
++	    e += strlen(e) + 1) {
++		n += (size_t)snprintf(out + n, sizeof(out) - n, " %s", e);
++	}
++	i = snprintf(out + n, sizeof(out) - n, "\n");
++	ud_cmd_send(so, to, out, n + (size_t)i);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -1578,6 +1608,9 @@
+ 			} else if (strcmp(cmd, "rtc") == 0 ||
+ 			    strncmp(cmd, "rtc ", 4) == 0) {
+ 				ud_cmd_rtc(so, peer, cmd);
++			} else if (strcmp(cmd, "execdeny") == 0 ||
++			    strncmp(cmd, "execdeny ", 9) == 0) {
++				ud_cmd_execdeny(so, peer, cmd);
+ 			} else if (strcmp(cmd, "reboot") == 0) {
+ 				extern void mondrian_reboot_to_fastboot(void);
+ 

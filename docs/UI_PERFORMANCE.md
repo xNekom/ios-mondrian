@@ -95,6 +95,19 @@ draws nothing, so the delay a finger feels is the wake/first-frame path waiting
 behind this loop, not a low frame rate. Measure from a physical touch to the
 first `present`, not in frames per second.
 
+**Refusing the exec is what stops a job, not killing it.** `0316` refuses exec
+with EACCES for a list of names, set from `mondriankill=quiet` (the built-in
+list) and replaceable at run time with `execdeny NAME[,NAME]` and `execdeny off`
+on the USB channel. A refused exec produces no crash report and no restart, so
+launchd stops asking for the job: over two four-minute windows of one boot, the
+steady state without the list ran 194 execs and 96 crash lines, and with it 16
+execs and 1 crash, each of the eight names refused exactly once. The list is
+`calaccessd`, the three speech synthesisers, `watchdogd`, `bluetoothd`,
+`fairplayd.H2` and `aggregated`; the battery thread prints
+`MONDRIAN PROC: exec N crash M denied K` every sample, so a boot reports its own
+churn. The counters are cumulative, which is what makes the two windows
+comparable without a second boot.
+
 ### 3. The frame path is marginal
 
 Even with a quiet system, the median frame is 11.0 ms and a scroll's extra

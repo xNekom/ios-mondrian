@@ -263,19 +263,19 @@ fills the banks, the UFS host and the GIC from the same dump (`parse_facts`).
 
 ## Boot arguments
 
-The board table carries the default line (`tools/boards.py`,
-`BOARDS['mondrian'].cmdline`); do not copy it here. The less obvious ones:
+The board table carries the default line (`tools/boards.py`); the less obvious
+ones:
 
 | Boot-arg | Effect |
 | --- | --- |
 | `rd=ufsroot0 ufsrw=1 rootrw=1` | root on the `userdata` partition, writable |
-| `cpus=8` | every core the tree has, which is seven: the X2, the three A710s and three of the A510s. The A510 at Aff1 0 is where the firmware runs the shim; it is parked there and left out of the device tree (PSCI `CPU_OFF` does not take it down on this TZ). `cpus=1` is the safe fallback |
+| `cpus=8` | every core the tree has, which is seven: the X2, the three A710s and three of the A510s. The A510 at Aff1 0 runs the shim and is parked, left out of the device tree (PSCI `CPU_OFF` does not take it down on this TZ). `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
-| `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn) |
-| `mondrianfb_hz=60` | vsync rate the display presents at (the panel itself is 120 Hz) |
+| `mondrianfb_noconsole=1` `mondrianfb_hz=60` | stop drawing kernel text over the GUI (panics are still drawn); the vsync rate the display presents at, on a panel whose own rate is 120 Hz |
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen, re-requests it every minute, and holds the `UIApplication` idle timer |
+| `mondriankill=quiet` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable with `execdeny` |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 | length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
 

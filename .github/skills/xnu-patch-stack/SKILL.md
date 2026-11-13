@@ -55,6 +55,14 @@ diff -u --label a/bsd/dev/mondrian_ufs.c --label b/bsd/dev/mondrian_ufs.c \
   says what the previous boot proved and what the new build answers.
 - Keep `NOTES.md` (handoff) and `docs/MONDIAN_PORT.md` (work list) in the same
   commit when a patch changes the plan.
+- **A "redefinition" error means the series was applied twice, not that the
+  patch is wrong.** `build-kernel.sh` skips its reset when `$WORK/.series-state`
+  already holds the series hash, and `git reset --hard` alone leaves the files a
+  patch *creates* in place (they are untracked, so the next `git apply` appends a
+  second copy of every hunk it adds to them). Delete the state file and run
+  `git reset --hard && git clean -fdx` in the cache tree, then rebuild. A patch
+  that adds a command to `mondrian_usb.c` also needs a name that is not already
+  taken there -- `kill` is a pid.
 
 Reordering or rebasing: edit the staged tree until it matches the target
 state, then regenerate every patch that moved. `tools/apply-series.py` and

@@ -343,6 +343,14 @@ MONDRIAN = Board(
              # hardware has no saved brightness of its own, and CoreBrightness
              # starts from its own small value. A quarter of full scale.
              'mondrianbl=1024 mondrianblfmt=8 '
+             # Cut the jobs that abort in their own code on this port: the
+             # calendar daemon and the three speech synthesisers were about
+             # 400 of one boot's crashes, and each respawn costs a dyld load
+             # and a synchronous HFS+ read. The kernel refuses their exec
+             # (0316); `quiet` is the built-in list, any other value names
+             # processes. Not a number: PE_parse_boot_argn would store one as
+             # a binary integer instead of a string.
+             'mondriankill=quiet '
              'mondrianunlock=1'),
 )
 
