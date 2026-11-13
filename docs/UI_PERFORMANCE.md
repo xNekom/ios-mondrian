@@ -115,16 +115,20 @@ draws push the p90 past the period. This is the real cost once 1 and 2 are
 gone; the levers are the draw count and the copy-out path
 (`glflushdraws`, `glcopy`, `glfetch`), not the panel.
 
-### 4. Opening Safari stops the UI
+### 4. The UI can stop presenting, and then it stays dark
 
-Measured on one boot: tapping the Safari icon brings up its window with
-`google.com` in the address bar and a black page, `MobileSafari` exits 0x9, the
+Measured twice. Opening Safari brings up its window with `google.com` in the
+address bar and a black page, `MobileSafari` exits 0x9, the
 `com.apple.WebKit.WebContent` helper execs again, `pipelined` crashes, and from
-there `MONDRIAN FB: present 0/s` with `touch 0/s` -- presents stop and so does
-touch, while SpringBoard keeps its heartbeat and does not crash. The frame tick
-shows gaps of 2-40 s. WebKit needs the GPU path this port does not have
-(`docs/COREANIMATION_GLES.md`) and the UI never recovers: treat a Safari launch
-as a way to lose the boot, not as a browser.
+there `MONDRIAN FB: present 0/s` with `touch 0/s` while SpringBoard keeps its
+heartbeat and does not crash. The same end state happens with no app involved:
+after the panel blanks on its own, the screen stays black, `present 0/s`, and a
+tap does not wake it -- the touch driver is fine (`MONDRIAN TOUCH: points r0 497
+...`, `ev gap` grows) but nothing is dispatched (`ev 0/s`) and no frame is
+produced, so the wake, which is driven by a present, never happens. Treat a
+black panel with a live ring as this state, not as a dead kernel: the USB
+channel answers, and only a reset leaves it. The cause is open; the ring is what
+to read, and `MONDRIAN FB: present`/`ev` are the two numbers that name it.
 
 ## Measurement traps
 
