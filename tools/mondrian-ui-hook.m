@@ -2576,6 +2576,16 @@ mondrian_cc_normalize(id view, unsigned depth, unsigned *changed)
 	return *changed;
 }
 
+/*
+ * The window the touches land in, kept from the sendEvent probe: the sheet the
+ * finger reaches is not always the window `[UIApplication windows]` lists (a
+ * touch on the connectivity block reports `NSKVONotifying_CCUIRoundButton`
+ * inside `SBControlCenterWindow`, while walking that window shows empty module
+ * containers). Whatever window a Control Center touch arrives in is the one
+ * worth describing, so it is remembered here and the geometry thread walks it.
+ */
+static id mondrian_cc_touch_window;
+
 typedef struct {
 	CGFloat top;
 	CGFloat left;
@@ -2602,7 +2612,7 @@ mondrian_deep_walk(id view, unsigned depth, CGPoint space, unsigned *lines)
 	char extra[64] = "";
 	BOOL control;
 
-	if (view == nil || depth > 12 || *lines >= 140) {
+	if (view == nil || depth > 14 || *lines >= 200) {
 		return;
 	}
 	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
@@ -2659,7 +2669,7 @@ mondrian_deep_find(id view, unsigned depth, CGPoint space, unsigned found)
 	unsigned n, i;
 	const char *name = object_getClassName(view);
 
-	if (view == nil || depth > 9 || found >= 3) {
+	if (view == nil || depth > 14 || found >= 3) {
 		return found;
 	}
 	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
@@ -2696,7 +2706,7 @@ mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 	char line[224];
 	const char *name;
 
-	if (view == nil || depth > 9 || *lines >= 420) {
+	if (view == nil || depth > 14 || *lines >= 700) {
 		return;
 	}
 	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
@@ -2779,7 +2789,7 @@ mondrian_geom_walk(id view, unsigned depth, unsigned *lines, CGPoint space)
 	}
 	space.x = here.x - bounds.origin.x;
 	space.y = here.y - bounds.origin.y;
-	for (i = 0; i < n && *lines < 420; i++) {
+	for (i = 0; i < n && *lines < 700; i++) {
 		mondrian_geom_walk([(NSArray *)kids objectAtIndex:i], depth + 1,
 		    lines, space);
 	}
@@ -2927,6 +2937,7 @@ mondrian_log_screen_geometry(void)
 	{
 		id windows = mondrian_send(app, "windows");
 		unsigned count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+		BOOL walked_touch = NO;
 
 		for (i = 0; i < count; i++) {
 			id window = [(NSArray *)windows objectAtIndex:i];
@@ -2978,9 +2989,29 @@ mondrian_log_screen_geometry(void)
 			say(line);
 			mondrian_geom_walk(window, 0, &lines, CGPointZero);
 			mondrian_deep_find(window, 0, CGPointZero, 0);
+			if (window == mondrian_cc_touch_window) {
+				walked_touch = YES;
+			}
 			if (boot_arg_set("mondriancctest=1")) {
 				mondrian_cc_activate(window);
 			}
+		}
+		/*
+		 * The window a Control Center touch arrives in is not always one of
+		 * these; when it is a different object, describe that one too.
+		 */
+		if (mondrian_cc_touch_window != nil && !walked_touch) {
+			unsigned lines = 0;
+			const char *tname = object_getClassName(mondrian_cc_touch_window);
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: geom cc touch window %s\n",
+			    tname != NULL ? tname : "?");
+			say(line);
+			mondrian_geom_walk(mondrian_cc_touch_window, 0, &lines,
+			    CGPointZero);
+			mondrian_deep_find(mondrian_cc_touch_window, 0, CGPointZero,
+			    0);
 		}
 	}
 }
@@ -3367,6 +3398,15 @@ mondrian_send_event(id self, SEL cmd, id event)
 			view = mondrian_send(touch, "view");
 			wclass = win != nil ? object_getClassName(win) : "nil";
 			vclass = view != nil ? object_getClassName(view) : "nil";
+			if (win != nil && wclass != NULL &&
+			    strstr(wclass, "ControlCenter") != NULL &&
+			    win != mondrian_cc_touch_window) {
+				[(id)win retain];
+				if (mondrian_cc_touch_window != nil) {
+					[(id)mondrian_cc_touch_window release];
+				}
+				mondrian_cc_touch_window = win;
+			}
 		}
 		/* A drag is a hundred moves; the phases that matter are the ends. */
 		if (phase == 1) {
@@ -4615,13 +4655,52 @@ mondrian_cc_retry_thread(void *unused)
  * working or the sheet cannot be pulled down at all, so only the delay and the
  * scrolling go: `mondriancg=1`.
  */
+/*
+ * The sliders are the sheet's own controls and one of them arrives dead: the
+ * brightness slider is `CCUIContinuousSliderView ... ui 0`, user interaction
+ * off, while the volume slider next to it is enabled and wired (valueChanged,
+ * one target). Nothing in the tree explains the difference, so the pass turns
+ * interaction back on for every Control Center slider and lets the module's own
+ * action do the work.
+ */
+static unsigned
+mondrian_cc_wake_sliders(id view, unsigned depth)
+{
+	id kids;
+	unsigned n, i, woken = 0;
+	const char *name = object_getClassName(view);
+
+	if (view == nil || depth > 16) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, "SliderView") != NULL) {
+		BOOL enabled = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("isUserInteractionEnabled"));
+
+		if (!enabled) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(view,
+			    sel_registerName("setUserInteractionEnabled:"), YES);
+			woken++;
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		woken += mondrian_cc_wake_sliders(
+		    [(NSArray *)kids objectAtIndex:i], depth + 1);
+	}
+	return woken;
+}
+
 static void
 mondrian_cc_gestures_pass(void)
 {
+	static unsigned open_passes;
 	Class app_cls = objc_getClass("UIApplication");
 	Method shared;
 	id app, windows;
 	unsigned n, i;
+	static int told_woken;
 
 	if (!boot_arg_set("mondriancg=1") || app_cls == Nil) {
 		return;
@@ -4637,21 +4716,32 @@ mondrian_cc_gestures_pass(void)
 	for (i = 0; i < n; i++) {
 		id win = [(NSArray *)windows objectAtIndex:i];
 		const char *wclass = object_getClassName(win);
+		BOOL hidden;
 		id kids;
 
 		if (wclass == NULL || strstr(wclass, "ControlCenter") == NULL) {
 			continue;
 		}
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(win,
+		    sel_registerName("isHidden"));
 		kids = mondrian_send(win, "subviews");
 		for (unsigned k = 0; k < (kids != nil ? (unsigned)[(NSArray *)kids count] : 0); k++) {
 			id v = [(NSArray *)kids objectAtIndex:k];
 			const char *c = object_getClassName(v);
 
-			if (c != NULL && strstr(c, "CCUIScrollView") != NULL) {
+			if (c != NULL && strstr(c, "CCUIScrollView") != NULL && !hidden) {
 				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
 				    sel_registerName("setScrollEnabled:"), NO);
 				((void (*)(id, SEL, BOOL))objc_msgSend)(v,
 				    sel_registerName("setDelaysContentTouches:"), NO);
+			}
+		}
+		if (!hidden) {
+			unsigned woken = mondrian_cc_wake_sliders(win, 0);
+
+			if (woken != 0 && told_woken == 0) {
+				told_woken = 1;
+				say("MONDRIAN UI: cc sliders woken\n");
 			}
 		}
 	}
