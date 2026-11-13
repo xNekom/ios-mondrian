@@ -1,0 +1,36 @@
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4876,6 +4876,33 @@
+ 					    view != NULL ?
+ 					    view[mondrian_uc_fence_word(want)] : 0);
+ 					mondrian_log_flush_now();
++					/*
++					 * The gate reads one slot per sequence, and a
++					 * slot that never matches its sequence stops
++					 * every later submit with the ring full. The
++					 * values in the page say whether the firmware
++					 * used the same number of slots the driver
++					 * assumes: print the first ones and the count.
++					 */
++					if (told == 1 && view != NULL) {
++						uint32_t base =
++						    MONDRIAN_UC_FENCE_BASE >> 2;
++						unsigned int i;
++
++						for (i = 0; i < 16; i += 4) {
++							printf("MONDRIAN GPU: fpage %u"
++							    " %x %x %x %x\n", i,
++							    view[base + i],
++							    view[base + i + 1],
++							    view[base + i + 2],
++							    view[base + i + 3]);
++						}
++						printf("MONDRIAN GPU: fpage slots %u"
++						    " seq %u want %u word %u\n",
++						    MONDRIAN_UC_FENCE_SLOTS, seq, want,
++						    mondrian_uc_fence_word(want));
++						mondrian_log_flush_now();
++					}
+ 				}
+ 				/*
+ 				 * The doorbell is a posted write: if the one that
