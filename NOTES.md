@@ -63,11 +63,11 @@ Current blockers, in order:
    counter is out of the AP's reach: the level comes from the PMK8350 VADC
    (`0304`) and a voltage table, which overstates it (3.80 V reads 58 % where
    Android said 36 %, 1683 mAh of `charge_full` 4952).
-2. **The compositor stops drawing.** Some boots never put a frame on the
-   glass: `backboardd` commits 3-7 frames at 5 ms each, then goes silent and the
-   screen keeps the boot logo. That is the GPU write-target bug in
-   `docs/MONDIAN_GPU.md`, not the panel (the tick still runs at 60 Hz). A dirty
-   root volume gives the same symptom with no USB at all; see the journal trap.
+2. **The compositor draws.** Not reproduced since the secure-mode switch: 8
+   consecutive cold boots (measured 2026-11-13) enumerated over USB in ~27 s,
+   drew the home screen and answered a tap on Settings. `fps 0` at rest is a
+   still screen, not a stall: read `drawn in place` before blaming the GPU
+   (`docs/MONDIAN_GPU.md`), and a tap is what makes a boot prove itself.
 3. **Control Center.** `mondrianwin=1` aborted SpringBoard; without it the
    sheet draws full size. The slider ignores taps and the bottom banding stays.
 4. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
@@ -152,8 +152,9 @@ reservation inside). Rules that still cost resets:
   across the window, and a page on a firmware island aborts (`Kernel data
   abort`, `far` inside the physmap).
 
-The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `arm_vm_init`
-installs the explicit kernel VA alias for the early console (`0295`).
+The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S`
+no longer maps it `VA=PA` and `arm_vm_init` installs the explicit kernel VA
+alias for the early console (`0295`).
 
 The **physmap slide** comes from `/chosen/random-seed`, so a random seed
 makes the boot a coin flip (about one host boot in three dies); `boards.py`
@@ -208,16 +209,14 @@ kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
 every mount hangs *before* the framebuffer: the screen keeps the shim log, the
 USB gadget never appears, so there is no ring and no userland left to undo it.
 `mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
-(`journal_close(NULL)` has no NULL check). `fsck.hfsplus -fy` on a copy names
-what a rebuild has to fix.
+(`journal_close(NULL)` has no NULL check). Reflashing `backup/ios-root.simg` is
+the repair for a dirty volume, and `fsck.hfsplus -fy` on a copy names what a
+rebuild has to fix.
 
-**`hfs_mark_inconsistent` is the port eating its own root, and it breaks apps.**
-A catalog entry that claims data and owns no blocks makes every open fail with
-`EINVAL`; the hard resets write that damage (the legal under-one-block case is
-exempt: `hfs_zero_block_stub()`). Measured 330 in one boot. An app that reads its
-plists at launch then hangs in `CFPreferences` on `cfprefsd`, which never saw the
-request, and the watchdog kills it -- that was Date & Time, not `locationd`.
-Restore the root before debugging a random crash (`README.md` has the procedure).
+**`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
+entry that claims data and owns no blocks is rejected on every open (2 560
+times in one boot), and the hard resets write that damage; the legal
+under-one-block case is exempt (`hfs_zero_block_stub()`).
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload: that travels **appended to the
@@ -333,7 +332,8 @@ by the `pon` compatible. Rising edges drive the menu. A refusal prints
 `spmi code N` with N naming the failing step in `shim/spmi.c`: one photo names
 it. A failed transaction is a busy arbiter, not a broken bus -- the battery's
 conversion runs on it every 2 s -- and treating one collision as fatal ended
-button polling for the rest of the boot; `keys` prints the poller's state.
+button polling for the rest of the boot; `keys` prints the poller's state and
+one live read of both registers.
 
 **The APID table cannot be written from the AP.** It only holds what XBL gave
 EE0 (540 of 1024 here, `si APID` over the USB channel); the charger has no entry
