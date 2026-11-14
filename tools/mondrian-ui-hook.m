@@ -24,6 +24,12 @@ typedef struct _xpc_object_s *xpc_object_t;
 extern xpc_object_t xpc_connection_send_message_with_reply_sync(
     xpc_connection_t connection, xpc_object_t message);
 extern const char *xpc_connection_get_name(xpc_connection_t connection);
+extern char *xpc_copy_description(xpc_object_t object);
+extern int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t message,
+    xpc_object_t *reply);
+/* Defined far below; the XPC wrapper above needs them. */
+static int boot_arg_set(const char *name);
+static int boot_arg_int(const char *name, int fallback);
 
 /*
  * The bootstrap namespace lives in libSystem and the SDK ships no servers/
@@ -35,6 +41,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 
 #include <crt_externs.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld.h>
 #include <mach-o/nlist.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -77,98 +84,732 @@ say(const char *message)
 }
 
 /*
- * The peer of the synchronous BoardServices call that freezes SpringBoard.
- * The main thread waits there and the stack cannot name the service, so every
- * synchronous call reports before it starts and after it returns; a begin with
- * no end is the one that never came back.
- *
- * This runs in every injected daemon, so it stays out of the others' way: an
- * earlier version looked the peer up in backboardd too and crash-looped it
- * (libxpc traps when the name is asked of a connection it considers
- * unresolved). Only SpringBoard reports, and the others pass straight through.
+ * Interposing a libsystem symbol does not take effect in this dylib: the XPC
+ * wrapper that would have logged the launch request stayed silent across two
+ * boots that did include a tap, while every Objective-C hook works. The
+ * remaining way to see the request is to name it: this prints the selectors of
+ * the classes in the launch path, so the next build swizzles the right one with
+ * the right signature instead of guessing.
  */
-static uint32_t mondrian_xpc_logs;
-static int mondrian_xpc_enabled = -1;
+static void
+mondrian_rbs_probe(void)
+{
+	static const char *classes[] = {
+		"RBSConnection", "RBSService",
+		"FBProcessManager", "FBProcess", "FBApplicationProcess"
+	};
+	extern Class objc_getClass(const char *);
+	unsigned shown = 0;
+
+	for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); c++) {
+		Class cls = objc_getClass(classes[c]);
+		char line[224];
+
+		if (cls == Nil) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN RBS: %s absent\n", classes[c]);
+			say(line);
+			continue;
+		}
+		for (int meta = 0; meta < 2; meta++) {
+			Class owner = meta ? object_getClass((id)cls) : cls;
+			unsigned count = 0;
+			Method *methods = class_copyMethodList(owner, &count);
+
+			for (unsigned i = 0; methods != NULL && i < count; i++) {
+				const char *sel = sel_getName(method_getName(methods[i]));
+
+				if (strstr(sel, "launch") == NULL &&
+				    strstr(sel, "Launch") == NULL &&
+				    strstr(sel, "exec") == NULL &&
+				    strstr(sel, "Exec") == NULL &&
+				    strstr(sel, "bootstrap") == NULL &&
+				    strstr(sel, "spawn") == NULL) {
+					continue;
+				}
+				if (shown++ > 60) {
+					continue;
+				}
+				snprintf(line, sizeof(line),
+				    "MONDRIAN RBS: %s%s %s %s\n", classes[c],
+				    meta ? " +" : " -", sel,
+				    method_getTypeEncoding(methods[i]));
+				say(line);
+			}
+			if (methods != NULL) {
+				free(methods);
+			}
+		}
+	}
+}
+
+static IMP forward_impl;
+static int mondrian_srv_listed;
+
+/*
+ * The frames that matter in runningboardd are offsets inside images that live in
+ * the dyld shared cache (AppServerSupport+0x2d10, RunningBoard+0x2eaf0), and the
+ * cache is not on disk, so the file probe cannot name them. Here the Mach-O is
+ * read from memory: a file offset is turned into the vmaddr of the segment that
+ * contains it, then the symbol table is searched for the nearest name below.
+ */
+/*
+ * Every frame line goes to the console, not to stdout: a daemon's stdout is
+ * /dev/null, which is where the first version of this probe sent its answers.
+ */
+static void
+mondrian_frame_say(int index, const char *image, uint64_t off, const char *sym,
+    uint64_t delta, bool ok)
+{
+	char line[240];
+
+	if (ok) {
+		snprintf(line, sizeof(line),
+		    "MONDRIAN FRAME[%d]: %s+0x%llx -> %s+0x%llx\n", index, image,
+		    (unsigned long long)off, sym, (unsigned long long)delta);
+	} else if (sym != NULL) {
+		snprintf(line, sizeof(line), "MONDRIAN FRAME[%d]: %s %s\n",
+		    index, image, sym);
+	} else {
+		snprintf(line, sizeof(line),
+		    "MONDRIAN FRAME[%d]: %s+0x%llx -> no symbol below\n", index,
+		    image, (unsigned long long)off);
+	}
+	say(line);
+}
+
+/*
+ * A file offset inside an image becomes an address in memory: segments are
+ * mapped relative to the image header, and __TEXT is the header, so the address
+ * is hdr + (seg->vmaddr - __TEXT->vmaddr) + (off - seg->fileoff). The first
+ * version used header + off, which is only right for a plain executable and
+ * gave garbage for every image in the shared cache.
+ */
+static uintptr_t
+mondrian_seg_addr(const struct mach_header_64 *hdr, uint32_t off,
+    const char **why)
+{
+	struct load_command *cmd = (struct load_command *)((char *)hdr +
+	    sizeof(*hdr));
+	uint64_t text = 0;
+	uintptr_t answer = 0;
+
+	for (uint32_t pass = 0; pass < 2; pass++) {
+		cmd = (struct load_command *)((char *)hdr + sizeof(*hdr));
+		for (uint32_t i = 0; i < hdr->ncmds; i++) {
+			if (cmd->cmd == LC_SEGMENT_64) {
+				struct segment_command_64 *seg =
+				    (struct segment_command_64 *)cmd;
+
+				if (pass == 0 && strcmp(seg->segname, "__TEXT") == 0) {
+					text = seg->vmaddr;
+				} else if (pass == 1 &&
+				    off >= seg->fileoff &&
+				    off < seg->fileoff + seg->filesize) {
+					answer = (uintptr_t)hdr +
+					    (uintptr_t)(seg->vmaddr - text) +
+					    (uintptr_t)(off - seg->fileoff);
+				}
+			}
+			if (cmd->cmdsize == 0) {
+				break;
+			}
+			cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
+		}
+	}
+	if (answer == 0 && why != NULL) {
+		*why = "offset outside the segments";
+	}
+	return answer;
+}
+
+static uint64_t
+mondrian_image_text(const struct mach_header_64 *hdr)
+{
+	struct load_command *cmd = (struct load_command *)((char *)hdr +
+	    sizeof(*hdr));
+
+	for (uint32_t i = 0; i < hdr->ncmds; i++) {
+		if (cmd->cmd == LC_SEGMENT_64) {
+			struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
+
+			if (strcmp(seg->segname, "__TEXT") == 0) {
+				return seg->vmaddr;
+			}
+		}
+		if (cmd->cmdsize == 0) {
+			break;
+		}
+		cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
+	}
+	return 0;
+}
 
 static void
-mondrian_xpc_line(const char *phase, const char *name, long ms)
+mondrian_frame_name(int index, const char *wanted, uint64_t off)
 {
-	char line[224];
-	int n;
+	uint32_t count = _dyld_image_count();
 
-	if (mondrian_xpc_logs >= 200) {
+	for (uint32_t i = 0; i < count; i++) {
+		const struct mach_header_64 *hdr =
+		    (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const char *path = _dyld_get_image_name(i);
+		const char *base;
+		struct load_command *cmd;
+		struct symtab_command *sym = NULL;
+		struct nlist_64 *nl;
+		const char *strs;
+		uint64_t target;
+		const char *best = NULL;
+		uint64_t best_val = 0;
+
+		if (hdr == NULL || path == NULL || hdr->magic != MH_MAGIC_64) {
+			continue;
+		}
+		base = strrchr(path, '/');
+		base = base != NULL ? base + 1 : path;
+		if (strncmp(base, wanted, strlen(wanted)) != 0) {
+			continue;
+		}
+		cmd = (struct load_command *)((char *)hdr + sizeof(*hdr));
+		for (uint32_t k = 0; k < hdr->ncmds; k++) {
+			if (cmd->cmd == LC_SYMTAB) {
+				sym = (struct symtab_command *)cmd;
+			}
+			if (cmd->cmdsize == 0) {
+				break;
+			}
+			cmd = (struct load_command *)((char *)cmd + cmd->cmdsize);
+		}
+		if (sym == NULL || sym->symoff == 0 || sym->nsyms == 0) {
+			mondrian_frame_say(index, base, off, "has no symbol table", 0,
+			    false);
+			return;
+		}
+		nl = (struct nlist_64 *)mondrian_seg_addr(hdr, sym->symoff, NULL);
+		strs = (const char *)mondrian_seg_addr(hdr, sym->stroff, NULL);
+		if (nl == NULL || strs == NULL) {
+			mondrian_frame_say(index, base, off, "symbol table unmapped",
+			    0, false);
+			return;
+		}
+		target = mondrian_image_text(hdr) + off;
+		for (uint32_t k = 0; k < sym->nsyms; k++) {
+			if ((nl[k].n_type & 0x0e) != 0x0e || nl[k].n_un.n_strx == 0 ||
+			    nl[k].n_value == 0 || nl[k].n_value > target) {
+				continue;
+			}
+			if (nl[k].n_value < best_val) {
+				continue;
+			}
+			best_val = nl[k].n_value;
+			best = strs + nl[k].n_un.n_strx;
+		}
+		if (best != NULL && best[0] != '\0') {
+			mondrian_frame_say(index, base, off, best, target - best_val,
+			    true);
+		} else {
+			mondrian_frame_say(index, base, off, "no symbol below", 0,
+			    false);
+		}
 		return;
 	}
-	mondrian_xpc_logs++;
-	if (ms < 0) {
-		n = snprintf(line, sizeof(line), "MONDRIAN XPC: %s %s\n",
-		    name, phase);
-	} else {
-		n = snprintf(line, sizeof(line), "MONDRIAN XPC: %s %s %ld ms\n",
-		    name, phase, ms);
-	}
-	if (n > 0) {
-		say(line);
-	}
+	mondrian_frame_say(index, wanted, off, "not loaded", 0, false);
 }
 
-static xpc_object_t
-mondrian_xpc_sync(xpc_connection_t connection, xpc_object_t message)
+static void *
+mondrian_frames_thread(void *unused)
 {
-	static xpc_object_t (*real)(xpc_connection_t, xpc_object_t);
-	const char *name = "anon";
-	struct timespec began, ended;
-	long ms;
-	xpc_object_t reply;
+	static const struct {
+		const char *image;
+		uint64_t off;
+	} frames[] = {
+		{ "AppServerSupport", 0x2d10 },
+		{ "AppServerSupport", 0x243c },
+		{ "RunningBoard", 0x2eaf0 },
+		{ "RunningBoard", 0x360f8 },
+		{ "RunningBoard", 0x15504 },
+		{ "libxpc.dylib", 0x4358 },
+	};
 
-	if (real == NULL) {
-		real = (xpc_object_t (*)(xpc_connection_t, xpc_object_t))
-		    dlsym(RTLD_NEXT,
-		    "xpc_connection_send_message_with_reply_sync");
-		if (real == NULL) {
-			return NULL;
-		}
+	(void)unused;
+	sleep(50);
+	for (size_t i = 0; i < sizeof(frames) / sizeof(frames[0]); i++) {
+		mondrian_frame_name((int)i, frames[i].image, frames[i].off);
 	}
-	if (mondrian_xpc_enabled < 0) {
-		const char *me = getprogname();
-
-		mondrian_xpc_enabled = me != NULL &&
-		    strcmp(me, "SpringBoard") == 0;
-	}
-	if (!mondrian_xpc_enabled) {
-		return real(connection, message);
-	}
-	if (connection != NULL) {
-		const char *known = xpc_connection_get_name(connection);
-
-		if (known != NULL) {
-			name = known;
-		}
-	}
-	mondrian_xpc_line("begin", name, -1);
-	clock_gettime(CLOCK_MONOTONIC, &began);
-	reply = real(connection, message);
-	clock_gettime(CLOCK_MONOTONIC, &ended);
-	ms = (ended.tv_sec - began.tv_sec) * 1000L +
-	    (ended.tv_nsec - began.tv_nsec) / 1000000L;
-	mondrian_xpc_line("end", name, ms);
-	return reply;
+	return NULL;
 }
 
-#if 0
 /*
- * Kept for reference only: the interposer wraps a call that this port hangs
- * inside, and the one boot that reached the lock screen ran without it, so it
- * stays out of the way until the missing reply is understood.
+ * The server side, now named: RBLaunchdInterface hands the extension to launchd
+ * and OSLaunchdJob is that client. One of these is where the poster launch
+ * stops, so each one prints what it was asked and what it answered; a missing
+ * `ret` line is the call that never came back.
  */
-__attribute__((used)) static struct {
-	const void *replacement;
-	const void *replaced;
-} mondrian_interposers[] __attribute__((section("__DATA,__interpose"))) = {
-	{ (const void *)mondrian_xpc_sync,
-	  (const void *)xpc_connection_send_message_with_reply_sync },
-};
-#endif
+static char *
+mondrian_obj_text(id object, char *buffer, size_t size)
+{
+	const char *utf8 = NULL;
+
+	buffer[0] = '\0';
+	if (object != nil && [object respondsToSelector:sel_registerName("description")]) {
+		id text = ((id (*)(id, SEL))objc_msgSend)(object,
+		    sel_registerName("description"));
+
+		if (text != nil) {
+			utf8 = ((const char *(*)(id, SEL))objc_msgSend)(text,
+			    sel_registerName("UTF8String"));
+		}
+	}
+	if (utf8 != NULL) {
+		snprintf(buffer, size, "%s", utf8);
+	}
+	return buffer;
+}
+
+static void
+mondrian_launch_say(const char *what, const char *detail, int ok, long code,
+    int done)
+{
+	char line[420];
+
+	if (!done) {
+		snprintf(line, sizeof(line), "MONDRIAN LAUNCH: %s %s\n", what,
+		    detail);
+	} else {
+		snprintf(line, sizeof(line), "MONDRIAN LAUNCH: %s ret %d err %ld\n",
+		    what, ok, code);
+	}
+	say(line);
+}
+
+static id mondrian_forward_submit_extension;
+static id mondrian_forward_job_submit;
+static id mondrian_forward_execute_request;
+
+static id
+mondrian_submit_extension(id self, SEL _cmd, id ext, id overlay, id domain,
+    id *error)
+{
+	static id (*forward)(id, SEL, id, id, id, id *);
+	char text[300];
+
+	if (forward == NULL) {
+		forward = (id (*)(id, SEL, id, id, id, id *))
+		    mondrian_forward_submit_extension;
+	}
+	mondrian_launch_say("submitExtension", mondrian_obj_text(ext, text,
+	    sizeof(text)), 0, 0, 0);
+	/*
+	 * The domain is what tells a system job from a per-user one, and a job
+	 * that never answers is worth knowing the domain of: a whole domain can be
+	 * the broken part.
+	 */
+	mondrian_launch_say("submitDomain", mondrian_obj_text(domain, text,
+	    sizeof(text)), 0, 0, 0);
+	if (forward == NULL) {
+		return nil;
+	}
+	{
+		id result = forward(self, _cmd, ext, overlay, domain, error);
+		long code = -1;
+
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		mondrian_launch_say("submitExtension", NULL, result != nil, code, 1);
+		return result;
+	}
+}
+
+static BOOL
+mondrian_job_submit(id self, SEL _cmd, id *error)
+{
+	static BOOL (*forward)(id, SEL, id *);
+	char text[300];
+
+	if (forward == NULL) {
+		forward = (BOOL (*)(id, SEL, id *))mondrian_forward_job_submit;
+	}
+	mondrian_launch_say("jobSubmit", mondrian_obj_text(self, text,
+	    sizeof(text)), 0, 0, 0);
+	if (forward == NULL) {
+		return NO;
+	}
+	{
+		BOOL ok = forward(self, _cmd, error);
+		long code = -1;
+
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		mondrian_launch_say("jobSubmit", NULL, ok, code, 1);
+		return ok;
+	}
+}
+
+static id
+mondrian_execute_request(id self, SEL _cmd, id request, id existing,
+    id identity, id *error)
+{
+	static id (*forward)(id, SEL, id, id, id, id *);
+	char text[300];
+
+	if (forward == NULL) {
+		forward = (id (*)(id, SEL, id, id, id, id *))
+		    mondrian_forward_execute_request;
+	}
+	mondrian_launch_say("executeLaunchRequest", mondrian_obj_text(request,
+	    text, sizeof(text)), 0, 0, 0);
+	if (forward == NULL) {
+		return nil;
+	}
+	{
+		id result = forward(self, _cmd, request, existing, identity, error);
+		long code = -1;
+
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		mondrian_launch_say("executeLaunchRequest", NULL, result != nil, code,
+		    1);
+		return result;
+	}
+}
+
+/*
+ * Two questions about the call that never answers, asked where it is made.
+ *
+ * 1. Is it hung or just slow? A watcher thread says, three seconds later, that
+ *    the call is still pending, so a slow call cannot be mistaken for a lost one.
+ * 2. Do mach port rights travel in replies at all? A job start is answered with
+ *    a message that carries the job's service port, and the same mechanism is
+ *    what bootstrap_look_up uses; if a lookup of a service that is certainly
+ *    running fails here, the reply is the broken part and not launchd.
+ */
+static volatile int mondrian_start_pending;
+static volatile int mondrian_start_count;
+
+static void *
+mondrian_start_watch(void *unused)
+{
+	int seen = 0, rounds = 0;
+
+	(void)unused;
+	for (rounds = 0; rounds < 400; rounds++) {
+		if (mondrian_start_count != seen) {
+			seen = mondrian_start_count;
+			say("MONDRIAN JOB: start in flight\n");
+		} else if (mondrian_start_pending > 0) {
+			char line[120];
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN JOB: start %d still pending after %d s\n",
+			    mondrian_start_pending, rounds);
+			say(line);
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
+static void *
+mondrian_port_probe(void *unused)
+{
+	static const char *services[] = {
+		"com.apple.cfprefsd.daemon",
+		"com.apple.runningboard",
+		"com.apple.system.logger",
+	};
+	extern int bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+
+	for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+		mach_port_t port = MACH_PORT_NULL;
+		int kr = bootstrap_look_up(bootstrap_port, services[i], &port);
+		char line[200];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN PORT: lookup %s kr %d port 0x%x\n", services[i], kr,
+		    port);
+		say(line);
+		if (kr == 0 && port != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), port);
+		}
+	}
+	return NULL;
+}
+
+/* the properties that name a job, read only when the class has them */
+static void
+mondrian_job_properties(id job)
+{
+	static const char *keys[] = {
+		"label", "program", "domain", "type", "handle", "serviceName",
+	};
+
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		SEL sel = sel_registerName(keys[i]);
+		char text[200];
+		char line[260];
+
+		if (![job respondsToSelector:sel]) {
+			continue;
+		}
+		@try {
+			id value = ((id (*)(id, SEL))objc_msgSend)(job, sel);
+
+			mondrian_obj_text(value, text, sizeof(text));
+			snprintf(line, sizeof(line), "MONDRIAN JOB: %s = %s\n", keys[i],
+			    text);
+			say(line);
+		} @catch (id exception) {
+			(void)exception;
+		}
+	}
+}
+
+static id mondrian_forward_job_start;
+static id mondrian_forward_job_submit_start;
+
+static id
+mondrian_job_start(id self, SEL _cmd, id *error)
+{
+	static id (*forward)(id, SEL, id *);
+	char text[300];
+
+	if (forward == NULL) {
+		forward = (id (*)(id, SEL, id *))mondrian_forward_job_start;
+	}
+	mondrian_launch_say("jobStart", mondrian_obj_text(self, text,
+	    sizeof(text)), 0, 0, 0);
+	mondrian_job_properties(self);
+	if (forward == NULL) {
+		return nil;
+	}
+	{
+		id result;
+		long code = -1;
+
+		mondrian_start_pending++;
+		mondrian_start_count++;
+		result = forward(self, _cmd, error);
+		mondrian_start_pending--;
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		mondrian_launch_say("jobStart", NULL, result != nil, code, 1);
+		return result;
+	}
+}
+
+static id
+mondrian_job_submit_start(id self, SEL _cmd, id *error)
+{
+	static id (*forward)(id, SEL, id *);
+	char text[300];
+
+	if (forward == NULL) {
+		forward = (id (*)(id, SEL, id *))mondrian_forward_job_submit_start;
+	}
+	mondrian_launch_say("jobSubmitStart", mondrian_obj_text(self, text,
+	    sizeof(text)), 0, 0, 0);
+	if (forward == NULL) {
+		return nil;
+	}
+	{
+		id result = forward(self, _cmd, error);
+		long code = -1;
+
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		mondrian_launch_say("jobSubmitStart", NULL, result != nil, code, 1);
+		return result;
+	}
+}
+
+static void
+mondrian_wrap(const char *class_name, const char *sel_name, IMP replacement,
+    id *slot)
+{
+	Class cls = objc_getClass(class_name);
+	Method method;
+
+	if (cls == Nil ||
+	    (method = class_getInstanceMethod(cls, sel_registerName(sel_name))) == NULL) {
+		char line[200];
+
+		snprintf(line, sizeof(line), "MONDRIAN LAUNCH: no %s -%s\n",
+		    class_name, sel_name);
+		say(line);
+		return;
+	}
+	*slot = (id)method_getImplementation(method);
+	method_setImplementation(method, replacement);
+}
+
+static void
+mondrian_install_server_wrappers(void)
+{
+	mondrian_wrap("RBLaunchdInterface", "submitExtension:overlay:domain:error:",
+	    (IMP)mondrian_submit_extension, &mondrian_forward_submit_extension);
+	mondrian_wrap("OSLaunchdJob", "submit:", (IMP)mondrian_job_submit,
+	    &mondrian_forward_job_submit);
+	mondrian_wrap("OSLaunchdJob", "start:", (IMP)mondrian_job_start,
+	    &mondrian_forward_job_start);
+	mondrian_wrap("OSLaunchdJob", "submitAndStart:",
+	    (IMP)mondrian_job_submit_start, &mondrian_forward_job_submit_start);
+	mondrian_wrap("RBLaunchManager",
+	    "executeLaunchRequest:existingProcess:requestIdentity:withError:",
+	    (IMP)mondrian_execute_request, &mondrian_forward_execute_request);
+	say("MONDRIAN LAUNCH: server wrappers installed\n");
+}
+
+/*
+ * SpringBoard's first launch request on every boot is the poster extension
+ * (com.apple.WallpaperKit.CollectionsPoster) and it never returns, so it holds
+ * FrontBoard's bootstrap lock and every app launch queues behind it. The client
+ * side is named now; this names the server side: the classes in runningboardd
+ * that submit a job to launchd, and whether a start method runs and returns.
+ */
+static void
+mondrian_rbsrv_probe(void)
+{
+	Class *classes;
+	unsigned total = 0, shown = 0;
+	int showed_classes = 0;
+
+	if (mondrian_srv_listed) {
+		return;
+	}
+	mondrian_srv_listed = 1;
+	classes = objc_copyClassList(&total);
+	if (classes == NULL) {
+		say("MONDRIAN RBSRV: no class list\n");
+		return;
+	}
+	for (unsigned i = 0; i < total && showed_classes < 14; i++) {
+		const char *name = class_getName(classes[i]);
+		unsigned count = 0, printed = 0;
+		Method *methods;
+
+		if (strstr(name, "Launch") == NULL && strstr(name, "launchd") == NULL) {
+			continue;
+		}
+		showed_classes++;
+		{
+			char line[200];
+
+			snprintf(line, sizeof(line), "MONDRIAN RBSRV: class %s\n", name);
+			say(line);
+		}
+		methods = class_copyMethodList(classes[i], &count);
+		for (unsigned k = 0; methods != NULL && k < count && printed < 10; k++) {
+			const char *sel = sel_getName(method_getName(methods[k]));
+			const char *enc = method_getTypeEncoding(methods[k]);
+
+			if (strstr(sel, "start") == NULL && strstr(sel, "submit") == NULL &&
+			    strstr(sel, "launch") == NULL && strstr(sel, "exec") == NULL) {
+				continue;
+			}
+			printed++;
+			{
+				char line[220];
+
+				snprintf(line, sizeof(line),
+				    "MONDRIAN RBSRV: %s -%s %s\n", name, sel,
+				    enc != NULL ? enc : "-");
+				say(line);
+			}
+		}
+		if (methods != NULL) {
+			free(methods);
+		}
+	}
+	free(classes);
+	(void)shown;
+}
+
+/*
+ * The one call that carries an app launch from SpringBoard to runningboardd.
+ * Its signature came from the probe above (B48@0:8@16o^@24o^@32o^@40), so the
+ * request can be read and the call forwarded unchanged: a request that returns
+ * NO with an error is a refusal, and one that never returns is the hang the
+ * thread dump shows.
+ */
+static BOOL
+mondrian_execute_launch(id self, SEL _cmd, id request, id process, id assertion,
+    id *error)
+{
+	char line[420];
+	char what[300];
+
+	(void)self;
+	what[0] = '\0';
+	if (request != nil && [request respondsToSelector:sel_registerName("description")]) {
+		id text = ((id (*)(id, SEL))objc_msgSend)(request,
+		    sel_registerName("description"));
+		const char *utf8 = NULL;
+
+		if (text != nil) {
+			utf8 = ((const char *(*)(id, SEL))objc_msgSend)(text,
+			    sel_registerName("UTF8String"));
+		}
+		if (utf8 != NULL) {
+			snprintf(what, sizeof(what), "%s", utf8);
+		}
+	}
+	snprintf(line, sizeof(line), "MONDRIAN RBSX: req %s\n", what);
+	say(line);
+	if (forward_impl != NULL) {
+		BOOL ok = ((BOOL (*)(id, SEL, id, id, id, id *))forward_impl)(
+		    self, _cmd, request, process, assertion, error);
+		long code = -1;
+
+		if (error != NULL && *error != nil) {
+			code = (long)((NSInteger (*)(id, SEL))objc_msgSend)(*error,
+			    sel_registerName("code"));
+		}
+		snprintf(line, sizeof(line), "MONDRIAN RBSX: ret %d err %ld\n",
+		    (int)ok, code);
+		say(line);
+		return ok;
+	}
+	return NO;
+}
+
+static void
+mondrian_install_launch_wrapper(void)
+{
+	Class cls = objc_getClass("RBSConnection");
+	Method method;
+	IMP impl;
+
+	if (cls == Nil ||
+	    (method = class_getInstanceMethod(cls,
+	    sel_registerName("executeLaunchRequest:process:assertion:error:"))) == NULL) {
+		say("MONDRIAN RBSX: no method to wrap\n");
+		return;
+	}
+	impl = method_getImplementation(method);
+	forward_impl = impl;
+	method_setImplementation(method, (IMP)mondrian_execute_launch);
+	say("MONDRIAN RBSX: wrapped\n");
+}
+
+static void *
+mondrian_rbs_thread(void *unused)
+{
+	(void)unused;
+	sleep(60);
+	mondrian_rbs_probe();
+	return NULL;
+}
 
 /*
  * The crash reporter records an uncaught NSException as `ns 2 code 0x6` and a
@@ -7462,7 +8103,7 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc36 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc52 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
@@ -7518,7 +8159,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc36 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc52 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
@@ -7539,12 +8180,53 @@ mondrian_install_ui_hooks(void)
 	} else {
 		say("MONDRIAN UI: bare mode, swizzles skipped\n");
 	}
+	/*
+	 * The launch path on the server side: runningboardd is where the request
+	 * to launchd is made, and the frames to name are offsets inside the images
+	 * it has loaded. Nothing here touches SpringBoard.
+	 */
+	if (strcmp(getprogname(), "runningboardd") == 0) {
+		pthread_t fr;
+
+		if (boot_arg_set("mondrianframes=1") &&
+		    pthread_create(&fr, NULL, mondrian_frames_thread, NULL) == 0) {
+			pthread_detach(fr);
+		}
+		if (boot_arg_set("mondrianrbsrv=1")) {
+			mondrian_rbsrv_probe();
+		}
+		if (boot_arg_set("mondrianlaunch=1")) {
+			pthread_t watch;
+
+			mondrian_install_server_wrappers();
+			if (pthread_create(&watch, NULL, mondrian_start_watch, NULL) == 0) {
+				pthread_detach(watch);
+			}
+		}
+		if (boot_arg_set("mondrianports=1")) {
+			pthread_t ports;
+
+			if (pthread_create(&ports, NULL, mondrian_port_probe, NULL) == 0) {
+				pthread_detach(ports);
+			}
+		}
+	}
 	if (strcmp(getprogname(), "SpringBoard") == 0) {
 		pthread_t tz, launch;
 
 		/* The zone file is written by a root daemon; Foundation re-reads it. */
 		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
 			pthread_detach(tz);
+		}
+		if (boot_arg_set("mondrianrbsx=1")) {
+			mondrian_install_launch_wrapper();
+		}
+		if (boot_arg_set("mondrianrbs=1")) {
+			pthread_t rbs;
+
+			if (pthread_create(&rbs, NULL, mondrian_rbs_thread, NULL) == 0) {
+				pthread_detach(rbs);
+			}
 		}
 		if (boot_arg_set("mondrianwin=1")) {
 			pthread_t win;

@@ -337,7 +337,7 @@ MONDRIAN = Board(
              # is quiet, which is every still screen. 0 keeps the last frame lit
              # until the power key or the idle timer blinks it.
              'mondrianfb_blank=0 '
-             'mondrian_ui_hook=15 cpstress=0 glenv=FD_MESA_DEBUG=nobin '
+             'mondrian_ui_hook=31 cpstress=0 mondrianlaunch=1 msgtrace=26 glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the
              # hardware has no saved brightness of its own, and CoreBrightness

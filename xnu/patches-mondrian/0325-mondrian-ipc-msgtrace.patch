@@ -1,0 +1,139 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -120,6 +120,11 @@
+ #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
+ #endif /* offsetof */
+ 
++/* mondrian: defined with the message traps below, used by both of them. */
++static void mondrian_msgtrace_send(mach_msg_user_header_t *header);
++static void mondrian_msgtrace_recv(mach_vm_address_t msg_addr,
++    mach_msg_size_t size);
++
+ /*
+  * Forward declarations - kernel internal routines
+  */
+@@ -1000,6 +1005,9 @@
+ 		mr = mach_msg_trap_send(msg_addr, 0, (mach_msg_option64_t)option32,
+ 		    msg_timeout, priority, filter_nonfatal,
+ 		    user_header, send_size, 0, desc_count);
++		if (mr == MACH_MSG_SUCCESS) {
++			mondrian_msgtrace_send(&user_header);
++		}
+ 	}
+ 
+ 	/* If send failed, skip receive */
+@@ -1026,6 +1034,9 @@
+ 		}
+ 		mr = mach_msg_trap_receive(msg_addr, 0, (mach_msg_option64_t)option32,
+ 		    msg_timeout, sync_send, rcv_size, 0, rcv_name);
++		if (mr == MACH_MSG_SUCCESS) {
++			mondrian_msgtrace_recv(msg_addr, rcv_size);
++		}
+ 	}
+ 
+ end:
+@@ -1071,6 +1082,84 @@
+ }
+ 
+ /*
++ * mondrian: does a message actually reach the process it was sent to?
++ *
++ * The app job's start never answers and launchd looks idle, so the question is
++ * whether the request got into launchd's queue at all. With msgtrace=1 this
++ * prints every message a listed process sends (id and destination port name) and
++ * every message pid 1 receives (id and size), so the two sides can be lined up.
++ * Bounded, because the console ring is small.
++ */
++static int mondrian_msgtrace;
++static bool mondrian_msgtrace_setup_done;
++static unsigned mondrian_msgtrace_lines;
++
++static void
++mondrian_msgtrace_setup(void)
++{
++	int value = 0;
++
++	if (PE_parse_boot_argn("msgtrace", &value, sizeof(value))) {
++		mondrian_msgtrace = value;
++	}
++}
++
++static bool
++mondrian_msgtrace_wanted(int pid)
++{
++	/* the boot argument is read once, and before it is tested: the first
++	 * version checked the value first and therefore never parsed it. */
++	if (!mondrian_msgtrace_setup_done) {
++		mondrian_msgtrace_setup_done = true;
++		mondrian_msgtrace_setup();
++		if (mondrian_msgtrace != 0) {
++			printf("MONDRIAN MSG: trace on pid %d\n",
++			    mondrian_msgtrace);
++		}
++	}
++	if (mondrian_msgtrace == 0 || mondrian_msgtrace_lines > 12000) {
++		return false;
++	}
++	return pid == 1 || pid == mondrian_msgtrace;
++}
++
++static void
++mondrian_msgtrace_send(mach_msg_user_header_t *header)
++{
++	int pid = proc_pid(current_proc());
++
++	/*
++	 * launchd answers everybody; only the clients that wait are interesting,
++	 * and among those only the calls that expect an answer (a reply port):
++	 * one-way notifications were most of the traffic and pushed the trace over
++	 * its budget before the tap that starts the app.
++	 */
++	if (pid == 1 || header->msgh_local_port == 0 ||
++	    !mondrian_msgtrace_wanted(pid)) {
++		return;
++	}
++	mondrian_msgtrace_lines++;
++	printf("MONDRIAN MSG: send pid %d id %d dest 0x%x local 0x%x size %d\n",
++	    pid, (int)header->msgh_id, header->msgh_remote_port,
++	    header->msgh_local_port, (int)header->msgh_size);
++}
++
++static void
++mondrian_msgtrace_recv(mach_vm_address_t msg_addr, mach_msg_size_t size)
++{
++	int pid = proc_pid(current_proc());
++	int32_t id = -1;
++
++	if (!mondrian_msgtrace_wanted(pid)) {
++		return;
++	}
++	(void)copyin((user_addr_t)(msg_addr + 20), (char *)&id, sizeof(id));
++	mondrian_msgtrace_lines++;
++	printf("MONDRIAN MSG: recv pid %d id %d size %d\n", pid, (int)id,
++	    (int)size);
++}
++
++/*
+  *  Routine:    mach_msg2_trap [mach trap]
+  *  Purpose:
+  *      Modern mach_msg_trap() with vector message and CFI support.
+@@ -1192,6 +1281,9 @@
+ 		    msg_timeout, priority, filter_nonfatal,
+ 		    user_header, msg_send_size,
+ 		    aux_send_size, desc_count);
++		if (mr == MACH_MSG_SUCCESS) {
++			mondrian_msgtrace_send(&user_header);
++		}
+ 	}
+ 
+ 	/* if send failed, skip receive */
+@@ -1232,6 +1324,9 @@
+ 		mr = mach_msg_trap_receive(msg_addr, aux_addr, option64,
+ 		    msg_timeout, sync_send, max_msg_rcv_size,
+ 		    max_aux_rcv_size, rcv_name);
++		if (mr == MACH_MSG_SUCCESS) {
++			mondrian_msgtrace_recv(msg_addr, max_msg_rcv_size);
++		}
+ 	}
+ 
+ end:
