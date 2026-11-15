@@ -1240,6 +1240,23 @@ first attempt returns EROFS and marks it done). Once the root is writable,
 channel; a process that has the file mapped must be killed first, and `kill PID`
 does that.
 
+### os_log blocks when logd is not running
+
+`os_log` is synchronous only in the sense that its writers must be drained: with
+no `logd` the userspace log buffer fills and the next call blocks inside
+libdispatch's `mach_msg` for ever. The probe in the UI hook says where a boot
+stands in one boot: `MONDRIAN PROBE: framebuffer match` (the kernel's
+`IOMobileFramebuffer` is published as `AppleCLCD` and matches), `UIScreen
+screens` (the client's view), then `os_log enter` / `os_log return` -- the
+second line only appears if the call came back.
+
+Measured 2026-11-15, before `0330`: `exec logd` was followed by `MONDRIAN
+Sandbox: logd privilege 1002 denied` (`PRIV_GLOBAL_PROC_INFO`), `logd` never
+ran, `os_log enter` never returned, the window server never started, and the
+panel stayed on the boot console (`present 0/s`, display link `0` ticks). The
+sandbox stand-in grants every privilege it is asked for and logs the first ask
+per process, which is how the one denial that cost the whole UI was named.
+
 ## Android capture (2026-10-28)
 
 A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug

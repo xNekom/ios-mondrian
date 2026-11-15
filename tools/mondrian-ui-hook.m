@@ -7,6 +7,7 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOKit/IOKitLib.h>
+#import <os/log.h>
 #import <execinfo.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
@@ -1551,6 +1552,58 @@ dl_report(void *unused)
 	return NULL;
 }
 
+/*
+ * What the graphics stack can see from inside a hooked process, asked once:
+ * whether the kernel's framebuffer matches by name (IOMobileFramebuffer's
+ * framework counts /arm-io children that do), whether CoreAnimation has a
+ * display at all, and whether os_log returns -- it is the call that hung the
+ * injector's initializer on 2026-11-15, so it is asked from its own thread and
+ * the line after it only appears if it came back.
+ */
+static void *
+mondrian_env_probe(void *unused)
+{
+	char line[160];
+	io_service_t svc;
+	io_name_t name;
+
+	(void)unused;
+	say("MONDRIAN PROBE: thread start\n");
+	sleep(5);
+	say("MONDRIAN PROBE: framebuffer match, before\n");
+	svc = IOServiceGetMatchingService(kIOMainPortDefault,
+	    IOServiceMatching("IOMobileFramebuffer"));
+	snprintf(line, sizeof(line), "MONDRIAN PROBE: framebuffer match %u\n",
+	    (unsigned)svc);
+	say(line);
+	if (svc != 0) {
+		if (IORegistryEntryGetName(svc, name) == KERN_SUCCESS) {
+			snprintf(line, sizeof(line), "MONDRIAN PROBE: framebuffer name %s\n",
+			    name);
+			say(line);
+		}
+		IOObjectRelease(svc);
+	}
+	say("MONDRIAN PROBE: screens, before\n");
+	{
+		Class cls = objc_getClass("UIScreen");
+		id screens = Nil;
+
+		if (cls != Nil) {
+			screens = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+			    sel_registerName("screens"));
+		}
+		snprintf(line, sizeof(line), "MONDRIAN PROBE: UIScreen screens %d\n",
+		    screens != nil ? (int)((unsigned long (*)(id, SEL))objc_msgSend)(
+		    screens, sel_registerName("count")) : -1);
+		say(line);
+	}
+	say("MONDRIAN PROBE: os_log enter\n");
+	os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "mondrian env probe");
+	say("MONDRIAN PROBE: os_log return\n");
+	return NULL;
+}
+
 static void
 start_display_link_probe(void)
 {
@@ -1562,6 +1615,7 @@ start_display_link_probe(void)
 	(void)pthread_create(&thread, NULL, dl_arm, NULL);
 	(void)pthread_create(&thread, NULL, dl_arm_late, NULL);
 	(void)pthread_create(&thread, NULL, dl_report, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_env_probe, NULL);
 }
 
 /*
@@ -8130,7 +8184,7 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc55 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc56 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
@@ -8186,7 +8240,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc55 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc56 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}

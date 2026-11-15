@@ -1,0 +1,50 @@
+--- a/bsd/kern/mondrian_amfi.c
++++ b/bsd/kern/mondrian_amfi.c
+@@ -355,10 +355,14 @@
+ 
+ /*
+  * Privileges for non-root processes come from MAC policies (priv_check_cred
+- * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
+- * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+- * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+- * Grant that one; log the first denial of each other privilege per process.
++ * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. This is a stand-in for
++ * Sandbox, not Sandbox, so everything is granted, and the log is the point:
++ * it names the privilege each process asks for, once per process, which is how
++ * the one denial that broke the whole UI was found. logd asks for
++ * PRIV_GLOBAL_PROC_INFO (1002) and exits when it is refused; with no logd
++ * draining the userspace os_log buffer, the next os_log call in backboardd
++ * blocks inside libdispatch's mach_msg for ever, so the window server never
++ * starts and the panel shows nothing (measured 2026-11-15).
+  */
+ #define MONDRIAN_PRIV_LOG_MAX      64
+ static struct {
+@@ -370,24 +374,22 @@
+ static int
+ mondrian_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+-	if (priv == PRIV_WORK_INTERVAL) {
+-		return 0;
+-	}
+ 	char name[20];
++
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < mondrian_priv_logged_count; i++) {
+ 		if (mondrian_priv_logged[i].priv == priv &&
+ 		    strncmp(mondrian_priv_logged[i].name, name, sizeof(name)) == 0) {
+-			return EPERM;
++			return 0;
+ 		}
+ 	}
+ 	if (mondrian_priv_logged_count < MONDRIAN_PRIV_LOG_MAX) {
+ 		mondrian_priv_logged[mondrian_priv_logged_count].priv = priv;
+ 		strlcpy(mondrian_priv_logged[mondrian_priv_logged_count].name, name, sizeof(name));
+ 		mondrian_priv_logged_count++;
+-		printf("MONDRIAN Sandbox: %s privilege %d denied\n", name, priv);
++		printf("MONDRIAN Sandbox: %s privilege %d granted\n", name, priv);
+ 	}
+-	return EPERM;
++	return 0;
+ }
+ 
+ static const struct mac_policy_ops mondrian_sandbox_mac_ops = {
