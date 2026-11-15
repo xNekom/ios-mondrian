@@ -1238,9 +1238,13 @@ usb-ring.py wfile PATH LOCAL-FILE` replaces either copy over the control
 channel, and a process that has the file mapped must be killed first (`kill
 PID`). A `wfile` into `/private/var/vm` does not survive the next boot: `glblob=1`
 writes the kernel image's copy over it as soon as the root turns writable, so a
-hook change is one kernel build (`cp` the dylib into `out/gpu/` first) and one
-`fastboot boot`. The ring says which copy is in use (`MONDRIAN HOOK: <proc> uses
-the /private/var/vm copy`) and when the blob lands (`MONDRIAN GLBLOB: ... -> 0`).
+hook change is `tools/build-mondrian-ui-hook.sh out/gpu/mondrian-ui-hook.dylib`
+(there is no xcrun on WSL; the script links with `ld64.lld` there), one kernel
+build, and one `fastboot boot` -- a dylib left in `out/gpu/` from an earlier
+change is embedded silently, so check the new string is in the kernel with
+`strings xnu/out/kernel.development.mondrian`. The ring says which copy is in
+use (`MONDRIAN HOOK: <proc> uses the /private/var/vm copy`) and when the blob
+lands (`MONDRIAN GLBLOB: ... -> 0`).
 
 ### os_log blocks with logd running
 
