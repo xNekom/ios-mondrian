@@ -14,6 +14,15 @@
 #import <mach/thread_act.h>
 #import <mach/thread_state.h>
 #import <mach/thread_info.h>
+
+/*
+ * The iPhoneOS SDK marks mach_vm.h unsupported in userland, but the trap is in
+ * libsystem_kernel: reading another thread's message without faulting on a bad
+ * pointer is what this probe needs.
+ */
+extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
+    mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data,
+    mach_vm_size_t *outsize);
 #import <dlfcn.h>
 
 /*
@@ -40,6 +49,7 @@ extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
     const char *service_name, mach_port_t *service_port);
 
+#include <dispatch/dispatch.h>
 #include <crt_externs.h>
 #include <mach-o/loader.h>
 #include <mach-o/dyld.h>
@@ -1060,6 +1070,70 @@ window_server_probe_wanted(void)
 	return wanted;
 }
 
+/*
+ * Which queue is the main thread waiting on? Its stack ends in
+ * `dispatch_sync -> mach_msg`, so the label of the queue it entered names the
+ * subsystem whose block never runs. Gated by the marker, limited to
+ * backboardd, capped: this is a probe, not a trace.
+ *
+ * The real function comes from dlsym(RTLD_NEXT) once, in the constructor: an
+ * interpose entry whose replacement calls the symbol again is re-bound to the
+ * replacement, which recursed until the stack was gone on the first attempt.
+ */
+extern void dispatch_sync(dispatch_queue_t queue, dispatch_block_t block);
+static void (*real_dispatch_sync)(dispatch_queue_t queue, dispatch_block_t block);
+
+static void
+resolve_dispatch_sync(void)
+{
+	if (real_dispatch_sync == NULL) {
+		real_dispatch_sync = (void (*)(dispatch_queue_t, dispatch_block_t))
+		    dlsym(RTLD_NEXT, "dispatch_sync");
+	}
+}
+
+static void
+mondrian_dispatch_sync(dispatch_queue_t queue, dispatch_block_t block)
+{
+	static int budget = 80;
+	const char *label;
+
+	resolve_dispatch_sync();
+	if (real_dispatch_sync == NULL) {
+		return;
+	}
+	if (budget <= 0 || !window_server_probe_wanted() ||
+	    strcmp(getprogname(), "backboardd") != 0) {
+		real_dispatch_sync(queue, block);
+		return;
+	}
+	budget -= 2;
+	label = queue != NULL ? dispatch_queue_get_label(queue) : NULL;
+	{
+		char line[192];
+
+		snprintf(line, sizeof(line), "MONDRIAN SYNCS: enter %s\n",
+		    label != NULL ? label : "(no label)");
+		say(line);
+	}
+	real_dispatch_sync(queue, block);
+	{
+		char line[192];
+
+		snprintf(line, sizeof(line), "MONDRIAN SYNCS: exit %s\n",
+		    label != NULL ? label : "(no label)");
+		say(line);
+	}
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct {
+	const void *replacement;
+	const void *replacee;
+} mondrian_sync_interposer[] = {
+	{ (const void *)mondrian_dispatch_sync, (const void *)dispatch_sync },
+};
+
 static void
 say_window_server(void)
 {
@@ -1791,6 +1865,246 @@ mondrian_bootstrap_probe(void *unused)
 }
 
 /*
+ * Which service does the accessory init open? With the hook out of
+ * backboardd, its main thread waits for a reply from a connection the
+ * CoreAccessories framework makes, and the name never reaches the ring. The
+ * fix is to reproduce the call from a process that carries the probe, with
+ * `xpc_connection_create_mach_service` interposed, so the name prints before
+ * the wait; the call is expected to hang, which is what backboardd shows.
+ *
+ * The interposer passes every call through and only reports while the probe
+ * below is armed, because this dylib also lives in launchd and SpringBoard.
+ */
+extern xpc_connection_t xpc_connection_create_mach_service(const char *name,
+    dispatch_queue_t targetq, uint64_t flags);
+static xpc_connection_t (*real_create_mach_service)(const char *,
+    dispatch_queue_t, uint64_t);
+static volatile int mondrian_acc_armed;
+
+static xpc_connection_t
+mondrian_create_mach_service(const char *name, dispatch_queue_t targetq,
+    uint64_t flags)
+{
+	if (real_create_mach_service == NULL) {
+		real_create_mach_service = (xpc_connection_t (*)(const char *,
+		    dispatch_queue_t, uint64_t))
+		    dlsym(RTLD_NEXT, "xpc_connection_create_mach_service");
+	}
+	/*
+	 * This dylib is injected into launchd, xpcproxy and every daemon in the
+	 * mask, so a NULL here would take the boot down with it: libxpc's own
+	 * image is the second way to the real function.
+	 */
+	if (real_create_mach_service == NULL) {
+		void *libxpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW);
+
+		if (libxpc != NULL) {
+			real_create_mach_service = (xpc_connection_t (*)(
+			    const char *, dispatch_queue_t, uint64_t))
+			    dlsym(libxpc, "xpc_connection_create_mach_service");
+		}
+	}
+	if (real_create_mach_service == NULL) {
+		return NULL;
+	}
+	if (mondrian_acc_armed) {
+		char line[224];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN ACC: create %s flags 0x%llx\n",
+		    name != NULL ? name : "(null)", (unsigned long long)flags);
+		say(line);
+	}
+	return real_create_mach_service(name, targetq, flags);
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct {
+	const void *replacement;
+	const void *replacee;
+} mondrian_xpc_interposer[] = {
+	{ (const void *)mondrian_create_mach_service,
+	  (const void *)xpc_connection_create_mach_service },
+};
+
+static void mondrian_dump_threads(const char *tag);
+
+/*
+ * The blocked thread is inside `mach_msg`, so its user registers still point at
+ * the trap arguments: x0 is `struct mach_msg2_trap_args *` and the first field
+ * is the message header. Reading it through `mach_vm_read_overwrite` names the
+ * destination port without risking a fault in this thread, and
+ * `mach_port_type` says whether that name is a live send right or a dead name
+ * -- the difference between "the service never answered" and "the service no
+ * longer exists".
+ */
+static void
+mondrian_acc_peek(pthread_t thread)
+{
+	arm_thread_state64_t state;
+	mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+	mach_vm_size_t got = 0;
+	uint64_t args[1] = { 0 };
+	struct {
+		uint32_t bits;
+		uint32_t size;
+		uint32_t remote;
+		uint32_t local;
+		uint32_t voucher;
+		int32_t id;
+	} header;
+	mach_port_type_t type = 0;
+	char line[224];
+
+	if (thread_get_state(pthread_mach_thread_np(thread), ARM_THREAD_STATE64,
+	    (thread_state_t)&state, &count) != KERN_SUCCESS) {
+		say("MONDRIAN ACC: thread state failed\n");
+		return;
+	}
+	if (mach_vm_read_overwrite(mach_task_self(),
+	    (mach_vm_address_t)state.__x[0], sizeof(args),
+	    (mach_vm_address_t)args, &got) != KERN_SUCCESS || got != sizeof(args)) {
+		snprintf(line, sizeof(line), "MONDRIAN ACC: x0 %p unreadable\n",
+		    (void *)(uintptr_t)state.__x[0]);
+		say(line);
+		return;
+	}
+	if (mach_vm_read_overwrite(mach_task_self(),
+	    (mach_vm_address_t)args[0], sizeof(header),
+	    (mach_vm_address_t)&header, &got) != KERN_SUCCESS ||
+	    got != sizeof(header)) {
+		snprintf(line, sizeof(line), "MONDRIAN ACC: msg %p unreadable\n",
+		    (void *)(uintptr_t)args[0]);
+		say(line);
+		return;
+	}
+	(void)mach_port_type(mach_task_self(), header.remote, &type);
+	snprintf(line, sizeof(line),
+	    "MONDRIAN ACC: msg %p id %d bits 0x%x size %u remote %u local %u type 0x%x\n",
+	    (void *)(uintptr_t)args[0], header.id, header.bits, header.size,
+	    header.remote, header.local, type);
+	say(line);
+}
+
+static void *
+mondrian_acc_watch(void *unused)
+{
+	(void)unused;
+	sleep(20);
+	mondrian_dump_threads("acc");
+	mondrian_acc_peek((pthread_t)unused);
+	return NULL;
+}
+
+static void *
+mondrian_acc_probe(void *unused)
+{
+	void *handle;
+	void (*init_hid)(void);
+	pthread_t watch;
+	char line[192];
+
+	(void)unused;
+	sleep(60);
+	if (strcmp(getprogname(), "runningboardd") != 0) {
+		return NULL;
+	}
+	handle = dlopen("/System/Library/PrivateFrameworks/"
+	    "CoreAccessories.framework/CoreAccessories", RTLD_NOW);
+	if (handle == NULL) {
+		snprintf(line, sizeof(line), "MONDRIAN ACC: dlopen failed %s\n",
+		    dlerror() != NULL ? dlerror() : "?");
+		say(line);
+		return NULL;
+	}
+	init_hid = (void (*)(void))dlsym(handle, "CoreAccessoriesInitForHID");
+	snprintf(line, sizeof(line), "MONDRIAN ACC: init %p\n",
+	    (void *)init_hid);
+	say(line);
+	if (init_hid == NULL) {
+		return NULL;
+	}
+	mondrian_acc_armed = 1;
+	/*
+	 * The call is expected to hang; a watchdog dumps every thread 20 s
+	 * later, so the frame that never returns is read here instead of being
+	 * guessed from another process's stack.
+	 */
+	(void)pthread_create(&watch, NULL, mondrian_acc_watch,
+	    (void *)pthread_self());
+	init_hid();
+	mondrian_acc_armed = 0;
+	say("MONDRIAN ACC: init returned\n");
+	return NULL;
+}
+
+/*
+ * Does the on-demand path work? A Mach service that no job is serving is a
+ * send right whose first message is supposed to make launchd start the job.
+ * Backboardd waiting for accessoryd and runningboardd waiting for launchd
+ * both look exactly like that path not firing, so the probe walks it end to
+ * end: look the service up, send a message with a marker id, and let the exec
+ * trace say whether a process appeared. The marker also lands in launchd's
+ * receive trace, which splits "launchd never got the message" from "launchd
+ * got it and did nothing".
+ */
+#define MONDRIAN_DEMAND_ID 0x4d4f4e44 /* 'MOND' */
+
+static void *
+mondrian_demand_probe(void *unused)
+{
+	static const char *names[] = {
+		"com.apple.accessories.hid",
+		"com.apple.accessories.connection-info-server",
+		"com.apple.accessories.transport-server",
+		"com.apple.diagnosticd",
+	};
+	mach_port_t bp = MACH_PORT_NULL;
+	char line[192];
+
+	(void)unused;
+	{
+		snprintf(line, sizeof(line), "MONDRIAN DEMAND: %d armed %s\n",
+		    getpid(), getprogname());
+		say(line);
+	}
+	sleep(40);
+	if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS ||
+	    bp == MACH_PORT_NULL) {
+		say("MONDRIAN DEMAND: no bootstrap port\n");
+		return NULL;
+	}
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		struct {
+			mach_msg_header_t header;
+		} msg;
+		mach_port_t svc = MACH_PORT_NULL;
+		kern_return_t kr;
+
+		kr = bootstrap_look_up(bp, names[i], &svc);
+		snprintf(line, sizeof(line),
+		    "MONDRIAN DEMAND: %d %s -> 0x%x port %u\n",
+		    getpid(), names[i], kr, (unsigned)svc);
+		say(line);
+		if (kr != KERN_SUCCESS || svc == MACH_PORT_NULL) {
+			continue;
+		}
+		memset(&msg, 0, sizeof(msg));
+		msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+		msg.header.msgh_size = sizeof(msg.header);
+		msg.header.msgh_remote_port = svc;
+		msg.header.msgh_id = MONDRIAN_DEMAND_ID;
+		kr = mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+		    sizeof(msg.header), 0, MACH_PORT_NULL, 200, MACH_PORT_NULL);
+		snprintf(line, sizeof(line),
+		    "MONDRIAN DEMAND: %d %s send 0x%x\n", getpid(), names[i], kr);
+		say(line);
+		mach_port_deallocate(mach_task_self(), svc);
+	}
+	return NULL;
+}
+
+/*
  * Name an address that came from somewhere else: the kernel sampler prints raw
  * user pcs for a process it cannot symbolicate, and every process shares the
  * same images at the same addresses, so this process's dladdr answers for it.
@@ -1861,6 +2175,8 @@ start_display_link_probe(void)
 	(void)pthread_create(&thread, NULL, mondrian_os_log_again, (void *)(intptr_t)45);
 	(void)pthread_create(&thread, NULL, mondrian_os_log_again, (void *)(intptr_t)100);
 	(void)pthread_create(&thread, NULL, mondrian_bootstrap_probe, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_demand_probe, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_acc_probe, NULL);
 	(void)pthread_create(&thread, NULL, mondrian_addr_watch, NULL);
 }
 
@@ -8496,6 +8812,7 @@ mondrian_install_ui_hooks(void)
 	 * deadlocks on its own or because of a hook in that path.
 	 */
 	if (!boot_arg_set("mondrianbare=1")) {
+		resolve_dispatch_sync();
 		install_display_diagnostic();
 		if (window_server_probe_wanted()) {
 			install_server_hook();

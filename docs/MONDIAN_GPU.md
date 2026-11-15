@@ -1314,16 +1314,46 @@ the getter flips to 1 -- it does not block and needs nothing that the port
 lacks. `backboardd` simply never makes that call, which is why the compositor
 has no server to detect displays into.
 
-**Why it never gets there: the main thread is inside the log call.** Its stack
-is `dyld start -> BackBoardServices -> BKLogCommon -> libsystem_trace ->
-dispatch_sync -> mach_msg`, frozen from before userland settles, so the whole
-display bring-up in that process never runs.
+**Why it never gets there: the main thread is inside the log call.** That is
+what a boot *with the hook in backboardd* shows: `dyld start -->
+BackBoardServices -> BKLogCommon -> libsystem_trace -> dispatch_sync ->
+mach_msg`, frozen from before userland settles. The same boot with the hook out
+of `backboardd` (`mondrian_ui_hook=61`) gets past that and stops one step
+further, in `CoreAccessoriesInitForHID`. The dylib links QuartzCore, so an
+injected `backboardd` loads images in a different order and the log wait moves
+ahead of everything else; read `backboardd`'s own startup only from a boot
+where the dylib is not in it.
 
 Naming the queue by interposing `dispatch_sync` does not work: a
 `__DATA,__interpose` entry whose replacement calls `dispatch_sync` again is not
 re-bound away from the replacement, so the first call recurses until the stack
 is gone. Userland then never comes up at all -- the USB gadget still
 enumerates, the ring never answers, and there is no panic to read.
+
+### A clean backboardd stops in the accessory init
+
+Measured 2026-11-16 with `mondrian_ui_hook=61`: `backboardd`'s main thread sits
+in `CoreAccessoriesInitForHID` -> `CoreAccessories+0x20cf0` -> `dispatch_sync`
+-> `mach_msg`, and the window server work never starts. Reproducing the call
+from `runningboardd` (dlopen the framework, call the symbol from the hook)
+hangs in exactly the same frame, so the wait does not need `backboardd` to be
+observed.
+
+It is not an XPC mach service: interposing `xpc_connection_create_mach_service`
+in the reproducing process prints nothing while the call is stuck, and the
+thread's stack goes straight from the framework into `mach_msg`. The framework
+speaks Mach directly to one port, and the hook's next probe reads that port out
+of the blocked thread's trap arguments (`mach_vm_read_overwrite` on
+`mach_msg2_trap_args.data`, then `mach_port_type`), which says whether it is a
+live send right or a dead name.
+
+The on-demand side is not the fault. A first message to
+`com.apple.accessories.hid`, `com.apple.accessories.connection-info-server` or
+`com.apple.accessories.transport-server` (lookup `0x0`, send `0x0`) spawns
+`accessoryd` immediately -- `exec accessoryd` lands right after the send in the
+ring, and the fourth send resolves to `owner 128`, the daemon that just
+started. So `accessoryd` is available on demand; a clean `backboardd` still
+waits after it is up, which rules the demand trigger out as the cause.
 
 The blocking frame is `libsystem_trace + 0x5ccc`, which is **not**
 `os_log_create` (that one is at `+0x4000`, and there is a private
