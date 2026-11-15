@@ -60,7 +60,7 @@
  		return sp_count != 0 && sp_count <= MONDRIAN_SPMI_COUNT_MAX;
 --- /dev/null
 +++ b/bsd/dev/mondrian_virtio.c
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,614 @@
 +/*
 + * mondrian: virtio-blk over virtio-mmio, for the QEMU bench.
 + *
@@ -183,6 +183,9 @@
 +	uint64_t capacity;              /* in 512-byte sectors */
 +	uint32_t status_byte;
 +	uint32_t notify_index;
++	vm_offset_t verify;             /* copy of the data a write sent */
++	unsigned int verify_checks;
++	unsigned int verify_bad;
 +	int bmajor, cmajor;
 +	dev_t bdev;
 +	bool ready;
@@ -327,6 +330,35 @@
 +			error = vblk_io(VBLK_T_OUT, (off + sent) / DEV_BSIZE, chunk);
 +			if (error) {
 +				break;
++			}
++			if (vb.verify != 0) {
++				uint8_t *kept = (uint8_t *)vb.verify;
++
++				memcpy(kept, data, chunk);
++				if (vblk_io(VBLK_T_IN, (off + sent) / DEV_BSIZE,
++				    chunk) == 0) {
++					uint32_t at = 0;
++
++					vb.verify_checks++;
++					if ((vb.verify_checks & 0x3ff) == 0) {
++						printf("MONDRIAN VBLK: verified %u"
++						    " writes, %u bad\n",
++						    vb.verify_checks, vb.verify_bad);
++					}
++					while (at < chunk && kept[at] == data[at]) {
++						at++;
++					}
++					if (at < chunk) {
++						vb.verify_bad++;
++						if (vb.verify_bad <= 4) {
++							printf("MONDRIAN VBLK: verify"
++							    " mismatch sector %llu byte"
++							    " %u of %u (%02x != %02x)\n",
++							    (off + sent) / DEV_BSIZE,
++							    at, chunk, kept[at], data[at]);
++						}
++					}
++				}
 +			}
 +		}
 +		sent += chunk;
@@ -578,6 +610,23 @@
 +		}
 +		vb.bounce_size >>= 1;
 +	}
++	/*
++	 * mondrianvblkverify=1 reads every written range back and compares it
++	 * with what was sent. Without it a lost write is invisible: the guest
++	 * only sees its own memory, and HFS later reports a bitmap that does
++	 * not match what it thinks it allocated.
++	 */
++	if (PE_parse_boot_argn("mondrianvblkverify", &vb.verify_checks,
++	    sizeof(vb.verify_checks))) {
++		(void)kmem_alloc_contig(kernel_map, &vb.verify,
++		    vb.bounce_size + 2 * PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++		vb.verify_checks = 0;
++		if (vb.verify == 0) {
++			printf("MONDRIAN VBLK: no memory to verify writes\n");
++		}
++	}
++
 +	if (vb.bounce == 0) {
 +		printf("MONDRIAN VBLK: no contiguous bounce buffer\n");
 +		return ENOMEM;
