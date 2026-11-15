@@ -1,6 +1,30 @@
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -1052,6 +1052,84 @@
+@@ -725,6 +725,9 @@
+ #define FBCON_CURSOR    0xff303060u
+ 
+ static volatile uint32_t *fbcon_base;
++
++/* The tree has no panel node: the HUD goes to the serial console. */
++int mondrian_panel_absent;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ /*
+@@ -1000,6 +1003,13 @@
+ 
+ 	if (SecureDTFindEntry("name", "mondrian-fbcon", &entry) != kSuccess ||
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		/*
++		 * No panel: QEMU's virt machine. The HUD (panic reports, the
++		 * memory lines, KABORT) normally paints the panel; with no panel
++		 * every one of those lines was written into memory nobody reads,
++		 * so a guest died silently.
++		 */
++		mondrian_panel_absent = 1;
+ 		return;
+ 	}
+ 	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
+@@ -1052,6 +1062,84 @@
  	}
  }
  
@@ -85,7 +109,7 @@
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -1133,6 +1211,7 @@
+@@ -1133,6 +1221,7 @@
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  
  	fbcon_probe();
@@ -105,3 +129,28 @@
  } serial_device_t;
  
  kern_return_t serial_irq_enable(serial_device_t device);
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -362,6 +362,22 @@
+ hud_row_text(unsigned int row, const char *s)
+ {
+ 	unsigned int col = 0;
++	extern int mondrian_panel_absent;
++	extern void uart_putc(char c);
++
++	/*
++	 * No panel: QEMU's virt machine (pe_serial.c sets this when the tree has
++	 * no mondrian-fbcon node). The HUD is where a panic, a KABORT and the
++	 * memory lines actually get written, so without the panel a guest used
++	 * to die silently. Send the same rows to the serial console instead.
++	 */
++	if (mondrian_panel_absent != 0) {
++		for (; s != NULL && *s != 0 && col < EARLY_COLS; s++, col++) {
++			uart_putc(*s);
++		}
++		uart_putc('\n');
++		return;
++	}
+ 
+ 	hud_fill_row(row, 0xff000000u);
+ 	for (; s != NULL && *s != 0 && col < EARLY_COLS; s++, col++) {

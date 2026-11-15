@@ -1,0 +1,615 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/mondrian_ufs.c			standard
++bsd/dev/mondrian_virtio.c		standard
+ bsd/dev/mondrian_sample.c		standard
+ bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,25 @@
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++
++	/*
++	 * MONDRIAN: the QEMU bench roots on the host's disk image through
++	 * virtio-blk (bsd/dev/mondrian_virtio.c). The phone boots from UFS and
++	 * never asks for this name.
++	 */
++	if (strcmp(rdBootVar, "vblk0") == 0) {
++		extern int mondrian_vblk_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int vblk_error = mondrian_vblk_rootdev(root);
++		if (vblk_error) {
++			panic("IOFindBSDRoot: MONDRIAN virtio-blk root unavailable: %d",
++			    vblk_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+ 
+ //
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -569,6 +569,19 @@
+ sp_ensure(void)
+ {
+ 	uint32_t version;
++	int enable = 1;
++
++	/*
++	 * QEMU's virt machine has no PMIC. The arbiter's windows are board
++	 * constants, not device-tree entries, so on the emulator the first read
++	 * is a synchronous external abort inside IOKitInitializeTime() and the
++	 * boot dies in the panic trap. A bench boots with mondrianspmi=0: no
++	 * RTC, no keys, no battery, and the date comes from mondriantime.
++	 */
++	if (PE_parse_boot_argn("mondrianspmi", &enable, sizeof(enable)) &&
++	    enable == 0) {
++		return 0;
++	}
+ 
+ 	if (sp_core != NULL && sp_cnfg != NULL && sp_obs != NULL) {
+ 		return sp_count != 0 && sp_count <= MONDRIAN_SPMI_COUNT_MAX;
+--- /dev/null
++++ b/bsd/dev/mondrian_virtio.c
+@@ -0,0 +1,552 @@
++/*
++ * mondrian: virtio-blk over virtio-mmio, for the QEMU bench.
++ *
++ * The phone's root is on UFS; QEMU's `virt` machine has no UFS and this tree
++ * had no block device at all, so a guest boot stopped in IOFindBSDRoot waiting
++ * for a disk it would never see. This driver gives the bench one: the root
++ * image stays on the host and QEMU serves it through virtio-blk / virtio-mmio,
++ * so nothing has to fit in guest RAM (the image is 16 GB; the host is 20 GB).
++ *
++ * The bench is the point: it lets a launch be traced without a phone and
++ * without a fastboot per attempt. It is not a phone driver, and the phone does
++ * not boot from it.
++ *
++ * ADT node: "mondrian-virtio-blk" (absolute physical address, as
++ * mondrian-fbcon):
++ *   reg = <base size>
++ *
++ * Requests are polled, not interrupted: the node carries no interrupt, so the
++ * GIC never forwards the device's line, and the driver acknowledges the
++ * interrupt status register itself after every completion.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/uio_internal.h>
++#include <sys/vm.h>
++
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <mach/vm_param.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++/* Declared where the platform headers do not reach a bsd/dev driver. */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define VBLK_QUEUE_NUM      8
++#define VBLK_BOUNCE_SIZE    (64u << 10)
++
++/* virtio-mmio registers (version 2, the modern transport). */
++#define VIRTIO_MMIO_MAGIC           0x000
++#define VIRTIO_MMIO_VERSION         0x004
++#define VIRTIO_MMIO_DEVICE_ID       0x008
++#define VIRTIO_MMIO_VENDOR_ID       0x00c
++#define VIRTIO_MMIO_DEVICE_FEATURES 0x010
++#define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
++#define VIRTIO_MMIO_DRIVER_FEATURES 0x020
++#define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
++#define VIRTIO_MMIO_QUEUE_SEL       0x030
++#define VIRTIO_MMIO_QUEUE_NUM_MAX   0x034
++#define VIRTIO_MMIO_QUEUE_NUM       0x038
++#define VIRTIO_MMIO_QUEUE_READY     0x044
++#define VIRTIO_MMIO_QUEUE_NOTIFY    0x050
++#define VIRTIO_MMIO_INTERRUPT_STATUS 0x060
++#define VIRTIO_MMIO_INTERRUPT_ACK   0x064
++#define VIRTIO_MMIO_STATUS          0x070
++#define VIRTIO_MMIO_QUEUE_DESC_LOW  0x080
++#define VIRTIO_MMIO_QUEUE_DESC_HIGH 0x084
++#define VIRTIO_MMIO_DRIVER_DESC_LOW 0x090
++#define VIRTIO_MMIO_DRIVER_DESC_HIGH 0x094
++#define VIRTIO_MMIO_DEVICE_DESC_LOW 0x0a0
++#define VIRTIO_MMIO_DEVICE_DESC_HIGH 0x0a4
++#define VIRTIO_MMIO_CONFIG          0x100
++
++#define VIRTIO_MAGIC_VALUE          0x74726976u    /* "virt" */
++#define VIRTIO_VERSION_MODERN       2
++#define VIRTIO_DEVICE_ID_BLOCK      2
++
++#define VIRTIO_STATUS_ACK           0x01
++#define VIRTIO_STATUS_DRIVER        0x02
++#define VIRTIO_STATUS_DRIVER_OK     0x04
++#define VIRTIO_STATUS_FEATURES_OK   0x08
++#define VIRTIO_STATUS_FAILED        0x80
++
++#define VIRTQ_DESC_F_NEXT           0x1
++#define VIRTQ_DESC_F_WRITE          0x2
++
++#define VBLK_T_IN             0
++#define VBLK_T_OUT            1
++
++/* Layout inside the one page the queue lives in. */
++#define VBLK_DESC_OFF   0x000
++#define VBLK_AVAIL_OFF  0x080
++#define VBLK_USED_OFF   0x0a0
++
++struct virtq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++
++struct vblk_header {
++	uint32_t type;
++	uint32_t reserved;
++	uint64_t sector;
++};
++
++static struct {
++	vm_offset_t regs;               /* MMIO */
++	vm_offset_t queue;              /* one page: descriptors, avail, used */
++	uint64_t queue_pa;
++	vm_offset_t bounce;
++	uint64_t bounce_pa;
++	uint32_t bounce_size;
++	uint32_t queue_num;
++	uint64_t capacity;              /* in 512-byte sectors */
++	uint32_t status_byte;
++	uint32_t notify_index;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} vb;
++
++static LCK_GRP_DECLARE(mondrian_vblk_grp, "mondrian_vblk");
++static LCK_MTX_DECLARE(mondrian_vblk_lock, &mondrian_vblk_grp);
++
++#define VB_REG(off)     (*(volatile uint32_t *)(vb.regs + (off)))
++#define VB_DESC         ((struct virtq_desc *)(vb.queue + VBLK_DESC_OFF))
++#define VB_AVAIL        ((volatile uint16_t *)(vb.queue + VBLK_AVAIL_OFF))
++#define VB_USED         ((volatile uint16_t *)(vb.queue + VBLK_USED_OFF))
++#define VB_USED_RING    ((volatile uint32_t *)(vb.queue + VBLK_USED_OFF + 4))
++
++static void
++vblk_barrier(void)
++{
++	__asm__ volatile("dmb ish" ::: "memory");
++}
++
++static int
++vblk_io(uint32_t type, uint64_t sector, uint32_t bytes)
++{
++	struct virtq_desc *desc = VB_DESC;
++	struct vblk_header *header = (struct vblk_header *)vb.bounce;
++	uint8_t *status = (uint8_t *)(vb.bounce + sizeof(*header) + bytes);
++	uint16_t seen = VB_USED[1];
++	uint64_t spins;
++
++	header->type = type;
++	header->reserved = 0;
++	header->sector = sector;
++	*status = 0xff;
++
++	desc[0].addr = vb.bounce_pa;
++	desc[0].len = sizeof(*header);
++	desc[0].flags = VIRTQ_DESC_F_NEXT;
++	desc[0].next = 1;
++
++	desc[1].addr = vb.bounce_pa + sizeof(*header);
++	desc[1].len = bytes;
++	desc[1].flags = VIRTQ_DESC_F_NEXT |
++	    (type == VBLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
++	desc[1].next = 2;
++
++	desc[2].addr = vb.bounce_pa + sizeof(*header) + bytes;
++	desc[2].len = 1;
++	desc[2].flags = VIRTQ_DESC_F_WRITE;
++	desc[2].next = 0;
++
++	VB_AVAIL[2 + (VB_AVAIL[1] % vb.queue_num)] = 0;
++	vblk_barrier();
++	VB_AVAIL[1] = VB_AVAIL[1] + 1;
++	vblk_barrier();
++
++	VB_REG(VIRTIO_MMIO_QUEUE_NOTIFY) = vb.notify_index;
++
++	for (spins = 0; spins < 200000000ull; spins++) {
++		vblk_barrier();
++		if (VB_USED[1] != seen) {
++			break;
++		}
++		if ((spins & 0x3ff) == 0) {
++			__builtin_arm_wfe();
++		}
++	}
++	/* Drop the device's line: nothing is wired to it, but a level held high
++	 * for ever is a trap for whoever looks at the GIC next. */
++	(void)VB_REG(VIRTIO_MMIO_INTERRUPT_STATUS);
++	VB_REG(VIRTIO_MMIO_INTERRUPT_ACK) = 1;
++
++	if (VB_USED[1] == seen) {
++		printf("MONDRIAN VBLK: request %u at sector %llu timed out\n",
++		    type, sector);
++		return ETIMEDOUT;
++	}
++	if (*status != 0) {
++		printf("MONDRIAN VBLK: request %u at sector %llu, status %u\n",
++		    type, sector, *status);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++mondrian_vblk_open(__unused dev_t dev, __unused int flags,
++    __unused int devtype, __unused struct proc *p)
++{
++	return vb.ready ? 0 : ENXIO;
++}
++
++static int
++mondrian_vblk_close(__unused dev_t dev, __unused int flags,
++    __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++mondrian_vblk_strategy(buf_t bp)
++{
++	uint64_t const bytes_on_device = vb.capacity * DEV_BSIZE;
++	uint64_t off = (uint64_t)buf_blkno(bp) * DEV_BSIZE;
++	uint32_t count = buf_count(bp);
++	int error = 0;
++	caddr_t vaddr = NULL;
++
++	buf_setresid(bp, count);
++	if (!vb.ready) {
++		error = ENXIO;
++		goto done;
++	}
++	if (off > bytes_on_device || count > bytes_on_device - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if ((count % DEV_BSIZE) != 0) {
++		error = EINVAL;
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&mondrian_vblk_lock);
++	for (uint32_t sent = 0; sent < count; ) {
++		uint32_t chunk = MIN(count - sent, vb.bounce_size);
++		uint8_t *data = (uint8_t *)(vb.bounce + sizeof(struct vblk_header));
++
++		if (buf_flags(bp) & B_READ) {
++			error = vblk_io(VBLK_T_IN, (off + sent) / DEV_BSIZE, chunk);
++			if (error) {
++				break;
++			}
++			memcpy(vaddr + sent, data, chunk);
++		} else {
++			memcpy(data, vaddr + sent, chunk);
++			error = vblk_io(VBLK_T_OUT, (off + sent) / DEV_BSIZE, chunk);
++			if (error) {
++				break;
++			}
++		}
++		sent += chunk;
++		buf_setresid(bp, count - sent);
++	}
++	lck_mtx_unlock(&mondrian_vblk_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++mondrian_vblk_ioctl(__unused dev_t dev, u_long cmd, caddr_t data,
++    __unused int flag, __unused struct proc *p)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = DEV_BSIZE;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = vb.capacity;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 1;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++		return 0;       /* the host file is written through */
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = vb.bounce_size / DEV_BSIZE;
++		return 0;
++	case DKIOCGETMAXBYTECOUNTREAD:
++	case DKIOCGETMAXBYTECOUNTWRITE:
++		*o = vb.bounce_size;
++		return 0;
++	case DKIOCGETMAXSEGMENTBYTECOUNTREAD:
++	case DKIOCGETMAXSEGMENTBYTECOUNTWRITE:
++		*o = vb.bounce_size;
++		return 0;
++	case DKIOCGETMINSEGMENTALIGNMENTBYTECOUNT:
++		*o = DEV_BSIZE;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++mondrian_vblk_psize(__unused dev_t dev)
++{
++	return vb.ready ? (int)MIN(vb.capacity, INT_MAX) : -1;
++}
++
++static int
++mondrian_vblk_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(mondrian_vblk_strategy, NULL, dev, B_READ, minphys, uio,
++	    DEV_BSIZE);
++}
++
++static int
++mondrian_vblk_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(mondrian_vblk_strategy, NULL, dev, B_WRITE, minphys, uio,
++	    DEV_BSIZE);
++}
++
++static const struct bdevsw mondrian_vblk_bdevsw = {
++	.d_open     = mondrian_vblk_open,
++	.d_close    = mondrian_vblk_close,
++	.d_strategy = mondrian_vblk_strategy,
++	.d_ioctl    = mondrian_vblk_ioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = mondrian_vblk_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw mondrian_vblk_cdevsw = {
++	.d_open       = mondrian_vblk_open,
++	.d_close      = mondrian_vblk_close,
++	.d_read       = mondrian_vblk_read,
++	.d_write      = mondrian_vblk_write,
++	.d_ioctl      = mondrian_vblk_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static void
++vblk_status(uint32_t bits)
++{
++	uint32_t status = VB_REG(VIRTIO_MMIO_STATUS);
++
++	VB_REG(VIRTIO_MMIO_STATUS) = status | bits;
++	vblk_barrier();
++}
++
++/*
++ * One contiguous page holds the three rings: descriptors at 0, the avail ring
++ * at 0x80 and the used ring at 0xa0 (aligned 16, as the transport requires).
++ * 8 descriptors is all a 16-byte header, one data buffer and one status byte
++ * need.
++ */
++static int
++vblk_setup_queue(void)
++{
++	uint64_t pa;
++	uint32_t num_max;
++	uint16_t num;
++
++	VB_REG(VIRTIO_MMIO_QUEUE_SEL) = 0;
++	num_max = VB_REG(VIRTIO_MMIO_QUEUE_NUM_MAX);
++	if (num_max == 0) {
++		printf("MONDRIAN VBLK: the device has no queue 0\n");
++		return ENXIO;
++	}
++	num = (uint16_t)MIN(num_max, VBLK_QUEUE_NUM);
++	VB_REG(VIRTIO_MMIO_QUEUE_NUM) = num;
++
++	if (kmem_alloc_contig(kernel_map, &vb.queue, PAGE_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		printf("MONDRIAN VBLK: no page for the queue\n");
++		return ENOMEM;
++	}
++	pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)vb.queue));
++	vb.queue_pa = pa;
++
++	VB_REG(VIRTIO_MMIO_QUEUE_DESC_LOW) = (uint32_t)pa;
++	VB_REG(VIRTIO_MMIO_QUEUE_DESC_HIGH) = (uint32_t)(pa >> 32);
++	pa += VBLK_AVAIL_OFF;
++	VB_REG(VIRTIO_MMIO_DRIVER_DESC_LOW) = (uint32_t)pa;
++	VB_REG(VIRTIO_MMIO_DRIVER_DESC_HIGH) = (uint32_t)(pa >> 32);
++	pa += VBLK_USED_OFF - VBLK_AVAIL_OFF;
++	VB_REG(VIRTIO_MMIO_DEVICE_DESC_LOW) = (uint32_t)pa;
++	VB_REG(VIRTIO_MMIO_DEVICE_DESC_HIGH) = (uint32_t)(pa >> 32);
++
++	VB_REG(VIRTIO_MMIO_QUEUE_READY) = 1;
++	vblk_barrier();
++	vb.queue_num = num;
++	vb.notify_index = 0;
++	return 0;
++}
++
++static int
++mondrian_vblk_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	uint64_t features_high;
++	uint32_t version;
++
++	memset(&vb, 0, sizeof(vb));
++	vb.bmajor = vb.cmajor = -1;
++
++	if (SecureDTLookupEntry(NULL, "/mondrian-virtio-blk", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) || reg[0] == 0) {
++		printf("MONDRIAN VBLK: no /mondrian-virtio-blk node\n");
++		return ENXIO;
++	}
++	vb.regs = ml_io_map(reg[0], reg[1]);
++	if (vb.regs == 0) {
++		printf("MONDRIAN VBLK: cannot map %llx\n", (uint64_t)reg[0]);
++		return ENXIO;
++	}
++
++	if (VB_REG(VIRTIO_MMIO_MAGIC) != VIRTIO_MAGIC_VALUE) {
++		printf("MONDRIAN VBLK: bad magic %x\n", VB_REG(VIRTIO_MMIO_MAGIC));
++		return ENXIO;
++	}
++	version = VB_REG(VIRTIO_MMIO_VERSION);
++	if (VB_REG(VIRTIO_MMIO_DEVICE_ID) != VIRTIO_DEVICE_ID_BLOCK) {
++		printf("MONDRIAN VBLK: not a block device (id %u)\n",
++		    VB_REG(VIRTIO_MMIO_DEVICE_ID));
++		return ENXIO;
++	}
++	if (version != VIRTIO_VERSION_MODERN) {
++		/* QEMU's virtio-mmio is legacy by default: the bench passes
++		 * -global virtio-mmio.force-legacy=false. */
++		printf("MONDRIAN VBLK: transport version %u, need 2\n", version);
++		return ENXIO;
++	}
++
++	VB_REG(VIRTIO_MMIO_STATUS) = 0;
++	vblk_status(VIRTIO_STATUS_ACK);
++	vblk_status(VIRTIO_STATUS_DRIVER);
++
++	/* VIRTIO_F_VERSION_1 lives in the high feature word and is mandatory. */
++	VB_REG(VIRTIO_MMIO_DEVICE_FEATURES_SEL) = 1;
++	features_high = VB_REG(VIRTIO_MMIO_DEVICE_FEATURES);
++	if ((features_high & 1) == 0) {
++		printf("MONDRIAN VBLK: no VIRTIO_F_VERSION_1\n");
++		return ENXIO;
++	}
++	VB_REG(VIRTIO_MMIO_DRIVER_FEATURES_SEL) = 1;
++	VB_REG(VIRTIO_MMIO_DRIVER_FEATURES) = 1;
++	VB_REG(VIRTIO_MMIO_DRIVER_FEATURES_SEL) = 0;
++	VB_REG(VIRTIO_MMIO_DRIVER_FEATURES) = 0;
++
++	vblk_status(VIRTIO_STATUS_FEATURES_OK);
++	if ((VB_REG(VIRTIO_MMIO_STATUS) & VIRTIO_STATUS_FEATURES_OK) == 0) {
++		printf("MONDRIAN VBLK: the device refused the features\n");
++		return ENXIO;
++	}
++
++	if (vblk_setup_queue() != 0) {
++		return ENXIO;
++	}
++
++	vb.bounce_size = VBLK_BOUNCE_SIZE;
++	while (vb.bounce_size >= PAGE_SIZE) {
++		if (kmem_alloc_contig(kernel_map, &vb.bounce, vb.bounce_size,
++		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++			break;
++		}
++		vb.bounce_size >>= 1;
++	}
++	if (vb.bounce == 0) {
++		printf("MONDRIAN VBLK: no contiguous bounce buffer\n");
++		return ENOMEM;
++	}
++	vb.bounce_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)vb.bounce));
++
++	vblk_status(VIRTIO_STATUS_DRIVER_OK);
++	if (VB_REG(VIRTIO_MMIO_STATUS) & VIRTIO_STATUS_FAILED) {
++		printf("MONDRIAN VBLK: the device failed\n");
++		return ENXIO;
++	}
++
++	/* virtio_blk_config: capacity in 512-byte sectors. */
++	vb.capacity = *(volatile uint64_t *)(vb.regs + VIRTIO_MMIO_CONFIG);
++
++	vb.bmajor = bdevsw_add(-1, &mondrian_vblk_bdevsw);
++	if (vb.bmajor < 0) {
++		return ENXIO;
++	}
++	vb.cmajor = cdevsw_add_with_bdev(-1, &mondrian_vblk_cdevsw, vb.bmajor);
++	if (vb.cmajor < 0) {
++		return ENXIO;
++	}
++	vb.bdev = makedev(vb.bmajor, 0);
++	devfs_make_node(vb.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "vblk0");
++	devfs_make_node(makedev(vb.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR,
++	    0640, "rvblk0");
++	vb.ready = true;
++	printf("MONDRIAN VBLK: virtio-blk, %llu MiB, queue %u, %u KiB requests\n",
++	    vb.capacity >> 11, vb.queue_num, vb.bounce_size >> 10);
++	return 0;
++}
++
++/* Root device for rd=vblk0 (IOFindBSDRoot). */
++int
++mondrian_vblk_rootdev(dev_t *dev)
++{
++	int error;
++
++	if (!vb.ready) {
++		error = mondrian_vblk_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = vb.bdev;
++	return 0;
++}

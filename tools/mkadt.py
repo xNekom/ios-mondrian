@@ -233,6 +233,12 @@ def build(board, seed=None, qemu=False, altmem=False):
             ph(),
             ('reg', u64(0x09000000, 0x1000)),
         ])
+        # The root image, served by QEMU as virtio-blk on the first virtio-mmio
+        # slot (bsd/dev/mondrian_virtio.c, rd=vblk0).
+        virtio = [node(board.dt_prefix + '-virtio-blk', [
+            ph(),
+            ('reg', u64(0x0a000000, 0x200)),
+        ])]
     else:
         console = node(board.dt_prefix + '-fbcon', [
             ph(),
@@ -241,6 +247,7 @@ def build(board, seed=None, qemu=False, altmem=False):
             ('height', u32(board.fb_h)),
             ('stride', u32(board.fb_w * 4)),
         ])
+        virtio = []
 
     # bsd/dev/<board>_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node(board.dt_prefix + '-ufs', [
@@ -352,7 +359,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, console, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs, gcc]))
+    ], [chosen, defaults, cpus, arm_io, console, buttons, pram] + virtio + memory + reserved + product + ([] if qemu else [ufs, gcc]))
 
 
 if __name__ == '__main__':

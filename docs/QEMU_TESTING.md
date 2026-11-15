@@ -1,109 +1,89 @@
 # QEMU testing
 
 `tools/qemu-ios.py` boots the same payload (`mkpayload.py` output) on QEMU's
-`virt` machine, so most kernel changes can be checked without touching the
-phone. It emulates what the shim does: place the segments, the ADT and the
-boot arguments at their physical addresses and jump.
-
-It covers the physical memory layout, the GICv3, the virtual timer and the
-console, and it writes:
+`virt` machine, so kernel changes can be checked without touching the phone. It
+does what the shim does: place the segments, the ADT and the boot arguments at
+their physical addresses and jump. It covers the physical memory layout, the
+GICv3, the virtual timer, a PL011 console and virtio-blk, and it writes:
 
 | file | content |
 | --- | --- |
-| `fb.png` | the panel as the guest left it |
-| `fb.txt` | the console text, decoded with the kernel's own font (needs `--kernel`) |
-| `serial.txt` | the console, straight from QEMU's PL011 (`mkadt.py --qemu` only) |
+| `serial.txt` | the console, from QEMU's PL011 (`mkadt.py --qemu` only) |
+| `fb.png`, `fb.txt` | the panel, or its text decoded with the kernel's font |
 | `regs.txt` | register state, plus the output of every `--hmp` command |
 | `qemu.log` | guest exceptions (interrupts, aborts, translation faults) |
 | `result.json` | `no_panic_observed`, `panic`, `blank_screen` or `incomplete_decode` |
 
-Not emulated: Qualcomm XPU/TZ protections, the ABL, the real panel and the MDP,
-and the PSCI conduit (QEMU uses `hvc`). Those are decided by the hardware.
+Not emulated: Qualcomm XPU/TZ protections, the ABL, the panel and its MDP, the
+PMIC, and the PSCI conduit (QEMU uses `hvc`).
 
-### Console and the display nodes
+## What the emulator does not have, and what that costs
 
-`mkadt.py --qemu` leaves the display (`disp0`) and panel console
-(`mondrian-fbcon`) nodes out and emits `mondrian-qemu-uart` with `virt`'s PL011
-at `0x09000000` instead. Both halves of that matter:
+Every one of these was a boot that died for a reason that is not a kernel bug:
 
-- The kernel console is the panel on the phone, so without a UART node a QEMU
-  boot prints nothing at all (`serial.txt` stays empty and only the framebuffer
-  decode is left).
-- A display node with no MDP behind it is worse than silence: the first
-  register read takes a synchronous external abort, QEMU restarts the
-  instruction, and the boot dies in an abort loop that looks like a hang
-  (`Taking exception 5 [IRQ]` repeating in `qemu.log`).
-
-With both, the guest boots past the platform expert to BSD init
-(`MAC Framework successfully initialized`, then `using N buffer headers`) and
-stops in `IOFindBSDRoot` waiting for a root device, which `virt` does not
-provide: there is no virtio-blk driver in this tree yet.
-
-
-## Setup
-
-```sh
-python3 tools/qemu-ios.py --check-env          # reports what is missing
-brew install qemu llvm                         # macOS; pacman/apt/dnf on Linux
-```
+- **No MDP.** `mkadt.py --qemu` leaves `disp0` out. With the node, the
+  framebuffer driver reads a register that is not there, takes a synchronous
+  external abort, and QEMU re-executes the instruction for ever: it looks hung
+  and `qemu.log` fills with one repeating exception.
+- **No UART on the board, and no panel either.** The phone's console is the
+  panel, so `--qemu` emits `mondrian-qemu-uart` (PL011 at `0x09000000`) instead
+  of `mondrian-fbcon`, and `pe_serial.c` drives it as one more serial device.
+  The HUD (panic report, `KABORT`, the memory lines) paints the panel; with no
+  panel node (`mondrian_panel_absent`) those rows go to the console. Without
+  that, a guest panic is silent.
+- **No block device.** `bsd/dev/mondrian_virtio.c` is virtio-blk over the modern
+  virtio-mmio transport, polled: the node carries no interrupt, so the GIC never
+  forwards the line. The root image stays on the host, which is what makes a
+  16 GB root possible on a 20 GB host.
+- **No PMIC.** The SPMI windows are board constants, not tree entries, so the
+  RTC read in `IOKitInitializeTime()` aborts. `mondrianspmi=0` skips the
+  arbiter: no RTC, no keys, no battery.
 
 ## Build a payload and run it
 
 ```sh
-python3 tools/mkadt.py /tmp/qemu.adt --qemu
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet /tmp/qemu.adt \
+python3 tools/mkadt.py /tmp/qemu.adt --qemu --board mondrian
+python3 tools/mkpayload.py xnu/out/kernel.development.mondrian /tmp/qemu.adt \
     /tmp/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=md0'
+    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=vblk0 mondrianspmi=0' \
+    --board mondrian --allow-silent-boot
 
-python3 tools/qemu-ios.py /tmp/payload.bin /tmp/qemu-run --secs 20 \
-    --kernel xnu/out/kernel.development.sweet
+simg2img backup/ios-root.simg /root/ios-root.raw      # once: 16 GB, Android sparse
+python3 tools/qemu-ios.py /tmp/payload.bin /tmp/qemu-run --secs 240 \
+    --board mondrian --kernel xnu/out/kernel.development.mondrian \
+    --disk /root/ios-root.raw
 ```
 
-Options worth knowing:
+`--disk` serves the image as virtio-blk and forces it onto `virtio-mmio-bus.0`:
+without `bus=` QEMU hands the device to the *last* free transport
+(`0xa003e00`), while `mkadt.py` states the first (`0xa000000`). Both halves have
+to agree, and the kernel prints `MONDRIAN VBLK: virtio-blk, N MiB` when they do.
+Under TCG a boot to `bsd_init` takes a minute, so `--secs 240` is the minimum
+worth typing.
 
-- `--board mondrian` selects the 1440x3200 framebuffer and the `max` CPU model
-  (the board is armv8.5 and touches `DIT`, which `cortex-a76` does not have).
-- `--live-serial` streams the serial console to the terminal.
-- `--fail-on-panic` exits 2 on a visible panic and 3 on a blank or undecodable
-  screen; useful in CI.
-- `--gdb` starts halted with a gdb stub on port 1234:
-  `lldb -o "gdb-remote 1234" -o "register read -a"`.
-- `--hmp "xp/8gx 0x<pa>"` reads guest physical memory after it stops. Any kernel
-  variable can be read this way: `llvm-nm` gives the link address, and the
-  physical address is `VA - VM_KERNEL_LINK_ADDRESS + phys_base + 0x4000`.
-
-`tools/qemu-triage.py <outdir> <kernel>` prints the first exception and the
-symbol it happened in, which is usually enough to name the culprit.
-
-QEMU's `virt` puts the low GiB at `0x40000000` and the rest at `0x100000000`,
-so the kernel can be booted with the shape the phone's 9 GiB bank has:
-
-```sh
-QEMU_PHYS_BASE=0x100000000 QEMU_MEM_SIZE=0x180000000 \
-    python3 tools/mkadt.py /tmp/qemu-high.adt --qemu --board mondrian
-```
-
-`qemu-ios.py` sizes `-m` from the payload header, so the rest of the recipe is
-unchanged; the phone's own base needs `-m 41G` (virt RAM starts at 1 GiB) and
-`vm.overcommit_memory=1`, which leaves the RSS at what the guest touches.
-
-Two traps it found: the ADT's CPU node must carry MPIDR 0 under QEMU (the
-phone's boot core is 7), and `phystokv()` panics on any address outside the
-window, so the splash must not go through it when the window excludes it.
+Options worth knowing: `--board mondrian` picks the 1440x3200 panel and the
+`max` CPU model (the board is armv8.5 and touches `DIT`, which `cortex-a76`
+lacks); `--live-serial` streams the console; `--gdb` starts halted with a stub
+on 1234; `--hmp "xp/8gx 0x<pa>"` reads guest memory after the stop, where the
+physical address of a kernel variable is
+`VA - VM_KERNEL_LINK_ADDRESS + phys_base + 0x4000`. `tools/qemu-triage.py
+<outdir> <kernel>` names the symbol of the first exception, which is usually
+enough to place the culprit.
 
 ## Environment knobs
 
 | variable | effect |
 | --- | --- |
-| `QEMU_PHYS_BASE`, `QEMU_MEM_SIZE` | try another window of RAM (this is how the mondrian window was chosen) |
+| `QEMU_PHYS_BASE`, `QEMU_MEM_SIZE` | another window of RAM (default `0xb0000000`/`0x4d000000`; the phone's own shape is `0x100000000`/`0x180000000`) |
 | `ADT_SEED` | pin the random seed the physmap slide derives from |
 | `ADT_MEMORY=0` | leave `/memory` out of the tree |
 | `DT_CPUS=1` | emit a single CPU node |
 
 ## Reading the result
 
-The screen rows are circular and the console blanks once per screenful, so
-`no_panic_observed` means "no visible panic in that snapshot", not "booted".
-Use `qemu-triage.py`, the `--hmp` reads or the `--gdb` stub to find out where
-it actually stopped. A 12 s run can miss panics that follow the 30 s `IORTC`
-wait: use at least 45 s, or a board that skips that wait.
+`no_panic_observed` means "no visible panic in the framebuffer snapshot", not
+"booted". With `--qemu` read `serial.txt`, which has the whole console, and use
+`qemu.log`/`qemu-triage.py` when the last line is not enough. Two traps this
+machine found: the ADT's CPU node must carry MPIDR 0 under QEMU (the phone's
+boot core is 7), and `phystokv()` panics on any address outside the window, so
+the splash must not go through it when the window excludes it.

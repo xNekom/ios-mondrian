@@ -244,6 +244,7 @@ def main():
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     ap.add_argument('--board', default='sweet', help='sweet | mondrian (the framebuffer to decode)')
+    ap.add_argument('--disk', help='raw disk image served through virtio-blk (the kernel root, rd=vblk0)')
     a = ap.parse_args()
     set_board(a.board)
     if a.cpu is None:
@@ -301,6 +302,17 @@ def main():
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
+    if a.disk:
+        # The root image stays on the host: virtio-blk over virtio-mmio reads it
+        # from there, so a 16 GB root costs no guest RAM. QEMU's virtio-mmio is
+        # legacy by default and bsd/dev/mondrian_virtio.c speaks the modern
+        # transport (version 2).
+        cmd += ['-global', 'virtio-mmio.force-legacy=false',
+                '-drive', f'file={os.path.abspath(a.disk)},format=raw,if=none,id=vblk0',
+                # slot 0 of the mmio bank, which is the address mkadt.py states:
+                # without bus= the machine hands the device to the last free
+                # transport (bus 31 at 0xa003e00), not the first.
+                '-device', 'virtio-blk-device,drive=vblk0,bus=virtio-mmio-bus.0']
     if a.gdb:
         cmd += ['-S', '-gdb', 'tcp::1234']
 
