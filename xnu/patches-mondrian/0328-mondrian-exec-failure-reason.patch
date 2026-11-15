@@ -1,0 +1,26 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7568,7 +7568,12 @@
+ 	if (kr != KERN_SUCCESS) {
+ 		error = EINVAL;
+ 
+-		if (error_msg != NULL) {
++		if (error_msg == NULL) {
++			/* No string from the machine layer: still leave the caller
++			 * a reason, or the exec kills the process with none. */
++			*signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++			    EXEC_EXIT_REASON_SECURITY_POLICY);
++		} else {
+ 			uint32_t error_msg_len = (uint32_t)strlen(error_msg) + 1;
+ 			mach_vm_address_t data_addr = 0;
+ 			int reason_error = 0;
+@@ -7707,6 +7712,9 @@
+ 				if (mondrian_exec_kill_armed(p->p_name)) {
+ 					mondrian_proc_denied++;
+ 					printf("MONDRIAN EXEC: denied %s\n", p->p_name);
++					signature_failure_reason = os_reason_create(
++					    OS_REASON_EXEC,
++					    EXEC_EXIT_REASON_SECURITY_POLICY);
+ 					error = EACCES;
+ 					goto done;
+ 				}
