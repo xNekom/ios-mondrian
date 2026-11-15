@@ -1319,6 +1319,12 @@ is `dyld start -> BackBoardServices -> BKLogCommon -> libsystem_trace ->
 dispatch_sync -> mach_msg`, frozen from before userland settles, so the whole
 display bring-up in that process never runs.
 
+Naming the queue by interposing `dispatch_sync` does not work: a
+`__DATA,__interpose` entry whose replacement calls `dispatch_sync` again is not
+re-bound away from the replacement, so the first call recurses until the stack
+is gone. Userland then never comes up at all -- the USB gadget still
+enumerates, the ring never answers, and there is no panic to read.
+
 The blocking frame is `libsystem_trace + 0x5ccc`, which is **not**
 `os_log_create` (that one is at `+0x4000`, and there is a private
 `_os_log_create` at `+0x14ac0`). Measured by printing the offsets at runtime;
