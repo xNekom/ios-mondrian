@@ -308,7 +308,11 @@ def main():
         # legacy by default and bsd/dev/mondrian_virtio.c speaks the modern
         # transport (version 2).
         cmd += ['-global', 'virtio-mmio.force-legacy=false',
-                '-drive', f'file={os.path.abspath(a.disk)},format=raw,if=none,id=vblk0',
+                # snapshot=on: the guest writes into a temporary overlay, so the
+                # image stays pristine. Without it a killed run leaves the
+                # volume dirty (no journal) and the next boot inherits the
+                # errors and reports them as runtime corruption.
+                '-drive', f'file={os.path.abspath(a.disk)},format=raw,if=none,id=vblk0,snapshot=on',
                 # slot 0 of the mmio bank, which is the address mkadt.py states:
                 # without bus= the machine hands the device to the last free
                 # transport (bus 31 at 0xa003e00), not the first.

@@ -47,7 +47,7 @@ python3 tools/mkpayload.py xnu/out/kernel.development.mondrian /tmp/qemu.adt \
         ignition_level=1 wdt=-1 mondriankill=quiet' \
     --board mondrian --allow-silent-boot
 
-simg2img backup/ios-root.simg /root/ios-root.raw   # 16 GB; the guest writes this copy
+simg2img backup/ios-root.simg /root/ios-root.raw   # 16 GB; served snapshot=on
 python3 tools/qemu-ios.py /tmp/payload.bin /tmp/qemu-run --secs 240 \
     --board mondrian --kernel xnu/out/kernel.development.mondrian \
     --disk /root/ios-root.raw
@@ -57,10 +57,13 @@ The userland flags are the phone's (`tools/boards.py`), not QEMU's: without
 `launchd_unsecure_cache=1` and `unentitled_ios_sim_launch=1` the guest mounts
 the root, execs `/sbin/launchd`, and init exits before it can start anything.
 
-`--disk` serves the image as virtio-blk and forces it onto `virtio-mmio-bus.0`:
-without `bus=` QEMU hands the device to the *last* free transport
-(`0xa003e00`), while `mkadt.py` states the first (`0xa000000`). Both halves have
-to agree, and the kernel prints `MONDRIAN VBLK: virtio-blk, N MiB` when they do.
+`--disk` serves the image as virtio-blk, `snapshot=on`, and forces it onto
+`virtio-mmio-bus.0`: without `bus=` QEMU hands the device to the *last* free
+transport (`0xa003e00`), while `mkadt.py` states the first (`0xa000000`). Both
+halves have to agree, and the kernel prints `MONDRIAN VBLK: virtio-blk, N MiB`
+when they do. The snapshot matters: the volume is not journaled, so a run killed
+mid-flight leaves it dirty and the next boot inherits the errors as runtime
+corruption.
 Under TCG a boot to `bsd_init` takes a minute, so `--secs 240` is the minimum
 worth typing.
 
