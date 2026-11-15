@@ -1306,6 +1306,35 @@ Do not call it yourself to "wake it up": a constructor that asks for the server
 creates one on the spot and the boot stops answering on the ring before the
 first heartbeat pair ends (two boots). Observing is safe; asking is not.
 
+The render server itself is the step before that, and it is missing too:
+`CARenderServerIsRunning()` answers 0 in `backboardd` at 20, 40 and 60 s, so
+nothing in the system ever created one. Calling `CARenderServerStart()`
+yourself (in `backboardd`, through `dlsym(RTLD_DEFAULT, ...)`) returns 1 and
+the getter flips to 1 -- it does not block and needs nothing that the port
+lacks. `backboardd` simply never makes that call, which is why the compositor
+has no server to detect displays into.
+
+**Why it never gets there: the main thread is inside the log call.** Its stack
+is `dyld start -> BackBoardServices -> BKLogCommon -> libsystem_trace ->
+dispatch_sync -> mach_msg`, frozen from before userland settles, so the whole
+display bring-up in that process never runs.
+
+The blocking frame is `libsystem_trace + 0x5ccc`, which is **not**
+`os_log_create` (that one is at `+0x4000`, and there is a private
+`_os_log_create` at `+0x14ac0`). Measured by printing the offsets at runtime;
+`dladdr` on the blocked frame names the nearest public symbol, which is why it
+reads as `os_log_create`.
+
+Silencing the logging entry points (`os_log_create`, `os_log_type_enabled`,
+`_os_log_impl` through a `__DATA,__interpose` table) does not move that frame:
+the call is made from another image's initializer, through the private entry.
+Interposing `BKLogCommon` itself to return a dummy handle *does* release the
+main thread -- and then `backboardd` dies (143 crashes in one boot, and it is
+gone from the process table by `t=273 s`), because the handle it hands back is
+used somewhere that this port has not silenced. Neither shim is a fix; the
+block has to be removed in the logging path itself (the firehose wait that
+`dispatch_sync` is sitting on), not stubbed out above it.
+
 ## Android capture (2026-10-28)
 
 A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug
