@@ -61,7 +61,6 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <sys/ucontext.h>
-#include <syslog.h>
 
 /* The kernel rewrites this one at boot (glblob=1); the root itself is mounted
  * read-only, /private/var is not. */
@@ -396,5 +395,13 @@ mondrian_inject(void)
 	    MONDIAN_GL_LIBRARY_WRITABLE : MONDIAN_GL_LIBRARY, RTLD_NOW);
 	gl_hooks(library);
 	say("mondrian-crash: handlers set, GL %s\n", library != NULL ? "loaded" : dlerror());
-	syslog(LOG_NOTICE, "mondrian: %s %s", MONDIAN_GL_LIBRARY, library != NULL ? "loaded" : dlerror());
+	/*
+	 * No syslog() here, ever: this runs from an image initializer, and
+	 * syslog -> libsystem_asl -> os_log_shim_enabled -> dispatch blocks in
+	 * mach_msg until the process is dead. Measured on the phone
+	 * (2026-11-15): every injected daemon stopped inside this call, so
+	 * backboardd's window server never started and SpringBoard's main
+	 * queue never drained -- no presents, no display link, black panel.
+	 * The line above is the log.
+	 */
 }

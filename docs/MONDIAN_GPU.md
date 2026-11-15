@@ -1219,6 +1219,27 @@ tools/flash-root.sh ios16-root.simg
 tools/mondrian-boot-log.sh --reset 150
 ```
 
+### Never call syslog() from an image initializer
+
+`mondrian_inject.c` used to end its constructor with `syslog()`, and on this
+port that call never returns: `syslog` -> `libsystem_asl` ->
+`os_log_shim_enabled` -> libdispatch waits in `mach_msg` for a service that is
+not there. An image initializer holds its process's main thread while it waits,
+so every injected daemon (backboardd, SpringBoard, containermanagerd) stopped
+inside it on 2026-11-15: backboardd's window server never started, SpringBoard's
+main queue never drained (`MONDRIAN UI: lock step stuck`), and the ring showed a
+main-thread stack ending in `#12 syslog`, `#13 mondrian_inject`. Use the
+`say()` on the line above it: a plain write to stderr and `/dev/console`.
+
+Two copies of the injector are live at once: the kernel injects
+`/private/var/vm/mondrian-inject.dylib` into the poster extensions, and the UI
+hook dlopens `/usr/libexec/mondrian-inject.dylib` in the daemons. `glblob=1`
+only rewrites the first, and only if the root is writable at that moment (the
+first attempt returns EROFS and marks it done). Once the root is writable,
+`tools/usb-ring.py wfile PATH LOCAL-FILE` replaces either copy over the control
+channel; a process that has the file mapped must be killed first, and `kill PID`
+does that.
+
 ## Android capture (2026-10-28)
 
 A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug

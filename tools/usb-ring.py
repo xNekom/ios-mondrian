@@ -65,6 +65,47 @@ def simple(command, timeout=2.0):
 CHUNK = 1200
 
 
+def wfile(path, local):
+    """Replace one file in the mounted root, over the control channel.
+
+    The kernel opens the path with O_TRUNC and writes what it received, so a
+    dylib can be swapped without a userdata flash (bsd/dev/mondrian_usb.c,
+    "wfile"). A file a process has mapped must be killed first: the caller's
+    job, and the usual reason for `kill`.
+    """
+    data = open(local, "rb").read()
+    answer = simple(f"wfile {path} {len(data)}", 5.0)
+    if answer is None:
+        print("no answer to wfile", file=sys.stderr)
+        return 1
+    print(answer.decode(errors="replace").strip(), file=sys.stderr)
+
+    s = open_socket(1.0)
+    try:
+        offset = 0
+        while offset < len(data):
+            body = data[offset:offset + CHUNK - 8]
+            s.sendto(b"RLW1" + struct.pack("<I", offset) + body, PHONE)
+            offset += len(body)
+        # The write happens when the last byte lands; wstat says whether the
+        # kernel got the whole file before answering.
+        got = 0
+        for _ in range(40):
+            reply = simple("wstat", 1.0)
+            if reply is not None:
+                parts = reply.decode(errors="replace").split()
+                if len(parts) >= 2 and parts[0] == "wstat":
+                    got = int(parts[1])
+                    if got >= len(data):
+                        break
+            time.sleep(0.25)
+    finally:
+        s.close()
+    print(f"wfile {path}: {got} of {len(data)} bytes delivered")
+    time.sleep(0.5)
+    return 0 if got >= len(data) else 1
+
+
 def request_chunk(s, offset):
     s.sendto(b"RLQ1" + struct.pack("<I", offset), PHONE)
 
@@ -340,7 +381,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=("dump", "prev", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
+                        choices=("dump", "prev", "wfile", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "kill", "fps"))
     parser.add_argument("args", nargs="*")
@@ -357,6 +398,11 @@ def main():
     if args.command == "prev":
         path = args.args[0] if args.args else "usb-prev.txt"
         return prev(path, args.timeout)
+    if args.command == "wfile":
+        if len(args.args) < 2:
+            print("usage: usb-ring.py wfile REMOTE-PATH LOCAL-FILE", file=sys.stderr)
+            return 2
+        return wfile(args.args[0], args.args[1])
     if args.command == "screen":
         path = args.args[0] if args.args else "usb-screen.png"
         return screen(path, args.rows, args.timeout)
