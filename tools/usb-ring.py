@@ -6,6 +6,8 @@ The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
 192.168.7.1/24.  Commands:
 
   dump [FILE]   the whole 4 MiB console ring, reassembled a chunk at a time
+  prev [FILE]   the PREVIOUS boot's console, from the partition (kernel 0329):
+                the panic report that a reset would otherwise carry away
   pos           the ring's absolute position
   mem           print the compressor and GPU-buffer histogram to the live log
   tap X Y       one synthetic touch, panel pixels (1440x3200)
@@ -67,13 +69,15 @@ def request_chunk(s, offset):
     s.sendto(b"RLQ1" + struct.pack("<I", offset), PHONE)
 
 
-def dump(path, timeout):
-    answer = simple("pos")
-    if answer is None:
-        print("no answer to pos", file=sys.stderr)
-        return 1
-    total = int(answer.decode().strip())
-    start = max(0, total - (4 << 20))
+def dump(path, timeout, start=None, total=None):
+    if total is None:
+        answer = simple("pos")
+        if answer is None:
+            print("no answer to pos", file=sys.stderr)
+            return 1
+        total = int(answer.decode().strip())
+    if start is None:
+        start = max(0, total - (4 << 20))
 
     # One datagram per request, a few in flight: the gadget's TX queue holds
     # 32 frames, and a burst of the whole ring loses most of it.
@@ -137,6 +141,34 @@ def dump(path, timeout):
         f.write(ring)
     print(f"{len(ring)} bytes, {len(chunks)} datagrams, {holes} bytes missing -> {path}")
     return 0
+
+
+def prev(path, timeout):
+    """The previous boot's console, from the partition, over the live channel.
+
+    The kernel copies the previous boot's ring out of userdata before this
+    boot's first flush (bsd/dev/mondrian_ufs.c, 0329) and prints it into the
+    current ring on request, so the reply is the ring position the lines start
+    at and the usual chunk loop fetches them.
+    """
+    answer = simple("prev", 5.0)
+    if answer is None:
+        print("no answer to prev: this kernel has no 0329", file=sys.stderr)
+        return 1
+    text = answer.decode(errors="replace").strip()
+    if not text.isdigit():
+        print(f"prev answered {text!r}", file=sys.stderr)
+        return 1
+    start = int(text)
+    after = simple("pos")
+    if after is None:
+        print("no answer to pos", file=sys.stderr)
+        return 1
+    total = int(after.decode().strip())
+    if total <= start:
+        print("prev printed nothing into the ring", file=sys.stderr)
+        return 1
+    return dump(path, timeout, start=start, total=total)
 
 
 def fps(seconds):
@@ -308,7 +340,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=("dump", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
+                        choices=("dump", "prev", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "kill", "fps"))
     parser.add_argument("args", nargs="*")
@@ -322,6 +354,9 @@ def main():
     if args.command == "dump":
         path = args.args[0] if args.args else "usb-ring.txt"
         return dump(path, args.timeout)
+    if args.command == "prev":
+        path = args.args[0] if args.args else "usb-prev.txt"
+        return prev(path, args.timeout)
     if args.command == "screen":
         path = args.args[0] if args.args else "usb-screen.png"
         return screen(path, args.rows, args.timeout)

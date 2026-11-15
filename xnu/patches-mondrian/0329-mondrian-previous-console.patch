@@ -1,0 +1,192 @@
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1880,6 +1880,120 @@
+ }
+ 
+ /*
++ * The console of the previous boot, copied out of the last 4 MiB of userdata
++ * between the moment the partition is known and this boot's first flush -- the
++ * last moment it still exists -- and printed later, on request, when the USB
++ * control channel can carry the lines to the host.
++ *
++ * `mondriandump` prints the same lines, but it runs before the gadget exists,
++ * so its output can only be read off the panel. This one is read with
++ * `tools/usb-ring.py prev`.
++ *
++ * Boot-arg mondrianprevlog=0 turns the copy off; mondrianprevlines=N prints
++ * fewer of the newest lines (default 120).
++ */
++#define MONDRIAN_PREV_LINES     120
++static char mondrian_prev_stream[UFS_BLOCK + MONDRIAN_LOG_SIZE];
++static uint32_t mondrian_prev_bytes;
++
++static void
++mondrian_prev_read(void)
++{
++	uint64_t base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	uint32_t done = 0;
++
++	if (ufs_read_blocks(base, 1) != 0) {
++		return;
++	}
++	memcpy(mondrian_prev_stream, (void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++	while (done < MONDRIAN_LOG_SIZE) {
++		uint32_t blocks = MIN(BOUNCE_SIZE / UFS_BLOCK,
++		    (MONDRIAN_LOG_SIZE - done) / UFS_BLOCK);
++
++		if (ufs_read_blocks(base + 1 + done / UFS_BLOCK, blocks) != 0) {
++			break;
++		}
++		memcpy(mondrian_prev_stream + UFS_BLOCK + done,
++		    (void *)(su.dma + DMA_BOUNCE), (size_t)blocks * UFS_BLOCK);
++		done += blocks * UFS_BLOCK;
++	}
++	mondrian_prev_bytes = UFS_BLOCK + done;
++}
++
++void
++mondrian_prev_print(void)
++{
++	char *h = mondrian_prev_stream;
++	char *ring = mondrian_prev_stream + UFS_BLOCK;
++	char line[192];
++	uint32_t ring_size, have, nl = 0, n = 0;
++	uint32_t lines = MONDRIAN_PREV_LINES;
++	uint64_t total, start;
++
++	if (mondrian_prev_bytes < 2 * UFS_BLOCK) {
++		printf("MONDRIAN PREVLOG: no previous console (the copy failed)\n");
++		return;
++	}
++	if (memcmp(h, "MONDLOG", 7) != 0) {
++		printf("MONDRIAN PREVLOG: no MONDLOG header (nothing was flushed)\n");
++		return;
++	}
++	ring_size = *(uint32_t *)(void *)(h + 12);
++	total = *(uint64_t *)(void *)(h + 16);
++	if (ring_size != MONDRIAN_LOG_SIZE || total == 0) {
++		printf("MONDRIAN PREVLOG: bad header ring %u total %llu\n",
++		    ring_size, (unsigned long long)total);
++		return;
++	}
++	(void)PE_parse_boot_argn("mondrianprevlines", &lines, sizeof(lines));
++	have = total < ring_size ? (uint32_t)total : ring_size;
++	start = (total % ring_size + ring_size - have) % ring_size;
++	printf("MONDRIAN PREVLOG: %llu bytes, %u in the ring, flush seq %llu\n",
++	    (unsigned long long)total, have,
++	    (unsigned long long)*(uint64_t *)(void *)(h + 24));
++	for (uint32_t i = 0; i < have; i++) {
++		if (ring[(start + i) % ring_size] == '\n') {
++			nl++;
++		}
++	}
++	{
++		uint32_t const line0 = (nl > lines) ? (nl - lines) : 0;
++		uint32_t at = 0;
++
++		if (line0 != 0) {
++			uint32_t seen = 0;
++
++			for (uint32_t i = 0; i < have; i++) {
++				if (ring[(start + i) % ring_size] != '\n') {
++					continue;
++				}
++				if (seen == line0) {
++					at = i + 1;
++					break;
++				}
++				seen++;
++			}
++		}
++		for (uint32_t i = at; i < have; i++) {
++			char const c = ring[(start + i) % ring_size];
++
++			if (c != '\n' && n < sizeof(line) - 1) {
++				line[n++] = (c >= 0x20 && c < 0x7f) ? c : '.';
++				continue;
++			}
++			line[n] = 0;
++			printf("PREV | %s\n", line);
++			n = 0;
++		}
++		if (n != 0) {
++			line[n] = 0;
++			printf("PREV | %s\n", line);
++		}
++	}
++	printf("MONDRIAN PREVLOG: end\n");
++}
++
++/*
+  * Arm the console ring as soon as the UFS device is usable: the writer has to
+  * be running before vfs_mountroot(), or a failed root mount leaves the log
+  * that explains it in RAM and nothing on disk.
+@@ -1905,6 +2019,18 @@
+ 		return;
+ 	}
+ 	mondrian_log_base = su.first_block + su.nblocks - MONDRIAN_LOG_BLOCKS;
++	/*
++	 * Before this boot's first flush: the previous console is still on the
++	 * partition, and it is the only copy of a panic that the reset did not
++	 * carry away.
++	 */
++	{
++		uint32_t prev = 1;
++
++		if (!PE_parse_boot_argn("mondrianprevlog", &prev, sizeof(prev)) || prev) {
++			mondrian_prev_read();
++		}
++	}
+ 	os_atomic_store(&mondrian_log_next_wake,
+ 	    os_atomic_load(&mondrian_log_total, relaxed) + MONDRIAN_LOG_KICK_BYTES, relaxed);
+ 	os_atomic_store(&mondrian_log_ready, 1, relaxed);
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1601,6 +1601,21 @@
+ 				    "wstat %u %u\n", ud_wfile_got, ud_wfile_len);
+ 
+ 				ud_cmd_send(so, peer, out, (size_t)len);
++			} else if (strcmp(cmd, "prev") == 0) {
++				/*
++				 * The previous boot's console, printed into this ring
++				 * so the host can read it with the usual chunk loop: the
++				 * reply is the ring position the lines start at.
++				 */
++				extern void mondrian_prev_print(void);
++				uint64_t before = mondrian_log_position();
++				char out[32];
++				int len;
++
++				mondrian_prev_print();
++				len = snprintf(out, sizeof(out), "%llu\n",
++				    (unsigned long long)before);
++				ud_cmd_send(so, peer, out, (size_t)len);
+ 			} else if (strcmp(cmd, "pos") == 0) {
+ 				char out[32];
+ 				int len = snprintf(out, sizeof(out), "%llu\n",
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1157,6 +1157,23 @@
+ 			mondrian_early_panic_fmt(panic_format_str, (uint64_t)panic_caller);
+ 			mondrian_early_panic_report((uint64_t)panic_caller, panic_format_str,
+ 			    a[0], a[1], a[2], a[3]);
++			/*
++			 * What is on the console now is the whole report: this path
++			 * hangs in wfe below, and the panel that shows it cannot be
++			 * read from the host. The UFS host answers by polling, so the
++			 * ring can still reach the disk (tools/usb-ring.py prev reads
++			 * it at the next boot); without this the last, partial block
++			 * -- the message and the abort's registers -- dies with the
++			 * reset.
++			 */
++			{
++				extern void mondrian_log_flush_now(void);
++				static volatile int flushed;
++
++				if (__sync_lock_test_and_set(&flushed, 1) == 0) {
++					mondrian_log_flush_now();
++				}
++			}
+ 		}
+ 	}
+ 	/*

@@ -102,16 +102,16 @@ and refuses `boot_a` unless `BOOT_A=1`; `tools/qemu-ios.py` boots the same
 payload (`docs/QEMU_TESTING.md`).
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
-ring that `0174` arms before `vfs_mountroot`, and the same ring is the last
-4 MiB of `userdata` behind a `MONDLOG` header, so a boot with no USB still has
-its log: dump that tail from OrangeFox and drop the 512-byte header. With the
-kernel running, `tools/usb-ring.py dump` reads it over USB (`usbipd attach
---wsl` first; `0298` survives a detach). A photo can show an earlier boot with
-`mondrianfb_noconsole=1`: the ring is the truth. A previous boot is printed by a
-dump kernel (`mondriandump=1`), `mondrianstop=N` halts at early mark N (`0174`
-keeps marks above 20 visible after the console is off), and `mondrianreset=N`
-is a second clock: a boot that ends at about 45 s is that thread rebooting to
-fastboot, not a crash.
+ring that `0174` arms before `vfs_mountroot`; the same ring is the last 4 MiB of
+`userdata` behind a `MONDLOG` header, so a boot with no USB still has its log
+(dump that tail from OrangeFox). With the kernel running, `tools/usb-ring.py
+dump` reads the live ring and `screen` captures the panel (`usbipd attach --wsl`
+first; `0298` survives a detach). `prev` prints the *previous* boot's newest
+lines over USB: `0329` copies that area into RAM before this boot's first flush
+and flushes the ring from the panic path, so a panic report reaches the host
+with no photograph. `mondrianstop=N` halts at early mark N (`0174` keeps marks
+above 20 visible once the console is off) and `mondrianreset=N` is a second
+clock: a boot that ends at about 45 s is that thread rebooting to fastboot.
 
 ## Measured hardware facts
 

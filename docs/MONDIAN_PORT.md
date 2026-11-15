@@ -183,16 +183,14 @@ Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the 
 and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
 The flattened HFS root is not a stock volume layout: launchd still expects a
-Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`. The volume
-is non-journaled: a boot logs 10,000-13,000 `hfs_mark_inconsistent` lines and
-`suggestd` restart-loops (200-290 crashes), and still held 60 fps during a
-drag, so it is not a proven cause of a UI stall (`NOTES.md`).
+Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`, and the
+volume is non-journaled, so a boot logs 10,000-13,000 `hfs_mark_inconsistent`
+lines and `suggestd` restart-loops, yet held 60 fps during a drag (`NOTES.md`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
-UFS probe, before the root mount, so a failed mount still flushes its error.
-Read a prior boot with `mondriandump=1` and
-`mondriandumpmatch=SMP,CRASH,CODE,memorystatus`; the log-viewer shim is
-unreliable on this UFS host, so use the kernel dump path.
+UFS probe, before the root mount, so a failed mount still flushes its error. Read
+a prior boot over USB with `tools/usb-ring.py prev` (`0329`), or on the panel
+with a dump kernel (`mondriandump=1`).
 
 ### 2. The UFS root device
 
