@@ -349,8 +349,12 @@ MONDRIAN = Board(
              # and a synchronous HFS+ read. The kernel refuses their exec
              # (0316); `quiet` is the built-in list, any other value names
              # processes. Not a number: PE_parse_boot_argn would store one as
-             # a binary integer instead of a string.
-             'mondriankill=quiet '
+             # a binary integer instead of a string. `none` matches nothing:
+             # 0328 gave a refused exec a reason, and in the QEMU bench the
+             # listed daemons (watchdogd, bluetoothd, calaccessd,
+             # fairplayd.H2, aggregated) now exit cleanly, so the list is
+             # kept only as a switch to put back if a phone boot disagrees.
+             'mondriankill=none '
              # glblob=1: the kernel carries the UI hook and the CoreAnimation
              # dylibs and writes them into /private/var/vm at boot, so a hook
              # change costs one kernel build and one `fastboot boot` instead of
