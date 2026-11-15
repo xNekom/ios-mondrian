@@ -143,7 +143,7 @@ tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
 sudo fsck.hfsplus -fy ios16-root.img
 sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
 sudo python3 tools/ios-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
+sudo umount /mnt/iosroot && sudo fsck.hfsplus -fy ios16-root.img
 img2simg ios16-root.img ios16-root.simg
 ```
 
