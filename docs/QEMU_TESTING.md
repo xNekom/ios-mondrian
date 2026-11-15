@@ -63,17 +63,15 @@ transport (`0xa003e00`), while `mkadt.py` states the first (`0xa000000`). Both
 halves have to agree, and the kernel prints `MONDRIAN VBLK: virtio-blk, N MiB`
 when they do. The snapshot matters: the volume is not journaled, so a run killed
 mid-flight leaves it dirty and the next boot inherits the errors as runtime
-corruption.
-Under TCG a boot to `bsd_init` takes a minute, so `--secs 240` is the minimum
-worth typing.
+corruption. Under TCG a boot to `bsd_init` takes a minute, so `--secs 240` is
+the minimum worth typing.
 
 Options worth knowing: `--board mondrian` picks the 1440x3200 panel and the
 `max` CPU model (the board is armv8.5 and touches `DIT`, which `cortex-a76`
 lacks); `--live-serial` streams the console; `--gdb` starts halted with a stub
 on 1234; `--hmp "xp/8gx 0x<pa>"` reads guest memory after the stop, where a
 kernel variable's physical address is
-`VA - VM_KERNEL_LINK_ADDRESS + phys_base + 0x4000`. `tools/qemu-triage.py
-<outdir> <kernel>` names the symbol of the first exception.
+`VA - VM_KERNEL_LINK_ADDRESS + phys_base + 0x4000`.
 
 ## Environment knobs
 
@@ -81,13 +79,12 @@ kernel variable's physical address is
 | --- | --- |
 | `QEMU_PHYS_BASE`, `QEMU_MEM_SIZE` | another window of RAM (default `0xb0000000`/`0x4d000000`; the phone's own shape is `0x100000000`/`0x180000000`) |
 | `ADT_SEED` | pin the random seed the physmap slide derives from |
-| `ADT_MEMORY=0` | leave `/memory` out of the tree |
-| `DT_CPUS=1` | emit a single CPU node |
+| `ADT_MEMORY=0`, `DT_CPUS=1` | leave `/memory` out of the tree, or emit a single CPU node |
 
 ## Reading the result
 
 `no_panic_observed` means "no visible panic in the framebuffer snapshot", not
-"booted". With `--qemu` read `serial.txt`, which has the whole console, and use
-`qemu.log`/`qemu-triage.py` when the last line is not enough. Two traps this
+"booted": with `--qemu` read `serial.txt`, which has the whole console, and use
+`qemu.log`/`qemu-triage.py` when its last line is not enough. Two traps this
 machine found: the ADT's CPU node must carry MPIDR 0 (the phone's boot core is
 7), and `phystokv()` panics on any address outside the window.
