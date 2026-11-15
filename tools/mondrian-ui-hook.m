@@ -1035,6 +1035,42 @@ say_pid(const char *what)
  * itself. A slow heartbeat proves the image is loaded and alive, and the
  * last beat tells how far it got before the screen stopped.
  */
+/*
+ * The window server is created by the process that hosts it, so `+server` is
+ * nil in a constructor that runs before that. Ask again once the app has had
+ * time to build it: a nil server at 60 s says CoreAnimation never created one
+ * (and no display link can tick), while a server with zero displays says the
+ * display list came back empty, which is the kernel's contract to fix.
+ */
+static void
+say_window_server(void)
+{
+	id cls = (id)objc_getClass("CAWindowServer");
+	id (*send_id)(id, SEL);
+	NSUInteger (*send_uint)(id, SEL);
+	id server, displays;
+	char line[160];
+
+	if (cls == Nil) {
+		say("MONDRIAN WS: CAWindowServer class missing\n");
+		return;
+	}
+	send_id = (id (*)(id, SEL))objc_msgSend;
+	send_uint = (NSUInteger (*)(id, SEL))objc_msgSend;
+	server = send_id(cls, sel_registerName("server"));
+	if (server == nil) {
+		say("MONDRIAN WS: server nil\n");
+		return;
+	}
+	displays = nil;
+	if ([(id)server respondsToSelector:sel_registerName("displays")]) {
+		displays = send_id(server, sel_registerName("displays"));
+	}
+	snprintf(line, sizeof(line), "MONDRIAN WS: server %p displays %lu\n", server,
+	    displays != nil ? (unsigned long)send_uint(displays, sel_registerName("count")) : 0UL);
+	say(line);
+}
+
 static void *
 heartbeat(void *unused)
 {
@@ -1042,6 +1078,9 @@ heartbeat(void *unused)
 	for (int i = 0; i < 30; i++) {
 		sleep(2);
 		say("MONDRIAN UI: heartbeat\n");
+		if (i == 9 || i == 19 || i == 29) {
+			say_window_server();
+		}
 	}
 	return NULL;
 }
@@ -1566,6 +1605,8 @@ mondrian_env_probe(void *unused)
 	char line[160];
 	io_service_t svc;
 	io_name_t name;
+	io_connect_t conn = 0;
+	kern_return_t kr;
 
 	(void)unused;
 	say("MONDRIAN PROBE: thread start\n");
@@ -1582,25 +1623,173 @@ mondrian_env_probe(void *unused)
 			    name);
 			say(line);
 		}
+		/*
+		 * Type 0 is what IOMobileFramebufferOpen asks for: if this works
+		 * from here, the plumbing the window server needs is there and
+		 * its absence is somewhere else.
+		 */
+		kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+		snprintf(line, sizeof(line), "MONDRIAN PROBE: IOServiceOpen -> 0x%x conn %u\n",
+		    kr, (unsigned)conn);
+		say(line);
+		if (kr == KERN_SUCCESS) {
+			IOServiceClose(conn);
+		}
 		IOObjectRelease(svc);
 	}
-	say("MONDRIAN PROBE: screens, before\n");
+	say("MONDRIAN PROBE: window server, before\n");
 	{
-		Class cls = objc_getClass("UIScreen");
-		id screens = Nil;
+		Class cls = objc_getClass("CAWindowServer");
+		id server = Nil;
 
 		if (cls != Nil) {
-			screens = ((id (*)(id, SEL))objc_msgSend)((id)cls,
-			    sel_registerName("screens"));
+			server = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+			    sel_registerName("serverIfRunning"));
 		}
-		snprintf(line, sizeof(line), "MONDRIAN PROBE: UIScreen screens %d\n",
-		    screens != nil ? (int)((unsigned long (*)(id, SEL))objc_msgSend)(
-		    screens, sel_registerName("count")) : -1);
+		snprintf(line, sizeof(line), "MONDRIAN PROBE: CAWindowServer %s\n",
+		    cls == Nil ? "class missing" : (server != nil ? "running" : "nil"));
+		say(line);
+	}
+	{
+		Class cls = objc_getClass("CADisplay");
+		id display = Nil;
+
+		if (cls != Nil) {
+			display = ((id (*)(id, SEL))objc_msgSend)((id)cls,
+			    sel_registerName("mainDisplay"));
+		}
+		snprintf(line, sizeof(line), "MONDRIAN PROBE: CADisplay %s\n",
+		    cls == Nil ? "class missing" : (display != nil ? "present" : "nil"));
 		say(line);
 	}
 	say("MONDRIAN PROBE: os_log enter\n");
 	os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "mondrian env probe");
 	say("MONDRIAN PROBE: os_log return\n");
+	return NULL;
+}
+
+/*
+ * The same os_log ask, later: if the first one is stuck because logd was not
+ * up yet, these two come back and say so.
+ */
+static void *
+mondrian_os_log_again(void *arg)
+{
+	char line[64];
+	int seconds = (int)(intptr_t)arg;
+
+	sleep((unsigned)seconds);
+	snprintf(line, sizeof(line), "MONDRIAN PROBE: os_log %d enter\n", seconds);
+	say(line);
+	os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, "mondrian env probe late");
+	snprintf(line, sizeof(line), "MONDRIAN PROBE: os_log %d return\n", seconds);
+	say(line);
+	return NULL;
+}
+
+/*
+ * Which bootstrap services exist decides whether a daemon that blocks in
+ * mach_msg is waiting for a service nobody registered or for a service that is
+ * there and does not answer. os_log is the case in hand: it is the shim path
+ * for an unentitled process, so it looks a name up and sends to it.
+ */
+static pthread_mutex_t mondrian_pp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *
+mondrian_bootstrap_probe(void *unused)
+{
+	static const char *names[] = {
+		"com.apple.system.logger",
+		"com.apple.logd",
+		"com.apple.logd.buffer",
+		"com.apple.system.logger.logd",
+		"com.apple.diagnosticd",
+	};
+	mach_port_t bp = MACH_PORT_NULL;
+	char line[160];
+
+	(void)unused;
+	sleep(25);
+	if (task_get_bootstrap_port(mach_task_self(), &bp) != KERN_SUCCESS ||
+	    bp == MACH_PORT_NULL) {
+		say("MONDRIAN SVC: no bootstrap port\n");
+		return NULL;
+	}
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		mach_port_t svc = MACH_PORT_NULL;
+		kern_return_t (*look_up)(mach_port_t, const char *, mach_port_t *) =
+		    (kern_return_t (*)(mach_port_t, const char *, mach_port_t *))
+		    dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+		kern_return_t kr;
+
+		if (look_up == NULL) {
+			say("MONDRIAN SVC: bootstrap_look_up missing\n");
+			return NULL;
+		}
+		kr = look_up(bp, names[i], &svc);
+		snprintf(line, sizeof(line), "MONDRIAN SVC: %s -> 0x%x port %u\n",
+		    names[i], kr, (unsigned)svc);
+		say(line);
+		if (kr == 0) {
+			mach_port_deallocate(mach_task_self(), svc);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Name an address that came from somewhere else: the kernel sampler prints raw
+ * user pcs for a process it cannot symbolicate, and every process shares the
+ * same images at the same addresses, so this process's dladdr answers for it.
+ * `tools/usb-ring.py wfile /private/var/vm/mondrian-addrs.txt local-file` with
+ * one 0x... per line, and the lines below appear in the ring.
+ */
+static void *
+mondrian_addr_watch(void *unused)
+{
+	const char *path = "/private/var/vm/mondrian-addrs.txt";
+
+	(void)unused;
+	(void)mondrian_pp_lock;
+	for (;;) {
+		FILE *f = fopen(path, "r");
+		char line[512];
+
+		if (f == NULL) {
+			sleep(10);
+			continue;
+		}
+		while (fgets(line, sizeof(line), f) != NULL) {
+			unsigned long long addr = 0;
+			Dl_info info;
+			char out[512];
+			char *p = line;
+
+			while (*p == ' ' || *p == '\t') {
+				p++;
+			}
+			if (strncmp(p, "0x", 2) != 0 && strncmp(p, "0X", 2) != 0) {
+				continue;
+			}
+			addr = strtoull(p, NULL, 16);
+			memset(&info, 0, sizeof(info));
+			if (addr != 0 && dladdr((void *)(uintptr_t)addr, &info) != 0) {
+				snprintf(out, sizeof(out),
+				    "MONDRIAN ADDR[%d]: 0x%llx -> %s+0x%llx %s\n",
+				    getpid(), addr,
+				    info.dli_fname != NULL ? info.dli_fname : "?",
+				    addr - (unsigned long long)(uintptr_t)info.dli_fbase,
+				    info.dli_sname != NULL ? info.dli_sname : "");
+			} else {
+				snprintf(out, sizeof(out),
+				    "MONDRIAN ADDR[%d]: 0x%llx -> ?\n",
+				    getpid(), addr);
+			}
+			say(out);
+		}
+		fclose(f);
+		(void)unlink(path);
+	}
 	return NULL;
 }
 
@@ -1616,6 +1805,10 @@ start_display_link_probe(void)
 	(void)pthread_create(&thread, NULL, dl_arm_late, NULL);
 	(void)pthread_create(&thread, NULL, dl_report, NULL);
 	(void)pthread_create(&thread, NULL, mondrian_env_probe, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_os_log_again, (void *)(intptr_t)45);
+	(void)pthread_create(&thread, NULL, mondrian_os_log_again, (void *)(intptr_t)100);
+	(void)pthread_create(&thread, NULL, mondrian_bootstrap_probe, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_addr_watch, NULL);
 }
 
 /*

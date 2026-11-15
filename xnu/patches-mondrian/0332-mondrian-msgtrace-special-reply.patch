@@ -1,0 +1,32 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -1210,20 +1210,22 @@
+ 	int pid = proc_pid(current_proc());
+ 
+ 	/*
+-	 * launchd answers everybody; only the clients that wait are interesting,
+-	 * and among those only the calls that expect an answer (a reply port):
+-	 * one-way notifications were most of the traffic and pushed the trace over
+-	 * its budget before the tap that starts the app.
++	 * Every send of the traced process, one-way or not: the call a daemon is
++	 * stuck on can carry a special reply port, and that arrives as
++	 * msgh_local_port == 0, so filtering those out hid exactly the message
++	 * that never gets an answer (backboardd's firehose registration,
++	 * 2026-11-15). The destination owner pid is the other half: it names the
++	 * process that owes the reply.
+ 	 */
+-	if (pid == 1 || header->msgh_local_port == 0 ||
+-	    !mondrian_msgtrace_wanted(pid)) {
++	if (pid == 1 || !mondrian_msgtrace_wanted(pid)) {
+ 		return;
+ 	}
+ 	{
+ 		extern volatile int mondrian_dest_owner_pid;
+ 
+ 		mondrian_msg_record(MONDRIAN_MSG_SEND_OK, pid,
+-		    (int)header->msgh_id, mondrian_dest_owner_pid, 0);
++		    (int)header->msgh_id, mondrian_dest_owner_pid,
++		    (int)header->msgh_local_port);
+ 	}
+ }
+ 

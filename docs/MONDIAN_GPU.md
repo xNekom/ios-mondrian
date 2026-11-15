@@ -1233,29 +1233,61 @@ main-thread stack ending in `#12 syslog`, `#13 mondrian_inject`. Use the
 
 Two copies of the injector are live at once: the kernel injects
 `/private/var/vm/mondrian-inject.dylib` into the poster extensions, and the UI
-hook dlopens `/usr/libexec/mondrian-inject.dylib` in the daemons. `glblob=1`
-only rewrites the first, and only if the root is writable at that moment (the
-first attempt returns EROFS and marks it done). Once the root is writable,
-`tools/usb-ring.py wfile PATH LOCAL-FILE` replaces either copy over the control
-channel; a process that has the file mapped must be killed first, and `kill PID`
-does that.
+hook dlopens `/usr/libexec/mondrian-inject.dylib` in the daemons. `tools/
+usb-ring.py wfile PATH LOCAL-FILE` replaces either copy over the control
+channel, and a process that has the file mapped must be killed first (`kill
+PID`). A `wfile` into `/private/var/vm` does not survive the next boot: `glblob=1`
+writes the kernel image's copy over it as soon as the root turns writable, so a
+hook change is one kernel build (`cp` the dylib into `out/gpu/` first) and one
+`fastboot boot`. The ring says which copy is in use (`MONDRIAN HOOK: <proc> uses
+the /private/var/vm copy`) and when the blob lands (`MONDRIAN GLBLOB: ... -> 0`).
 
-### os_log blocks when logd is not running
+### os_log blocks with logd running
 
-`os_log` is synchronous only in the sense that its writers must be drained: with
-no `logd` the userspace log buffer fills and the next call blocks inside
-libdispatch's `mach_msg` for ever. The probe in the UI hook says where a boot
-stands in one boot: `MONDRIAN PROBE: framebuffer match` (the kernel's
-`IOMobileFramebuffer` is published as `AppleCLCD` and matches), `UIScreen
-screens` (the client's view), then `os_log enter` / `os_log return` -- the
-second line only appears if the call came back.
+The probe in the UI hook answers the graphics side in one boot:
+`MONDRIAN PROBE: framebuffer match` (the kernel's `IOMobileFramebuffer` is
+published as `AppleCLCD`), `IOServiceOpen -> 0x0` (type 0 opens, so the user
+client the window server would use is there), `CAWindowServer nil`,
+`CADisplay` (this one blocks) and `os_log enter` / `os_log return`.
 
-Measured 2026-11-15, before `0330`: `exec logd` was followed by `MONDRIAN
-Sandbox: logd privilege 1002 denied` (`PRIV_GLOBAL_PROC_INFO`), `logd` never
-ran, `os_log enter` never returned, the window server never started, and the
-panel stayed on the boot console (`present 0/s`, display link `0` ticks). The
-sandbox stand-in grants every privilege it is asked for and logs the first ask
-per process, which is how the one denial that cost the whole UI was named.
+Measured 2026-11-15, with `0330` (logd granted and alive, no `exit logd` in the
+ring): `os_log enter` still never returns, at t=5 s and again at t=45 s and
+t=100 s from their own threads, and `os_log_create` from BackBoardServices holds
+backboardd's main thread in `libdispatch` -> `libsystem_trace` ->
+`mach_msg` -> `os_log_create`. The boot log has `Firehose configured: 16 chunks,
+8 io pages`, so the kernel side is up and the writer is waiting for a consumer:
+`firehose_buffer_tracepoint_reserve_wait_for_chunks_from_logd` in libdispatch is
+the wait, and logd is the flusher that never frees a chunk. The window server
+therefore never reaches display detection (`present 0/s`, display link `0`
+ticks, panel on the boot console).
+
+Do not inject the UI hook into `logd` to look at it: the dylib links
+CoreAnimation, and a boot with the hook in logd stopped answering on the ring
+and on fastboot within a minute (2026-11-15).
+
+Do not interpose `os_log_*` either. A `__DATA,__interpose` table does take
+effect -- `backboardd`'s `BKLogCommon` really did call the replacement -- but
+forwarding the call needs `dlsym(RTLD_NEXT, ...)`, and that dlsym from inside
+every log call deadlocks in dyld. Two boots' worth of "backboardd is stuck in
+`os_log_create`" and a launchd whose queue stopped draining were that deadlock,
+not the port's. Hook the caller, or read the stall with the sampler, but leave
+the logging entry points alone.
+
+### Resolving a port's owner from the sampler
+
+`0332` records the port name of every send the traced pid starts; `0333`
+resolves it from the sampler, outside the trap, and prints
+`MONDRIAN DEST: pid N port M owner P`, because a send that never completes
+never reaches the print that would have named its destination. `mprev/ringpid.py`
+turns `owner P` into a process name from the ring's own process list.
+
+The trap that version cost one boot: `ipc_port_translate_send` returns the port
+**active and locked, and without a reference**. Unlock it with `ip_mq_unlock`
+(there is no `ip_unlock` in this XNU) and never call `ipc_port_release_send` on
+it -- that consumes a send right that was not taken and spins on the port's own
+lock. The kernel wedges silently: the USB gadget still enumerates as
+`1209:0001`, no IP answers, and the ring is gone, which reads like a shim or
+payload failure rather than a deadlock in the new code.
 
 ## Android capture (2026-10-28)
 

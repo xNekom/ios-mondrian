@@ -1,0 +1,113 @@
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -1109,6 +1109,8 @@
+  */
+ int mondrian_msgtrace;
+ 
++volatile int mondrian_trace_port;
++
+ /*
+  * Samples are stored, never printed, from inside the message traps: the console
+  * write that prints a message sends messages of its own, and printing from here
+@@ -1202,6 +1204,7 @@
+ 	mondrian_msg_record(MONDRIAN_MSG_SEND_BEGIN, pid,
+ 	    (int)header->msgh_id, (int)header->msgh_remote_port,
+ 	    (int)header->msgh_size);
++	mondrian_trace_port = (int)header->msgh_remote_port;
+ }
+ 
+ static void
+--- a/osfmk/ipc/ipc_port.c
++++ b/osfmk/ipc/ipc_port.c
+@@ -2935,6 +2935,52 @@
+ }
+ 
+ /*
++ * mondrian: the owner pid of a port name in another task's space.
++ *
++ * A send that never completes never reports where it was going, and the trap
++ * cannot take the locks to find out. The sampler calls this instead: it
++ * translates the name the trap recorded and reads the receiving task off the
++ * port, which names the process that owes the answer.
++ */
++/* kern/bsd_kern.c; vm_protos.h carries the declaration */
++extern ipc_space_t get_task_ipcspace(task_t);
++
++int
++mondrian_task_port_owner_pid(task_t task, mach_port_name_t name)
++{
++	ipc_space_t space;
++	ipc_port_t port = IP_NULL;
++	ipc_space_t rcv;
++	int owner = -1;
++
++	if (task == TASK_NULL || !MACH_PORT_VALID(name)) {
++		return -1;
++	}
++	space = get_task_ipcspace(task);
++	if (space == IS_NULL) {
++		return -1;
++	}
++	if (ipc_port_translate_send(space, name, &port) != KERN_SUCCESS ||
++	    port == IP_NULL) {
++		return -1;
++	}
++	/*
++	 * translate_send returns the port active and LOCKED, without a ref:
++	 * unlock it here and never release a send right that was not taken.
++	 * ipc_port_release_send on a locked port spins on its own lock and
++	 * takes the whole kernel with it, which is what the first version of
++	 * this helper did (one boot, no ring, no panic). ip_mq_unlock is the
++	 * port unlock in this XNU; there is no ip_unlock.
++	 */
++	rcv = port->ip_receiver;
++	if (rcv != IPS_NULL && rcv->is_task != TASK_NULL) {
++		owner = task_pid(rcv->is_task);
++	}
++	ip_mq_unlock(port);
++	return owner;
++}
++
++/*
+  *	Routine:	ipc_port_release_send
+  *	Purpose:
+  *		Release a naked send right.
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -243,6 +243,36 @@
+ 			return;
+ 		}
+ 	}
++	/*
++	 * A send that never completes never reports its destination, so the port
++	 * the trap recorded is resolved here: the answer names the process that
++	 * owes the reply.
++	 */
++	{
++		extern volatile int mondrian_trace_port;
++		extern int mondrian_msgtrace;
++		extern int mondrian_task_port_owner_pid(task_t, mach_port_name_t);
++
++		static int last_port = -1, last_owner = -2;
++
++		if (mondrian_msgtrace > 0 && mondrian_trace_port > 0) {
++			int owner = -1;
++			proc_t p = proc_find(mondrian_msgtrace);
++
++			if (p != PROC_NULL) {
++				owner = mondrian_task_port_owner_pid(proc_task(p),
++				    (mach_port_name_t)mondrian_trace_port);
++				proc_rele(p);
++			}
++			if (mondrian_trace_port != last_port || owner != last_owner) {
++				last_port = mondrian_trace_port;
++				last_owner = owner;
++				printf("MONDRIAN DEST: pid %d port %d owner %d\n",
++				    mondrian_msgtrace, last_port, owner);
++			}
++		}
++	}
++
+ 	if (!armed) {
+ 		armed = true;
+ 		mondrian_parse_names();
