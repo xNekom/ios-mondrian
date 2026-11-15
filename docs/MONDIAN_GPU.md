@@ -1293,6 +1293,19 @@ lock. The kernel wedges silently: the USB gadget still enumerates as
 `1209:0001`, no IP answers, and the ring is gone, which reads like a shim or
 payload failure rather than a deadlock in the new code.
 
+### The window server is never asked for
+
+No process in the hook set (`launchd`, `containermanagerd`, `backboardd`,
+`runningboardd`, `SpringBoard`) calls `+[CAWindowServer server]`, measured with
+a passive hook over a whole boot: CA's window-server path is not entered at
+all, which is why no `IOMobileFramebuffer` selector from the compositor ever
+arrives (`sel 4:0 5:0 …`), no display link ticks (`DL[57] … ticks/5s 0/0`) and
+`present` stays 0/s.
+
+Do not call it yourself to "wake it up": a constructor that asks for the server
+creates one on the spot and the boot stops answering on the ring before the
+first heartbeat pair ends (two boots). Observing is safe; asking is not.
+
 ## Android capture (2026-10-28)
 
 A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug

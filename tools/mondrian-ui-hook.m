@@ -1041,34 +1041,82 @@ say_pid(const char *what)
  * time to build it: a nil server at 60 s says CoreAnimation never created one
  * (and no display link can tick), while a server with zero displays says the
  * display list came back empty, which is the kernel's contract to fix.
+ *
+ * Opt-in with a file rather than a boot argument: the command line is at its
+ * 607-byte limit, and this probe runs in every hooked process, so a boot that
+ * does not ask for it must stay the boot that is known to work.
+ * `tools/usb-ring.py wfile /private/var/vm/mondrian-ws LOCAL-FILE`.
  */
+#define MONDRIAN_WS_MARKER	"/private/var/vm/mondrian-ws"
+
+static int
+window_server_probe_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		wanted = access(MONDRIAN_WS_MARKER, F_OK) == 0;
+	}
+	return wanted;
+}
+
 static void
 say_window_server(void)
 {
-	id cls = (id)objc_getClass("CAWindowServer");
-	id (*send_id)(id, SEL);
-	NSUInteger (*send_uint)(id, SEL);
-	id server, displays;
 	char line[160];
+	int (*is_running)(void);
 
-	if (cls == Nil) {
-		say("MONDRIAN WS: CAWindowServer class missing\n");
-		return;
-	}
-	send_id = (id (*)(id, SEL))objc_msgSend;
-	send_uint = (NSUInteger (*)(id, SEL))objc_msgSend;
-	server = send_id(cls, sel_registerName("server"));
-	if (server == nil) {
-		say("MONDRIAN WS: server nil\n");
-		return;
-	}
-	displays = nil;
-	if ([(id)server respondsToSelector:sel_registerName("displays")]) {
-		displays = send_id(server, sel_registerName("displays"));
-	}
-	snprintf(line, sizeof(line), "MONDRIAN WS: server %p displays %lu\n", server,
-	    displays != nil ? (unsigned long)send_uint(displays, sel_registerName("count")) : 0UL);
+	/*
+	 * No process in the hook set ever asks for the window server: on every
+	 * boot so far `+[CAWindowServer server]` was never called, and calling it
+	 * from here created the server and stopped the boot dead. The decision
+	 * that leaves the port without frames is therefore taken earlier, in
+	 * CARenderServerStart, and its companion getter says whether that server
+	 * came up at all without doing any of that work.
+	 */
+	is_running = (int (*)(void))dlsym(RTLD_DEFAULT, "CARenderServerIsRunning");
+	snprintf(line, sizeof(line), "MONDRIAN WS: %s render server running %d\n",
+	    getprogname(), is_running != NULL ? is_running() : -1);
 	say(line);
+}
+
+/*
+ * Calling `+[CAWindowServer server]` ourselves creates the window server on
+ * the spot, and a boot that did it stopped answering on the ring before the
+ * first heartbeat pair was over: observing the call is safe, making it is not.
+ * So watch who asks and what comes back, and let the system decide when.
+ */
+static id (*original_server)(id, SEL);
+
+static id
+mondrian_server(id self, SEL selector)
+{
+	id server = original_server(self, selector);
+	char line[128];
+
+	snprintf(line, sizeof(line), "MONDRIAN WS: +server -> %p\n", server);
+	say(line);
+	return server;
+}
+
+static void
+install_server_hook(void)
+{
+	Class cls = objc_getClass("CAWindowServer");
+	Method method = cls != Nil ? class_getClassMethod(cls, sel_registerName("server")) : NULL;
+	IMP implementation;
+
+	if (method == NULL) {
+		return;
+	}
+	implementation = method_getImplementation(method);
+	if (implementation == NULL) {
+		return;
+	}
+	original_server = (id (*)(id, SEL))method_setImplementation(method, (IMP)mondrian_server);
+	if (original_server != NULL) {
+		say("MONDRIAN WS: +server hook installed\n");
+	}
 }
 
 static void *
@@ -1078,7 +1126,12 @@ heartbeat(void *unused)
 	for (int i = 0; i < 30; i++) {
 		sleep(2);
 		say("MONDRIAN UI: heartbeat\n");
-		if (i == 9 || i == 19 || i == 29) {
+		/*
+		 * Opt-in through a marker file: this probe runs in every hooked
+		 * process and calling CA early can take the boot with it, so the
+		 * default image stays exactly the image that booted.
+		 */
+		if ((i == 9 || i == 19 || i == 29) && window_server_probe_wanted()) {
 			say_window_server();
 		}
 	}
@@ -8444,6 +8497,9 @@ mondrian_install_ui_hooks(void)
 	 */
 	if (!boot_arg_set("mondrianbare=1")) {
 		install_display_diagnostic();
+		if (window_server_probe_wanted()) {
+			install_server_hook();
+		}
 		install_activation_hooks();
 		install_icon_probe();
 		install_idle_hooks();
