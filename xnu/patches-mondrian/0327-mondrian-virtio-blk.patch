@@ -60,7 +60,7 @@
  		return sp_count != 0 && sp_count <= MONDRIAN_SPMI_COUNT_MAX;
 --- /dev/null
 +++ b/bsd/dev/mondrian_virtio.c
-@@ -0,0 +1,552 @@
+@@ -0,0 +1,565 @@
 +/*
 + * mondrian: virtio-blk over virtio-mmio, for the QEMU bench.
 + *
@@ -354,6 +354,14 @@
 +	case DKIOCGETPHYSICALBLOCKSIZE:
 +		*f = DEV_BSIZE;
 +		return 0;
++	case DKIOCSETBLOCKSIZE:
++		/*
++		 * spec_open() sets the block size to 512 to read the block count
++		 * and sets it back afterwards, and returns ENXIO if either fails:
++		 * without this case bdevvp() panics with "bdevvp failed: open"
++		 * before the root is ever read.
++		 */
++		return *f == DEV_BSIZE ? 0 : EINVAL;
 +	case DKIOCGETBLOCKCOUNT:
 +		*o = vb.capacity;
 +		return 0;
@@ -558,7 +566,12 @@
 +
 +	vb.bounce_size = VBLK_BOUNCE_SIZE;
 +	while (vb.bounce_size >= PAGE_SIZE) {
-+		if (kmem_alloc_contig(kernel_map, &vb.bounce, vb.bounce_size,
++		/* The header goes in front and the status byte behind, so the
++		 * allocation is larger than one request: with the buffer exactly
++		 * bounce_size the status byte of a full-size request landed
++		 * outside it. */
++		if (kmem_alloc_contig(kernel_map, &vb.bounce,
++		    vb.bounce_size + 2 * PAGE_SIZE,
 +		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
 +		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
 +			break;
