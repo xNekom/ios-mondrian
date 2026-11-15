@@ -275,7 +275,7 @@ ones:
 | `mondrianfb_noconsole=1` `mondrianfb_hz=60` | stop drawing kernel text over the GUI (panics are still drawn); the vsync rate the display presents at, on a panel whose own rate is 120 Hz |
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen, re-requests it every minute, and holds the `UIApplication` idle timer |
-| `mondriankill=quiet` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable with `execdeny` |
+| `mondriankill=quiet` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable with `execdeny`. A denied exec must still create a `signature_failure_reason` (`0328`): without one the assert in `kern_exec.c` fires, the SIGKILL carries no reason, and the half-initialised image dies with `SIGSEGV` inside the shared cache — which cost the bench 400 of its 500 execs |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 | length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
 

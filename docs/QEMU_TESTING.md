@@ -47,7 +47,7 @@ python3 tools/mkpayload.py xnu/out/kernel.development.mondrian /tmp/qemu.adt \
         ignition_level=1 wdt=-1 mondriankill=quiet' \
     --board mondrian --allow-silent-boot
 
-simg2img backup/ios-root.simg /root/ios-root.raw      # once: 16 GB, Android sparse
+simg2img backup/ios-root.simg /root/ios-root.raw   # 16 GB; the guest writes this copy
 python3 tools/qemu-ios.py /tmp/payload.bin /tmp/qemu-run --secs 240 \
     --board mondrian --kernel xnu/out/kernel.development.mondrian \
     --disk /root/ios-root.raw
