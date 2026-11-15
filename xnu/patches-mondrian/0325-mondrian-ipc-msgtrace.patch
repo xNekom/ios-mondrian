@@ -1,28 +1,48 @@
 --- a/osfmk/ipc/mach_msg.c
 +++ b/osfmk/ipc/mach_msg.c
-@@ -120,6 +120,11 @@
+@@ -120,6 +120,15 @@
  #define offsetof(type, member)  ((size_t)(&((type *)0)->member))
  #endif /* offsetof */
  
 +/* mondrian: defined with the message traps below, used by both of them. */
 +static void mondrian_msgtrace_send(mach_msg_user_header_t *header);
++static void mondrian_msgtrace_send_begin(mach_msg_user_header_t *header);
 +static void mondrian_msgtrace_recv(mach_vm_address_t msg_addr,
 +    mach_msg_size_t size);
++static void mondrian_msg_record(int kind, int pid, int msg_id, int owner,
++    int size);
++extern int mondrian_msgtrace;
 +
  /*
   * Forward declarations - kernel internal routines
   */
-@@ -1000,6 +1005,9 @@
+@@ -997,9 +1006,25 @@
+ 
+ 	if (option32 & MACH_SEND_MSG) {
+ 		/* send_size is bound checked */
++		mondrian_msgtrace_send_begin(&user_header);
  		mr = mach_msg_trap_send(msg_addr, 0, (mach_msg_option64_t)option32,
  		    msg_timeout, priority, filter_nonfatal,
  		    user_header, send_size, 0, desc_count);
 +		if (mr == MACH_MSG_SUCCESS) {
 +			mondrian_msgtrace_send(&user_header);
++		} else {
++			{
++				int fpid = proc_pid(current_proc());
++
++				/* only the process being traced: the system sends
++				 * a thousand failed messages a minute and printing
++				 * them all flooded the console. */
++				if (mondrian_msgtrace != 0 && fpid == mondrian_msgtrace) {
++					mondrian_msg_record(4, fpid,
++					    (int)user_header.msgh_id, (int)mr, 0);
++				}
++			}
 +		}
  	}
  
  	/* If send failed, skip receive */
-@@ -1026,6 +1034,9 @@
+@@ -1026,6 +1051,9 @@
  		}
  		mr = mach_msg_trap_receive(msg_addr, 0, (mach_msg_option64_t)option32,
  		    msg_timeout, sync_send, rcv_size, 0, rcv_name);
@@ -32,7 +52,7 @@
  	}
  
  end:
-@@ -1071,6 +1082,84 @@
+@@ -1071,6 +1099,149 @@
  }
  
  /*
@@ -44,7 +64,42 @@
 + * every message pid 1 receives (id and size), so the two sides can be lined up.
 + * Bounded, because the console ring is small.
 + */
-+static int mondrian_msgtrace;
++int mondrian_msgtrace;
++
++/*
++ * Samples are stored, never printed, from inside the message traps: the console
++ * write that prints a message sends messages of its own, and printing from here
++ * wedged three boots. bsd/dev/mondrian_sample.c drains this from its timer.
++ */
++#define MONDRIAN_MSG_SAMPLES 96
++#define MONDRIAN_MSG_SEND_BEGIN 0
++#define MONDRIAN_MSG_SEND_OK 1
++#define MONDRIAN_MSG_RECV 2
++#define MONDRIAN_MSG_ARMED 3
++
++volatile unsigned int mondrian_msg_samples_total;
++int mondrian_msg_samples_head;
++struct mondrian_msg_sample {
++	int kind;
++	int pid;
++	int msg_id;
++	int owner;
++	int size;
++} mondrian_msg_samples[MONDRIAN_MSG_SAMPLES];
++
++static void
++mondrian_msg_record(int kind, int pid, int msg_id, int owner, int size)
++{
++	unsigned int slot = mondrian_msg_samples_total %
++	    MONDRIAN_MSG_SAMPLES;
++
++	mondrian_msg_samples[slot].kind = kind;
++	mondrian_msg_samples[slot].pid = pid;
++	mondrian_msg_samples[slot].msg_id = msg_id;
++	mondrian_msg_samples[slot].owner = owner;
++	mondrian_msg_samples[slot].size = size;
++	mondrian_msg_samples_total++;
++}
 +static bool mondrian_msgtrace_setup_done;
 +static unsigned mondrian_msgtrace_lines;
 +
@@ -67,14 +122,43 @@
 +		mondrian_msgtrace_setup_done = true;
 +		mondrian_msgtrace_setup();
 +		if (mondrian_msgtrace != 0) {
-+			printf("MONDRIAN MSG: trace on pid %d\n",
-+			    mondrian_msgtrace);
++			mondrian_msg_record(MONDRIAN_MSG_ARMED, 0,
++			    mondrian_msgtrace, 0, 0);
 +		}
 +	}
-+	if (mondrian_msgtrace == 0 || mondrian_msgtrace_lines > 12000) {
++	if (mondrian_msgtrace == 0 || mondrian_msgtrace_lines > 400) {
 +		return false;
 +	}
++	/*
++	 * Nothing before the boot settles: the console write that prints a traced
++	 * message sends a message of its own, and tracing that from inside the trap
++	 * wedged two boots before the USB gadget came up.
++	 */
++	{
++		uint64_t seconds = 0;
++		uint32_t micro = 0;
++
++		absolutetime_to_microtime(mach_absolute_time(), &seconds, &micro);
++		if (seconds < 75) {
++			return false;
++		}
++	}
 +	return pid == 1 || pid == mondrian_msgtrace;
++}
++
++static void
++mondrian_msgtrace_send_begin(mach_msg_user_header_t *header)
++{
++	int pid = proc_pid(current_proc());
++
++	if (pid == 1 || header->msgh_local_port == 0 ||
++	    !mondrian_msgtrace_wanted(pid)) {
++		return;
++	}
++	mondrian_msgtrace_lines++;
++	mondrian_msg_record(MONDRIAN_MSG_SEND_BEGIN, pid,
++	    (int)header->msgh_id, (int)header->msgh_remote_port,
++	    (int)header->msgh_size);
 +}
 +
 +static void
@@ -92,10 +176,12 @@
 +	    !mondrian_msgtrace_wanted(pid)) {
 +		return;
 +	}
-+	mondrian_msgtrace_lines++;
-+	printf("MONDRIAN MSG: send pid %d id %d dest 0x%x local 0x%x size %d\n",
-+	    pid, (int)header->msgh_id, header->msgh_remote_port,
-+	    header->msgh_local_port, (int)header->msgh_size);
++	{
++		extern volatile int mondrian_dest_owner_pid;
++
++		mondrian_msg_record(MONDRIAN_MSG_SEND_OK, pid,
++		    (int)header->msgh_id, mondrian_dest_owner_pid, 0);
++	}
 +}
 +
 +static void
@@ -109,25 +195,41 @@
 +	}
 +	(void)copyin((user_addr_t)(msg_addr + 20), (char *)&id, sizeof(id));
 +	mondrian_msgtrace_lines++;
-+	printf("MONDRIAN MSG: recv pid %d id %d size %d\n", pid, (int)id,
-+	    (int)size);
++	mondrian_msg_record(MONDRIAN_MSG_RECV, pid, (int)id, 0, (int)size);
 +}
 +
 +/*
   *  Routine:    mach_msg2_trap [mach trap]
   *  Purpose:
   *      Modern mach_msg_trap() with vector message and CFI support.
-@@ -1192,6 +1281,9 @@
+@@ -1188,10 +1359,26 @@
+ 		}
+ 
+ 		/* for scalar send: msg_send_size (from mb_ss) has not been bound checked */
++		mondrian_msgtrace_send_begin(&user_header);
+ 		mr = mach_msg_trap_send(msg_addr, aux_addr, option64,
  		    msg_timeout, priority, filter_nonfatal,
  		    user_header, msg_send_size,
  		    aux_send_size, desc_count);
 +		if (mr == MACH_MSG_SUCCESS) {
 +			mondrian_msgtrace_send(&user_header);
++		} else {
++			{
++				int fpid = proc_pid(current_proc());
++
++				/* only the process being traced: the system sends
++				 * a thousand failed messages a minute and printing
++				 * them all flooded the console. */
++				if (mondrian_msgtrace != 0 && fpid == mondrian_msgtrace) {
++					mondrian_msg_record(4, fpid,
++					    (int)user_header.msgh_id, (int)mr, 0);
++				}
++			}
 +		}
  	}
  
  	/* if send failed, skip receive */
-@@ -1232,6 +1324,9 @@
+@@ -1232,6 +1419,9 @@
  		mr = mach_msg_trap_receive(msg_addr, aux_addr, option64,
  		    msg_timeout, sync_send, max_msg_rcv_size,
  		    max_aux_rcv_size, rcv_name);
@@ -137,3 +239,110 @@
  	}
  
  end:
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -72,6 +72,11 @@
+ 
+ 
+ #include <mach/mach_types.h>
++
++/* mondrian: set under the send lock, printed outside it (ipc_kmsg_send) */
++extern int mondrian_msgtrace;
++volatile int mondrian_dest_owner_pid = -1;
++volatile int mondrian_dest_id;
+ #include <mach/boolean.h>
+ #include <mach/kern_return.h>
+ #include <mach/message.h>
+@@ -2913,6 +2918,29 @@
+ 	ip_mq_lock(port);
+ 
+ 	/*
++	 * mondrian: who owns the port a traced process is sending to? A send that
++	 * succeeds into a port whose owner is not the process that should answer
++	 * (a stale right left by a dead service) waits for a reply that no one can
++	 * send, which is what the app's job start looks like.
++	 */
++	/*
++	 * The owner of the destination is recorded here, under the queue lock, but
++	 * never printed here: the console write takes IPC locks of its own and in
++	 * a boot's first traffic that deadlocks the whole system. The trap prints
++	 * it after the send, with the locks released.
++	 */
++	mondrian_dest_owner_pid = -1;
++	if (mondrian_msgtrace != 0 &&
++	    task_pid(current_task()) == mondrian_msgtrace) {
++		ipc_space_t rcv = port->ip_receiver;
++
++		if (rcv != IPS_NULL && rcv->is_task != TASK_NULL) {
++			mondrian_dest_owner_pid = task_pid(rcv->is_task);
++		}
++		mondrian_dest_id = (int)hdr->msgh_id;
++	}
++
++	/*
+ 	 * If the destination has been guarded with a reply context, and the
+ 	 * sender is consuming a send-once right, then assume this is a reply
+ 	 * to an RPC and we need to validate that this sender is currently in
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -40,6 +40,52 @@
+ static int      mondrian_proc_len;
+ static int      mondrian_proc_count;
+ 
++
++/*
++ * The IPC message trace records samples from inside the message traps and prints
++ * nothing there (a console write from a trap sends messages of its own). This is
++ * where they come out, on the same timer as the rest of the HUD.
++ */
++struct mondrian_msg_sample {
++	int kind;
++	int pid;
++	int msg_id;
++	int owner;
++	int size;
++};
++
++extern volatile unsigned int mondrian_msg_samples_total;
++extern struct mondrian_msg_sample mondrian_msg_samples[96];
++extern int mondrian_msg_samples_head;
++
++static unsigned int mondrian_msg_drained;
++
++static void
++mondrian_msg_drain(void)
++{
++	static const char *kinds[] = { "try", "sent", "recv", "armed", "fail" };
++	unsigned int total = mondrian_msg_samples_total;
++	unsigned int limit = sizeof(mondrian_msg_samples) /
++	    sizeof(mondrian_msg_samples[0]);
++
++	while (mondrian_msg_drained != total) {
++		struct mondrian_msg_sample *sample;
++
++		if (total - mondrian_msg_drained > limit) {
++			mondrian_msg_drained = total - limit;
++		}
++		sample = &mondrian_msg_samples[
++		    mondrian_msg_drained % limit];
++		if (sample->kind >= 0 && sample->kind <= 4) {
++			printf("MONDRIAN MSG: %s pid %d id %d owner %d size %d\n",
++			    kinds[sample->kind], sample->pid, sample->msg_id,
++			    sample->owner, sample->size);
++		}
++		mondrian_msg_drained++;
++	}
++}
++
++
+ static void
+ mondrian_pause(int ticks)
+ {
+@@ -266,6 +312,7 @@
+ 	}
+ 	printf("SMP t=%llus %d procs", (unsigned long long)(now / 1000000000ULL),
+ 	    mondrian_proc_count);
++	mondrian_msg_drain();
+ 	for (int k = 0; k < mondrian_names_count; k++) {
+ 		printf(" | %s(%d) pc=0x%llx", mondrian_names[k],
+ 		    mondrian_want_pid[k], mondrian_want_pc[k]);

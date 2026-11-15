@@ -6,18 +6,39 @@ phone. It emulates what the shim does: place the segments, the ADT and the
 boot arguments at their physical addresses and jump.
 
 It covers the physical memory layout, the GICv3, the virtual timer and the
-framebuffer, and it writes:
+console, and it writes:
 
 | file | content |
 | --- | --- |
 | `fb.png` | the panel as the guest left it |
 | `fb.txt` | the console text, decoded with the kernel's own font (needs `--kernel`) |
+| `serial.txt` | the console, straight from QEMU's PL011 (`mkadt.py --qemu` only) |
 | `regs.txt` | register state, plus the output of every `--hmp` command |
 | `qemu.log` | guest exceptions (interrupts, aborts, translation faults) |
 | `result.json` | `no_panic_observed`, `panic`, `blank_screen` or `incomplete_decode` |
 
-Not emulated: Qualcomm XPU/TZ protections, the ABL, the real panel, and the
-PSCI conduit (QEMU uses `hvc`). Those are decided by the hardware.
+Not emulated: Qualcomm XPU/TZ protections, the ABL, the real panel and the MDP,
+and the PSCI conduit (QEMU uses `hvc`). Those are decided by the hardware.
+
+### Console and the display nodes
+
+`mkadt.py --qemu` leaves the display (`disp0`) and panel console
+(`mondrian-fbcon`) nodes out and emits `mondrian-qemu-uart` with `virt`'s PL011
+at `0x09000000` instead. Both halves of that matter:
+
+- The kernel console is the panel on the phone, so without a UART node a QEMU
+  boot prints nothing at all (`serial.txt` stays empty and only the framebuffer
+  decode is left).
+- A display node with no MDP behind it is worse than silence: the first
+  register read takes a synchronous external abort, QEMU restarts the
+  instruction, and the boot dies in an abort loop that looks like a hang
+  (`Taking exception 5 [IRQ]` repeating in `qemu.log`).
+
+With both, the guest boots past the platform expert to BSD init
+(`MAC Framework successfully initialized`, then `using N buffer headers`) and
+stops in `IOFindBSDRoot` waiting for a root device, which `virt` does not
+provide: there is no virtio-blk driver in this tree yet.
+
 
 ## Setup
 
@@ -64,9 +85,7 @@ QEMU_PHYS_BASE=0x100000000 QEMU_MEM_SIZE=0x180000000 \
 
 `qemu-ios.py` sizes `-m` from the payload header, so the rest of the recipe is
 unchanged; the phone's own base needs `-m 41G` (virt RAM starts at 1 GiB) and
-`vm.overcommit_memory=1`, which leaves the RSS at what the guest touches. Both
-windows stop at `AppleCLCD::vsyncFired`, which touches the MDP QEMU does not
-emulate: that is the pass condition for the early boot.
+`vm.overcommit_memory=1`, which leaves the RSS at what the guest touches.
 
 Two traps it found: the ADT's CPU node must carry MPIDR 0 under QEMU (the
 phone's boot core is 7), and `phystokv()` panics on any address outside the

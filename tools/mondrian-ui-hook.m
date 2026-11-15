@@ -44,6 +44,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 #include <mach-o/dyld.h>
 #include <mach-o/nlist.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -478,6 +479,32 @@ mondrian_execute_request(id self, SEL _cmd, id request, id existing,
 		    1);
 		return result;
 	}
+}
+
+/*
+ * The kernel's IPC trace has to start after the boot, not with it: the console
+ * write that prints a traced message sends a message of its own, and tracing
+ * that from the trap wedged two boots before the USB came up. The switch is a
+ * sysctl, so the trace begins here, when the system is quiet and the next tap is
+ * the only traffic worth looking at.
+ */
+static void *
+mondrian_trace_on_thread(void *unused)
+{
+	int one = 1;
+	int rc;
+
+	(void)unused;
+	sleep(75);
+	rc = sysctlbyname("kern.mondrian_trace_on", NULL, NULL, &one, sizeof(one));
+	{
+		char line[160];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN MSG: userspace trace on rc %d errno %d\n", rc, errno);
+		say(line);
+	}
+	return NULL;
 }
 
 /*
@@ -8103,7 +8130,7 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc52 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc55 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
@@ -8159,7 +8186,7 @@ mondrian_install_ui_hooks(void)
 		char tag[128];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc52 uid %d prog %s\n",
+		    "MONDRIAN UI: hook tag cc55 uid %d prog %s\n",
 		    (int)geteuid(), getprogname());
 		say(tag);
 	}
@@ -8196,9 +8223,13 @@ mondrian_install_ui_hooks(void)
 			mondrian_rbsrv_probe();
 		}
 		if (boot_arg_set("mondrianlaunch=1")) {
-			pthread_t watch;
+			pthread_t watch, trace;
 
 			mondrian_install_server_wrappers();
+			if (pthread_create(&trace, NULL, mondrian_trace_on_thread,
+			    NULL) == 0) {
+				pthread_detach(trace);
+			}
 			if (pthread_create(&watch, NULL, mondrian_start_watch, NULL) == 0) {
 				pthread_detach(watch);
 			}

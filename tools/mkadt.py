@@ -212,24 +212,35 @@ def build(board, seed=None, qemu=False, altmem=False):
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node; it
         # matches the panel in the framebuffer driver, which copies layers
-        # 1:1 and does not scale.
-        node('disp0', [
-            ph(),
-            ('device_type', cstr('display-subsystem')),
-            ('compatible', cstr(board.dt_prefix + ',display')),
-            # IOMobileFramebuffer's getEDTProperty() reads these as 4-byte
-            # CFData (getBytes:range:); keep them u32, not a number object.
-            ('canvas-width', u32(board.fb_w)),
-            ('canvas-height', u32(board.fb_h)),
-        ])])
-
-    fbcon = node(board.dt_prefix + '-fbcon', [
+        # 1:1 and does not scale. QEMU's virt machine has no MDP, so the node
+        # is left out there: a driver attached to it aborts on the first
+        # register read and QEMU restarts the instruction forever.
+    ] + ([] if qemu else [node('disp0', [
         ph(),
-        ('reg', u64(board.fb, board.fb_size)),
-        ('width', u32(board.fb_w)),
-        ('height', u32(board.fb_h)),
-        ('stride', u32(board.fb_w * 4)),
-    ])
+        ('device_type', cstr('display-subsystem')),
+        ('compatible', cstr(board.dt_prefix + ',display')),
+        # IOMobileFramebuffer's getEDTProperty() reads these as 4-byte
+        # CFData (getBytes:range:); keep them u32, not a number object.
+        ('canvas-width', u32(board.fb_w)),
+        ('canvas-height', u32(board.fb_h)),
+    ])]))
+
+    # The console. On the phone it is the panel (no usable UART on the board),
+    # on QEMU it is the PL011 that `virt` maps at 0x09000000 and that the
+    # emulator leaves configured; both use an absolute physical address.
+    if qemu:
+        console = node(board.dt_prefix + '-qemu-uart', [
+            ph(),
+            ('reg', u64(0x09000000, 0x1000)),
+        ])
+    else:
+        console = node(board.dt_prefix + '-fbcon', [
+            ph(),
+            ('reg', u64(board.fb, board.fb_size)),
+            ('width', u32(board.fb_w)),
+            ('height', u32(board.fb_h)),
+            ('stride', u32(board.fb_w * 4)),
+        ])
 
     # bsd/dev/<board>_ufs.c: the UFS host ABL leaves running (absolute physical reg).
     ufs = node(board.dt_prefix + '-ufs', [
@@ -341,7 +352,7 @@ def build(board, seed=None, qemu=False, altmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs, gcc]))
+    ], [chosen, defaults, cpus, arm_io, console, buttons, pram] + memory + reserved + product + ([] if qemu else [ufs, gcc]))
 
 
 if __name__ == '__main__':

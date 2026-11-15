@@ -1,0 +1,107 @@
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -1052,6 +1052,84 @@
+ 	}
+ }
+ 
++/*
++ * mondrian: console for QEMU's `virt` machine. The board has no usable UART, so
++ * the phone console is the panel; the emulator has no MDP, so a panel driver
++ * there aborts on its first register read. `virt` maps a PL011 the firmware
++ * (or QEMU itself) already configured, and the ADT node "mondrian-qemu-uart"
++ * states where:
++ *   reg    = <phys size>       absolute physical address, as mondrian-fbcon
++ */
++#define QEMU_UART_DR        0x00
++#define QEMU_UART_FR        0x18
++#define QEMU_UART_FR_TXFF   (1u << 5)
++
++static vm_offset_t qemu_uart_base;
++
++static void
++qemu_uart_init(void)
++{
++	/* QEMU leaves the PL011 at 115200 8n1, which is what the console wants. */
++}
++
++static unsigned int
++qemu_uart_transmit_ready(void)
++{
++	if (qemu_uart_base == 0) {
++		return 0;
++	}
++	return (*(volatile uint32_t *)(qemu_uart_base + QEMU_UART_FR) &
++	    QEMU_UART_FR_TXFF) == 0;
++}
++
++static void
++qemu_uart_transmit_data(uint8_t c)
++{
++	if (qemu_uart_base != 0) {
++		*(volatile uint32_t *)(qemu_uart_base + QEMU_UART_DR) = c;
++	}
++}
++
++static unsigned int
++qemu_uart_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++qemu_uart_receive_data(void)
++{
++	return 0;
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) mondrian_qemu_serial_functions =
++{
++	.init = qemu_uart_init,
++	.transmit_ready = qemu_uart_transmit_ready,
++	.transmit_data = qemu_uart_transmit_data,
++	.receive_ready = qemu_uart_receive_ready,
++	.receive_data = qemu_uart_receive_data,
++	.device = SERIAL_QEMU_UART
++};
++
++static void
++qemu_uart_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	unsigned int size;
++
++	if (SecureDTFindEntry("name", "mondrian-qemu-uart", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 16 || reg[0] == 0) {
++		return;
++	}
++	qemu_uart_base = ml_io_map(reg[0], reg[1]);
++	if (qemu_uart_base != 0) {
++		register_serial_functions(&mondrian_qemu_serial_functions);
++	}
++}
++
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation
+@@ -1133,6 +1211,7 @@
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
+ 	fbcon_probe();
++	qemu_uart_probe();
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -51,7 +51,8 @@
+ 	SERIAL_PI3_UART=0x4,
+ 	SERIAL_VMAPPLE_UART=0x8,
+ 	SERIAL_DCC_UART=0x10,
+-	SERIAL_SWEET_FBCON=0x20
++	SERIAL_SWEET_FBCON=0x20,
++	SERIAL_QEMU_UART=0x40
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
