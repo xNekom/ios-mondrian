@@ -201,7 +201,12 @@ started, so refusing the *next* exec changes nothing.
 NVRAM node, so the lookup fails and its failure path is a trap rather than a
 fallback. `0336` attaches an `options` node to the device-tree root with the
 kernel's command line as `boot-args`; nothing writes it back, which is what an
-NVRAM controller would be for. A crash at that offset is this, not a watchdog.
+NVRAM controller would be for. Measured, same four-minute window: watchdogd
+went from 24-31 crash lines to 4, and the boot's own total from
+`exec 1301 crash 210` to `exec 629 crash 59`. The four that remain report a pc
+inside its `os_log` wrapper (`watchdogd+0xa620`), not the `brk` at `0xb620`, so
+they are a second failure of the same daemon and not this lookup. A crash at
+`+0xb620` means the `options` node or its `boot-args` property is missing again.
 
 ### 3. The frame path is marginal
 
