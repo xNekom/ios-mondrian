@@ -1347,6 +1347,18 @@ prints nothing and that the ring says which copy the process loaded
 Test the other bits the same way before reading anything below as a property of
 the port.
 
+**A hook change does not need a kernel build.** The injector only tests that
+`/private/var/vm/mondrian-ui-hook.dylib` exists, so `tools/usb-ring.py wfile`
+replaces it and `kill <SpringBoard pid>` (the pid is in the ring's
+`SMP ... SpringBoard(N)`) makes launchd re-exec with the new file; the ring
+proves it with `MONDRIAN WFILE ... -> 0` followed by `injected UI hook` and a
+new pid. Write first and kill after: a write that lands after the respawn
+leaves the old dylib mapped (measured), and `O_TRUNC` on a mapped file can
+SIGBUS the process, which is harmless because the respawn loads the new one.
+Never leave a truncated hook in place: the existence test prefers it over the
+`/usr/libexec` copy and every SpringBoard exec then dies at dyld. A reboot
+restores the kernel's copy (`glblob=1`).
+
 With the hook injected, no process in the hook set (`launchd`,
 `containermanagerd`, `backboardd`, `runningboardd`, `SpringBoard`) calls
 `+[CAWindowServer server]`, measured with a passive hook over a whole boot: CA's
