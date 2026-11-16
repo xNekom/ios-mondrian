@@ -2679,17 +2679,34 @@ mondrian_idle_disabled(id self, SEL selector, BOOL disabled, id reason)
 	if ((int)disabled != last) {
 		last = (int)disabled;
 		snprintf(line, sizeof(line),
-		    "MONDRIAN UI: idle timer asked %d, forced 1\n", (int)disabled);
+		    "MONDRIAN UI: idle timer asked %d, forced %d\n", (int)disabled,
+		    boot_arg_set("mondriankeepawake=0") == 0);
 		say(line);
 	}
 	if (original_idle_disabled != NULL) {
-		original_idle_disabled(self, selector, YES, reason);
+		/*
+		 * SpringBoard asks for the timer to stay off and the port has
+		 * honoured that since the day the display never came back
+		 * (`mondrian_lock_step` explains it). `mondriankeepawake=0`
+		 * passes the ask through unchanged instead, so one boot can
+		 * watch the idle path.
+		 */
+		BOOL forced = boot_arg_set("mondriankeepawake=0") == 0;
+
+		original_idle_disabled(self, selector, forced ? YES : disabled,
+		    reason);
 	}
 }
+
+static BOOL (*original_idle_disabled_for_reason)(id, SEL, id);
 
 static BOOL
 mondrian_idle_disabled_for_reason(id self, SEL selector, id reason)
 {
+	/* The setter is forced too; this answers with the same value. */
+	if (boot_arg_set("mondriankeepawake=0") && original_idle_disabled_for_reason) {
+		return original_idle_disabled_for_reason(self, selector, reason);
+	}
 	(void)self;
 	(void)selector;
 	(void)reason;
@@ -2754,7 +2771,9 @@ mondrian_install_agent_hooks(void)
 	method = class_getInstanceMethod(agent,
 	    sel_registerName("isIdleTimerDisabledForReason:"));
 	if (method != NULL) {
-		method_setImplementation(method, (IMP)mondrian_idle_disabled_for_reason);
+		original_idle_disabled_for_reason = (BOOL (*)(id, SEL, id))
+		    method_setImplementation(method,
+		    (IMP)mondrian_idle_disabled_for_reason);
 		say("MONDRIAN UI: idle timer getter hook installed\n");
 	}
 	/*

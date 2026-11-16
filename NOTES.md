@@ -53,20 +53,20 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The home screen draws on its own 1440x3200 canvas
-  (480x1066 pt at scale 3) and the tick holds two records (`0282`);
-  `docs/UI_PERFORMANCE.md` has the frame meter. The UI comes up with
-  `mondrian_ui_hook=0x4`: lock screen, home screen, Control Center, `exec
-  Preferences` on a tap.
+- **Display and UI.** The home screen draws on its own 1440x3200 canvas (480x1066
+  pt at scale 3); `docs/UI_PERFORMANCE.md` has the frame meter, `0282` the
+  two-record tick. `mondrian_ui_hook=0x4` brings up the lock screen, the home
+  screen, the Control Center and `exec Preferences` on a tap.
 
 Current blockers, in order:
 
 1. **The panel never sleeps.** `mondrian_ui_hook=0x4` renders (lock screen, home
-   screen, Control Center, apps) and the hook holds `setIdleTimerDisabled:` down
-   every two seconds, so iOS's idle timer never fires. The kernel's blank works
-   (the power key paints black, `panel blank (power key)`) and a *touch* brings
-   the UI back; a second power press does not, because iOS believes the display
-   is on and presents no frame. `mondriankeepawake=0` drops the hold for a boot.
+   screen, Control Center, apps) and the hook forces `setIdleTimerDisabled:` in
+   both places it appears -- the `SBUserAgent` setter and a two-second tick --
+   so iOS's idle timer never fires. The kernel's blank works (the power key
+   paints black, `panel blank (power key)`) and a *touch* brings the UI back; a
+   second power press does not, because iOS believes the display is on and
+   presents no frame. `mondriankeepawake=0` drops both holds for a boot.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
