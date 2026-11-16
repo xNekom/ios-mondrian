@@ -1,0 +1,288 @@
+xnu 0342: blank the panel with DCS instead of painting the framebuffer black
+
+Measured 2026-11-16 on the phone with mondrianfb_blank=30: 30 s after the last
+present the panel reads black, a touch is delivered (the ring logs
+`MONDRIAN HID: touch 0 down`), and the framebuffer never changes again -- no
+`MONDRIAN FB: panel wake` line at all, because the wake lives inside present()
+and iOS, which has already dimmed and stopped its own display link, presents
+nothing after the touch. The black paint is what makes that final: it destroys
+the only frame the panel could show.
+
+The panel is a DCS command panel, so switch it off with 0x28 and back on with
+0x29. Off, it keeps its own RAM; on, it shows the last frame again without
+waiting for a present. Input un-blanks the driver state at once and the tick
+sends 0x29 on the thread that already sends the brightness DCS. A panel that
+refuses 0x28 keeps the old black-paint fallback, so the change cannot make the
+blank worse than it was.
+
+The DMA helper grows the MIPI short form (data type 0x05, the command in the
+first packet byte, four bytes on the wire); display on and off take no
+parameter and a long write with two NOP bytes is not what the standard says.
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index 352f0bd..1da2385 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -528,7 +528,8 @@ public:
+ 	 * power call into this driver. A command-mode panel keeps the last
+ 	 * frame forever, so the power key blanks it at once and a fallback
+ 	 * timer blanks it after fBlankAfter seconds without a present. The
+-	 * tick paints the panel memory black and the start below sends it.
++	 * panel is switched off with DCS 0x28 and keeps its RAM, so switching
++	 * it back on shows that frame without waiting for a present.
+ 	 * mondrianfb_blank=N seconds (default 1), 0 disables the timer.
+ 	 */
+ 	bool          fBlanked;
+@@ -540,6 +541,7 @@ public:
+ 	uint64_t      fHoldBlankUntil;
+ 	uint64_t      fWakeArmedTicks;    /* input asked for the next frame */
+ 	uint64_t      fActivityTicks;     /* no blank before this after input */
++	bool          fPanelOnPending;    /* the tick sends DCS display on */
+ 	/* mondrianfb_test: the band, and the pixels it covers. */
+ 	bool          fTest;
+ 	bool          fTestShown;
+@@ -663,18 +665,19 @@ mondrian_dsi_packet(AppleCLCD *fb, uint32_t type, const uint8_t *data,
+ }
+ 
+ /*
+- * The brightness write, as a DSI DMA out of fBrightBuf: the DCS long write
+- * sits in memory (4-byte packet header 03 00 39 c0, then the command byte and
+- * the 12-bit level, 0xff pad) and DSI_DMA_CMD_OFFSET points the engine at it.
+- * The two lengths are the constants the old kernel used: three payload bytes,
+- * eight on the wire. `cmd` is the DCS command byte, `value` its 16-bit payload
+- * low byte first.
++ * A DCS write as a DSI DMA out of fBrightBuf, and DSI_DMA_CMD_OFFSET points
++ * the engine at it. The long form is the brightness packet: header 03 00 39 c0
++ * (three payload bytes), the command byte and the 12-bit level, 0xff pad, eight
++ * bytes on the wire. The short form is a command with no parameter -- display
++ * on and off -- which MIPI sends as 05 with the command in the first byte and
++ * four bytes on the wire; `value` is ignored there.
+  *
+  * Returns -1 without a DSI window or a command page, -2 when the DMA-done bit
+  * never arrives (100 ms), 0 once it did.
+  */
+ static int
+-mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
++mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value,
++    bool short_form)
+ {
+ 	volatile uint32_t *dsi = fb->fDsi;
+ 	volatile uint32_t *buf = (volatile uint32_t *)fb->fBrightBuf;
+@@ -707,9 +710,16 @@ mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
+ 		return -1;
+ 	}
+ 
+-	/* 64-byte block; the DMA reads the first 8 bytes. */
+-	buf[0] = 0xc0390003u;
+-	buf[1] = 0xff000000u | (cmd & 0xff) | ((value & 0xffff) << 8);
++	/* 64-byte block; the DMA reads the first 8 bytes (4 when short). */
++	uint32_t wire = short_form ? 4 : 8;
++
++	if (short_form) {
++		buf[0] = 0x00050000u | (cmd & 0xff);
++		buf[1] = 0xffffffffu;
++	} else {
++		buf[0] = 0xc0390003u;
++		buf[1] = 0xff000000u | (cmd & 0xff) | ((value & 0xffff) << 8);
++	}
+ 	for (uint32_t i = 2; i < 16; i++) {
+ 		buf[i] = 0xffffffff;
+ 	}
+@@ -729,7 +739,7 @@ mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50 | 0x00110000u);
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_OFFSET,
+ 	    (uint32_t)fb->fBrightPhys);
+-	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH, 8);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH, wire);
+ 
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_DMA_DONE, 1);
+@@ -750,7 +760,8 @@ mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
+ 	}
+ 
+ 	IOLog("MONDRIAN BL: dma len %u size %u phys 0x%llx int 0x%08x done %d\n",
+-	    3, 8, (unsigned long long)fb->fBrightPhys, iv, done ? 1 : 0);
++	    short_form ? 0 : 3, wire, (unsigned long long)fb->fBrightPhys, iv,
++	    done ? 1 : 0);
+ 	IOLog("MONDRIAN BL: status 0x%x -> 0x%x fifo 0x%x ack 0x%x to 0x%x "
+ 	    "vmode 0x%x off 0x%x len 0x%x\n",
+ 	    status, mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS),
+@@ -773,6 +784,22 @@ mondrian_dsi_dcs_dma(AppleCLCD *fb, uint32_t cmd, uint32_t value)
+ 	return rc;
+ }
+ 
++/*
++ * The panel's own display on/off (DCS 0x29 / 0x28). The driver used to paint
++ * the framebuffer black instead, which destroys the only frame the panel has:
++ * iOS stops its display link when it sleeps, so the tap that should wake the
++ * screen produces no present, and the glass stayed black with no way back.
++ * Switched off, the panel keeps its RAM; switched on, it shows that frame.
++ *
++ * Returns the DMA result, so a panel that refuses the command keeps the old
++ * black-paint fallback in the blank path.
++ */
++static int
++mondrian_panel_light(AppleCLCD *fb, bool on)
++{
++	return mondrian_dsi_dcs_dma(fb, on ? 0x29 : 0x28, 0, true);
++}
++
+ /*
+  * Send the stored level: three DCS bytes, command first, the 12-bit DBV split
+  * by the format (bit0 swaps the byte order, bit1 inverts it), then the DMA.
+@@ -799,13 +826,13 @@ mondrian_fb_brightness_apply(AppleCLCD *fb)
+ 
+ 	IOLog("MONDRIAN BL: level %u fmt %d cmd 0x%02x dbv 0x%03x path dma\n",
+ 	    level, (int)fmt, cmd, v);
+-	rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8));
++	rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8), false);
+ 	if (rc != 0 && fb->fDsi != NULL) {
+ 		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_CTRL, 0);
+ 		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 1);
+ 		delay(10);
+ 		mondrian_mdp_wr(fb->fDsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 0);
+-		rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8));
++		rc = mondrian_dsi_dcs_dma(fb, p0, p1 | (p2 << 8), false);
+ 	}
+ 	IOLog("MONDRIAN BL: sent rc %d ack 0x%08x\n", rc, 0);
+ 	fb->fBrightApplies++;
+@@ -869,6 +896,7 @@ AppleCLCD::start(IOService *provider)
+ 	fHoldBlankUntil = 0;
+ 	fWakeArmedTicks = 0;
+ 	fActivityTicks = 0;
++	fPanelOnPending = false;
+ 	fTest = false;
+ 	fTestShown = false;
+ 	fTestY = 0;
+@@ -1299,8 +1327,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			idle = idleNs >= (uint64_t)fb->fBlankAfter * 1000000000ULL;
+ 		}
+ 		if (request || idle) {
+-			memset((void *)fb->fPixels, 0, (size_t)fb->fHeight * fb->fRowBytes);
+-			__asm__ volatile("dsb sy" ::: "memory");
++			/*
++			 * Off, not black: the frame stays in the panel's own
++			 * RAM and comes back with 0x29 even if nothing ever
++			 * presents again. The black paint is the fallback for
++			 * a panel that refuses the command.
++			 */
++			if (mondrian_panel_light(fb, false) != 0) {
++				memset((void *)fb->fPixels, 0,
++				    (size_t)fb->fHeight * fb->fRowBytes);
++				__asm__ volatile("dsb sy" ::: "memory");
++			}
+ 			fb->fBlanked = true;
+ 			fb->fPanelSig = 0;
+ 			if (request) {
+@@ -1457,6 +1494,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fBrightPending = false;
+ 		mondrian_fb_brightness_apply(fb);
+ 	}
++	/*
++	 * A wake that came from input is the same kind of write, and it must not
++	 * wait for a frame: iOS presents nothing after its display link stops.
++	 */
++	if (fb->fPanelOnPending && fb->fDsi != NULL && fb->fKick &&
++	    count >= fb->fKickFrom) {
++		fb->fPanelOnPending = false;
++		if (mondrian_panel_light(fb, true) == 0) {
++			IOLog("MONDRIAN FB: panel on (dcs)\n");
++		}
++	}
+ 	/*
+ 	 * Sample the panel memory once a tick and count the ticks whose sample
+ 	 * changed. 64 pixels is nothing next to a 18 MB frame, and it answers
+@@ -1844,6 +1892,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			fBlankFirstPresent = 0;
+ 			fBlankPresents = 0;
+ 			fWakeArmedTicks = 0;
++			fPanelOnPending = true;
+ 			fActivityTicks = began + grace;
+ 			IOLog("MONDRIAN FB: panel wake (input)\n");
+ 		} else {
+@@ -1860,6 +1909,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			fBlanked = false;
+ 			fBlankFirstPresent = 0;
+ 			fBlankPresents = 0;
++			fPanelOnPending = true;
+ 			fActivityTicks = began + grace;
+ 			IOLog("MONDRIAN FB: panel wake\n");
+ 		}
+@@ -2534,15 +2584,28 @@ extern "C" void
+ mondrian_fb_power_key(void)
+ {
+ 	AppleCLCD *fb = gMondrianFB;
+-	uint64_t arm;
++	uint64_t arm, grace;
+ 
+ 	if (fb == NULL) {
+ 		return;
+ 	}
+ 	nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_WAKE_NS, &arm);
++	nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_GRACE_NS, &grace);
+ 	if (fb->fBlanked) {
++		/*
++		 * The press is the wake, and it does not wait for a frame: the
++		 * panel keeps its RAM while it is off, so switching it back on
++		 * shows the last frame even when iOS never presents again.
++		 */
+ 		fb->fHoldBlank = false;
+-		fb->fWakeArmedTicks = mach_absolute_time() + arm;
++		fb->fBlankRequest = false;
++		fb->fBlanked = false;
++		fb->fBlankFirstPresent = 0;
++		fb->fBlankPresents = 0;
++		fb->fWakeArmedTicks = 0;
++		fb->fPanelOnPending = true;
++		fb->fActivityTicks = mach_absolute_time() + grace;
++		IOLog("MONDRIAN FB: panel wake (power key)\n");
+ 	} else {
+ 		fb->fBlankRequest = true;
+ 	}
+@@ -2557,31 +2620,31 @@ extern "C" void
+ mondrian_fb_touch_activity(void)
+ {
+ 	AppleCLCD *fb = gMondrianFB;
+-	uint64_t now;
++	uint64_t now, grace;
+ 
+ 	if (fb == NULL) {
+ 		return;
+ 	}
+ 	now = mach_absolute_time();
++	nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_GRACE_NS, &grace);
+ 	if (fb->fBlanked) {
+ 		/*
+-		 * The power key's hold only hides the lock animation; the idle
+-		 * blank's hold ends here, because a finger is exactly what it is
+-		 * waiting for.
++		 * A finger is the wake, and it does not wait for a frame either:
++		 * the power key's hold only hides the lock animation, and the
++		 * idle blank's hold ends here because a finger is what it waits
++		 * for. The DCS goes out on the tick, the thread that owns the
++		 * interface.
+ 		 */
+ 		fb->fHoldBlank = false;
+-		{
+-			uint64_t arm;
+-
+-			nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_WAKE_NS, &arm);
+-			fb->fWakeArmedTicks = now + arm;
+-		}
+-	} else {
+-		uint64_t grace;
+-
+-		nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_GRACE_NS, &grace);
+-		fb->fActivityTicks = now + grace;
+-	}
++		fb->fBlankRequest = false;
++		fb->fBlanked = false;
++		fb->fBlankFirstPresent = 0;
++		fb->fBlankPresents = 0;
++		fb->fWakeArmedTicks = 0;
++		fb->fPanelOnPending = true;
++		IOLog("MONDRIAN FB: panel wake (touch)\n");
++	}
++	fb->fActivityTicks = now + grace;
+ }
+ 
+ /*

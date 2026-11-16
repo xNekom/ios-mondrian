@@ -27,14 +27,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `0309`), flushes the ring and resets; fastboot answers about 2 s later.
   The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
   so a reset that only writes those boots the active slot instead.
-  **`boot` itself can be refused, and it says so only on the second line:**
-  `Sending 'boot.img' … OKAY` prints even when the command returns
-  `FAILED (remote: 'Failed to load/authenticate boot image: Not Found')`, the
-  image never runs and `boot_b` answers — which reads like a kernel that
-  crashes before its first line. A script needs `Booting … OKAY` *and* no
-  `FAILED`; when the refusal comes (it did for our image and for OrangeFox, so
-  it is the bootloader's state), `tools/wsl/flash-image.sh` writes `boot_b`
-  after checking the slot.
+  **`boot` itself can be refused, and only the second line says so:**
+  `Sending … OKAY` prints when the command returns `FAILED (remote: 'Failed
+  to load/authenticate boot image: Not Found')`: the image never runs and
+  `boot_b` answers, which reads like a kernel that dies before its first line.
+  Require `Booting … OKAY` *and* no `FAILED`, then use
+  `tools/wsl/flash-image.sh`, which checks the slot before writing `boot_b`.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
@@ -69,12 +67,14 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **The panel sleeps, but iOS's idle timer is dead.** The driver's fallback paints
-   black after `mondrianfb_blank` seconds without a present or a touch (30 in the
-   board table) and the first touch wakes it; the hook's two holds are off
-   (`mondriankeepawake=0`). iOS's own timer never arms: `SBLockScreenAutoLockTime`
-   was missing (the hook writes it) and `SBLockScreenManager` exposes no
-   `_idleTimerPolicyAggregator`.
+1. **The panel sleeps, and iOS stops drawing before it does.** `mondrianfb_blank`
+   seconds (30 in the board table) without a present switches the panel off with
+   DCS `0x28`; a key or a touch switches it back on (`0x29`) from the tick, never
+   from a frame -- iOS has stopped its display link, so the tap presents nothing
+   (`0342`; `0302` painted the framebuffer black instead and destroyed the only
+   frame the panel had). The hook's holds stay off (`mondriankeepawake=0`) and
+   iOS's timer never arms: `SBLockScreenAutoLockTime` was missing (the hook
+   writes it) and `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is
    out of reach: the level is a voltage table (`0304`), anchored to the Android

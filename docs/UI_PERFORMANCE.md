@@ -16,12 +16,15 @@ budget problem: the compositor only presents when something changes, so `fps 0`
 on a still screen is normal, and what matters is whether a touch brings a frame.
 
 - **Idle is the driver's, not the compositor's.** Measured on a boot left
-  untouched for 45 s: the ring carries `MONDRIAN UI: idle timer left armed
+  untouched: the ring carries `MONDRIAN UI: idle timer left armed
   (mondriankeepawake=0)`, then `MONDRIAN FB: panel blank after 30 s without a
-  frame` (the seconds are `mondrianfb_blank`), then `MONDRIAN FB: panel wake
-  (input)` on the first touch. Those three lines are the check: a missing blank
-  line means frames never stopped (or the blank is disabled), and a missing wake
-  line means the touch never reached the driver. Neither costs a rebuild.
+  frame` (the seconds are `mondrianfb_blank`) with the DCS write that follows it
+  (`MONDRIAN BL: dma len 0 size 4 ... done 1`), then on the first touch
+  `MONDRIAN FB: panel wake (touch)` and `MONDRIAN FB: panel on (dcs)`. Those
+  lines are the check: a missing blank means frames never stopped (or the blank
+  is disabled), `panel off refused` means the panel rejected `0x28` and the
+  black-paint fallback ran, and a missing wake line means the touch never
+  reached the driver. None of it costs a rebuild.
   `present 0/s` in the same dump is the still screen, not a fault: the samples
   that follow a touch read 4-5/s.
 
@@ -217,18 +220,26 @@ gone; the levers are the draw count and the copy-out path
 
 ### 4. The UI can stop presenting, and then it stays dark
 
-Measured twice. Opening Safari brings up its window with `google.com` in the
-address bar and a black page, `MobileSafari` exits 0x9, the
-`com.apple.WebKit.WebContent` helper execs again, `pipelined` crashes, and from
-there `MONDRIAN FB: present 0/s` with `touch 0/s` while SpringBoard keeps its
-heartbeat and does not crash. The same end state happens with no app involved:
-after the panel blanks on its own, the screen stays black, `present 0/s`, and a
-tap does not wake it -- the touch driver is fine (`MONDRIAN TOUCH: points r0 497
-...`, `ev gap` grows) but nothing is dispatched (`ev 0/s`) and no frame is
-produced, so the wake, which is driven by a present, never happens. Treat a
-black panel with a live ring as this state, not as a dead kernel: the USB
-channel answers, and only a reset leaves it. The cause is open; the ring is what
-to read, and `MONDRIAN FB: present`/`ev` are the two numbers that name it.
+Two ways into the same end state: a lost compositor, which is still open, and
+the idle blank, which `0342` closes.
+
+Opening Safari brings up its window with `google.com` in the address bar and a
+black page, `MobileSafari` exits 0x9, the `com.apple.WebKit.WebContent` helper
+execs again, `pipelined` crashes, and from there `MONDRIAN FB: present 0/s` with
+`touch 0/s` while SpringBoard keeps its heartbeat and does not crash. Treat a
+black panel with a live ring as this state, not as a dead kernel: the USB channel
+answers, and only a reset leaves it. The ring is what to read, and
+`MONDRIAN FB: present`/`ev` are the two numbers that name it.
+
+The idle path had a second cause and it was ours. Until `0342` the driver
+painted the framebuffer black when the blank fired, and the wake lived inside
+`present()`: by then iOS has dimmed and stopped its own display link, so a tap
+is delivered (`MONDRIAN HID: touch 0 down`) and produces **no present at all**.
+Measured on a still lock screen: `panel blank after 30 s`, no wake line,
+`present 0/s`, `panel 0/60 sampled ticks changed`, and the panel read 0.0 on
+every capture afterwards -- the black paint had destroyed the only frame it
+could show. The fix switches the panel off with DCS `0x28` (its RAM keeps the
+image) and back on with `0x29` from the tick, so the wake needs no frame.
 
 ## Measurement traps
 
@@ -257,11 +268,14 @@ to read, and `MONDRIAN FB: present`/`ev` are the two numbers that name it.
   ARP, `fastboot devices` empty) with the kernel still running. Recovering
   needs power + volume down, so only try it with the buttons in reach.
 - **The power key toggles the panel.** Pressing it on a lit screen blanks it
-  (`MONDRIAN FB: panel blank (power key)`, DBV 0). Injected touches do not wake
-  it: the wake comes from the touch controller's interrupt, which a HID
-  injection bypasses. A host-driven test starts with the screen already on.
-- **A blanked panel keeps its last image.** Screenshots then show a stale
-  clock, not a frozen compositor.
+  (`MONDRIAN FB: panel blank (power key)`) and a second press wakes it
+  (`panel wake (power key)` + `panel on (dcs)`). Injected touches wake it as
+  well: `tools/usb-ring.py tap` ends in `mondrian_hid_touch`, the same call the
+  touch driver makes.
+- **A blanked panel keeps its last image.** `0342` switches the panel off and
+  leaves its RAM alone, so a capture taken while it is off shows the frame from
+  before the blank: an old clock, not a frozen compositor. A capture that reads
+  0.0 means the panel rejected `0x28` and the black-paint fallback ran.
 - **`cpufreq=0` disables the idle accounting** (`md_governor` gates the idle
   hook), so the busy figure reads 100 %. Keep `cpufreq=2` when the CPU line
   matters.
@@ -271,7 +285,7 @@ to read, and `MONDRIAN FB: present`/`ev` are the two numbers that name it.
   `start_heartbeat()`), and the per-process CPU line replaces it as the cheap
   default.
 - **The boot arg `mondrianfb_blank` is a fallback timer** (seconds without a
-  present, 0 disables it), not the power key. The board cmdline sets 0.
+  present, 0 disables it), not the power key. The board cmdline sets 30.
 
 ## Next probes
 

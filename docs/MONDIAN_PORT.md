@@ -210,11 +210,11 @@ panel is written through the console alias, which is only stopped with
 
 Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
 (`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
-`0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
-timer (`mondrianfb_blank`) is 30 in the board cmdline: 30 s without a present
-or a touch paints the panel black and the first touch wakes it, because the
-fallback holds the black until input (the power key keeps its own 1.2 s hold for
-the lock animation). The hook's `setIdleTimerDisabled:` holds are off
+`0302`/`0303` blank the panel on the power key and on idle sleep, and `0342`
+switches it off with DCS `0x28` instead of painting the framebuffer black: iOS
+stops presenting when it sleeps, so a key or a touch un-blanks and the tick
+sends `0x29` -- a wake cannot wait for a frame. The fallback timer
+(`mondrianfb_blank`) is 30 in the board cmdline. The hook's holds are off
 (`mondriankeepawake=0`); iOS's timer never arms -- `SBLockScreenAutoLockTime` was
 missing and the hook writes it, and `SBLockScreenManager` has no
 `_idleTimerPolicyAggregator`. `0305` sets the brightness, `0304` the battery.
