@@ -64,10 +64,9 @@ Current blockers, in order:
 
 1. **The UI hook.** With `0x1` backboardd keeps 3-6 threads and no layer
    arrives; with `0x4` five layers reach the panel before it parks on the Apple
-   logo; with `0` they reach 19 and 14 and 235 layers of 1440x3200 are
-   submitted. The plan's hook-side work (control centre, brightness bridge, USB
-   network, zone) cannot ride along until the injection is bisected
-   (`mondrianbare=1` is the next split).
+   logo; with `0` they reach 19 and 14 and 235 layers are submitted. The plan's
+   hook-side work (control centre, brightness, USB network, zone) waits until
+   the injection is bisected, with `mondrianbare=1` as the next split.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
