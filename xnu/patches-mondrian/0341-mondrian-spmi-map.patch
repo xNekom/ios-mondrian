@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 --- a/bsd/dev/mondrian_spmi.c
 +++ b/bsd/dev/mondrian_spmi.c
-@@ -730,6 +730,36 @@
+@@ -768,6 +768,36 @@
  	return sp_rd(sp_cnfg, sp_owner_off + 4u * apid) & 7u;
  }
  

@@ -295,8 +295,10 @@ the vendor's three matching modules (AW86927, AW862xx, QCOM_HV_HAPTICS) are
 `0x3f2` — APID 465 and 466 are owner 0 (this AP), while `0x3f2` is APID 400,
 owner 3, the charger firmware. Addressing the block as `0xf0` finds nothing,
 which reads exactly like "the block is not there". `mondrian_spmi_reg_read()/
-reg_write(ppid, reg, val)` are the primitives, gated on the owner bits: a read
-of a peripheral another processor owns wedges the arbiter and costs the boot.
+reg_write(ppid, reg, val)` are the primitives, gated on the owner bits, because
+a write to a channel another EE owns is refused by the arbiter. Reads are not
+restricted the same way (`qcom-hv-haptics.c` reads HBST on every play), and
+`mondrian_spmi_reg_read_raw()` exists for that one page.
 
 The boost is HBST's business, not the enable bit's: the vendor votes it by
 writing HBST 0x46 bit 7 (`SW_CTRL_HBST`) or treats the block as externally
@@ -308,19 +310,39 @@ first one that does not answer, `hapr BLOCK REG` reads a single byte and `hapw
 BLOCK REG VAL` writes one. The first boot that read it (16:45) reported the
 state the bootloader left: `cfg-rev 0x00 ptn-rev 0x02 status 0x04 hpwr 0x00
 fault 0x00 vmax 0x1c amp 0xff play 0x01` — the block answers, no fault, PTN
-revision 2, the direct-play source selected and idle, VMAX at 1.4 V, and `hpwr`
-at 0, which the vendor's own masks read as `HPWR_DISABLED`: the PMIC's boost is
-not up.
+revision 2 (the vendor's own log agrees), the direct-play source selected and
+idle, VMAX at 1.4 V, and `hpwr` at 0, which the vendor's masks read as
+`HPWR_DISABLED`: the PMIC's boost is not up. The one number that disagrees with
+the vendor is `cfg-rev`: its two-byte read at 0x00 returns 0x0002 where our
+single byte returns 0, so that byte alone does not identify the revision.
 
-That is the open question. The vendor enables the boost two ways
-(`qcom-hv-haptics.c`): `SW_CTRL_HBST` writes HBST 0x46 bit 7, which this AP
-cannot do because the page belongs to the charger firmware, or it treats the
-block as externally powered through the `qcom,hap-swr-slave-reg` that LPASS
-provides. `haptics_force_vreg_ready()` (CFG 0x68 bit 0, plus bit 1 on HAP525_HV)
-exists for the case where the charger firmware owns the boost, and it is only
-set when that firmware reports the boost enabled. A buzz that reads `hpwr` and
-the live impedance (0x0e) during the play says which of the three the board is
-in.
+**Measured, and blocked: the AP can configure the block but not raise its
+boost.** The vendor kernel says which path this board uses (`tools/vendor-dump.sh`
+dmesg): `haptics revision: HAP_CFG 0x2, HAP_PTN 0x2, HAP_HBST 0x1`, and
+`HAP_HBST 0x1` is `HAP_BOOST_V0P1`, the case where `qcom-hv-haptics.c` takes
+`SW_CTRL_HBST` and votes HBST 0x46 bit 7. `hap-swr-slave-reg: disabling` says
+nothing enabled that regulator, so the block is not externally powered.
+
+On the live kernel `haps` reads `vset 0x00 en 0x80 hbst-vreg 0x00 hbst-follow
+0xe0`: the module is enabled, the boost's vote is off. `vib 100 64 2`, which
+writes that bit through `mondrian_spmi_reg_write_raw()`, **never answered**, and
+neither did any command after it: a write to a page another EE owns is accepted
+and never completes, and it takes the command channel with it. Reads of the same
+page are fine, which is why `haps` shows them.
+
+So CFG and PTN are the AP's (VMAX and amplitude read back as written, the DT's
+ranges included), and the HV boost is not: `hpwr` stays `HPWR_DISABLED` (0), the
+live impedance 0x0e reads 0 and the LRA does not move. The vendor gets away with
+that write because its driver also holds a `qcom,pbs-client` handle (the DT
+carries one, and the recovery kernel has `qpnp_pbs` loaded with `qcom_hv_haptics`
+as a user): the PBS is what puts the block in a state where the boost can be
+voted. This port has no PBS client.
+
+What would unblock it, in order of cost: a `qpnp_pbs` client in the port for the
+haptics cell, a boost vote made by whatever owns that page (the charger firmware,
+reachable only through `pmic_glink` on the ADSP, which this port does not start),
+or a boost the AP does own. Until one exists, a tone into the block cannot move
+the actuator and item 11 stays parked.
 
 `vib [ms [amp]]` plays a constant tone: the DT's 1.25 V VMAX, amplitude 0x40 of
 0xff and 100 ms by default, deliberately low for a first drive, and it logs the

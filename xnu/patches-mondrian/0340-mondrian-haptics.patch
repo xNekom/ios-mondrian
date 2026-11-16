@@ -12,7 +12,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 --- a/bsd/dev/mondrian_spmi.c
 +++ b/bsd/dev/mondrian_spmi.c
-@@ -217,6 +217,92 @@
+@@ -217,6 +217,130 @@
  }
  
  /*
@@ -65,6 +65,44 @@ diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 +		return 0;
 +	}
 +	return sp_read(apid, reg, out);
++}
++
++/*
++ * A write with no owner gate, for HBST only: the vendor driver votes that boost
++ * from the AP (SW_CTRL_HBST) even though the map records another owner for the
++ * page, so whether the arbiter allows it is a measurement, not an assumption.
++ * A refusal comes back as an error bit in the status word, not as a wedge.
++ */
++int
++mondrian_spmi_reg_write_raw(uint16_t ppid, uint8_t reg, uint8_t val)
++{
++	uint16_t apid = sp_find_apid(ppid);
++	volatile uint32_t *win;
++	uint32_t st = 0, i;
++
++	if (apid == 0xffffu) {
++		return 0;
++	}
++	win = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++	    MONDRIAN_SPMI_CHNLS_SIZE);
++	if (win == NULL) {
++		return 0;
++	}
++	win[0x10 / 4] = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	win[0] = (uint32_t)reg << 4;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++		st = win[0x08 / 4];
++		if (st & 1u) {
++			printf("MONDRIAN SPMI: raw write ppid 0x%x reg 0x%02x status"
++			    " 0x%02x\n", ppid, reg, st);
++			return (st & 0x0eu) ? 0 : 1;
++		}
++		delay(1);
++	}
++	return 0;
 +}
 +
 +int
@@ -218,7 +256,7 @@ diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mondrian_haptics.c
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,243 @@
 +/*
 + * The vibrator is not an I2C part: SM8475 drives an LRA from the PMIC's HV
 + * haptics block, three SPMI pages on pm8350b (SID 3):
@@ -250,6 +288,7 @@ new file mode 100644
 +extern int mondrian_spmi_reg_read(uint16_t ppid, uint8_t reg, uint8_t *out);
 +extern int mondrian_spmi_reg_read_raw(uint16_t ppid, uint8_t reg, uint8_t *out);
 +extern int mondrian_spmi_reg_write(uint16_t ppid, uint8_t reg, uint8_t val);
++extern int mondrian_spmi_reg_write_raw(uint16_t ppid, uint8_t reg, uint8_t val);
 +extern void delay(int us);
 +
 +/*
@@ -284,11 +323,18 @@ new file mode 100644
 +#define HAP_VMAX_MV		1250	/* the DT's qcom,vmax-mv */
 +#define HAP_VMAX_STEP_MV	50
 +
++/*
++ * HBST is read-only on this board. A write there (the vendor's SW_CTRL_HBST
++ * path, taken because the block reports HAP_BOOST_V0P1) never completes: the
++ * command is accepted and the channel never reports done, which takes the whole
++ * command channel with it. `hapw 2 ...` keeps the primitive for a deliberate
++ * experiment; nothing else calls it.
++ */
 +static int
 +hap_w(uint8_t block, uint8_t reg, uint8_t val)
 +{
 +	if (block > 1) {
-+		return 0;	/* HBST is the charger firmware's page */
++		return 0;
 +	}
 +	return mondrian_spmi_reg_write(
 +	    block == 0 ? MONDRIAN_HAP_CFG : MONDRIAN_HAP_PTN, reg, val);
@@ -373,7 +419,7 @@ new file mode 100644
 +	}
 +	ok &= hap_w(0, HAP_CFG_VMAX, vmax);
 +	ok &= hap_w(0, HAP_CFG_EN_CTL, HAP_EN_BIT);
-+	if (force != 0) {
++	if ((force & 0x1) != 0) {
 +		ok &= hap_w(0, HAP_CFG_VSET_CFG,
 +		    HAP_FORCE_VREG_RDY | HAP_FORCE_VSET_ACK);
 +	}
@@ -393,7 +439,7 @@ new file mode 100644
 +	}
 +	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT);
 +	ok &= hap_w(0, HAP_CFG_EN_CTL, 0);
-+	if (force != 0) {
++	if ((force & 0x1) != 0) {
 +		(void)hap_w(0, HAP_CFG_VSET_CFG, 0);
 +	}
 +	if (hap_r(0, HAP_CFG_STATUS_MSB, &st) &&

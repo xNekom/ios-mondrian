@@ -104,7 +104,11 @@ Pro, SM8475) is the port being done here.
   `raw.githubusercontent.com` rate-limits (429); `cdn.jsdelivr.net/gh/
   <owner>/<repo>@<sha>/<path>` serves the same file. An OrangeFox boot from RAM
   (`fastboot boot`, ten seconds, writes nothing) answers anything the kernel
-  can.
+  can: `tools/vendor-dump.sh` collects its clocks, regulators, thermal zones,
+  UFS gear, panel, SPMI state and dmesg into `/root/vendor-dump` in one boot,
+  and `tools/ofox-leave-and-cycle.sh` gets the phone back out of the recovery
+  (OrangeFox ignores `adb reboot bootloader`; `adb shell reboot bootloader`
+  works, and `adb devices` reports its state as `recovery`).
 - **Declare before you build.** A missing `extern`/prototype (`delay`, `hz`,
   `sp_apid_owner`) is the commonest failure and costs a ten-minute build.
 - **Patches come from a diff of the staged series.** Hand-counted hunks have
