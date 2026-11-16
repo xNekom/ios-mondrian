@@ -1,16 +1,17 @@
 diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 --- a/bsd/dev/mondrian_spmi.c
 +++ b/bsd/dev/mondrian_spmi.c
-@@ -411,7 +411,30 @@
+@@ -411,7 +411,31 @@
  	printf("MONDRIAN SPMI: vbat %d mV out of range, dropped\n", mv);
  	return -1;
  }
  
 +/*
-+ * The PMIC's own thermometer: VADC channel 6 on SID 0 (pmk8350) is the die
-+ * temperature, and mainline's qcom_vadc_scale_die_temp() divides the voltage
-+ * by two to get kelvin (0.6 V at 300 K, 2 mV/K). Returns millidegrees
-+ * Celsius, or -1.
++ * The PMIC's own thermometer: the device tree's pmk8350_die_temp channel is
++ * reg = <0 3>, and this tree packs the SID in the high byte and the channel in
++ * the low one (pm8350b_vbat_sns reads <3 0x8f>, which is what the battery
++ * uses). Mainline's qcom_vadc_scale_die_temp() divides the voltage by two to
++ * get kelvin (0.6 V at 300 K, 2 mV/K). Returns millidegrees Celsius, or -1.
 + *
 + * This is the first channel of the thermal work and the cheapest one to
 + * trust: it goes through the VADC path the battery already uses, it needs no
@@ -21,7 +22,7 @@ diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 +int
 +mondrian_spmi_temp_mc(void)
 +{
-+	int mv = mondrian_spmi_adc_mv(0, 0x06u, 1u);
++	int mv = mondrian_spmi_adc_mv(0, 0x03u, 1u);
 +
 +	if (mv < 1) {
 +		return -1;

@@ -62,7 +62,12 @@ button polling for the rest of the boot.
 
 `mondrian_spmi_adc_mv(sid, chan, div)` and the live `sa SID CHAN DIV` command
 over the USB channel share one path; `sav` is the same conversion with its
-internals on the ring (the seven writes, STATUS1, the data bytes). ADC7 has no
+internals on the ring (the seven writes, STATUS1, the data bytes). The channel
+number is the **low byte of the device tree's `reg`**: this tree packs the PMIC
+in the high byte, so `pm8350b_vbat_sns` reads `<3 0x8f>` (SID 3, channel 0x8f)
+and `pmk8350_die_temp` reads `<0 3>` (SID 0, channel **3**, not the 6 that
+mainline's ADC5 binding numbers it). A wrong channel does not read junk: the
+arbiter sets its fault bit and the driver prints `adc conversion fault`. ADC7 has no
 polling mode, so the reader sleeps `MONDRIAN_SPMI_ADC_US` (5 ms) after the
 writes and then requires STATUS1 `EOC` set with `REQ_STS` clear and no fault
 bit: polling earlier returns the previous conversion, which is where 816 mV,
