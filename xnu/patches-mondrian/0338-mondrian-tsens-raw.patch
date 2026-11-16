@@ -1,0 +1,137 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,4 +111,5 @@
+ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mondrian_usb.c			standard
++bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+diff --git a/bsd/dev/mondrian_tsens.c b/bsd/dev/mondrian_tsens.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/mondrian_tsens.c
+@@ -0,0 +1,92 @@
++/*
++ * The SoC's own thermal sensors (TSENS v2), read raw.
++ *
++ * This board has two controllers of sixteen sensors each. The TM block
++ * (0xc263000, 0xc265000) holds the per-sensor status and the SROT block
++ * (0xc222000, 0xc223000) the enable and the version. Mainline's tsens-v2
++ * places sensor n at TM_Sn_STATUS = 0xa0 + 4*n, the temperature in bits 11:0
++ * (twelve bits, sign in bit 11) and VALID at bit 21.
++ *
++ * The code is not yet a temperature: the slope and offset come from a
++ * calibration this device tree does not carry, so the vendor kernel's own
++ * numbers (OrangeFox's /sys/class/thermal) are the reference until that is
++ * decoded. The PMIC path needs no calibration and is what `temp` reads.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(MONDRIAN)
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void mondrian_log_flush_now(void);
++
++#define MONDRIAN_TSENS_TM0	0x0c263000u
++#define MONDRIAN_TSENS_SROT0	0x0c222000u
++#define MONDRIAN_TSENS_TM1	0x0c265000u
++#define MONDRIAN_TSENS_SROT1	0x0c223000u
++#define MONDRIAN_TSENS_SIZE	0x200u
++
++#define MONDRIAN_TSENS_SN	0x0a0u	/* TM_Sn_STATUS, +4 per sensor */
++#define MONDRIAN_TSENS_TRDY	0x0e4u
++#define MONDRIAN_TSENS_CTRL	0x004u	/* in the SROT block */
++#define MONDRIAN_TSENS_SENSORS	16
++
++static volatile uint32_t *mondrian_tsens_tm[2];
++static volatile uint32_t *mondrian_tsens_srot[2];
++static int mondrian_tsens_mapped;
++
++static void
++mondrian_tsens_map(void)
++{
++	if (mondrian_tsens_mapped != 0) {
++		return;
++	}
++	mondrian_tsens_mapped = 1;
++	mondrian_tsens_tm[0] = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_TSENS_TM0, MONDRIAN_TSENS_SIZE);
++	mondrian_tsens_srot[0] = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_TSENS_SROT0, MONDRIAN_TSENS_SIZE);
++	mondrian_tsens_tm[1] = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_TSENS_TM1, MONDRIAN_TSENS_SIZE);
++	mondrian_tsens_srot[1] = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_TSENS_SROT1, MONDRIAN_TSENS_SIZE);
++}
++
++/*
++ * One line per block and one per sensor, each flushed: if a read of an
++ * unclocked block takes the CPU with it, the last line names the register.
++ */
++void
++mondrian_tsens_show(void)
++{
++	int b, n;
++
++	mondrian_tsens_map();
++	for (b = 0; b < 2; b++) {
++		volatile uint32_t *tm = mondrian_tsens_tm[b];
++		volatile uint32_t *srot = mondrian_tsens_srot[b];
++
++		if (tm == NULL) {
++			continue;
++		}
++		printf("MONDRIAN TSENS: block %d ctrl 0x%x trdy 0x%x\n", b,
++		    srot != NULL ? srot[MONDRIAN_TSENS_CTRL / 4] : 0,
++		    tm[MONDRIAN_TSENS_TRDY / 4]);
++		mondrian_log_flush_now();
++		for (n = 0; n < MONDRIAN_TSENS_SENSORS; n++) {
++			uint32_t v = tm[(MONDRIAN_TSENS_SN +
++			    4 * (uint32_t)n) / 4];
++			int32_t code = (int32_t)(v & 0xfffu);
++
++			if ((code & 0x800) != 0) {
++				code -= 0x1000;
++			}
++			printf("MONDRIAN TSENS: %d.%d code %d valid %u"
++			    " raw 0x%08x\n", b, n, code, (v >> 21) & 1u, v);
++			mondrian_log_flush_now();
++		}
++	}
++}
++#endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1989,6 +1989,20 @@
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "tsens" logs the SoC's thermal sensors raw: mainline's tsens-v2 map, one
++ * flushed line per sensor so the last one names a register that hangs.
++ */
++static void
++ud_cmd_tsens(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern void mondrian_tsens_show(void);
++
++	(void)line;
++	mondrian_tsens_show();
++	ud_cmd_send(so, to, "tsens\n", 6);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2384,4 +2396,6 @@
+ 				ud_cmd_temp(so, peer, cmd);
++			} else if (strcmp(cmd, "tsens") == 0) {
++				ud_cmd_tsens(so, peer, cmd);
+ 			} else if (strcmp(cmd, "execdeny") == 0 ||
+ 			    strncmp(cmd, "execdeny ", 9) == 0) {
+ 				ud_cmd_execdeny(so, peer, cmd);
