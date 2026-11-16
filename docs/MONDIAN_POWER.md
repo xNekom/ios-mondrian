@@ -93,14 +93,47 @@ Every PMIC answers its own die temperature on channel 3 of its own SID
 `pmr735a` `<4 3>`). `tools/usb-ring.py temp` prints the pmk8350's, and
 `sa SID 3 1` reads any of them. Measured with the cable attached and the phone
 idle: SID 1, 3 and 4 answer 673, 664 and 655 mV, i.e. 63, 59 and 54 °C, while
-SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C -- double the others. All
-five `die_temp` channels declare the same `qcom,pre-scaling` (1 1), so this is
-not a missing divider: either that part really is the hot one or its sensor
-answers something else. The comparison that settles it is Android's
-`/sys/class/thermal/thermal_zone*` on the same device. Until then only the
-movement is trusted: the reading is quantised in 0.5 °C steps (1 mV) and
-wanders 1 °C over minutes. For a temperature to act on, use the charger PMIC
-(`sa 3 3 1`), which agrees with the other two.
+SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C — double the others. All five
+`die_temp` channels declare the same `qcom,pre-scaling` (1 1), so this is not a
+missing divider.
+
+**SID 0 is not a die temperature on this board.** The vendor kernel (an
+OrangeFox boot, its own thermal drivers) exposes `pm8350_tz`, `pm8350b_tz`,
+`pm8350c_tz`, `pmr735a_tz` and `pmr735b_tz` — and no `pmk8350_tz` at all. It
+simply never publishes what SID 0 answers, so the 124 °C is an artefact of
+reading a channel the vendor leaves alone, not a hot PMIC.
+
+Cold and charging, the vendor reads 36.5 (`pm8350`), 40.6 (`pm8350b`) and
+35.8 °C (`pmr735a`); our VADC reads 59-63 °C for the same three on a phone that
+has been in iOS for half an hour with the panel on. Part of that is real (iOS
+does not throttle anything yet) and part may be the 0.5 °C/LSB scale, so treat
+SID 1/3/4 as monotonic until a same-moment A/B exists. The reading is
+quantised in 0.5 °C steps (1 mV) and wanders 1 °C over minutes; the charger
+PMIC (`sa 3 3 1`) is the one to watch.
+
+### The SoC's own sensors (TSENS)
+
+Two `qcom,tsens-v2` blocks of sixteen sensors each: TM at `0xc263000` and
+`0xc265000`, SROT at `0xc222000` and `0xc223000`. Sensor *n* is at TM + `0xa0` +
+4*n*, the code in bits 11:0 (sign in bit 11) and VALID at bit 21; `TM_TRDY` is
+at `0xe4` and the SROT CTRL register at +`0x4`. The block is already enabled by
+the time we run: CTRL reads `0x9d67fff9`, whose low bits are exactly mainline's
+EN (bit 0) plus the sixteen per-sensor enables (bits 3-18), and TRDY bit 3 is
+set.
+
+`tools/usb-ring.py tsens` logs all 32 sensors, one flushed line each (`MONDRIAN
+TSENS: <block>.<n> code <c> valid <v> raw <hex>`), so a read of an unclocked
+block cannot be mistaken for a hang. Measured 2026-11-16 with the phone idle in
+iOS: every sensor `valid 1`, codes from 410 to 463, block 0 the warm one.
+
+Those codes are **not degrees**. `tsens.c` turns a code into °C with
+`(code * 1000 - offset) / slope`, and both numbers are per-sensor calibration
+from the SoC's efuse; the live device tree carries no calibration cells (no
+`qfprom`, no `nvmem-cells`), and mainline's fallback (`slope 3200`, offset 0)
+would put these codes at 128-145 °C, which is impossible here. The vendor gets
+that calibration from a source outside the AP's device tree, so the raw read is
+what the port can do without it: enough to see a sensor move, not enough to
+publish a temperature.
 
 ### The charger is behind the ADSP
 
