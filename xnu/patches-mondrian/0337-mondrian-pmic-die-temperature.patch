@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -411,7 +411,30 @@
+ 	printf("MONDRIAN SPMI: vbat %d mV out of range, dropped\n", mv);
+ 	return -1;
+ }
+ 
++/*
++ * The PMIC's own thermometer: VADC channel 6 on SID 0 (pmk8350) is the die
++ * temperature, and mainline's qcom_vadc_scale_die_temp() divides the voltage
++ * by two to get kelvin (0.6 V at 300 K, 2 mV/K). Returns millidegrees
++ * Celsius, or -1.
++ *
++ * This is the first channel of the thermal work and the cheapest one to
++ * trust: it goes through the VADC path the battery already uses, it needs no
++ * calibration table from the device tree, and it says whether the PMIC is
++ * the thing that gets hot under load. The SoC's TSENS block is a separate
++ * driver with its own calibration.
++ */
++int
++mondrian_spmi_temp_mc(void)
++{
++	int mv = mondrian_spmi_adc_mv(0, 0x06u, 1u);
++
++	if (mv < 1) {
++		return -1;
++	}
++	return mv * 500 - 273150;
++}
++
+ /*
+  * The charger's side of the USB divider. The pair span is wide because the
+  * same conversion is 5 V, 0 V or 20 V depending on which channel the pmic
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1969,6 +1969,28 @@
+ 	ud_cmd_send(so, to, "gpustat\n", 8);
+ }
+ 
++/*
++ * "temp" prints the PMIC die temperature in millidegrees, read on demand so a
++ * thermal measurement costs no rebuild and no second process.
++ */
++static void
++ud_cmd_temp(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_spmi_temp_mc(void);
++	int mc = mondrian_spmi_temp_mc();
++	char out[48];
++	int n;
++
++	(void)line;
++	if (mc < 0) {
++		n = snprintf(out, sizeof(out), "temp no answer\n");
++	} else {
++		n = snprintf(out, sizeof(out), "temp %d mC\n", mc);
++	}
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2361,6 +2382,8 @@
+ 				ud_cmd_gpukeep(so, peer, cmd);
+ 			} else if (strcmp(cmd, "gpustat") == 0) {
+ 				ud_cmd_gpustat(so, peer, cmd);
++			} else if (strcmp(cmd, "temp") == 0) {
++				ud_cmd_temp(so, peer, cmd);
+ 			} else if (strcmp(cmd, "execdeny") == 0 ||
+ 			    strncmp(cmd, "execdeny ", 9) == 0) {
+ 				ud_cmd_execdeny(so, peer, cmd);
