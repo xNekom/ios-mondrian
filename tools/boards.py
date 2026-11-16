@@ -337,12 +337,14 @@ MONDRIAN = Board(
              # is quiet, which is every still screen. 0 keeps the last frame lit
              # until the power key or the idle timer blinks it.
              'mondrianfb_blank=0 '
-             # 0 is the configuration that renders: with the hook in any
-             # daemon the glass stays black (0x1: 0 layers, SpringBoard 2
-             # threads; 0x4: 5 layers and the panel parks on the Apple logo).
-             # The hook's own parts have to be bisected with `mondrianbare=1`
-             # before it can carry the plan's UI work again.
-             'mondrian_ui_hook=4 mondriansample=logd,backboardd,SpringBoard'
+             # The hook only in SpringBoard (0x4) renders: lock screen, home
+             # screen, Control Center, apps. Any bit that puts it in launchd,
+             # backboardd or runningboardd leaves the glass black, measured
+             # 2026-11-16 (docs/MONDIAN_GPU.md).
+             # mondriankeepawake=0 removes the hook's setIdleTimerDisabled: for
+             # one boot, so the idle blanking path can be watched.
+             'mondrian_ui_hook=4 mondriankeepawake=0 '
+             'mondriansample=logd,backboardd,SpringBoard'
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does
@@ -360,12 +362,14 @@ MONDRIAN = Board(
              # and a synchronous HFS+ read. The kernel refuses their exec
              # (0316); `quiet` is the built-in list, any other value names
              # processes. Not a number: PE_parse_boot_argn would store one as
-             # a binary integer instead of a string. `none` matches nothing:
-             # 0328 gave a refused exec a reason, and in the QEMU bench the
-             # listed daemons (watchdogd, bluetoothd, calaccessd,
-             # fairplayd.H2, aggregated) now exit cleanly, so the list is
-             # kept only as a switch to put back if a phone boot disagrees.
-             'mondriankill=quiet '
+             # a binary integer instead of a string. `none` matches nothing.
+             # Measured 2026-11-16 with the UI up, over one-minute windows on
+             # the live channel (`execdeny`): off = 1 crash/min, the three
+             # voice daemons = 12, `quiet` = 55, and the exec count did not
+             # move (28-30/min either way). A refused exec is a SIGKILL the
+             # crash reporter counts, so the list is a net loss now that the
+             # UI runs; keep it as a switch and leave it off.
+             'mondriankill=none '
              # glblob=1: the kernel carries the UI hook and the CoreAnimation
              # dylibs and writes them into /private/var/vm at boot, so a hook
              # change costs one kernel build and one `fastboot boot` instead of

@@ -47,15 +47,11 @@ needs, and where the numbers come from. The boot history and the traps are in
 
 `0085` (the framebuffer presentation driver) is in this series. `MondrianFramebuffer`
 presents userland IOSurface swaps and kicks the command-mode interface, so the
-lock screen and the home screen render on-device.
-
-UI probe `0106` injects a diagnostic dylib into the UI daemons selected by
-`mondrian_ui_hook` (`0112`). It wraps `CAWindowServer._detectDisplays`; dyld
-needs the `AMFI` answer to `__mac_syscall` 0x5a (`0108`) or drops
-`DYLD_INSERT_LIBRARIES`. **A stale copy in `/private/var/vm` is what kept the
-glass black; check which copy the ring says a process loaded
-(`docs/MONDIAN_GPU.md`).** Build with `tools/build-mondrian-ui-hook.sh`, install
-with `tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`; it logs exceptions.
+lock screen and the home screen render on-device. UI probe `0106` injects a
+diagnostic dylib into the UI daemons selected by `mondrian_ui_hook` (`0112`);
+dyld needs the `AMFI` answer to `__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. **A stale copy in
+`/private/var/vm` is what kept the glass black; check which copy the ring says a
+process loaded (`docs/MONDIAN_GPU.md`).** Build with the script named there.
 `/product` needs `research/ipsw-x/d22ap.adt`; `disp0` `canvas-width`/
 `canvas-height` must be 4-byte data (`u32` ADT, `OSData` driver), because
 `getEDTProperty` reads them with `getBytes:range:` and an OSNumber or
@@ -212,13 +208,16 @@ panel is written through the console alias, which is only stopped with
 `disableConsoleOutput` (`0115`, an `IOMemoryDescriptor` there panics
 `pmap_remove_pv`); and the dylib forces activation past MobileActivation.
 
-Open: the UI is rendered at the panel's own 1440x3200 (480x1066 pt at scale 3);
-the `mondrianfb_canvas_w/h` scaler (`0268`) is off because a smaller canvas made
-text soft and the UI oversized; smoothness is in `docs/UI_PERFORMANCE.md`.
+Open: the UI renders at the panel's 1440x3200 (480x1066 pt at scale 3) and the
+`mondrianfb_canvas_w/h` scaler (`0268`) is off; `docs/UI_PERFORMANCE.md` has
+the smoothness numbers.
 `0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
-timer (`mondrianfb_blank`) is 0 in the board cmdline, because at its default of
-1 the panel went dark a second after the compositor went quiet. `0305` sets the
-brightness and `0304` the battery level, both off the frame path.
+timer (`mondrianfb_blank`) is 0 in the board cmdline: at its default of 1 the
+panel went dark a second after the compositor went quiet. The hook holds
+`setIdleTimerDisabled:` down every two seconds, so the idle timer never fires;
+`mondriankeepawake=0` drops that for one boot and `MONDRIAN FB: sel` (`0261`,
+13 selectors, reset every second) names what the blanking path calls. `0305`
+sets the brightness and `0304` the battery level, both off the frame path.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
@@ -273,8 +272,9 @@ ones:
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
 | `mondrianfb_noconsole=1` `mondrianfb_hz=60` | stop drawing kernel text over the GUI (panics are still drawn); the vsync rate the display presents at, on a panel whose own rate is 120 Hz |
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
-| `mondrianunlock=1` | the hook unlocks the lock screen, re-requests it every minute, and holds the `UIApplication` idle timer |
-| `mondriankill=quiet` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable with `execdeny`. A denied exec must still create a `signature_failure_reason` (`0328`): without one the assert in `kern_exec.c` fires, the SIGKILL carries no reason, and the half-initialised image dies with `SIGSEGV` inside the shared cache — which cost the bench 400 of its 500 execs |
+| `mondrianunlock=1` | the hook unlocks the lock screen and re-requests it every minute |
+| `mondriankeepawake=0` | the hook stops holding `UIApplication`'s idle timer down (it does that every two seconds on purpose: the first time iOS blanked the display by itself the frames never came back). One boot with it off is how the idle path gets watched |
+| `mondriankill=none` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable at run time with `execdeny` -- not `kill`, which takes a pid. `quiet` is the built-in list. A denied exec must still create a `signature_failure_reason` (`0328`): without one the assert in `kern_exec.c` fires and the half-initialised image dies inside the shared cache -- which cost the bench 400 of its 500 execs. Measured with the UI up, one-minute windows: off 1 crash/min, the three voice daemons 12, `quiet` 55, exec count flat at 28-30/min. A refusal is a SIGKILL the crash reporter counts, so the list is a loss once the UI runs; it stays as a switch |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 | length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
 

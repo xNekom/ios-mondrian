@@ -4520,6 +4520,7 @@ static unsigned mondrian_unlock_attempts;
  * five seconds with `mondriangeom=1`.
  */
 static int mondrian_win_logs;
+static int mondrian_keepawake_off_logs;
 
 static void
 mondrian_dump_windows(const char *why)
@@ -4791,12 +4792,20 @@ mondrian_lock_step(void *context)
 	 * ts 138 s, fifty seconds after the unlock, and no touch brings them
 	 * back). The public property is the documented switch for it; setting
 	 * it every two seconds survives a userland that clears it.
+	 *
+	 * `mondriankeepawake=0` turns the switch off so a boot can watch the
+	 * blanking path itself and name the selector that hangs SpringBoard
+	 * (`MONDRIAN FB: sel`, 0261) instead of guessing from a dead panel.
 	 */
-	idle_method = class_getInstanceMethod(app_cls,
-	    sel_registerName("setIdleTimerDisabled:"));
-	if (idle_method != NULL) {
-		((void (*)(id, SEL, BOOL))method_getImplementation(idle_method))(
-		    app, sel_registerName("setIdleTimerDisabled:"), YES);
+	if (!boot_arg_set("mondriankeepawake=0")) {
+		idle_method = class_getInstanceMethod(app_cls,
+		    sel_registerName("setIdleTimerDisabled:"));
+		if (idle_method != NULL) {
+			((void (*)(id, SEL, BOOL))method_getImplementation(idle_method))(
+			    app, sel_registerName("setIdleTimerDisabled:"), YES);
+		}
+	} else if (mondrian_keepawake_off_logs++ == 0) {
+		say("MONDRIAN UI: idle timer left armed (mondriankeepawake=0)\n");
 	}
 	method = class_getClassMethod(cls, shared_sel);
 	if (method == NULL) {

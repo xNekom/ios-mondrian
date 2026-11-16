@@ -47,25 +47,26 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   nothing on i2c5 even when powered; `mondrianusbfallback=N` returns to fastboot.
 - **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) reads 268 671 s
   (1975) and belongs to another processor (owner 4), so a write is refused:
-  `mondriantime=<seconds>` seeds the date and `rtc set SECONDS` moves the running
-  clock (`0315`). Nothing sets the zone, so iOS uses `America/Los_Angeles`; the
-  hook points `/var/db/timezone/localtime` at `Europe/Madrid` and resets
-  `NSTimeZone`.
+  `mondriantime=<seconds>` seeds the date, `rtc set SECONDS` moves the clock
+  (`0315`), and the hook repoints `/var/db/timezone/localtime` from
+  `America/Los_Angeles` to `Europe/Madrid` and resets `NSTimeZone`.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
   (480x1066 pt at scale 3) and the tick holds two records (`0282`);
   `docs/UI_PERFORMANCE.md` has the frame meter. The UI comes up with
-  `mondrian_ui_hook=0` and, with the fixed hook, `0x4`: lock screen, home
-  screen, Control Center, `exec Preferences` on a tap.
+  `mondrian_ui_hook=0x4`: lock screen, home screen, Control Center, `exec
+  Preferences` on a tap.
 
 Current blockers, in order:
 
-1. **The UI hook bits.** `0x4` (SpringBoard) renders and carries the brightness,
-   display-link and clock-zone work; the black boots of 2026-11-16 were a stale
-   `/private/var/vm` copy that interposed `dispatch_sync` and parked dyld
-   (`docs/MONDIAN_GPU.md`). backboardd and the other bits are still unmeasured.
+1. **The panel never sleeps.** `mondrian_ui_hook=0x4` renders (lock screen, home
+   screen, Control Center, apps) and the hook holds `setIdleTimerDisabled:` down
+   every two seconds, so iOS's idle timer never fires. The kernel's blank works
+   (the power key paints black, `panel blank (power key)`) and a *touch* brings
+   the UI back; a second power press does not, because iOS believes the display
+   is on and presents no frame. `mondriankeepawake=0` drops the hold for a boot.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V

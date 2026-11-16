@@ -1,6 +1,6 @@
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7380,6 +7380,48 @@
+@@ -7380,6 +7380,55 @@
  	string_size = strlcpy(path, exec_path, string_size);
  	return string_size;
  }
@@ -36,6 +36,13 @@
 +{
 +	char *e;
 +
++	/*
++	 * strlcpy does not clear the tail, and this buffer is read as a
++	 * NUL-separated list: replacing "quiet" with a shorter name left the
++	 * old entries after the new one, so the channel could never shrink the
++	 * list. Zero it first.
++	 */
++	memset(mondrian_exec_kill_list, 0, sizeof(mondrian_exec_kill_list));
 +	strlcpy(mondrian_exec_kill_list, list != NULL ? list : "",
 +	    sizeof(mondrian_exec_kill_list));
 +	for (e = mondrian_exec_kill_list; *e != '\0'; e++) {
