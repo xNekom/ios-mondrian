@@ -89,7 +89,9 @@ Pro, SM8475) is the port being done here.
 - **Prove the kernel before trusting any answer.** A RAM boot that dies falls
   back to `boot_b`, so "command not found" means "old kernel" as often as
   "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the
-  kernel on disk first.
+  kernel on disk first. The same applies to checking a build: a `grep -c
+  "MONDRIAN HAP" kernel` written inline in PowerShell comes back 0 because the
+  quotes never reach grep — put the check in a script file.
 - **Every WSL script attaches the phone itself.** WSL shuts down between tool
   calls, so `usbipd attach --wsl` and the `192.168.7.1` address must be redone
   inside each script or the first send fails with `Errno 99`.
