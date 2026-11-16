@@ -6046,16 +6046,36 @@ mondrian_cc_centre(id scroll)
 	CGRect b;
 	CGSize content;
 	mondrian_insets inset;
-	CGFloat pad;
+	CGFloat pad, grid = 0.0;
+	id kids;
+	unsigned n, i;
+	static int told;
 
 	b = ((CGRect (*)(id, SEL))objc_msgSend)(scroll, sel_registerName("bounds"));
 	content = ((CGSize (*)(id, SEL))objc_msgSend)(scroll,
 	    sel_registerName("contentSize"));
-	if (b.size.width < 1.0 || content.width < 1.0 ||
-	    content.width + 1.0 >= b.size.width) {
+	/*
+	 * The 430 pt grid is a child of the full-width scroll view, so
+	 * contentSize says 480 and the old test was a no-op. Take the widest
+	 * direct child narrower than the scroll view instead.
+	 */
+	kids = mondrian_send(scroll, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(
+		    [(NSArray *)kids objectAtIndex:i], sel_registerName("frame"));
+
+		if (f.size.width > grid && f.size.width < b.size.width - 0.5) {
+			grid = f.size.width;
+		}
+	}
+	if (grid < 1.0) {
+		grid = content.width;
+	}
+	if (b.size.width < 1.0 || grid < 1.0 || grid + 1.0 >= b.size.width) {
 		return;
 	}
-	pad = (b.size.width - content.width) / 2.0;
+	pad = (b.size.width - grid) / 2.0;
 	inset = ((mondrian_insets (*)(id, SEL))objc_msgSend)(scroll,
 	    sel_registerName("contentInset"));
 	if (inset.left == pad && inset.right == pad) {
@@ -6065,6 +6085,42 @@ mondrian_cc_centre(id scroll)
 	inset.right = pad;
 	((void (*)(id, SEL, mondrian_insets))objc_msgSend)(scroll,
 	    sel_registerName("setContentInset:"), inset);
+	if (!told) {
+		char line[192];
+
+		told = 1;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN UI: cc centre grid %.0f content %.0f bounds %.0f inset %.0f\n",
+		    grid, content.width, b.size.width, pad);
+		say(line);
+	}
+}
+
+/*
+ * The scroll view is not a direct child of the Control Center window (measured
+ * at depth 3), so the window's child loop never reached it and the grid stayed
+ * at 430 pt against the left edge. Walk to it; the loop's scroll settings stay
+ * where they are, this only centres the content.
+ */
+static void
+mondrian_cc_find_scroll(id view, unsigned depth)
+{
+	const char *name = object_getClassName(view);
+	id kids;
+	unsigned n, i;
+
+	if (view == nil || depth > 12) {
+		return;
+	}
+	if (name != NULL && strstr(name, "CCUIScrollView") != NULL) {
+		mondrian_cc_centre(view);
+		return;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_cc_find_scroll([(NSArray *)kids objectAtIndex:i], depth + 1);
+	}
 }
 
 /*
@@ -6226,10 +6282,84 @@ mondrian_cc_wake_sliders(id view, unsigned depth)
 }
 
 /*
+ * The volume and "Not Playing" modules promise things this port cannot do: the
+ * volume card talks to a media stack that does not exist and the media card has
+ * nothing to play. Their content views are the only stable handles: measured
+ * `MRUVolumeView` for the volume capsule and the label text "Not Playing" for
+ * the media card (its class is below the old dump cap). Both are dimmed on
+ * their nearest `CCUIContentModuleContainerView`, which is what the sheet
+ * actually draws; the alpha is re-checked every pass, so a view iOS resets is
+ * dimmed again, and the sheet builds new views on every open.
+ */
+static void
+mondrian_cc_dim_media(id view, unsigned depth)
+{
+	const char *name = object_getClassName(view);
+	id kids, c;
+	unsigned n, i;
+	BOOL want = NO, found = NO;
+	const char *why = NULL;
+
+	if (view == nil || depth > 24) {
+		return;
+	}
+	if (name != NULL && strstr(name, "MRUVolumeView") != NULL) {
+		want = YES;
+		why = "volume";
+	}
+	if ([view respondsToSelector:sel_registerName("text")]) {
+		id t = mondrian_send(view, "text");
+		const char *u = t != nil &&
+		    [t respondsToSelector:sel_registerName("UTF8String")] ?
+		    [t UTF8String] : NULL;
+
+		if (u != NULL && strcmp(u, "Not Playing") == 0) {
+			want = YES;
+			why = "not-playing";
+		}
+	}
+	for (i = 0, c = view; want && c != nil && i < 16; i++) {
+		const char *cn = object_getClassName(c);
+
+		if (cn != NULL &&
+		    strstr(cn, "CCUIContentModuleContainerView") != NULL) {
+			found = YES;
+			break;
+		}
+		c = mondrian_send(c, "superview");
+	}
+	if (want && found && c != nil) {
+		BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(c,
+		    sel_registerName("isHidden"));
+		double alpha = ((double (*)(id, SEL))objc_msgSend)(c,
+		    sel_registerName("alpha"));
+
+		if (!hidden && alpha > 0.36) {
+			char line[160];
+
+			((void (*)(id, SEL, double))objc_msgSend)(c,
+			    sel_registerName("setAlpha:"), 0.35);
+			((void (*)(id, SEL, BOOL))objc_msgSend)(c,
+			    sel_registerName("setUserInteractionEnabled:"), NO);
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: cc dim %s %s a %.2f\n", why,
+			    object_getClassName(c), alpha);
+			say(line);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_cc_dim_media([(NSArray *)kids objectAtIndex:i], depth + 1);
+	}
+}
+
+/*
  * One dump of the whole sheet, once per boot, on the frame that first sees it:
  * the banding question is whether the sheet's material covers the screen or
- * stops short, and that is a frame, not a colour. Depth 12 with 70 lines was
- * enough to reach the grid on this layout (a cap of 9 hid the sliders).
+ * stops short, and that is a frame, not a colour. Depth 24 with 400 lines names
+ * the media card's classes, which the old depth-12 / 70-line cap cut off; the
+ * cap still bounds the walk.
  */
 static unsigned mondrian_cc_dump_lines;
 
@@ -6240,7 +6370,7 @@ mondrian_cc_dump(id view, unsigned depth)
 	id kids;
 	unsigned n, i;
 
-	if (view == nil || depth > 12 || mondrian_cc_dump_lines > 70) {
+	if (view == nil || depth > 24 || mondrian_cc_dump_lines > 400) {
 		return;
 	}
 	{
@@ -6313,6 +6443,8 @@ mondrian_cc_main_pass(void)
 		if (!hidden) {
 			unsigned woken = mondrian_cc_wake_sliders(win, 0);
 
+			mondrian_cc_find_scroll(win, 0);
+			mondrian_cc_dim_media(win, 0);
 			if (mondrian_cc_dump_lines == 0) {
 				CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(win,
 				    sel_registerName("bounds"));
