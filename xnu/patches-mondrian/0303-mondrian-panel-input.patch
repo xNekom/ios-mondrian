@@ -79,7 +79,7 @@ mondrianfb_blank=0 still disables the timer.
  
  		if (PE_parse_boot_argn("mondrianfb_blank", &blank, sizeof(blank))) {
  			fBlankAfter = blank > 0 ? (uint32_t)blank : 0;
-@@ -904,19 +926,47 @@
+@@ -904,19 +926,56 @@
  	 * last frame forever, which on an AMOLED looks like an always-on
  	 * display. Black pixels are off pixels; the next swap wakes the panel.
  	 */
@@ -129,6 +129,15 @@ mondrianfb_blank=0 still disables the timer.
 +				fb->fBlankRequest = false;
 +				IOLog("MONDRIAN FB: panel blank (power key)\n");
 +			} else {
++				/*
++				 * An idle blank has to outlast the UI's own bursts: a
++				 * static lock screen still presents the minute tick and
++				 * the odd animation, and three of those in 1.5 s would
++				 * count as a wake. Hold until an input clears it.
++				 */
++				nanoseconds_to_absolutetime(3600ULL * 1000000000ULL, &hold);
++				fb->fHoldBlank = true;
++				fb->fHoldBlankUntil = now + hold;
 +				IOLog("MONDRIAN FB: panel blank after %u s without a frame\n",
 +				    fb->fBlankAfter);
 +			}
@@ -196,7 +205,7 @@ mondrianfb_blank=0 still disables the timer.
  	}
  	/*
  	 * The gap between frames on the panel is the one the hand feels: the
-@@ -2067,4 +2146,63 @@
+@@ -2067,4 +2146,65 @@
  	return (fb != NULL && fb->fPixels != 0) ? fb->fWidth / 2 : 0;
  }
  
@@ -241,11 +250,13 @@ mondrianfb_blank=0 still disables the timer.
 +	}
 +	now = mach_absolute_time();
 +	if (fb->fBlanked) {
-+		/* The hold only exists to hide the lock animation. */
-+		if (fb->fHoldBlank && now >= fb->fHoldBlankUntil) {
-+			fb->fHoldBlank = false;
-+		}
-+		if (!fb->fHoldBlank) {
++		/*
++		 * The power key's hold only hides the lock animation; the idle
++		 * blank's hold ends here, because a finger is exactly what it is
++		 * waiting for.
++		 */
++		fb->fHoldBlank = false;
++		{
 +			uint64_t arm;
 +
 +			nanoseconds_to_absolutetime(MONDRIAN_FB_INPUT_WAKE_NS, &arm);

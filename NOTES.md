@@ -60,13 +60,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **The panel never sleeps.** `mondrian_ui_hook=0x4` renders (lock screen, home
-   screen, Control Center, apps) and the hook forces `setIdleTimerDisabled:` in
-   both places it appears -- the `SBUserAgent` setter and a two-second tick --
-   so iOS's idle timer never fires. The kernel's blank works (the power key
-   paints black, `panel blank (power key)`) and a *touch* brings the UI back; a
-   second power press does not, because iOS believes the display is on and
-   presents no frame. `mondriankeepawake=0` drops both holds for a boot.
+1. **The panel sleeps, but iOS's idle timer is dead.** The driver's fallback paints
+   black after `mondrianfb_blank` seconds without a present or a touch (30 in the
+   board table) and the first touch wakes it; the hook's two holds are off
+   (`mondriankeepawake=0`). iOS's own timer never arms: `SBLockScreenAutoLockTime`
+   was missing (the hook writes it) and `SBLockScreenManager` exposes no
+   `_idleTimerPolicyAggregator`.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V

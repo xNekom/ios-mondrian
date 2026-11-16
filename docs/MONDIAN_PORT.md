@@ -212,13 +212,13 @@ Open: the UI renders at the panel's 1440x3200 (480x1066 pt at scale 3) and the
 `mondrianfb_canvas_w/h` scaler (`0268`) is off; `docs/UI_PERFORMANCE.md` has
 the smoothness numbers.
 `0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
-timer (`mondrianfb_blank`) is 0 in the board cmdline: at its default of 1 the
-panel went dark a second after the compositor went quiet. The hook holds
-`setIdleTimerDisabled:` down every two seconds; `mondriankeepawake=0` drops both
-holds, and a boot with it never asks for the timer and holds 21 fps for ten
-minutes. `SBLockScreenAutoLockTime` is missing from SpringBoard's preferences,
-so the hook prints the pref at boot and `mondrianautolock=N` writes it through
-cfprefsd. `0305` sets the brightness, `0304` the battery level.
+timer (`mondrianfb_blank`) is 30 in the board cmdline: 30 s without a present
+or a touch paints the panel black and the first touch wakes it, because the
+fallback holds the black until input (the power key keeps its own 1.2 s hold for
+the lock animation). The hook's `setIdleTimerDisabled:` holds are off
+(`mondriankeepawake=0`); iOS's timer never arms -- `SBLockScreenAutoLockTime` was
+missing and the hook writes it, and `SBLockScreenManager` has no
+`_idleTimerPolicyAggregator`. `0305` sets the brightness, `0304` the battery.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.

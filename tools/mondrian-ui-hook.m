@@ -4803,6 +4803,95 @@ mondrian_report_autolock(void)
 	}
 }
 
+/*
+ * What is the idle machinery doing? SpringBoard's lock screen owns an
+ * `SBIdleTimerPolicyAggregator` fed by providers (`idleTimerProvider:
+ * didProposeBehavior:forReason:`); its description lists the providers and the
+ * behaviour in effect, which is what says whether the timer was ever armed.
+ */
+static void
+mondrian_report_idle(void)
+{
+	Class cls = objc_getClass("SBLockScreenManager");
+	SEL shared_sel = sel_registerName("sharedInstance");
+	SEL agg_sel = sel_registerName("_idleTimerPolicyAggregator");
+	char line[400];
+	Method method;
+	id manager;
+	id agg;
+
+	if (cls == Nil) {
+		say("MONDRIAN IDLE: no SBLockScreenManager\n");
+		return;
+	}
+	method = class_getClassMethod(cls, shared_sel);
+	if (method == NULL) {
+		return;
+	}
+	manager = ((id (*)(id, SEL))method_getImplementation(method))((id)cls,
+	    shared_sel);
+	if (manager == nil) {
+		say("MONDRIAN IDLE: no shared lock screen manager\n");
+		return;
+	}
+	if (![manager respondsToSelector:agg_sel]) {
+		say("MONDRIAN IDLE: no _idleTimerPolicyAggregator\n");
+		return;
+	}
+	agg = ((id (*)(id, SEL))objc_msgSend)(manager, agg_sel);
+	snprintf(line, sizeof(line), "MONDRIAN IDLE: aggregator %s\n",
+	    agg != NULL ? object_getClassName(agg) : "(nil)");
+	say(line);
+	if (agg == nil) {
+		return;
+	}
+	if ([agg respondsToSelector:sel_registerName("description")]) {
+		id desc = ((id (*)(id, SEL))objc_msgSend)(agg,
+		    sel_registerName("description"));
+		const char *text = desc != nil ? [desc UTF8String] : NULL;
+
+		if (text != NULL) {
+			snprintf(line, sizeof(line), "MONDRIAN IDLE: %.360s\n", text);
+			say(line);
+		}
+	}
+	if ([agg respondsToSelector:sel_registerName("isDisabled")]) {
+		BOOL disabled = ((BOOL (*)(id, SEL))objc_msgSend)(agg,
+		    sel_registerName("isDisabled"));
+
+		snprintf(line, sizeof(line), "MONDRIAN IDLE: disabled %d\n",
+		    (int)disabled);
+		say(line);
+	}
+}
+
+/*
+ * Does the blanking call return? `0261` recorded SpringBoard's main thread
+ * stopping inside `BKSDisplayServicesSetScreenBlanked`, so the call runs on a
+ * thread of its own: if it never returns, the ring shows the enter line
+ * without the exit one and the UI keeps its run loop. `mondrianblank=N`.
+ */
+static void *
+mondrian_blank_test(void *unused)
+{
+	void (*set_blanked)(int) = (void (*)(int))dlsym(RTLD_DEFAULT,
+	    "BKSDisplayServicesSetScreenBlanked");
+
+	(void)unused;
+	if (set_blanked == NULL) {
+		say("MONDRIAN BLANK: BKSDisplayServicesSetScreenBlanked missing\n");
+		return NULL;
+	}
+	say("MONDRIAN BLANK: setScreenBlanked 1 enter\n");
+	set_blanked(1);
+	say("MONDRIAN BLANK: setScreenBlanked 1 exit\n");
+	sleep(5);
+	say("MONDRIAN BLANK: setScreenBlanked 0 enter\n");
+	set_blanked(0);
+	say("MONDRIAN BLANK: setScreenBlanked 0 exit\n");
+	return NULL;
+}
+
 static void
 mondrian_lock_step(void *context)
 {
@@ -4826,6 +4915,15 @@ mondrian_lock_step(void *context)
 	}
 	if (mondrian_pref_logs++ == 0) {
 		mondrian_report_autolock();
+		mondrian_report_idle();
+		if (boot_arg_int("mondrianblank=", 0) > 0) {
+			pthread_t thread;
+
+			if (pthread_create(&thread, NULL, mondrian_blank_test,
+			    NULL) == 0) {
+				say("MONDRIAN BLANK: test thread running\n");
+			}
+		}
 	}
 	if (!mondrian_agent_hooks) {
 		mondrian_agent_hooks = mondrian_install_agent_hooks();

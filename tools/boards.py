@@ -332,11 +332,11 @@ MONDRIAN = Board(
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
-             # The driver's fallback blank: seconds without a present, and the
-             # default of 1 turns the panel off the first second the compositor
-             # is quiet, which is every still screen. 0 keeps the last frame lit
-             # until the power key or the idle timer blinks it.
-             'mondrianfb_blank=0 '
+             # The driver's fallback blank: seconds without a present and
+             # without a touch, then it paints black and a touch wakes it. The
+             # default of 1 turned the panel off the first second the compositor
+             # quieted; 30 is the idle timeout this boot is testing.
+             'mondrianfb_blank=30 '
              # The hook only in SpringBoard (0x4) renders: lock screen, home
              # screen, Control Center, apps. Any bit that puts it in launchd,
              # backboardd or runningboardd leaves the glass black, measured
