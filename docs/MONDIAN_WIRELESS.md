@@ -49,16 +49,25 @@ tools/dtb-dump.py dtb/mondrian-live.dtb 'bt_qca6490'
   (2.8 V); `vdd-rfa1` → `pm8350c S1` (1.9–2.04 V); `vdd-rfa2` → `pm8350 S12`
   (1.35–2.024 V); `vreg_ipa` → `pmr735a S3` (2.2 V).
 
-Nothing powers any of it yet: the kernel has no QUP UART driver and no
-`hci_qca`, so the next step is the GENI SE/UART in the driver set, with these
-addresses, and the firmware load after that.
+The QUP side now exists in the kernel (`0343`, below); nothing powers the chip
+yet — no rail and none of the three GPIOs — so the firmware load is still the
+step after that.
 
-### The engine answers (measured)
+### The engine, the UART and the wire (measured)
 
 `0343` maps wrapper 2, SE5 and GCC, votes the five bits of 0x62010 and reads the
-identity registers; `tools/usb-ring.py btuart` runs it from the host. Measured
-on the kernel of 2026-11-16, with the control channel still answering afterwards
-(`pos` and `thermal` both came back, so the reads do not wedge the bus):
+identity registers; `tools/usb-ring.py` runs it from the host. Three stages,
+each one proof for the next:
+
+```
+btuart         identity registers with the clocks voted
+btuart loop    programs 8N1 and sends a byte into its own loopback
+btuart hci     sends HCI_Reset (01 03 0c 00) and prints the answer
+```
+
+Measured on the kernel of 2026-11-16, with the control channel still answering
+afterwards (`pos` and `thermal` both came back, so the reads do not wedge the
+bus):
 
 ```
 btuart: vote 0x0 -> 0x20f want 0x20f granted
@@ -76,10 +85,48 @@ or bootloader step powers this engine), the write sticks (`0x20f` = core 2x,
 core, m-ahb, s-ahb, SE5), the SE clock root was **already on** so the XO
 fallback did not run, bit 0 of the SE5 halt register is clear (the engine is not
 halted), and the engine reports a GENI init-config revision of **0xa**, `CGC_CTRL`
-0x7f, `CLK_CTRL_RO` 1 and a firmware revision of **0x204**. That is the
-"the register window is alive" milestone: the next step is programming the SE
-for the UART protocol and reading the chip's HCI version before loading
-`hci_qca`'s firmware.
+0x7f, `CLK_CTRL_RO` 1 and a firmware revision of **0x204** (protocol UART, already
+loaded).
+
+The UART stage, measured on the kernel of 2026-11-17 with `pos` answering
+afterwards (`269963`):
+
+```
+btuart: fifo tx 16 words x 32 bits, rx 32 words
+btuart: uart 8n1 div 10 (xo 19.2MHz -> 120000 baud) loopback 1 status 0x41000
+btuart: m_cmd0 0x8000000 status 0x41000 -> 0x41041
+btuart: tx fifo filled 0x10000000
+btuart: tx 1 bytes done 1 irq 0x40000001 tx_fifo left 0x0
+btuart: rx fifo status 0x90000001, 1 bytes
+btuart: rx data: 5a
+```
+
+`btuart hci` prints the same lines with `4 bytes` and `rx data: (nothing)`: the
+`HCI_Reset` leaves the wire and the engine completes, but nothing answers,
+because nothing powers the chip yet.
+
+Four traps in that sequence, each one a boot when it was wrong, all settled by
+mainline `qcom_geni_serial.c` / `qcom-geni-se.c`:
+
+- `SE_UART_TX_TRANS_CFG` (0x25c) bit 1 (`UART_CTS_MASK`) must be **set** with no
+  hardware flow control. Cleared, the TX command latches (`M_GENI_CMD_ACTIVE`
+  comes on, `status …41`) and never completes: `done 0`, `M_IRQ_STATUS` 0.
+- The TX command starts **before** the FIFO is filled: `SE_UART_TX_TRANS_LEN`,
+  `M_CMD0` = `UART_START_TX << 27`, then the FIFO. Filling first leaves
+  `TX_FIFO_STATUS` at 0 — the writes do not land.
+- `SE_GENI_BYTE_GRAN` (0x254) is 0 for 8-bit words (`bpw / 16`). What the
+  bootloader leaves there swallows byte writes.
+- Depths come from `SE_HW_PARAM_0/1` bits 21:16 (16 TX words of 32 bits, 32 RX),
+  not a guessed 62; `SE_GENI_RX_STALE_CNT` (0x294) is 160 (`10 * 16`); packing is
+  8 bits, four words per entry, lsb first (`TX_PACKING_CFG0` 0x4380e, `CFG1`
+  0xc3e0e), and the TX FIFO holds four bytes per 32-bit entry.
+
+The loopback proves the engine and the framing, **not** the baud: div 10 off the
+XO is 120000, 4 % high. The ROM needs 115200 exactly, and the QUP source table
+already has it: `F(14745600, P_GCC_GPLL0_OUT_EVEN, 1, 768, 15625)` in
+`gcc-sm8450.c`, and `14745600 / (8 * 16) = 115200`. `gcc_qupv3_wrap2_s5_clk_src`
+has `mnd_width = 16`, so the SE root takes the fractional M/N, and the SER
+divider is 8.
 
 - The WiFi part is a WCN6855-class device (the QCA6490 is its board-level
   name). Linux firmware: `ath11k/WCN6855/hw2.0/amss.bin`, `m3.bin`,

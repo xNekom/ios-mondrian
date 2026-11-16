@@ -1,7 +1,17 @@
 xnu 0343: probe the Bluetooth engine (QUPv3 wrap2 SE5) with its clocks voted
 
-Item 17's first driver, read only: no byte is transferred and no firmware is
-loaded, because the question before either is whether the engine answers at all.
+Item 17's driver: the engine's identity with its clocks voted, then the UART
+programmed for 8N1 with a loopback byte and HCI_Reset on the wire. No QCA
+firmware is loaded, and the loopback is what separates "the engine cannot frame
+a byte" from "the chip does not answer": measured, the byte comes back as 5a
+and the HCI_Reset completes with an empty RX FIFO, because the chip's rails and
+reset GPIO are not in the kernel yet.
+
+Four things in that sequence are not obvious and each cost a boot: the CTS mask
+in SE_UART_TX_TRANS_CFG must be set with no flow control, the TX command starts
+before the FIFO is filled, SE_GENI_BYTE_GRAN must be 0 for 8-bit words, and the
+depths come from SE_HW_PARAM_0/1. They are recorded in
+docs/MONDIAN_WIRELESS.md.
 
 The addresses are the live tree's (docs/MONDIAN_WIRELESS.md): the engine is
 qcom,msm-geni-serial-hs at 0x894000, which is SE5 of the wrapper at 0x8C0000
@@ -16,8 +26,10 @@ own root at CMD_RCGR 0x2e618 / CFG_RCGR 0x2e61c. The root is set to the XO only
 when the bootloader left it off, the way 0120 does it for the touch engine.
 
 `btuart` on the control channel runs it and answers with the vote, the halt
-state and the engine's identity registers; every read is flushed first so a
-stalled bus leaves the last line on the ring.
+state and the engine's identity registers; `btuart loop` programs the engine
+for 8N1 and waits for a byte on its own RX, and `btuart hci` sends HCI_Reset
+(01 03 0c 00) and prints what answers. Every line is flushed before the next
+read, so a stalled bus leaves the culprit register on the ring.
 
 diff --git a/bsd/conf/files b/bsd/conf/files
 index 94f8668..9cebc34 100755
@@ -33,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..ef4e428
+index 0000000..2b1fb28
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,505 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -51,13 +63,22 @@ index 0000000..ef4e428
 + * with core bit 0 and core 2x bit 3 beside them. The SE's own root is the RCG
 + * at CMD_RCGR 0x2e618 / CFG_RCGR 0x2e61c.
 + *
-+ * Nothing here transfers a byte. The question it answers is whether the SE
-+ * answers at all once its clocks are voted, which is what has to be true before
-+ * hci_qca and a firmware load are worth writing. Every read is flushed first, so
-+ * a stalled bus leaves the last line on the ring.
++ * Three stages, each one proof for the next:
++ *   btuart        the engine answers with its clocks voted (identity registers)
++ *   btuart loop   the UART is programmed and a byte comes back on its own RX
++ *   btuart hci    HCI_Reset goes out on the wire and whatever answers is printed
++ *
++ * The register set and the order are mainline's (qcom_geni_serial.c and
++ * geni-se.h): FIFO mode (SE_GENI_DMA_MODE_EN = 0), SER clock divider in
++ * GENI_SER_M/S_CLK_CFG, 8N1 in the SE_UART_* registers, RX started once with
++ * UART_START_READ and each TX framed by SE_UART_TX_TRANS_LEN + UART_START_TX.
++ *
++ * Nothing here reaches the QCA firmware: the ROM's UART is the thing being
++ * spoken to, and a firmware load only makes sense after this answers.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
++#include <libkern/libkern.h>
 +#include <pexpert/arm64/board_config.h>
 +
 +#if defined(MONDRIAN)
@@ -94,6 +115,69 @@ index 0000000..ef4e428
 +#define MONDRIAN_BT_SE_CLK_CTRL_RO	0x60
 +#define MONDRIAN_BT_SE_FW_REV		0x1000
 +
++/* geni-se.h */
++#define MONDRIAN_BT_SE_GENI_STATUS	0x40
++#define MONDRIAN_BT_SER_M_CLK_CFG	0x48
++#define MONDRIAN_BT_SER_S_CLK_CFG	0x4c
++#define MONDRIAN_BT_SE_GENI_CLK_SEL	0x7c
++#define MONDRIAN_BT_GENI_OUTPUT_CTRL	0x24
++#define MONDRIAN_BT_GENI_FORCE_DEFAULT	0x20
++#define MONDRIAN_BT_SE_IRQ_EN		0xe1c
++#define MONDRIAN_BT_SE_DMA_GENERAL_CFG	0xe30
++#define MONDRIAN_BT_SE_HW_PARAM_0	0xe24
++#define MONDRIAN_BT_SE_HW_PARAM_1	0xe28
++#define MONDRIAN_BT_SE_UART_RX_STALE	0x294
++#define MONDRIAN_BT_SE_BYTE_GRAN	0x254
++#define MONDRIAN_BT_TX_WATERMARK_REG	0x80c
++#define MONDRIAN_BT_RX_WATERMARK	0x810
++#define MONDRIAN_BT_RX_RFR_WATERMARK	0x814
++#define MONDRIAN_BT_TX_PACKING_CFG0	0x260
++#define MONDRIAN_BT_TX_PACKING_CFG1	0x264
++#define MONDRIAN_BT_RX_PACKING_CFG0	0x284
++#define MONDRIAN_BT_RX_PACKING_CFG1	0x288
++#define MONDRIAN_BT_DMA_MODE_EN		0x258
++#define MONDRIAN_BT_M_CMD0		0x600
++#define MONDRIAN_BT_M_CMD_CTRL		0x604
++#define MONDRIAN_BT_M_IRQ_STATUS	0x610
++#define MONDRIAN_BT_M_IRQ_EN		0x614
++#define MONDRIAN_BT_M_IRQ_CLEAR		0x618
++#define MONDRIAN_BT_S_CMD0		0x630
++#define MONDRIAN_BT_S_CMD_CTRL		0x634
++#define MONDRIAN_BT_S_IRQ_STATUS	0x640
++#define MONDRIAN_BT_S_IRQ_EN		0x644
++#define MONDRIAN_BT_S_IRQ_CLEAR		0x648
++#define MONDRIAN_BT_TX_FIFO		0x700
++#define MONDRIAN_BT_RX_FIFO		0x780
++#define MONDRIAN_BT_TX_FIFO_STATUS	0x800
++#define MONDRIAN_BT_RX_FIFO_STATUS	0x804
++#define MONDRIAN_BT_SER_CLK_EN		(1u << 0)
++#define MONDRIAN_BT_CLK_DIV_SHFT	4
++#define MONDRIAN_BT_M_OPCODE_SHFT	27
++#define MONDRIAN_BT_S_OPCODE_SHFT	27
++#define MONDRIAN_BT_M_CMD_DONE_EN	(1u << 0)
++#define MONDRIAN_BT_M_TX_WATERMARK_EN	(1u << 30)
++#define MONDRIAN_BT_M_CMD_ABORT_EN	(1u << 1)
++#define MONDRIAN_BT_M_GENI_CMD_ABORT	(1u << 1)
++#define MONDRIAN_BT_UART_START_TX	0x1
++#define MONDRIAN_BT_UART_START_READ	0x1
++#define MONDRIAN_BT_RX_FIFO_WC_MSK	0x01ffffffu
++#define MONDRIAN_BT_RX_LAST		(1u << 31)
++#define MONDRIAN_BT_RX_LAST_BYTE_MSK	(0x7u << 28)
++#define MONDRIAN_BT_RX_LAST_BYTE_SHFT	28
++
++/* qcom_geni_serial.c */
++#define MONDRIAN_BT_SE_UART_LOOPBACK	0x22c
++#define MONDRIAN_BT_SE_UART_TX_CFG	0x25c
++#define MONDRIAN_BT_SE_UART_TX_WORD	0x268
++#define MONDRIAN_BT_SE_UART_TX_STOP	0x26c
++#define MONDRIAN_BT_SE_UART_TX_LEN	0x270
++#define MONDRIAN_BT_SE_UART_RX_CFG	0x280
++#define MONDRIAN_BT_SE_UART_RX_WORD	0x28c
++#define MONDRIAN_BT_SE_UART_TX_PAR	0x2a4
++#define MONDRIAN_BT_SE_UART_RX_PAR	0x2a8
++#define MONDRIAN_BT_LOOPBACK_RX_TX_SORTED (1u << 0)
++#define MONDRIAN_BT_UART_CTS_MASK	(1u << 1)
++
 +extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
 +extern void delay(int us);
 +extern void mondrian_log_flush_now(void);
@@ -126,45 +210,26 @@ index 0000000..ef4e428
 +	return n + snprintf(out + n, len - (size_t)n, "%s", line);
 +}
 +
-+/*
-+ * Returns the number of bytes written to `out`, like the haptics dump: the
-+ * caller sends exactly that and the ring carries it to the host.
-+ */
-+int
-+mondrian_btuart_probe(char *out, size_t len)
++/* The same map the probe uses; 0 on any failure. */
++static int
++mondrian_bt_map(vm_offset_t *gcc, vm_offset_t *wrap, vm_offset_t *se)
 +{
-+	vm_offset_t gcc, wrap, se;
-+	uint32_t vote, after, halt5, haltm, halts, cmd, cfg, hw, init, cgc, clk, fw;
-+	char line[192];
-+	int rooted = 0;
-+	int n = 0;
++	*gcc = ml_io_map(MONDRIAN_BT_GCC_BASE, 0x70000);
++	*wrap = ml_io_map(MONDRIAN_BT_WRAP2_BASE, 0x2000);
++	*se = ml_io_map(MONDRIAN_BT_SE5_BASE, 0x4000);
++	return *gcc != 0 && *wrap != 0 && *se != 0;
++}
 +
-+	gcc = ml_io_map(MONDRIAN_BT_GCC_BASE, 0x70000);
-+	wrap = ml_io_map(MONDRIAN_BT_WRAP2_BASE, 0x2000);
-+	se = ml_io_map(MONDRIAN_BT_SE5_BASE, 0x4000);
-+	if (gcc == 0 || wrap == 0 || se == 0) {
-+		snprintf(line, sizeof(line),
-+		    "btuart: cannot map gcc 0x%lx wrap 0x%lx se 0x%lx\n",
-+		    (unsigned long)gcc, (unsigned long)wrap, (unsigned long)se);
-+		return mondrian_bt_step(out, len, 0, line);
-+	}
++/* Vote the five bits, root the SE clock on the XO only if it was off. */
++static void
++mondrian_bt_power(vm_offset_t gcc)
++{
++	uint32_t vote, cmd, cfg;
 +
 +	vote = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
 +	mondrian_bt_wr(gcc, MONDRIAN_BT_VOTE_REG, vote | MONDRIAN_BT_WANT);
 +	delay(1000);
-+	after = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
-+	snprintf(line, sizeof(line), "btuart: vote 0x%x -> 0x%x want 0x%x %s\n",
-+	    vote, after, MONDRIAN_BT_WANT,
-+	    (after & MONDRIAN_BT_WANT) == MONDRIAN_BT_WANT ? "granted" :
-+	    "NOT granted");
-+	n = mondrian_bt_step(out, len, n, line);
 +
-+	/*
-+	 * The engine's register interface lives in its own clock domain, so the
-+	 * root has to be on before the identity reads: if the bootloader left
-+	 * it off, root it on the XO (source 0, divider 1) as 0120 does for the
-+	 * touch engine.
-+	 */
 +	cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
 +	if ((cmd & MONDRIAN_BT_RCG_ROOT_OFF) != 0) {
 +		cfg = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR);
@@ -182,78 +247,353 @@ index 0000000..ef4e428
 +		mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CMD_RCGR,
 +		    cmd | MONDRIAN_BT_RCG_ROOT_EN);
 +		delay(1000);
-+		rooted = 1;
++	} else if ((cmd & MONDRIAN_BT_RCG_ROOT_EN) == 0) {
++		/*
++		 * Rooted but not enabled: ROOT_OFF (bit 31) clear only means the
++		 * root was picked, and this one read back 0x0 with ROOT_EN clear,
++		 * which is a clock that does not run. The RX sequencer still
++		 * accepted a command, so this is not the whole story, but a
++		 * gated root has no business being left off.
++		 */
++		mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CMD_RCGR,
++		    cmd | MONDRIAN_BT_RCG_ROOT_EN);
++		delay(1000);
 +	}
-+	cfg = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR);
-+	cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
-+	snprintf(line, sizeof(line), "btuart: rcgr cmd 0x%x cfg 0x%x%s\n", cmd, cfg,
-+	    rooted ? " rooted on xo" : " (was already rooted)");
-+	n = mondrian_bt_step(out, len, n, line);
++}
 +
-+	halt5 = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_SE5);
-+	haltm = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_M_AHB);
-+	halts = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_S_AHB);
++/*
++ * Program the engine for 8N1 in FIFO mode. The SE's root is the XO (19.2 MHz,
++ * divider 1), so the SER divider is what sets the baud: with the 16x
++ * oversampling the 2.5+ engines use, divider 10 gives 120000, not 115200 --
++ * the clock cannot hit 115200 exactly with an integer divider from 19.2 MHz,
++ * and the loopback stage is what says whether the programming itself is right
++ * before any of that can be blamed on the far end.
++ */
++static int
++mondrian_bt_uart_init(vm_offset_t se, uint32_t div, int loopback, char *out,
++    size_t len, int n)
++{
++	char line[160];
++
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_EN, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_S_IRQ_EN, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_CLEAR, 0xffffffffu);
++	mondrian_bt_wr(se, MONDRIAN_BT_S_IRQ_CLEAR, 0xffffffffu);
++
++	/*
++	 * geni_se_io_init: clock gating on, the IO macro in its default output
++	 * state, and FORCE_DEFAULT last. That last write is what put the first
++	 * attempt's UART_START_TX command in limbo: M_CMD0 was written, the
++	 * engine stayed idle and M_IRQ_STATUS never moved.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_CGC_CTRL,
++	    mondrian_bt_rd(se, MONDRIAN_BT_SE_CGC_CTRL) | 0x7fu);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_DMA_GENERAL_CFG,
++	    mondrian_bt_rd(se, MONDRIAN_BT_SE_DMA_GENERAL_CFG) | 0xfu);
++	mondrian_bt_wr(se, MONDRIAN_BT_GENI_OUTPUT_CTRL, 0x7fu);
++	mondrian_bt_wr(se, MONDRIAN_BT_GENI_FORCE_DEFAULT, 1);
++
++	/* geni_se_io_set_mode (FIFO): IRQ lines on, DMA mode off. */
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_IRQ_EN,
++	    mondrian_bt_rd(se, MONDRIAN_BT_SE_IRQ_EN) | 0xfu);
++	mondrian_bt_wr(se, MONDRIAN_BT_DMA_MODE_EN, 0);
++
++	/*
++	 * geni_se_config_packing(8 bits, 4 per FIFO entry, lsb first) and the
++	 * watermarks geni_se_init sets (rx 2, rfr 62 of the 64-entry FIFO).
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_TX_PACKING_CFG0, 0x4380eu);
++	mondrian_bt_wr(se, MONDRIAN_BT_TX_PACKING_CFG1, 0xc3e0eu);
++	mondrian_bt_wr(se, MONDRIAN_BT_RX_PACKING_CFG0, 0x4380eu);
++	mondrian_bt_wr(se, MONDRIAN_BT_RX_PACKING_CFG1, 0xc3e0eu);
++	/*
++	 * setup_fifos(): the depth is the engine's, not a guess -- HW_PARAM_1
++	 * bits 21:16 peeking through a mask that widens on 3.10+ hardware, and
++	 * a watermark past the depth would hold the RFR line for ever.
++	 */
++	{
++		uint32_t hw0 = mondrian_bt_rd(se, MONDRIAN_BT_SE_HW_PARAM_0);
++		uint32_t hw1 = mondrian_bt_rd(se, MONDRIAN_BT_SE_HW_PARAM_1);
++		uint32_t tx_depth = (hw0 >> 16) & 0x3fu;
++		uint32_t rx_depth = (hw1 >> 16) & 0x3fu;
++		uint32_t tx_width = (hw0 >> 24) & 0x3fu;
++
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_BYTE_GRAN, 0);
++		mondrian_bt_wr(se, MONDRIAN_BT_RX_WATERMARK, 2);
++		mondrian_bt_wr(se, MONDRIAN_BT_RX_RFR_WATERMARK,
++		    rx_depth > 2 ? rx_depth - 2 : rx_depth);
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_RX_STALE, 160);
++		snprintf(line, sizeof(line),
++		    "btuart: fifo tx %u words x %u bits, rx %u words\n", tx_depth,
++		    tx_width, rx_depth);
++		n = mondrian_bt_step(out, len, n, line);
++	}
++
++	/*
++	 * The primary sequencer is the one that would not move. Abort whatever
++	 * it is holding (M_CMD_ABORT on M_CMD_CTRL, done = M_CMD_ABORT in
++	 * M_IRQ_STATUS) and latch-clear both sides, so the next TX starts from
++	 * a known state rather than from the bootloader's.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_M_CMD_CTRL, MONDRIAN_BT_M_GENI_CMD_ABORT);
++	for (int i = 0; i < 500; i++) {
++		if ((mondrian_bt_rd(se, MONDRIAN_BT_M_IRQ_STATUS) &
++		    MONDRIAN_BT_M_CMD_ABORT_EN) != 0) {
++			break;
++		}
++		delay(100);
++	}
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_CLEAR, 0xffffffffu);
++	mondrian_bt_wr(se, MONDRIAN_BT_S_IRQ_CLEAR, 0xffffffffu);
++
++	mondrian_bt_wr(se, MONDRIAN_BT_SER_M_CLK_CFG,
++	    MONDRIAN_BT_SER_CLK_EN | (div << MONDRIAN_BT_CLK_DIV_SHFT));
++	mondrian_bt_wr(se, MONDRIAN_BT_SER_S_CLK_CFG,
++	    MONDRIAN_BT_SER_CLK_EN | (div << MONDRIAN_BT_CLK_DIV_SHFT));
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_GENI_CLK_SEL, 0);
++
++	/*
++	 * UART_CTS_MASK: without hardware flow control the engine must ignore
++	 * the CTS pin. With this zero the TX command latched, went ACTIVE and
++	 * never completed, which is the whole of the first two attempts.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, MONDRIAN_BT_UART_CTS_MASK);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_PAR, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_RX_CFG, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_RX_PAR, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_WORD, 8);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_RX_WORD, 8);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_STOP, 0);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK,
++	    loopback ? MONDRIAN_BT_LOOPBACK_RX_TX_SORTED : 0);
++
++	/* One RX command per session: it keeps receiving into the FIFO. */
++	mondrian_bt_wr(se, MONDRIAN_BT_S_CMD0,
++	    MONDRIAN_BT_UART_START_READ << MONDRIAN_BT_S_OPCODE_SHFT);
++	delay(2000);
++
 +	snprintf(line, sizeof(line),
-+	    "btuart: halt se5 0x%x m-ahb 0x%x s-ahb 0x%x%s\n", halt5, haltm, halts,
-+	    (halt5 & MONDRIAN_BT_HALTED) ? " se5 STILL HALTED" : "");
-+	n = mondrian_bt_step(out, len, n, line);
++	    "btuart: uart 8n1 div %u (xo 19.2MHz -> %u baud) loopback %d "
++	    "status 0x%x\n", div, 19200000u / (div * 16), loopback ? 1 : 0,
++	    mondrian_bt_rd(se, MONDRIAN_BT_SE_GENI_STATUS));
++	return mondrian_bt_step(out, len, n, line);
++}
 +
-+	hw = mondrian_bt_rd(wrap, MONDRIAN_BT_QUPV3_HW_VER);
-+	snprintf(line, sizeof(line), "btuart: wrapper2 hw ver 0x%x\n", hw);
-+	n = mondrian_bt_step(out, len, n, line);
++/* Send len bytes and wait for the TX command to complete. */
++static int
++mondrian_bt_send(vm_offset_t se, const uint8_t *buf, uint32_t len, char *out,
++    size_t len_out, int n)
++{
++	uint32_t status = 0;
++	char line[128];
++	int done = 0;
 +
-+	/* One line per read: if the bus stalls, the next line names the register. */
-+	init = mondrian_bt_rd(se, MONDRIAN_BT_SE_INIT_CFG_REV);
-+	snprintf(line, sizeof(line), "btuart: se init 0x%x\n", init);
-+	n = mondrian_bt_step(out, len, n, line);
-+	cgc = mondrian_bt_rd(se, MONDRIAN_BT_SE_CGC_CTRL);
-+	snprintf(line, sizeof(line), "btuart: se cgc 0x%x\n", cgc);
-+	n = mondrian_bt_step(out, len, n, line);
-+	clk = mondrian_bt_rd(se, MONDRIAN_BT_SE_CLK_CTRL_RO);
-+	snprintf(line, sizeof(line), "btuart: se clk 0x%x\n", clk);
-+	n = mondrian_bt_step(out, len, n, line);
-+	fw = mondrian_bt_rd(se, MONDRIAN_BT_SE_FW_REV);
-+	snprintf(line, sizeof(line), "btuart: se fw 0x%x\n", fw);
-+	n = mondrian_bt_step(out, len, n, line);
++	/*
++	 * mainline's order: qcom_geni_serial_setup_tx starts the command and
++	 * send_chunk_fifo fills the FIFO afterwards, four bytes per 32-bit
++	 * entry with the first byte in the low bits (the packing is programmed
++	 * msb_to_lsb = false). The first attempt filled the FIFO first.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_EN,
++	    MONDRIAN_BT_M_CMD_DONE_EN | MONDRIAN_BT_M_TX_WATERMARK_EN);
++	mondrian_bt_wr(se, MONDRIAN_BT_TX_WATERMARK_REG, 2);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_LEN, len);
++	{
++		uint32_t before = mondrian_bt_rd(se, MONDRIAN_BT_SE_GENI_STATUS);
 +
++		mondrian_bt_wr(se, MONDRIAN_BT_M_CMD0,
++		    MONDRIAN_BT_UART_START_TX << MONDRIAN_BT_M_OPCODE_SHFT);
++		delay(1000);
++		snprintf(line, sizeof(line),
++		    "btuart: m_cmd0 0x%x status 0x%x -> 0x%x\n",
++		    mondrian_bt_rd(se, MONDRIAN_BT_M_CMD0), before,
++		    mondrian_bt_rd(se, MONDRIAN_BT_SE_GENI_STATUS));
++		n = mondrian_bt_step(out, len_out, n, line);
++	}
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t word = 0;
++
++		for (uint32_t j = 0; j < 4 && i + j < len; j++) {
++			word |= (uint32_t)buf[i + j] << (8 * j);
++		}
++		mondrian_bt_wr(se, MONDRIAN_BT_TX_FIFO, word);
++	}
++	snprintf(line, sizeof(line), "btuart: tx fifo filled 0x%x\n",
++	    mondrian_bt_rd(se, MONDRIAN_BT_TX_FIFO_STATUS));
++	n = mondrian_bt_step(out, len_out, n, line);
++	for (int i = 0; i < 2000; i++) {
++		status = mondrian_bt_rd(se, MONDRIAN_BT_M_IRQ_STATUS);
++		if ((status & MONDRIAN_BT_M_CMD_DONE_EN) != 0) {
++			done = 1;
++			break;
++		}
++		delay(100);
++	}
++	if (!done) {
++		mondrian_bt_wr(se, MONDRIAN_BT_M_CMD_CTRL,
++		    MONDRIAN_BT_M_GENI_CMD_ABORT);
++	}
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_CLEAR, 0xffffffffu);
++	snprintf(line, sizeof(line),
++	    "btuart: tx %u bytes done %d irq 0x%x tx_fifo left 0x%x\n", len,
++	    done, status, mondrian_bt_rd(se, MONDRIAN_BT_TX_FIFO_STATUS));
++	return mondrian_bt_step(out, len_out, n, line);
++}
++
++/* How many bytes the engine has received, and take them out of the FIFO. */
++static int
++mondrian_bt_recv(vm_offset_t se, uint8_t *buf, uint32_t cap, uint32_t wait_ms,
++    char *out, size_t len_out, int n)
++{
++	uint32_t status = 0, count = 0;
++	char line[192];
++	int got = 0;
++
++	for (uint32_t t = 0; t < wait_ms; t++) {
++		status = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
++		count = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
++		if (count != 0) {
++			break;
++		}
++		delay(1000);
++	}
++	if (count > cap) {
++		count = cap;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		buf[i] = (uint8_t)mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO);
++		got++;
++	}
++	snprintf(line, sizeof(line), "btuart: rx fifo status 0x%x, %d bytes\n",
++	    status, got);
++	n = mondrian_bt_step(out, len_out, n, line);
++	{
++		int m = snprintf(line, sizeof(line), "btuart: rx data:");
++
++		for (int i = 0; i < got && m < (int)sizeof(line) - 4; i++) {
++			m += snprintf(line + m, sizeof(line) - (size_t)m, " %02x",
++			    buf[i]);
++		}
++		if (got == 0) {
++			m += snprintf(line + m, sizeof(line) - (size_t)m,
++			    " (nothing)");
++		}
++		line[m++] = '\n';
++		line[m] = '\0';
++		n = mondrian_bt_step(out, len_out, n, line);
++	}
++	return n;
++}
++
++int
++mondrian_btuart_run(const char *mode, char *out, size_t len)
++{
++	vm_offset_t gcc, wrap, se;
++	uint8_t buf[32];
++	char line[192];
++	int n = 0;
++
++	if (!mondrian_bt_map(&gcc, &wrap, &se)) {
++		return snprintf(out, len, "btuart: cannot map the engine\n");
++	}
++	mondrian_bt_power(gcc);
++
++	if (mode != NULL && strcmp(mode, "loop") == 0) {
++		uint8_t one = 0x5a;
++
++		n = mondrian_bt_uart_init(se, 10, 1, out, len, n);
++		n = mondrian_bt_send(se, &one, 1, out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 20, out, len, n);
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);
++		return n;
++	}
++	if (mode != NULL && strcmp(mode, "hci") == 0) {
++		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++
++		n = mondrian_bt_uart_init(se, 10, 0, out, len, n);
++		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 150, out, len, n);
++		return n;
++	}
++
++	/* No mode: the identity probe, unchanged. */
++	{
++		uint32_t vote, halt5, init, cgc, clk, fw, hw;
++
++		vote = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
++		snprintf(line, sizeof(line), "btuart: vote 0x%x (want 0x%x) %s\n",
++		    vote, MONDRIAN_BT_WANT,
++		    (vote & MONDRIAN_BT_WANT) == MONDRIAN_BT_WANT ? "granted" :
++		    "NOT granted");
++		n = mondrian_bt_step(out, len, n, line);
++
++		halt5 = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_SE5);
++		snprintf(line, sizeof(line),
++		    "btuart: halt se5 0x%x%s\n", halt5,
++		    (halt5 & MONDRIAN_BT_HALTED) ? " se5 STILL HALTED" : "");
++		n = mondrian_bt_step(out, len, n, line);
++
++		hw = mondrian_bt_rd(wrap, MONDRIAN_BT_QUPV3_HW_VER);
++		snprintf(line, sizeof(line), "btuart: wrapper2 hw ver 0x%x\n", hw);
++		n = mondrian_bt_step(out, len, n, line);
++
++		init = mondrian_bt_rd(se, MONDRIAN_BT_SE_INIT_CFG_REV);
++		snprintf(line, sizeof(line), "btuart: se init 0x%x\n", init);
++		n = mondrian_bt_step(out, len, n, line);
++		cgc = mondrian_bt_rd(se, MONDRIAN_BT_SE_CGC_CTRL);
++		snprintf(line, sizeof(line), "btuart: se cgc 0x%x\n", cgc);
++		n = mondrian_bt_step(out, len, n, line);
++		clk = mondrian_bt_rd(se, MONDRIAN_BT_SE_CLK_CTRL_RO);
++		snprintf(line, sizeof(line), "btuart: se clk 0x%x\n", clk);
++		n = mondrian_bt_step(out, len, n, line);
++		fw = mondrian_bt_rd(se, MONDRIAN_BT_SE_FW_REV);
++		snprintf(line, sizeof(line), "btuart: se fw 0x%x\n", fw);
++		n = mondrian_bt_step(out, len, n, line);
++	}
 +	return n;
 +}
 +
 +#endif /* MONDRIAN */
 diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
-index 2c59647..51528e4 100644
+index 2c59647..f7ba1d4 100644
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
-@@ -2138,6 +2138,24 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+@@ -2138,6 +2138,29 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
  	printf("%s", out);
  }
  
 +/*
-+ * "btuart" maps the Bluetooth engine (QUPv3 wrapper 2, SE5 at 0x894000) with
-+ * its clocks voted and prints what it answers. It transfers nothing: the first
-+ * question is whether the register window is alive, and a driver that loads
-+ * firmware into a dead engine only hides that.
++ * "btuart [loop|hci]" runs the Bluetooth engine: no argument reads the identity
++ * registers with the clocks voted, "loop" programs the UART and waits for the
++ * byte on its own RX, "hci" sends HCI_Reset 01 03 0c 00 and prints whatever
++ * comes back. The stages exist because they fail differently: an engine that
++ * does not answer, an engine that answers but cannot frame a byte, and a byte
++ * that reaches the wrong far end.
 + */
 +static void
 +ud_cmd_btuart(socket_t so, struct sockaddr_in *to, const char *line)
 +{
-+	extern int mondrian_btuart_probe(char *out, size_t len);
-+	char out[384];
++	extern int mondrian_btuart_run(const char *mode, char *out, size_t len);
++	char out[512];
++	const char *p = line + 6;
 +	int n;
 +
-+	(void)line;
-+	n = mondrian_btuart_probe(out, sizeof(out));
++	while (*p == ' ') {
++		p++;
++	}
++	n = mondrian_btuart_run(*p != '\0' ? p : NULL, out, sizeof(out));
 +	ud_cmd_send(so, to, out, (size_t)n);
 +}
 +
  static void
  ud_cmd_hapreg(socket_t so, struct sockaddr_in *to, const char *line)
  {
-@@ -2591,6 +2609,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2591,6 +2614,9 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
  			    strcmp(cmd, "vib") == 0 ||
  			    strncmp(cmd, "vib ", 4) == 0) {
  				ud_cmd_hap(so, peer, cmd);
-+			} else if (strcmp(cmd, "btuart") == 0) {
++			} else if (strcmp(cmd, "btuart") == 0 ||
++			    strncmp(cmd, "btuart ", 7) == 0) {
 +				ud_cmd_btuart(so, peer, cmd);
  			} else if (strncmp(cmd, "hapr ", 5) == 0 ||
  			    strncmp(cmd, "hapw ", 5) == 0) {
