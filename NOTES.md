@@ -57,16 +57,15 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
   (480x1066 pt at scale 3) and the tick holds two records (`0282`);
   `docs/UI_PERFORMANCE.md` has the frame meter. The UI comes up with
-  `mondrian_ui_hook=0` (lock screen, home screen, `exec Preferences` on a tap):
-  injecting the hook is what keeps the glass black (`docs/MONDIAN_GPU.md`).
+  `mondrian_ui_hook=0` and, with the fixed hook, `0x4`: lock screen, home
+  screen, Control Center, `exec Preferences` on a tap.
 
 Current blockers, in order:
 
-1. **The UI hook.** With `0x1` backboardd keeps 3-6 threads and no layer
-   arrives; with `0x4` five layers reach the panel before it parks on the Apple
-   logo; with `0` they reach 19 and 14 and 235 layers are submitted. The plan's
-   hook-side work (control centre, brightness, USB network, zone) waits until
-   the injection is bisected, with `mondrianbare=1` as the next split.
+1. **The UI hook bits.** `0x4` (SpringBoard) renders and carries the brightness,
+   display-link and clock-zone work; the black boots of 2026-11-16 were a stale
+   `/private/var/vm` copy that interposed `dispatch_sync` and parked dyld
+   (`docs/MONDIAN_GPU.md`). backboardd and the other bits are still unmeasured.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V

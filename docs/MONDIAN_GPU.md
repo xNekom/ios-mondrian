@@ -1316,13 +1316,16 @@ With `0` the compositor submits `MONDRIAN FB: layer 0 surface 2 1440x3200
 dst 0,0` 235 times in one dump and the panel shows the live UI, minute clock
 included. So the window-server path, the display link, the panel copy and the
 app launch chain all work on this port; what breaks them is the injected dylib.
-Bisected one bit at a time. **`mondrian_ui_hook=1` (containermanagerd alone) is
-enough to reproduce the black glass** -- 0 layers, SpringBoard 2 threads,
-backboardd 3-6, `sel` all zero -- and the hook's own log shows it loaded in pid
-64. **`0x4` (SpringBoard alone) fails differently**: SpringBoard reaches 12
-threads and backboardd 14, 5 layers are submitted, and the panel parks on the
-Apple logo. `0x4` with `mondrianbare=1` (the hook's own switch, no swizzles)
-fails the same way, which rules the swizzles out: the dylib's *load* is enough.
+Bisected one bit at a time. With the interposer removed, **`0x4` (SpringBoard
+alone) renders**: 108 layers of 1440x3200, backboardd 14-15 threads, the lock
+screen, the home screen and an opened Control Center, with the hook's own lines
+in the ring (`brightness level hooked`, `display link rates hooked`,
+`MONDRIAN TZ: localtime .../US/Pacific -> .../Europe/Madrid`). The bits that
+were measured before that fix -- `0x1` leaving 0 layers and SpringBoard 2
+threads, `0x4` parking the panel on the Apple logo -- were the stale dylib, not
+the bits. `0x4` is the configuration in `tools/boards.py`; the remaining bits
+(backboardd, runningboardd, launchd, poster, xpcproxy) are still unmeasured
+with the fixed hook.
 
 ### The hook that was measured was not the hook in the tree
 
@@ -1338,7 +1341,8 @@ asks `dlsym(RTLD_NEXT, "dispatch_sync")` from inside `dispatch_sync`, and a
 thread that already holds dyld's lock parks there -- the same dyld deadlock the
 logging interposers paid for. The interposer is removed; before trusting a
 boot's hook, check `nm out/gpu/mondrian-ui-hook.dylib | grep dispatch_sync`
-prints nothing and that the ring says which copy the process loaded.
+prints nothing and that the ring says which copy the process loaded
+(`MONDRIAN HOOK: <process> uses the /private/var/vm copy`).
 
 Test the other bits the same way before reading anything below as a property of
 the port.

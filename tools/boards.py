@@ -342,7 +342,7 @@ MONDRIAN = Board(
              # threads; 0x4: 5 layers and the panel parks on the Apple logo).
              # The hook's own parts have to be bisected with `mondrianbare=1`
              # before it can carry the plan's UI work again.
-             'mondrian_ui_hook=63 mondriansample=logd,backboardd,SpringBoard'
+             'mondrian_ui_hook=4 mondriansample=logd,backboardd,SpringBoard'
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does

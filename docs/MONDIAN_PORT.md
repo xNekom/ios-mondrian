@@ -50,13 +50,12 @@ presents userland IOSurface swaps and kicks the command-mode interface, so the
 lock screen and the home screen render on-device.
 
 UI probe `0106` injects a diagnostic dylib into the UI daemons selected by
-`mondrian_ui_hook` (`0112`, 7 = all three). It wraps
-`CAWindowServer._detectDisplays`; dyld needs the `AMFI` answer to
-`__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. **It also keeps
-the glass black: measured 2026-11-16, `0` renders and `61` does not, so bisect
-the bits before reading any UI measurement.** Build with
-`tools/build-mondrian-ui-hook.sh`, install with
-`tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`; it logs uncaught exceptions.
+`mondrian_ui_hook` (`0112`). It wraps `CAWindowServer._detectDisplays`; dyld
+needs the `AMFI` answer to `__mac_syscall` 0x5a (`0108`) or drops
+`DYLD_INSERT_LIBRARIES`. **A stale copy in `/private/var/vm` is what kept the
+glass black; check which copy the ring says a process loaded
+(`docs/MONDIAN_GPU.md`).** Build with `tools/build-mondrian-ui-hook.sh`, install
+with `tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`; it logs exceptions.
 `/product` needs `research/ipsw-x/d22ap.adt`; `disp0` `canvas-width`/
 `canvas-height` must be 4-byte data (`u32` ADT, `OSData` driver), because
 `getEDTProperty` reads them with `getBytes:range:` and an OSNumber or
