@@ -271,7 +271,9 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   (`MONDRIAN FB: panel blank (power key)`) and a second press wakes it
   (`panel wake (power key)` + `panel on (dcs)`). Injected touches wake it as
   well: `tools/usb-ring.py tap` ends in `mondrian_hid_touch`, the same call the
-  touch driver makes.
+  touch driver makes. Send both edges of a synthetic press (`key 0 down`, then
+  `key 0 up`): a held key auto-repeats, and each repeat blanks again right after
+  the wake.
 - **A blanked panel keeps its last image.** `0342` switches the panel off and
   leaves its RAM alone, so a capture taken while it is off shows the frame from
   before the blank: an old clock, not a frozen compositor. A capture that reads
