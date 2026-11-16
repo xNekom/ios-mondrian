@@ -80,7 +80,7 @@
 +		return;
 +	}
 +	printf("MONDRIAN GPU: gpustat gxclk 0x%x keep 0x%x pwr 0x%x cxbusy 0x%x"
-+	    " fence 0x%x/0x%x cp2gmu 0x%x rbbm 0x%x keepmode %d\n",
++	    " fence 0x%x/0x%x cp2gmu 0x%x rbbm 0x%x keepmode %d nomark %d\n",
 +	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)),
 +	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8c3u)),
 +	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8ecu)),
@@ -89,7 +89,7 @@
 +	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x23b13u)),
 +	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_CP2GMU_STATUS * 4u),
 +	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u),
-+	    mondrian_uc_keep);
++	    mondrian_uc_keep, mondrian_uc_nomark);
 +	mondrian_log_flush_now();
 +}
 +
