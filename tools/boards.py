@@ -340,10 +340,10 @@ MONDRIAN = Board(
              # The hook only in SpringBoard (0x4) renders: lock screen, home
              # screen, Control Center, apps. Any bit that puts it in launchd,
              # backboardd or runningboardd leaves the glass black, measured
-             # 2026-11-16 (docs/MONDIAN_GPU.md).
-             # mondriankeepawake=0 removes the hook's setIdleTimerDisabled: for
-             # one boot, so the idle blanking path can be watched.
-             'mondrian_ui_hook=4 mondriankeepawake=0 '
+             # 2026-11-16 (docs/MONDIAN_GPU.md). `mondriankeepawake=0` takes
+             # both idle-timer holds off for a boot; the idle timer still never
+             # fires, so the holds are the default (docs/MONDIAN_PORT.md).
+             'mondrian_ui_hook=4 '
              'mondriansample=logd,backboardd,SpringBoard'
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push

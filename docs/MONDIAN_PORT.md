@@ -215,9 +215,10 @@ the smoothness numbers.
 timer (`mondrianfb_blank`) is 0 in the board cmdline: at its default of 1 the
 panel went dark a second after the compositor went quiet. The hook holds
 `setIdleTimerDisabled:` down every two seconds, so the idle timer never fires;
-`mondriankeepawake=0` drops that for one boot and `MONDRIAN FB: sel` (`0261`,
-13 selectors, reset every second) names what the blanking path calls. `0305`
-sets the brightness and `0304` the battery level, both off the frame path.
+`mondriankeepawake=0` drops both holds, and a boot with it still never asks for
+the timer, never blanks and holds 21 fps for ten minutes -- so the auto-lock
+preference in the root is the next thing to check. `0305` sets the brightness
+and `0304` the battery level, both off the frame path.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
