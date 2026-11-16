@@ -87,11 +87,14 @@ Every PMIC answers its own die temperature on channel 3 of its own SID
 `pmr735a` `<4 3>`). `tools/usb-ring.py temp` prints the pmk8350's, and
 `sa SID 3 1` reads any of them. Measured with the cable attached and the phone
 idle: SID 1, 3 and 4 answer 673, 664 and 655 mV, i.e. 63, 59 and 54 °C, while
-SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C -- double the others. Either
-that part really is the hot one or its sensor has a different scale, and the
-comparison that settles it is Android's `/sys/class/thermal/thermal_zone*`
-on the same device. Until then only the movement is trusted: the reading is
-quantised in 0.5 °C steps (1 mV) and wanders 1 °C over minutes.
+SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C -- double the others. All
+five `die_temp` channels declare the same `qcom,pre-scaling` (1 1), so this is
+not a missing divider: either that part really is the hot one or its sensor
+answers something else. The comparison that settles it is Android's
+`/sys/class/thermal/thermal_zone*` on the same device. Until then only the
+movement is trusted: the reading is quantised in 0.5 °C steps (1 mV) and
+wanders 1 °C over minutes. For a temperature to act on, use the charger PMIC
+(`sa 3 3 1`), which agrees with the other two.
 
 ### The charger is behind the ADSP
 
