@@ -82,6 +82,12 @@ Pro, SM8475) is the port being done here.
   builds the image, boots it from RAM, proves which kernel is running and runs
   the ring commands. A build is ~10-15 minutes and a boot ~2.5, so a second
   question in the same boot is free while a repeated boot is not.
+- **Publish from Windows, not from WSL.** `git push` inside WSL stops at
+  `could not read Username for 'https://github.com'`: WSL has no credential
+  helper. The same push from PowerShell (`git -C
+  C:\Users\Pedro\Documents\GitHub\ios-mondrian push origin HEAD:mondrian`) uses
+  Git Credential Manager and succeeds. CI only sees what is in
+  `origin/mondrian`, so push before dispatching a run.
 - **Never pipe a build script.** `bash mkimg.sh | head -1` killed it with
   SIGPIPE and left the previous image: the phone booted the old kernel twice
   and the new command "did not exist". Read the exit status, not the first

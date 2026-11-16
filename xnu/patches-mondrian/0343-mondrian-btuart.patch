@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..2b1fb28
+index 0000000..1341ea7
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,594 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -104,6 +104,18 @@ index 0000000..2b1fb28
 +#define MONDRIAN_BT_HALT_S_AHB		0x2e008
 +#define MONDRIAN_BT_SE5_CMD_RCGR	0x2e618
 +#define MONDRIAN_BT_SE5_CFG_RCGR	0x2e61c
++#define MONDRIAN_BT_SE5_M_RCGR		0x2e620
++#define MONDRIAN_BT_SE5_N_RCGR		0x2e624
++#define MONDRIAN_BT_SE5_D_RCGR		0x2e628
++#define MONDRIAN_BT_CMD_UPDATE		(1u << 0)
++#define MONDRIAN_BT_CFG_PRE_DIV		0xffu
++#define MONDRIAN_BT_CFG_SRC_SEL		(0x7u << 8)
++#define MONDRIAN_BT_CFG_MODE		(0x3u << 12)
++#define MONDRIAN_BT_CFG_MODE_DUAL	(0x2u << 12)
++#define MONDRIAN_BT_SRC_GPLL0_EVEN	6u
++#define MONDRIAN_BT_RCG_M		768u
++#define MONDRIAN_BT_RCG_N		15625u
++#define MONDRIAN_BT_GPLL0_HZ		300000000u
 +#define MONDRIAN_BT_RCG_ROOT_OFF	(1u << 31)
 +#define MONDRIAN_BT_RCG_ROOT_EN		(1u << 1)
 +#define MONDRIAN_BT_RCG_UPDATE		(1u << 0)
@@ -146,6 +158,7 @@ index 0000000..2b1fb28
 +#define MONDRIAN_BT_S_IRQ_STATUS	0x640
 +#define MONDRIAN_BT_S_IRQ_EN		0x644
 +#define MONDRIAN_BT_S_IRQ_CLEAR		0x648
++#define MONDRIAN_BT_S_GENI_CMD_ABORT	(1u << 1)
 +#define MONDRIAN_BT_TX_FIFO		0x700
 +#define MONDRIAN_BT_RX_FIFO		0x780
 +#define MONDRIAN_BT_TX_FIFO_STATUS	0x800
@@ -262,6 +275,55 @@ index 0000000..2b1fb28
 +}
 +
 +/*
++ * Move the SE root from the XO to P_GCC_GPLL0_OUT_EVEN at M/N = 768/15625, the
++ * 14745600 Hz entry of mainline's QUP table, so that a SER divider of 8 gives
++ * 115200 exactly. The UART divider is a small integer, so the root has to be a
++ * multiple of baud * 16; the XO (19.2 MHz) is not.
++ */
++static int
++mondrian_bt_rcg_14745600(vm_offset_t gcc, char *out, size_t len, int n)
++{
++	uint32_t cfg, cmd;
++	char line[192];
++
++	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_M_RCGR, MONDRIAN_BT_RCG_M);
++	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_N_RCGR,
++	    (uint16_t)~(MONDRIAN_BT_RCG_N - MONDRIAN_BT_RCG_M));
++	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_D_RCGR,
++	    (uint16_t)~MONDRIAN_BT_RCG_N);
++
++	cfg = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR);
++	cfg &= ~(MONDRIAN_BT_CFG_PRE_DIV | MONDRIAN_BT_CFG_SRC_SEL |
++	    MONDRIAN_BT_CFG_MODE);
++	cfg |= 1u;   /* pre divider 1 */
++	cfg |= MONDRIAN_BT_SRC_GPLL0_EVEN << 8;
++	cfg |= MONDRIAN_BT_CFG_MODE_DUAL;
++	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CFG_RCGR, cfg);
++
++	/* Read-modify-write, the way update_config() does it: ROOT_EN stays. */
++	cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
++	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CMD_RCGR, cmd | MONDRIAN_BT_CMD_UPDATE);
++	for (int i = 0; i < 1000; i++) {
++		cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
++		if ((cmd & MONDRIAN_BT_CMD_UPDATE) == 0) {
++			break;
++		}
++		delay(10);
++	}
++
++	snprintf(line, sizeof(line),
++	    "btuart: rcg cmd 0x%x cfg 0x%x m 0x%x n 0x%x d 0x%x -> %u Hz\n",
++	    mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR),
++	    mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR),
++	    mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_M_RCGR) & 0xffffu,
++	    mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_N_RCGR) & 0xffffu,
++	    mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_D_RCGR) & 0xffffu,
++	    (uint32_t)((uint64_t)MONDRIAN_BT_GPLL0_HZ * MONDRIAN_BT_RCG_M /
++	    MONDRIAN_BT_RCG_N));
++	return mondrian_bt_step(out, len, n, line);
++}
++
++/*
 + * Program the engine for 8N1 in FIFO mode. The SE's root is the XO (19.2 MHz,
 + * divider 1), so the SER divider is what sets the baud: with the 16x
 + * oversampling the 2.5+ engines use, divider 10 gives 120000, not 115200 --
@@ -275,6 +337,19 @@ index 0000000..2b1fb28
 +{
 +	char line[160];
 +
++	/*
++	 * qcom_geni_serial_abort_rx: cancel the secondary command before
++	 * anything else, because the previous stage leaves one ACTIVE and the
++	 * engine would hand this stage its leftovers.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_S_CMD_CTRL, MONDRIAN_BT_S_GENI_CMD_ABORT);
++	for (int i = 0; i < 500; i++) {
++		if ((mondrian_bt_rd(se, MONDRIAN_BT_S_CMD_CTRL) &
++		    MONDRIAN_BT_S_GENI_CMD_ABORT) == 0) {
++			break;
++		}
++		delay(100);
++	}
 +	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_EN, 0);
 +	mondrian_bt_wr(se, MONDRIAN_BT_S_IRQ_EN, 0);
 +	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_CLEAR, 0xffffffffu);
@@ -394,8 +469,12 @@ index 0000000..2b1fb28
 +	 * entry with the first byte in the low bits (the packing is programmed
 +	 * msb_to_lsb = false). The first attempt filled the FIFO first.
 +	 */
-+	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_EN,
-+	    MONDRIAN_BT_M_CMD_DONE_EN | MONDRIAN_BT_M_TX_WATERMARK_EN);
++	/*
++	 * M_IRQ_STATUS latches the completion whether or not M_IRQ_EN lets it
++	 * reach the GIC, and this kernel has no handler for SPI 587: enabling it
++	 * would assert a level-high line that nothing clears.
++	 */
++	mondrian_bt_wr(se, MONDRIAN_BT_M_IRQ_EN, 0);
 +	mondrian_bt_wr(se, MONDRIAN_BT_TX_WATERMARK_REG, 2);
 +	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_LEN, len);
 +	{
@@ -502,6 +581,16 @@ index 0000000..2b1fb28
 +		uint8_t one = 0x5a;
 +
 +		n = mondrian_bt_uart_init(se, 10, 1, out, len, n);
++		n = mondrian_bt_send(se, &one, 1, out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 20, out, len, n);
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);
++		return n;
++	}
++	if (mode != NULL && strcmp(mode, "baud") == 0) {
++		uint8_t one = 0x5a;
++
++		n = mondrian_bt_rcg_14745600(gcc, out, len, n);
++		n = mondrian_bt_uart_init(se, 8, 1, out, len, n);
 +		n = mondrian_bt_send(se, &one, 1, out, len, n);
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 20, out, len, n);
 +		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);

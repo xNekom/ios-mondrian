@@ -128,6 +128,29 @@ already has it: `F(14745600, P_GCC_GPLL0_OUT_EVEN, 1, 768, 15625)` in
 has `mnd_width = 16`, so the SE root takes the fractional M/N, and the SER
 divider is 8.
 
+`btuart baud` programs that and reads it back exactly (measured):
+
+```
+btuart: rcg cmd 0x2 cfg 0x102601 m 0x300 n 0xc5f6 d 0xc2f6 -> 14745600 Hz
+```
+
+`cmd 0x2` is `ROOT_EN` with the update latched, `cfg 0x102601` keeps the hardware
+clock-control bit (20) and sets parent 6, pre divider 1 and dual-edge mode, and
+the M/N/D fields are `~(N - M)` and `~N` as `clk-rcg2.c` writes them. The write
+must be a read-modify-write of `CMD_UPDATE`: a plain write of `0x1` clears
+`ROOT_EN`.
+
+Its loopback byte has not been measured clean yet (TODO): the one run that
+reached the wire returned `00`, and that run inherited an ACTIVE secondary
+command from the stage before it, with `M_IRQ_EN` set on a line (SPI 587) that
+has no handler in this kernel. Both are now avoided — `S_GENI_CMD_ABORT` before
+the engine is re-programmed, and `M_IRQ_EN` left at 0 because `M_IRQ_STATUS`
+latches completion without it.
+
+A dead command channel looks like this: the phone still answers ICMP on
+192.168.7.2 and nothing on UDP 5141, so `tools/usb-ring.py` reports `no answer`
+for every command. Only the hardware buttons reach fastboot from there.
+
 - The WiFi part is a WCN6855-class device (the QCA6490 is its board-level
   name). Linux firmware: `ath11k/WCN6855/hw2.0/amss.bin`, `m3.bin`,
   `board-2.bin`, `regdb.bin`. `board-2.bin` is board-specific; the stock
