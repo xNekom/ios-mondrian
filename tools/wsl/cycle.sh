@@ -21,12 +21,23 @@ if [ "${1:-}" = "--no-build" ]; then
 	BUILD=0
 	shift
 fi
-CMDS=("$@")
+CMDS=()
+if [ "${1#@}" != "${1:-}" ]; then
+	# "@FILE" reads one command per line. Inline commands need their spaces
+	# quoted, and a shell one level up (PowerShell calling wsl) eats those
+	# quotes: `hapr 0 0` arrived as a bare `hapr` and the block "did not
+	# answer". A file has no quoting to lose.
+	while IFS= read -r line; do
+		[ -n "$line" ] && CMDS+=("$line")
+	done < "${1#@}"
+else
+	CMDS=("$@")
+fi
 IFACE=${IFACE:-enx02005e77ee01}
 BUSID=${BUSID:-7-1}
 FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
 K=xnu/out/kernel.development.mondrian
-LOG=${LOG:-/tmp/cycle}
+LOG=${LOG:-/root/cycle}
 
 mkdir -p "$LOG" || exit 1
 
@@ -68,7 +79,8 @@ attach() {
 }
 
 echo "== fastboot boot"
-timeout 60 "$FB" boot "$(cygpath -w "$PWD/shim/out/shim-boot.img")" > "$LOG/fastboot.log" 2>&1
+WIMG=$(wslpath -w "$PWD/shim/out/shim-boot.img")
+timeout 60 "$FB" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
 grep -a -q OKAY "$LOG/fastboot.log" || { tail -3 "$LOG/fastboot.log"; exit 1; }
 
 # 3. Wait for the ring, then prove the kernel.
@@ -78,7 +90,7 @@ for i in $(seq 1 40); do
 	sleep 6
 	attach
 	if timeout 20 python3 tools/usb-ring.py pos > "$LOG/pos.txt" 2>&1 &&
-	    grep -a -q 'pos' "$LOG/pos.txt"; then
+	    grep -a -qE '^[0-9]+$' "$LOG/pos.txt"; then
 		UP=1
 		break
 	fi
@@ -100,6 +112,7 @@ for c in "${CMDS[@]}"; do
 done
 
 echo "== ring: MONDRIAN lines"
+timeout 250 python3 tools/usb-ring.py dump "$LOG/ring.txt" > "$LOG/dump2.txt" 2>&1
 grep -a 'MONDRIAN' "$LOG/ring.txt" | tail -20
 for c in "${CMDS[@]}"; do
 	name=${c%% *}

@@ -4,7 +4,8 @@ The port boots to SpringBoard with the GPU drawing, shows a battery level in the
 status bar, and still gets hot. Nothing on the AP turns charging on or off, so
 the level is a measurement and the charger is the bootloader's business. Both
 are measured here, not guessed. This is the work list for
-`docs/MONDIAN_PORT.md` §5.
+`docs/MONDIAN_PORT.md` §5. It also covers the two other PMIC blocks the port
+drives: the thermal sensors and the haptics driver.
 
 ## Battery
 
@@ -277,6 +278,57 @@ nothing registers `IOPlatformSleepAction`, nothing calls
 wake source. It needs a platform sleep driver, PSCI `SYSTEM_SUSPEND`, GIC
 save/restore with wake masks, `CNTVOFF`/`CVAL` save, PMIC wake and an RPMh
 DDR self-refresh vote.
+
+## Haptics
+
+The vibrator is not an I²C part. SM8475 drives an LRA from the PMIC's HV
+haptics block on `pm8350b@3`, three SPMI pages (`reg = <0xf000 0xf100 0xf200>`):
+CFG at 0xf000 (enable 0x46 bit 7, VMAX 0x48 = mV/50, play 0x4c = source | 0x80,
+autoresonance 0x63 bit 7), PTN at 0xf100 (waveform FIFO at 0x20 and the
+direct-play amplitude at 0x26) and HBST at 0xf200 (the vote for the PMIC's own
+boost, 0x46 bit 7). The I²C scan of a vendor boot has no haptic address, and
+the vendor's three matching modules (AW86927, AW862xx, QCOM_HV_HAPTICS) are
+`=m` because only the last one matches this board.
+
+**The PPID carries the SID.** A peripheral is `(sid << 8) | page`, measured with
+`tools/usb-ring.py spmimap`: the three pages above are `0x3f0`, `0x3f1` and
+`0x3f2` — APID 465 and 466 are owner 0 (this AP), while `0x3f2` is APID 400,
+owner 3, the charger firmware. Addressing the block as `0xf0` finds nothing,
+which reads exactly like "the block is not there". `mondrian_spmi_reg_read()/
+reg_write(ppid, reg, val)` are the primitives, gated on the owner bits: a read
+of a peripheral another processor owns wedges the arbiter and costs the boot.
+
+The boost is HBST's business, not the enable bit's: the vendor votes it by
+writing HBST 0x46 bit 7 (`SW_CTRL_HBST`) or treats the block as externally
+powered through the SWR slave regulator LPASS exposes
+(`qcom,hap-swr-slave-reg`). CFG 0x46 bit 7 only enables the module.
+
+`tools/usb-ring.py haps` walks the block one register at a time and stops at the
+first one that does not answer, `hapr BLOCK REG` reads a single byte and `hapw
+BLOCK REG VAL` writes one. The first boot that read it (16:45) reported the
+state the bootloader left: `cfg-rev 0x00 ptn-rev 0x02 status 0x04 hpwr 0x00
+fault 0x00 vmax 0x1c amp 0xff play 0x01` — the block answers, no fault, PTN
+revision 2, the direct-play source selected and idle, VMAX at 1.4 V, and `hpwr`
+at 0, which the vendor's own masks read as `HPWR_DISABLED`: the PMIC's boost is
+not up.
+
+That is the open question. The vendor enables the boost two ways
+(`qcom-hv-haptics.c`): `SW_CTRL_HBST` writes HBST 0x46 bit 7, which this AP
+cannot do because the page belongs to the charger firmware, or it treats the
+block as externally powered through the `qcom,hap-swr-slave-reg` that LPASS
+provides. `haptics_force_vreg_ready()` (CFG 0x68 bit 0, plus bit 1 on HAP525_HV)
+exists for the case where the charger firmware owns the boost, and it is only
+set when that firmware reports the boost enabled. A buzz that reads `hpwr` and
+the live impedance (0x0e) during the play says which of the three the board is
+in.
+
+`vib [ms [amp]]` plays a constant tone: the DT's 1.25 V VMAX, amplitude 0x40 of
+0xff and 100 ms by default, deliberately low for a first drive, and it logs the
+impedance and status 20 ms in. The DT's `effect_0..5` tables are a click
+waveform, not filler: eight samples of (amplitude, period, f_lra_x2) =
+(0x1f,0,0) (0x3f,0,0) (0x5f,0,0) (0x7f,0,0) (0x17f,0,0) (0x15f,0,0)
+(0x13f,0,0) (0x11f,0,0), written as 24 bytes at PTN 0x34 with TLRA 0x30 =
+period/5 and the source field set to PATTERN1.
 
 ## Measuring it
 
