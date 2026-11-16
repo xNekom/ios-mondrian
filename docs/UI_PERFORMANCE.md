@@ -15,6 +15,16 @@ A boot that reaches SpringBoard and then stops drawing is not always a frame
 budget problem: the compositor only presents when something changes, so `fps 0`
 on a still screen is normal, and what matters is whether a touch brings a frame.
 
+- **Idle is the driver's, not the compositor's.** Measured on a boot left
+  untouched for 45 s: the ring carries `MONDRIAN UI: idle timer left armed
+  (mondriankeepawake=0)`, then `MONDRIAN FB: panel blank after 30 s without a
+  frame` (the seconds are `mondrianfb_blank`), then `MONDRIAN FB: panel wake
+  (input)` on the first touch. Those three lines are the check: a missing blank
+  line means frames never stopped (or the blank is disabled), and a missing wake
+  line means the touch never reached the driver. Neither costs a rebuild.
+  `present 0/s` in the same dump is the still screen, not a fault: the samples
+  that follow a touch read 4-5/s.
+
 - **An app launch that times out freezes the compositor.** Measured chain, all
   in the ring: SpringBoard's launch thread waits on an `os_unfair_lock` inside
   `-[FBProcess bootstrapLock:]`, entered from
