@@ -80,6 +80,19 @@ vbus). The divider is not a register: it comes from the channel's
 is 1875 mV / 28900. A cable counts as present above 4.3 V and gone below 4.0 V,
 the gap being what keeps the icon from flapping.
 
+### Die temperatures
+
+Every PMIC answers its own die temperature on channel 3 of its own SID
+(`pmk8350_die_temp` = `<0 3>`, `pm8350` `<1 3>`, `pm8350b` `<3 3>`,
+`pmr735a` `<4 3>`). `tools/usb-ring.py temp` prints the pmk8350's, and
+`sa SID 3 1` reads any of them. Measured with the cable attached and the phone
+idle: SID 1, 3 and 4 answer 673, 664 and 655 mV, i.e. 63, 59 and 54 °C, while
+SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C -- double the others. Either
+that part really is the hot one or its sensor has a different scale, and the
+comparison that settles it is Android's `/sys/class/thermal/thermal_zone*`
+on the same device. Until then only the movement is trusted: the reading is
+quantised in 0.5 °C steps (1 mV) and wanders 1 °C over minutes.
+
 ### The charger is behind the ADSP
 
 `qcom,battery_charger` hangs off `qcom,pmic_glink`, and `pm8350b@3` in the live
