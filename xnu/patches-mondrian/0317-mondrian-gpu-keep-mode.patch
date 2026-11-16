@@ -1,6 +1,6 @@
 --- a/bsd/dev/mondrian_gpu.c
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -3857,6 +3857,66 @@
+@@ -3857,6 +3857,96 @@
   * already up, so this is a no-op; it exists for gpukeep=0, kgsl's
   * submit-time toggle and the default until the measured death above.
   */
@@ -64,6 +64,36 @@
 +	printf("MONDRIAN GPU: keep mode %d -> %d\n", was, mode);
 +}
 +
++/*
++ * The collapse, in one line: the plan's gpustat, read only. 0x1f8d0 bits 0/1
++ * say GX's GDSC or clock are off; 0x1f8ec is the GMU's own RPMH power state
++ * (3 = IFPC, 0xf = slumber); 0x23b0c bit 23 is GPUBUSYIGNAHB; 0x23b10 is the
++ * AHB fence control (0 = allow) and 0x23b13 its status; CP_CP2GMU_STATUS bit 0
++ * is the CP sitting in IFPC. The three 0x23b** offsets are a6xx plus 0x1a800,
++ * so they are printed before anything is ever written to them.
++ */
++void
++mondrian_gpu_status(void)
++{
++	if (mondrian_uc_gmu == 0 || mondrian_uc_gpu == 0) {
++		printf("MONDRIAN GPU: gpustat no gpu in this boot\n");
++		return;
++	}
++	printf("MONDRIAN GPU: gpustat gxclk 0x%x keep 0x%x pwr 0x%x cxbusy 0x%x"
++	    " fence 0x%x/0x%x cp2gmu 0x%x rbbm 0x%x keepmode %d\n",
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u)),
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8c3u)),
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8ecu)),
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x23b0cu)),
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x23b10u)),
++	    mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x23b13u)),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_CP2GMU_STATUS * 4u),
++	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u),
++	    mondrian_uc_keep);
++	mondrian_log_flush_now();
++}
++
++
  static uint32_t mondrian_uc_keep_depth;
  
  static void
@@ -78,7 +108,7 @@
  	}
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
-@@ -1238,6 +1238,29 @@
+@@ -1238,6 +1238,43 @@
  	printf("%s", out);
  }
  
@@ -105,16 +135,32 @@
 +	printf("%s", out);
 +}
 +
++/*
++ * "gpustat" logs the collapse registers; the answer is only the ack, because
++ * the numbers are lines in the ring already.
++ */
++static void
++ud_cmd_gpustat(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern void mondrian_gpu_status(void);
++
++	(void)line;
++	mondrian_gpu_status();
++	ud_cmd_send(so, to, "gpustat\n", 8);
++}
++
  static void
  ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
  {
-@@ -1608,6 +1631,9 @@
+@@ -1608,6 +1631,11 @@
  			} else if (strcmp(cmd, "rtc") == 0 ||
  			    strncmp(cmd, "rtc ", 4) == 0) {
  				ud_cmd_rtc(so, peer, cmd);
 +			} else if (strcmp(cmd, "gpukeep") == 0 ||
 +			    strncmp(cmd, "gpukeep ", 8) == 0) {
 +				ud_cmd_gpukeep(so, peer, cmd);
++			} else if (strcmp(cmd, "gpustat") == 0) {
++				ud_cmd_gpustat(so, peer, cmd);
  			} else if (strcmp(cmd, "execdeny") == 0 ||
  			    strncmp(cmd, "execdeny ", 9) == 0) {
  				ud_cmd_execdeny(so, peer, cmd);
