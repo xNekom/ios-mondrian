@@ -107,8 +107,13 @@ Pro, SM8475) is the port being done here.
   can.
 - **Declare before you build.** A missing `extern`/prototype (`delay`, `hz`,
   `sp_apid_owner`) is the commonest failure and costs a ten-minute build.
-- **Patches come from a diff.** Hand-counted hunks have failed four times:
-  stage the series tree, edit it, and `diff -u` (the `mkNNN.py` builders do).
+- **Patches come from a diff of the staged series.** Hand-counted hunks have
+  failed four times. Stage the series with `tools/wsl/series-stage.sh <last>`
+  (a copy of the pristine cache under `/root`, patches applied in order) and
+  `diff -u` the files before and after the change: diffing against the *build*
+  cache duplicates whatever the last build already applied, which is how 0341
+  stopped applying the moment 0340 grew a function. `tools/check-patches.sh`
+  must report every patch applying before a build is worth starting.
 
 ## Documentation rules (hard requirements)
 
