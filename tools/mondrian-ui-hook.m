@@ -1071,68 +1071,16 @@ window_server_probe_wanted(void)
 }
 
 /*
- * Which queue is the main thread waiting on? Its stack ends in
- * `dispatch_sync -> mach_msg`, so the label of the queue it entered names the
- * subsystem whose block never runs. Gated by the marker, limited to
- * backboardd, capped: this is a probe, not a trace.
- *
- * The real function comes from dlsym(RTLD_NEXT) once, in the constructor: an
- * interpose entry whose replacement calls the symbol again is re-bound to the
- * replacement, which recursed until the stack was gone on the first attempt.
+ * The dispatch_sync interposer is gone on purpose. Two boots measured what it
+ * costs: with the dylib loaded anywhere, the first `dispatch_sync` of a
+ * process enters the replacement, the replacement asks dyld for the real
+ * symbol (dlsym(RTLD_NEXT)), and a thread already holding dyld's lock parks
+ * it there -- SpringBoard's main thread sat in
+ * `mondrian_dispatch_sync -> ChronoServices -> SBSystemAppMain` and the panel
+ * never left the Apple logo, while containermanagerd never answered
+ * backboardd's container query. That is the same dyld deadlock the logging
+ * interposers paid for. Name the queue some other way, or not at all.
  */
-extern void dispatch_sync(dispatch_queue_t queue, dispatch_block_t block);
-static void (*real_dispatch_sync)(dispatch_queue_t queue, dispatch_block_t block);
-
-static void
-resolve_dispatch_sync(void)
-{
-	if (real_dispatch_sync == NULL) {
-		real_dispatch_sync = (void (*)(dispatch_queue_t, dispatch_block_t))
-		    dlsym(RTLD_NEXT, "dispatch_sync");
-	}
-}
-
-static void
-mondrian_dispatch_sync(dispatch_queue_t queue, dispatch_block_t block)
-{
-	static int budget = 80;
-	const char *label;
-
-	resolve_dispatch_sync();
-	if (real_dispatch_sync == NULL) {
-		return;
-	}
-	if (budget <= 0 || !window_server_probe_wanted() ||
-	    strcmp(getprogname(), "backboardd") != 0) {
-		real_dispatch_sync(queue, block);
-		return;
-	}
-	budget -= 2;
-	label = queue != NULL ? dispatch_queue_get_label(queue) : NULL;
-	{
-		char line[192];
-
-		snprintf(line, sizeof(line), "MONDRIAN SYNCS: enter %s\n",
-		    label != NULL ? label : "(no label)");
-		say(line);
-	}
-	real_dispatch_sync(queue, block);
-	{
-		char line[192];
-
-		snprintf(line, sizeof(line), "MONDRIAN SYNCS: exit %s\n",
-		    label != NULL ? label : "(no label)");
-		say(line);
-	}
-}
-
-__attribute__((used, section("__DATA,__interpose")))
-static const struct {
-	const void *replacement;
-	const void *replacee;
-} mondrian_sync_interposer[] = {
-	{ (const void *)mondrian_dispatch_sync, (const void *)dispatch_sync },
-};
 
 static void
 say_window_server(void)
@@ -8812,7 +8760,6 @@ mondrian_install_ui_hooks(void)
 	 * deadlocks on its own or because of a hook in that path.
 	 */
 	if (!boot_arg_set("mondrianbare=1")) {
-		resolve_dispatch_sync();
 		install_display_diagnostic();
 		if (window_server_probe_wanted()) {
 			install_server_hook();

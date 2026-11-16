@@ -1321,10 +1321,27 @@ enough to reproduce the black glass** -- 0 layers, SpringBoard 2 threads,
 backboardd 3-6, `sel` all zero -- and the hook's own log shows it loaded in pid
 64. **`0x4` (SpringBoard alone) fails differently**: SpringBoard reaches 12
 threads and backboardd 14, 5 layers are submitted, and the panel parks on the
-Apple logo. So both the personas daemon and SpringBoard's swizzles are on the
-path; `mondrianbare=1` (the hook's own switch that skips the swizzles but keeps
-the personas fix) is the next split. Test the other bits the same way before
-reading anything below as a property of the port.
+Apple logo. `0x4` with `mondrianbare=1` (the hook's own switch, no swizzles)
+fails the same way, which rules the swizzles out: the dylib's *load* is enough.
+
+### The hook that was measured was not the hook in the tree
+
+The kernel embeds `out/gpu/mondrian-ui-hook.dylib` and writes it to
+`/private/var/vm` at boot. When that file is missing the kernel embeds nothing,
+the device keeps loading the copy an earlier boot left there, and the source
+change looks inert. That is what happened here: the running dylib was a build
+that still interposed `dispatch_sync`, so SpringBoard's main thread sat in
+`mondrian_dispatch_sync -> ChronoServices -> SBSystemAppMain` (the hook's own
+`MONDRIAN DL` dump names it) and the panel never left the Apple logo, while
+containermanagerd never answered backboardd's container query. The replacement
+asks `dlsym(RTLD_NEXT, "dispatch_sync")` from inside `dispatch_sync`, and a
+thread that already holds dyld's lock parks there -- the same dyld deadlock the
+logging interposers paid for. The interposer is removed; before trusting a
+boot's hook, check `nm out/gpu/mondrian-ui-hook.dylib | grep dispatch_sync`
+prints nothing and that the ring says which copy the process loaded.
+
+Test the other bits the same way before reading anything below as a property of
+the port.
 
 With the hook injected, no process in the hook set (`launchd`,
 `containermanagerd`, `backboardd`, `runningboardd`, `SpringBoard`) calls
