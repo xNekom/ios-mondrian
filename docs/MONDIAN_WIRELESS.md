@@ -19,6 +19,40 @@ aliases):
 | WiFi | PCIe 0, `pcie@1c00000` endpoint | `qcom,cnss-qca6490@b0000000`, `cnss_pci`, `cnss_pins` | `cnss2` loads the firmware and brings up MHI; `ath11k` drives the WLAN |
 | Bluetooth | QUP UART (`hci_qca`) | `bt_qca6490`: reset, sw-ctrl and xo GPIOs, eight rails, `mboxes` | `hci_qca` (UART), `btqca` (power) |
 
+### The Bluetooth UART, as the live tree has it
+
+Measured on `dtb/mondrian-live.dtb` with `tools/dtb-dump.py` (the host has no
+`dtc`; the phandles are resolved because a pin number and a regulator are the
+part that is easy to misread):
+
+```
+tools/dtb-dump.py dtb/mondrian-live.dtb 'qup_uart@894000'
+tools/dtb-dump.py dtb/mondrian-live.dtb 'bt_qca6490'
+```
+
+- **High-speed UART**: `/soc/qcom,qup_uart@894000`, `qcom,msm-geni-serial-hs`,
+  `reg` **0x894000 + 0x4000**, `status` ok, `qcom,wakeup-byte` **0xfd**. It sits
+  in the `qupv3_2` GENI wrapper at **0x8C0000** (`qcom,wrapper-core`), with
+  `gcc` (`clock-controller@100000`) clocks `0x82` (se), `0x8a` (m-ahb), `0x8b`
+  (s-ahb). Four pinctrl states: default, active, sleep, shutdown.
+- **Interrupts**: GIC SPI **587**, level high, plus a wakeup line from
+  `pinctrl@f000000` GPIO **79** (`interrupts-extended` = `<gic 0 587 4>`
+  `<pinctrl 79 4>`).
+- **The console UART is the other one**: `/soc/qcom,qup_uart@99c000`,
+  `qcom,msm-geni-console`, SPI **608**. Do not bring that one up for Bluetooth.
+- **BT node** `/soc/bt_qca6490` (`qcom,qca6490`): reset GPIO **81**, switch
+  control GPIO **82**, WLAN reset GPIO **80**, XO clock GPIO **204**, all on
+  `pinctrl@f000000`; `mboxes` = `qmp-aop` index 0.
+- **Rails**, with the DT's own min/max/load/enable and the regulator each names:
+  `vdd-aon`, `vdd-dig`, `vdd-rfa-0p8` and `vdd-rfacmn` → `pm8350 S11`
+  (0.966–1.17 V); `vdd-io` → `pm8350 S10` (1.8 V); `vdd-asd` → `pmr735a L7`
+  (2.8 V); `vdd-rfa1` → `pm8350c S1` (1.9–2.04 V); `vdd-rfa2` → `pm8350 S12`
+  (1.35–2.024 V); `vreg_ipa` → `pmr735a S3` (2.2 V).
+
+Nothing powers any of it yet: the kernel has no QUP UART driver and no
+`hci_qca`, so the next step is the GENI SE/UART in the driver set, with these
+addresses, and the firmware load after that.
+
 - The WiFi part is a WCN6855-class device (the QCA6490 is its board-level
   name). Linux firmware: `ath11k/WCN6855/hw2.0/amss.bin`, `m3.bin`,
   `board-2.bin`, `regdb.bin`. `board-2.bin` is board-specific; the stock
