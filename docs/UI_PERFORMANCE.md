@@ -274,6 +274,13 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   touch driver makes. Send both edges of a synthetic press (`key 0 down`, then
   `key 0 up`): a held key auto-repeats, and each repeat blanks again right after
   the wake.
+- **Injected input does not drive SpringBoard's lock screen.** Measured on the
+  lock screen: the unlock gesture (`swipe 720 3150 720 900 250`) leaves
+  `panel 0/60 sampled ticks` with `1 present/s` and byte-identical captures, and
+  a tap on a modal button ("Turn On Siri") does the same. The events reach the
+  driver (`MONDRIAN HID: touch 0 down`), so it is SpringBoard that ignores
+  them: a UI test must not assume it can unlock the device, and a transition has
+  to be produced by the port (`mondriananim=2`) or by a boot.
 - **A blanked panel keeps its last image.** `0342` switches the panel off and
   leaves its RAM alone, so a capture taken while it is off shows the frame from
   before the blank: an old clock, not a frozen compositor. A capture that reads
