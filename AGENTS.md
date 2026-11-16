@@ -76,6 +76,40 @@ Pro, SM8475) is the port being done here.
   device trees, mondrian UFS). Update the relevant one when a new trap is paid
   for; load it before re-deriving it.
 
+## The development loop (hard rules; each one has already cost a boot)
+
+- **One command per experiment.** `tools/wsl/cycle.sh haps "vib 150 64"`
+  builds the image, boots it from RAM, proves which kernel is running and runs
+  the ring commands. A build is ~10-15 minutes and a boot ~2.5, so a second
+  question in the same boot is free while a repeated boot is not.
+- **Never pipe a build script.** `bash mkimg.sh | head -1` killed it with
+  SIGPIPE and left the previous image: the phone booted the old kernel twice
+  and the new command "did not exist". Read the exit status, not the first
+  line.
+- **Prove the kernel before trusting any answer.** A RAM boot that dies falls
+  back to `boot_b`, so "command not found" means "old kernel" as often as
+  "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the
+  kernel on disk first.
+- **Every WSL script attaches the phone itself.** WSL shuts down between tool
+  calls, so `usbipd attach --wsl` and the `192.168.7.1` address must be redone
+  inside each script or the first send fails with `Errno 99`.
+- **SPMI: the map is the truth.** A peripheral's PPID is `(sid << 8) |
+  peripheral`, not its DT address: pm8350b's haptics at `0xf000` is `0x3f0`,
+  while the SID-0 VADC is `0x031`. `tools/usb-ring.py spmimap` dumps the 540
+  entries the bootloader left; check the owner bits before touching anything,
+  because reading a peripheral another processor owns wedges the arbiter and
+  costs the boot.
+- **Ask the vendor before writing a driver.** The live device tree and the
+  vendor source answer in minutes what a boot cannot.
+  `raw.githubusercontent.com` rate-limits (429); `cdn.jsdelivr.net/gh/
+  <owner>/<repo>@<sha>/<path>` serves the same file. An OrangeFox boot from RAM
+  (`fastboot boot`, ten seconds, writes nothing) answers anything the kernel
+  can.
+- **Declare before you build.** A missing `extern`/prototype (`delay`, `hz`,
+  `sp_apid_owner`) is the commonest failure and costs a ten-minute build.
+- **Patches come from a diff.** Hand-counted hunks have failed four times:
+  stage the series tree, edit it, and `diff -u` (the `mkNNN.py` builders do).
+
 ## Documentation rules (hard requirements)
 
 The `.md` files are for the next developer, not for the session that wrote
