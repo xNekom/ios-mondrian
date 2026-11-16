@@ -178,15 +178,21 @@ first `present`, not in frames per second.
 **Refusing the exec is what stops a job, not killing it.** `0316` refuses exec
 with EACCES for a list of names, set from `mondriankill=quiet` (the built-in
 list) and replaceable at run time with `execdeny NAME[,NAME]` and `execdeny off`
-on the USB channel. A refused exec produces no crash report and no restart, so
-launchd stops asking for the job: over two four-minute windows of one boot, the
-steady state without the list ran 194 execs and 96 crash lines, and with it 16
-execs and 1 crash, each of the eight names refused exactly once. The list is
-`calaccessd`, the three speech synthesisers, `watchdogd`, `bluetoothd`,
-`fairplayd.H2` and `aggregated`; the battery thread prints
-`MONDRIAN PROC: exec N crash M denied K` every sample, so a boot reports its own
-churn. The counters are cumulative, which is what makes the two windows
-comparable without a second boot.
+on the USB channel. A refused exec is reported as a SIGKILL, so the crash
+reporter counts it: over two four-minute windows of one boot with the UI up,
+the eight-name list (`calaccessd`, the three speech synthesisers, `watchdogd`,
+`bluetoothd`, `fairplayd.H2`, `aggregated`) produced 97 crash lines against 25
+without it, 24 of them for each refused name, and the exec count went up, not
+down. The list is a loss once the UI runs; it stays as a switch.
+`MONDRIAN PROC: exec N crash M denied K` prints every sample, so a boot reports
+its own churn, and the counters are cumulative, which is what makes two windows
+of one boot comparable without a second boot.
+
+**`watchdogd` is the loop the list cannot touch.** 24 to 31 crash lines per four
+minutes in both windows, i.e. one every ten seconds, with or without its exec
+refused: it dies inside its own libdispatch callback (`pc == lr`) after being
+started, so refusing the *next* exec changes nothing. That is the loop to
+remove; the other names are noise around it.
 
 ### 3. The frame path is marginal
 
