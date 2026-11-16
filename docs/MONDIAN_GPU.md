@@ -1316,8 +1316,11 @@ With `0` the compositor submits `MONDRIAN FB: layer 0 surface 2 1440x3200
 dst 0,0` 235 times in one dump and the panel shows the live UI, minute clock
 included. So the window-server path, the display link, the panel copy and the
 app launch chain all work on this port; what breaks them is the injected dylib.
-Bisect the injection (bits 1, 4, 8, 16, 32, 64 one at a time) before reading
-anything below as a property of the port.
+Bisected one bit at a time: **`mondrian_ui_hook=1` (containermanagerd alone) is
+enough to reproduce the black glass** -- 0 layers, SpringBoard 2 threads,
+backboardd 3-6, `sel` all zero -- and the hook's own log shows it loaded in pid
+64. Test the other bits the same way before reading anything below as a
+property of the port.
 
 With the hook injected, no process in the hook set (`launchd`,
 `containermanagerd`, `backboardd`, `runningboardd`, `SpringBoard`) calls
