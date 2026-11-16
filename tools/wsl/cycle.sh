@@ -66,12 +66,7 @@ attach() {
 
 "$FB" devices 2>/dev/null | grep -q fastboot || {
 	echo "== asking the running kernel for fastboot"
-	attach
-	timeout 25 python3 tools/usb-ring.py reboot > /dev/null 2>&1
-	for i in $(seq 1 30); do
-		sleep 5
-		"$FB" devices 2>/dev/null | grep -q fastboot && break
-	done
+	bash tools/wsl/to-fastboot.sh || exit 1
 }
 "$FB" devices 2>/dev/null | grep -q fastboot || {
 	echo "== no fastboot: power + volume down, or check the cable"

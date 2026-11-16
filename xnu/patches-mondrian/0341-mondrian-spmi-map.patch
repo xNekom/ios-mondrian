@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -730,6 +730,36 @@
+ 	return sp_rd(sp_cnfg, sp_owner_off + 4u * apid) & 7u;
+ }
+ 
++/*
++ * The APID map as the bootloader left it: one ring line per entry with the
++ * PPID it carries and the owner bits. Both matter, because a peripheral this
++ * AP cannot see at all (no entry) and one another processor owns look the
++ * same from a read that returns nothing.
++ */
++void
++mondrian_spmi_dump_map(unsigned int first, unsigned int count)
++{
++	unsigned int i;
++
++	if (!sp_ensure()) {
++		printf("MONDRIAN SPMI: no arbiter\n");
++		return;
++	}
++	if (first >= sp_count) {
++		printf("MONDRIAN SPMI: APIDs %u, %u out of range\n", sp_count,
++		    first);
++		return;
++	}
++	for (i = first; i < sp_count && i < first + count; i++) {
++		uint32_t map = sp_rd(sp_core, sp_map_off + 4u * i);
++		uint32_t owner = sp_rd(sp_cnfg, sp_owner_off + 4u * i) & 7u;
++
++		printf("MONDRIAN SPMI: apid %u ppid 0x%03x owner %u\n", i,
++		    (map >> 8) & 0xfffu, owner);
++	}
++	printf("MONDRIAN SPMI: map %u entries from %u\n", sp_count, first);
++}
++
+ void
+ mondrian_spmi_probe(void)
+ {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2171,6 +2171,22 @@
+ 	printf("%s", out);
+ }
+ 
++/* "spmimap [first [count]]" logs the arbiter's APID map to the ring. */
++static void
++ud_cmd_spmimap(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern void mondrian_spmi_dump_map(unsigned int first, unsigned int count);
++	const char *p;
++	uint32_t first = 0, count = 600;
++
++	p = ud_cmd_num(line + 7, &first);
++	if (p != NULL) {
++		(void)ud_cmd_num(p, &count);
++	}
++	mondrian_spmi_dump_map(first, count);
++	ud_cmd_send(so, to, "spmimap\n", 8);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2569,6 +2585,8 @@
+ 				ud_cmd_thermal(so, peer, cmd);
+ 			} else if (strncmp(cmd, "burn ", 5) == 0) {
+ 				ud_cmd_burn(so, peer, cmd);
++			} else if (strncmp(cmd, "spmimap", 7) == 0) {
++				ud_cmd_spmimap(so, peer, cmd);
+ 			} else if (strcmp(cmd, "haps") == 0 ||
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {

@@ -1,0 +1,456 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
++bsd/dev/mondrian_haptics.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -217,6 +217,92 @@
+ }
+ 
+ /*
++ * A byte of any peripheral the AP owns, addressed by PPID. The haptics block
++ * has no channel window like the VADC's, so reads go through the arbiter
++ * (sp_read) and writes through the command window at CHNLS + apid * 0x1000,
++ * the transaction the restart reason already uses. 1 = done.
++ *
++ * The owner check is not decoration: writing a peripheral another processor
++ * owns is refused by the arbiter, and treating that as a transport failure has
++ * cost a boot before. mondrian_spmi_reg_read_raw() is the one exception, for
++ * HBST: reads of that page are what the vendor driver does on every play.
++ */
++static uint32_t sp_apid_owner(uint16_t apid);	/* defined below */
++
++static int
++sp_apid_for(uint16_t ppid, uint16_t *apid)
++{
++	uint16_t a = sp_find_apid(ppid);
++
++	if (a == 0xffffu) {
++		return 0;
++	}
++	if (sp_apid_owner(a) != 0) {
++		printf("MONDRIAN SPMI: ppid 0x%x is not AP-owned (owner %u)\n",
++		    ppid, sp_apid_owner(a));
++		return 0;
++	}
++	*apid = a;
++	return 1;
++}
++
++int
++mondrian_spmi_reg_read(uint16_t ppid, uint8_t reg, uint8_t *out)
++{
++	uint16_t apid;
++
++	if (!sp_apid_for(ppid, &apid)) {
++		return 0;
++	}
++	return sp_read(apid, reg, out);
++}
++
++int
++mondrian_spmi_reg_read_raw(uint16_t ppid, uint8_t reg, uint8_t *out)
++{
++	uint16_t apid = sp_find_apid(ppid);
++
++	if (apid == 0xffffu) {
++		return 0;
++	}
++	return sp_read(apid, reg, out);
++}
++
++int
++mondrian_spmi_reg_write(uint16_t ppid, uint8_t reg, uint8_t val)
++{
++	static uint16_t cached_ppid;
++	static volatile uint32_t *win;
++	uint16_t apid;
++
++	if (ppid != cached_ppid || win == NULL) {
++		if (!sp_apid_for(ppid, &apid)) {
++			return 0;
++		}
++		win = (volatile uint32_t *)ml_io_map(
++		    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++		    MONDRIAN_SPMI_CHNLS_SIZE);
++		if (win == NULL) {
++			return 0;
++		}
++		cached_ppid = ppid;
++	}
++	win[0x10 / 4] = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	win[0] = (uint32_t)reg << 4;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (uint32_t i = 0; i < MONDRIAN_SPMI_RETRIES; i++) {
++		uint32_t st = win[0x08 / 4];
++
++		if (st & 1u) {
++			return (st & 0x0eu) ? 0 : 1;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++/*
+  * The restart reason the bootloader obeys is the PMIC's, not IMEM's:
+  * qcom-reboot-reason writes one byte into the seven-bit cell at
+  * pmk8350@0/sdam@7100/restart@48, and the codes there are 1 for recovery and
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2075,10 +2075,12 @@
+ 	{
+ 		extern int mondrian_cpufreq_start(void);
+ 		extern void mondrian_thermal_start(void);
++		extern void mondrian_haptics_probe(void);
+ 
+ 		(void)mondrian_cpufreq_start();
+ 		/* after cpufreq: it needs the domains' rows to cap them */
+ 		mondrian_thermal_start();
++		mondrian_haptics_probe();
+ 	}
+ 	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
+ 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2102,6 +2102,75 @@
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "haps" prints the PMIC's HV haptics block, "vib [ms [amp [force]]]" plays a
++ * constant tone on it, and "hapr BLOCK REG" / "hapw BLOCK REG VAL" read and
++ * write one byte by page number (0 CFG, 1 PTN, 2 HBST, read only). Both pairs
++ * are here because the first question is whether the block answers and the
++ * second is whether the actuator moves; one transaction at a time is what
++ * makes a wedge attributable to a register.
++ */
++static void
++ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_haptics_dump(char *out, size_t len);
++	extern int mondrian_haptics_buzz(unsigned int ms, unsigned int amp,
++	    unsigned int force);
++	char out[256];
++	int n;
++
++	if (line[3] == 's') {			/* "haps" */
++		n = mondrian_haptics_dump(out, sizeof(out));
++	} else {				/* "vib [ms [amp [force]]]" */
++		uint32_t ms = 0, amp = 0, force = 0;
++		const char *p = ud_cmd_num(line + 3, &ms);
++
++		if (p != NULL) {
++			p = ud_cmd_num(p, &amp);
++		}
++		if (p != NULL) {
++			(void)ud_cmd_num(p, &force);
++		}
++		n = snprintf(out, sizeof(out), "vib %s\n",
++		    mondrian_haptics_buzz(ms, amp, force) == 0 ? "sent" : "failed");
++	}
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
++static void
++ud_cmd_hapreg(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_haptics_peek(unsigned int block, unsigned int reg,
++	    uint8_t *out);
++	extern int mondrian_haptics_poke(unsigned int block, unsigned int reg,
++	    unsigned int val);
++	char out[96];
++	uint32_t block = 0, reg = 0, val = 0;
++	const char *p = ud_cmd_num(line + 4, &block);
++	uint8_t v = 0;
++	int n;
++
++	p = p != NULL ? ud_cmd_num(p, &reg) : NULL;
++	if (line[3] == 'w' && p != NULL) {
++		p = ud_cmd_num(p, &val);
++	}
++	if (p == NULL) {
++		n = snprintf(out, sizeof(out), "usage: hapr|hapw BLOCK REG [VAL]\n");
++	} else if (line[3] == 'w') {
++		n = snprintf(out, sizeof(out), "hapw %s\n",
++		    mondrian_haptics_poke(block, reg, val) ? "ok" : "failed");
++	} else if (mondrian_haptics_peek(block, reg, &v)) {
++		n = snprintf(out, sizeof(out), "hapr blk %u 0x%02x = 0x%02x\n",
++		    block, reg, v);
++	} else {
++		n = snprintf(out, sizeof(out), "hapr blk %u 0x%02x no answer\n",
++		    block, reg);
++	}
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2500,6 +2569,13 @@
+ 				ud_cmd_thermal(so, peer, cmd);
+ 			} else if (strncmp(cmd, "burn ", 5) == 0) {
+ 				ud_cmd_burn(so, peer, cmd);
++			} else if (strcmp(cmd, "haps") == 0 ||
++			    strcmp(cmd, "vib") == 0 ||
++			    strncmp(cmd, "vib ", 4) == 0) {
++				ud_cmd_hap(so, peer, cmd);
++			} else if (strncmp(cmd, "hapr ", 5) == 0 ||
++			    strncmp(cmd, "hapw ", 5) == 0) {
++				ud_cmd_hapreg(so, peer, cmd);
+ 			} else if (strcmp(cmd, "execdeny") == 0 ||
+ 			    strncmp(cmd, "execdeny ", 9) == 0) {
+ 				ud_cmd_execdeny(so, peer, cmd);
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/mondrian_haptics.c
+@@ -0,0 +1,235 @@
++/*
++ * The vibrator is not an I2C part: SM8475 drives an LRA from the PMIC's HV
++ * haptics block, three SPMI pages on pm8350b (SID 3):
++ *
++ *   CFG   0xf000  enable, VMAX, brake and the play register
++ *   PTN   0xf100  the waveform FIFO and the direct-play amplitude
++ *   HBST  0xf200  the vote for the internal high-voltage boost
++ *
++ * Register numbers are the vendor driver's (qcom-hv-haptics.c): EN_CTL 0x46
++ * bit 7, VMAX 0x48 = mV / 50, SPMI_PLAY 0x4c = source | 0x80, AUTORES 0x63
++ * bit 7, FAULT_CLR 0x66, VSET_CFG 0x68 (force-VREG-ready bit 0, plus bit 1 on
++ * HAP525_HV), the PTN direct-play amplitude 0x26 and the live LRA impedance
++ * 0x0e.
++ *
++ * The boost is HBST's business, not the enable bit's. The vendor votes it
++ * there, and falls back to force-VREG-ready only when the page is not its to
++ * write -- which is this board's case: 0x3f2 belongs to the charger firmware
++ * (owner 3 in the arbiter map that `spmimap` prints). Reading that page is
++ * what the vendor driver does on every play; writing it from this AP is what
++ * the arbiter refuses, so hap_r goes raw there and everything else stays
++ * gated.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(MONDRIAN)
++
++extern int mondrian_spmi_reg_read(uint16_t ppid, uint8_t reg, uint8_t *out);
++extern int mondrian_spmi_reg_read_raw(uint16_t ppid, uint8_t reg, uint8_t *out);
++extern int mondrian_spmi_reg_write(uint16_t ppid, uint8_t reg, uint8_t val);
++extern void delay(int us);
++
++/*
++ * The arbiter's PPID is (sid << 8) | peripheral, not the peripheral alone: the
++ * SID-0 VADC answers at 0x031, and these three pages of pm8350b (SID 3) sit at
++ * 0x3f0, 0x3f1 and 0x3f2. Addressing the block as 0xf0 finds nothing in the
++ * map, which reads exactly like "the block is not there".
++ */
++#define MONDRIAN_HAP_CFG	0x03f0u
++#define MONDRIAN_HAP_PTN	0x03f1u
++#define MONDRIAN_HAP_HBST	0x03f2u
++
++#define HAP_CFG_REV		0x00
++#define HAP_CFG_STATUS_MSB	0x09
++#define HAP_CFG_HPWR_INTF	0x0b
++#define HAP_CFG_FAULT		0x0c
++#define HAP_CFG_IMPEDANCE	0x0e	/* REAL_TIME_LRA_IMPEDANCE */
++#define HAP_CFG_EN_CTL		0x46
++#define HAP_CFG_VMAX		0x48
++#define HAP_CFG_PLAY		0x4c
++#define HAP_CFG_AUTORES		0x63
++#define HAP_CFG_VSET_CFG	0x68
++#define HAP_PTN_REV		0x01
++#define HAP_PTN_DIRECT		0x26
++
++#define HAP_EN_BIT		0x80
++#define HAP_PLAY_EN		0x80
++#define HAP_SRC_DIRECT		0x01
++#define HAP_AUTORES_EN		0x80
++#define HAP_FORCE_VREG_RDY	0x01
++#define HAP_FORCE_VSET_ACK	0x02	/* HAP525_HV only */
++#define HAP_VMAX_MV		1250	/* the DT's qcom,vmax-mv */
++#define HAP_VMAX_STEP_MV	50
++
++static int
++hap_w(uint8_t block, uint8_t reg, uint8_t val)
++{
++	if (block > 1) {
++		return 0;	/* HBST is the charger firmware's page */
++	}
++	return mondrian_spmi_reg_write(
++	    block == 0 ? MONDRIAN_HAP_CFG : MONDRIAN_HAP_PTN, reg, val);
++}
++
++static int
++hap_r(uint8_t block, uint8_t reg, uint8_t *out)
++{
++	if (block == 2) {
++		return mondrian_spmi_reg_read_raw(MONDRIAN_HAP_HBST, reg, out);
++	}
++	return mondrian_spmi_reg_read(
++	    block == 0 ? MONDRIAN_HAP_CFG : MONDRIAN_HAP_PTN, reg, out);
++}
++
++/* One register, one transaction: the unit the USB side walks. */
++int
++mondrian_haptics_peek(unsigned int block, unsigned int reg, uint8_t *out)
++{
++	if (block > 2 || reg > 0xff) {
++		return 0;
++	}
++	return hap_r((uint8_t)block, (uint8_t)reg, out);
++}
++
++int
++mondrian_haptics_poke(unsigned int block, unsigned int reg, unsigned int val)
++{
++	if (block > 2 || reg > 0xff || val > 0xff) {
++		return 0;
++	}
++	return hap_w((uint8_t)block, (uint8_t)reg, (uint8_t)val);
++}
++
++/*
++ * Off by default. The first read that actually reached the block (after the
++ * PPID was corrected) cost a boot, so this probe answers to `hap=1` and the
++ * live haps/hapr/hapw commands are the way to walk it.
++ */
++void
++mondrian_haptics_probe(void)
++{
++	extern int PE_parse_boot_argn(const char *arg, void *result, int len);
++	int on = 0;
++	uint8_t cfg = 0, ptn = 0;
++
++	if (!PE_parse_boot_argn("hap", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (!hap_r(0, HAP_CFG_REV, &cfg) || !hap_r(1, HAP_PTN_REV, &ptn)) {
++		printf("MONDRIAN HAP: the block did not answer\n");
++		return;
++	}
++	printf("MONDRIAN HAP: cfg rev %u ptn rev %u\n", cfg, ptn);
++}
++
++/*
++ * Constant tone. amplitude is the PTN register (0xff is the vendor's full
++ * scale) and ms is capped low on purpose: this is the first time the port
++ * drives an HV block. force sets force-VREG-ready (CFG 0x68), the vendor's
++ * path for a boost the charger firmware owns, so one boot can compare both.
++ *
++ * The impedance and status read 20 ms in are what says whether anything
++ * happened: a tone that moves the LRA changes both, a tone into an unpowered
++ * block leaves impedance at 0 and hpwr at HPWR_DISABLED (0).
++ */
++int
++mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
++{
++	uint8_t vmax = HAP_VMAX_MV / HAP_VMAX_STEP_MV;
++	uint8_t z = 0, st = 0, hpwr = 0;
++	int ok = 1;
++
++	if (ms == 0) {
++		ms = 100;
++	}
++	if (ms > 2000) {
++		return -1;
++	}
++	if (amp == 0 || amp > 0xffu) {
++		amp = 0x40;
++	}
++	ok &= hap_w(0, HAP_CFG_VMAX, vmax);
++	ok &= hap_w(0, HAP_CFG_EN_CTL, HAP_EN_BIT);
++	if (force != 0) {
++		ok &= hap_w(0, HAP_CFG_VSET_CFG,
++		    HAP_FORCE_VREG_RDY | HAP_FORCE_VSET_ACK);
++	}
++	ok &= hap_w(0, HAP_CFG_AUTORES, HAP_AUTORES_EN);
++	ok &= hap_w(1, HAP_PTN_DIRECT, (uint8_t)amp);
++	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT | HAP_PLAY_EN);
++	delay(20 * 1000);
++	if (hap_r(0, HAP_CFG_IMPEDANCE, &z) && hap_r(0, HAP_CFG_STATUS_MSB, &st)) {
++		printf("MONDRIAN HAP: playing amp 0x%02x force %u: impedance 0x%02x"
++		    " status 0x%02x\n", amp, force, z, st);
++	} else {
++		printf("MONDRIAN HAP: playing amp 0x%02x force %u: no answer\n",
++		    amp, force);
++	}
++	if (ms > 20) {
++		delay((ms - 20) * 1000);
++	}
++	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT);
++	ok &= hap_w(0, HAP_CFG_EN_CTL, 0);
++	if (force != 0) {
++		(void)hap_w(0, HAP_CFG_VSET_CFG, 0);
++	}
++	if (hap_r(0, HAP_CFG_STATUS_MSB, &st) &&
++	    hap_r(0, HAP_CFG_HPWR_INTF, &hpwr)) {
++		printf("MONDRIAN HAP: stopped: status 0x%02x hpwr 0x%02x\n",
++		    st, hpwr);
++	}
++	printf("MONDRIAN HAP: buzz %u ms amp 0x%02x vmax %d force %u %s\n", ms,
++	    amp, HAP_VMAX_MV, force, ok ? "sent" : "with a failed write");
++	return ok ? 0 : -1;
++}
++
++/*
++ * The whole block for one USB line, in the order that answers "is it there, is
++ * it alive, is it playing". The walk stops at the first register that does not
++ * answer and names it: that is the whole point of doing this from the USB side.
++ */
++static const struct {
++	uint8_t block, reg;
++	const char *name;
++} hap_dump_regs[] = {
++	{ 0, HAP_CFG_REV, "cfg-rev" },
++	{ 1, HAP_PTN_REV, "ptn-rev" },
++	{ 0, HAP_CFG_STATUS_MSB, "status" },
++	{ 0, HAP_CFG_HPWR_INTF, "hpwr" },
++	{ 0, HAP_CFG_FAULT, "fault" },
++	{ 0, HAP_CFG_VMAX, "vmax" },
++	{ 1, HAP_PTN_DIRECT, "amp" },
++	{ 0, HAP_CFG_PLAY, "play" },
++	{ 0, HAP_CFG_VSET_CFG, "vset" },
++	{ 0, HAP_CFG_EN_CTL, "en" },
++	/* The boost page: read only, and the bit that says if it is up. */
++	{ 2, 0x46, "hbst-vreg" },
++	{ 2, 0x41, "hbst-follow" },
++};
++
++int
++mondrian_haptics_dump(char *out, size_t len)
++{
++	char line[224];
++	size_t used;
++	unsigned int i;
++
++	used = (size_t)snprintf(line, sizeof(line), "haps:");
++	for (i = 0; i < sizeof(hap_dump_regs) / sizeof(hap_dump_regs[0]); i++) {
++		uint8_t v = 0;
++
++		if (!hap_r(hap_dump_regs[i].block, hap_dump_regs[i].reg, &v)) {
++			used += (size_t)snprintf(line + used,
++			    sizeof(line) - used, " %s no answer",
++			    hap_dump_regs[i].name);
++			break;
++		}
++		used += (size_t)snprintf(line + used, sizeof(line) - used,
++		    " %s 0x%02x", hap_dump_regs[i].name, v);
++	}
++	used += (size_t)snprintf(line + used, sizeof(line) - used, "\n");
++	return snprintf(out, len, "%s", line);
++}
++#endif /* MONDRIAN */
