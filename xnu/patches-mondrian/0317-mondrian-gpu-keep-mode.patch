@@ -1,9 +1,34 @@
 --- a/bsd/dev/mondrian_gpu.c
 +++ b/bsd/dev/mondrian_gpu.c
-@@ -3857,6 +3857,39 @@
+@@ -3857,6 +3857,66 @@
   * already up, so this is a no-op; it exists for gpukeep=0, kgsl's
   * submit-time toggle and the default until the measured death above.
   */
++/*
++ * a6xx_gmu_gx_is_on(): GX is up when neither its GDSC nor its clock reports
++ * off. Bit 0 is "GDSC off", bit 1 "clock off" -- the same register the probe
++ * prints as "gfx pwr clk". Sleeping a fixed 2 ms here is what makes the first
++ * register access after a collapse fault: the GMU takes as long as it takes.
++ */
++static int
++mondrian_gpu_gx_wait_up(void)
++{
++	uint32_t v = ~0u;
++	int ms;
++
++	for (ms = 0; ms < 2000; ms++) {
++		v = mondrian_gpu_read(mondrian_uc_gmu, GMU_OFF(0x1f8d0u));
++		if ((v & 3u) == 0) {
++			if (ms > 2) {
++				printf("MONDRIAN GPU: GX up after %d ms\n", ms);
++			}
++			return 1;
++		}
++		delay(1000);
++	}
++	printf("MONDRIAN GPU: GX still down after 2000 ms (0x%08x)\n", v);
++	return 0;
++}
 +/*
 + * kgsl's power modes, at run time: 0 raises the GMU keepalive around each
 + * register access and drops it after (the GPU collapses while idle), 1 holds
@@ -11,6 +36,8 @@
 + * raises it. The probe reads the mode, so one boot can drop the keepalive on a
 + * live system and see whether anything touches the GPU while it is collapsed.
 + */
++
++
 +int
 +mondrian_gpu_keep_mode(void)
 +{
@@ -29,7 +56,7 @@
 +	if (mode == 1) {
 +		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1u);
 +		__asm__ volatile("dsb sy" ::: "memory");
-+		delay(2000);
++		(void)mondrian_gpu_gx_wait_up();
 +	} else if (mode != 1 && was == 1) {
 +		mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 0u);
 +		__asm__ volatile("dsb sy" ::: "memory");
@@ -40,17 +67,12 @@
  static uint32_t mondrian_uc_keep_depth;
  
  static void
-@@ -3869,6 +3902,13 @@
+@@ -3869,6 +3902,8 @@
  		if (mondrian_uc_keep_depth++ == 0) {
  			mondrian_gpu_write(mondrian_uc_gmu, GMU_OFF(0x1f8c3u), 1u);
  			__asm__ volatile("dsb sy" ::: "memory");
-+			/*
-+			 * The GMU raises the keepalive asynchronously: the next access to
-+			 * a core register before it acts hangs the CPU that issued it.
-+			 * kgsl waits on the GMU's own status; this is the cheap version
-+			 * until that status register is trusted.
-+			 */
-+			delay(2000);
++			/* The GMU raises the keepalive asynchronously: wait for GX. */
++			(void)mondrian_gpu_gx_wait_up();
  		}
  		return;
  	}
