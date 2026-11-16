@@ -247,9 +247,10 @@ behind the ADSP; dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
 
 Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
-`tools/usb-ring.py` (see `README.md`). `0335` adds a read-only disk beside it:
-interface 2 is bulk-only mass storage over the GPT `userdata` partition, on the
-endpoint pair the ECM function leaves free (0x03/0x83, FIFO 3). `usb=1` probes.
+`tools/usb-ring.py` (see `README.md`). `0335` carries a read-only disk over the
+GPT `userdata` partition but keeps it out of the descriptor: the core takes
+`DEPCFG` on 0x02/0x03/0x83 with status 0 and never completes a packet, even
+with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 
 ## Getting the numbers off the device
 

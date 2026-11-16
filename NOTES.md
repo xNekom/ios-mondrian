@@ -41,10 +41,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   reboots to the bootloader. `tools/ios-usbnet.sh` sets the host up, NATs the
   link and streams udp/5140; names resolve only once the hook publishes
   `State:/Network/Service/mondrian-usb/{IPv4,DNS}` in configd's store -- iOS
-  never reads `/etc/resolv.conf`, so TCP answered while DNS did not. A cold boot
-  now enumerates: `0312` makes the DWC3 reset (PHY powered, PIPE clock from
-  UTMI) and `0313` votes the eUSB2 repeater's rails. The repeater answers
-  nothing on i2c5 even when powered; `mondrianusbfallback=N` returns to fastboot.
+  never reads `/etc/resolv.conf`. A cold boot now enumerates: `0312` makes the
+  DWC3 reset (PHY powered, PIPE clock from UTMI) and `0313` votes the eUSB2
+  repeater's rails; it answers nothing on i2c5 even when powered, and
+  `mondrianusbfallback=N` returns to fastboot. This core has one RX FIFO per
+  OUT endpoint (`GRXFIFOSIZ`, depth in 8-byte units) and the bootloader only
+  sizes the ones it uses; depth 0 NAKs every packet and `DEPCFG` still says 0.
 - **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) reads 268 671 s
   (1975) and belongs to another processor (owner 4), so a write is refused:
   `mondriantime=<seconds>` seeds the date, `rtc set SECONDS` moves the clock

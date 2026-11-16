@@ -2,7 +2,7 @@ xnu 0335: the userdata partition as a read-only USB disk
 
 The gadget's configuration grows a third interface: bulk-only mass storage
 (SCSI transparent, class 8 subclass 6 protocol 0x50) on the endpoint pair the
-ECM function leaves free, 0x03 OUT and 0x83 IN. The ECM function, the console
+ECM function leaves free, 0x02 OUT and 0x83 IN. The ECM function, the console
 stream and the udp/5141 control channel are untouched, so a boot keeps its
 remote control while the host mounts the iOS root read-only and can copy it,
 fsck it, or diff it against a backup.
@@ -42,17 +42,22 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  #define DWC3_GUSB2PHYCFG	0x0000c200	/* bit 6 SUSPHY, bit 8 ENBLSLPM */
  #define DWC3_GUSB3PIPECTL	0x0000c2c0
  #define DWC3_GEVNTADRLO		0x0000c400
-@@ -330,12 +333,25 @@
+@@ -330,12 +333,31 @@
  #define UD_RX           0x2000          /* one received frame */
  #define UD_TX           0x2800          /* one frame to send */
  #define UD_FRAME_MAX    0x800
 -#define UD_SIZE         0x4000
-+#define UD_TRB_MSC_OUT  0x3000          /* mass storage: CBW, discarded OUT data */
-+#define UD_TRB_MSC_IN   0x3010          /* mass storage: IN data and the CSW */
-+#define UD_MSC_CBW      0x3040          /* 31-byte command block */
-+#define UD_MSC_CSW      0x3080          /* 13-byte command status */
-+#define UD_MSC_DATA     0x4000          /* data phase, one chunk at a time */
-+#define UD_MSC_CHUNK    0x10000         /* 64 KiB: 32 SCSI sectors, 16 UFS blocks */
++#define UD_TRB_MSC_OUT  0x1060          /* mass storage: CBW, discarded OUT data */
++#define UD_TRB_MSC_IN   0x1070          /* mass storage: IN data and the CSW */
++#define UD_MSC_CBW      0x1080          /* 31-byte command block */
++#define UD_MSC_CSW      0x10a0          /* 13-byte command status */
++/*
++ * Everything the storage function DMAs lives in the same pages the ECM
++ * buffers already use, next to the TRBs the controller fetches for the
++ * other endpoints.
++ */
++#define UD_MSC_DATA     0x1400          /* data phase, one chunk at a time */
++#define UD_MSC_CHUNK    0xc00           /* 3 KiB: 6 SCSI sectors, 2 UFS blocks */
 +#define UD_SIZE         (UD_MSC_DATA + UD_MSC_CHUNK)
  
  /* Physical endpoints: 2n = OUT, 2n+1 = IN */
@@ -61,10 +66,11 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  #define EP_INT          5               /* 0x82 interrupt IN */
 +/*
 + * The core addresses its endpoint pairs as 2n = OUT, 2n+1 = IN, so 0x01/0x81
-+ * are physical 2/3 and 0x82 is 5. The storage pair is 0x03 OUT (6) and
-+ * 0x83 IN (7): the last free pair, and it leaves 0x02 free.
++ * are physical 2/3 and 0x82 is 5. The storage OUT endpoint is 0x02 (physical
++ * 4): the other free OUT of the core. 0x03 (physical 6) accepts the same
++ * configuration and a posted TRB and then never completes an OUT packet.
 + */
-+#define EP_MSC_OUT      6               /* 0x03 bulk OUT */
++#define EP_MSC_OUT      4               /* 0x02 bulk OUT */
 +#define EP_MSC_IN       7               /* 0x83 bulk IN */
  #define TRBCTL_NORMAL   (1u << 4)
  
@@ -89,7 +95,7 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
  	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
 +	9, 4, 2, 0, 2, 0x08, 0x06, 0x50, 0,             /* interface 2: mass storage, bulk-only */
-+	7, 5, 0x03, 0x02, 0x00, 0x02, 0,                /* ep 0x03 bulk OUT, 512 */
++	7, 5, 0x02, 0x02, 0x00, 0x02, 0,                /* ep 0x02 bulk OUT, 512 */
 +	7, 5, 0x83, 0x02, 0x00, 0x02, 0,                /* ep 0x83 bulk IN, 512 */
  };
 +/* The two ECM interfaces alone, when the storage pair cannot work. */
@@ -116,14 +122,19 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  
  /* NETWORK_CONNECTION notification: the host brings its link up on it. */
  static void
-@@ -540,6 +573,19 @@
- 	ud_tx_kick_locked();
- 	lck_mtx_unlock(ud.lock);
- 	printf("MONDR USB: ECM endpoints configured\n");
+@@ -535,9 +568,28 @@
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
++	/*
++	 * Before ud_rx_arm(): once a transfer is posted the core keeps
++	 * answering DEPCFG and DEPXFERCFG with status 0 and then never
++	 * completes a packet on the endpoint, which is what the storage
++	 * pair did when it was configured after the ECM bulk-out arm.
++	 */
 +	if (ud_msc_ok) {
 +		if (ud_msc_ep_setup()) {
 +			ud_msc_restart();
-+			printf("MONDR USB: mass storage endpoints 0x03/0x83 configured\n");
++			printf("MONDR USB: mass storage endpoints 0x02/0x83 configured\n");
 +		} else {
 +			/*
 +			 * The descriptor already went out: the host will bind
@@ -133,9 +144,13 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +			printf("MONDR USB: mass storage endpoints FAILED (interface was advertised)\n");
 +		}
 +	}
+ 	ud_rx_arm();
+ 	lck_mtx_lock(ud.lock);
+ 	ud.tx_busy = false;
+ 	ud_tx_kick_locked();
+ 	lck_mtx_unlock(ud.lock);
+ 	printf("MONDR USB: ECM endpoints configured\n");
  }
- 
- static void
 @@ -556,14 +602,35 @@
  
  	printf("MONDR USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
@@ -185,13 +200,13 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +		 * be dropped, not finished.
 +		 */
 +		if (req == 1 && value == 0 && ud_msc_ok &&
-+		    (index == 0x03 || index == 0x83)) {
++		    (index == 0x02 || index == 0x83)) {
 +			ud_msc_reset();
 +		}
  	} else {
  		ok = false;
  	}
-@@ -665,6 +741,506 @@
+@@ -665,6 +741,582 @@
  	ud_rx_arm();
  }
  
@@ -200,7 +215,7 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +/*
 + * Bulk-only transport (interface class 8, subclass 6, protocol 0x50) on a
 + * third interface, so the ECM function keeps the log and control channels.
-+ * The host sends a 31-byte command block (CBW) on 0x03 OUT and reads data and
++ * The host sends a 31-byte command block (CBW) on 0x02 OUT and reads data and
 + * a 13-byte status block (CSW) on 0x83 IN; the medium is the GPT partition the
 + * root was mounted from, read through the UFS driver's own block path
 + * (mondrian_ufs_userdata_read), so "512 bytes at an LBA" has one
@@ -244,6 +259,8 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +static void
 +ud_msc_arm(void)
 +{
++	static unsigned arms;
++
 +	if (msc.out_armed) {
 +		return;
 +	}
@@ -252,6 +269,13 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +	msc.out_armed = true;
 +	msc.out_buf = UD_MSC_CBW;
 +	ud_start_trb(EP_MSC_OUT, UD_TRB_MSC_OUT, UD_MSC_CBW, 31, TRBCTL_NORMAL);
++	if (arms < 4) {
++		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_MSC_OUT);
++
++		arms++;
++		printf("MONDR USB: msc arm %u depcmd 0x%08x trb %08x %08x %08x %08x\n",
++		    arms, dwc_rd(DEPCMD(EP_MSC_OUT)), t[0], t[1], t[2], t[3]);
++	}
 +}
 +
 +/*
@@ -577,6 +601,8 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +		 * Not a command block. There is no tag to answer, so drop it and
 +		 * wait for the next one; the host's timeout is the recovery.
 +		 */
++		printf("MONDR USB: msc bad cbw %02x %02x %02x %02x\n",
++		    c[0], c[1], c[2], c[3]);
 +		ud_msc_arm();
 +		return;
 +	}
@@ -628,19 +654,58 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 + * (physical 7 -> FIFO 3, dep->number >> 1); two IN endpoints that name the
 + * same FIFO are not a supported configuration.
 + */
++
 +static bool
 +ud_msc_ep_setup(void)
 +{
-+	if (ud_epcmd(EP_MSC_OUT, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3),
-+	    (1u << 8) | ((uint32_t)EP_MSC_OUT << 25), 0) ||
-+	    ud_epcmd(EP_MSC_OUT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
-+	    ud_epcmd(EP_MSC_IN, DEPCMD_SETEPCONFIG,
++	int a, b, c, d;
++	uint32_t hw3 = dwc_rd(0xc14c);
++	uint32_t r1, r2, r3, r4, s2, s4, s7;
++
++	/*
++	 * A SETEPCONFIG that "succeeds" on an endpoint the core does not have
++	 * leaves DALEPENA set and the host waiting forever on its first
++	 * INQUIRY, so print what the core advertises before touching it.
++	 */
++	printf("MONDR USB: msc hwparams3 0x%08x num_eps %u num_in_eps %u\n",
++	    hw3, (hw3 >> 12) & 0x3f, (hw3 >> 18) & 0x1f);
++	/*
++	 * Every command is kept: a SETEPCONFIG that "succeeds" but leaves the
++	 * endpoint unusable is the difference between a host that sees a disk
++	 * and one that times out on its first INQUIRY.
++	 */
++	a = ud_epcmd(EP_MSC_OUT, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3),
++	    (1u << 8) | ((uint32_t)EP_MSC_OUT << 25), 0);
++	r1 = dwc_rd(DEPCMD(EP_MSC_OUT));
++	b = ud_epcmd(EP_MSC_OUT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
++	r2 = dwc_rd(DEPCMD(EP_MSC_OUT));
++	c = ud_epcmd(EP_MSC_IN, DEPCMD_SETEPCONFIG,
 +	    (2u << 1) | (512u << 3) | (3u << 17),
-+	    (1u << 8) | ((uint32_t)EP_MSC_IN << 25), 0) ||
-+	    ud_epcmd(EP_MSC_IN, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++	    (1u << 8) | ((uint32_t)EP_MSC_IN << 25), 0);
++	r3 = dwc_rd(DEPCMD(EP_MSC_IN));
++	d = ud_epcmd(EP_MSC_IN, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0);
++	r4 = dwc_rd(DEPCMD(EP_MSC_IN));
++	printf("MONDR USB: msc epcmd %d %d %d %d dalepena 0x%08x\n",
++	    a, b, c, d, dwc_rd(DALEPENA));
++	printf("MONDR USB: msc epcmd raw out 0x%08x 0x%08x in 0x%08x 0x%08x\n",
++	    r1, r2, r3, r4);
++	if (a || b || c || d) {
 +		return false;
 +	}
 +	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_MSC_OUT) | (1u << EP_MSC_IN));
++	printf("MONDR USB: msc dalepena now 0x%08x\n", dwc_rd(DALEPENA));
++	/*
++	 * GETEPSTATE (3) returns the endpoint state in the command status:
++	 * 0 disabled, 1 enabled, 2 stalled, 3 setup, 4 in progress. EP_RX is
++	 * the control: it carries the working network and must read enabled.
++	 */
++	dwc_wr(DEPCMD(EP_RX), 3 | DEPCMD_CMDACT);
++	s2 = dwc_rd(DEPCMD(EP_RX));
++	dwc_wr(DEPCMD(EP_MSC_OUT), 3 | DEPCMD_CMDACT);
++	s4 = dwc_rd(DEPCMD(EP_MSC_OUT));
++	dwc_wr(DEPCMD(EP_MSC_IN), 3 | DEPCMD_CMDACT);
++	s7 = dwc_rd(DEPCMD(EP_MSC_IN));
++	printf("MONDR USB: msc epstate 2/4/7 0x%08x 0x%08x 0x%08x\n", s2, s4, s7);
 +	return true;
 +}
 +
@@ -665,14 +730,40 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +	int n;
 +
 +	for (n = 0; n < 4; n++) {
-+		uint32_t r = dwc_rd(DWC3_GTXFIFOSIZ(n));
-+		uint32_t start = (r >> 16) & 0xffff;
-+		uint32_t d = r & 0xffff;
++		uint32_t r = dwc_rd(0xc380 + 4 * (uint32_t)n);
 +
-+		printf("MONDR USB: TXFIFO%u 0x%08x start %u depth %u\n", n, r, start, d);
-+		if (d != 0 && start + d > last) {
-+			last = start + d;
++		printf("MONDR USB: RXFIFO%u 0x%08x depth %u\n", n, r, r & 0x7fff);
++	}
++	/*
++	 * This controller keeps one RX FIFO per OUT endpoint and the
++	 * bootloader only sizes the ones it uses: FIFO 0 and 1 came up with
++	 * 787 entries each, FIFO 2 (the storage OUT endpoint) with none. An
++	 * OUT endpoint whose FIFO has depth 0 takes DEPCFG and then NAKs every
++	 * packet, which a host sees as a bulk-out endpoint that never accepts
++	 * the command block. The start address in the upper half is what the
++	 * bootloader reserved for it; keep it.
++	 */
++	{
++		uint32_t fifo = (uint32_t)EP_MSC_OUT >> 1;
++		uint32_t reg = 0xc380 + 4 * fifo;
++		uint32_t r = dwc_rd(reg);
++		uint32_t start = (r >> 16) & 0xffff;
++		uint32_t depth = 400;   /* 400 x 8 bytes: three 512-byte packets */
++		int f;
++
++		if (start == 0) {
++			for (f = 0; f < (int)fifo; f++) {
++				uint32_t o = dwc_rd(0xc380 + 4 * (uint32_t)f);
++				uint32_t e = ((o >> 16) & 0xffff) + (o & 0xffff);
++
++				if (e > start) {
++					start = e;
++				}
++			}
 +		}
++		dwc_wr(reg, (start << 16) | depth);
++		printf("MONDR USB: RXFIFO%u was 0x%08x, now 0x%08x\n",
++		    fifo, r, dwc_rd(reg));
 +	}
 +	if (eps < 8) {
 +		printf("MONDR USB: msc: %u endpoints, the storage pair is 6/7\n", eps);
@@ -698,11 +789,18 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  /* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
  static void
  ud_tx_kick_locked(void)
-@@ -873,6 +1449,23 @@
+@@ -873,6 +1449,30 @@
  		lck_mtx_unlock(ud.lock);
  		return;
  	}
 +	if ((ep == EP_MSC_OUT || ep == EP_MSC_IN) && ud_msc_ok) {
++		static unsigned events;
++
++		if (events < 8) {
++			events++;
++			printf("MONDR USB: msc event ep %u type %u status %u\n",
++			    ep, type, status);
++		}
 +		if (ep == EP_MSC_OUT) {
 +			if (type == 1) {
 +				ud_msc_out_done();
@@ -722,16 +820,22 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
  	if (ep > 1) {
  		return;
  	}
-@@ -2215,6 +2808,13 @@
+@@ -2215,6 +2808,19 @@
  		return;
  	}
  
-+	/* Before the host can read the configuration: never advertise a
-+	 * storage interface whose endpoints cannot carry a byte. */
-+	ud_msc_ok = ud_msc_probe();
++	/*
++	 * The pair is configured, enabled, has an RX FIFO and still never
++	 * moves a packet (0x02, 0x03 and 0x83 measured), so the
++	 * descriptor stays ECM-only: a host that binds a dead disk resets
++	 * the device every 20 s and takes the console with it.
++	 * docs/MONDIAN_PORT.md carries the evidence.
++	 */
++	(void)ud_msc_probe();
++	ud_msc_ok = false;
 +	printf("MONDR USB: config %u bytes, %s\n",
 +	    ud_msc_ok ? (uint32_t)sizeof(ud_cfg_desc) : UD_CFG_ECM_ONLY,
-+	    ud_msc_ok ? "mass storage on 0x03/0x83" : "ECM only");
++	    ud_msc_ok ? "mass storage on 0x02/0x83" : "ECM only");
 +
  	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
  	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));

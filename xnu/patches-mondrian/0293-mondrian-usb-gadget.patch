@@ -16,7 +16,7 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mondrian_usb.c
-@@ -0,0 +1,1258 @@
+@@ -0,0 +1,1264 @@
 +/*
 + * MONDRIAN: USB bring-up, step 1 - read-only state probe.
 + *
@@ -527,6 +527,12 @@ new file mode 100644
 +	if (ud.configured) {
 +		return;
 +	}
++	/*
++	 * DEPCFG is only valid on a disabled endpoint: reconfiguring after a
++	 * bus reset with the old DALEPENA bits still set left the controller
++	 * with a stale configuration and no transfer ever completed there.
++	 */
++	dwc_wr(DALEPENA, (1u << 0) | (1u << 1));	/* EP0/EP1 stay enabled */
 +	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
 +	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
 +	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
