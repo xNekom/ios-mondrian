@@ -191,8 +191,17 @@ of one boot comparable without a second boot.
 **`watchdogd` is the loop the list cannot touch.** 24 to 31 crash lines per four
 minutes in both windows, i.e. one every ten seconds, with or without its exec
 refused: it dies inside its own libdispatch callback (`pc == lr`) after being
-started, so refusing the *next* exec changes nothing. That is the loop to
-remove; the other names are noise around it.
+started, so refusing the *next* exec changes nothing.
+
+**It dies because the boot arguments are not in IOKit.** The signal is
+`sig 5 code 0x600000001` at `watchdogd+0xb620`, which is the `brk` after its own
+`__os_crash("could not retrieve device boot-args")`: `watchdogd` reads
+`IODeviceTree:/options` through `IORegistryEntryFromPath` and
+`IORegistryEntryCreateCFProperty("boot-args")`, and this port publishes no
+NVRAM node, so the lookup fails and its failure path is a trap rather than a
+fallback. `0336` attaches an `options` node to the device-tree root with the
+kernel's command line as `boot-args`; nothing writes it back, which is what an
+NVRAM controller would be for. A crash at that offset is this, not a watchdog.
 
 ### 3. The frame path is marginal
 
