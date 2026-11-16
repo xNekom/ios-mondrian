@@ -21,18 +21,16 @@ PMIC, and the PSCI conduit (QEMU uses `hvc`).
 
 Every one of these was a boot that died for a reason that is not a kernel bug:
 
-- **No MDP.** `mkadt.py --qemu` leaves `disp0` out. With the node, the
+- **No MDP.** `mkadt.py --qemu` leaves `disp0` out: with the node, the
   framebuffer driver reads a register that is not there, takes a synchronous
   external abort, and QEMU re-executes the instruction for ever.
-- **No UART on the board, and no panel either.** The phone's console is the
-  panel, so `--qemu` emits `mondrian-qemu-uart` (PL011 at `0x09000000`) instead
-  of `mondrian-fbcon`, and `pe_serial.c` drives it as one more serial device.
-  The HUD (panic report, `KABORT`, the memory lines) paints the panel; with no
-  panel node (`mondrian_panel_absent`) those rows go to the console, or a guest
-  panic is silent.
+- **No UART and no panel.** `--qemu` emits `mondrian-qemu-uart` (PL011 at
+  `0x09000000`) instead of `mondrian-fbcon`; with no panel node
+  (`mondrian_panel_absent`) the HUD rows go to that console, or a panic is
+  silent.
 - **No block device.** `bsd/dev/mondrian_virtio.c` is virtio-blk over the modern
-  virtio-mmio transport, polled: the node carries no interrupt, so the GIC never
-  forwards the line. The image stays on the host, so a 16 GB root fits here.
+  virtio-mmio transport, polled (no interrupt, so the GIC never forwards the
+  line). The image stays on the host, so a 16 GB root fits.
 - **No PMIC.** The SPMI windows are board constants, not tree entries, so the
   RTC read in `IOKitInitializeTime()` aborts. `mondrianspmi=0` skips it.
 
@@ -64,9 +62,8 @@ The run directory has to be on the Linux side: QEMU's QMP socket fails to bind
 under `/mnt/c` ("Operation not supported") and the run exits 1 before the guest
 starts.
 
-A run carries the dylib the *image* holds, not the kernel's blob:
-`tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR` replaces it, or a stale
-copy answers for the hook.
+A run carries the dylib the *image* holds, not the kernel's blob
+(`tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR` replaces it).
 
 **The command line must be one line.** A multi-line string inside the shell
 quotes puts a newline after `rd=vblk0`, `rdBootVar` stops being the string
