@@ -1369,6 +1369,14 @@ framebuffer selector from the compositor and `present` 0/s. The accessory call
 is the first of several synchronous replies `backboardd` waits for at startup,
 not the cause of the black screen by itself.
 
+A probe inside `backboardd` is racy: of eight boots with the same kind of
+dylib, two reached the accessory call (`loaded` followed by `skipped`) and six
+landed in the `BKLogCommon` block before it (`loaded` only). Deferring the
+worker threads out of the constructor did not change that, and neither did
+turning off `msgtrace`, so the race is between the dylib's own load and logd
+being ready, not between the probe's threads. Only a boot whose ring has the
+`skipped` line measured the accessory step.
+
 Two build facts, one boot each:
 
 - The interpose only binds if the framework is linked. With

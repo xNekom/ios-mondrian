@@ -26,6 +26,8 @@
 #import <unistd.h>
 #import <errno.h>
 
+static void say(const char *message);
+
 extern void CoreAccessoriesInitForHID(void);
 
 static void
@@ -114,6 +116,29 @@ mondrian_probe_container(void *unused)
 	return NULL;
 }
 
+/*
+ * One thread at load, the rest after the init window: the boots that reached
+ * the accessory call are the ones whose constructor did one `pthread_create`
+ * and one console write. A second thread created there is enough to land
+ * `backboardd` in the BKLogCommon race instead (see docs/MONDIAN_GPU.md), so
+ * the workers start a few seconds later.
+ */
+static void *
+mondrian_probe_boot(void *unused)
+{
+	pthread_t thread;
+
+	(void)unused;
+	sleep(3);
+	if (pthread_create(&thread, NULL, mondrian_probe_report, NULL) == 0) {
+		pthread_detach(thread);
+	}
+	if (pthread_create(&thread, NULL, mondrian_probe_container, NULL) == 0) {
+		pthread_detach(thread);
+	}
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_probe_start(void)
@@ -125,10 +150,7 @@ mondrian_probe_start(void)
 	    getpid(), getprogname(),
 	    dlsym(RTLD_DEFAULT, "CoreAccessoriesInitForHID"));
 	say(line);
-	if (pthread_create(&thread, NULL, mondrian_probe_report, NULL) == 0) {
-		pthread_detach(thread);
-	}
-	if (pthread_create(&thread, NULL, mondrian_probe_container, NULL) == 0) {
+	if (pthread_create(&thread, NULL, mondrian_probe_boot, NULL) == 0) {
 		pthread_detach(thread);
 	}
 }

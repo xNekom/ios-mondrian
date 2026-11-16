@@ -372,7 +372,7 @@ MONDRIAN = Board(
              # msgtrace: record every send of one pid together with the owner
              # of the destination port (0332/0333), so a reply that never
              # arrives names the process that owes it.
-             'msgtrace=57'),
+             'msgtrace=26'),
 )
 
 BOARDS = {b.name: b for b in (SWEET, MONDRIAN)}
