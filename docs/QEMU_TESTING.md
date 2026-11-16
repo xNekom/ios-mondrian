@@ -71,20 +71,28 @@ A run carries the dylib the *image* holds, not the kernel's blob:
 `tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR` replaces it, or a stale
 copy answers for the hook.
 
+**The command line must be one line.** A multi-line string inside the shell
+quotes puts a newline after `rd=vblk0`, `rdBootVar` stops being the string
+`vblk0`, the guest falls into the generic `IOBSDNameMatching` path and waits for
+a disk for ever — which reads exactly like a virtio driver that never probed.
+`tools/wsl/qemu-run.sh` builds it in one line and runs the whole thing.
+
+What a good run looks like (measured): `MONDRIAN VBLK: virtio-blk, 16384 MiB`,
+`hfs: mounted iOSRoot on device b(1, 0)`, `exec launchd`, then the ignition log
+and hundreds of `exec`s. `result.json` still says `incomplete_decode` because
+there is no panel to read the framebuffer from; that is the decoder, not the
+boot.
+
 Options worth knowing: `--board mondrian` picks the 1440x3200 panel and the
 `max` CPU model (the board is armv8.5 and touches `DIT`, which `cortex-a76`
 lacks); `--live-serial` streams the console; `--gdb` starts halted with a stub
 on 1234; `--hmp "xp/8gx 0x<pa>"` reads guest memory after the stop.
 
-## Environment knobs
-
-`QEMU_PHYS_BASE`/`QEMU_MEM_SIZE` pick another window of RAM (default
-`0xb0000000`/`0x4d000000`; the phone's own shape is `0x100000000`/`0x180000000`),
-and `ADT_SEED` pins the random seed the physmap slide derives from.
-
 ## Reading the result
 
 `no_panic_observed` means "no visible panic in the framebuffer snapshot", not
 "booted": with `--qemu` read `serial.txt` and `qemu.log`/`qemu-triage.py` when
-its last line is not enough. Two traps: the ADT's CPU node must carry MPIDR 0
-(the boot core is 7) and `phystokv()` panics outside the window.
+its last line is not enough. With no panel, `result.json` says
+`incomplete_decode` on every run; that is the text decoder, not the boot. Two
+traps: the ADT's CPU node must carry MPIDR 0 (the boot core is 7) and
+`phystokv()` panics outside the window.
