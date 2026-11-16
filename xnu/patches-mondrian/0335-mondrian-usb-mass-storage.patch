@@ -1,0 +1,812 @@
+xnu 0335: the userdata partition as a read-only USB disk
+
+The gadget's configuration grows a third interface: bulk-only mass storage
+(SCSI transparent, class 8 subclass 6 protocol 0x50) on the endpoint pair the
+ECM function leaves free, 0x03 OUT and 0x83 IN. The ECM function, the console
+stream and the udp/5141 control channel are untouched, so a boot keeps its
+remote control while the host mounts the iOS root read-only and can copy it,
+fsck it, or diff it against a backup.
+
+The medium is the GPT partition the root was mounted from, not a guess: the
+UFS driver already parses `userdata` out of the entry table, and 0335 exports
+one 512-byte-sector read of that range (mondrian_ufs_userdata_read), under the
+same lock as the block device. The gadget answers INQUIRY (36 bytes: vendor
+"MONDRIAN", product "iOS userdata", revision "1.0"), TEST UNIT READY, REQUEST
+SENSE, MODE SENSE, READ CAPACITY(10), REPORT LUNS and READ(10); writes are
+consumed and refused with DATA PROTECT, so the host sees a write-protected
+disk.
+
+Two things decide whether the function can work, and they are the two that
+made the earlier attempt hang on the host's first INQUIRY: the storage IN
+endpoint needs a TX FIFO of its own (FIFO 3 by mainline's numbering, not the
+ECM's FIFO 1, and GTXFIFOSIZ(3) is usually empty after the bootloader sized
+the FIFOs for fastboot), and the interface must not be advertised at all when
+its endpoints cannot be brought up. The device descriptor moves to class 0 so
+the host binds each interface by its own class, as a composite device must.
+
+GET_MAX_LUN answers 0 instead of stalling, the bulk-only reset and a
+CLEAR_FEATURE on either endpoint drop the command in flight, and every path
+through the state machine ends in a CSW, which is what the host is waiting for
+when it looks stuck.
+
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -103,6 +103,9 @@
+ #define DWC3_GSNPSID		0x0000c120
+ #define DWC3_GUCTL		0x0000c12c
+ #define DWC3_GHWPARAMS0		0x0000c140
++#define DWC3_GHWPARAMS3		0x0000c14c	/* [17:12] number of endpoints */
++#define DWC3_GHWPARAMS7		0x0000c160	/* [15:0] TX FIFO RAM, in words */
++#define DWC3_GTXFIFOSIZ(n)	(0x0000c300 + 4 * (n))
+ #define DWC3_GUSB2PHYCFG	0x0000c200	/* bit 6 SUSPHY, bit 8 ENBLSLPM */
+ #define DWC3_GUSB3PIPECTL	0x0000c2c0
+ #define DWC3_GEVNTADRLO		0x0000c400
+@@ -330,12 +333,25 @@
+ #define UD_RX           0x2000          /* one received frame */
+ #define UD_TX           0x2800          /* one frame to send */
+ #define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++#define UD_TRB_MSC_OUT  0x3000          /* mass storage: CBW, discarded OUT data */
++#define UD_TRB_MSC_IN   0x3010          /* mass storage: IN data and the CSW */
++#define UD_MSC_CBW      0x3040          /* 31-byte command block */
++#define UD_MSC_CSW      0x3080          /* 13-byte command status */
++#define UD_MSC_DATA     0x4000          /* data phase, one chunk at a time */
++#define UD_MSC_CHUNK    0x10000         /* 64 KiB: 32 SCSI sectors, 16 UFS blocks */
++#define UD_SIZE         (UD_MSC_DATA + UD_MSC_CHUNK)
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+ #define EP_TX           3               /* 0x81 bulk IN */
+ #define EP_INT          5               /* 0x82 interrupt IN */
++/*
++ * The core addresses its endpoint pairs as 2n = OUT, 2n+1 = IN, so 0x01/0x81
++ * are physical 2/3 and 0x82 is 5. The storage pair is 0x03 OUT (6) and
++ * 0x83 IN (7): the last free pair, and it leaves 0x02 free.
++ */
++#define EP_MSC_OUT      6               /* 0x03 bulk OUT */
++#define EP_MSC_IN       7               /* 0x83 bulk IN */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+ #define UD_TXQ          32
+@@ -456,11 +472,11 @@
+  * pid.codes test ID, not a product.
+  */
+ static const uint8_t ud_dev_desc[18] = {
+-	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,        /* class 0: per interface */
+ 	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
+ };
+-static const uint8_t ud_cfg_desc[80] = {
+-	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++static const uint8_t ud_cfg_desc[103] = {
++	9, 2, 103, 0, 3, 1, 0, 0x80, 250,               /* config: 3 interfaces, 500 mA */
+ 	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
+ 	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
+ 	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
+@@ -470,7 +486,12 @@
+ 	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++	9, 4, 2, 0, 2, 0x08, 0x06, 0x50, 0,             /* interface 2: mass storage, bulk-only */
++	7, 5, 0x03, 0x02, 0x00, 0x02, 0,                /* ep 0x03 bulk OUT, 512 */
++	7, 5, 0x83, 0x02, 0x00, 0x02, 0,                /* ep 0x83 bulk IN, 512 */
+ };
++/* The two ECM interfaces alone, when the storage pair cannot work. */
++#define UD_CFG_ECM_ONLY	80
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-mondrian", "iOS on SM8475 (USB Ethernet)", "0001", "02005E77EE01",
+@@ -501,6 +522,18 @@
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
++static void ud_msc_arm(void);
++static void ud_msc_reset(void);
++static void ud_msc_restart(void);
++static bool ud_msc_ep_setup(void);
++
++/*
++ * Decided before the host can read the configuration descriptor, so an
++ * interface whose endpoints did not come up is never advertised: a host that
++ * binds a storage function to dead endpoints waits on its first INQUIRY
++ * forever. See ud_msc_probe().
++ */
++static bool ud_msc_ok;
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -540,6 +573,19 @@
+ 	ud_tx_kick_locked();
+ 	lck_mtx_unlock(ud.lock);
+ 	printf("MONDR USB: ECM endpoints configured\n");
++	if (ud_msc_ok) {
++		if (ud_msc_ep_setup()) {
++			ud_msc_restart();
++			printf("MONDR USB: mass storage endpoints 0x03/0x83 configured\n");
++		} else {
++			/*
++			 * The descriptor already went out: the host will bind
++			 * the disk and hang on its first INQUIRY. This line is
++			 * the only place that says why.
++			 */
++			printf("MONDR USB: mass storage endpoints FAILED (interface was advertised)\n");
++		}
++	}
+ }
+ 
+ static void
+@@ -556,14 +602,35 @@
+ 
+ 	printf("MONDR USB: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
+ 	ud.data_in = (type & 0x80) != 0;
+-	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+-		ok = (length == 0);
++	if ((type & 0x60) == 0x20) {    /* class request: CDC filters, bulk-only */
++		if (req == 0xfe && (type & 0x80) && length >= 1) {
++			data[0] = 0;            /* GET_MAX_LUN: one LUN */
++			n = 1;
++		} else if (req == 0xff && !(type & 0x80) && ud_msc_ok) {
++			/* BOT reset: drop the command in flight, no data. The
++			 * posted transfer re-arms the command block. */
++			ud_msc_reset();
++		} else {
++			ok = (length == 0);
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 2: {
++			uint32_t cfg = ud_msc_ok ? (uint32_t)sizeof(ud_cfg_desc) :
++			    UD_CFG_ECM_ONLY;
++
++			memcpy(data, ud_cfg_desc, cfg);
++			if (cfg < sizeof(ud_cfg_desc)) {
++				data[2] = (uint8_t)cfg; /* wTotalLength */
++				data[3] = 0;
++				data[4] = 2;            /* bNumInterfaces */
++			}
++			n = cfg;
++			break;
++		}
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -598,6 +665,15 @@
+ 	} else if (req == 10) {         /* GET_INTERFACE */
+ 		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
+ 	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++		/*
++		 * CLEAR_FEATURE(ENDPOINT_HALT) on a storage endpoint is part of
++		 * the host's reset recovery: whatever command it was in has to
++		 * be dropped, not finished.
++		 */
++		if (req == 1 && value == 0 && ud_msc_ok &&
++		    (index == 0x03 || index == 0x83)) {
++			ud_msc_reset();
++		}
+ 	} else {
+ 		ok = false;
+ 	}
+@@ -665,6 +741,506 @@
+ 	ud_rx_arm();
+ }
+ 
++/* ---- USB mass storage: the userdata partition, read-only ---- */
++
++/*
++ * Bulk-only transport (interface class 8, subclass 6, protocol 0x50) on a
++ * third interface, so the ECM function keeps the log and control channels.
++ * The host sends a 31-byte command block (CBW) on 0x03 OUT and reads data and
++ * a 13-byte status block (CSW) on 0x83 IN; the medium is the GPT partition the
++ * root was mounted from, read through the UFS driver's own block path
++ * (mondrian_ufs_userdata_read), so "512 bytes at an LBA" has one
++ * implementation. Nothing here writes.
++ *
++ * One command is in flight at a time and every path ends in a CSW, including
++ * the failures: a host that never sees one waits out its own timeout and then
++ * resets the port, which from the outside is the same as a hang.
++ */
++#define MSC_CBW_SIG		0x43425355u	/* "USBC" */
++#define MSC_CSW_SIG		0x53425355u	/* "USBS" */
++#define MSC_ASC_READ_ERROR	0x11
++#define MSC_ASC_INVALID_CMD	0x20
++#define MSC_ASC_OUT_OF_RANGE	0x21
++#define MSC_ASC_INVALID_FIELD	0x24
++#define MSC_ASC_WRITE_PROTECT	0x27
++#define MSC_ASC_MEDIUM_ABSENT	0x3a
++
++extern int mondrian_ufs_userdata_read(uint64_t sector, void *dst, uint32_t bytes);
++extern uint64_t mondrian_ufs_userdata_sectors(void);
++
++enum { MSC_WAIT_CBW, MSC_DATA_IN, MSC_DATA_OUT, MSC_CSW, MSC_RESET };
++
++static struct {
++	uint32_t tag;			/* dCBWTag, echoed in the CSW */
++	uint32_t data_len;		/* dCBWDataTransferLength */
++	uint32_t remaining;		/* still to start in this data phase */
++	uint32_t sent;			/* started so far: residue is data_len - sent */
++	uint32_t chunk;			/* this OUT discard's length */
++	uint64_t lba;			/* in 512-byte sectors */
++	uint8_t  cdb[16];
++	uint8_t  phase;
++	uint8_t  sense_key, sense_asc;
++	bool     streaming;		/* READ: the data comes from the UFS */
++	bool     out_armed;		/* a transfer is posted on EP_MSC_OUT */
++	uint32_t out_buf;		/* ... and it points here */
++	uint32_t commands;		/* rate limit for the log */
++} msc;
++
++/* Post the command block, unless one is already posted. */
++static void
++ud_msc_arm(void)
++{
++	if (msc.out_armed) {
++		return;
++	}
++	msc.phase = MSC_WAIT_CBW;
++	msc.streaming = false;
++	msc.out_armed = true;
++	msc.out_buf = UD_MSC_CBW;
++	ud_start_trb(EP_MSC_OUT, UD_TRB_MSC_OUT, UD_MSC_CBW, 31, TRBCTL_NORMAL);
++}
++
++/*
++ * Bulk-only reset (also what a CLEAR_FEATURE on either bulk endpoint means):
++ * drop the command in flight. A transfer stays posted -- the controller owns
++ * it and there is no way to take it back from here -- so the completion of
++ * that transfer is what re-arms the command block. MSC_RESET is that state:
++ * whatever arrives is parsed as a command block, from the buffer the posted
++ * transfer points at, and not finished as the command the host abandoned.
++ */
++static void
++ud_msc_reset(void)
++{
++	msc.tag = 0;
++	msc.data_len = msc.remaining = msc.sent = msc.chunk = 0;
++	msc.streaming = false;
++	msc.sense_key = msc.sense_asc = 0;
++	msc.phase = MSC_RESET;
++}
++
++/*
++ * A fresh configuration (SET_CONFIGURATION, after a bus reset): the endpoints
++ * were just programmed, so nothing is posted any more and the command block
++ * has to be armed again -- 0298's lesson for the ECM endpoints.
++ */
++static void
++ud_msc_restart(void)
++{
++	ud_msc_reset();
++	msc.out_armed = false;
++	ud_msc_arm();
++}
++
++static void
++ud_msc_csw(uint8_t status)
++{
++	uint8_t *c = (uint8_t *)(ud.dma + UD_MSC_CSW);
++	uint32_t residue = msc.sent < msc.data_len ? msc.data_len - msc.sent : 0;
++
++	c[0] = (uint8_t)MSC_CSW_SIG;
++	c[1] = (uint8_t)(MSC_CSW_SIG >> 8);
++	c[2] = (uint8_t)(MSC_CSW_SIG >> 16);
++	c[3] = (uint8_t)(MSC_CSW_SIG >> 24);
++	c[4] = (uint8_t)msc.tag;
++	c[5] = (uint8_t)(msc.tag >> 8);
++	c[6] = (uint8_t)(msc.tag >> 16);
++	c[7] = (uint8_t)(msc.tag >> 24);
++	c[8] = (uint8_t)residue;
++	c[9] = (uint8_t)(residue >> 8);
++	c[10] = (uint8_t)(residue >> 16);
++	c[11] = (uint8_t)(residue >> 24);
++	c[12] = status;
++	msc.phase = MSC_CSW;
++	ud_start_trb(EP_MSC_IN, UD_TRB_MSC_IN, UD_MSC_CSW, 13, TRBCTL_NORMAL);
++}
++
++/* Remember why, for the REQUEST SENSE the host sends after a failure. */
++static void
++ud_msc_fail(uint8_t key, uint8_t asc)
++{
++	msc.sense_key = key;
++	msc.sense_asc = asc;
++	ud_msc_csw(1);
++}
++
++/* Finish a command whose response is in UD_MSC_DATA, or that has none. */
++static void
++ud_msc_send(uint32_t n)
++{
++	if (n > msc.data_len) {
++		n = msc.data_len;
++	}
++	msc.sent = n;
++	msc.remaining = 0;
++	if (n == 0) {
++		ud_msc_csw(0);
++		return;
++	}
++	msc.phase = MSC_DATA_IN;
++	ud_start_trb(EP_MSC_IN, UD_TRB_MSC_IN, UD_MSC_DATA, n, TRBCTL_NORMAL);
++}
++
++/*
++ * One chunk of a READ(10): the UFS fills the data buffer, then the endpoint
++ * carries it. 64 KiB is 32 sectors and 16 device blocks, half the UFS driver's
++ * bounce buffer, so one call is one READ(10) on the wire.
++ */
++static void
++ud_msc_chunk(void)
++{
++	uint32_t len = msc.remaining < UD_MSC_CHUNK ? msc.remaining : UD_MSC_CHUNK;
++
++	len &= ~511u;			/* whole sectors only */
++	if (len == 0) {
++		ud_msc_csw(0);
++		return;
++	}
++	if (mondrian_ufs_userdata_read(msc.lba, (void *)(ud.dma + UD_MSC_DATA), len)) {
++		ud_msc_fail(3, MSC_ASC_READ_ERROR);	/* MEDIUM ERROR */
++		return;
++	}
++	msc.lba += len >> 9;
++	msc.remaining -= len;
++	msc.sent += len;
++	msc.phase = MSC_DATA_IN;
++	ud_start_trb(EP_MSC_IN, UD_TRB_MSC_IN, UD_MSC_DATA, len, TRBCTL_NORMAL);
++}
++
++/* WRITE(10): the data phase has to be consumed, or the host's OUT transfer
++ * never completes; the CSW then reports the medium write-protected. */
++static void
++ud_msc_discard(void)
++{
++	msc.chunk = msc.remaining < UD_MSC_CHUNK ? msc.remaining : UD_MSC_CHUNK;
++	if (msc.chunk == 0) {
++		ud_msc_csw(1);
++		return;
++	}
++	msc.phase = MSC_DATA_OUT;
++	msc.out_armed = true;
++	msc.out_buf = UD_MSC_DATA;
++	ud_start_trb(EP_MSC_OUT, UD_TRB_MSC_OUT, UD_MSC_DATA, msc.chunk, TRBCTL_NORMAL);
++}
++
++/*
++ * The commands answered without the medium. INQUIRY included: it reads no
++ * block, so it answers even while the UFS probe still holds the lock and a
++ * host is waiting on its first command.
++ */
++static void
++ud_msc_response(void)
++{
++	uint8_t *d = (uint8_t *)(ud.dma + UD_MSC_DATA);
++	uint8_t *cdb = msc.cdb;
++	uint32_t n = 0;
++
++	switch (cdb[0]) {
++	case 0x00:			/* TEST UNIT READY */
++		if (mondrian_ufs_userdata_sectors() == 0) {
++			ud_msc_fail(2, MSC_ASC_MEDIUM_ABSENT);	/* NOT READY */
++			return;
++		}
++		break;
++	case 0x03:			/* REQUEST SENSE: the last failure, once */
++		memset(d, 0, 18);
++		d[0] = 0x70;
++		d[2] = msc.sense_key;
++		d[7] = 10;
++		d[12] = msc.sense_asc;
++		msc.sense_key = msc.sense_asc = 0;
++		n = 18;
++		break;
++	case 0x12:			/* INQUIRY */
++		if (cdb[1] & 1) {	/* EVPD: the supported pages */
++			if (cdb[2] != 0) {
++				ud_msc_fail(5, MSC_ASC_INVALID_FIELD);
++				return;
++			}
++			memset(d, 0, 6);
++			d[3] = 1;	/* one page follows */
++			d[4] = 0x00;	/* page 0x00: the list itself */
++			n = 6;
++			break;
++		}
++		memset(d, 0, 36);
++		d[0] = 0x00;		/* direct access block device */
++		d[2] = 0x05;		/* SPC-3 */
++		d[3] = 0x02;		/* response data format */
++		d[4] = 31;		/* the rest of the 36 bytes */
++		memcpy(d + 8, "MONDRIAN", 8);			/* vendor */
++		memcpy(d + 16, "iOS userdata    ", 16);		/* product */
++		memcpy(d + 32, "1.0 ", 4);			/* revision */
++		n = 36;
++		break;
++	case 0x1a:			/* MODE SENSE(6): write protected, no pages */
++		memset(d, 0, 4);
++		d[0] = 3;
++		d[2] = 0x80;		/* WP: the host marks the disk read-only */
++		n = 4;
++		break;
++	case 0x5a:			/* MODE SENSE(10) */
++		memset(d, 0, 8);
++		d[1] = 6;
++		d[3] = 0x80;
++		n = 8;
++		break;
++	case 0x25: {			/* READ CAPACITY(10) */
++		uint64_t sectors = mondrian_ufs_userdata_sectors();
++		uint64_t last;
++
++		if (sectors == 0) {
++			ud_msc_fail(2, MSC_ASC_MEDIUM_ABSENT);
++			return;
++		}
++		last = sectors - 1;
++		if (last > 0xffffffffu) {
++			last = 0xffffffffu;	/* past READ(10)'s reach */
++		}
++		memset(d, 0, 8);
++		d[0] = (uint8_t)(last >> 24);
++		d[1] = (uint8_t)(last >> 16);
++		d[2] = (uint8_t)(last >> 8);
++		d[3] = (uint8_t)last;
++		d[6] = 2;		/* 512-byte blocks: 0x00000200 */
++		n = 8;
++		break;
++	}
++	case 0xa0:			/* REPORT LUNS: LUN 0 */
++		memset(d, 0, 16);
++		d[3] = 8;		/* one 8-byte LUN */
++		n = 16;
++		break;
++	case 0x1b:			/* START STOP UNIT */
++	case 0x1e:			/* PREVENT ALLOW MEDIUM REMOVAL */
++	case 0x2f:			/* VERIFY(10) */
++	case 0x35:			/* SYNCHRONIZE CACHE(10) */
++		break;			/* nothing to do, no data */
++	default:
++		ud_msc_fail(5, MSC_ASC_INVALID_CMD);
++		return;
++	}
++	ud_msc_send(n);
++}
++
++static void
++ud_msc_command(void)
++{
++	uint8_t *cdb = msc.cdb;
++
++	msc.streaming = false;
++	switch (cdb[0]) {
++	case 0x28: {			/* READ(10) */
++		uint64_t lba = ((uint64_t)cdb[2] << 24) | ((uint64_t)cdb[3] << 16) |
++		    ((uint64_t)cdb[4] << 8) | cdb[5];
++		uint64_t count = ((uint64_t)cdb[7] << 8) | cdb[8];
++		uint64_t bytes = count * 512;
++		uint64_t sectors = mondrian_ufs_userdata_sectors();
++
++		if (count == 0) {
++			ud_msc_csw(0);		/* no data phase */
++			return;
++		}
++		if (sectors == 0) {
++			ud_msc_fail(2, MSC_ASC_MEDIUM_ABSENT);
++			return;
++		}
++		if (lba >= sectors || count > sectors - lba) {
++			ud_msc_fail(5, MSC_ASC_OUT_OF_RANGE);
++			return;
++		}
++		/*
++		 * The data phase is the host's length, and it has to be whole
++		 * sectors no longer than the CDB asks for: a transfer that ends
++		 * on a full packet with bytes still owed would leave the host
++		 * waiting for a short packet that is not coming.
++		 */
++		if ((msc.data_len & 511) || msc.data_len > bytes) {
++			ud_msc_fail(5, MSC_ASC_INVALID_FIELD);
++			return;
++		}
++		if (msc.data_len == 0) {
++			ud_msc_csw(0);
++			return;
++		}
++		msc.lba = lba;
++		msc.remaining = msc.data_len;
++		msc.streaming = true;
++		ud_msc_chunk();
++		return;
++	}
++	case 0x2a:			/* WRITE(10), read-only medium */
++		msc.sense_key = 7;	/* DATA PROTECT */
++		msc.sense_asc = MSC_ASC_WRITE_PROTECT;
++		if (msc.data_len != 0) {
++			ud_msc_discard();
++		} else {
++			msc.remaining = 0;
++			ud_msc_csw(1);
++		}
++		return;
++	default:
++		ud_msc_response();
++		return;
++	}
++}
++
++/* The 31-byte command block, or the tail of a discarded data phase. */
++static void
++ud_msc_out_done(void)
++{
++	uint8_t *c;
++	uint32_t sig, tag, len;
++	uint8_t cblen;
++
++	msc.out_armed = false;
++	if (msc.phase == MSC_DATA_OUT) {
++		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_MSC_OUT);
++		uint32_t moved;
++
++		ud_sync(UD_TRB_MSC_OUT, 16);
++		moved = msc.chunk - (t[2] & 0xffffff);
++		msc.sent += moved;
++		if (moved >= msc.remaining) {
++			msc.remaining = 0;
++			ud_msc_csw(1);		/* the sense data has the reason */
++		} else {
++			msc.remaining -= moved;
++			ud_msc_discard();
++		}
++		return;
++	}
++
++	/*
++	 * A command block: normally in UD_MSC_CBW, but after a reset it is
++	 * whatever the transfer that was still posted was pointed at.
++	 */
++	ud_sync(msc.out_buf, 64);
++	c = (uint8_t *)(ud.dma + msc.out_buf);
++	sig = (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) |
++	    ((uint32_t)c[3] << 24);
++	if (sig != MSC_CBW_SIG) {
++		/*
++		 * Not a command block. There is no tag to answer, so drop it and
++		 * wait for the next one; the host's timeout is the recovery.
++		 */
++		ud_msc_arm();
++		return;
++	}
++	tag = (uint32_t)c[4] | ((uint32_t)c[5] << 8) | ((uint32_t)c[6] << 16) |
++	    ((uint32_t)c[7] << 24);
++	len = (uint32_t)c[8] | ((uint32_t)c[9] << 8) | ((uint32_t)c[10] << 16) |
++	    ((uint32_t)c[11] << 24);
++	cblen = c[14];
++	msc.tag = tag;
++	msc.data_len = len;
++	msc.remaining = len;
++	msc.sent = 0;
++	msc.commands++;
++	if (msc.commands <= 4 || (msc.commands & 0xff) == 0) {
++		printf("MONDR USB: msc cbw #%u tag %08x len %u flags %02x cdb %02x %02x %02x\n",
++		    msc.commands, tag, len, c[12], c[15], c[16], c[17]);
++	}
++	if (cblen < 1 || cblen > 16) {
++		ud_msc_fail(5, MSC_ASC_INVALID_FIELD);
++		return;
++	}
++	memcpy(msc.cdb, c + 15, 16);
++	ud_msc_command();
++}
++
++/* An IN transfer finished: the next chunk, the CSW, or the command block. */
++static void
++ud_msc_in_done(void)
++{
++	if (msc.phase == MSC_RESET) {
++		ud_msc_arm();		/* the reset dropped that transfer */
++		return;
++	}
++	if (msc.phase == MSC_CSW) {
++		ud_msc_arm();
++		return;
++	}
++	if (msc.phase == MSC_DATA_IN) {
++		if (msc.streaming && msc.remaining > 0) {
++			ud_msc_chunk();
++			return;
++		}
++		ud_msc_csw(0);
++	}
++}
++
++/*
++ * The two endpoints. The FIFO number is the one mainline gives an IN endpoint
++ * (physical 7 -> FIFO 3, dep->number >> 1); two IN endpoints that name the
++ * same FIFO are not a supported configuration.
++ */
++static bool
++ud_msc_ep_setup(void)
++{
++	if (ud_epcmd(EP_MSC_OUT, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3),
++	    (1u << 8) | ((uint32_t)EP_MSC_OUT << 25), 0) ||
++	    ud_epcmd(EP_MSC_OUT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_MSC_IN, DEPCMD_SETEPCONFIG,
++	    (2u << 1) | (512u << 3) | (3u << 17),
++	    (1u << 8) | ((uint32_t)EP_MSC_IN << 25), 0) ||
++	    ud_epcmd(EP_MSC_IN, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		return false;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_MSC_OUT) | (1u << EP_MSC_IN));
++	return true;
++}
++
++/*
++ * Whether the storage function can work at all, decided before the host reads
++ * the configuration descriptor. Two things can be missing there: the endpoint
++ * pair itself (the core's NUM_EPS), and the IN endpoint's TX FIFO. GTXFIFOSIZ
++ * holds what the bootloader sized for fastboot, and FIFO 3 is usually not in
++ * it; an IN endpoint without a FIFO accepts the transfer and never puts a
++ * packet on the wire, which a host experiences as its first INQUIRY never
++ * returning. Take the depth the ECM bulk IN (FIFO 1) already carries 512-byte
++ * packets with, and append it after the last allocated FIFO.
++ */
++static bool
++ud_msc_probe(void)
++{
++	uint32_t hw3 = dwc_rd(DWC3_GHWPARAMS3);
++	uint32_t hw7 = dwc_rd(DWC3_GHWPARAMS7);
++	uint32_t eps = (hw3 >> 12) & 0x3f;
++	uint32_t ram = hw7 & 0xffff;
++	uint32_t depth, last = 0;
++	int n;
++
++	for (n = 0; n < 4; n++) {
++		uint32_t r = dwc_rd(DWC3_GTXFIFOSIZ(n));
++		uint32_t start = (r >> 16) & 0xffff;
++		uint32_t d = r & 0xffff;
++
++		printf("MONDR USB: TXFIFO%u 0x%08x start %u depth %u\n", n, r, start, d);
++		if (d != 0 && start + d > last) {
++			last = start + d;
++		}
++	}
++	if (eps < 8) {
++		printf("MONDR USB: msc: %u endpoints, the storage pair is 6/7\n", eps);
++		return false;
++	}
++	if ((dwc_rd(DWC3_GTXFIFOSIZ(3)) & 0xffff) != 0) {
++		return true;		/* the bootloader sized it */
++	}
++	depth = dwc_rd(DWC3_GTXFIFOSIZ(1)) & 0xffff;
++	if (depth < 130) {
++		depth = 260;		/* two 512-byte packets plus margin */
++	}
++	if (ram == 0 || last > ram || depth > ram - last) {
++		printf("MONDR USB: msc: no TX FIFO room (last %u depth %u ram %u)\n",
++		    last, depth, ram);
++		return false;
++	}
++	dwc_wr(DWC3_GTXFIFOSIZ(3), (last << 16) | depth);
++	printf("MONDR USB: msc: TXFIFO3 start %u depth %u of %u\n", last, depth, ram);
++	return true;
++}
++
+ /* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
+ static void
+ ud_tx_kick_locked(void)
+@@ -873,6 +1449,23 @@
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+ 	}
++	if ((ep == EP_MSC_OUT || ep == EP_MSC_IN) && ud_msc_ok) {
++		if (ep == EP_MSC_OUT) {
++			if (type == 1) {
++				ud_msc_out_done();
++			} else if (type == 3 && status == 0 && !msc.out_armed) {
++				/*
++				 * The host offered a command block with none
++				 * posted (a reset dropped it). Post one and the
++				 * host retries its transfer.
++				 */
++				ud_msc_arm();
++			}
++		} else if (type == 1) {
++			ud_msc_in_done();
++		}
++		return;
++	}
+ 	if (ep > 1) {
+ 		return;
+ 	}
+@@ -2215,6 +2808,13 @@
+ 		return;
+ 	}
+ 
++	/* Before the host can read the configuration: never advertise a
++	 * storage interface whose endpoints cannot carry a byte. */
++	ud_msc_ok = ud_msc_probe();
++	printf("MONDR USB: config %u bytes, %s\n",
++	    ud_msc_ok ? (uint32_t)sizeof(ud_cfg_desc) : UD_CFG_ECM_ONLY,
++	    ud_msc_ok ? "mass storage on 0x03/0x83" : "ECM only");
++
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+ 	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -789,6 +789,69 @@
+ 	buf_biodone(bp);
+ }
+ 
++/*
++ * The userdata partition as a SCSI medium, for the USB mass-storage interface
++ * (bsd/dev/mondrian_usb.c). The sectors are 512 bytes while the device works
++ * in 4 KiB blocks; the range is the GPT entry the mount came from, so a host
++ * can address exactly the volume that holds the iOS root and nothing outside
++ * it. One lock for the whole transfer, the same one the block device and the
++ * console ring take: a host read cannot interleave with a file system write.
++ */
++int
++mondrian_ufs_userdata_read(uint64_t sector, void *dst, uint32_t bytes)
++{
++	uint8_t *out = dst;
++	uint64_t byte = sector << 9;
++	uint64_t limit;
++	int error = 0;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	limit = su.nblocks * UFS_BLOCK;
++	if (byte > limit || bytes > limit - byte) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&mondrian_ufs_lock);
++	while (bytes > 0) {
++		uint64_t block = su.first_block + byte / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(byte % UFS_BLOCK);
++		uint32_t len;
++
++		if (skip == 0 && bytes >= UFS_BLOCK) {
++			uint32_t count = MIN(bytes / UFS_BLOCK,
++			    BOUNCE_SIZE / UFS_BLOCK);
++
++			error = ufs_read_blocks(block, count);
++			if (error) {
++				break;
++			}
++			len = count * UFS_BLOCK;
++			memcpy(out, (const void *)(su.dma + DMA_BOUNCE), len);
++		} else {
++			error = ufs_read_blocks(block, 1);
++			if (error) {
++				break;
++			}
++			len = MIN(UFS_BLOCK - skip, bytes);
++			memcpy(out, (const void *)(su.dma + DMA_BOUNCE + skip),
++			    len);
++		}
++		out += len;
++		byte += len;
++		bytes -= len;
++	}
++	lck_mtx_unlock(&mondrian_ufs_lock);
++	return error;
++}
++
++/* That range in 512-byte SCSI sectors, 0 while the partition is not known. */
++uint64_t
++mondrian_ufs_userdata_sectors(void)
++{
++	return su.ready ? su.nblocks * (UFS_BLOCK / 512) : 0;
++}
++
+ static int
+ mondrian_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
