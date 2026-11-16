@@ -352,11 +352,14 @@ MONDRIAN = Board(
              # that blocks a writer. Resolved by name so the traced pid does
              # not depend on the boot.
              'msgtracename=logd '
-             # The measured Android pair (see 0304): 3.80 V read 36 % on Android
-             # where the old table said 58; 4.15 V is the pack's full point.
-             # `battfix=mv:pct,...` replaces the built-in table; the points are
-             # sorted by voltage, whatever order they are written in.
-             'battfix=4150:100,3800:36 '
+             # Measured against Android's own kernel (an OrangeFox boot, the
+             # vendor drivers): the pack is 4.42 V full (`voltage_max`), and at
+             # 3.701 V the gauge says 18 % -- with the old 4.15/3.80 table the
+             # same pack read 1 % on iOS. 3.35 V is the device tree's
+             # shutdown-voltage. `battfix=mv:pct,...` replaces the built-in
+             # table; the points are sorted by voltage, whatever order they are
+             # written in.
+             'battfix=3350:0,3701:18,4420:100 '
              'glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the

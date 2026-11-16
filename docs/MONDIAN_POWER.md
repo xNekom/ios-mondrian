@@ -27,7 +27,12 @@ below read `0x3xx`:
 | `pm8350b_chg_temp` | — | `0x310` | — | `Temperature` |
 
 Pack capacity is **5160 mAh** (`M11A_5160mah` in the vendor model), not
-sweet's 5020.
+sweet's 5020. Measured against the vendor kernel (an OrangeFox boot, where the
+gauge answers): `charge_full` 4900 mAh, `voltage_max` 4.42 V, `cycle_count` 9,
+and **3.701 V reads 18 %** while charging at 229 mA. The board's `battfix`
+table is those anchors plus the device tree's 3.35 V shutdown point
+(`3350:0,3701:18,4420:100`); the table it replaced (4.15 V full, 3.80 V = 36 %)
+read the same pack as 1 % on iOS.
 
 What the port publishes (`MondrianPowerSource`, sampled once every 2 s by the
 SPMI thread): `BatteryInstalled`, `CurrentCapacity`/`MaxCapacity` **in mAh**,
