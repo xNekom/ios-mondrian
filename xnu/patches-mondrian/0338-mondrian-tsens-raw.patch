@@ -11,7 +11,7 @@ diff --git a/bsd/dev/mondrian_tsens.c b/bsd/dev/mondrian_tsens.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mondrian_tsens.c
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,105 @@
 +/*
 + * The SoC's own thermal sensors (TSENS v2), read raw.
 + *
@@ -21,10 +21,14 @@ new file mode 100644
 + * places sensor n at TM_Sn_STATUS = 0xa0 + 4*n, the temperature in bits 11:0
 + * (twelve bits, sign in bit 11) and VALID at bit 21.
 + *
-+ * The code is not yet a temperature: the slope and offset come from a
-+ * calibration this device tree does not carry, so the vendor kernel's own
-+ * numbers (OrangeFox's /sys/class/thermal) are the reference until that is
-+ * decoded. The PMIC path needs no calibration and is what `temp` reads.
++ * The code is not a temperature on its own: `tsens.c` turns it into one with
++ * (code * 1000 - offset) / slope, and both numbers are per-sensor efuse
++ * calibration this tree does not carry. The estimate printed here is a fit
++ * against the vendor kernel (an OrangeFox boot, which publishes the zones
++ * these sensors belong to): about 0.1 C per code, residual 2 C. It is enough
++ * to gate thermal pressure and is marked with "~" so nobody reads it as a
++ * calibrated degree. The PMIC path needs no calibration and is what `temp`
++ * reads.
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -93,12 +97,21 @@ new file mode 100644
 +			uint32_t v = tm[(MONDRIAN_TSENS_SN +
 +			    4 * (uint32_t)n) / 4];
 +			int32_t code = (int32_t)(v & 0xfffu);
++			int32_t mc;
 +
 +			if ((code & 0x800) != 0) {
 +				code -= 0x1000;
 +			}
++			/*
++			 * A fit, not a calibration: this tree has no per-sensor
++			 * efuse corrections, but an idle pair of reads against
++			 * the vendor kernel's cold numbers puts one code at
++			 * about 0.1 C, and the residual is 2 C.
++			 */
++			mc = code * 100 - 1600;
 +			printf("MONDRIAN TSENS: %d.%d code %d valid %u"
-+			    " raw 0x%08x\n", b, n, code, (v >> 21) & 1u, v);
++			    " raw 0x%08x ~%d.%d C\n", b, n, code,
++			    (v >> 21) & 1u, v, mc / 1000, (mc % 1000) / 100);
 +			mondrian_log_flush_now();
 +		}
 +	}

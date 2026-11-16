@@ -1,33 +1,24 @@
 diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 --- a/bsd/dev/mondrian_spmi.c
 +++ b/bsd/dev/mondrian_spmi.c
-@@ -411,7 +411,31 @@
+@@ -411,7 +411,22 @@
  	printf("MONDRIAN SPMI: vbat %d mV out of range, dropped\n", mv);
  	return -1;
  }
  
 +/*
-+ * The PMIC's own thermometer: the device tree's pmk8350_die_temp channel is
-+ * reg = <0 3>, and this tree packs the SID in the high byte and the channel in
-+ * the low one (pm8350b_vbat_sns reads <3 0x8f>, which is what the battery
-+ * uses). Mainline's qcom_vadc_scale_die_temp() divides the voltage by two to
-+ * get kelvin (0.6 V at 300 K, 2 mV/K). Returns millidegrees Celsius, or -1.
++ * A PMIC's own thermometer lives on channel 3 of its own SID (the tree packs
++ * the SID in the high byte of reg: pm8350b_vbat_sns is <3 0x8f>). Mainline's
++ * qcom_vadc_scale_die_temp() divides the voltage by two to get kelvin, with
++ * 0.6 V at 300 K, so mC = mV * 500 - 273150.
 + *
-+ * This is the first channel of the thermal work and the cheapest one to
-+ * trust: it goes through the VADC path the battery already uses, it needs no
-+ * calibration table from the device tree, and it says whether the PMIC is
-+ * the thing that gets hot under load. The SoC's TSENS block is a separate
-+ * driver with its own calibration.
++ * The voltage is returned instead of the temperature because one of the five
++ * PMICs answers a value that is not one: see tools/usb-ring.py temp.
 + */
 +int
-+mondrian_spmi_temp_mc(void)
++mondrian_spmi_die_mv(uint32_t sid)
 +{
-+	int mv = mondrian_spmi_adc_mv(0, 0x03u, 1u);
-+
-+	if (mv < 1) {
-+		return -1;
-+	}
-+	return mv * 500 - 273150;
++	return mondrian_spmi_adc_mv(sid, 0x03u, 1u);
 +}
 +
  /*
@@ -36,36 +27,61 @@ diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
 diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
-@@ -1969,6 +1969,28 @@
+@@ -1969,6 +1969,53 @@
  	ud_cmd_send(so, to, "gpustat\n", 8);
  }
  
 +/*
-+ * "temp" prints the PMIC die temperature in millidegrees, read on demand so a
-+ * thermal measurement costs no rebuild and no second process.
++ * "temp" prints the die temperature of every PMIC that answers one, in
++ * degrees and with the voltage behind it so a reader can check the scale.
++ *
++ * SID 1 (pm8350), 3 (pm8350b) and 4 (pmr735a) are temperatures. SID 0, the
++ * pmk8350 that owns the ADC, moves with them (794->772 mV as the phone
++ * cooled, the same 22 mV the others lost) but sits about 155 mV high: 113 C
++ * on a phone the vendor kernel puts at 34. Channel 3 is its die_temp (a sweep
++ * of all sixteen channels has 1.2 V and 1.9 V references and ~40 mV floating
++ * pins, and 3 the only mid-scale one), so this is the ADC's own-die path
++ * reading differently, not a wrong channel. Reported raw, never as a degree.
 + */
 +static void
 +ud_cmd_temp(socket_t so, struct sockaddr_in *to, const char *line)
 +{
-+	extern int mondrian_spmi_temp_mc(void);
-+	int mc = mondrian_spmi_temp_mc();
-+	char out[48];
-+	int n;
++	extern int mondrian_spmi_die_mv(uint32_t sid);
++	static const uint32_t sids[] = { 1, 3, 4, 0 };
++	char out[192];
++	size_t len = 0;
 +
 +	(void)line;
-+	if (mc < 0) {
-+		n = snprintf(out, sizeof(out), "temp no answer\n");
-+	} else {
-+		n = snprintf(out, sizeof(out), "temp %d mC\n", mc);
++	for (size_t i = 0; i < sizeof(sids) / sizeof(sids[0]); i++) {
++		int mv = mondrian_spmi_die_mv(sids[i]);
++		int mc = mv * 500 - 273150;
++		int n;
++
++		if (mv < 1) {
++			n = snprintf(out + len, sizeof(out) - len,
++			    "temp sid %u no answer\n", sids[i]);
++		} else if (sids[i] == 0) {
++			n = snprintf(out + len, sizeof(out) - len,
++			    "temp sid 0 %d mV: tracks, not a temperature\n",
++			    mv);
++		} else {
++			n = snprintf(out + len, sizeof(out) - len,
++			    "temp sid %u %d mV %d.%d C\n", sids[i], mv,
++			    mc / 1000, (mc % 1000) / 100);
++		}
++		if (n < 0 || (size_t)n >= sizeof(out) - len) {
++			break;
++		}
++		len += (size_t)n;
 +	}
-+	ud_cmd_send(so, to, out, (size_t)n);
++	ud_cmd_send(so, to, out, len);
 +	printf("%s", out);
 +}
 +
  static void
  ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
  {
-@@ -2361,6 +2382,8 @@
+@@ -2361,6 +2402,8 @@
  				ud_cmd_gpukeep(so, peer, cmd);
  			} else if (strcmp(cmd, "gpustat") == 0) {
  				ud_cmd_gpustat(so, peer, cmd);

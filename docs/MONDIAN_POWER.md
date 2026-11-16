@@ -97,14 +97,29 @@ SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C — double the others. All fi
 `die_temp` channels declare the same `qcom,pre-scaling` (1 1), so this is not a
 missing divider.
 
-**SID 0 is our bug, not the chip.** The vendor's own VADC (`iio:device0`, the
-pmk8350's `vadc@3100`) publishes `in_temp_pmk8350_die_temp_input` = 34.1 °C
-while `pm8350_die_temp` says 35.6 and `pm8350b_die_temp` 40.2, so that channel
-does answer a sane temperature in the vendor kernel. Our 794 mV for the same
-PMIC is therefore a wrong read, not a hot part: the pmk8350 is an **ADC7**
-peripheral (`adc7_chans_pmic`), where `die_temp` is channel 6 and the decimation
-and settle-time tables differ from ADC5's, so channel 3 there is some other
-input. Nothing depends on it: SID 1, 3 and 4 are fine.
+**SID 0 reads the right channel but is not a temperature.** The pmk8350 owns
+the ADC and answers its own die_temp on channel 3 like the others. A sweep of
+all sixteen channels of that SID shows references at 1226 mV (channel 1) and
+1915 mV (2 and 7), floating pins at about 40 mV (4-15) and channel 3 alone in
+between -- so channel 6, which mainline's ADC7 table calls `die_temp`, is a
+dead pin here (58 mV) and must not be used. What the channel does answer
+tracks the three PMICs (794 to 772 mV as the phone cooled, the same 22 mV they
+lost) but sits about 155 mV high: 113 °C on a phone the vendor kernel puts at
+34. `temp` therefore prints SID 1, 3 and 4 in degrees and SID 0 as a voltage,
+labelled as a value that moves but is not a temperature.
+
+The vendor's own VADC agrees the channel works in its hands
+(`in_temp_pmk8350_die_temp_input` = 34.1 °C on the same PMIC), so this is the
+ADC's own-die path and not a broken sensor: it is the one channel where the
+port knows the reading is off and by how much, and nothing depends on it.
+
+Cold and charging, the vendor reads 36.5 (`pm8350`), 40.6 (`pm8350b`) and
+35.8 °C (`pmr735a`); our VADC reads 59-63 °C for the same three on a phone that
+has been in iOS for half an hour with the panel on. Part of that is real (iOS
+does not throttle anything yet) and part may be the 0.5 °C/LSB scale, so treat
+SID 1/3/4 as monotonic until a same-moment A/B exists. The reading is
+quantised in 0.5 °C steps (1 mV) and wanders 1 °C over minutes; the charger
+PMIC is the one to watch.
 
 Cold and charging, the vendor reads 36.5 (`pm8350`), 40.6 (`pm8350b`) and
 35.8 °C (`pmr735a`); our VADC reads 59-63 °C for the same three on a phone that
@@ -144,9 +159,8 @@ controller and a sensor index (`thermal-sensors = <&tsens0 N>`, where phandle
 And an idle pair of reads against the vendor's cold numbers fits a straight
 line of **about 0.1 °C per code** (residual ±2 °C): with `gpuss` at 40.5-41.3 °C
 reading 416-424 and `cpu-0` at 43.0-43.8 reading 434-446, `T ≈ code/10 - 1.6`.
-That is a fit, not a calibration - the per-sensor error is visible on the
-hotter cores, and a loaded boot moves both ends - but it is enough to gate a
-thermal-pressure decision, which is the next step.
+So `tsens` prints `~24.6 C` next to each code, with the tilde: it is a fit that
+gates a thermal decision, not a calibrated degree.
 
 ### The charger is behind the ADSP
 
