@@ -10,6 +10,11 @@
 # passing both DESTDIR and the staged path nests it one level deeper, which
 # leaves the file the caller meant to replace untouched.
 #
+# `get` fails with "read failed" both when the path is missing and when the tree
+# is bigger than the transport image it copies through: /private/preboot holds a
+# whole Cryptexes/OS tree and dies on "No space left on device". Check the log
+# before concluding that a directory does not exist.
+#
 # The iOS root is HFS+, and the Linux kernel WSL2 runs is built without
 # hfsplus, so it cannot be mounted here. This boots a stock Ubuntu kernel in
 # qemu (it has hfsplus.ko), attaches the image as a virtio disk, and does the
