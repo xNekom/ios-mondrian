@@ -63,28 +63,28 @@ forces it onto `virtio-mmio-bus.0`: `mkadt.py` states the first transport
 (`0xa000000`) and without `bus=` QEMU hands the device to the last. The kernel
 prints `MONDRIAN VBLK: virtio-blk, N MiB` when the two agree. Under TCG a boot
 to `bsd_init` takes a minute, so `--secs 240` is the minimum worth typing.
+The run directory has to be on the Linux side: QEMU's QMP socket fails to bind
+under `/mnt/c` ("Operation not supported") and the run exits 1 before the guest
+starts.
 
-A run carries the dylib the *image* holds, not the kernel's blob: put the
-current one in with `tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR`, or a
-stale copy answers for the hook.
+A run carries the dylib the *image* holds, not the kernel's blob:
+`tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR` replaces it, or a stale
+copy answers for the hook.
 
 Options worth knowing: `--board mondrian` picks the 1440x3200 panel and the
 `max` CPU model (the board is armv8.5 and touches `DIT`, which `cortex-a76`
 lacks); `--live-serial` streams the console; `--gdb` starts halted with a stub
-on 1234; `--hmp "xp/8gx 0x<pa>"` reads guest memory after the stop, where a
-kernel variable is at `VA - VM_KERNEL_LINK_ADDRESS + phys_base + 0x4000`.
+on 1234; `--hmp "xp/8gx 0x<pa>"` reads guest memory after the stop.
 
 ## Environment knobs
 
-| variable | effect |
-| --- | --- |
-| `QEMU_PHYS_BASE`, `QEMU_MEM_SIZE` | another window of RAM (default `0xb0000000`/`0x4d000000`; the phone's own shape is `0x100000000`/`0x180000000`) |
-| `ADT_SEED` | pin the random seed the physmap slide derives from |
+`QEMU_PHYS_BASE`/`QEMU_MEM_SIZE` pick another window of RAM (default
+`0xb0000000`/`0x4d000000`; the phone's own shape is `0x100000000`/`0x180000000`),
+and `ADT_SEED` pins the random seed the physmap slide derives from.
 
 ## Reading the result
 
 `no_panic_observed` means "no visible panic in the framebuffer snapshot", not
-"booted": with `--qemu` read `serial.txt` (the whole console) and use
-`qemu.log`/`qemu-triage.py` when its last line is not enough. Two traps: the
-ADT's CPU node must carry MPIDR 0 (the phone's boot core is 7), and `phystokv()`
-panics on any address outside the window.
+"booted": with `--qemu` read `serial.txt` and `qemu.log`/`qemu-triage.py` when
+its last line is not enough. Two traps: the ADT's CPU node must carry MPIDR 0
+(the boot core is 7) and `phystokv()` panics outside the window.
