@@ -234,8 +234,8 @@ shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
-OrangeFox lives in `boot` (`fastboot flash boot_b ofox-boot-b-complete.img`);
-`boot-recovery` starts the active `boot` slot, so `recovery_a/b` never boot.
+A recovery needs no partition: `fastboot boot ofox.img` runs it from RAM (the
+`boot-recovery` BCB runs the active `boot` slot; `recovery_a/b` never boot).
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)

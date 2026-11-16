@@ -97,11 +97,14 @@ SID 0 (the ADC's own PMIC) answers 794 mV, 124 °C — double the others. All fi
 `die_temp` channels declare the same `qcom,pre-scaling` (1 1), so this is not a
 missing divider.
 
-**SID 0 is not a die temperature on this board.** The vendor kernel (an
-OrangeFox boot, its own thermal drivers) exposes `pm8350_tz`, `pm8350b_tz`,
-`pm8350c_tz`, `pmr735a_tz` and `pmr735b_tz` — and no `pmk8350_tz` at all. It
-simply never publishes what SID 0 answers, so the 124 °C is an artefact of
-reading a channel the vendor leaves alone, not a hot PMIC.
+**SID 0 is our bug, not the chip.** The vendor's own VADC (`iio:device0`, the
+pmk8350's `vadc@3100`) publishes `in_temp_pmk8350_die_temp_input` = 34.1 °C
+while `pm8350_die_temp` says 35.6 and `pm8350b_die_temp` 40.2, so that channel
+does answer a sane temperature in the vendor kernel. Our 794 mV for the same
+PMIC is therefore a wrong read, not a hot part: the pmk8350 is an **ADC7**
+peripheral (`adc7_chans_pmic`), where `die_temp` is channel 6 and the decimation
+and settle-time tables differ from ADC5's, so channel 3 there is some other
+input. Nothing depends on it: SID 1, 3 and 4 are fine.
 
 Cold and charging, the vendor reads 36.5 (`pm8350`), 40.6 (`pm8350b`) and
 35.8 °C (`pmr735a`); our VADC reads 59-63 °C for the same three on a phone that
@@ -131,9 +134,19 @@ Those codes are **not degrees**. `tsens.c` turns a code into °C with
 from the SoC's efuse; the live device tree carries no calibration cells (no
 `qfprom`, no `nvmem-cells`), and mainline's fallback (`slope 3200`, offset 0)
 would put these codes at 128-145 °C, which is impossible here. The vendor gets
-that calibration from a source outside the AP's device tree, so the raw read is
-what the port can do without it: enough to see a sensor move, not enough to
-publish a temperature.
+that calibration from a source outside the AP's device tree.
+
+Two things make the codes usable anyway. The vendor's tree maps every zone to a
+controller and a sensor index (`thermal-sensors = <&tsens0 N>`, where phandle
+`0x5f` is `@c263000` and `0x6d` is `@c265000`): block 0 carries `cpuss-0..3`
+(N 1-4), `cpu-1-0..8` (5-13) and `gpuss-0/1` (14-15); block 1 carries
+`cpu-0-0..3` (1-4), `ddr` (9), `mdmss-0..3` (10-13) and `camera-0/1` (14-15).
+And an idle pair of reads against the vendor's cold numbers fits a straight
+line of **about 0.1 °C per code** (residual ±2 °C): with `gpuss` at 40.5-41.3 °C
+reading 416-424 and `cpu-0` at 43.0-43.8 reading 434-446, `T ≈ code/10 - 1.6`.
+That is a fit, not a calibration - the per-sensor error is visible on the
+hotter cores, and a loaded boot moves both ends - but it is enough to gate a
+thermal-pressure decision, which is the next step.
 
 ### The charger is behind the ADSP
 
