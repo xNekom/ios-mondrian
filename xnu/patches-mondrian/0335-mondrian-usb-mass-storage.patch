@@ -102,7 +102,7 @@ diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 +#define UD_CFG_ECM_ONLY	80
  /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
  static const char *const ud_strings[] = {
- 	NULL, "ios-mondrian", "iOS on SM8475 (USB Ethernet)", "0001", "02005E77EE01",
+ 	NULL, "ios-mondrian", "Poco F5 Pro (USB Ethernet)", "0001", "02005E77EE01",
 @@ -501,6 +522,18 @@
  static void ud_rx_arm(void);
  static void ud_tx_kick_locked(void);

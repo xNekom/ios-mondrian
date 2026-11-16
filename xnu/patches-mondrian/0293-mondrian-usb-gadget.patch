@@ -479,7 +479,7 @@ new file mode 100644
 +};
 +/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
 +static const char *const ud_strings[] = {
-+	NULL, "ios-mondrian", "iOS on SM8475 (USB Ethernet)", "0001", "02005E77EE01",
++	NULL, "ios-mondrian", "Poco F5 Pro (USB Ethernet)", "0001", "02005E77EE01",
 +};
 +static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
 +
