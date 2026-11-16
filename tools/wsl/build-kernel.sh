@@ -256,6 +256,13 @@ say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 				out/gpu/mondrian-gl.dylib out/gpu/mondrian-inject.dylib \
 				out/gpu/mondrian-ui-hook.dylib "${probe[@]}"
 		else
+			# Say it out loud: without the blob the kernel writes nothing and
+			# the device keeps loading whatever /private/var/vm holds from an
+			# earlier boot, so a source change looks inert. That cost a
+			# debugging session on 2026-11-16.
+			say "warning: out/gpu/mondrian-ui-hook.dylib is missing; this kernel"
+			say "         carries no hook and the device will run the stale"
+			say "         /private/var/vm copy (tools/build-mondrian-ui-hook.sh)"
 			python3 tools/gen-glblob.py "$XNU/bsd/dev" \
 				out/gpu/mondrian-gl.dylib out/gpu/mondrian-inject.dylib
 		fi

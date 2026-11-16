@@ -365,7 +365,7 @@ MONDRIAN = Board(
              # listed daemons (watchdogd, bluetoothd, calaccessd,
              # fairplayd.H2, aggregated) now exit cleanly, so the list is
              # kept only as a switch to put back if a phone boot disagrees.
-             'mondriankill=none '
+             'mondriankill=quiet '
              # glblob=1: the kernel carries the UI hook and the CoreAnimation
              # dylibs and writes them into /private/var/vm at boot, so a hook
              # change costs one kernel build and one `fastboot boot` instead of
