@@ -1355,6 +1355,34 @@ ring, and the fourth send resolves to `owner 128`, the daemon that just
 started. So `accessoryd` is available on demand; a clean `backboardd` still
 waits after it is up, which rules the demand trigger out as the cause.
 
+### Skipping the accessory init moves the wait, it does not remove it
+
+Measured 2026-11-16 with `tools/mondrian-probe.m` injected into `backboardd`
+alone (`mondrian_probe=1 mondrian_probe_proc=backboardd`; the dylib links
+Foundation and CoreAccessories and no QuartzCore): the replacement returns from
+`CoreAccessoriesInitForHID` and the main thread leaves that wait. The next stop
+is the container manager --
+`BSSystemSharedDirectoryForIdentifier -> container_system_path_for_identifier
+-> ... -> xpc_connection_send_message_with_reply_sync -> mach_msg` -- and 120 s
+later there is still no render server (`CARenderServerIsRunning` 0), no
+framebuffer selector from the compositor and `present` 0/s. The accessory call
+is the first of several synchronous replies `backboardd` waits for at startup,
+not the cause of the black screen by itself.
+
+Two build facts, one boot each:
+
+- The interpose only binds if the framework is linked. With
+  `-undefined dynamic_lookup` alone, CoreAccessories is not in the image when
+  the interpose table is processed, dyld drops the entry, and the dylib loads
+  without changing anything. `-framework CoreAccessories` works: the SDK ships
+  `CoreAccessories.framework/CoreAccessories.tbd`.
+- `container_system_path_for_identifier` is the nearest exported symbol above
+  the blocked frame, not the frame itself. Interposing it (with a hand-written
+  `.tbd` for `libsystem_containermanager`, so the dylib is loaded before the
+  probe binds) prints nothing and moves nothing: the call is an internal
+  function that follows that export. The same `dladdr` trap that made
+  `os_log_create` look like the logging stall.
+
 The blocking frame is `libsystem_trace + 0x5ccc`, which is **not**
 `os_log_create` (that one is at `+0x4000`, and there is a private
 `_os_log_create` at `+0x14ac0`). Measured by printing the offsets at runtime;

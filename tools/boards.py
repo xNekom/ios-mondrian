@@ -337,8 +337,11 @@ MONDRIAN = Board(
              # is quiet, which is every still screen. 0 keeps the last frame lit
              # until the power key or the idle timer blinks it.
              'mondrianfb_blank=0 '
-             'mondrian_ui_hook=61 mondriansample=launchd,backboardd,logd '
-             'mondrianlaunch=1 msgtrace=26 glenv=FD_MESA_DEBUG=nobin '
+             'mondrian_ui_hook=61 mondriansample=backboardd,containermanager '
+             # The minimal probe goes into backboardd only, so the process
+             # that has to reach the render server carries no QuartzCore.
+             'mondrian_probe=1 mondrian_probe_proc=backboardd '
+             'glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the
              # hardware has no saved brightness of its own, and CoreBrightness
@@ -366,12 +369,10 @@ MONDRIAN = Board(
              # 0: no kernel timer resets to fastboot. A reset is a debugging
              # aid and must be asked for explicitly.
              'mondrianreset=0 '
-             # The private unlock API starts an appearance transition the
-             # switcher never closes ("Unbalanced calls ... for
-             # SBSwitcherViewController"), and every app launch then queues
-             # behind it. A swipe unlocks; 0 keeps the hook out of the state
-             # machine. Set to 0 only to test that hypothesis.
-             'mondrianunlock=1'),
+             # msgtrace: record every send of one pid together with the owner
+             # of the destination port (0332/0333), so a reply that never
+             # arrives names the process that owes it.
+             'msgtrace=57'),
 )
 
 BOARDS = {b.name: b for b in (SWEET, MONDRIAN)}
