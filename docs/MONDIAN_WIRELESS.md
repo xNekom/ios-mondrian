@@ -53,6 +53,34 @@ Nothing powers any of it yet: the kernel has no QUP UART driver and no
 `hci_qca`, so the next step is the GENI SE/UART in the driver set, with these
 addresses, and the firmware load after that.
 
+### The engine answers (measured)
+
+`0343` maps wrapper 2, SE5 and GCC, votes the five bits of 0x62010 and reads the
+identity registers; `tools/usb-ring.py btuart` runs it from the host. Measured
+on the kernel of 2026-11-16, with the control channel still answering afterwards
+(`pos` and `thermal` both came back, so the reads do not wedge the bus):
+
+```
+btuart: vote 0x0 -> 0x20f want 0x20f granted
+btuart: rcgr cmd 0x0 cfg 0x100000 (was already rooted)
+btuart: halt se5 0x4220 m-ahb 0x0 s-ahb 0x80000002
+btuart: wrapper2 hw ver 0x30080000
+btuart: se init 0xa
+btuart: se cgc 0x7f
+btuart: se clk 0x1
+btuart: se fw 0x204
+```
+
+Read it as: the vote register came back **0 with nothing set** (no earlier boot
+or bootloader step powers this engine), the write sticks (`0x20f` = core 2x,
+core, m-ahb, s-ahb, SE5), the SE clock root was **already on** so the XO
+fallback did not run, bit 0 of the SE5 halt register is clear (the engine is not
+halted), and the engine reports a GENI init-config revision of **0xa**, `CGC_CTRL`
+0x7f, `CLK_CTRL_RO` 1 and a firmware revision of **0x204**. That is the
+"the register window is alive" milestone: the next step is programming the SE
+for the UART protocol and reading the chip's HCI version before loading
+`hci_qca`'s firmware.
+
 - The WiFi part is a WCN6855-class device (the QCA6490 is its board-level
   name). Linux firmware: `ath11k/WCN6855/hw2.0/amss.bin`, `m3.bin`,
   `board-2.bin`, `regdb.bin`. `board-2.bin` is board-specific; the stock

@@ -385,6 +385,7 @@ def main():
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "gpustat", "temp", "tsens",
                                  "thermal", "burn", "haps", "vib", "hapr", "hapw", "spmimap",
+                                 "btuart",
                                  "kill", "fps"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
@@ -447,7 +448,7 @@ def main():
     if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob",
                         "rtc", "execdeny", "gpukeep", "gpustat", "temp", "tsens",
                         "thermal", "burn", "haps", "vib", "hapr", "hapw",
-                        "spmimap", "kill"):
+                        "spmimap", "kill", "btuart"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0

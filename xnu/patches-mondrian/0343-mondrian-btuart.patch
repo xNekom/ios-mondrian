@@ -1,0 +1,260 @@
+xnu 0343: probe the Bluetooth engine (QUPv3 wrap2 SE5) with its clocks voted
+
+Item 17's first driver, read only: no byte is transferred and no firmware is
+loaded, because the question before either is whether the engine answers at all.
+
+The addresses are the live tree's (docs/MONDIAN_WIRELESS.md): the engine is
+qcom,msm-geni-serial-hs at 0x894000, which is SE5 of the wrapper at 0x8C0000
+(SE apertures from 0x880000 in steps of 0x4000), with GIC SPI 587 and a wakeup
+on GPIO 79. The console UART is the other engine (0x99c000, SPI 608).
+
+The three clocks the node names resolve, in mainline's gcc-sm8450, to
+GCC_QUPV3_WRAP2_S5_CLK, GCC_QUPV3_WRAP_2_M_AHB_CLK and
+GCC_QUPV3_WRAP_2_S_AHB_CLK: ids 0x82, 0x8a and 0x8b, all bits of the one vote
+register 0x62010 (SE5 bit 9, m-ahb 2, s-ahb 1, core 0, core 2x 3), with the SE's
+own root at CMD_RCGR 0x2e618 / CFG_RCGR 0x2e61c. The root is set to the XO only
+when the bootloader left it off, the way 0120 does it for the touch engine.
+
+`btuart` on the control channel runs it and answers with the vote, the halt
+state and the engine's identity registers; every read is flushed first so a
+stalled bus leaves the last line on the ring.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 94f8668..9cebc34 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
+ bsd/dev/mondrian_haptics.c		standard
++bsd/dev/mondrian_btuart.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
+new file mode 100644
+index 0000000..ef4e428
+--- /dev/null
++++ b/bsd/dev/mondrian_btuart.c
+@@ -0,0 +1,183 @@
++/*
++ * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
++ * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
++ * apertures start at 0x880000 in steps of 0x4000), GIC SPI 587 and a wakeup on
++ * GPIO 79; the console UART is the other engine, 0x99c000 on SPI 608, and
++ * bringing that one up for Bluetooth is the mistake this comment exists for.
++ *
++ * The three clocks the node names (se-clk, m-ahb, s-ahb) resolve, in mainline's
++ * gcc-sm8450, to ids 0x82, 0x8a and 0x8b = GCC_QUPV3_WRAP2_S5_CLK,
++ * GCC_QUPV3_WRAP_2_M_AHB_CLK and GCC_QUPV3_WRAP_2_S_AHB_CLK, and all three are
++ * bits of the one vote register 0x62010: SE5 bit 9, m-ahb bit 2, s-ahb bit 1,
++ * with core bit 0 and core 2x bit 3 beside them. The SE's own root is the RCG
++ * at CMD_RCGR 0x2e618 / CFG_RCGR 0x2e61c.
++ *
++ * Nothing here transfers a byte. The question it answers is whether the SE
++ * answers at all once its clocks are voted, which is what has to be true before
++ * hci_qca and a firmware load are worth writing. Every read is flushed first, so
++ * a stalled bus leaves the last line on the ring.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(MONDRIAN)
++
++#define MONDRIAN_BT_GCC_BASE		0x00100000UL
++#define MONDRIAN_BT_WRAP2_BASE		0x008c0000UL
++#define MONDRIAN_BT_SE5_BASE		0x00894000UL
++
++#define MONDRIAN_BT_VOTE_REG		0x62010
++#define MONDRIAN_BT_CORE		(1u << 0)
++#define MONDRIAN_BT_S_AHB		(1u << 1)
++#define MONDRIAN_BT_M_AHB		(1u << 2)
++#define MONDRIAN_BT_CORE_2X		(1u << 3)
++#define MONDRIAN_BT_SE5			(1u << 9)
++#define MONDRIAN_BT_WANT		(MONDRIAN_BT_CORE | \
++					 MONDRIAN_BT_S_AHB | \
++					 MONDRIAN_BT_M_AHB | \
++					 MONDRIAN_BT_CORE_2X | \
++					 MONDRIAN_BT_SE5)
++
++#define MONDRIAN_BT_HALT_SE5		0x2e610
++#define MONDRIAN_BT_HALT_M_AHB		0x2e004
++#define MONDRIAN_BT_HALT_S_AHB		0x2e008
++#define MONDRIAN_BT_SE5_CMD_RCGR	0x2e618
++#define MONDRIAN_BT_SE5_CFG_RCGR	0x2e61c
++#define MONDRIAN_BT_RCG_ROOT_OFF	(1u << 31)
++#define MONDRIAN_BT_RCG_ROOT_EN		(1u << 1)
++#define MONDRIAN_BT_RCG_UPDATE		(1u << 0)
++#define MONDRIAN_BT_HALTED		0x1
++
++#define MONDRIAN_BT_QUPV3_HW_VER	0x4
++#define MONDRIAN_BT_SE_INIT_CFG_REV	0x0
++#define MONDRIAN_BT_SE_CGC_CTRL		0x28
++#define MONDRIAN_BT_SE_CLK_CTRL_RO	0x60
++#define MONDRIAN_BT_SE_FW_REV		0x1000
++
++extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++extern void delay(int us);
++extern void mondrian_log_flush_now(void);
++
++static uint32_t
++mondrian_bt_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++mondrian_bt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * One step, in both directions: to the ring first (flushed, so a stalled bus
++ * leaves this line and not silence), then to the host's answer.
++ */
++static int
++mondrian_bt_step(char *out, size_t len, int n, const char *line)
++{
++	printf("%s", line);
++	mondrian_log_flush_now();
++	if (n < 0) {
++		return 0;
++	}
++	return n + snprintf(out + n, len - (size_t)n, "%s", line);
++}
++
++/*
++ * Returns the number of bytes written to `out`, like the haptics dump: the
++ * caller sends exactly that and the ring carries it to the host.
++ */
++int
++mondrian_btuart_probe(char *out, size_t len)
++{
++	vm_offset_t gcc, wrap, se;
++	uint32_t vote, after, halt5, haltm, halts, cmd, cfg, hw, init, cgc, clk, fw;
++	char line[192];
++	int rooted = 0;
++	int n = 0;
++
++	gcc = ml_io_map(MONDRIAN_BT_GCC_BASE, 0x70000);
++	wrap = ml_io_map(MONDRIAN_BT_WRAP2_BASE, 0x2000);
++	se = ml_io_map(MONDRIAN_BT_SE5_BASE, 0x4000);
++	if (gcc == 0 || wrap == 0 || se == 0) {
++		snprintf(line, sizeof(line),
++		    "btuart: cannot map gcc 0x%lx wrap 0x%lx se 0x%lx\n",
++		    (unsigned long)gcc, (unsigned long)wrap, (unsigned long)se);
++		return mondrian_bt_step(out, len, 0, line);
++	}
++
++	vote = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
++	mondrian_bt_wr(gcc, MONDRIAN_BT_VOTE_REG, vote | MONDRIAN_BT_WANT);
++	delay(1000);
++	after = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
++	snprintf(line, sizeof(line), "btuart: vote 0x%x -> 0x%x want 0x%x %s\n",
++	    vote, after, MONDRIAN_BT_WANT,
++	    (after & MONDRIAN_BT_WANT) == MONDRIAN_BT_WANT ? "granted" :
++	    "NOT granted");
++	n = mondrian_bt_step(out, len, n, line);
++
++	/*
++	 * The engine's register interface lives in its own clock domain, so the
++	 * root has to be on before the identity reads: if the bootloader left
++	 * it off, root it on the XO (source 0, divider 1) as 0120 does for the
++	 * touch engine.
++	 */
++	cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
++	if ((cmd & MONDRIAN_BT_RCG_ROOT_OFF) != 0) {
++		cfg = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR);
++		cfg &= ~0x1fu;
++		cfg &= ~0x700u;
++		mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CFG_RCGR, cfg);
++		mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CMD_RCGR, MONDRIAN_BT_RCG_UPDATE);
++		for (int i = 0; i < 1000; i++) {
++			if ((mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR) &
++			    MONDRIAN_BT_RCG_UPDATE) == 0) {
++				break;
++			}
++		}
++		cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
++		mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_CMD_RCGR,
++		    cmd | MONDRIAN_BT_RCG_ROOT_EN);
++		delay(1000);
++		rooted = 1;
++	}
++	cfg = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CFG_RCGR);
++	cmd = mondrian_bt_rd(gcc, MONDRIAN_BT_SE5_CMD_RCGR);
++	snprintf(line, sizeof(line), "btuart: rcgr cmd 0x%x cfg 0x%x%s\n", cmd, cfg,
++	    rooted ? " rooted on xo" : " (was already rooted)");
++	n = mondrian_bt_step(out, len, n, line);
++
++	halt5 = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_SE5);
++	haltm = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_M_AHB);
++	halts = mondrian_bt_rd(gcc, MONDRIAN_BT_HALT_S_AHB);
++	snprintf(line, sizeof(line),
++	    "btuart: halt se5 0x%x m-ahb 0x%x s-ahb 0x%x%s\n", halt5, haltm, halts,
++	    (halt5 & MONDRIAN_BT_HALTED) ? " se5 STILL HALTED" : "");
++	n = mondrian_bt_step(out, len, n, line);
++
++	hw = mondrian_bt_rd(wrap, MONDRIAN_BT_QUPV3_HW_VER);
++	snprintf(line, sizeof(line), "btuart: wrapper2 hw ver 0x%x\n", hw);
++	n = mondrian_bt_step(out, len, n, line);
++
++	/* One line per read: if the bus stalls, the next line names the register. */
++	init = mondrian_bt_rd(se, MONDRIAN_BT_SE_INIT_CFG_REV);
++	snprintf(line, sizeof(line), "btuart: se init 0x%x\n", init);
++	n = mondrian_bt_step(out, len, n, line);
++	cgc = mondrian_bt_rd(se, MONDRIAN_BT_SE_CGC_CTRL);
++	snprintf(line, sizeof(line), "btuart: se cgc 0x%x\n", cgc);
++	n = mondrian_bt_step(out, len, n, line);
++	clk = mondrian_bt_rd(se, MONDRIAN_BT_SE_CLK_CTRL_RO);
++	snprintf(line, sizeof(line), "btuart: se clk 0x%x\n", clk);
++	n = mondrian_bt_step(out, len, n, line);
++	fw = mondrian_bt_rd(se, MONDRIAN_BT_SE_FW_REV);
++	snprintf(line, sizeof(line), "btuart: se fw 0x%x\n", fw);
++	n = mondrian_bt_step(out, len, n, line);
++
++	return n;
++}
++
++#endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 2c59647..51528e4 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2138,6 +2138,24 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "btuart" maps the Bluetooth engine (QUPv3 wrapper 2, SE5 at 0x894000) with
++ * its clocks voted and prints what it answers. It transfers nothing: the first
++ * question is whether the register window is alive, and a driver that loads
++ * firmware into a dead engine only hides that.
++ */
++static void
++ud_cmd_btuart(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_btuart_probe(char *out, size_t len);
++	char out[384];
++	int n;
++
++	(void)line;
++	n = mondrian_btuart_probe(out, sizeof(out));
++	ud_cmd_send(so, to, out, (size_t)n);
++}
++
+ static void
+ ud_cmd_hapreg(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2591,6 +2609,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);
++			} else if (strcmp(cmd, "btuart") == 0) {
++				ud_cmd_btuart(so, peer, cmd);
+ 			} else if (strncmp(cmd, "hapr ", 5) == 0 ||
+ 			    strncmp(cmd, "hapw ", 5) == 0) {
+ 				ud_cmd_hapreg(so, peer, cmd);
