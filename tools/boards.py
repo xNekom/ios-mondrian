@@ -337,10 +337,19 @@ MONDRIAN = Board(
              # is quiet, which is every still screen. 0 keeps the last frame lit
              # until the power key or the idle timer blinks it.
              'mondrianfb_blank=0 '
-             'mondrian_ui_hook=61 mondriansample=backboardd,containermanager '
-             # The minimal probe goes into backboardd only, so the process
-             # that has to reach the render server carries no QuartzCore.
-             'mondrian_probe=1 mondrian_probe_proc=backboardd '
+             # logd: the firehose consumer. Every process that logs blocks on
+             # a chunk it never frees, which is why backboardd and SpringBoard
+             # freeze in their first os_log call, so its thread states are the
+             # measurement that matters.
+             # 0: no hook in any process. The daemons' own startup is then
+             # the only thing the ring shows, which is what separates a hook
+             # that breaks them from a daemon that never gets an answer.
+             'mondrian_ui_hook=0 mondriansample=logd,backboardd,SpringBoard '
+             # The firehose subsystem is 11600: a receive with id 11600 on
+             # logd is a buffer registration, 11601 is the synchronous push
+             # that blocks a writer. Resolved by name so the traced pid does
+             # not depend on the boot.
+             'msgtracename=logd '
              'glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the
@@ -368,11 +377,7 @@ MONDRIAN = Board(
              'glblob=1 '
              # 0: no kernel timer resets to fastboot. A reset is a debugging
              # aid and must be asked for explicitly.
-             'mondrianreset=0 '
-             # msgtrace: record every send of one pid together with the owner
-             # of the destination port (0332/0333), so a reply that never
-             # arrives names the process that owes it.
-             'msgtrace=26'),
+             'mondrianreset=0 '),
 )
 
 BOARDS = {b.name: b for b in (SWEET, MONDRIAN)}

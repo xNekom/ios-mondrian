@@ -1,0 +1,224 @@
+xnu 0334: print the request a blocked send carries, and trace a process by name
+
+The container query's stall says nothing about what it asked for: the ring only
+showed a 24-byte request with msgh id 1000 and its reply, and the probe that
+interposed bootstrap_look_up never fired, so the name was never visible. Copy
+the body of such a request inside the trap and print it from the sampler
+outside, which is what the existing message trace already does for ids and
+sizes. The first measurement says the body is empty, so that channel is not a
+name lookup at all.
+
+msgtrace also takes a pid, and a pid guessed from the previous boot wastes a
+boot when the daemon moves; msgtracename resolves it from the same process walk
+the sampler already does. That is how logd is followed: the firehose subsystem
+is 11600, so a receive with id 11600 on logd is a buffer registration and 11601
+is the synchronous push a blocked writer is waiting on.
+
+diff --git a/osfmk/ipc/mach_msg.c b/osfmk/ipc/mach_msg.c
+--- a/osfmk/ipc/mach_msg.c
++++ b/osfmk/ipc/mach_msg.c
+@@ -123,6 +123,8 @@
+ /* mondrian: defined with the message traps below, used by both of them. */
+ static void mondrian_msgtrace_send(mach_msg_user_header_t *header);
+ static void mondrian_msgtrace_send_begin(mach_msg_user_header_t *header);
++static void mondrian_msgtrace_lookup(mach_vm_address_t msg_addr,
++    mach_msg_size_t size, mach_msg_user_header_t *header);
+ static void mondrian_msgtrace_recv(mach_vm_address_t msg_addr,
+     mach_msg_size_t size);
+ static void mondrian_msg_record(int kind, int pid, int msg_id, int owner,
+@@ -1007,6 +1009,7 @@
+ 	if (option32 & MACH_SEND_MSG) {
+ 		/* send_size is bound checked */
+ 		mondrian_msgtrace_send_begin(&user_header);
++		mondrian_msgtrace_lookup(msg_addr, send_size, &user_header);
+ 		mr = mach_msg_trap_send(msg_addr, 0, (mach_msg_option64_t)option32,
+ 		    msg_timeout, priority, filter_nonfatal,
+ 		    user_header, send_size, 0, desc_count);
+@@ -1207,6 +1210,71 @@
+ 	mondrian_trace_port = (int)header->msgh_remote_port;
+ }
+ 
++/*
++ * mondrian: the service name a bootstrap request carries.
++ *
++ * backboardd's container query never returns and all the ring shows is a
++ * request with msgh id 1000 and its reply, so the request itself is copied
++ * here: the body is the service name (or, for a complex message, whatever
++ * precedes the descriptors), and the sampler prints it outside the trap. That
++ * is what separates an unregistered service from one that is registered and
++ * never answers.
++ */
++char mondrian_lookup_name[80];
++unsigned char mondrian_lookup_hex[48];
++int mondrian_lookup_hex_len;
++int mondrian_lookup_kind;
++volatile int mondrian_lookup_seq;
++int mondrian_lookup_pid;
++int mondrian_lookup_bits;
++int mondrian_lookup_size;
++
++static void
++mondrian_msgtrace_lookup(mach_vm_address_t msg_addr, mach_msg_size_t size,
++    mach_msg_user_header_t *header)
++{
++	mach_msg_size_t body;
++	char name[80];
++	int pid = proc_pid(current_proc());
++	int i;
++
++	if (header->msgh_id != 1000 || !mondrian_msgtrace_wanted(pid)) {
++		return;
++	}
++	memset(name, 0, sizeof(name));
++	body = size > sizeof(*header) ? size - sizeof(*header) : 0;
++	if (body >= sizeof(name)) {
++		body = sizeof(name) - 1;
++	}
++	if (body != 0 &&
++	    copyin((user_addr_t)(msg_addr + sizeof(*header)), name, body) != 0) {
++		strlcpy(name, "copyin failed", sizeof(name));
++	}
++	for (i = 0; i < (int)sizeof(name); i++) {
++		if (name[i] == 0) {
++			break;
++		}
++		if ((unsigned char)name[i] < 0x20 ||
++		    (unsigned char)name[i] > 0x7e) {
++			name[i] = '.';
++		}
++	}
++	memcpy(mondrian_lookup_name, name, sizeof(mondrian_lookup_name));
++	{
++		mach_msg_size_t len = size > sizeof(mondrian_lookup_hex) ?
++		    sizeof(mondrian_lookup_hex) : size;
++
++		if (copyin((user_addr_t)msg_addr, mondrian_lookup_hex, len) == 0) {
++			mondrian_lookup_hex_len = (int)len;
++			mondrian_lookup_kind = 0;
++		}
++	}
++	mondrian_lookup_pid = pid;
++	mondrian_lookup_bits = (int)header->msgh_bits;
++	mondrian_lookup_size = (int)size;
++	mondrian_lookup_seq++;
++}
++
+ static void
+ mondrian_msgtrace_send(mach_msg_user_header_t *header)
+ {
+@@ -1244,6 +1312,28 @@
+ 	(void)copyin((user_addr_t)(msg_addr + 20), (char *)&id, sizeof(id));
+ 	mondrian_msgtrace_lines++;
+ 	mondrian_msg_record(MONDRIAN_MSG_RECV, pid, (int)id, 0, (int)size);
++	/*
++	 * The reply to the bootstrap-shaped request: bytes are what say whether it
++	 * carries a port right (a service that exists) or an error code.
++	 */
++	if (id == 1100) {
++		mach_msg_user_header_t hdr;
++		mach_msg_size_t len;
++
++		if (copyin((user_addr_t)msg_addr, &hdr, sizeof(hdr)) == 0) {
++			len = hdr.msgh_size;
++			if (len > sizeof(mondrian_lookup_hex)) {
++				len = sizeof(mondrian_lookup_hex);
++			}
++			if (len != 0 &&
++			    copyin((user_addr_t)msg_addr, mondrian_lookup_hex,
++			    len) == 0) {
++				mondrian_lookup_hex_len = (int)len;
++				mondrian_lookup_kind = 1;
++				mondrian_lookup_seq++;
++			}
++		}
++	}
+ }
+ 
+ /*
+@@ -1365,6 +1455,7 @@
+ 
+ 		/* for scalar send: msg_send_size (from mb_ss) has not been bound checked */
+ 		mondrian_msgtrace_send_begin(&user_header);
++		mondrian_msgtrace_lookup(msg_addr, msg_send_size, &user_header);
+ 		mr = mach_msg_trap_send(msg_addr, aux_addr, option64,
+ 		    msg_timeout, priority, filter_nonfatal,
+ 		    user_header, msg_send_size,
+diff --git a/bsd/dev/mondrian_sample.c b/bsd/dev/mondrian_sample.c
+--- a/bsd/dev/mondrian_sample.c
++++ b/bsd/dev/mondrian_sample.c
+@@ -36,6 +36,15 @@
+ static int      mondrian_want_pid[MONDRIAN_SAMPLE_MAX];
+ static uint64_t mondrian_want_pc[MONDRIAN_SAMPLE_MAX];
+ 
++/*
++ * msgtrace takes a pid, and a pid guessed from the previous boot is a wasted
++ * boot when the daemon moves. msgtracename resolves it by name from the same
++ * process walk the sampler already does: the firehose subsystem is 11600, so
++ * "does logd receive id 11600/11601" is the question this answers.
++ */
++static char     mondrian_trace_name[32];
++extern int      mondrian_msgtrace;
++
+ static char     mondrian_proc_list[1024];
+ static int      mondrian_proc_len;
+ static int      mondrian_proc_count;
+@@ -83,6 +92,35 @@
+ 		}
+ 		mondrian_msg_drained++;
+ 	}
++	/*
++	 * The bootstrap request body, printed here and not in the trap: this is the
++	 * service name backboardd asks for before it waits forever, and an empty
++	 * name with a size of 24 means the request carries no inline body at all.
++	 */
++	{
++		extern volatile int mondrian_lookup_seq;
++		extern char mondrian_lookup_name[80];
++		extern int mondrian_lookup_pid;
++		extern int mondrian_lookup_bits;
++		extern int mondrian_lookup_size;
++		extern unsigned char mondrian_lookup_hex[48];
++		extern int mondrian_lookup_hex_len;
++		extern int mondrian_lookup_kind;
++		static int last_lookup_seq;
++		int i;
++
++		if (mondrian_lookup_seq != last_lookup_seq) {
++			last_lookup_seq = mondrian_lookup_seq;
++			printf("MONDRIAN LOOKUP: pid %d kind %d bits 0x%x size %d name \"%s\" hex",
++			    mondrian_lookup_pid, mondrian_lookup_kind,
++			    mondrian_lookup_bits, mondrian_lookup_size,
++			    mondrian_lookup_name);
++			for (i = 0; i < mondrian_lookup_hex_len && i < 40; i++) {
++				printf(" %02x", mondrian_lookup_hex[i]);
++			}
++			printf("\n");
++		}
++	}
+ }
+ 
+ 
+@@ -107,6 +145,10 @@
+ 	if (!PE_parse_boot_argn("mondriansample", arg, sizeof(arg))) {
+ 		strlcpy(arg, "SpringBoard,backboardd,launchd", sizeof(arg));
+ 	}
++	if (!PE_parse_boot_argn("msgtracename", mondrian_trace_name,
++	    sizeof(mondrian_trace_name))) {
++		mondrian_trace_name[0] = 0;
++	}
+ 	for (t = arg; *t != 0 && n < MONDRIAN_SAMPLE_MAX;) {
+ 		const char *end = strchr(t, ',');
+ 		size_t len = end ? (size_t)(end - t) : strlen(t);
+@@ -140,6 +182,12 @@
+ 
+ 	mondrian_proc_count++;
+ 	proc_name(proc_pid(p), name, sizeof(name));
++	if (mondrian_trace_name[0] != 0 && mondrian_msgtrace == 0 &&
++	    strcmp(name, mondrian_trace_name) == 0) {
++		mondrian_msgtrace = proc_pid(p);
++		printf("MONDRIAN MSG: trace %s pid %d\n", name,
++		    mondrian_msgtrace);
++	}
+ 	if (mondrian_proc_len < (int)sizeof(mondrian_proc_list) - 40) {
+ 		mondrian_proc_len += snprintf(mondrian_proc_list + mondrian_proc_len,
+ 		    sizeof(mondrian_proc_list) - mondrian_proc_len, "%s(%d) ",

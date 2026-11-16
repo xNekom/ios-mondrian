@@ -1259,11 +1259,20 @@ ring): `os_log enter` still never returns, at t=5 s and again at t=45 s and
 t=100 s from their own threads, and `os_log_create` from BackBoardServices holds
 backboardd's main thread in `libdispatch` -> `libsystem_trace` ->
 `mach_msg` -> `os_log_create`. The boot log has `Firehose configured: 16 chunks,
-8 io pages`, so the kernel side is up and the writer is waiting for a consumer:
-`firehose_buffer_tracepoint_reserve_wait_for_chunks_from_logd` in libdispatch is
-the wait, and logd is the flusher that never frees a chunk. The window server
-therefore never reaches display detection (`present 0/s`, display link `0`
-ticks, panel on the boot console).
+8 io pages`, which is the *kernel* buffer, so the stack was read as a writer
+waiting for a consumer in `firehose_buffer_tracepoint_reserve_wait_for_chunks_
+from_logd`. **That reading is wrong.** Measured 2026-11-16 with `msgtracename=logd`
+(`0334`): logd is alive and working -- it sends its own request/response pair
+(4811 of up to 120 KB, answered by 4911 of 52 bytes) several times a second and
+sends id **11702**, the firehose push acknowledgement, to several client ports.
+So logd does drain; the process that blocks in `os_log` is blocked on something
+else, and the container-manager wait in the same boot is not logd's fault
+either.
+
+The firehose MIG subsystem is 11600 (`register`, `push_and_wait`, `push_async`),
+replies are +100; a *container* request is id 1000 with an **empty** body (the
+reply is 1100), so that channel is not a bootstrap lookup with a name in it and
+interposing `bootstrap_look_up` can never see it.
 
 Do not inject the UI hook into `logd` to look at it: the dylib links
 CoreAnimation, and a boot with the hook in logd stopped answering on the ring
