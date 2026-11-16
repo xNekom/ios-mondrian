@@ -722,10 +722,20 @@ them has Metal. That is the path this port follows.
   so `gpukeep=0` also brackets every such access the way kgsl does in
   `gen7_irq_handler` (`adreno_gen7.c`). `gpukeep=2` never raises it, the A/B.
   `0317` moves the mode to run time (`gpukeep 0|1|2` on the USB channel) and
-  waits 2 ms after a raise, which is how the release was tested on a live system
+  waits for GX to report up after a raise (`GMU_OFF(0x1f8d0)` bits 0/1: GDSC
+  off, clock off), which is how the release was tested on a live system
   (`docs/MONDIAN_POWER.md`, "Heat"): the hold can come down without a reboot, but
   a blank-triggered drop faults, so the submit path has to bracket its ring
   writes first.
+- **The keepalive does not keep GX up.** `gpustat` (0317, on the USB channel)
+  with the keepalive held and then released for 58 s while the screen idled:
+  `gxclk 0x0 keep 0x0 pwr 0x0 cp2gmu 0x4 rbbm 0x1` at every sample, and the same
+  with the IFPC bracket on (`gpunomark=0`, logged as `nomark 0`). GX's GDSC and
+  clock stay on, the GMU's RPMH power state never reaches IFPC and the CP never
+  sits in IFPC, so the drop saves nothing: entering IFPC is the GMU's decision
+  and nothing the port does asks for it. `0317` is still the right shape (the
+  wait and the per-submit bracket), but the collapse itself needs the GMU side
+  (`docs/MONDIAN_PORT.md` item 9 in `~/.opencode/plan`), not this register.
 - **The IFPC bracket is not what the draw needed.** `0203` leaves kgsl's
   `0x101`/`0x100`/IB1LIST bracket off by default (`mondrian_uc_nomark = 1`), so
   the boot that first drew ran without it; `gpunomark=0` turns it back on for
