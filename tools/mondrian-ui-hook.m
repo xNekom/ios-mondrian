@@ -4540,6 +4540,7 @@ static unsigned mondrian_unlock_attempts;
  */
 static int mondrian_win_logs;
 static int mondrian_keepawake_off_logs;
+static int mondrian_pref_logs;
 
 static void
 mondrian_dump_windows(const char *why)
@@ -4725,6 +4726,83 @@ install_touch_probe(void)
 	say("MONDRIAN UI: touch probe installed\n");
 }
 
+/*
+ * Auto-lock. The idle timer never fires on this port and the hook no longer
+ * holds it (measured 2026-11-16: `SBUserAgent` never asks, no `panel blank`
+ * line, 21 fps for ten minutes), so the timeout is the next thing to look at.
+ * It lives in SpringBoard's own preferences; print what is there, and let
+ * `mondrianautolock=N` replace it through cfprefsd (the boot log shows the
+ * daemon starting, so the write is the supported one and persists in the root).
+ */
+static void
+mondrian_report_autolock(void)
+{
+	static const char *keys[] = {
+		"SBLockScreenAutoLockTime",
+		"SBLockScreenDisableAutoLock",
+		"SBIdleTimerTimeout",
+		"SBDeviceLockBlocked",
+	};
+	CFStringRef app = CFSTR("com.apple.springboard");
+	char line[160];
+	unsigned i;
+	int seconds;
+
+	for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i],
+		    kCFStringEncodingUTF8);
+		CFTypeRef value = key != NULL ?
+		    CFPreferencesCopyAppValue(key, app) : NULL;
+
+		if (value == NULL) {
+			snprintf(line, sizeof(line), "MONDRIAN PREF: %s missing\n",
+			    keys[i]);
+		} else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+			int number = 0;
+
+			CFNumberGetValue((CFNumberRef)value, kCFNumberIntType,
+			    &number);
+			snprintf(line, sizeof(line), "MONDRIAN PREF: %s = %d\n",
+			    keys[i], number);
+		} else if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+			snprintf(line, sizeof(line), "MONDRIAN PREF: %s = %s\n",
+			    keys[i], CFBooleanGetValue((CFBooleanRef)value) ?
+			    "true" : "false");
+		} else {
+			snprintf(line, sizeof(line), "MONDRIAN PREF: %s type %lu\n",
+			    keys[i], (unsigned long)CFGetTypeID(value));
+		}
+		say(line);
+		if (value != NULL) {
+			CFRelease(value);
+		}
+		if (key != NULL) {
+			CFRelease(key);
+		}
+	}
+	seconds = boot_arg_int("mondrianautolock=", 0);
+	if (seconds <= 0) {
+		return;
+	}
+	{
+		CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType,
+		    &seconds);
+
+		if (number == NULL) {
+			return;
+		}
+		CFPreferencesSetAppValue(CFSTR("SBLockScreenAutoLockTime"), number,
+		    app);
+		CFPreferencesSetAppValue(CFSTR("SBLockScreenDisableAutoLock"),
+		    kCFBooleanFalse, app);
+		CFPreferencesAppSynchronize(app);
+		CFRelease(number);
+		snprintf(line, sizeof(line), "MONDRIAN PREF: auto-lock set to %d s\n",
+		    seconds);
+		say(line);
+	}
+}
+
 static void
 mondrian_lock_step(void *context)
 {
@@ -4745,6 +4823,9 @@ mondrian_lock_step(void *context)
 	mondrian_lock_step_pending = 0;
 	if (cls == Nil) {
 		return;
+	}
+	if (mondrian_pref_logs++ == 0) {
+		mondrian_report_autolock();
 	}
 	if (!mondrian_agent_hooks) {
 		mondrian_agent_hooks = mondrian_install_agent_hooks();

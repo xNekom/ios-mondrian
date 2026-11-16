@@ -343,7 +343,9 @@ MONDRIAN = Board(
              # 2026-11-16 (docs/MONDIAN_GPU.md). `mondriankeepawake=0` takes
              # both idle-timer holds off for a boot; the idle timer still never
              # fires, so the holds are the default (docs/MONDIAN_PORT.md).
-             'mondrian_ui_hook=4 '
+             # `mondrianautolock=N` writes the root's auto-lock preference
+             # (measured missing: SBLockScreenAutoLockTime; the hook prints it).
+             'mondrian_ui_hook=4 mondriankeepawake=0 '
              'mondriansample=logd,backboardd,SpringBoard'
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push

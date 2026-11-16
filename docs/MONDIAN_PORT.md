@@ -214,11 +214,11 @@ the smoothness numbers.
 `0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
 timer (`mondrianfb_blank`) is 0 in the board cmdline: at its default of 1 the
 panel went dark a second after the compositor went quiet. The hook holds
-`setIdleTimerDisabled:` down every two seconds, so the idle timer never fires;
-`mondriankeepawake=0` drops both holds, and a boot with it still never asks for
-the timer, never blanks and holds 21 fps for ten minutes -- so the auto-lock
-preference in the root is the next thing to check. `0305` sets the brightness
-and `0304` the battery level, both off the frame path.
+`setIdleTimerDisabled:` down every two seconds; `mondriankeepawake=0` drops both
+holds, and a boot with it never asks for the timer and holds 21 fps for ten
+minutes. `SBLockScreenAutoLockTime` is missing from SpringBoard's preferences,
+so the hook prints the pref at boot and `mondrianautolock=N` writes it through
+cfprefsd. `0305` sets the brightness, `0304` the battery level.
 The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
 `backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
