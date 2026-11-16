@@ -422,6 +422,13 @@ def main():
         print("mem requested: the histogram goes to the live log (udp/5140)")
         return 0
     if args.command == "bl":
+        # "bl" sets the backlight (level [fmt [cmd]]); with no level there is
+        # nothing to set, and indexing args[0] threw an IndexError that read as
+        # a broken tool rather than a missing argument.
+        if not args.args:
+            print("usage: bl LEVEL [FMT [CMD]]  (CMD defaults to 0x51)",
+                file=sys.stderr)
+            return 2
         level = int(args.args[0])
         fmt = int(args.args[1]) if len(args.args) > 1 else 0
         cmd = int(args.args[2]) if len(args.args) > 2 else 0x51
