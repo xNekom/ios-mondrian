@@ -214,8 +214,7 @@ rebuild has to fix.
 
 **`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
 entry that claims data and owns no blocks is rejected on every open (2 560
-times in one boot), and the hard resets write that damage; the legal
-under-one-block case is exempt (`hfs_zero_block_stub()`).
+times for one record class), and the hard resets write that damage.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload: that travels **appended to the

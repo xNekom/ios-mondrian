@@ -148,8 +148,8 @@ img2simg ios16-root.img ios16-root.simg
 ```
 
 `mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive
-journaled HFS+ volume and adds the dyld cache links, the plain system keybag
-and the log directories the daemons expect. `ios-root-tweaks.py` applies the
+HFS+ volume, journal off before boot (`docs/DUAL_BOOT.md`), and adds the dyld
+cache links, the system keybag and the log directories the daemons expect. `ios-root-tweaks.py` applies the
 bring-up changes (skip Setup, seed activation, drop daemons that need missing
 hardware, disable the watchdogs that kill slow apps); its header explains each
 one. The device tree builder copies `/product` from the real iPhone X device

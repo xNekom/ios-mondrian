@@ -179,10 +179,10 @@ Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the 
 16 root built by `tools/mkiosroot.sh`, prepared by `tools/ios-root-tweaks.py`
 and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
-The flattened HFS root is not a stock volume layout: launchd still expects a
-Data volume and `/private/preboot/<uuid>/usr/standalone/firmware`, and the
-volume is non-journaled, so a boot logs 10,000-13,000 `hfs_mark_inconsistent`
-lines and `suggestd` restart-loops, yet held 60 fps during a drag (`NOTES.md`).
+The flattened HFS root is not a stock layout: launchd expects a Data volume and
+`/private/preboot/<uuid>/` (`.roots-installed` and the firmware tree); the
+non-journaled volume logs 10,000-13,000 `hfs_mark_inconsistent` lines once
+damaged (none after a fresh restore), yet held 60 fps in a drag (`NOTES.md`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error. Read
