@@ -616,7 +616,7 @@ new file mode 100644
 index 0000000..11eaf68
 --- /dev/null
 +++ b/iokit/Kernel/arm/MondrianPower.cpp
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,325 @@
 +/*
 + * MONDRIAN: the battery, published as an IOPMPowerSource.
 + *
@@ -656,40 +656,106 @@ index 0000000..11eaf68
 +#define MONDRIAN_BATT_TEMP	2500u	/* no thermometer; a constant */
 +
 +/*
-+ * Voltage to capacity, the old kernel's table: 4150 mV is full, 3450 mV the
-+ * lowest point that is not empty, and anything below 3450 reads 1%. Integer
-+ * division truncates, so the steps at the ends (4149 -> 99, 3449 -> 1) are
-+ * the original behaviour, not rounding artefacts.
++ * Voltage to capacity. The table below is the old kernel's: 4150 mV is full,
++ * 3450 mV the lowest point that is not empty, and anything below 3450 reads
++ * 1%. `battfix=mv:pct[,mv:pct...]` (up to four points, any order) replaces it
++ * with measured points: the vendor tree carries no mondrian battery
++ * profile to copy (`pc-temp-ocv-lut` appears nowhere under
++ * `MiCode/kernel_devicetree@mondrian-s-oss`, and the device dtsi only sets
++ * `qcom,shutdown-voltage = <3350>`), so the plan's Android `capacity` against
++ * `voltage_now` pairs are the only real anchors. The ends clamp.
 + */
++struct mondrian_batt_point {
++	uint32_t mv, pct;
++};
++
++#define MONDRIAN_BATT_FIX_POINTS	4
++static struct mondrian_batt_point mondrian_batt_fix[MONDRIAN_BATT_FIX_POINTS];
++static uint32_t mondrian_batt_fix_count;
++static bool mondrian_batt_fix_parsed;
++
++static void
++mondrian_batt_fix_parse(void)
++{
++	char arg[96];
++	char *p;
++
++	mondrian_batt_fix_parsed = true;
++	if (!PE_parse_boot_argn("battfix", arg, sizeof(arg))) {
++		return;
++	}
++	for (p = arg; *p >= '0' && *p <= '9' &&
++	    mondrian_batt_fix_count < MONDRIAN_BATT_FIX_POINTS; ) {
++		uint32_t mv = 0, pct = 0;
++
++		while (*p >= '0' && *p <= '9') {
++			mv = mv * 10 + (uint32_t)(*p++ - '0');
++		}
++		if (*p++ != ':') {
++			break;
++		}
++		while (*p >= '0' && *p <= '9') {
++			pct = pct * 10 + (uint32_t)(*p++ - '0');
++		}
++		if (mv < 2500 || mv > 5000 || pct > 100) {
++			break;
++		}
++		mondrian_batt_fix[mondrian_batt_fix_count].mv = mv;
++		mondrian_batt_fix[mondrian_batt_fix_count].pct = pct;
++		mondrian_batt_fix_count++;
++		if (*p != ',') {
++			break;
++		}
++		p++;
++	}
++	/* Descending by voltage, whatever order they were written in. */
++	for (uint32_t i = 1; i < mondrian_batt_fix_count; i++) {
++		struct mondrian_batt_point point = mondrian_batt_fix[i];
++		uint32_t j = i;
++
++		while (j > 0 && mondrian_batt_fix[j - 1].mv < point.mv) {
++			mondrian_batt_fix[j] = mondrian_batt_fix[j - 1];
++			j--;
++		}
++		mondrian_batt_fix[j] = point;
++	}
++}
++
 +static uint32_t
 +mondrian_battery_percent(int mv)
 +{
-+	static const struct {
-+		uint32_t mv, pct;
-+	} curve[] = {
++	static const struct mondrian_batt_point curve[] = {
 +		{ 4150, 100 }, { 4080, 95 }, { 4020, 90 }, { 3970, 85 },
 +		{ 3930, 80 },  { 3900, 75 }, { 3870, 70 }, { 3840, 65 },
 +		{ 3810, 60 },  { 3790, 55 }, { 3770, 50 }, { 3750, 45 },
 +		{ 3730, 40 },  { 3710, 35 }, { 3690, 30 }, { 3670, 25 },
 +		{ 3640, 20 },  { 3600, 15 }, { 3550, 10 }, { 3450, 5 },
 +	};
-+	const uint32_t n = sizeof(curve) / sizeof(curve[0]);
++	const struct mondrian_batt_point *table = curve;
++	uint32_t n = (uint32_t)(sizeof(curve) / sizeof(curve[0]));
 +	uint32_t i;
 +
-+	if (mv > (int)curve[0].mv - 1) {                /* 4150 and above */
++	if (!mondrian_batt_fix_parsed) {
++		mondrian_batt_fix_parse();
++	}
++	if (mondrian_batt_fix_count > 0) {
++		table = mondrian_batt_fix;
++		n = mondrian_batt_fix_count;
++	}
++	if (mv >= (int)table[0].mv) {                   /* the top point and up */
 +		return 100;
 +	}
 +	for (i = 1; i < n; i++) {
-+		if (mv >= (int)curve[i].mv) {
++		if (mv >= (int)table[i].mv) {
 +			break;
 +		}
 +	}
-+	if (i == n) {                                   /* 3450 and below */
++	if (i == n) {                                   /* the bottom point and down */
 +		return 1;
 +	}
-+	return (uint32_t)((int)curve[i].pct +
-+	    (int)((curve[i - 1].pct - curve[i].pct) * (uint32_t)(mv - curve[i].mv)) /
-+	    (int)(curve[i - 1].mv - curve[i].mv));
++	return (uint32_t)((int)table[i].pct +
++	    (int)((table[i - 1].pct - table[i].pct) * (uint32_t)(mv - table[i].mv)) /
++	    (int)(table[i - 1].mv - table[i].mv));
 +}
 +
 +class MondrianPowerSource : public IOPMPowerSource {

@@ -346,12 +346,17 @@ MONDRIAN = Board(
              # `mondrianautolock=N` writes the root's auto-lock preference
              # (measured missing: SBLockScreenAutoLockTime; the hook prints it).
              'mondrian_ui_hook=4 mondriankeepawake=0 '
-             'mondriansample=logd,backboardd,SpringBoard'
+             'mondriansample=logd,backboardd,SpringBoard '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does
              # not depend on the boot.
              'msgtracename=logd '
+             # The measured Android pair (see 0304): 3.80 V read 36 % on Android
+             # where the old table said 58; 4.15 V is the pack's full point.
+             # `battfix=mv:pct,...` replaces the built-in table; the points are
+             # sorted by voltage, whatever order they are written in.
+             'battfix=4150:100,3800:36 '
              'glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the

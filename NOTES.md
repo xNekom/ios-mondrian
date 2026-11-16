@@ -67,9 +67,9 @@ Current blockers, in order:
    was missing (the hook writes it) and `SBLockScreenManager` exposes no
    `_idleTimerPolicyAggregator`.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
-   and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
-   of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
-   reads 58 % where Android said 36 %).
+   and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is
+   out of reach: the level is a voltage table (`0304`), anchored to the Android
+   sample with `battfix=mv:pct,...` (the vendor tree has no profile to copy).
 3. **Control Center and the rest.** The CC grid is 430 pt wide whatever the
    screen is and the brightness module never calls its setter; GPU glitches,
    audio, modem and cameras remain (`docs/MONDIAN_GPU.md`).

@@ -208,9 +208,8 @@ panel is written through the console alias, which is only stopped with
 `disableConsoleOutput` (`0115`, an `IOMemoryDescriptor` there panics
 `pmap_remove_pv`); and the dylib forces activation past MobileActivation.
 
-Open: the UI renders at the panel's 1440x3200 (480x1066 pt at scale 3) and the
-`mondrianfb_canvas_w/h` scaler (`0268`) is off; `docs/UI_PERFORMANCE.md` has
-the smoothness numbers.
+Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
+(`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
 `0302`/`0303` blank the panel on the power key and on idle sleep; the fallback
 timer (`mondrianfb_blank`) is 30 in the board cmdline: 30 s without a present
 or a touch paints the panel black and the first touch wakes it, because the
@@ -275,6 +274,7 @@ ones:
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen and re-requests it every minute |
 | `mondriankeepawake=0` | the hook stops holding `UIApplication`'s idle timer down (it does that every two seconds on purpose: the first time iOS blanked the display by itself the frames never came back). One boot with it off is how the idle path gets watched |
+| `battfix=mv:pct,...` | replace `0304`'s built-in voltage table with measured points, up to four, any order (sorted by voltage). The vendor tree carries no mondrian profile, so the Android `capacity` against `voltage_now` pairs are the anchors: 3.80 V read 36 % there where the built-in table said 58 |
 | `mondriankill=none` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable at run time with `execdeny` -- not `kill`, which takes a pid. `quiet` is the built-in list. A denied exec must still create a `signature_failure_reason` (`0328`): without one the assert in `kern_exec.c` fires and the half-initialised image dies inside the shared cache -- which cost the bench 400 of its 500 execs. Measured with the UI up, one-minute windows: off 1 crash/min, the three voice daemons 12, `quiet` 55, exec count flat at 28-30/min. A refusal is a SIGKILL the crash reporter counts, so the list is a loss once the UI runs; it stays as a switch |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 | length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
