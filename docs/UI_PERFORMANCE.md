@@ -218,6 +218,16 @@ draws push the p90 past the period. This is the real cost once 1 and 2 are
 gone; the levers are the draw count and the copy-out path
 (`glflushdraws`, `glcopy`, `glfetch`), not the panel.
 
+Measured with a CoreAnimation animation as the load (`mondrianunlock=1
+mondriananim=1`, the probe square moving on the render server's clock): the path
+holds **60 presents a second**, `copy avg 3.0-3.2 ms` (max 5.5), `late avg
+3.5-3.8 ms` (max 16.6 once a window), `vsync avg 16.666 ms` with `over17` 5-7
+and `drop 0`. Driving the same square from the display link instead
+(`mondriananim=2`) moves nothing: the layer attaches to the key window
+(`probe attached (480x1067, key 1)`) and no `probe moves` line ever appears, so
+the client-side commit path is not reachable for a measurement until that is
+fixed.
+
 ### 4. The UI can stop presenting, and then it stays dark
 
 Two ways into the same end state: a lost compositor, which is still open, and
@@ -250,7 +260,11 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   that end in the GL shim's flush, so each answers a narrower question. The row
   sampler counts only what moves: a still screen reads 0 while the compositor
   is healthy, so pair it with two `screen` captures and diff them (PIL is in
-  the WSL image) before calling a boot frozen.
+  the WSL image) before calling a boot frozen. It also under-reads a *small*
+  moving layer: with the probe animation running, the driver counts `fps 60`
+  and `present 60/s` while the sampler reports 7-14 changes a second, because a
+  120 pt square crosses those eight rows only now and then. For an animation,
+  read the driver's line and use the sampler only to prove the glass moves.
 - **The probe can kill the app it measures.** With `mondriananim=2` the probe
   moved with `-setPosition:`; that lookup fails on this runtime (the
   `mondriandnr=1` log reads `class CALayer sel setPosition present 0`, caller
