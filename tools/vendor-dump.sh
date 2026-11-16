@@ -49,9 +49,11 @@ echo "== waiting for adb"
 adb start-server > /dev/null 2>&1
 for i in $(seq 1 40); do
 	sleep 5
-	adb devices | grep -q -w device && break
+	# OrangeFox reports its state as "recovery", not "device": a wait for the
+	# word "device" times out on a recovery that is already up and answering.
+	adb devices | grep -q -w -e device -e recovery && break
 done
-adb devices | grep -q -w device || { echo "no adb device" >&2; exit 1; }
+adb devices | grep -q -w -e device -e recovery || { echo "no adb device" >&2; exit 1; }
 
 mkdir -p "$OUT" || exit 1
 run() {
