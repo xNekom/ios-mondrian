@@ -162,6 +162,34 @@ reading 416-424 and `cpu-0` at 43.0-43.8 reading 434-446, `T ≈ code/10 - 1.6`.
 So `tsens` prints `~24.6 C` next to each code, with the tilde: it is a fit that
 gates a thermal decision, not a calibrated degree.
 
+### Thermal pressure
+
+The sensors drive something. A thread samples the hottest block-0 sensor twice
+a second and caps the CPU through the EPSS governor: at 62 °C every domain is
+held to three fifths of its rows, at 72 °C to the lowest row, and below 55 °C
+the ceiling is released, with the same band as hysteresis so a phone sitting on
+the threshold does not flap. The governor keeps running underneath, so releasing
+gives the frequency back to the load instead of to a value chosen here.
+
+`tools/usb-ring.py thermal` prints the decision and the p-states behind it
+(`thermal 45.1 C level 0 d0 4/14 806 MHz …`) and each change is one ring line
+(`MONDRIAN THERM: 63.4 C level 1 capped`). `mondriantherm=0` turns the loop off
+and `thermalthr=N` moves the first threshold to N °C (hard cap at N+10, release
+at N-7), which is how the mechanism is exercised on a phone at 40 °C.
+
+Measured 2026-11-16 on a boot that runs iOS to SpringBoard: at 63.4 °C the
+level-1 cap landed on three fifths of each domain's rows — `domain 0 row 13 -> 8
+(1228 MHz)`, `domain 1 16 -> 10 (1766 MHz)`, `domain 2 19 -> 12 (2246 MHz)` —
+and at 51.0 °C it released and the governor climbed again (`domain 0 8 -> 9`).
+With `thermalthr=30` the same loop takes level 2 on a 40 °C phone and `thermal`
+reports every domain at row 0 (300/633/787 MHz) with `cap 0`.
+
+`tools/usb-ring.py burn N` keeps one core busy for N seconds from a kernel
+thread (`delay()` in a loop), because the port cannot run a spinner in userland
+yet. One core is not a load test: 60 s of it moved the hottest reading from
+40.4 to 42.0 °C, inside the ±1 °C the estimate wanders by itself, which is why
+the cap is verified by the boot's own load and by moving the thresholds.
+
 ### The charger is behind the ADSP
 
 `qcom,battery_charger` hangs off `qcom,pmic_glink`, and `pm8350b@3` in the live

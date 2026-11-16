@@ -1,0 +1,434 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
++bsd/dev/mondrian_thermal.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+diff --git a/bsd/dev/mondrian_cpufreq.c b/bsd/dev/mondrian_cpufreq.c
+--- a/bsd/dev/mondrian_cpufreq.c
++++ b/bsd/dev/mondrian_cpufreq.c
+@@ -64,6 +64,7 @@
+ static uint64_t md_last;
+ static uint64_t md_log_at[MONDRIAN_EPSS_DOMAINS];
+ static uint32_t md_busy[MONDRIAN_EPSS_DOMAINS];	/* 0..256, smoothed */
++static int32_t md_ceiling[MONDRIAN_EPSS_DOMAINS] = { -1, -1, -1 };
+ 
+ /* The idle hook: remember when each core enters and leaves WFI. */
+ void
+@@ -154,6 +155,19 @@
+ 		if (target > span) {
+ 			target = span;
+ 		}
++		/*
++		 * A thermal ceiling outranks the load: drop to it now and
++		 * hold the governor there until it is released.
++		 */
++		if (md_ceiling[d] >= 0) {
++			if ((int32_t)cur > md_ceiling[d]) {
++				md_apply(d, (uint32_t)md_ceiling[d], now);
++				continue;
++			}
++			if ((int32_t)target > md_ceiling[d]) {
++				target = (uint32_t)md_ceiling[d];
++			}
++		}
+ 		if (target > cur) {
+ 			md_apply(d, target, now);	/* new load: at once */
+ 		} else if (target < cur) {
+@@ -267,3 +281,57 @@
+ 	}
+ 	return 0;
+ }
++
++/*
++ * The thermal ceiling. Level 0 releases it, 1 allows three fifths of each
++ * domain's rows and 2 only the lowest row. The governor keeps running
++ * underneath, so releasing gives the frequency back to whatever the load asks
++ * for instead of to a value picked here.
++ */
++void
++mondrian_cpufreq_level(unsigned int level)
++{
++	uint64_t now = mach_absolute_time();
++	unsigned int d;
++
++	for (d = 0; d < MONDRIAN_EPSS_DOMAINS; d++) {
++		int32_t cap = -1;
++
++		if (md[d].base == 0 || md[d].rows < 2) {
++			md_ceiling[d] = -1;
++			continue;
++		}
++		if (level >= 2) {
++			cap = 0;
++		} else if (level == 1) {
++			cap = (int32_t)((md[d].rows * 3u) / 5u);
++			if (cap >= (int32_t)md[d].rows) {
++				cap = (int32_t)md[d].rows - 1;
++			}
++		}
++		md_ceiling[d] = cap;
++		if (cap >= 0 && (int32_t)md[d].row > cap) {
++			md_log_at[d] = 0;
++			md_apply(d, (uint32_t)cap, now);
++		}
++	}
++}
++
++/*
++ * What a domain is doing, for the USB side: returns the row plus one (0 when
++ * the domain was never mapped) and fills in the row count, the ceiling in
++ * force (0xffffffff when there is none) and the frequency of that row.
++ */
++unsigned int
++mondrian_cpufreq_state(unsigned int d, uint32_t *rows, uint32_t *ceiling,
++    uint32_t *khz)
++{
++	if (d >= MONDRIAN_EPSS_DOMAINS || md[d].base == 0) {
++		return 0;
++	}
++	*rows = md[d].rows;
++	*ceiling = md_ceiling[d] < 0 ? 0xffffffffu : (uint32_t)md_ceiling[d];
++	*khz = md[d].khz[md[d].row];
++
++	return md[d].row + 1;
++}
+diff --git a/bsd/dev/mondrian_tsens.c b/bsd/dev/mondrian_tsens.c
+--- a/bsd/dev/mondrian_tsens.c
++++ b/bsd/dev/mondrian_tsens.c
+@@ -102,4 +102,42 @@
+ 		}
+ 	}
+ }
++/*
++ * The hottest sensor of block 0 as millidegrees, or -1. Block 0 is the one
++ * that carries the clusters (cpuss-0..3, cpu-1-0..8) and the GPU, so it is the
++ * number a frequency cap should follow; block 1 is DDR, modem and camera.
++ * A sensor whose VALID bit is clear is skipped: unclocked or disabled, it
++ * reads whatever the last conversion left behind.
++ */
++int
++mondrian_tsens_hottest_mc(void)
++{
++	volatile uint32_t *tm;
++	int n, best = -1;
++
++	mondrian_tsens_map();
++	tm = mondrian_tsens_tm[0];
++	if (tm == NULL) {
++		return -1;
++	}
++	for (n = 0; n < MONDRIAN_TSENS_SENSORS; n++) {
++		uint32_t v = tm[(MONDRIAN_TSENS_SN + 4 * (uint32_t)n) / 4];
++		int32_t code = (int32_t)(v & 0xfffu);
++		int32_t mc;
++
++		if (((v >> 21) & 1u) == 0) {
++			continue;
++		}
++		if ((code & 0x800) != 0) {
++			code -= 0x1000;
++		}
++		mc = code * 100 - 1600;
++		if (mc > best) {
++			best = mc;
++		}
++	}
++
++	return best;
++}
++
+ #endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2074,8 +2074,11 @@
+ 	}
+ 	{
+ 		extern int mondrian_cpufreq_start(void);
++		extern void mondrian_thermal_start(void);
+ 
+ 		(void)mondrian_cpufreq_start();
++		/* after cpufreq: it needs the domains' rows to cap them */
++		mondrian_thermal_start();
+ 	}
+ 	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
+ 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2030,6 +2030,78 @@
+ 	ud_cmd_send(so, to, "tsens\n", 6);
+ }
+ 
++/*
++ * "thermal" prints the decision and the p-states behind it: the SoC estimate,
++ * the level, and each EPSS domain's row against its ceiling. A domain that was
++ * never mapped is left out and "cap" only appears when there is one.
++ */
++static void
++ud_cmd_thermal(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_thermal_mc(void);
++	extern int mondrian_thermal_level(void);
++	extern unsigned int mondrian_cpufreq_state(unsigned int d,
++	    uint32_t *rows, uint32_t *ceiling, uint32_t *khz);
++	char out[192];
++	size_t len = 0;
++	int mc = mondrian_thermal_mc();
++	unsigned int d;
++	int n;
++
++	(void)line;
++	n = snprintf(out, sizeof(out), "thermal %d.%d C level %d", mc / 1000,
++	    (mc % 1000) / 100, mondrian_thermal_level());
++	if (n > 0) {
++		len = (size_t)n;
++	}
++	for (d = 0; d < 3 && len + 40 < sizeof(out); d++) {
++		uint32_t rows = 0, ceiling = 0, khz = 0;
++		unsigned int row = mondrian_cpufreq_state(d, &rows, &ceiling,
++		    &khz);
++
++		if (row == 0) {
++			continue;
++		}
++		if (ceiling == 0xffffffffu) {
++			n = snprintf(out + len, sizeof(out) - len,
++			    " d%u %u/%u %u MHz", d, row - 1, rows, khz / 1000);
++		} else {
++			n = snprintf(out + len, sizeof(out) - len,
++			    " d%u %u/%u %u MHz cap %u", d, row - 1, rows,
++			    khz / 1000, ceiling);
++		}
++		if (n < 0 || (size_t)n >= sizeof(out) - len) {
++			break;
++		}
++		len += (size_t)n;
++	}
++	if (len < sizeof(out) - 2) {
++		out[len++] = '\n';
++		out[len] = '\0';
++	}
++	ud_cmd_send(so, to, out, len);
++	printf("%s", out);
++}
++
++/* "burn <seconds>" keeps one core busy so the thermal loop has heat to see. */
++static void
++ud_cmd_burn(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_thermal_burn(unsigned int seconds);
++	char out[48];
++	uint32_t secs = 0;
++	int n;
++
++	if (ud_cmd_num(line + 4, &secs) == NULL ||
++	    mondrian_thermal_burn(secs) != 0) {
++		n = snprintf(out, sizeof(out), "burn 0..300 s\n");
++	} else {
++		n = snprintf(out, sizeof(out), "burn %u s\n", secs);
++	}
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ static void
+ ud_cmd_rtc(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2424,6 +2496,10 @@
+ 				ud_cmd_temp(so, peer, cmd);
+ 			} else if (strcmp(cmd, "tsens") == 0) {
+ 				ud_cmd_tsens(so, peer, cmd);
++			} else if (strcmp(cmd, "thermal") == 0) {
++				ud_cmd_thermal(so, peer, cmd);
++			} else if (strncmp(cmd, "burn ", 5) == 0) {
++				ud_cmd_burn(so, peer, cmd);
+ 			} else if (strcmp(cmd, "execdeny") == 0 ||
+ 			    strncmp(cmd, "execdeny ", 9) == 0) {
+ 				ud_cmd_execdeny(so, peer, cmd);
+diff --git a/bsd/dev/mondrian_thermal.c b/bsd/dev/mondrian_thermal.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/mondrian_thermal.c
+@@ -0,0 +1,175 @@
++/*
++ * Thermal pressure, from the SoC's own sensors to the CPU's p-states.
++ *
++ * The port's thermal input used to be the PMIC's die temperature, and the
++ * SoC's TSENS blocks were only read by hand over USB. This turns the estimate
++ * `tsens` prints into a decision: the hottest sensor of block 0 (the clusters
++ * and the GPU) is sampled twice a second, and two thresholds cap the frequency
++ * through the EPSS governor, which already knows the per-domain row to write.
++ *
++ * The estimate is a fit, not a calibration (0.1 C per code and 1.6 C of offset,
++ * residual 2 C -- see mondrian_tsens.c), so the thresholds are conservative and
++ * the hysteresis is wide: cap at 62 C, cap hard at 72 C, release below 55 C.
++ *
++ * mondriantherm=0 turns the loop off and thermalthr=N moves the first threshold
++ * to N C (the second follows 10 C above, the release 7 C below), which is how
++ * the decision can be exercised on a phone that sits at 40 C.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(MONDRIAN)
++
++extern int mondrian_tsens_hottest_mc(void);
++extern void mondrian_cpufreq_level(unsigned int level);
++extern void mondrian_log_flush_now(void);
++extern int hz;
++extern void delay(int us);
++
++#define MONDRIAN_THERM_HZ	2	/* samples a second */
++#define MONDRIAN_THERM_L1	62000	/* mC: three fifths of the rows */
++#define MONDRIAN_THERM_L2	72000	/* mC: the lowest row */
++#define MONDRIAN_THERM_HYST	7000	/* mC below L1 that releases */
++#define MONDRIAN_THERM_BURN_MAX	300	/* seconds */
++
++static int mt_level;
++static int mt_l1 = MONDRIAN_THERM_L1;
++static int mt_l2 = MONDRIAN_THERM_L2;
++static int mt_release = MONDRIAN_THERM_L1 - MONDRIAN_THERM_HYST;
++
++int
++mondrian_thermal_level(void)
++{
++	return mt_level;
++}
++
++int
++mondrian_thermal_mc(void)
++{
++	return mondrian_tsens_hottest_mc();
++}
++
++/*
++ * Two levels and nothing else. A hotter reading raises the level at once; a
++ * cooler one only releases it once the reading is MONDRIAN_THERM_HYST below
++ * the threshold, which is what keeps a phone sitting at the threshold from
++ * capping and releasing on every sample.
++ */
++static void
++mt_decide(int mc)
++{
++	int level = mt_level;
++
++	if (mc < 0) {
++		return;				/* no sensor, no decision */
++	}
++	if (mc >= mt_l2) {
++		level = 2;
++	} else if (mc >= mt_l1) {
++		if (level < 1) {
++			level = 1;
++		}
++	} else if (mc <= mt_release) {
++		level = 0;
++	} else if (level == 0) {
++		return;				/* inside the band: hold */
++	}
++	if (level == mt_level) {
++		return;
++	}
++	mt_level = level;
++	mondrian_cpufreq_level((unsigned int)level);
++	printf("MONDRIAN THERM: %d.%d C level %d %s\n", mc / 1000,
++	    (mc % 1000) / 100, level, level != 0 ? "capped" : "released");
++	mondrian_log_flush_now();
++}
++
++static void
++mondrian_thermal_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	int ticks = MAX(hz / MONDRIAN_THERM_HZ, 1);
++
++	for (;;) {
++		(void)tsleep(&chan, PZERO, "mondthrm", ticks);
++		mt_decide(mondrian_tsens_hottest_mc());
++	}
++}
++
++void
++mondrian_thermal_start(void)
++{
++	thread_t thread;
++	uint32_t on = 1;
++	int thr = 0;
++
++	if (PE_parse_boot_argn("mondriantherm", &on, sizeof(on)) && on == 0) {
++		printf("MONDRIAN THERM: disabled from the command line\n");
++		return;
++	}
++	if (PE_parse_boot_argn("thermalthr", &thr, sizeof(thr)) && thr > 0 &&
++	    thr < 100) {
++		mt_l1 = thr * 1000;
++		mt_l2 = mt_l1 + 10000;
++		mt_release = mt_l1 - MONDRIAN_THERM_HYST;
++		printf("MONDRIAN THERM: %d C caps, %d C caps hard, %d C releases\n",
++		    mt_l1 / 1000, mt_l2 / 1000, mt_release / 1000);
++	}
++	if (kernel_thread_start(mondrian_thermal_thread, NULL, &thread) !=
++	    KERN_SUCCESS) {
++		printf("MONDRIAN THERM: no thread\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++
++/*
++ * "burn" is the load the decision needs to see. The phone cannot run a spinner
++ * from userland yet, so a kernel thread keeps one core busy for the requested
++ * seconds with delay(), which is a busy wait, and the thermal loop watches it.
++ */
++static volatile int mb_running;
++static volatile uint64_t mb_until;
++
++static void
++mondrian_burn_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int mc;
++
++	do {
++		delay(1000);
++	} while (mach_absolute_time() < mb_until);
++	mc = mondrian_tsens_hottest_mc();
++	mb_running = 0;
++	printf("MONDRIAN THERM: burn done at %d.%d C\n", mc / 1000,
++	    (mc % 1000) / 100);
++	mondrian_log_flush_now();
++}
++
++int
++mondrian_thermal_burn(unsigned int seconds)
++{
++	thread_t thread;
++	uint64_t delta;
++
++	if (mb_running || seconds == 0 || seconds > MONDRIAN_THERM_BURN_MAX) {
++		return -1;
++	}
++	nanoseconds_to_absolutetime((uint64_t)seconds * 1000000000ull, &delta);
++	mb_until = mach_absolute_time() + delta;
++	mb_running = 1;
++	if (kernel_thread_start(mondrian_burn_thread, NULL, &thread) !=
++	    KERN_SUCCESS) {
++		mb_running = 0;
++		return -1;
++	}
++	thread_deallocate(thread);
++
++	return 0;
++}
++#endif /* MONDRIAN */

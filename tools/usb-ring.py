@@ -384,7 +384,7 @@ def main():
                         choices=("dump", "prev", "wfile", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "gpustat", "temp", "tsens",
-                                 "kill", "fps"))
+                                 "thermal", "burn", "kill", "fps"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -438,7 +438,7 @@ def main():
         return 0
     if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob",
                         "rtc", "execdeny", "gpukeep", "gpustat", "temp", "tsens",
-                        "kill"):
+                        "thermal", "burn", "kill"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
