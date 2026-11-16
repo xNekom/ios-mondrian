@@ -39,19 +39,16 @@ Every one of these was a boot that died for a reason that is not a kernel bug:
 ## Build a payload and run it
 
 ```sh
-python3 tools/mkadt.py /tmp/qemu.adt --qemu --board mondrian
-python3 tools/mkpayload.py xnu/out/kernel.development.mondrian /tmp/qemu.adt \
-    /tmp/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=vblk0 mondrianspmi=0
-        launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 rootrw=1
-        ignition_level=1 wdt=-1 mondriankill=quiet' \
-    --board mondrian --allow-silent-boot
-
-simg2img backup/ios-root.simg /root/ios-root.raw   # 16 GB; served snapshot=on
-python3 tools/qemu-ios.py /tmp/payload.bin /tmp/qemu-run --secs 240 \
-    --board mondrian --kernel xnu/out/kernel.development.mondrian \
-    --disk /root/ios-root.raw
+tools/wsl/qemu-run.sh 240          # ADT, payload, disk, run and summary, in one go
+tools/wsl/qemu-run.sh 240 && less /root/qemu-run/serial.txt
 ```
+
+The script exists because the recipe has five steps and four traps. The pieces,
+when one of them has to change: `mkadt.py --qemu --board mondrian` (ADT),
+`mkpayload.py ... --cmdline '<one line>' --allow-silent-boot` (payload),
+`simg2img backup/ios-root.simg /root/ios-root.raw` (the 16 GB root, once) and
+`qemu-ios.py ... --board mondrian --kernel xnu/out/kernel.development.mondrian
+--disk /root/ios-root.raw`.
 
 The userland flags are the phone's (`tools/boards.py`), not QEMU's: without
 `launchd_unsecure_cache=1` and `unentitled_ios_sim_launch=1` the guest mounts
