@@ -55,25 +55,25 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas
-  (480x1066 pt at scale 3) and the tick holds two records (`0282`).
-  CoreAnimation needs `TimingElements`/`ColorElements` and an `IOAcceleratorES`
-  service (`0114`); `docs/UI_PERFORMANCE.md` has the frame meter.
+  (480x1066 pt at scale 3) and the tick holds two records (`0282`);
+  `docs/UI_PERFORMANCE.md` has the frame meter. The UI comes up with
+  `mondrian_ui_hook=0` (lock screen, home screen, `exec Preferences` on a tap):
+  injecting the hook is what keeps the glass black (`docs/MONDIAN_GPU.md`).
 
 Current blockers, in order:
 
-1. **Charge level.** Charging works by itself (the charger sits behind the ADSP
+1. **The UI hook.** With any target bit set, backboardd keeps 2-7 threads and
+   SpringBoard 2, and no framebuffer layer arrives; with `0` they reach 19 and 14
+   and 235 layers of 1440x3200 are submitted. The plan's hook-side work (control
+   centre, brightness bridge, USB network, zone) cannot ride along until the
+   injection is bisected.
+2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is out
    of reach: the level is a voltage table (`0304`) that overstates it (3.80 V
    reads 58 % where Android said 36 %).
-2. **Control Center.** The grid is 430 pt wide whatever the screen is (a 375 pt
-   model: `CCUIModuleCollectionView` at x=0 in the `CCUIScrollView`, 77 pt
-   modules, 16 pt gaps). Widening it breaks the present; centring it with a left
-   and right `contentInset` works, but only from the main queue -- writing that
-   inset inside `-layoutSubviews` re-enters the sheet's layout and freezes the
-   panel. The brightness slider arrives with interaction off and its module never
-   calls a setter, so the hook wakes it and bridges it to the panel; the volume
-   slider is MediaRemoteUI's and is dimmed until there is audio.
-3. **The rest.** The GPU's glitches (`docs/MONDIAN_GPU.md`), audio, modem, cameras.
+3. **Control Center and the rest.** The CC grid is 430 pt wide whatever the
+   screen is and the brightness module never calls its setter; GPU glitches,
+   audio, modem and cameras remain (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 

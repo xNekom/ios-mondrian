@@ -1304,12 +1304,27 @@ payload failure rather than a deadlock in the new code.
 
 ### The window server is never asked for
 
-No process in the hook set (`launchd`, `containermanagerd`, `backboardd`,
-`runningboardd`, `SpringBoard`) calls `+[CAWindowServer server]`, measured with
-a passive hook over a whole boot: CA's window-server path is not entered at
-all, which is why no `IOMobileFramebuffer` selector from the compositor ever
-arrives (`sel 4:0 5:0 …`), no display link ticks (`DL[57] … ticks/5s 0/0`) and
-`present` stays 0/s.
+**Start here: this whole section is the hook's doing.** Measured 2026-11-16, the
+same kernel, image and board table with one argument changed:
+
+| `mondrian_ui_hook` | backboardd threads | SpringBoard threads | glass |
+| --- | --- | --- | --- |
+| `0` | 16-19 | 13-14 | lock screen, home screen, Settings opens (`exec Preferences`) |
+| `61` (every daemon but backboardd) | 2-7 | 2 | boot console, no layer |
+
+With `0` the compositor submits `MONDRIAN FB: layer 0 surface 2 1440x3200
+dst 0,0` 235 times in one dump and the panel shows the live UI, minute clock
+included. So the window-server path, the display link, the panel copy and the
+app launch chain all work on this port; what breaks them is the injected dylib.
+Bisect the injection (bits 1, 4, 8, 16, 32, 64 one at a time) before reading
+anything below as a property of the port.
+
+With the hook injected, no process in the hook set (`launchd`,
+`containermanagerd`, `backboardd`, `runningboardd`, `SpringBoard`) calls
+`+[CAWindowServer server]`, measured with a passive hook over a whole boot: CA's
+window-server path is not entered at all, which is why no
+`IOMobileFramebuffer` selector from the compositor ever arrives (`sel 4:0 5:0
+…`), no display link ticks (`DL[57] … ticks/5s 0/0`) and `present` stays 0/s.
 
 Do not call it yourself to "wake it up": a constructor that asks for the server
 creates one on the spot and the boot stops answering on the ring before the

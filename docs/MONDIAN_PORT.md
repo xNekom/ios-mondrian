@@ -52,7 +52,9 @@ lock screen and the home screen render on-device.
 UI probe `0106` injects a diagnostic dylib into the UI daemons selected by
 `mondrian_ui_hook` (`0112`, 7 = all three). It wraps
 `CAWindowServer._detectDisplays`; dyld needs the `AMFI` answer to
-`__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. Build with
+`__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. **It also keeps
+the glass black: measured 2026-11-16, `0` renders and `61` does not, so bisect
+the bits before reading any UI measurement.** Build with
 `tools/build-mondrian-ui-hook.sh`, install with
 `tools/ios-root-tweaks.py MOUNT --ui-hook DYLIB`; it logs uncaught exceptions.
 `/product` needs `research/ipsw-x/d22ap.adt`; `disp0` `canvas-width`/
