@@ -337,12 +337,12 @@ MONDRIAN = Board(
              # is quiet, which is every still screen. 0 keeps the last frame lit
              # until the power key or the idle timer blinks it.
              'mondrianfb_blank=0 '
-             # logd is sampled because every process that logs talks to it; the
-             # firehose is not the blocker (logd answers and pushes notices).
-             # Bisect: only SpringBoard (0x4), where the control centre,
-             # wallpaper and brightness parts live. If it renders, the hook can
-             # come back for the plan without the containermanagerd injection.
-             'mondrian_ui_hook=4 mondriansample=logd,backboardd,SpringBoard '
+             # 0 is the configuration that renders: with the hook in any
+             # daemon the glass stays black (0x1: 0 layers, SpringBoard 2
+             # threads; 0x4: 5 layers and the panel parks on the Apple logo).
+             # The hook's own parts have to be bisected with `mondrianbare=1`
+             # before it can carry the plan's UI work again.
+             'mondrian_ui_hook=0 mondriansample=logd,backboardd,SpringBoard '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does
