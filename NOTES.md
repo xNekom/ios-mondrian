@@ -15,8 +15,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
   console draws into the splash framebuffer the ABL leaves at **0xB8000000**
-  (1440x3200, stride 5760). Build with `SMALL_SHIM=1` (`tools/phone-deploy.sh`
-  does); why is in the shim trap.
+  (1440x3200, stride 5760). Build with `SMALL_SHIM=1`; why is in the shim trap.
 - **Fastboot, and the only way back to it.** `fastboot devices` answers in the
   bootloader's fastboot (power + volume down), which takes `fastboot boot`;
   fastbootd refuses it, `fastboot reboot bootloader` keeps USB alive. ABL
@@ -28,6 +27,14 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `0309`), flushes the ring and resets; fastboot answers about 2 s later.
   The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
   so a reset that only writes those boots the active slot instead.
+  **`boot` itself can be refused, and it says so only on the second line:**
+  `Sending 'boot.img' … OKAY` prints even when the command returns
+  `FAILED (remote: 'Failed to load/authenticate boot image: Not Found')`, the
+  image never runs and `boot_b` answers — which reads like a kernel that
+  crashes before its first line. A script needs `Booting … OKAY` *and* no
+  `FAILED`; when the refusal comes (it did for our image and for OrangeFox, so
+  it is the bootloader's state), `tools/wsl/flash-image.sh` writes `boot_b`
+  after checking the slot.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
@@ -157,21 +164,18 @@ reservation inside). Rules that still cost resets:
   abort`, `far` inside the physmap).
 
 The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S`
-no longer maps it `VA=PA` and `arm_vm_init` installs the explicit kernel VA
-alias for the early console (`0295`).
+no longer maps it `VA=PA`: `arm_vm_init` installs a VA alias (`0295`).
 
 The **physmap slide** comes from `/chosen/random-seed`, so a random seed
 makes the boot a coin flip (about one host boot in three dies); `boards.py`
 pins the seed and `ADT_SEED` overrides it.
 
 **The kernel's command line is the payload's, not ABL's.** With `fastboot
-boot`, ABL fills `/chosen/bootargs` with its own Android line (~1 KiB), and
-`BOOT_LINE_LENGTH` is 1024: a shim that copies it first loses `rd=ufsroot0`
-and the rest of the payload (the same silent cut that hid
-`mondrianiconset=1` past 608 in ring225), so the kernel reaches BSD init and
-waits for a root that never appears. The shim now reserves the payload's room
-first and gives ABL's line what is left; `fastboot boot --cmdline "..."` still
-overrides.
+boot`, ABL fills `/chosen/bootargs` with an Android line (~1 KiB) and
+`BOOT_LINE_LENGTH` is 1024: a shim that copies it first loses `rd=ufsroot0` and
+the rest of the payload, and the kernel waits for a root that never appears.
+The shim reserves the payload's room first and gives ABL's line what is left;
+`fastboot boot --cmdline "..."` still overrides.
 
 **Page size: 16 KiB, and the three pieces must agree.** `ID_AA64MMFR0_EL1`
 reports `TGran16=1` (measured 2026-10-23; the menu prints it as `tg16`), so
@@ -343,8 +347,4 @@ tick dies with it, while ping still answers.
 
 ## Other ports worth reading
 
-- **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
-- **Bergamota / Chlorophyll / HackiOS**, **`oosexgang/hakios-xnu-kernel`** —
-  CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead.
-- **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
-  TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.
+Listed with what each one solves in `docs/MONDIAN_REFERENCE.md`.

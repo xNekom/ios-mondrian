@@ -97,3 +97,11 @@ config, FDT, interrupts, iomem, regulators, input devices, power supply, GPU,
 thermal and devfreq. The touch frames come from
 `/sys/kernel/tracing/events/spi` and are described in `docs/MONDIAN_TOUCH.md`.
 Keep the tarball out of git; it is a device dump.
+
+## Other ports worth reading
+
+- **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
+- **Bergamota / Chlorophyll / HackiOS**, **`oosexgang/hakios-xnu-kernel`** —
+  CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead.
+- **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
+  TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.

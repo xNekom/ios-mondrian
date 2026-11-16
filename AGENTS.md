@@ -85,7 +85,10 @@ Pro, SM8475) is the port being done here.
 - **Never pipe a build script.** `bash mkimg.sh | head -1` killed it with
   SIGPIPE and left the previous image: the phone booted the old kernel twice
   and the new command "did not exist". Read the exit status, not the first
-  line.
+  line. The same goes for editing a script that is still running: bash reads
+  the file as it goes, so a mid-run edit corrupts the next line it parses
+  (`line 93: -3: command not found`), and the run then lies about why it
+  failed.
 - **Prove the kernel before trusting any answer.** A RAM boot that dies falls
   back to `boot_b`, so "command not found" means "old kernel" as often as
   "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the

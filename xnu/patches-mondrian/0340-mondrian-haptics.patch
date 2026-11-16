@@ -143,22 +143,6 @@ diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
   * The restart reason the bootloader obeys is the PMIC's, not IMEM's:
   * qcom-reboot-reason writes one byte into the seven-bit cell at
   * pmk8350@0/sdam@7100/restart@48, and the codes there are 1 for recovery and
-diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
---- a/bsd/dev/mondrian_ufs.c
-+++ b/bsd/dev/mondrian_ufs.c
-@@ -2075,10 +2075,12 @@
- 	{
- 		extern int mondrian_cpufreq_start(void);
- 		extern void mondrian_thermal_start(void);
-+		extern void mondrian_haptics_probe(void);
- 
- 		(void)mondrian_cpufreq_start();
- 		/* after cpufreq: it needs the domains' rows to cap them */
- 		mondrian_thermal_start();
-+		mondrian_haptics_probe();
- 	}
- 	PE_parse_boot_argn("mondrianlog", &on, sizeof(on));
- 	if (!on || su.nblocks < 2 * MONDRIAN_LOG_BLOCKS) {
 diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
@@ -256,7 +240,7 @@ diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/mondrian_haptics.c
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,221 @@
 +/*
 + * The vibrator is not an I2C part: SM8475 drives an LRA from the PMIC's HV
 + * haptics block, three SPMI pages on pm8350b (SID 3):
@@ -367,28 +351,6 @@ new file mode 100644
 +		return 0;
 +	}
 +	return hap_w((uint8_t)block, (uint8_t)reg, (uint8_t)val);
-+}
-+
-+/*
-+ * Off by default. The first read that actually reached the block (after the
-+ * PPID was corrected) cost a boot, so this probe answers to `hap=1` and the
-+ * live haps/hapr/hapw commands are the way to walk it.
-+ */
-+void
-+mondrian_haptics_probe(void)
-+{
-+	extern int PE_parse_boot_argn(const char *arg, void *result, int len);
-+	int on = 0;
-+	uint8_t cfg = 0, ptn = 0;
-+
-+	if (!PE_parse_boot_argn("hap", &on, sizeof(on)) || on == 0) {
-+		return;
-+	}
-+	if (!hap_r(0, HAP_CFG_REV, &cfg) || !hap_r(1, HAP_PTN_REV, &ptn)) {
-+		printf("MONDRIAN HAP: the block did not answer\n");
-+		return;
-+	}
-+	printf("MONDRIAN HAP: cfg rev %u ptn rev %u\n", cfg, ptn);
 +}
 +
 +/*

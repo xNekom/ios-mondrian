@@ -76,7 +76,16 @@ attach() {
 echo "== fastboot boot"
 WIMG=$(wslpath -w "$PWD/shim/out/shim-boot.img")
 timeout 60 "$FB" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
-grep -a -q OKAY "$LOG/fastboot.log" || { tail -3 "$LOG/fastboot.log"; exit 1; }
+# "Sending 'boot.img' ... OKAY" is printed even when the boot itself fails, and
+# a check that only looks for OKAY passes on it: the image was never loaded and
+# the phone fell back to boot_b, which then looks like a kernel that crashes.
+if grep -a -q 'FAILED' "$LOG/fastboot.log" ||
+    ! grep -a -q "Booting.*OKAY" "$LOG/fastboot.log"; then
+	tail -3 "$LOG/fastboot.log"
+	echo "== the bootloader refused the RAM boot (see above)" >&2
+	echo "   fall back to: tools/wsl/flash-image.sh   (writes boot_<slot>)" >&2
+	exit 1
+fi
 
 # 3. Wait for the ring, then prove the kernel.
 echo "== waiting for the ring"
