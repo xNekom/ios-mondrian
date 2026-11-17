@@ -2806,6 +2806,37 @@ mondrian_install_agent_hooks(void)
 static volatile int mondrian_lock_step_pending;
 static int mondrian_agent_hooks;
 static int mondrian_lock_last = -1;
+/*
+ * A display that sleeps between two measurements is the measurement trap that
+ * has cost the most: CoreAnimation stops presenting, `fps` reads 0 on a screen
+ * that looks frozen, and no injected touch wakes it again. A power assertion of
+ * the kind an app takes for NoDisplaySleep keeps it up, so a boot stays usable
+ * for as long as the ring is being read. `mondriannosleep=1` asks for it.
+ */
+typedef unsigned int mondrian_assertion_id;
+extern int IOPMAssertionCreateWithName(const void *type, unsigned int level,
+    const void *name, mondrian_assertion_id *out);
+
+static mondrian_assertion_id mondrian_sleep_assertion;
+
+static void
+mondrian_hold_display_awake(void)
+{
+	int r;
+
+	if (mondrian_sleep_assertion != 0) {
+		return;
+	}
+	r = IOPMAssertionCreateWithName(CFSTR("NoDisplaySleepAssertion"), 255u,
+	    CFSTR("mondrian: frame path measurement"), &mondrian_sleep_assertion);
+	if (r == 0 && mondrian_sleep_assertion != 0) {
+		say("MONDRIAN UI: display stays awake (assertion held)\n");
+	} else {
+		mondrian_sleep_assertion = 0;
+		say("MONDRIAN UI: display assertion refused\n");
+	}
+}
+
 static int mondrian_unlock_enabled;
 static int mondrian_unlock2_enabled;
 static int mondrian_anim_enabled;
@@ -4136,6 +4167,135 @@ mondrian_cc_activate(id window)
 	    sel_registerName("sendActionsForControlEvents:"), 1UL << 6);
 }
 
+/*
+ * The App Library's background is a blurred snapshot, and iOS draws it through
+ * a _UIVisualEffectView. When its pixels arrive blocky the two explanations are
+ * "the layer is scaled, so a small texture covers a big area" (geometry) and
+ * "the texture itself is small or wrong" (contents), and they need different
+ * work. Print every effect/backdrop view of a window with the numbers that
+ * separate them -- frame, bounds, the layer's bounds, contentsScale,
+ * rasterizationScale and whether the layer transform is identity.
+ * `mondriangeom=1` turns it on; the cap keeps one pass to a readable size.
+ */
+static unsigned
+mondrian_effect_walk(id view, unsigned depth, unsigned *printed, unsigned *seen)
+{
+	id kids, layer;
+	unsigned n, i, hits = 0;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 12 || *printed >= 16 || *seen >= 4000) {
+		return 0;
+	}
+	(*seen)++;
+	if (name != NULL && (strstr(name, "Backdrop") != NULL ||
+	    strstr(name, "VisualEffect") != NULL ||
+	    strstr(name, "EffectView") != NULL)) {
+		char line[288];
+
+		(*printed)++;
+		hits++;
+		layer = mondrian_send(view, "layer");
+		{
+			CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("frame"));
+			CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+			    sel_registerName("bounds"));
+			CGFloat scale = -1.0, rast = -1.0;
+			CGRect lb = CGRectZero;
+			BOOL ident = YES, contents = NO;
+			const char *gravity = "-";
+
+			if (layer != nil) {
+				if ([layer respondsToSelector:sel_registerName("contentsScale")]) {
+					scale = ((CGFloat (*)(id, SEL))objc_msgSend)(layer,
+					    sel_registerName("contentsScale"));
+				}
+				if ([layer respondsToSelector:sel_registerName("rasterizationScale")]) {
+					rast = ((CGFloat (*)(id, SEL))objc_msgSend)(layer,
+					    sel_registerName("rasterizationScale"));
+				}
+				if ([layer respondsToSelector:sel_registerName("contents")]) {
+					contents = mondrian_send(layer, "contents") != nil;
+				}
+				if ([layer respondsToSelector:sel_registerName("contentsGravity")]) {
+					id g = mondrian_send(layer, "contentsGravity");
+
+					if (g != nil && [g isKindOfClass:[NSString class]]) {
+						gravity = [(NSString *)g UTF8String];
+					}
+				}
+				lb = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+				    sel_registerName("bounds"));
+				{
+					CATransform3D m = ((CATransform3D (*)(id, SEL))objc_msgSend)(
+					    layer, sel_registerName("transform"));
+
+					ident = mondrian_geom_identity(m);
+				}
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN UI: fx %s d%u frame %.1fx%.1f at %.1f,%.1f"
+			    " bounds %.1fx%.1f layer %.1fx%.1f scale %.2f rast %.2f"
+			    " contents %d gravity %s ident %d\n",
+			    name, depth, frame.size.width, frame.size.height,
+			    frame.origin.x, frame.origin.y, bounds.size.width,
+			    bounds.size.height, lb.size.width, lb.size.height,
+			    (double)scale, (double)rast, (int)contents,
+			    gravity != NULL ? gravity : "-", (int)ident);
+			say(line);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_effect_walk([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, printed, seen);
+	}
+	layer = mondrian_send(view, "layer");
+	if (layer != nil) {
+		id subs = mondrian_send(layer, "sublayers");
+		unsigned sc = subs != nil ? (unsigned)[(NSArray *)subs count] : 0;
+
+		for (i = 0; i < sc; i++) {
+			id sl = [(NSArray *)subs objectAtIndex:i];
+			const char *sn = sl != nil ? object_getClassName(sl) : NULL;
+
+			if (sn != NULL && (strstr(sn, "Backdrop") != NULL ||
+			    strstr(sn, "VisualEffect") != NULL)) {
+				CGRect lb = ((CGRect (*)(id, SEL))objc_msgSend)(sl,
+				    sel_registerName("bounds"));
+				CGFloat scale = -1.0, bscale = -1.0;
+				char line[288];
+
+				(*printed)++;
+				hits++;
+				if ([sl respondsToSelector:sel_registerName("contentsScale")]) {
+					scale = ((CGFloat (*)(id, SEL))objc_msgSend)(sl,
+					    sel_registerName("contentsScale"));
+				}
+				/*
+				 * A CABackdropLayer carries its own `scale`, which is the
+				 * one its filter samples at; contentsScale says nothing
+				 * about the blur.
+				 */
+				if ([sl respondsToSelector:sel_registerName("scale")]) {
+					bscale = ((CGFloat (*)(id, SEL))objc_msgSend)(sl,
+					    sel_registerName("scale"));
+				}
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: fx L %s d%u bounds %.1fx%.1f"
+				    " scale %.2f bscale %.2f contents %d\n", sn, depth,
+				    lb.size.width, lb.size.height, (double)scale,
+				    (double)bscale,
+				    (int)(mondrian_send(sl, "contents") != nil));
+				say(line);
+			}
+		}
+	}
+	return hits;
+}
+
 static void
 mondrian_log_screen_geometry(void)
 {
@@ -4226,6 +4386,28 @@ mondrian_log_screen_geometry(void)
 			    frame.size.height, frame.origin.x, frame.origin.y,
 			    bounds.size.width, bounds.size.height, level, (int)hidden);
 			say(line);
+		}
+		/*
+		 * Every visible window, because the App Library is not the Control
+		 * Center: it is SpringBoard's own tree, and the backdrop that draws
+		 * wrong is somewhere inside it.
+		 */
+		for (i = 0; i < count && i < 8; i++) {
+			id window = [(NSArray *)windows objectAtIndex:i];
+			const char *name = object_getClassName(window);
+			unsigned printed = 0, seen = 0, hits;
+
+			if (((BOOL (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("isHidden"))) {
+				continue;
+			}
+			hits = mondrian_effect_walk(window, 0, &printed, &seen);
+			if (hits != 0) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN UI: fx window %s hits %u seen %u\n",
+				    name != NULL ? name : "?", hits, seen);
+				say(line);
+			}
 		}
 		for (i = 0; i < count; i++) {
 			id window = [(NSArray *)windows objectAtIndex:i];
@@ -5176,6 +5358,9 @@ mondrian_unlock_run(void *unused)
 		mondrian_unlock_enabled = 1;
 	}
 	mondrian_unlock2_enabled = boot_arg_set("mondrianunlock2=1") != 0;
+	if (boot_arg_set("mondriannosleep=1")) {
+		mondrian_hold_display_awake();
+	}
 	mondrian_anim_enabled = boot_arg_int("mondriananim=", 0);
 	/*
 	 * The dock's mask is on: measured against a home screen drawing every frame

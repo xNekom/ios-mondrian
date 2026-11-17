@@ -316,6 +316,18 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
 
 ## Measurement traps
 
+- **A corrupt iOS root looks exactly like a compositor fault.** Measured
+  2026-11-17: `hfs_mark_inconsistent: Runtime corruption detected on iOSRoot`
+  31 268 times in one boot. Two consequences that read as other bugs: the ring
+  is 4 MiB and the repeated line fills it, so the early boot lines are gone and
+  the log looks like it simply never printed them; and SpringBoard's main thread
+  stops draining its queue (`MONDRIAN UI: lock step stuck; reposting`) with
+  `fps 0`, `touch 0/s` and a panel that keeps its last image. That is
+  indistinguishable, from the ring alone, from a display that slept or a
+  compositor that hung, and a reboot does not clear it -- the forced `fsck`
+  still leaves 1357 marks in the next boot. Check `hfs_mark_inconsistent` first
+  in any boot that stops presenting, and restore
+  `backup/ios-root-repaired.simg` when it is there.
 - **Measure the glass, not the counters.** `tools/usb-ring.py fps N` hashes
   eight panel rows over the ring about 30 times a second and counts the
   changes: that is the frame rate the eye gets. `fps` counts swaps, `present`
