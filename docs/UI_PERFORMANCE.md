@@ -204,16 +204,36 @@ boot each, so the three columns differ only in what changed:
   bring-up boot, and a panic still paints either way. Measured after it: the
   lock screen of a fresh boot has no console text and no bands at all, where the
   boot before it had six `KABORT` rows and two black bands.
-- **The backdrop needs CoreAnimation's framebuffer fetch.** Measured 2026-11-17
+- **The App Library's background is one picture, and here that picture is
+  magenta.** Measured 2026-11-17: the library's background is a single
+  full-screen quad (program 21, blend off) sampling a 1440x3200 surface; the
+  image behind it -- the `UIImageView` inside `PBUISnapshotReplicaView`, in
+  `_SBWallpaperSecureWindow` -- is a CGImage of 1440x3200, 8 bits a component,
+  32 a pixel, **colour-space model 1 (monochrome)**, whose every byte at the
+  centre, a quarter and the bottom is `ff 00 ff ff`. It is a placeholder.
+  CoreAnimation reads one byte of every four out of a 32-bit image labelled
+  grey, and that is the 4-px striping on the glass (measured in the half-scale
+  capture: columns of `(165,166,165)` and `(24,28,24)` alternating). The grey,
+  the stripes and the white blob the substitute-colour A/B turned it into are
+  that one image.
+  The wallpaper itself cannot be copied from the layer tree: it is a
+  `CALayerHost` inside `_UIScenePresentationView`, drawn by another process, and
+  the materials ask the compositor for a group this port does not serve
+  (`MTMaterialLayer` with `groupName` `WallpaperCaptureGroup`). So the fix is
+  either to give the library's own background a real picture, or to find which
+  layer draws that quad above everything else.
+  Two A/Bs not worth repeating: setting `allowsInPlaceFiltering`,
+  `allowsSubstituteColor` and `disablesOccludedBackdropBlurs` to `NO` on every
+  backdrop layer turns the grey into black with a white blob and does not fix
+  it; hiding `SBHomeScreenBackdropView` (the only `*Backdrop*` in
+  `SBHomeScreenView`) leaves the stripes, and a wallpaper-sized `CALayer`
+  inserted at the bottom of `SBHomeScreenWindow` is invisible -- the striped quad
+  is drawn above both.
+- **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with
-  no build and no boot): the App Library's cards come out flat and light and the
-  backdrop stays grey, so the extension is doing real work and must stay
-  offered. What the grey *is*: the backdrop layer is 480x1066.7 at
-  `contentsScale 1.00` and it is drawn from the wallpaper picture CA asks for; in
-  the transition the ring prints `a 1326x1326 picture: 00 … 0 of 5304 bytes 0xff`,
-  an empty picture, which is the thing to chase next (the poster extension
-  renders it, one byte a pixel, and it is empty at that moment).
+  no build and no boot): the App Library's cards come out flat and light, so the
+  extension is doing real work.
 - **What the App Library transition costs, from the ring.** Measured 2026-11-17
   while swiping home -> App Library (the whole ring holds exactly two of these,
   both in that window): `readback 1440x3200 bgra invert 0 shared 0 mirror 0:
@@ -389,6 +409,16 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   and `present 60/s` while the sampler reports 7-14 changes a second, because a
   120 pt square crosses those eight rows only now and then. For an animation,
   read the driver's line and use the sampler only to prove the glass moves.
+- **`stat()` is refused to a daemon in `/private/var/vm`; `access()` and
+  `fopen()` are not.** Measured 2026-11-17: a probe armed by a file's mtime
+  never fired -- in SpringBoard and in backboardd -- while the same file could
+  be read at load. Arm a probe by comparing the file's *content* (a counter, or
+  the rectangle itself), never by `stat()`.
+- **Do not ask the display for a picture while SpringBoard is starting.**
+  `CARenderServerRenderDisplay` exists and returns pixels, but calling it during
+  startup leaves the phone on a black screen with a spinner, with SpringBoard
+  alive and the compositor stopped; a respring does not clear it and only a RAM
+  boot does. Take such a picture only on the running home screen.
 - **The probe can kill the app it measures.** With `mondriananim=2` the probe
   moved with `-setPosition:`; that lookup fails on this runtime (the
   `mondriandnr=1` log reads `class CALayer sel setPosition present 0`, caller

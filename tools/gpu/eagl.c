@@ -78,6 +78,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -360,9 +361,13 @@ static int trace_function_met;                                  /* ... CoreAnima
 static float trace_place[4];                    /* boot-arg gltrace_place=X0,Y0,X1,Y1: of those frames, only the draws that touch this */
 static int trace_placed, trace_placing;         /* ... is set; ... and this frame is one of them */
 static int trace_look;                          /* boot-arg gltrace_look=1: ... and what each of them left in the middle of itself */
+static float trace_screen[4];                   /* ... or the same rectangle in panel pixels from the top (the place file) */
+static int trace_screen_set;                    /* ... which is then tested where the draw lands, not where its corners are */
+static int trace_stripes;                       /* ... and the eight pixels it left and the eight it sampled */
 static float trace_middle[2];                   /* ... which is here, as CoreAnimation counts */
 static int trace_listed;                        /* the draw at hand is one of them */
 static int all_shaders;                         /* boot-arg glshaders=1: the text of every shader, not of the first two */
+static unsigned dump_program;                   /* ... or, from the shaders file, the one program whose shaders are written down */
 static struct group_texture *group_of(struct eagl *e, GLuint texture);
 static __thread struct eagl *current;
 static bool said_fallback;
@@ -452,17 +457,24 @@ static int fetch_offered = 1;
  * restart instead of a build and a boot.
  */
 static int
-fetch_switch(void)
+switch_file(const char *path)
 {
 	char first = 0;
-	int fd = open("/private/var/vm/mondrian-gl-fetch", O_RDONLY);
+	int fd = open(path, O_RDONLY);
 
 	if (fd < 0) {
-		return 1;
+		return 0;               /* (absent: the switch is off) */
 	}
 	(void)read(fd, &first, 1);
 	(void)close(fd);
 	return !(first == '0' || first == 'n');
+}
+
+static int
+fetch_switch(void)
+{
+	return switch_file("/private/var/vm/mondrian-gl-fetch") ||
+	    access("/private/var/vm/mondrian-gl-fetch", F_OK) != 0;
 }
 
 
@@ -1163,6 +1175,8 @@ upload_check(struct eagl *e, struct image *image, size_t row, const uint8_t *bas
 	free(surface);
 }
 
+static void note_created(GLuint texture, GLsizei width, GLsizei height, GLenum format, GLenum type, unsigned surface_pixel);
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -1292,6 +1306,8 @@ surface_to_texture(struct eagl *e, struct image *image)
 		glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height,
 		    0, up_format, up_type, base);
 	}
+	note_created(image->to, image->width, image->height, up_format, up_type, surface_pixel);
+	note_created(image->texture, image->width, image->height, up_format, up_type, surface_pixel);
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
 	upload_check(e, image, row, base, pixel, planar);
@@ -1541,6 +1557,109 @@ show_texture(struct eagl *e, struct image *image)
 	free(pixels);
 }
 
+/*
+ * How a texture came to be, for the place trace. The question a grey backdrop asks -- is this
+ * luminance-and-alpha CoreAnimation's own picture, or a two-byte surface read as one -- cannot be
+ * answered from the sampled texture's format alone, because both end up 0x190a.
+ */
+static struct created_texture {
+	GLuint texture;
+	GLsizei width, height;
+	GLenum format, type;
+	unsigned surface_pixel;         /* 0: CoreAnimation handed the pixels over itself */
+} created[512];
+static unsigned created_at;
+
+static void
+note_created(GLuint texture, GLsizei width, GLsizei height, GLenum format, GLenum type, unsigned surface_pixel)
+{
+	unsigned at = created_at++ % (unsigned)(sizeof(created) / sizeof(created[0]));
+
+	if (texture == 0) {
+		return;
+	}
+	created[at].texture = texture;
+	created[at].width = width;
+	created[at].height = height;
+	created[at].format = format;
+	created[at].type = type;
+	created[at].surface_pixel = surface_pixel;
+}
+
+static const struct created_texture *
+created_of(GLuint texture)
+{
+	/*
+	 * The latest record wins: a texture name is recycled, and the first one with
+	 * that number is a dead texture of the same process (measured: the trace
+	 * called a surface "of a 1-byte surface" because it had found the record of a
+	 * texture that had been deleted).
+	 */
+	const struct created_texture *found = NULL;
+	unsigned whole = (unsigned)(sizeof(created) / sizeof(created[0]));
+	unsigned at = created_at < whole ? created_at : whole;
+
+	for (unsigned i = 0; i < at; i++) {
+		unsigned slot = (created_at - 1 - i) % whole;
+
+		if (created[slot].texture == texture && created[slot].width != 0) {
+			found = &created[slot];
+			break;
+		}
+	}
+	return found;
+}
+
+/*
+ * The place file, read at load and again whenever its mtime moves: the rectangle is
+ * "x0 y0 x1 y1" in panel pixels from the top, "0 0 0 0" turns the trace off again.
+ * frame_begin() asks every thirty frames, which is what makes arming an A/B a write
+ * instead of a restart of the window server.
+ */
+static float place_corners[4];                 /* the rectangle the trace is armed with */
+static int place_armed;
+
+/*
+ * The place file, read at load and every thirty frames after that: the rectangle is
+ * "x0 y0 x1 y1" in panel pixels from the top, "0 0 0 0" turns the trace off again.
+ * The content is compared, not the file's date: stat() is refused to a daemon in
+ * /private/var/vm on this port (measured 2026-11-17), and open() is not.
+ */
+static void
+arm_place_from_file(bool first)
+{
+	FILE *place;
+	float corners[4] = { 0, 0, 0, 0 };
+
+	place = fopen("/private/var/vm/mondrian-gl-place", "r");
+	if (place == NULL) {
+		return;
+	}
+	if (fscanf(place, "%f %f %f %f", &corners[0], &corners[1], &corners[2], &corners[3]) != 4) {
+		(void)fclose(place);
+		return;
+	}
+	(void)fclose(place);
+	if (!first && place_armed && corners[0] == place_corners[0] && corners[1] == place_corners[1] &&
+	    corners[2] == place_corners[2] && corners[3] == place_corners[3]) {
+		return;
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		place_corners[i] = corners[i];
+		trace_place[i] = corners[i];
+		trace_screen[i] = corners[i];
+	}
+	place_armed = 1;
+	trace_screen_set = 1;
+	trace_placed = 1;
+	trace_look = 1;
+	trace_stripes = 1;
+	trace_left = ~0u;
+	say("mondrian-gl: place trace %s: %g,%g to %g,%g\n",
+	    corners[2] > corners[0] ? "armed" : "quiet", (double)corners[0], (double)corners[1],
+	    (double)corners[2], (double)corners[3]);
+}
+
 /* Before the first drawing of a frame: the textures whose IOSurfaces somebody has written to since. */
 static void
 frame_begin(struct eagl *e)
@@ -1560,6 +1679,9 @@ frame_begin(struct eagl *e)
 		trace_draws = 0;
 		trace_function_met = 0;
 		trace_function = -1;
+	}
+	if (e->frames % 30 == 0) {
+		arm_place_from_file(false);
 	}
 	trace_placing = 0;
 	if (trace_left != 0) {
@@ -1960,13 +2082,84 @@ half_float(uint16_t half)
 	return half & 0x8000 ? -value : value;
 }
 
+/*
+ * The place file counts panel pixels from the top, which is not how CoreAnimation counts its
+ * vertices and not how GL counts its viewport either. Project the middle of the quad the same way
+ * trace_placed_look() finds its pixel, and ask whether it lands in the rectangle. Both readings of
+ * y are tried, so neither convention has to be guessed.
+ */
+static int
+trace_screen_hit(struct eagl *e, const float *low, const float *high)
+{
+	const GLfloat *m = e->matrix;
+	GLint view[4] = { 0, 0, 0, 0 };
+	float mid[2], x, y, w;
+	int px, py, px0, py0, px1, py1;
+
+	if (m == NULL) {
+		return 1;                       /* (no matrix to project with: list it rather than lose it) */
+	}
+	mid[0] = (low[0] + high[0]) / 2;
+	mid[1] = (low[1] + high[1]) / 2;
+	x = m[0] * mid[0] + m[4] * mid[1] + m[12];
+	y = m[1] * mid[0] + m[5] * mid[1] + m[13];
+	w = m[3] * mid[0] + m[7] * mid[1] + m[15];
+	if (w == 0) {
+		return 1;
+	}
+	glGetIntegerv(GL_VIEWPORT, view);
+	px = view[0] + (int)((x / w + 1) / 2 * (float)view[2]);
+	py = view[1] + (int)((y / w + 1) / 2 * (float)view[3]);
+	px0 = (int)trace_screen[0];
+	py0 = (int)trace_screen[1];
+	px1 = (int)trace_screen[2];
+	py1 = (int)trace_screen[3];
+	if (px < px0 || px > px1) {
+		return 0;
+	}
+	return (py >= py0 && py <= py1) || (view[1] + view[3] - py >= py0 && view[1] + view[3] - py <= py1);
+}
+
+/* The eight pixels at a place of a texture, through a framebuffer of its own. */
+static int
+read_texture_row(struct eagl *e, GLuint texture, int x, int y, uint8_t *out)
+{
+	static GLuint fbo;
+	GLint width = 0, height = 0, fbo_before = 0;
+	int tx, ty;
+
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+	if (width <= 0 || height <= 0) {
+		return 0;
+	}
+	/* the draws this trace lists at the middle of the screen are 1:1 with it */
+	tx = x < width ? x : width - 1;
+	ty = y < height ? y : height - 1;
+	(void)e;
+	if (fbo == 0) {
+		glGenFramebuffers(1, &fbo);
+	}
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo_before);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo_before);
+		return 0;
+	}
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	glReadPixels(tx, ty, 8, 1, GL_RGBA, GL_UNSIGNED_BYTE, out);
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo_before);
+	return 1;
+}
+
 /* gltrace_place: a line about a draw, if any of its first corners is inside the rectangle (or the rectangle inside them). */
 static void
 trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count)
 {
 	float low[2] = { 1e9f, 1e9f }, high[2] = { -1e9f, -1e9f }, colour[4] = { 0, 0, 0, 0 }, where[2] = { 0, 0 };
 	GLint blend[2] = { 0, 0 }, scissor[4] = { 0, 0, 0, 0 };
-	char textures[160] = "";
+	char textures[256] = "";
 	size_t used = 0;
 
 	if (e->arrays[0].pointer == NULL || e->arrays[0].type != GL_FLOAT) {
@@ -1998,7 +2191,11 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 			}
 		}
 	}
-	if (low[0] > trace_place[2] || high[0] < trace_place[0] || low[1] > trace_place[3] || high[1] < trace_place[1]) {
+	if (trace_screen_set) {
+		if (!trace_screen_hit(e, low, high)) {
+			return;
+		}
+	} else if (low[0] > trace_place[2] || high[0] < trace_place[0] || low[1] > trace_place[3] || high[1] < trace_place[1]) {
 		return;
 	}
 	trace_listed = 1;
@@ -2016,9 +2213,23 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format);
 		image = image_of(e, e->bound[unit]);
-		used += (size_t)snprintf(textures + used, sizeof(textures) - used, " [%u] %u (%d x %d, %#x%s)", unit, e->bound[unit],
-		    width, height, (unsigned)format, image == NULL ? "" : image->shared ? ", a surface's memory" :
-		    image->wrapped ? ", a copy of wrapped memory" : ", a copy of a surface");
+		{
+			const struct created_texture *made = created_of(e->bound[unit]);
+			char how[48] = "";
+
+			if (made != NULL) {
+				if (made->surface_pixel != 0) {
+					(void)snprintf(how, sizeof(how), ", of a %u-byte surface",
+					    made->surface_pixel);
+				} else {
+					(void)snprintf(how, sizeof(how), ", handed over whole");
+				}
+			}
+			used += (size_t)snprintf(textures + used, sizeof(textures) - used,
+			    " [%u] %u (%d x %d, %#x%s%s)", unit, e->bound[unit], width, height,
+			    (unsigned)format, image == NULL ? "" : image->shared ? ", a surface's memory" :
+			    image->wrapped ? ", a copy of wrapped memory" : ", a copy of a surface", how);
+		}
 	}
 	glActiveTexture(GL_TEXTURE0 + e->unit);
 	glGetIntegerv(GL_BLEND_SRC_RGB, &blend[0]);
@@ -2055,6 +2266,32 @@ trace_placed_look(struct eagl *e)
 	glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
 	say("gl-at:     it left %u %u %u %u (red green blue alpha) at %d,%d of the framebuffer%s\n", pixel[0], pixel[1], pixel[2],
 	    pixel[3], px, py, glGetError() ? " (not readable)" : "");
+	/*
+	 * Eight pixels in a row, of the framebuffer and of the first texture the draw
+	 * sampled: a picture that comes out in fine vertical stripes either holds them
+	 * or is read into stripes, and these two lines say which.
+	 */
+	if (trace_stripes) {
+		uint8_t framebuffer[8 * 4] = { 0 }, sampled[8 * 4] = { 0 };
+		GLuint texture = 0;
+		unsigned tu;
+
+		glReadPixels(px, py, 8, 1, GL_RGBA, GL_UNSIGNED_BYTE, framebuffer);
+		for (tu = 0; tu < 4; tu++) {
+			if (e->bound[tu] != 0) {
+				texture = e->bound[tu];
+				break;
+			}
+		}
+		if (texture != 0 && read_texture_row(e, texture, px, py, sampled)) {
+			say("gl-at:     texture %u at %d,%d: %.3s/%.3s %.3s/%.3s %.3s/%.3s %.3s/%.3s (red/green, blue/alpha)\n",
+			    texture, px, py, framebuffer + 0, framebuffer + 1, framebuffer + 4, framebuffer + 5,
+			    framebuffer + 8, framebuffer + 9, framebuffer + 12, framebuffer + 13);
+			say("gl-at:     what it samples there: %u %u %u %u | %u %u %u %u | %u %u %u %u | %u %u %u %u\n",
+			    sampled[0], sampled[1], sampled[2], sampled[3], sampled[4], sampled[5], sampled[6], sampled[7],
+			    sampled[8], sampled[9], sampled[10], sampled[11], sampled[12], sampled[13], sampled[14], sampled[15]);
+		}
+	}
 }
 
 static unsigned
@@ -4331,7 +4568,13 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 
 	EAGL_ENTER(e, MONDIAN_GL_TEX_IMAGE_2D);
 	if (level == 0) {
+		GLint bound_texture = 0;
+
 		note_format(pixels ? "filled" : "empty", (GLenum)internal, format, type, width, height);
+		if (target == GL_TEXTURE_2D) {
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_texture);
+			note_created((GLuint)bound_texture, width, height, internal, type, 0);
+		}
 		/*
 		 * A big picture handed over by the window server: is it a photograph or
 		 * a coverage mask? The lock screen's wallpaper is a 1326x1326 surface
@@ -4745,6 +4988,21 @@ my_glLinkProgram(void *context, GLuint program)
 	if (!good) {
 		glGetProgramInfoLog(program, sizeof(said), NULL, said);
 		say("mondrian-gl: A PROGRAM DOES NOT LINK (program %u): %s\n", program, said);
+	}
+	if (good && dump_program != 0 && program == dump_program) {
+		GLuint asked[16];
+		GLsizei asked_count = 0;
+
+		glGetAttachedShaders(program, 16, &asked_count, asked);
+		say("mondrian-gl: program %u is made of %d shader(s)\n", program, (int)asked_count);
+		for (GLsizei i = 0; i < asked_count && i < 16; i++) {
+			if (e->sources[asked[i] % 64] != NULL) {
+				char which[64];
+
+				(void)snprintf(which, sizeof(which), "shader %u of program %u", asked[i], program);
+				say_long(which, e->sources[asked[i] % 64]);
+			}
+		}
 	}
 	if (good) {
 		GLuint attached[8];
@@ -5331,8 +5589,28 @@ install(void)
 			}
 			trace_placed = 1;
 		}
+		arm_place_from_file(true);
 		all_shaders = strstr(arguments, "glshaders=1") != NULL;
-		census_on = strstr(arguments, "glcensus=1") != NULL;
+		{
+			/*
+			 * The file holds the number of one program: at its link,
+			 * the text of the shaders attached to it is written down,
+			 * which is a hundredth of what glshaders=1 costs and the
+			 * only way to read what CoreAnimation asks a draw to do
+			 * with what it samples.
+			 */
+			FILE *asked = fopen("/private/var/vm/mondrian-gl-shaders", "r");
+			unsigned wanted = 0;
+
+			if (asked != NULL) {
+				if (fscanf(asked, "%u", &wanted) == 1) {
+					dump_program = wanted;
+				}
+				(void)fclose(asked);
+			}
+		}
+		census_on = strstr(arguments, "glcensus=1") != NULL ||
+		    switch_file("/private/var/vm/mondrian-gl-census");
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
@@ -5363,6 +5641,8 @@ install(void)
 		}
 		say("mondrian-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
+		say("mondrian-gl: this library: place trace by file %s, row check by file, fetch switch by file\n",
+		    trace_placed ? "ARMED" : "off");
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");
