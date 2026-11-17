@@ -201,7 +201,19 @@ boot each, so the three columns differ only in what changed:
   fault from painting six `KABORT` rows, and makes the status rows (`st …`,
   `SC …`, the console rate -- one of them a filled black band) follow the
   console off the panel; `mondrianfb_noconsole=0` restores all of it for a
-  bring-up boot, and a panic still paints either way.
+  bring-up boot, and a panic still paints either way. Measured after it: the
+  lock screen of a fresh boot has no console text and no bands at all, where the
+  boot before it had six `KABORT` rows and two black bands.
+- **The backdrop needs CoreAnimation's framebuffer fetch.** Measured 2026-11-17
+  by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
+  `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with
+  no build and no boot): the App Library's cards come out flat and light and the
+  backdrop stays grey, so the extension is doing real work and must stay
+  offered. What the grey *is*: the backdrop layer is 480x1066.7 at
+  `contentsScale 1.00` and it is drawn from the wallpaper picture CA asks for; in
+  the transition the ring prints `a 1326x1326 picture: 00 … 0 of 5304 bytes 0xff`,
+  an empty picture, which is the thing to chase next (the poster extension
+  renders it, one byte a pixel, and it is empty at that moment).
 - **What the App Library transition costs, from the ring.** Measured 2026-11-17
   while swiping home -> App Library (the whole ring holds exactly two of these,
   both in that window): `readback 1440x3200 bgra invert 0 shared 0 mirror 0:

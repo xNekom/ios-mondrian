@@ -80,6 +80,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "mondrian_gl.h"
 #include "mondrian_offsets.h"
@@ -443,6 +444,27 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  * CoreAnimation, to see the difference.
  */
 static int fetch_offered = 1;
+
+/*
+ * The same switch without a boot argument: a file the host writes with "0" takes
+ * the extension away from CoreAnimation at the next start of the window server.
+ * "1", or no file, offers it again, so an A/B of the backdrop costs a file and a
+ * restart instead of a build and a boot.
+ */
+static int
+fetch_switch(void)
+{
+	char first = 0;
+	int fd = open("/private/var/vm/mondrian-gl-fetch", O_RDONLY);
+
+	if (fd < 0) {
+		return 1;
+	}
+	(void)read(fd, &first, 1);
+	(void)close(fd);
+	return !(first == '0' || first == 'n');
+}
+
 
 #define GL_SCISSOR_TEST                 0x0c11
 #define GL_SCISSOR_BOX                  0x0c10
@@ -5294,7 +5316,7 @@ install(void)
 		}
 		trace_lit = strstr(arguments, "gltrace_lit=1") != NULL;
 		trace_look = strstr(arguments, "gltrace_look=1") != NULL;
-		fetch_offered = strstr(arguments, "glfetch=0") == NULL;
+		fetch_offered = fetch_switch() && strstr(arguments, "glfetch=0") == NULL;
 		fetch_flush_on = strstr(arguments, "glfbflush=0") == NULL;
 		if ((argument = strstr(arguments, "glflushdraws=")) != NULL) {
 			flush_draws = (int)strtoul(argument + 13, NULL, 10);

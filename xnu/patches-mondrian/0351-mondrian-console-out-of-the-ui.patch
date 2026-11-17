@@ -26,7 +26,17 @@ Three changes, all of them about who owns the panel:
 diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 --- a/osfmk/arm64/mondrian_early.c
 +++ b/osfmk/arm64/mondrian_early.c
-@@ -311,7 +311,7 @@
+@@ -53,6 +53,9 @@
+ /* The kernel VA alias of the framebuffer, 0 while the bootstrap VA=PA is live. */
+ static uint64_t early_fb_va;
+ 
++/* Whether the panel text console may paint at all (see its definition). */
++static bool panel_text_allowed(void);
++
+ static void
+ mondrian_early_clear_row(void)
+ {
+@@ -311,7 +314,7 @@
  	 * UI has taken the panel sits on top of it until the next frame -- or
  	 * forever, in the two rows the console keeps below its text area.
  	 */
@@ -35,7 +45,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  		return;
  	}
  	/* By position: the console cursor belongs to the log thread. */
-@@ -321,7 +321,7 @@
+@@ -321,7 +324,7 @@
  void
  mondrian_early_status(const char *s)
  {
@@ -44,7 +54,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
  		return;
  	}
  	hud_row_text(EARLY_HUD_ROW0, s);
-@@ -338,6 +338,56 @@
+@@ -338,6 +341,56 @@
  }
  
  /*
@@ -101,7 +111,7 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
   * A panic row, written by position instead of through the console cursor.
   * The log thread paints the console from another CPU and owns early_row and
   * early_col; a panic that shared them lost its first rows to the painter's
-@@ -523,7 +573,7 @@
+@@ -523,7 +576,7 @@
  	 * the HUD row painting "st <mpidr> s <stage>" over the UI for the whole
  	 * boot, the line the user saw advancing.
  	 */
