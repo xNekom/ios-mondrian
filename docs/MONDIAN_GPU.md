@@ -1238,6 +1238,27 @@ and the 60 Hz timer tick starts the interface. Panel and canvas are the same
 size (`1440x3200`, stride `5760`), so the copy is 1:1 and costs 2.8-3.9 ms
 (measured 2026-11-17, injector in `backboardd`).
 
+The `swap` records say what that copy is: **one layer, the whole panel**, and
+CoreAnimation alternating two canvas surfaces (`s2`/`s3`), so the canvas is
+double-buffered by CA itself and the driver's per-layer flattening is not used
+in practice. Nothing waited for the submission that named that canvas -- the GL
+interposer skips its `glFinish` (a full sync drops the display to about twenty
+swaps a second) and this driver never looked at the fence -- so `0350` adds
+`mondrian_gpu_retire()`, called once per present behind
+`mondrianfb_gpuwait=1`: a bounded wait on the fence the submission path already
+handed out. Measured on the lock screen it costs `gpuwait avg 155-447 us` a
+frame, because the GPU has usually retired the frame by then; it buys ordering,
+not frames, so it is off by default. `mondrianfb_nocopy=N` (skip the copy N
+seconds out of ten) measured the copy's share of the frame rate directly: no
+gain (54-56 fps with it against 41-59 without, with a worse `late`), so the copy
+is not what drops frames and no faster copy is worth writing.
+
+Corruption on the glass -- big diagonal stair edges, black holes, pieces of an
+earlier frame -- is not this path: with the geometry intact and the canvas
+double-buffered, it is drawn into the canvas, and the failing piece there is the
+texture upload (`docs/COREANIMATION_GLES.md`). Check the home screen's frame
+cost before touching this driver.
+
 What a swipe looks like in the ring (89-347 touches/s): 47-50 fps, the copy at
 ~3 ms, the frame arriving 8-12 ms after the tick (mean 8.8, max 16-17), and a
 backboardd frame of **14.6-15.6 ms of which 8.5-10.5 ms is the interposer

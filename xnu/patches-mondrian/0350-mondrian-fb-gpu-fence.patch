@@ -1,0 +1,174 @@
+xnu 0350: the panel copy waits for the frame it copies
+
+Nothing on this port waits for the submission that named a surface. The GL
+interposer skips its glFinish (a full sync puts the CPU behind the GPU and the
+display drops to about twenty swaps a second, docs/COREANIMATION_GLES.md) and
+the display driver never looked at the fence, so `swap()` copies the canvas
+while the GPU may still be drawing it. On the glass that is a frame with pieces
+of the previous one in it -- the diagonal stair edges of a raster in flight,
+black where nothing has been written yet -- and it stays there until something
+redraws, because CoreAnimation only draws on change.
+
+`mondrian_gpu_retire()` waits, bounded at 100 ms, for the fence the submission
+path already handed out; the framebuffer calls it once per present, before the
+layer loop, behind `mondrianfb_gpuwait=1` for an A/B. It does not consume the
+fence, so `gpuacct`'s numbers stay the client's, and it is not a glFinish: the
+wait sits in the present thread, on the GPU's own remaining time, instead of
+serialising the renderer's CPU work behind the GPU.
+
+The fps line now reports `gpuwait avg`, which is what that wait costs.
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -5676,6 +5676,43 @@
+ 	mondrian_log_flush_now();
+ }
+ 
++/*
++ * Wait until everything the compositor has submitted so far has retired.
++ *
++ * The framebuffer calls this before it copies a surface into the panel, and
++ * nothing else guarantees it: the GL interposer does not glFinish at the end of
++ * a frame (a full sync puts the CPU behind the GPU and the display drops to
++ * about twenty swaps a second), and the display driver never looked at the
++ * fence. A copy taken from a surface the GPU is still drawing is a frame with
++ * pieces of the previous one on the glass -- the diagonal stair edges of a
++ * raster in flight -- and the glass keeps it until something redraws.
++ *
++ * The wait is bounded and does not consume the fence: it is the one the
++ * submission path already handed out, so `gpuacct`'s numbers stay the client's.
++ */
++int
++mondrian_gpu_retire(void)
++{
++	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
++	uint32_t fence = mondrian_uc_fence;
++	uint32_t spent_us = 0;
++
++	if (view == NULL || fence == 0) {
++		return -1;
++	}
++	for (;;) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		if ((int32_t)(view[mondrian_uc_fence_word(fence)] - fence) >= 0) {
++			return 0;
++		}
++		if (spent_us >= 100000u) {
++			return -1;
++		}
++		delay(50);
++		spent_us += 50u;
++	}
++}
++
+ int
+ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ {
+@@ -5851,6 +5888,12 @@
+ 	return -1;
+ }
+ 
++int
++mondrian_gpu_retire(void)
++{
++	return -1;
++}
++
+ int
+ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ {
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -209,6 +209,8 @@
+ extern "C" void mondrian_touch_vsync(void);
+ extern "C" uint32_t mondrian_touch_report_count(void);
+ extern "C" uint32_t mondrian_touch_repeat_count(void);
++/* the GPU's fence wait: this file is C++, the driver is C */
++extern "C" int mondrian_gpu_retire(void);
+ extern "C" uint32_t mondrian_touch_poll_count(void);
+ extern "C" uint32_t mondrian_touch_event_count(void);
+ extern "C" void mondrian_touch_event_gap_report(void);
+@@ -236,6 +238,14 @@
+  * of the boot still shows the UI.
+  */
+ static int mondrian_fb_nocopy;
++/*
++ * mondrianfb_gpuwait=1: wait for the compositor's own fence before copying a
++ * surface into the panel. Without it the copy can read a surface the GPU is
++ * still drawing, because nothing on this port waits for that submission: the
++ * GL interposer skips its glFinish (it costs the frame rate), so the panel gets
++ * a frame with parts of the previous one in it.
++ */
++static int mondrian_fb_gpuwait;
+ 
+ /*
+  * Clean and drop the CPU's lines for a surface's pixels, by physical address.
+@@ -439,6 +449,7 @@
+ 	uint32_t            fColMapSource;
+ 	uint64_t            fCleanTicks;    /* cache clean inside swap() */
+ 	uint64_t            fScaleTicks;    /* canvas scale inside swap() */
++	uint64_t            fGpuWaitTicks;  /* waiting on the GPU's fence */
+ 	uint64_t            fLateTicks;      /* swap entry minus the last vsync */
+ 	uint64_t            fLateMaxTicks;
+ 	uint64_t            fNextVsync;      /* deadline of the next vsync, not a delay */
+@@ -987,6 +998,8 @@
+ 	    sizeof(mondrian_fb_probe));
+ 	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
+ 	    sizeof(mondrian_fb_nocopy));
++	(void)PE_parse_boot_argn("mondrianfb_gpuwait", &mondrian_fb_gpuwait,
++	    sizeof(mondrian_fb_gpuwait));
+ 	fDeferPresent = true;
+ 	{
+ 		int defer = 1;
+@@ -1594,7 +1607,7 @@
+ 		uint32_t swaps = fb->fSwapCount;
+ 		uint32_t n = swaps - fb->fFpsLast;
+ 		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
+-		uint64_t clean_avg = 0, scale_avg = 0;
++		uint64_t clean_avg = 0, scale_avg = 0, gpuwait_avg = 0;
+ 		uint64_t gap_avg = 0, gap_max = 0, gap_min = 0;
+ 		uint64_t vsync_avg = 0, vsync_min = 0, vsync_max = 0;
+ 		uint64_t present_avg = 0, present_max = 0;
+@@ -1610,6 +1623,8 @@
+ 			absolutetime_to_nanoseconds(fb->fScaleTicks, &scale_avg);
+ 			clean_avg /= n;
+ 			scale_avg /= n;
++			absolutetime_to_nanoseconds(fb->fGpuWaitTicks, &gpuwait_avg);
++			gpuwait_avg /= n;
+ 		}
+ 		if (fb->fGapCount != 0) {
+ 			absolutetime_to_nanoseconds(fb->fGapTicks / fb->fGapCount, &gap_avg);
+@@ -1632,10 +1647,10 @@
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us poll %u/s ev %u/s mode %s\n",
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us gpuwait avg %llu us poll %u/s ev %u/s mode %s\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+ 		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000,
+-		    fb->fTouchPollRate, fb->fTouchEventRate,
++		    gpuwait_avg / 1000, fb->fTouchPollRate, fb->fTouchEventRate,
+ 		    (mondrian_fb_nocopy > 0 &&
+ 			    (count % (MONDRIAN_FB_REFRESH_HZ * 10)) <
+ 			    (uint64_t)mondrian_fb_nocopy * MONDRIAN_FB_REFRESH_HZ) ?
+@@ -1676,7 +1691,7 @@
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
+-		fb->fCleanTicks = fb->fScaleTicks = 0;
++		fb->fCleanTicks = fb->fScaleTicks = fb->fGpuWaitTicks = 0;
+ 		fb->fGapTicks = fb->fGapMaxTicks = fb->fGapMinTicks = 0;
+ 		fb->fGapCount = 0;
+ 		fb->fGapUnder15 = fb->fGap15 = fb->fGap18 = 0;
+@@ -1954,6 +1969,12 @@
+ 		}
+ 	}
+ 
++	if (mondrian_fb_gpuwait) {
++		uint64_t waitBegan = mach_absolute_time();
++
++		(void)mondrian_gpu_retire();
++		fGpuWaitTicks += mach_absolute_time() - waitBegan;
++	}
+ 	for (uint32_t layer = 0; layer < MONDRIAN_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;

@@ -136,12 +136,34 @@ boot each, so the three columns differ only in what changed:
   `CLUSTER_TYPE_P`, which halves the CPU cost of a frame and moves almost all
   of it to the P cores. This is the single largest win measured so far and it
   costs nothing at run time.
-- **The copy is the next cliff**: 2.4 ms of a 9.2 ms frame, `clean` included,
-  and 5.4 ms at worst. `mondrianfb_nocopy=N` skips it N seconds out of ten so
-  one boot can show what the producer sustains without it. A sliced copy (the
-  caller plus kernel threads on the efficiency cluster) was written and does
-  not boot -- the first frame it serves ends the boot -- so it is not in the
-  tree.
+- **The copy is not what drops frames, measured, and the panel is a single
+  full-canvas layer.** `mondrianfb_nocopy=5` skips the copy five seconds out of
+  ten, and the same swipe in one boot gives 54-56 fps in the `copy` seconds
+  against 41-59 in the `nocopy` ones -- no gain, more variance, and a worse
+  `late`, because a panel that never changes breaks the pacing the UI keeps
+  against it. `swap` records show why the copy can be 1:1: one layer,
+  1440x3200, `bpr 5760` (exactly `width * 4`), and CoreAnimation alternating
+  two canvas surfaces (`s2`/`s3`), so the canvas is already double-buffered and
+  a full-frame copy at present reads a complete image. A sliced copy (the caller
+  plus kernel threads) was written and does not boot -- the first frame it
+  serves ends the boot -- so it is not in the tree.
+- **Nothing waited for the submission that named the surface.** The GL
+  interposer skips its `glFinish` (a full sync drops the display to about twenty
+  swaps a second) and the driver never looked at the fence, so `swap()` could
+  copy a canvas the GPU was still drawing. `mondrianfb_gpuwait=1` (`0350`)
+  waits, bounded at 100 ms, on the fence the submission path already handed out;
+  measured on the lock screen it costs `gpuwait avg 155-447 us` a frame -- the
+  GPU had retired the frame in most of them -- and the swap rate is 59-61 with
+  `late max` 4.0-4.4 ms. It is off by default: what it buys is ordering, not
+  frames.
+- **Corruption in the image is inside CoreAnimation's canvas, not the path to
+  the glass.** A frame with huge diagonal stair edges, black holes and icons
+  from an earlier frame (`2026-11-17`, landscape, App Library) is drawn into the
+  canvas with the layer geometry the driver logs intact, so the copy, the
+  double buffer and the panel are not where it starts: it is a texture, and the
+  texture path is the one `docs/COREANIMATION_GLES.md` records as failing
+  (`glTexImage2D: 0x505`). Measure that path in a boot where the UI is on the
+  home screen before touching the framebuffer again.
 - **The copy-out path is a cliff, not a slope**: some frames take
   `1 textures refilled from IOSurfaces (18400 KB)` plus 10-13 ms of
   `copying out` for two or three draws. It shows up at boot and on app launch,
