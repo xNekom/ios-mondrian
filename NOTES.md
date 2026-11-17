@@ -91,7 +91,12 @@ Current blockers, in order:
 **Kernel.** `.github/workflows/xnu.yml`, `tools/build-kernel-local.sh` (Mac) and
 `tools/wsl/build-kernel.sh` (Windows/WSL2, `docs/BUILD_LINUX.md`) fetch
 xnu-8796.141.3, reset the checkout and apply `xnu/patches-mondrian/`; a skipped
-patch fails the run. Run `tools/apply-series.py` (or `tools/check-patches.sh`)
+patch fails the run. **The workflow cannot run on this repository since
+2026-11-17**: every dispatch is cancelled within seconds with "The
+configuration 'macos-14-arm64-us-default' is not supported" (`gh run view`), so
+a green `gh run list` is not the thing to wait for -- build with
+`tools/wsl/build-kernel.sh` and flash that. Run `tools/apply-series.py` (or
+`tools/check-patches.sh`)
 after touching the series: it names the patch in seconds (`0161` was silently
 missing until 2026-10-28, `0157` carried its first hunk). **The series is the
 only source of truth:** a build whose hash changed resets that checkout, so a
