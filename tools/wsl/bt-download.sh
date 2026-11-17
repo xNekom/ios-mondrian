@@ -14,7 +14,8 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 IF=${IFACE:-enx02005e77ee01}
-BUSID=${BUSID:-7-1}
+BUSID=${BUSID:-$(usbipd.exe list 2>/dev/null |
+	grep -aE '1209:0001|18d1:d00d' | awk '{print $1}' | head -1)}
 FW=${FW:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpbtfw21.tlv}
 NVM=${NVM:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpnv21.bin}
 STEPS=${STEPS:-on,hci115,edl,config,fw,nvm}

@@ -29,7 +29,8 @@ set -u
 cd "$(dirname "$0")/../.." || exit 1
 IF=${IFACE:-enx02005e77ee01}
 FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
-BUSID=${BUSID:-7-1}
+BUSID=${BUSID:-$(usbipd.exe list 2>/dev/null |
+	grep -aE '1209:0001|18d1:d00d' | awk '{print $1}' | head -1)}
 OUT=${OUT:-/root/cycle/ring-bt.txt}
 STAGES=${STAGES:-hci115}
 

@@ -103,7 +103,12 @@ Pro, SM8475) is the port being done here.
   quotes never reach grep — put the check in a script file.
 - **Every WSL script attaches the phone itself.** WSL shuts down between tool
   calls, so `usbipd attach --wsl` and the `192.168.7.1` address must be redone
-  inside each script or the first send fails with `Errno 99`.
+  inside each script or the first send fails with `Errno 99`. **The bus id is
+  not fixed:** the phone moves ports and a stale `--busid` leaves the ring
+  silent while `fastboot devices` (host side, no `usbipd`) keeps answering, which
+  reads exactly like a kernel that does not boot. Look it up by USB id
+  (`usbipd list | grep -E '1209:0001|18d1:d00d'`), as `tools/wsl/bt-stage.sh`
+  does.
 - **SPMI: the map is the truth.** A peripheral's PPID is `(sid << 8) |
   peripheral`, not its DT address: pm8350b's haptics at `0xf000` is `0x3f0`,
   while the SID-0 VADC is `0x031`. `tools/usb-ring.py spmimap` dumps the 540

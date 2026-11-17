@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..ac9e630
+index 0000000..1d04562
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,967 @@
+@@ -0,0 +1,977 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -594,6 +594,14 @@ index 0000000..ac9e630
 +
 +		status = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
 +		words = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
++		/*
++		 * The FIFO is 32 words deep: a larger count is noise (a break on
++		 * the wire reads as a stale status) and draining it would loop
++		 * millions of times with the command thread held.
++		 */
++		if (words > 32) {
++			words = 32;
++		}
 +		if (words != 0) {
 +			uint32_t last = (status & MONDRIAN_BT_RX_LAST_BYTE) >> 28;
 +			uint32_t bytes = 4 * (words - 1);
@@ -918,7 +926,7 @@ index 0000000..ac9e630
 +	}
 +	if (mode != NULL && strncmp(mode, "cmd ", 4) == 0) {
 +		const char *hex = mode + 4;
-+		uint8_t pkt[1600];
++		uint8_t pkt[512];
 +		uint32_t plen = 0;
 +
 +		while (hex[0] != 0 && hex[1] != 0 && plen < sizeof(pkt)) {
@@ -935,6 +943,8 @@ index 0000000..ac9e630
 +			return mondrian_bt_step(out, len, n,
 +			    "btuart: cmd needs at least 4 bytes of hex\n");
 +		}
++		snprintf(line, sizeof(line), "btuart: cmd %u bytes\n", plen);
++		n = mondrian_bt_step(out, len, n, line);
 +		n = mondrian_bt_send(se, pkt, plen, out, len, n);
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 300, out, len, n);
 +		return n;
