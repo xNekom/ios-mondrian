@@ -51,6 +51,10 @@ done
 timeout 250 python3 tools/usb-ring.py dump "$OUT" > /dev/null 2>&1
 echo "got:  $(grep -a -o -m1 'Darwin Kernel Version[^;]*' "$OUT")"
 
+echo '== what powering the chip would touch (read only)'
+timeout 60 python3 tools/usb-ring.py btuart power 2>&1 | tail -14
+echo "pos: $(timeout 20 python3 tools/usb-ring.py pos 2>&1 | tail -1)"
+
 echo '== exact 115200 on a fresh engine (root 14745600, divider 8)'
 timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6
 echo "pos: $(timeout 20 python3 tools/usb-ring.py pos 2>&1 | tail -1)"

@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..1d810e2
+index 0000000..c297862
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,693 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -116,6 +116,27 @@ index 0000000..1d810e2
 +#define MONDRIAN_BT_RCG_M		768u
 +#define MONDRIAN_BT_RCG_N		15625u
 +#define MONDRIAN_BT_GPLL0_HZ		300000000u
++
++/*
++ * The pin controller, as the touch driver already uses it: the live tree
++ * declares pinctrl@f000000 with a 16 MB region, but the pin registers start one
++ * megabyte into it and a read of the hole wedges the interconnect. CFG is the
++ * function/pull/drive word, IN_OUT the level (bit 0) and the output enable.
++ */
++#define MONDRIAN_BT_TLMM_BASE		0x0f100000UL
++#define MONDRIAN_BT_TLMM_PAGE(n)	(MONDRIAN_BT_TLMM_BASE + 0x1000UL * (n))
++#define MONDRIAN_BT_TLMM_CFG		0x0
++#define MONDRIAN_BT_TLMM_IN_OUT		0x4
++#define MONDRIAN_BT_TLMM_INTR_CFG	0x8
++
++#define MONDRIAN_BT_GPIO_WAKEUP		79
++#define MONDRIAN_BT_GPIO_WL_RESET	80
++#define MONDRIAN_BT_GPIO_RESET		81
++#define MONDRIAN_BT_GPIO_SW_CTRL	82
++#define MONDRIAN_BT_GPIO_XO_CLK		204
++
++extern uint32_t mondrian_cmd_db_addr(const char *id);
++extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
 +#define MONDRIAN_BT_RCG_ROOT_OFF	(1u << 31)
 +#define MONDRIAN_BT_RCG_ROOT_EN		(1u << 1)
 +#define MONDRIAN_BT_RCG_UPDATE		(1u << 0)
@@ -568,6 +589,77 @@ index 0000000..1d810e2
 +	return n;
 +}
 +
++/*
++ * btpower: the rails by cmd-db name and the five pins, read only.
++ *
++ * The voltage each rail needs is the minimum of the node's own
++ * qcom,bt-vdd-*-config (966 aon/dig/rfa-0p8/rfacmn share smpb11); they are
++ * printed beside the resource so a vote can be written against the numbers
++ * that came from the tree, not from memory.
++ */
++static int
++mondrian_bt_power_probe(vm_offset_t gcc, char *out, size_t len, int n)
++{
++	static const struct {
++		const char *name;
++		uint32_t mv;
++		const char *who;
++	} rails[] = {
++		{ "smpb11", 966, "aon, dig, rfa-0p8, rfacmn" },
++		{ "smpb10", 1800, "io" },
++		{ "smpc1", 1900, "rfa1" },
++		{ "smpb12", 1350, "rfa2" },
++		{ "ldoe7", 2800, "asd" },
++		{ "smpe3", 2200, "ipa" },
++	};
++	static const uint32_t gpios[] = {
++		MONDRIAN_BT_GPIO_WAKEUP, MONDRIAN_BT_GPIO_WL_RESET,
++		MONDRIAN_BT_GPIO_RESET, MONDRIAN_BT_GPIO_SW_CTRL,
++		MONDRIAN_BT_GPIO_XO_CLK,
++	};
++	char line[192];
++
++	for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		uint32_t aux_len = 0;
++		const uint16_t *aux =
++		    mondrian_cmd_db_data(rails[i].name, &aux_len);
++		uint32_t addr = mondrian_cmd_db_addr(rails[i].name);
++
++		snprintf(line, sizeof(line),
++		    "btpower: %s addr 0x%x want %u mV aux %u bytes%s\n",
++		    rails[i].name, addr, rails[i].mv, aux_len,
++		    aux == NULL ? " (no aux data)" : "");
++		n = mondrian_bt_step(out, len, n, line);
++		if (aux != NULL && aux_len >= 6) {
++			/* linear range: min uV, step uV, count */
++			snprintf(line, sizeof(line),
++			    "btpower: %s range %u..%u uV step %u (%s)\n",
++			    rails[i].name, aux[0],
++			    (uint32_t)aux[0] + (uint32_t)aux[1] * (aux[2] - 1),
++			    aux[1], rails[i].who);
++			n = mondrian_bt_step(out, len, n, line);
++		}
++	}
++
++	for (size_t i = 0; i < sizeof(gpios) / sizeof(gpios[0]); i++) {
++		vm_offset_t page = ml_io_map(MONDRIAN_BT_TLMM_PAGE(gpios[i]), 0x1000);
++
++		if (page == 0) {
++			snprintf(line, sizeof(line),
++			    "btpower: gpio %u cannot map\n", gpios[i]);
++		} else {
++			snprintf(line, sizeof(line),
++			    "btpower: gpio %u cfg 0x%x io 0x%x intr 0x%x\n",
++			    gpios[i], mondrian_bt_rd(page, MONDRIAN_BT_TLMM_CFG),
++			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_IN_OUT),
++			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_INTR_CFG));
++		}
++		n = mondrian_bt_step(out, len, n, line);
++	}
++	(void)gcc;
++	return n;
++}
++
 +int
 +mondrian_btuart_run(const char *mode, char *out, size_t len)
 +{
@@ -589,6 +681,9 @@ index 0000000..1d810e2
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 20, out, len, n);
 +		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);
 +		return n;
++	}
++	if (mode != NULL && strcmp(mode, "power") == 0) {
++		return mondrian_bt_power_probe(gcc, out, len, n);
 +	}
 +	if (mode != NULL && strcmp(mode, "baud") == 0) {
 +		uint8_t one = 0x5a;

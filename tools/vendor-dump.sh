@@ -11,6 +11,14 @@
 # voltages and votes, the clock and interconnect tree, the SPMI map, the thermal
 # zones, panel timings, UFS gear and the haptics driver's own debugfs.
 #
+# Measured against the ABL here: `fastboot boot` refuses OrangeFox's own image
+# with "Failed to load/authenticate boot image: Bad Buffer Size" (36 MB), and
+# flashing it to boot_b then reboot does not boot it either -- the phone lands
+# in fastboot again. Whatever image this phone used before had been repacked;
+# there is no recipe for it in the tree. Until one exists, flashing boot_b
+# destroys the iOS image, so restore it in the same breath:
+#   fastboot flash boot_b shim/out/shim-boot.img && fastboot reboot
+#
 # Everything lands in $OUT (default /root/vendor-dump), never in git: these are
 # device dumps. Grep them; do not paste them into a doc. The point of a value is
 # to become a constant in tools/boards.py or shim/board.h, or a line in NOTES.md
