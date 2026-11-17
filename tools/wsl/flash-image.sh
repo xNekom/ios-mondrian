@@ -38,9 +38,15 @@ done
 	echo "the phone is not in fastboot (power + volume down)" >&2
 	exit 1
 }
-CUR=$("$FB" getvar current-slot 2>&1 | tr -d '\r' | sed -n 's/current-slot: *//p' | head -1)
+CUR=""
+for i in $(seq 1 10); do
+	CUR=$(timeout 10 "$FB" getvar current-slot 2>&1 | tr -d '\r' |
+		sed -n 's/current-slot: *//p' | head -1)
+	[ -n "$CUR" ] && break
+	sleep 2
+done
 if [ "$CUR" != "$SLOT" ]; then
-	echo "current slot is $CUR, refusing to write boot_$SLOT (SLOT=$SLOT)" >&2
+	echo "current slot is '$CUR', refusing to write boot_$SLOT (SLOT=$SLOT)" >&2
 	exit 1
 fi
 

@@ -205,15 +205,15 @@ kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
 authentication, so the phone faults where QEMU's `-cpu max` does not.
 
 **`ml_io_map()` traps twice: it never unmaps, and an early mapping dies.** The
-I/O submap is 8 MiB, so re-mapping a 128 KiB touch DB per lookup and 4 MiB of
-SPMI channels for one byte exhausted it and the next `kmem_alloc` panicked in
-`io_map`: map the one 4 KiB window (`0179`), and remember it belongs to one
-APID -- the next peripheral re-maps or the byte lands in the previous page. And
-a mapping taken before `STARTUP_SUB_KMEM` comes from `virtual_space_start`: once
-the VM owns that space the device is mapped nowhere and the next read is a bus
-abort (`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`), which is why `0087` re-maps
-GICD/GICR after the VM is up and the early framebuffer survives only on `0062`'s
-reserved low-global alias.
+I/O submap is 8 MiB, so re-mapping a 128 KiB touch DB per lookup, 4 MiB of SPMI
+channels for one byte, or a driver's windows on every command (BT mapped 480 KB
+per `btuart`) exhausts it: the first command after boot works, the next aborts.
+Map each window once and keep it (`0179`), and remember it belongs to one APID --
+the next peripheral re-maps or the byte lands in the previous page. A mapping
+taken before `STARTUP_SUB_KMEM` comes from `virtual_space_start`: once the VM
+owns that space the device is mapped nowhere and the next read is a bus abort
+(`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`), which is why `0087` re-maps GICD/GICR
+after the VM is up and the early framebuffer survives only on `0062`'s alias.
 
 **The HFS journal cannot be replayed, and a dirty volume looks like a dead
 kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then

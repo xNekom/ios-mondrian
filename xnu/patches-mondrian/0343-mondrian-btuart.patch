@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..1d04562
+index 0000000..2e4e6ca
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,1079 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -265,9 +265,26 @@ index 0000000..1d04562
 +static int
 +mondrian_bt_map(vm_offset_t *gcc, vm_offset_t *wrap, vm_offset_t *se)
 +{
-+	*gcc = ml_io_map(MONDRIAN_BT_GCC_BASE, 0x70000);
-+	*wrap = ml_io_map(MONDRIAN_BT_WRAP2_BASE, 0x2000);
-+	*se = ml_io_map(MONDRIAN_BT_SE5_BASE, 0x4000);
++	/*
++	 * Map once and keep it: the kernel IO window is finite and mapping 480 KB
++	 * again for every command runs it out. The stage after that gets an
++	 * address with nothing behind it, its first register read aborts and the
++	 * command thread dies with the network still answering.
++	 */
++	static vm_offset_t g_gcc, g_wrap, g_se;
++
++	if (g_gcc == 0) {
++		g_gcc = ml_io_map(MONDRIAN_BT_GCC_BASE, 0x70000);
++	}
++	if (g_wrap == 0) {
++		g_wrap = ml_io_map(MONDRIAN_BT_WRAP2_BASE, 0x2000);
++	}
++	if (g_se == 0) {
++		g_se = ml_io_map(MONDRIAN_BT_SE5_BASE, 0x4000);
++	}
++	*gcc = g_gcc;
++	*wrap = g_wrap;
++	*se = g_se;
 +	return *gcc != 0 && *wrap != 0 && *se != 0;
 +}
 +
@@ -543,13 +560,45 @@ index 0000000..1d04562
 +		    mondrian_bt_rd(se, MONDRIAN_BT_SE_GENI_STATUS));
 +		n = mondrian_bt_step(out, len_out, n, line);
 +	}
-+	for (uint32_t i = 0; i < len; i += 4) {
-+		uint32_t word = 0;
++	{
++		uint32_t depth = (mondrian_bt_rd(se, MONDRIAN_BT_SE_HW_PARAM_0)
++		    >> 16) & 0x3fu;
 +
-+		for (uint32_t j = 0; j < 4 && i + j < len; j++) {
-+			word |= (uint32_t)buf[i + j] << (8 * j);
++		if (depth == 0) {
++			depth = 16;
 +		}
-+		mondrian_bt_wr(se, MONDRIAN_BT_TX_FIFO, word);
++		for (uint32_t i = 0; i < len; i += 4) {
++			uint32_t word = 0;
++			int space = 0;
++
++			for (uint32_t j = 0; j < 4 && i + j < len; j++) {
++				word |= (uint32_t)buf[i + j] << (8 * j);
++			}
++			/*
++			 * Poll for room instead of writing blind. A word written
++			 * with the FIFO full stalls the AHB until the engine
++			 * drains, so a controller that stops draining holds this
++			 * thread for ever -- which reads as a dead kernel except
++			 * that the network still answers. Bounded, so it fails.
++			 */
++			for (int k = 0; k < 2000; k++) {
++				if ((mondrian_bt_rd(se,
++				    MONDRIAN_BT_TX_FIFO_STATUS) &
++				    0x0fffffffu) < depth) {
++					space = 1;
++					break;
++				}
++				delay(100);
++			}
++			if (!space) {
++				snprintf(line, sizeof(line),
++				    "btuart: tx fifo never drained at %u of %u\n",
++				    i, len);
++				n = mondrian_bt_step(out, len_out, n, line);
++				break;
++			}
++			mondrian_bt_wr(se, MONDRIAN_BT_TX_FIFO, word);
++		}
 +	}
 +	snprintf(line, sizeof(line), "btuart: tx fifo filled 0x%x\n",
 +	    mondrian_bt_rd(se, MONDRIAN_BT_TX_FIFO_STATUS));
@@ -924,8 +973,58 @@ index 0000000..1d04562
 +		    sirq);
 +		return mondrian_bt_step(out, len, n, line);
 +	}
-+	if (mode != NULL && strncmp(mode, "cmd ", 4) == 0) {
-+		const char *hex = mode + 4;
++	if (mode != NULL && strcmp(mode, "regs") == 0) {
++		snprintf(line, sizeof(line), "btuart: map gcc 0x%lx wrap 0x%lx se 0x%lx\n",
++		    gcc, wrap, se);
++		n = mondrian_bt_step(out, len, n, line);
++		snprintf(line, sizeof(line),
++		    "btuart: regs geni 0x%x m_irq 0x%x s_irq 0x%x rx 0x%x tx 0x%x\n",
++		    mondrian_bt_rd(se, MONDRIAN_BT_SE_GENI_STATUS),
++		    mondrian_bt_rd(se, MONDRIAN_BT_M_IRQ_STATUS),
++		    mondrian_bt_rd(se, MONDRIAN_BT_S_IRQ_STATUS),
++		    mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS),
++		    mondrian_bt_rd(se, MONDRIAN_BT_TX_FIFO_STATUS));
++		return mondrian_bt_step(out, len, n, line);
++	}
++	if (mode != NULL && strcmp(mode, "cts") == 0) {
++		static vm_offset_t cts_page;
++
++		if (cts_page == 0) {
++			cts_page = ml_io_map(
++			    MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_UART_CTS),
++			    0x1000);
++		}
++		if (cts_page == 0) {
++			return mondrian_bt_step(out, len, n,
++			    "btuart: cannot map the CTS pad\n");
++		}
++		snprintf(line, sizeof(line),
++		    "btuart: cts pin %u cfg 0x%x tx_cfg 0x%x\n",
++		    mondrian_bt_rd(cts_page, MONDRIAN_BT_TLMM_IN_OUT) & 1u,
++		    mondrian_bt_rd(cts_page, MONDRIAN_BT_TLMM_CFG),
++		    mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG));
++		return mondrian_bt_step(out, len, n, line);
++	}
++	if (mode != NULL && strcmp(mode, "flow") == 0) {
++		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++		uint32_t pin;
++
++		/* Honour CTS for one bounded exchange, then put the mask back. */
++		pin = mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG);
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, 0);
++		snprintf(line, sizeof(line),
++		    "btuart: flow honouring cts (tx_cfg 0x%x -> 0x%x)\n", pin,
++		    mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG));
++		n = mondrian_bt_step(out, len, n, line);
++		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 200, out, len, n);
++		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, pin);
++		return n;
++	}
++	if (mode != NULL && (strncmp(mode, "cmd ", 4) == 0 ||
++	    strncmp(mode, "cmd0 ", 5) == 0)) {
++		int quiet = strncmp(mode, "cmd0 ", 5) == 0;
++		const char *hex = mode + (quiet ? 5 : 4);
 +		uint8_t pkt[512];
 +		uint32_t plen = 0;
 +
@@ -946,6 +1045,9 @@ index 0000000..1d04562
 +		snprintf(line, sizeof(line), "btuart: cmd %u bytes\n", plen);
 +		n = mondrian_bt_step(out, len, n, line);
 +		n = mondrian_bt_send(se, pkt, plen, out, len, n);
++		if (quiet) {
++			return mondrian_bt_step(out, len, n, "btuart: sent, no read\n");
++		}
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 300, out, len, n);
 +		return n;
 +	}

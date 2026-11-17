@@ -66,8 +66,12 @@ btuart baud    the same, on the 14745600 root: 115200 exactly
 btuart power   the rails and pins powering the chip would touch (read only)
 btuart on      BT_EN / XO / SW_CTRL in the vendor's order, then the pinmux
 btuart hci115  HCI_Reset and Read Local Version on the 14745600 root
-btuart edl115  the vendor command that names the ROM (0xFC00 / 0x19)
 btuart tx115   the same send with no listen, to split TX from RX
+btuart cmd <hex>   one raw HCI packet out and its reply back
+btuart cmd0 <hex>  the same send with no read: the firmware burst needs it
+btuart regs    GENI/M/S status and both FIFO counters (read only)
+btuart cts     the CTS pad level and the TX config's CTS bit (read only)
+btuart flow    honours CTS for one bounded exchange, then restores the mask
 btuart baud    the UART loopback, for a wire that reaches no chip
 ```
 
@@ -80,9 +84,16 @@ real wedge, from an unrelated cause. Both ends are fixed now (the accumulator
 stops appending and keeps printing to the ring, and the handler owns 1152 bytes,
 one datagram under the interface MTU).
 
-Two things take the command channel down with ICMP still answering, and neither
-is the clock:
+Three things take the command channel down with ICMP still answering, and none
+of them is the clock:
 
+- **`ml_io_map()` on every invocation.** `mondrian_bt_map()` mapped ~480 KB
+  (GCC `0x70000`, wrapper `0x2000`, SE `0x4000`) each time a `btuart` command
+  ran. The first command of a boot worked and the next one died on its first
+  register read, which read as "`0xFC00` wedges the engine" for three boots: the
+  EDL commands were never the problem. The three mappings are cached in statics
+  now, and four engine commands in one boot are measured working. Any new driver
+  here maps its windows once and keeps them.
 - **`btuart power` between `btuart on` and the wire stage.** With the read-only
   probe in the middle the send killed the channel twice; without it the same
   stage came back with the chip's first event byte. Run the probe after the wire
@@ -363,12 +374,52 @@ Downloading it needs no TLV parser: btqca streams the **file itself** in 243-byt
 pieces, each as HCI `0xFC00` with `[0x1E, length, data…]`, and the controller
 parses the TLV (verified with `tools/bt-tlv.py`: `hpbtfw21.tlv` declares ROM
 `0x0201`, product `0x0013`, download mode 3). Before the patch a WCN6855-class
-chip wants `0xFC00` with `0x28, 0x01, 0, 0, 0`. That entire exchange lives in
-`tools/bt-download.py`, driven over `btuart cmd <hex>`; the kernel only puts
-bytes on the wire, which is also why the driver never re-programs the SE root
-(a **second** RCG change in one boot takes the command channel down: measured
-with `btuart baud` after another stage and again with `edl115` after
-`hci115`).
+chip wants `0xFC00` with `0x28, 0x01, 0, 0, 0`.
+
+Measured on 2026-11-17, the ROM answers on `0xFC00` with
+`[cresp][rtype][len][payload]`:
+
+```
+0x19             04 0e 12 01 00 fc 00 19 0c 13 00 00 00 e6 38 01 02 11 12 0c 40
+0x20             04 0e 1e 01 00 fc 00 20 18 42 54 46 57 2e 48 53 50 …
+0x23             04 0e 08 01 00 fc 00 23 02 00 00
+0x28 01 00 00 00 04 0e 07 01 00 fc 10 28 13 03
+```
+
+The version payload is btqca's `struct qca_btsoc_version`, `{product_id,
+patch_ver, rom_ver, soc_id}`, so this chip reports product **0x0013**, patch
+**0x38e6**, ROM **0x0201**, soc **0x400c1211**. ROM `0x0201` **is** the
+`hpbtfw21.tlv`/`hpnv21.*` pair and product `0x0013` matches what the file
+declares; a loaded patch replaces `patch_ver` with the TLV's `0x5e81`, which is
+how the download is verified. The build string is
+`BTFW.HSP.2.1-00124-ROM-0…`, and the board ID is **0x0000**, which no
+`hpnv21.<bid>` matches, so the NVM falls back to `hpnv21.bin`. The `0x28` reply
+carries `cresp 0x10` and a length that does not match its payload: btqca sends
+that command on the **WCN6750** path only, so it is out of this sequence.
+
+**The pacing is part of the protocol.** `download_mode 3` in the patch TLV is
+`QCA_SKIP_EVT_VSE_CC`, and `qca_tlv_send_segment` sends every segment with
+`__hci_cmd_send` — no event waited for — while `qca_download_firmware` forces
+`QCA_SKIP_EVT_NONE` for the last one, so the controller acks exactly once.
+Waiting for a reply per segment cost a boot: 440 segments of empty 300 ms reads
+(234 s), the rate then fell from 0.3 to 1.25 s per segment, and the command
+thread died there while ICMP kept answering. `tools/bt-download.py` bursts with
+`btuart cmd0` and verifies with a fresh `0x19`, which reports the patch's own
+version (`0x5e81` in the TLV) instead of the ROM's.
+
+The wedge itself was `mondrian_bt_send()` writing the TX FIFO blind: a word
+written with the FIFO full stalls the AHB until the engine drains, so a
+controller that stops draining holds the thread for ever. It polls
+`TX_FIFO_STATUS` now (bits 27:0 count words, and `depth - wc` is the room, as
+`qcom_geni_serial_write_fifo` does) and reports `tx fifo never drained at N of M`.
+Whether the controller stalled on its own or because its RX overflowed with CTS
+masked is what `btuart cts`/`btuart flow` measure.
+
+The exchange lives in `tools/bt-download.py`, driven over `btuart cmd <hex>`; the
+kernel only puts bytes on the wire, which is also why the driver never
+re-programs the SE root (a **second** RCG change in one boot takes the command
+channel down: measured with `btuart baud` after another stage and again with
+`edl115` after `hci115`).
 
 ## What iOS expects
 
