@@ -1216,6 +1216,42 @@ them has Metal. That is the path this port follows.
   = `id<<10 | BIT(8)` = `0x2500`), the writes stick and the blit still writes
   nothing. Both flags default on; `gpuif=0`/`gpuscache=0` are the A/B.
 
+### The panel canvas is copied, and the copy races the fetch
+
+The compositor draws into an ordinary-memory IOSurface; the driver copies that
+canvas into the panel carve-out at `0xb8000000` on every present (`mode copy`)
+and the timer tick starts the interface. Measured 2026-11-17 with the injector
+in `backboardd`: the copy costs 2.7-3.4 ms and the frame reaches the tick 7.4 to
+9.5 ms after it on average (max 15-16.6), at 21 to 57 fps. The DPU fetches the
+same 18 MB the copy is writing, so a frame on the glass is part old and part
+new: the band that walks down the panel while the UI moves.
+
+`mondrianfb_dbuf=1` splits the carve-out in two canvases. The pipes name the
+buffer the bootloader left (`0xb8000000`); the copy fills the next 18 MB
+(`0xb9194000`, the brightness DMA page at `0xbaaf0000` sits above both) and the
+tick points every pipe that named the old address at the new one before the CTL
+flush and start, so the buffer on the wire is the one the copy did not touch.
+The second canvas is a physical range mapped with an `IOMemoryMap` and
+`kIOMapWriteCombineCache`: an `ml_io_map` of the whole 18 MB fails in
+`kmem_alloc`, and the copy is 18 MB of sequential stores that must not be
+uncached.
+
+Status: the board's command line does not carry it, and that is the measured
+boot (the pre-dbuf behaviour: fluid UI, 0 GL errors). With
+`mondrianfb_dbuf=1` the phone resets instead of booting and the cause is not
+identified. The next step is one boot with `mondrianfb_noconsole=0`, so the
+panel keeps the last kernel lines for a photo. The display reads through the
+`apps-smmu` (`mdp_0_tbu@151f9000` and `mdp_1_tbu@151fd000` in the live device
+tree), so a pipe pointed outside the range the bootloader mapped for it faults
+in the SMMU and not in the CPU; that is the first thing to rule out.
+
+Trap: an IOKit object is not zeroed. The first version of the second canvas
+added `fDual`, `fAlt`, `fBasePhys`, `fAltPhys`, `fShown`, `fPending`, `fFlips`
+and `fAltMap` and did not initialise them in `AppleCLCD::start()`; a garbage
+`fDual` ran the path on a boot that never asked for it, and a garbage `fAlt`
+sent the copy into memory nobody mapped. Both read as a kernel that does not
+boot at all. Every member the driver adds goes in `start()` with the rest.
+
 ### Running the GPU test from the UI hook
 
 The UI hook dlopens it in every daemon the kernel injects it into, so there is

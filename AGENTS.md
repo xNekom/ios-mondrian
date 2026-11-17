@@ -82,6 +82,14 @@ Pro, SM8475) is the port being done here.
   builds the image, boots it from RAM, proves which kernel is running and runs
   the ring commands. A build is ~10-15 minutes and a boot ~2.5, so a second
   question in the same boot is free while a repeated boot is not.
+- **A failed boot disables RAM boots until the slot is re-activated.** After a
+  boot that dies, the ABL marks the active slot unbootable and then refuses
+  *every* `fastboot boot` with `Failed to load/authenticate boot image: Not
+  Found` — a 4 KB stub is refused the same way, and so is an image that booted
+  an hour earlier. `fastboot --set-active=<current-slot>` clears it.
+  `cycle.sh` does this before every boot; without it, the refusal reads as a
+  kernel that crashes, and the ring answering with the previous kernel's banner
+  "confirms" it.
 - **Publish from Windows, not from WSL.** `git push` inside WSL stops at
   `could not read Username for 'https://github.com'`: WSL has no credential
   helper. The same push from PowerShell (`git -C

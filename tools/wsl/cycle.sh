@@ -93,6 +93,16 @@ attach() {
 
 echo "== fastboot boot"
 WIMG=$(wslpath -w "$PWD/shim/out/shim-boot.img")
+# The ABL marks the active slot unbootable after a failed boot and then refuses
+# every RAM boot with "Failed to load/authenticate boot image: Not Found",
+# whatever image is handed to it -- a 4 KB stub is refused the same way, and so
+# is an image that booted an hour earlier. Re-activating the slot before the
+# boot clears it.
+SLOT=$("$FB" getvar current-slot 2>&1 | sed -n 's/^current-slot: *//p' | head -1)
+if [ -n "$SLOT" ]; then
+	"$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1
+	echo "   slot $SLOT re-activated"
+fi
 timeout 60 "$FB" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
 # "Sending 'boot.img' ... OKAY" is printed even when the boot itself fails, and
 # a check that only looks for OKAY passes on it: the image was never loaded and
