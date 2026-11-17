@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..2e4e6ca
+index 0000000..8a264ba
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,1079 @@
+@@ -0,0 +1,1083 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -1009,16 +1009,20 @@ index 0000000..2e4e6ca
 +		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
 +		uint32_t pin;
 +
-+		/* Honour CTS for one bounded exchange, then put the mask back. */
++		/*
++		 * Honour CTS from here on: the vendor HAL keeps hardware flow
++		 * control on for the whole transfer and only drops it around a
++		 * baud change, so the stages after this one have to run with
++		 * the mask clear to be representative. `uart_init` puts the
++		 * masked default back on the next `hci115`/`baud`.
++		 */
 +		pin = mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG);
 +		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, 0);
 +		snprintf(line, sizeof(line),
-+		    "btuart: flow honouring cts (tx_cfg 0x%x -> 0x%x)\n", pin,
-+		    mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG));
++		    "btuart: flow honouring cts from 0x%x (stays clear)\n", pin);
 +		n = mondrian_bt_step(out, len, n, line);
 +		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 200, out, len, n);
-+		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, pin);
 +		return n;
 +	}
 +	if (mode != NULL && (strncmp(mode, "cmd ", 4) == 0 ||

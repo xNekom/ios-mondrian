@@ -71,7 +71,7 @@ btuart cmd <hex>   one raw HCI packet out and its reply back
 btuart cmd0 <hex>  the same send with no read: the firmware burst needs it
 btuart regs    GENI/M/S status and both FIFO counters (read only)
 btuart cts     the CTS pad level and the TX config's CTS bit (read only)
-btuart flow    honours CTS for one bounded exchange, then restores the mask
+btuart flow    honours CTS for a probe and leaves it that way for the next stage
 btuart baud    the UART loopback, for a wire that reaches no chip
 ```
 
@@ -414,6 +414,30 @@ controller that stops draining holds the thread for ever. It polls
 `qcom_geni_serial_write_fifo` does) and reports `tx fifo never drained at N of M`.
 Whether the controller stalled on its own or because its RX overflowed with CTS
 masked is what `btuart cts`/`btuart flow` measure.
+
+**The vendor HAL already answered both questions.** Decompiling
+`lib64/hw/android.hardware.bluetooth@1.0-impl-qti.so` (aarch64, stripped, so this
+is `adrp`/`add` string cross-referencing plus the dynamic symbols):
+
+- `PatchDLManager::TlvDnldSegment(int, int, unsigned char)` builds **byte for
+  byte the packet this tree builds**: `0xfc00` and `0x1e` as literals, the HCI
+  length as `seglen + 2`, then `memcpy` of `seglen` bytes from `index * 243`.
+- It sends with `HciSendVsCmd` and reads **one event per segment only when its
+  third argument is non-zero and the byte at `this+122` is zero**. An ack per
+  segment is a switch the caller sets, not a property of the protocol.
+- `PerformChipInit` runs `SocInit`, `PatchVerReq`, `GetAppVerCmd`,
+  `EdlModeChange`, `SetBaudRateReq`, **`DownloadTlvFile`**, `GetBuildInfoReq`,
+  `DisableInternalLdo`, `GetAddOnFeatureList`, `HciReset`.
+- The transport keeps **hardware flow control on** for that transfer:
+  `HciUartTransport::InitTransport` and `ConfigUart` log "HW flow control
+  enabled", and `SocRxDWakeup` drops it only around a baud change — "Flow
+  off->Change UART baudrate to 38.4kbs->send 0x00->Change UART baudrate to
+  max->Flow on". So the download runs with CTS live, which is why `btuart flow`
+  leaves the mask clear instead of restoring it.
+
+Caveat: `TlvDnldSegment` has no call site in this build (two references, no
+`bl`), so the loop is probably inlined elsewhere; the packet layout and the
+conditional ack are the parts that carry over.
 
 The exchange lives in `tools/bt-download.py`, driven over `btuart cmd <hex>`; the
 kernel only puts bytes on the wire, which is also why the driver never

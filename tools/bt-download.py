@@ -120,7 +120,12 @@ def ask_versions(tries=3):
 
 
 def stream(name, blob):
-    """Burst the file out; the controller only acks the last segment."""
+    """Burst the file out; the controller only acks the last segment.
+
+    A segment whose answer says the TX FIFO never drained means the engine
+    stopped draining: the burst cannot make progress, so stop instead of pushing
+    600 more commands at a stalled controller.
+    """
     total = len(blob)
     sent = 0
     t0 = time.time()
@@ -129,10 +134,15 @@ def stream(name, blob):
         last = sent + len(piece) >= total
         params = bytes([0x1E, len(piece)]) + piece
         if last:
-            send_cmd(0xFC00, params, 10.0)
+            answer = send_cmd(0xFC00, params, 10.0)
         else:
-            send_quiet(0xFC00, params, 8.0)
+            answer = send_quiet(0xFC00, params, 8.0)
         sent += len(piece)
+        if answer and "never drained" in answer:
+            print("  %s stalled at %u/%u bytes: the engine stopped draining"
+                  % (name, sent, total), flush=True)
+            print(answer, flush=True)
+            return sent
         if sent % (SEG * 100) < SEG or last:
             print("  %s %u/%u bytes (%.0fs)"
                   % (name, sent, total, time.time() - t0), flush=True)
