@@ -68,19 +68,12 @@ def simple(command, timeout=2.0):
 CHUNK = 1200
 
 
-def wfile(path, local):
-    """Replace one file in the mounted root, over the control channel.
-
-    The kernel opens the path with O_TRUNC and writes what it received, so a
-    dylib can be swapped without a userdata flash (bsd/dev/mondrian_usb.c,
-    "wfile"). A file a process has mapped must be killed first: the caller's
-    job, and the usual reason for `kill`.
-    """
-    data = open(local, "rb").read()
+def wfile_attempt(path, data):
+    """One delivery attempt. Returns how many bytes the kernel took."""
     answer = simple(f"wfile {path} {len(data)}", 5.0)
     if answer is None:
         print("no answer to wfile", file=sys.stderr)
-        return 1
+        return 0
     print(answer.decode(errors="replace").strip(), file=sys.stderr)
 
     s = open_socket(1.0)
@@ -104,9 +97,38 @@ def wfile(path, local):
             time.sleep(0.25)
     finally:
         s.close()
-    print(f"wfile {path}: {got} of {len(data)} bytes delivered")
-    time.sleep(0.5)
-    return 0 if got >= len(data) else 1
+    return got
+
+
+def wfile(path, local):
+    """Replace one file in the mounted root, over the control channel.
+
+    The kernel opens the path with O_TRUNC and writes what it received, so a
+    dylib can be swapped without a userdata flash (bsd/dev/mondrian_usb.c,
+    "wfile"). A file a process has mapped must be killed first: the caller's
+    job, and the usual reason for `kill`.
+
+    A delivery that stops halfway leaves a truncated dylib behind, and the next
+    process to load it fails in ways that have nothing to do with its code
+    (measured 2026-11-18: a 3 576-byte hook whose first functions still ran, so
+    the tick printed once and then nothing). Retry inside the tool, and only
+    then report; the caller does not have to parse the count.
+    """
+    data = open(local, "rb").read()
+    got = 0
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        got = wfile_attempt(path, data)
+        if got >= len(data):
+            print(f"wfile {path}: {got} of {len(data)} bytes delivered")
+            time.sleep(0.5)
+            return 0
+        print(f"wfile {path}: {got} of {len(data)} on attempt {attempt}, retrying",
+              file=sys.stderr)
+        time.sleep(1.0)
+    print(f"wfile {path}: INCOMPLETE after {attempts} attempts, {got} of "
+          f"{len(data)} bytes; the file on the phone is truncated", file=sys.stderr)
+    return 1
 
 
 def request_chunk(s, offset):
