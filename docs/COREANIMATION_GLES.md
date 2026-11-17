@@ -102,9 +102,15 @@ thin arm64 Mach-O that `llvm-objdump` and REA's artifact reader both open:
     tools/dsc-image.py /root/dsccache SpringBoardHome /tmp/SpringBoardHome.arm64
     llvm-objdump --macho -p /tmp/SpringBoardHome.arm64
 
-REA on Windows identifies such an image but cannot analyse it: its Mach-O providers are Hopper
-(macOS), the macOS native utilities, and Ghidra, which on Windows accepts only PE and 6502.
-Rizin is the provider that does run on Windows (`REA_RIZIN_COMMAND`), and it is not installed.
+REA on Windows cannot analyse a Mach-O with its own providers: Hopper and the native utilities
+are macOS, and Ghidra on this platform accepts only PE and 6502. The provider that does run here
+is Rizin, through `execute_rizin_command`; it is installed at
+`%LOCALAPPDATA%\rizin\rizin-win-installer-vs2019_static-64\bin\rizin.exe` and its path is in
+the `rea` server entry of `~/.config/opencode/opencode.jsonc` as `REA_RIZIN_COMMAND` (the value is
+read when the server starts, so a change needs a client restart). Rizin reads the rebuilt image as
+`MACH064`/`arm`/`64`; REA's own artifact reader reports its format as `unknown`, which is harmless
+for the commands. `ic` prints no Objective-C classes on a rebuilt image (observed), so the class
+and method lists have to be read from the `__objc_classlist` / `__objc_const` sections directly.
 
 What the image already answers: `WallpaperCaptureGroup` is the backdrop group the library's
 materials name, and the library's background is built from `SBFFeatherBlurView`,
