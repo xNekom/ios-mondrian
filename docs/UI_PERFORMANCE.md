@@ -181,6 +181,21 @@ boot each, so the three columns differ only in what changed:
   `mondriangeom=1` runs the walker (`mondrian_effect_walk`): every visible
   window, each effect/backdrop view with frame, bounds, layer bounds,
   contentsScale, rasterizationScale and whether its transform is identity.
+- **What the App Library transition actually does, from the ring.** Measured
+  2026-11-17 while swiping home -> App Library with the glitch on the glass
+  (the whole ring holds exactly two of these, both in that window):
+  `readback 1440x3200 bgra invert 0 shared 0 mirror 0: read 9170 us` -- a
+  full-canvas CPU readback, 18.8 MB, 9.2 ms -- then
+  `2 textures refilled from IOSurfaces (23438 KB); 1 picture copied out` on a
+  **52 469 us** frame, with `rate 10.9 frames in 1008 ms` at its side, and
+  frames of 101 ms and 131 ms in the same window. The same context prints
+  `a 1326x1326 picture: 00 00 00 00 00 00 00 00, 0 of 5304 bytes 0xff` (the
+  poster surface, empty) and `CoreAnimation's GL renderer has no function 60`:
+  CA's own GLES renderer numbers its shader functions and asks the library
+  whether one is supported, and 60 is refused here. That is the shape of the
+  whole complaint -- the transition costs 50-130 ms *and* paints the backdrop
+  wrong -- so the next work is that function and the copy-out path, not the
+  framebuffer.
 - **The copy-out path is a cliff, not a slope**: some frames take
   `1 textures refilled from IOSurfaces (18400 KB)` plus 10-13 ms of
   `copying out` for two or three draws. It shows up at boot and on app launch,

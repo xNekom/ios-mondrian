@@ -5236,6 +5236,20 @@ mondrian_lock_step(void *context)
 			mondrian_wallpaper_done = 1;
 			mondrian_hide_wallpaper();
 		}
+		/*
+		 * Undo the wallpaper experiment: its trigger file lives on the data
+		 * volume and would hide the wallpaper on every boot, and the ring has
+		 * no way to delete a file. Removing it here is the only way back, and
+		 * a missing file is not an error.
+		 */
+		{
+			static int cleaned;
+
+			if (!cleaned) {
+				cleaned = 1;
+				(void)unlink("/private/var/vm/mondrian-hide-wallpaper");
+			}
+		}
 		mondrian_icon_probe_once();
 		/*
 		 * SpringBoard rebuilds the dock when the layout changes, and a
