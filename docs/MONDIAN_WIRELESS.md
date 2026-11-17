@@ -428,6 +428,16 @@ later command goes unanswered at 115200, which reads exactly like a dead chip.
 `qca_tlv_check_data` rewrites that byte (and sets the in-band sleep bit) to the
 rate the driver will actually use, and `patch_nvm()` in `tools/bt-download.py`
 does the same: `15 11` becomes `95 00` for 115200, two bytes and nothing else.
+
+Measured after the rewrite: `0xFC17` with `[0x14, 0x00]` answers
+`04 0e 05 01 17 fc 00 14` (status 0) and HCI_Reset answers
+`04 0e 04 01 03 0c 00` (status 0), so the controller is alive and running the
+patch. A Read Local Version right after comes back buried in `0xfd` filler: that
+is the in-band-sleep wake traffic the HCI tag enables with `data[0] |= 0x80`, not
+a lost packet. Two reading traps come with it — a `btuart` answer that starts
+with `0xfd` is noise rather than data, and the `rx data:` line is one 192-byte
+buffer (three characters per byte), so it truncates past about sixty bytes.
+
 After the NVM, btqca disables SoC logging (`0xFC17` with `[0x14, 0x00]`), runs
 HCI_Reset and reads the build info; `--steps post` does that.
 
