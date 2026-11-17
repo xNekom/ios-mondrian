@@ -33,8 +33,9 @@ BUSID=${BUSID:-$(usbipd.exe list 2>/dev/null |
 	grep -aE '1209:0001|18d1:d00d' | awk '{print $1}' | head -1)}
 OUT=${OUT:-/root/cycle/ring-bt.txt}
 STAGES=${STAGES:-hci115}
+RESET=${RESET:-240}
 
-CM=$(python3 -c "from tools.boards import BOARDS; print(BOARDS['mondrian'].cmdline.replace('mondrianreset=0', 'mondrianreset=240'))")
+CM=$(python3 -c "from tools.boards import BOARDS; print(BOARDS['mondrian'].cmdline.replace('mondrianreset=0', 'mondrianreset=$RESET'))")
 echo "cmdline: $(printf '%s' "$CM" | tr ' ' '\n' | grep -a -e mondrianreset -e usb=)"
 echo "stages: $STAGES"
 
@@ -73,7 +74,7 @@ for stage in $STAGES; do
 	if [ "$stage" = "download" ]; then
 		echo "== the host-driven download (EDL, patch, nvm)"
 		timeout 900 python3 tools/bt-download.py \
-			--steps "${DLSTEPS:-edl,fw,nvm,post}" \
+			--steps "${DLSTEPS:-flow,edl,fw,nvm,post}" \
 			--fw "${FW:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpbtfw21.tlv}" \
 			--nvm "${NVM:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpnv21.bin}"
 		echo "pos: $(pos)"

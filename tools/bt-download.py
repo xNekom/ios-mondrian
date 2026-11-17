@@ -219,6 +219,11 @@ def main():
         print("== btuart hci115 (reset + version, first clock change)", flush=True)
         print(simple("btuart hci115", 30) or "no answer", flush=True)
 
+    if "flow" in steps:
+        print("== btuart flow (honour CTS: the vendor runs the transfer that way)",
+              flush=True)
+        print(simple("btuart flow", 30) or "no answer", flush=True)
+
     if "edl" in steps:
         print("== EDL_PATCH_VER_REQ_CMD (the ROM)", flush=True)
         answer = send_cmd(0xFC00, b"\x19", 8.0)
