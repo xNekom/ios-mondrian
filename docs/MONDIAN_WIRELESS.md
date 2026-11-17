@@ -62,8 +62,19 @@ each one proof for the next:
 ```
 btuart         identity registers with the clocks voted
 btuart loop    programs 8N1 and sends a byte into its own loopback
+btuart baud    the same, on the 14745600 root: 115200 exactly
+btuart power   the rails and pins powering the chip would touch (read only)
 btuart hci     sends HCI_Reset (01 03 0c 00) and prints the answer
 ```
+
+A stage that prints more than the reply buffer holds **corrupts the kernel**.
+`mondrian_bt_step()` appends with `snprintf(out + n, len - n, ...)`, and `n`
+past `len` underflows that size into a huge one: `btuart power`'s seventeen
+lines ran past the handler's buffer, the answer came back truncated with binary
+junk, and the command channel was dead from the next command on — the same
+symptom as the wire stage, from an unrelated cause. Both ends are fixed now
+(the accumulator stops appending and keeps printing to the ring, and the handler
+owns 1152 bytes, one datagram under the interface MTU).
 
 Measured on the kernel of 2026-11-16, with the control channel still answering
 afterwards (`pos` and `thermal` both came back, so the reads do not wedge the

@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..c297862
+index 0000000..53b14ee
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,697 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -240,6 +240,10 @@ index 0000000..c297862
 +	mondrian_log_flush_now();
 +	if (n < 0) {
 +		return 0;
++	}
++	if ((size_t)n >= len) {
++		/* Full: the ring keeps the line, the answer does not. */
++		return (int)len;
 +	}
 +	return n + snprintf(out + n, len - (size_t)n, "%s", line);
 +}
@@ -743,7 +747,7 @@ index 0000000..c297862
 +
 +#endif /* MONDRIAN */
 diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
-index 2c59647..f7ba1d4 100644
+index 2c59647..735e729 100644
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
 @@ -2138,6 +2138,29 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
@@ -762,7 +766,7 @@ index 2c59647..f7ba1d4 100644
 +ud_cmd_btuart(socket_t so, struct sockaddr_in *to, const char *line)
 +{
 +	extern int mondrian_btuart_run(const char *mode, char *out, size_t len);
-+	char out[512];
++	char out[1152];
 +	const char *p = line + 6;
 +	int n;
 +
