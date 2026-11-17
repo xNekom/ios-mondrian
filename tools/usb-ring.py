@@ -188,15 +188,19 @@ def dump(path, timeout, start=None, total=None):
 
 
 def springboard_pid(text):
-    """The SpringBoard PID the kernel's own `SMP t=...` line carries, or None."""
+    """The SpringBoard PID from the kernel's own `SMP t=...` line, or None.
+
+    Only that line: a log line that happens to mention `SpringBoard(27)` sent a
+    `kill 27` to some other process instead (measured 2026-11-18).
+    """
     pid = None
     for line in text.splitlines():
-        at = line.find("SpringBoard(")
-        while at >= 0:
-            end = line.find(")", at)
-            if end > at:
-                pid = line[at + len("SpringBoard("):end]
-            at = line.find("SpringBoard(", at + 1)
+        if "SMP t=" not in line or "SpringBoard(" not in line:
+            continue
+        at = line.rfind("SpringBoard(")
+        end = line.find(")", at)
+        if end > at:
+            pid = line[at + len("SpringBoard("):end]
     return pid
 
 

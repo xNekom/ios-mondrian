@@ -247,6 +247,12 @@ boot each, so the three columns differ only in what changed:
   Two numbers that look like a dead UI and are not: `fps 0` and
   `panel 0/60 sampled ticks changed` were measured while the phone was
   responsive with the library on the glass.
+  The step itself is the fragile part: `mondrian_lock_step` is posted by its own
+  thread through `dispatch_async_f`, and a boot was measured where it ran once
+  (it printed `lock screen gone` and the twenty-second icon tree) and then never
+  again, with **no** `lock step stuck` line and no periodic `MONDRIAN WALL: dump`
+  to show for it -- so the library came up striped with the fix loaded and idle.
+  Count `MONDRIAN WALL: dump` lines before blaming the paint.
 - **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with
