@@ -29,7 +29,12 @@ if [ "${1:-}" != "--no-build" ]; then
 fi
 [ -f shim/out/shim-boot.img ] || { echo "no shim/out/shim-boot.img" >&2; exit 1; }
 
-"$FB" devices 2>/dev/null | grep -q fastboot || {
+OK=0
+for i in $(seq 1 10); do
+	"$FB" devices 2>/dev/null | grep -q fastboot && { OK=1; break; }
+	sleep 2
+done
+[ "$OK" = 1 ] || {
 	echo "the phone is not in fastboot (power + volume down)" >&2
 	exit 1
 }

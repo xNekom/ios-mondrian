@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..3ef451c
+index 0000000..db41766
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,790 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -684,7 +684,7 @@ index 0000000..3ef451c
 + * is the minimum of the node's own qcom,bt-vdd-*-config.
 + */
 +static int
-+mondrian_bt_power_on(char *out, size_t len, int n)
++mondrian_bt_power_on(int vote, char *out, size_t len, int n)
 +{
 +	static const struct {
 +		const char *name;
@@ -702,7 +702,7 @@ index 0000000..3ef451c
 +	vm_offset_t bt_en, xo, sw_ctrl;
 +	uint32_t got;
 +
-+	for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++	for (size_t i = 0; vote && i < sizeof(rails) / sizeof(rails[0]); i++) {
 +		uint32_t addr = mondrian_cmd_db_addr(rails[i].name);
 +
 +		if (addr == 0) {
@@ -715,7 +715,9 @@ index 0000000..3ef451c
 +		    rails[i].name, addr, rails[i].mv);
 +		n = mondrian_bt_step(out, len, n, line);
 +	}
-+	delay(20000);
++	if (vote) {
++		delay(20000);
++	}
 +
 +	bt_en = ml_io_map(MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_RESET), 0x1000);
 +	xo = ml_io_map(MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_XO_CLK), 0x1000);
@@ -775,7 +777,10 @@ index 0000000..3ef451c
 +		return mondrian_bt_power_probe(gcc, out, len, n);
 +	}
 +	if (mode != NULL && strcmp(mode, "on") == 0) {
-+		return mondrian_bt_power_on(out, len, n);
++		return mondrian_bt_power_on(0, out, len, n);
++	}
++	if (mode != NULL && strcmp(mode, "vote") == 0) {
++		return mondrian_bt_power_on(1, out, len, n);
 +	}
 +	if (mode != NULL && strcmp(mode, "baud") == 0) {
 +		uint8_t one = 0x5a;
