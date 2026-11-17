@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..5fe89b8
+index 0000000..ac9e630
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,967 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -725,6 +725,21 @@ index 0000000..5fe89b8
 +	return n;
 +}
 +
++static int
++mondrian_bt_hexval(char c)
++{
++	if (c >= '0' && c <= '9') {
++		return c - '0';
++	}
++	if (c >= 'a' && c <= 'f') {
++		return c - 'a' + 10;
++	}
++	if (c >= 'A' && c <= 'F') {
++		return c - 'A' + 10;
++	}
++	return -1;
++}
++
 +/* One pad as a push-pull output at 8 mA: level first, then the config. */
 +static void
 +mondrian_bt_gpio_out(vm_offset_t page, int level)
@@ -900,6 +915,29 @@ index 0000000..5fe89b8
 +		    "btuart: right after tx rx fifo 0x%x s_irq 0x%x\n", fifo,
 +		    sirq);
 +		return mondrian_bt_step(out, len, n, line);
++	}
++	if (mode != NULL && strncmp(mode, "cmd ", 4) == 0) {
++		const char *hex = mode + 4;
++		uint8_t pkt[1600];
++		uint32_t plen = 0;
++
++		while (hex[0] != 0 && hex[1] != 0 && plen < sizeof(pkt)) {
++			int hi = mondrian_bt_hexval(hex[0]);
++			int lo = mondrian_bt_hexval(hex[1]);
++
++			if (hi < 0 || lo < 0) {
++				break;
++			}
++			pkt[plen++] = (uint8_t)((hi << 4) | lo);
++			hex += 2;
++		}
++		if (plen < 4) {
++			return mondrian_bt_step(out, len, n,
++			    "btuart: cmd needs at least 4 bytes of hex\n");
++		}
++		n = mondrian_bt_send(se, pkt, plen, out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 300, out, len, n);
++		return n;
 +	}
 +	if (mode != NULL && strcmp(mode, "edl115") == 0) {
 +		static const uint8_t ver[5] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };

@@ -359,6 +359,17 @@ it carries nothing): merge with `tools/sparse-merge.py`, then
 `mount -t erofs`. `/vendor/firmware` is only 12 MB of audio and sensor blobs;
 the Bluetooth firmware lives in the separate `bluetooth` partition.
 
+Downloading it needs no TLV parser: btqca streams the **file itself** in 243-byte
+pieces, each as HCI `0xFC00` with `[0x1E, length, data…]`, and the controller
+parses the TLV (verified with `tools/bt-tlv.py`: `hpbtfw21.tlv` declares ROM
+`0x0201`, product `0x0013`, download mode 3). Before the patch a WCN6855-class
+chip wants `0xFC00` with `0x28, 0x01, 0, 0, 0`. That entire exchange lives in
+`tools/bt-download.py`, driven over `btuart cmd <hex>`; the kernel only puts
+bytes on the wire, which is also why the driver never re-programs the SE root
+(a **second** RCG change in one boot takes the command channel down: measured
+with `btuart baud` after another stage and again with `edl115` after
+`hci115`).
+
 ## What iOS expects
 
 Measured strings in the iOS 16.7.16 root:
