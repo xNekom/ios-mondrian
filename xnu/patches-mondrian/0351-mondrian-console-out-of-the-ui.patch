@@ -26,7 +26,25 @@ Three changes, all of them about who owns the panel:
 diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 --- a/osfmk/arm64/mondrian_early.c
 +++ b/osfmk/arm64/mondrian_early.c
-@@ -338,6 +338,40 @@
+@@ -311,7 +311,7 @@
+ 	 * UI has taken the panel sits on top of it until the next frame -- or
+ 	 * forever, in the two rows the console keeps below its text area.
+ 	 */
+-	if (!early_text && !early_panicking) {
++	if (!panel_text_allowed() || (!early_text && !early_panicking)) {
+ 		return;
+ 	}
+ 	/* By position: the console cursor belongs to the log thread. */
+@@ -321,7 +321,7 @@
+ void
+ mondrian_early_status(const char *s)
+ {
+-	if (!early_text && !early_panicking) {
++	if (!panel_text_allowed() || (!early_text && !early_panicking)) {
+ 		return;
+ 	}
+ 	hud_row_text(EARLY_HUD_ROW0, s);
+@@ -338,6 +338,56 @@
  }
  
  /*
@@ -64,9 +82,34 @@ diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
 +}
 +
 +/*
++ * The status rows follow the console off the screen: with the panel taken from
++ * the console (mondrianfb_noconsole=1, the board's default) the scheduler's
++ * "st" row and the framebuffer's "SC"/console rate used to keep painting over a
++ * live UI whenever a panic had set early_panicking, and one of them is a filled
++ * black band across the panel. A panic still paints: its own rows go through
++ * hud_row_text(), not through these.
++ */
++static bool
++panel_text_allowed(void)
++{
++	extern int mondrian_fbcon_quiet;
++
++	return mondrian_fbcon_quiet == 0;
++}
++
++/*
   * A panic row, written by position instead of through the console cursor.
   * The log thread paints the console from another CPU and owns early_row and
   * early_col; a panic that shared them lost its first rows to the painter's
+@@ -523,7 +573,7 @@
+ 	 * the HUD row painting "st <mpidr> s <stage>" over the UI for the whole
+ 	 * boot, the line the user saw advancing.
+ 	 */
+-	if (!early_text && !early_panicking) {
++	if (!panel_text_allowed() || (!early_text && !early_panicking)) {
+ 		return;
+ 	}
+ 	early_forced = 1;
 diff --git a/osfmk/arm64/mondrian_early.h b/osfmk/arm64/mondrian_early.h
 --- a/osfmk/arm64/mondrian_early.h
 +++ b/osfmk/arm64/mondrian_early.h

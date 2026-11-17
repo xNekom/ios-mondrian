@@ -197,10 +197,11 @@ boot each, so the three columns differ only in what changed:
   that painted before the UI existed leaves `early_panicking` set, and from then
   on every line and every status row paints over the UI for the rest of the boot.
   `0351` gives the panel to the compositor at its first swap (the ring is fed
-  before any quiet flag, so nothing is lost) and stops a *recovered* copyin
-  fault from painting six `KABORT` rows; `mondrianfb_noconsole=0` restores the
-  scripted console for a bring-up boot. `mondrianfb_noconsole=1` at boot is the
-  one-argument test of the same thing.
+  before any quiet flag, so nothing is lost), stops a *recovered* copyin
+  fault from painting six `KABORT` rows, and makes the status rows (`st …`,
+  `SC …`, the console rate -- one of them a filled black band) follow the
+  console off the panel; `mondrianfb_noconsole=0` restores all of it for a
+  bring-up boot, and a panic still paints either way.
 - **What the App Library transition costs, from the ring.** Measured 2026-11-17
   while swiping home -> App Library (the whole ring holds exactly two of these,
   both in that window): `readback 1440x3200 bgra invert 0 shared 0 mirror 0:
