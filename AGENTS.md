@@ -102,7 +102,11 @@ Pro, SM8475) is the port being done here.
   line. The same goes for editing a script that is still running: bash reads
   the file as it goes, so a mid-run edit corrupts the next line it parses
   (`line 93: -3: command not found`), and the run then lies about why it
-  failed.
+  failed. **The same trap in its quiet form:** `bash tools/flash-root.sh IMG |
+  tail -6` keeps the last six lines and throws away the `fastboot flash`
+  progress and its failure, so a flash that never started and one that finished
+  look identical -- the next boot then reports the same corruption and the
+  flash gets blamed on the image. Log to a file and read the exit status.
 - **Prove the kernel before trusting any answer.** A RAM boot that dies falls
   back to `boot_b`, so "command not found" means "old kernel" as often as
   "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the
