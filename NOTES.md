@@ -117,7 +117,12 @@ dump` reads the live ring and `screen` captures the panel (`usbipd attach --wsl`
 first; `0298` survives a detach). `prev` prints the *previous* boot's newest
 lines over USB: `0329` copies that area into RAM before this boot's first flush
 and flushes the ring from the panic path, so a panic report reaches the host
-with no photograph. `mondrianstop=N` halts at early mark N (`0174` keeps marks
+with no photograph. The window is the *reader's*: `mondrianprevlines=N` goes on
+the boot that reads, because the dying boot's area is replaced by the next
+boot's first flush, and a chatty writer (the iOS-side net script repeating
+`default route ... err 17` every few hundred ms) pushes the interesting lines
+out of a small window — a wedge followed by a quiet reader needs `N` in the
+thousands. `mondrianstop=N` halts at early mark N (`0174` keeps marks
 above 20 visible once the console is off) and `mondrianreset=N` is a second
 clock: a boot that ends at about 45 s is that thread rebooting to fastboot.
 

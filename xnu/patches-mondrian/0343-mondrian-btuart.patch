@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..4d8a094
+index 0000000..9677a58
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,900 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -576,32 +576,48 @@ index 0000000..4d8a094
 +mondrian_bt_recv(vm_offset_t se, uint8_t *buf, uint32_t cap, uint32_t wait_ms,
 +    char *out, size_t len_out, int n)
 +{
-+	uint32_t status = 0, count = 0;
++	uint32_t status = 0;
 +	char line[192];
-+	int got = 0;
++	uint32_t got = 0, quiet = 0;
 +
++	/*
++	 * One FIFO word holds four bytes (the packing above says so), so the
++	 * drain splits the word instead of taking one byte per read, and it
++	 * keeps going until 40 ms pass with nothing new: a Command Complete is
++	 * two or three bytes behind the first one, and stopping at the first
++	 * byte reported the reset as a lone 0x04.
++	 */
 +	for (uint32_t t = 0; t < wait_ms; t++) {
++		uint32_t count, drained = 0;
++
 +		status = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
 +		count = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
-+		if (count != 0) {
++		while (drained < count) {
++			uint32_t word = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO);
++			uint32_t take = (count - drained) > 4 ? 4 : count - drained;
++
++			for (uint32_t i = 0; i < take; i++) {
++				if (got < cap) {
++					buf[got] = (uint8_t)(word >> (8 * i));
++				}
++				got++;
++			}
++			drained += take;
++		}
++		if (drained != 0) {
++			quiet = 0;
++		} else if (++quiet > 40 && got != 0) {
 +			break;
 +		}
 +		delay(1000);
 +	}
-+	if (count > cap) {
-+		count = cap;
-+	}
-+	for (uint32_t i = 0; i < count; i++) {
-+		buf[i] = (uint8_t)mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO);
-+		got++;
-+	}
-+	snprintf(line, sizeof(line), "btuart: rx fifo status 0x%x, %d bytes\n",
++	snprintf(line, sizeof(line), "btuart: rx fifo status 0x%x, %u bytes\n",
 +	    status, got);
 +	n = mondrian_bt_step(out, len_out, n, line);
 +	{
 +		int m = snprintf(line, sizeof(line), "btuart: rx data:");
 +
-+		for (int i = 0; i < got && m < (int)sizeof(line) - 4; i++) {
++		for (uint32_t i = 0; i < got && m < (int)sizeof(line) - 4; i++) {
 +			m += snprintf(line + m, sizeof(line) - (size_t)m, " %02x",
 +			    buf[i]);
 +		}
@@ -850,6 +866,21 @@ index 0000000..4d8a094
 +		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);
 +		return n;
 +	}
++	if (mode != NULL && strcmp(mode, "tx115") == 0) {
++		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++		char line[160];
++		uint32_t fifo, sirq;
++
++		n = mondrian_bt_rcg_14745600(gcc, out, len, n);
++		n = mondrian_bt_uart_init(se, 8, 14745600u, 0, out, len, n);
++		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
++		fifo = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
++		sirq = mondrian_bt_rd(se, MONDRIAN_BT_S_IRQ_STATUS);
++		snprintf(line, sizeof(line),
++		    "btuart: right after tx rx fifo 0x%x s_irq 0x%x\n", fifo,
++		    sirq);
++		return mondrian_bt_step(out, len, n, line);
++	}
 +	if (mode != NULL && strcmp(mode, "hci115") == 0) {
 +		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
 +
@@ -857,6 +888,18 @@ index 0000000..4d8a094
 +		n = mondrian_bt_uart_init(se, 8, 14745600u, 0, out, len, n);
 +		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 400, out, len, n);
++
++		/*
++		 * HCI_Read_Local_Version_Information: the reset event only says the
++		 * ROM is awake. This command names it, and hci_qca asks the same one
++		 * to decide which firmware applies.
++		 */
++		{
++			static const uint8_t ver[4] = { 0x01, 0x01, 0x10, 0x00 };
++
++			n = mondrian_bt_send(se, ver, sizeof(ver), out, len, n);
++			n = mondrian_bt_recv(se, buf, sizeof(buf), 400, out, len, n);
++		}
 +		return n;
 +	}
 +	if (mode != NULL && strcmp(mode, "hci") == 0) {

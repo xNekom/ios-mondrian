@@ -64,28 +64,32 @@ btuart         identity registers with the clocks voted
 btuart loop    programs 8N1 and sends a byte into its own loopback
 btuart baud    the same, on the 14745600 root: 115200 exactly
 btuart power   the rails and pins powering the chip would touch (read only)
-btuart on      the vote plus BT_EN / XO / SW_CTRL, the vendor's sequence
-btuart hci     sends HCI_Reset (01 03 0c 00) and prints the answer
+btuart on      BT_EN / XO / SW_CTRL in the vendor's order, then the pinmux
+btuart hci115  HCI_Reset and Read Local Version on the 14745600 root
+btuart tx115   the same send with no listen, to split TX from RX
+btuart baud    the UART loopback, for a wire that reaches no chip
 ```
 
 A stage that prints more than the reply buffer holds **corrupts the kernel**.
 `mondrian_bt_step()` appends with `snprintf(out + n, len - n, ...)`, and `n` past
 `len` underflows that size into a huge one: `btuart power`'s seventeen lines ran
 past the handler's buffer, the answer came back truncated with binary junk, and
-the command channel was dead from the next command on — the same symptom as the
-wire stage, from an unrelated cause. Both ends are fixed now (the accumulator
+the command channel was dead from the next command on — the same symptom as a
+real wedge, from an unrelated cause. Both ends are fixed now (the accumulator
 stops appending and keeps printing to the ring, and the handler owns 1152 bytes,
 one datagram under the interface MTU).
 
-One wedge is still open and reproducible: `btuart baud` takes the command channel
-down when it runs **after** another stage in the same boot (twice measured, with
-`pos` answering right up to it and the phone then at 19-38 ms latency, i.e.
-spinning), while two baud stages back to back survive. The suspect is the RCG
-update with the engine already running: `mondrian_bt_rcg_14745600()` writes the
-M/N/D, the new parent and the dual-edge mode in a single `CMD_UPDATE`, where the
-clock framework does `clk_set_parent` and `clk_set_rate` as two updates, and the
-first read of the SE afterwards is what never returns. Gate the engine (or split
-the update the way the framework does) before trusting the stage in a sequence.
+Two things take the command channel down with ICMP still answering, and neither
+is the clock:
+
+- **`btuart power` between `btuart on` and the wire stage.** With the read-only
+  probe in the middle the send killed the channel twice; without it the same
+  stage came back with the chip's first event byte. Run the probe after the wire
+  stage or not at all; `tools/wsl/bt-stage.sh` does.
+- **`mondrian_bt_rcg_14745600()` did not gate the branch.** It now drops SE5's
+  vote for the duration of the M/N/D and parent change and restores it after,
+  which is what the clock framework does around `set_parent()`. Whether that is
+  strictly required is unmeasured, but the stage completes with it.
 
 Measured on the kernel of 2026-11-16, with the control channel still answering
 afterwards (`pos` and `thermal` both came back, so the reads do not wedge the
@@ -123,9 +127,8 @@ btuart: rx fifo status 0x90000001, 1 bytes
 btuart: rx data: 5a
 ```
 
-`btuart hci` prints the same lines with `4 bytes` and `rx data: (nothing)`: the
-`HCI_Reset` leaves the wire and the engine completes, but nothing answers,
-because nothing powers the chip yet.
+With no chip powered, the same sequence prints `4 bytes` out and
+`rx data: (nothing)`: the engine completes and the wire is silent.
 
 Four traps in that sequence, each one a boot when it was wrong, all settled by
 mainline `qcom_geni_serial.c` / `qcom-geni-se.c`:
@@ -172,15 +175,24 @@ btuart: rx data: 5a
 ```
 
 So the engine frames at the rate the RCG was set to. 115200 itself is derived
-from that readback (14745600 / (8 × 16)), not measured against a chip.
+from that readback (14745600 / (8 × 16)).
 
-`btuart hci` — the only stage that drives the physical TX pin (loopback off) —
-must not be run yet. Twice it left the phone answering ICMP with 19-38 ms latency
-(a spinning kernel) and nothing on UDP 5141: mainline enables
-`SE_IRQ_EN`'s four sources because it has a handler for SPI 587, and driving a
-line whose far end is an unpowered chip is what produces the event. Both
-`SE_IRQ_EN` and `M_IRQ_EN` now stay 0 and the completion is polled, but the wire
-test waits until the pins and that interrupt are ours.
+With the chip powered, the same stage answers (measured: `btuart on` then
+`btuart hci115`, no probe in between):
+
+```
+btuart: tx 4 bytes done 1 irq 0x40000001 tx_fifo left 0x0
+btuart: rx fifo status 0x1, 1 bytes
+btuart: rx data: 04
+```
+
+`0x04` is the HCI *Event* packet type: the QCA6490's ROM took `01 03 0c 00` and
+began the Command Complete. So the baud is right, the TX pad reaches the chip
+and the RX pad reaches the engine — the link works end to end. The single byte
+was the old drain (one 32-bit FIFO word read per byte, and it stopped at the
+first); the drain now splits the word into its four bytes and waits 40 ms of
+quiet, and the stage sends `HCI_Read_Local_Version_Information` (`01 01 10 00`)
+after the reset, so one boot reports the ROM's HCI and LMP versions.
 
 A boot used for that test carries **`mondrianreset=120`**. `0127`/`0133`/`0220`
 run a thread that flushes the ring, points the BCB at `boot-fastboot` and resets
