@@ -140,16 +140,49 @@ the M/N/D fields are `~(N - M)` and `~N` as `clk-rcg2.c` writes them. The write
 must be a read-modify-write of `CMD_UPDATE`: a plain write of `0x1` clears
 `ROOT_EN`.
 
-Its loopback byte has not been measured clean yet (TODO): the one run that
-reached the wire returned `00`, and that run inherited an ACTIVE secondary
-command from the stage before it, with `M_IRQ_EN` set on a line (SPI 587) that
-has no handler in this kernel. Both are now avoided — `S_GENI_CMD_ABORT` before
-the engine is re-programmed, and `M_IRQ_EN` left at 0 because `M_IRQ_STATUS`
-latches completion without it.
+Its loopback, measured after the fix that cancels the previous stage's secondary
+command (`btuart baud` twice in a row, and 5a both times):
 
-A dead command channel looks like this: the phone still answers ICMP on
-192.168.7.2 and nothing on UDP 5141, so `tools/usb-ring.py` reports `no answer`
-for every command. Only the hardware buttons reach fastboot from there.
+```
+btuart: uart 8n1 div 8 (root 14745600 -> 115200 baud) loopback 1 status 0x41000
+btuart: tx 1 bytes done 1 irq 0x40000001 tx_fifo left 0x0
+btuart: rx data: 5a
+```
+
+So the engine frames at the rate the RCG was set to. 115200 itself is derived
+from that readback (14745600 / (8 × 16)), not measured against a chip.
+
+`btuart hci` — the only stage that drives the physical TX pin (loopback off) —
+must not be run yet. Twice it left the phone answering ICMP with 19-38 ms latency
+(a spinning kernel) and nothing on UDP 5141: mainline enables
+`SE_IRQ_EN`'s four sources because it has a handler for SPI 587, and driving a
+line whose far end is an unpowered chip is what produces the event. Both
+`SE_IRQ_EN` and `M_IRQ_EN` now stay 0 and the completion is polled, but the wire
+test waits until the pins and that interrupt are ours.
+
+### What powering the chip needs
+
+The eight rails are RPMh resources, not SPMI registers: the live tree's
+`qcom,bt-vdd-*-supply` resolves to `qcom,rpmh-vrm-regulator` nodes under
+`/soc/rsc@17a00000` with `qcom,resource-name` **smpb11** (S11: aon, dig,
+rfa-0p8, rfacmn), **smpb10** (S10: io, 1.8 V), **smpb12** (S12: rfa2),
+**smpc1** (pm8350c S1: rfa1), **ldoe7** (pmr735a L7: asd, 2.8 V) and **smpe3**
+(pmr735a S3: ipa), all with `qcom,set 3` (active and sleep). That is an AOP vote
+with a voltage and a mode, the same door the GPU votes in `0170` use, not
+`mondrian_spmi_reg_write()`.
+
+The three GPIOs are `qcom,bt-reset-gpio` **81**, `qcom,bt-sw-ctrl-gpio` **82** and
+`qcom,xo-clk-gpio` **204** on `/soc/pinctrl@f000000`, which is
+`qcom,cape-pinctrl` (`reg` 0xf000000 + 0x1000000) and uses mainline's tiled
+layout: per-pin offsets come from the SoC's pinctrl table, so a guessed
+`0x1000 * gpio` is wrong here. `bt_en_sleep` in that node is
+`bias-pull-down, drive-strength 2, output-low`, i.e. the tree's own idea of the
+chip being off.
+
+Before writing either, dump what the vendor kernel leaves behind: an OrangeFox
+`fastboot boot` (ten seconds, writes nothing) reports the rails
+(`/sys/class/regulator/*/state`) and the pin state
+(`/sys/kernel/debug/pinctrl/*/pinconf-pins`) of the same hardware.
 
 - The WiFi part is a WCN6855-class device (the QCA6490 is its board-level
   name). Linux firmware: `ath11k/WCN6855/hw2.0/amss.bin`, `m3.bin`,
