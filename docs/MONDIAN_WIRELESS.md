@@ -160,6 +160,16 @@ line whose far end is an unpowered chip is what produces the event. Both
 `SE_IRQ_EN` and `M_IRQ_EN` now stay 0 and the completion is polled, but the wire
 test waits until the pins and that interrupt are ours.
 
+A boot used for that test carries **`mondrianreset=120`**. `0127`/`0133`/`0220`
+run a thread that flushes the ring, points the BCB at `boot-fastboot` and resets
+the SoC, so a wedged kernel returns to fastboot about two minutes later with no
+key presses (`mondrianresetrecovery=1` lands in the recovery instead, where adb
+reads the ring). The board cmdline ships `mondrianreset=0`, which is why both
+wedges above needed the buttons; the test image is the one place to add it.
+Reaching fastboot from a healthy iOS is the ring's `reboot` (`0309`), which
+writes the PMK8350 restart reason over SPMI — a dead command channel takes that
+away too, so the timer is the only unattended way back.
+
 ### What powering the chip needs
 
 The eight rails are RPMh resources, not SPMI registers: the live tree's
