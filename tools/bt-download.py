@@ -18,6 +18,13 @@ it is easy to change:
     which this chip answers with `cresp 0x10`. It is not in the default steps.
   * the TLV file is streamed **raw** in 243-byte pieces, each as 0xFC00 with
     [0x1E, length, data...]; the controller parses the TLV itself.
+  * the NVM is streamed the same way, but **not** untouched: its HCI tag carries
+    the UART rate the controller switches to when it applies the file, and the
+    stock `hpnv21.bin` says `0x11` (`QCA_BAUDRATE_3200000`). Sending it as-is
+    moved the chip to 3.2 Mbaud and every later command went unanswered. btqca
+    rewrites that byte before sending, and so does `patch_nvm()`.
+  * after the NVM, btqca disables SoC logging (0xFC17 with [0x14, 0x00]), runs
+    HCI_Reset and reads the build info; `--steps post` does the same.
 
 The pacing is the part that cost a boot. `qca_tlv_check_data` reads
 `download_mode` out of the patch TLV and the WCN6855 files say 3, which is
@@ -41,6 +48,49 @@ import time
 
 PHONE = ("192.168.7.2", 5141)
 SEG = 243
+
+# struct tlv_type_nvm { u16 tag_id; u16 tag_len; u32 r1; u32 r2; u8 data[]; }
+EDL_TAG_ID_HCI = 0x11
+EDL_TAG_ID_DEEP_SLEEP = 0x1B
+
+# btqca's enum qca_btsoc_baudrate, the byte the HCI tag carries.
+BAUD_CODES = {115200: 0, 57600: 1, 38400: 2, 19200: 3, 9600: 4, 230400: 5,
+              250000: 6, 460800: 7, 500000: 8, 720000: 9, 921600: 10,
+              1000000: 11, 1250000: 12, 2000000: 13, 3000000: 14, 4000000: 15,
+              1600000: 16, 3200000: 17, 3500000: 18}
+
+
+def patch_nvm(blob, baud):
+    """Rewrite the NVM tags the way `qca_tlv_check_data` does before sending.
+
+    The HCI tag carries the UART rate the controller switches to once the NVM is
+    applied, and the stock file says `0x11` = `QCA_BAUDRATE_3200000`. Sending it
+    unmodified moved our chip to 3.2 Mbaud and it answered nothing afterwards
+    (measured: silence at 115200 from the byte after the last segment). btqca
+    sets the in-band sleep bit and overwrites the rate with the one the driver
+    will actually use, so this does the same.
+    """
+    b = bytearray(blob)
+    type_len = int.from_bytes(b[0:4], "little")
+    end = min(4 + (type_len >> 8), len(b))
+    idx = 4
+    notes = []
+    while idx + 12 <= end:
+        tag = int.from_bytes(b[idx:idx + 2], "little")
+        tlen = int.from_bytes(b[idx + 2:idx + 4], "little")
+        data = idx + 12
+        if data + tlen > end:
+            break
+        if tag == EDL_TAG_ID_HCI and tlen >= 3:
+            was = (b[data], b[data + 1])
+            b[data] |= 0x80
+            b[data + 1] = baud
+            notes.append("HCI tag %02x %02x -> %02x %02x"
+                         % (was[0], was[1], b[data], b[data + 1]))
+        elif tag == EDL_TAG_ID_DEEP_SLEEP and tlen >= 1:
+            b[data] |= 0x01
+        idx = data + tlen
+    return bytes(b), notes
 
 
 def simple(cmd, timeout=6.0):
@@ -153,7 +203,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fw")
     ap.add_argument("--nvm")
-    ap.add_argument("--steps", default="on,hci115,edl,fw,nvm")
+    ap.add_argument("--steps", default="on,hci115,edl,fw,nvm,post")
+    ap.add_argument("--nvm-baud", type=int, default=115200,
+                    help="UART rate written into the NVM's HCI tag")
+    ap.add_argument("--nvm-raw", action="store_true",
+                    help="send the NVM file untouched")
     args = ap.parse_args()
     steps = [s.strip() for s in args.steps.split(",") if s.strip()]
 
@@ -200,8 +254,25 @@ def main():
             raise SystemExit("--nvm is needed for the nvm step")
         with open(args.nvm, "rb") as f:
             blob = f.read()
-        print("== nvm: %s, %u bytes" % (args.nvm, len(blob)), flush=True)
+        if args.nvm_raw:
+            print("== nvm: %s, %u bytes (raw)" % (args.nvm, len(blob)),
+                  flush=True)
+        else:
+            blob, notes = patch_nvm(blob, BAUD_CODES[args.nvm_baud])
+            print("== nvm: %s, %u bytes at %u baud"
+                  % (args.nvm, len(blob), args.nvm_baud), flush=True)
+            for note in notes:
+                print("   " + note, flush=True)
         stream("nvm", blob)
+
+    if "post" in steps:
+        print("== QCA_DISABLE_LOGGING (0xFC17 [0x14, 0x00])", flush=True)
+        print(send_cmd(0xFC17, b"\x14\x00") or "no answer", flush=True)
+        print("== HCI_Reset", flush=True)
+        print(send_cmd(0x0C03, b"") or "no answer", flush=True)
+        print("== Read Local Version (a patched controller stops reporting 0x38e6)",
+              flush=True)
+        print(send_cmd(0x1001, b"") or "no answer", flush=True)
 
     print("== pos: %s" % (simple("pos", 5) or "no answer"), flush=True)
     return 0

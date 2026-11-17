@@ -73,7 +73,7 @@ for stage in $STAGES; do
 	if [ "$stage" = "download" ]; then
 		echo "== the host-driven download (EDL, patch, nvm)"
 		timeout 900 python3 tools/bt-download.py \
-			--steps "${DLSTEPS:-edl,fw,nvm}" \
+			--steps "${DLSTEPS:-edl,fw,nvm,post}" \
 			--fw "${FW:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpbtfw21.tlv}" \
 			--nvm "${NVM:-/mnt/c/Users/Pedro/mondrian-firmware/bluetooth/hpnv21.bin}"
 		echo "pos: $(pos)"

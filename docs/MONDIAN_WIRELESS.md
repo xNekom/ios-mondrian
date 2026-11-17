@@ -412,8 +412,24 @@ written with the FIFO full stalls the AHB until the engine drains, so a
 controller that stops draining holds the thread for ever. It polls
 `TX_FIFO_STATUS` now (bits 27:0 count words, and `depth - wc` is the room, as
 `qcom_geni_serial_write_fifo` does) and reports `tx fifo never drained at N of M`.
-Whether the controller stalled on its own or because its RX overflowed with CTS
-masked is what `btuart cts`/`btuart flow` measure.
+Measured on 2026-11-17: with CTS honoured (`btuart flow`), the patch downloads in
+**17 s** and the chip then reports `patch 0x5e81` instead of the ROM's `0x38e6`,
+which is the TLV's own patch version: the firmware is running. With the mask set
+it took 234 s to reach 106920 bytes and then the engine stopped draining. The
+CTS pad reads **0** (asserted, ready) at 115200 and stays there through the
+transfer, so the stall was the vendor's flow control doing its job on a wire we
+were transmitting over regardless.
+
+**The NVM must be rewritten before it is sent, or the chip moves its own UART.**
+The NVM's `EDL_TAG_ID_HCI` tag (0x11) carries the rate the controller switches to
+when it applies the file, and the stock `hpnv21.bin` says `data[1] = 0x11` =
+`QCA_BAUDRATE_3200000`. Sent untouched, the download succeeds and then **every**
+later command goes unanswered at 115200, which reads exactly like a dead chip.
+`qca_tlv_check_data` rewrites that byte (and sets the in-band sleep bit) to the
+rate the driver will actually use, and `patch_nvm()` in `tools/bt-download.py`
+does the same: `15 11` becomes `95 00` for 115200, two bytes and nothing else.
+After the NVM, btqca disables SoC logging (`0xFC17` with `[0x14, 0x00]`), runs
+HCI_Reset and reads the build info; `--steps post` does that.
 
 **The vendor HAL already answered both questions.** Decompiling
 `lib64/hw/android.hardware.bluetooth@1.0-impl-qti.so` (aarch64, stripped, so this
