@@ -171,9 +171,16 @@ boot each, so the three columns differ only in what changed:
   they are correct, so the canvas, the double buffer and the panel are not where
   it starts: the backdrop layer's own content is wrong, and the candidate there
   is the picture path `0 pictures copied out` and the blur that feeds it.
-  `mondriangeom=1` walks the view tree and prints the frame and any
-  non-identity transform of every view, which is how to tell a layer placed
-  wrong from a layer with wrong pixels, on the next boot where it shows.
+  The backdrop layers are also the only ones at the wrong resolution, measured
+  with the walker below: `UIScreen` reports scale 3.000 (native 1440x3200) while
+  `SBHomeScreenBackdropView` and `SBSearchBackdropView` sit at
+  `contentsScale 1.00` with layer bounds 480x1066.7. **That is not the cause**:
+  forcing them, and the nested `CABackdropLayer`'s own `scale`, to 3.00 at run
+  time left the artifact exactly as it was, and the layer classes, frames and
+  transforms are all as expected. Do not spend another boot on the scale.
+  `mondriangeom=1` runs the walker (`mondrian_effect_walk`): every visible
+  window, each effect/backdrop view with frame, bounds, layer bounds,
+  contentsScale, rasterizationScale and whether its transform is identity.
 - **The copy-out path is a cliff, not a slope**: some frames take
   `1 textures refilled from IOSurfaces (18400 KB)` plus 10-13 ms of
   `copying out` for two or three draws. It shows up at boot and on app launch,
