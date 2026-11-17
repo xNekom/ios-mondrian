@@ -1006,6 +1006,141 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/*
+ * A one-shot check of one upload, asked for by a file the host can leave in
+ * /private/var/vm (the check unlinks it once it has answered): for a few rows
+ * of the picture, the texture's row is compared with the surface's own row at
+ * every shift from -64 to +64 pixels, and the shift with the smallest error is
+ * printed next to the error at no shift. No shift at every row means the upload
+ * put the surface's rows where the surface has them; a best shift of n pixels on
+ * row 1 (while row 0 cannot shift) is a row length (or a start offset) that is
+ * n pixels out, which on the glass is a backdrop sheared by n pixels a row
+ * rather than an error.
+ */
+static unsigned
+row_error(const uint8_t *a, const uint8_t *b, unsigned width, int lag)
+{
+	unsigned long sum = 0;
+	unsigned from = lag > 0 ? 0u : (unsigned)(-lag);
+	unsigned to = lag > 0 ? width - (unsigned)lag : width;
+	unsigned count = 0;
+
+	for (unsigned x = from; x < to; x++) {
+		const uint8_t *pa = a + (size_t)x * 4;
+		const uint8_t *pb = b + (size_t)(x + (unsigned)lag) * 4;
+		int la = (pa[0] + pa[1] + pa[2]) / 3;
+		int lb = (pb[0] + pb[1] + pb[2]) / 3;
+
+		sum += (unsigned long)(la > lb ? la - lb : lb - la);
+		count++;
+	}
+	return count != 0 ? (unsigned)(sum / count) : 0;
+}
+
+/* How much a row of the surface changes across: 0 for a flat (empty) one. */
+static unsigned
+row_spread(const uint8_t *rowbytes, unsigned width)
+{
+	unsigned low = 255, high = 0;
+
+	for (unsigned x = 0; x < width; x += 7) {
+		unsigned lum = (rowbytes[x * 4] + rowbytes[x * 4 + 1] + rowbytes[x * 4 + 2]) / 3;
+
+		if (lum < low) {
+			low = lum;
+		}
+		if (lum > high) {
+			high = lum;
+		}
+	}
+	return high - low;
+}
+
+static void
+upload_check(struct eagl *e, struct image *image, size_t row, const uint8_t *base, unsigned pixel, bool planar)
+{
+	static GLuint reader;
+	static unsigned done;
+	GLint read = 0, draw = 0;
+	uint8_t *line, *surface;
+	unsigned height = (unsigned)image->height;
+
+	if (done >= 2 || planar || pixel != 4 || base == NULL || image->width < 1000 || height < 2000 ||
+	    access("/private/var/vm/mondrian-glupload-check", F_OK) != 0) {
+		return;
+	}
+	line = malloc((size_t)image->width * 4);
+	surface = malloc((size_t)image->width * 4);
+	if (line == NULL || surface == NULL) {
+		free(line);
+		free(surface);
+		return;
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (reader == 0) {
+		glGenFramebuffers(1, &reader);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_PACK_ALIGNMENT, 1);
+	{
+		unsigned const at[3] = { 0, 1, height / 2 };
+		unsigned spread = 0;
+
+		for (unsigned i = 0; i < 3; i++) {
+			memcpy(surface, base + row * (size_t)at[i], (size_t)image->width * 4);
+			if (row_spread(surface, (unsigned)image->width) > spread) {
+				spread = row_spread(surface, (unsigned)image->width);
+			}
+		}
+		if (spread < 6) {
+			/* an empty picture says nothing: the next upload is asked instead */
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+			glPixelStorei(GL_PACK_ALIGNMENT, 4);
+			free(line);
+			free(surface);
+			return;
+		}
+		done++;
+		(void)unlink("/private/var/vm/mondrian-glupload-check");
+		say("mondrian-gl: upload check %d: texture %u from surface %u, %d x %d, %zu bytes a row (UNPACK_ROW_LENGTH was %zu),"
+		    " invert %d, format %#x/%#x/%#x\n", done, image->texture, IOSurfaceGetID(image->surface), image->width,
+		    image->height, row, row / pixel, (int)image->invert, image->internal, image->format, image->type);
+		for (unsigned i = 0; i < 3; i++) {
+			int best = 0;
+			unsigned best_error = 0, at_zero;
+
+			glReadPixels(0, (GLint)at[i], image->width, 1, 0x1908, GL_UNSIGNED_BYTE, line);
+			memcpy(surface, base + row * (size_t)at[i], (size_t)image->width * 4);
+			at_zero = row_error(line, surface, (unsigned)image->width, 0);
+			best_error = at_zero;
+			for (int lag = -64; lag <= 64; lag++) {
+				unsigned error;
+
+				if (lag == 0) {
+					continue;
+				}
+				error = row_error(line, surface, (unsigned)image->width, lag);
+				if (error < best_error) {
+					best_error = error;
+					best = lag;
+				}
+			}
+			say("mondrian-gl: upload check %d: row %u (spread %u): best shift %+d, error %u; at no shift %u\n",
+			    done, at[i], row_spread(surface, (unsigned)image->width), best, best_error, at_zero);
+		}
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	free(line);
+	free(surface);
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
@@ -1137,6 +1272,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	}
 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+	upload_check(e, image, row, base, pixel, planar);
 	if (trace_placing) {
 		size_t set[4] = { 0, 0, 0, 0 }, size = row * (size_t)(image->height - 1) + (size_t)image->width * pixel;
 

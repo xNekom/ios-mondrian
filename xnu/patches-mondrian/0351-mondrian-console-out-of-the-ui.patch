@@ -121,7 +121,16 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
 --- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
 +++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
-@@ -1950,22 +1950,28 @@
+@@ -216,6 +216,8 @@
+ extern "C" void mondrian_touch_event_gap_report(void);
+ /* osfmk/arm64/mondrian_early.c: the console's mapping of the panel. */
+ extern "C" uint64_t mondrian_early_fb_va(void);
++/* ... and the console letting go of it when the compositor has the screen. */
++extern "C" void mondrian_early_ui_owns(void);
+ extern "C" int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
+ 
+ /*
+@@ -1950,22 +1952,27 @@
  	fLastPresentTicks = began;
  
  	if (!fConsolePaused) {
@@ -153,7 +162,6 @@ diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/Mondria
 +		(void)PE_parse_boot_argn("mondrianfb_noconsole", &quiet, sizeof(quiet));
 +		if (quiet != 0) {
  			extern int mondrian_fbcon_quiet;
-+			extern void mondrian_early_ui_owns(void);
  
 -			disableConsoleOutput = 1;
  			mondrian_fbcon_quiet = 1;

@@ -87,11 +87,11 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   the kernel rewrites it, so they load the previous build. A hook change reaches
   them one boot later; a build with no guard for launchd takes the boot down to
   two processes.
-- **A panel capture is not a screenshot.** `usb-ring.py screen` reads the
-  buffer the kernel console HUD (`0289`) writes, so rows such as `KABORT` and
-  `P:` appear there even when the current boot logged none. The compositor's
-  frame goes through its own surface (`MONDRIAN FB: layer 0 surface N`), so the
-  capture shows the console, not the glass.
+- **`usb-ring.py screen` reads the panel itself.** Half scale, RGB565, one row
+  per request, straight out of the memory the panel scans out: what the capture
+  shows is what is on the glass, kernel console text included. That is how the
+  console-over-UI text below was measured -- and why a capture can show the
+  console where the glass has the UI: both write the same memory.
 
 ## The frame budget
 
