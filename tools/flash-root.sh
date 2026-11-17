@@ -2,6 +2,7 @@
 # Flash the iOS root into the userdata partition. Nothing else.
 #
 #   tools/flash-root.sh ios16-root.simg
+#   tools/flash-root.sh --yes ios16-root.simg   # no prompt, for a script
 #
 # This is the only destructive step of the project and the only one that
 # changes the phone: it erases the Android user data (the partition, not the
@@ -12,7 +13,16 @@
 # a hard brick. This script refuses to do it.
 set -euo pipefail
 
-image=${1:?usage: flash-root.sh ROOT.simg}
+image=""
+assume_yes=0
+for arg in "$@"; do
+	case "$arg" in
+		--yes|-y) assume_yes=1 ;;
+		-*) echo "error: unknown option $arg" >&2; exit 2 ;;
+		*) image=$arg ;;
+	esac
+done
+[ -n "$image" ] || { echo "usage: flash-root.sh [--yes] ROOT.img|ROOT.simg" >&2; exit 2; }
 
 # The partition the iOS root goes into. Do not change this.
 partition=userdata
@@ -38,8 +48,15 @@ echo "  $image ($(du -h "$image" | cut -f1))"
 echo "This deletes the Android user data. The bootloader, recovery, modem and"
 echo "persist are not touched."
 printf "Type 'yes' to continue: "
-read -r answer
-[ "$answer" = yes ] || { echo "aborted"; exit 1; }
+# `read` fails when there is no terminal (a pipeline, a log redirect) and `set
+# -e` then aborts the script with no message at all, which leaves the flash
+# looking "silent" instead of refused. `--yes` is the way past the prompt in a
+# script; a failed read is a refusal here, not a crash.
+if [ "$assume_yes" != 1 ]; then
+	answer=""
+	read -r answer || answer=""
+	[ "$answer" = yes ] || { echo "aborted"; exit 1; }
+fi
 
 # The bootloader serves 768 MiB per download and fastboot cannot split a raw
 # image (it tries to resparse it, and that wants to read the partition:
