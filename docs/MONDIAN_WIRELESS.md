@@ -272,6 +272,17 @@ things missing were the three lines: `BT_EN` (81) ends as output high
 buffer (204) is back low after the switch. Voting the rails is therefore *not*
 on the path to the first HCI packet; `btuart vote` keeps it for later.
 
+The UART does **not** use those pins. `qup_uart@894000`'s `pinctrl-0` is
+`qupv3_se20_4uart_pins` — 76 cts, 77 rts, **78 tx**, **79 rx** (SE20 is the
+vendor's numbering for the engine at 0x894000) — and its *default* state muxes
+all four as `gpio` (78 with a pull-up, 77/79 pull-down) while its *active* state
+muxes them as `qup20`. The vendor flips to active when it powers the part, and
+this kernel left them parked: the HCI_Reset left the SE and stopped at a pad
+configured as a GPIO, which is exactly the silence that was measured. `qup20` is
+fsel **1** (mainline's per-pin list starts with `gpio`), so the mux is
+`CFG = 1 << 2` with no pull and 2 mA, the tree's own `bias-disable,
+drive-strength 2`.
+
 Voting them is also what took the command channel down once: `btuart vote`
 writes the six voltages and enables through one RPMh TCS each, and those SMPS
 are shared, with 4 bytes of aux data instead of the linear range the GPU rails

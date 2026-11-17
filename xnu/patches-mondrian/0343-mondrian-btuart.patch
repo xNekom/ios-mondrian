@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..b69329b
+index 0000000..239f429
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,811 @@
+@@ -0,0 +1,839 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -132,7 +132,12 @@ index 0000000..b69329b
 +#define MONDRIAN_BT_RPMH_VOLTAGE	0x0
 +#define MONDRIAN_BT_RPMH_ENABLE		0x4
 +
++#define MONDRIAN_BT_GPIO_UART_CTS	76
++#define MONDRIAN_BT_GPIO_UART_RTS	77
++#define MONDRIAN_BT_GPIO_UART_TX		78
++#define MONDRIAN_BT_GPIO_UART_RX		79
 +#define MONDRIAN_BT_GPIO_WAKEUP		79
++#define MONDRIAN_BT_TLMM_FUNC_QUP20	(1u << 2)
 +#define MONDRIAN_BT_GPIO_WL_RESET	80
 +#define MONDRIAN_BT_GPIO_RESET		81
 +#define MONDRIAN_BT_GPIO_SW_CTRL	82
@@ -633,9 +638,10 @@ index 0000000..b69329b
 +		{ "smpe3", 2200, "ipa" },
 +	};
 +	static const uint32_t gpios[] = {
-+		MONDRIAN_BT_GPIO_WAKEUP, MONDRIAN_BT_GPIO_WL_RESET,
-+		MONDRIAN_BT_GPIO_RESET, MONDRIAN_BT_GPIO_SW_CTRL,
-+		MONDRIAN_BT_GPIO_XO_CLK,
++		MONDRIAN_BT_GPIO_UART_CTS, MONDRIAN_BT_GPIO_UART_RTS,
++		MONDRIAN_BT_GPIO_UART_TX, MONDRIAN_BT_GPIO_UART_RX,
++		MONDRIAN_BT_GPIO_WL_RESET, MONDRIAN_BT_GPIO_RESET,
++		MONDRIAN_BT_GPIO_SW_CTRL, MONDRIAN_BT_GPIO_XO_CLK,
 +	};
 +	char line[192];
 +
@@ -753,6 +759,28 @@ index 0000000..b69329b
 +	delay(5000);
 +	mondrian_bt_gpio_out(xo, 0);
 +	delay(50000);
++
++	/*
++	 * The tree's active state: qup20 on the four UART pads. Without it the
++	 * TX byte the SE pushes stops at a pad still configured as a GPIO.
++	 */
++	for (uint32_t i = 0; i < 4; i++) {
++		static const uint32_t uart_pins[] = {
++			MONDRIAN_BT_GPIO_UART_CTS, MONDRIAN_BT_GPIO_UART_RTS,
++			MONDRIAN_BT_GPIO_UART_TX, MONDRIAN_BT_GPIO_UART_RX,
++		};
++		vm_offset_t page = ml_io_map(MONDRIAN_BT_TLMM_PAGE(uart_pins[i]),
++		    0x1000);
++
++		if (page == 0) {
++			continue;
++		}
++		mondrian_bt_wr(page, MONDRIAN_BT_TLMM_CFG,
++		    MONDRIAN_BT_TLMM_FUNC_QUP20);
++		snprintf(line, sizeof(line), "btpower: gpio %u -> qup20 cfg 0x%x\n",
++		    uart_pins[i], mondrian_bt_rd(page, MONDRIAN_BT_TLMM_CFG));
++		n = mondrian_bt_step(out, len, n, line);
++	}
 +
 +	/* SW_CTRL is an input: the part drives it high once it is running. */
 +	mondrian_bt_wr(sw_ctrl, MONDRIAN_BT_TLMM_CFG, 0);
