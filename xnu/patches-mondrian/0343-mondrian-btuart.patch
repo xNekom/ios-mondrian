@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..34663af
+index 0000000..5fe89b8
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,929 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -900,6 +900,15 @@ index 0000000..34663af
 +		    "btuart: right after tx rx fifo 0x%x s_irq 0x%x\n", fifo,
 +		    sirq);
 +		return mondrian_bt_step(out, len, n, line);
++	}
++	if (mode != NULL && strcmp(mode, "edl115") == 0) {
++		static const uint8_t ver[5] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
++
++		n = mondrian_bt_rcg_14745600(gcc, out, len, n);
++		n = mondrian_bt_uart_init(se, 8, 14745600u, 0, out, len, n);
++		n = mondrian_bt_send(se, ver, sizeof(ver), out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 600, out, len, n);
++		return n;
 +	}
 +	if (mode != NULL && strcmp(mode, "hci115") == 0) {
 +		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };

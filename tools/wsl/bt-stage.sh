@@ -64,6 +64,10 @@ echo '== HCI_Reset, then Read Local Version, at 115200'
 timeout 120 python3 tools/usb-ring.py btuart hci115 2>&1 | tail -12
 echo "pos: $(pos)"
 
+echo '== EDL_PATCH_VER_REQ_CMD: the ROM names itself'
+timeout 120 python3 tools/usb-ring.py btuart edl115 2>&1 | tail -8
+echo "pos: $(pos)"
+
 if [ "${BTBAUD:-0}" = 1 ]; then
 	echo '== the UART loopback on its 14745600 root'
 	timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6

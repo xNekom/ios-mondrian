@@ -66,6 +66,7 @@ btuart baud    the same, on the 14745600 root: 115200 exactly
 btuart power   the rails and pins powering the chip would touch (read only)
 btuart on      BT_EN / XO / SW_CTRL in the vendor's order, then the pinmux
 btuart hci115  HCI_Reset and Read Local Version on the 14745600 root
+btuart edl115  the vendor command that names the ROM (0xFC00 / 0x19)
 btuart tx115   the same send with no listen, to split TX from RX
 btuart baud    the UART loopback, for a wire that reaches no chip
 ```
@@ -181,18 +182,21 @@ With the chip powered, the same stage answers (measured: `btuart on` then
 `btuart hci115`, no probe in between):
 
 ```
-btuart: tx 4 bytes done 1 irq 0x40000001 tx_fifo left 0x0
-btuart: rx fifo status 0x1, 1 bytes
-btuart: rx data: 04
+btuart: rx data: 04 0e 04 01 03 0c 00
+btuart: rx data: 04 0e 0c 01 01 10 00 0b 00 00 0b 1d 00 e6 38
 ```
 
-`0x04` is the HCI *Event* packet type: the QCA6490's ROM took `01 03 0c 00` and
-began the Command Complete. So the baud is right, the TX pad reaches the chip
-and the RX pad reaches the engine — the link works end to end. The single byte
-was the old drain (one 32-bit FIFO word read per byte, and it stopped at the
-first); the drain now splits the word into its four bytes and waits 40 ms of
-quiet, and the stage sends `HCI_Read_Local_Version_Information` (`01 01 10 00`)
-after the reset, so one boot reports the ROM's HCI and LMP versions.
+Decoded: the Command Complete of `0x0C03` (`HCI_Reset`) with status 0, then the
+Command Complete of `0x1001` (`Read Local Version`) with status 0, **HCI 0x0B
+(5.2)**, HCI revision 0, **LMP 0x0B (5.2)**, manufacturer **0x001D (Qualcomm)**
+and LMP subversion **0x38E6**. The ROM runs at 115200 with no patch loaded, and
+`btuart edl115` (`0xFC00`/`0x19`, btqca's `EDL_PATCH_VER_REQ_CMD`) is what names
+it next.
+
+Two bugs truncated those events first, both in the drain: it treated
+`SE_GENI_RX_FIFO_STATUS` as a byte count when bits 24:0 count **words** (with
+`RX_LAST` bit 31 and `RX_LAST_BYTE_VALID` 30:28 for a short last word), and it
+stopped at the first byte. The wire never lost a byte.
 
 A boot used for that test carries **`mondrianreset=120`**. `0127`/`0133`/`0220`
 run a thread that flushes the ring, points the BCB at `boot-fastboot` and resets
