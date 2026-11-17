@@ -45,7 +45,7 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..53b14ee
+index 0000000..1e08130
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
 @@ -0,0 +1,697 @@
@@ -127,7 +127,6 @@ index 0000000..53b14ee
 +#define MONDRIAN_BT_TLMM_PAGE(n)	(MONDRIAN_BT_TLMM_BASE + 0x1000UL * (n))
 +#define MONDRIAN_BT_TLMM_CFG		0x0
 +#define MONDRIAN_BT_TLMM_IN_OUT		0x4
-+#define MONDRIAN_BT_TLMM_INTR_CFG	0x8
 +
 +#define MONDRIAN_BT_GPIO_WAKEUP		79
 +#define MONDRIAN_BT_GPIO_WL_RESET	80
@@ -623,6 +622,7 @@ index 0000000..53b14ee
 +	};
 +	char line[192];
 +
++	n = mondrian_bt_step(out, len, n, "btpower: rails\n");
 +	for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
 +		uint32_t aux_len = 0;
 +		const uint16_t *aux =
@@ -645,6 +645,7 @@ index 0000000..53b14ee
 +		}
 +	}
 +
++	n = mondrian_bt_step(out, len, n, "btpower: pins\n");
 +	for (size_t i = 0; i < sizeof(gpios) / sizeof(gpios[0]); i++) {
 +		vm_offset_t page = ml_io_map(MONDRIAN_BT_TLMM_PAGE(gpios[i]), 0x1000);
 +
@@ -653,10 +654,9 @@ index 0000000..53b14ee
 +			    "btpower: gpio %u cannot map\n", gpios[i]);
 +		} else {
 +			snprintf(line, sizeof(line),
-+			    "btpower: gpio %u cfg 0x%x io 0x%x intr 0x%x\n",
++			    "btpower: gpio %u cfg 0x%x io 0x%x\n",
 +			    gpios[i], mondrian_bt_rd(page, MONDRIAN_BT_TLMM_CFG),
-+			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_IN_OUT),
-+			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_INTR_CFG));
++			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_IN_OUT));
 +		}
 +		n = mondrian_bt_step(out, len, n, line);
 +	}

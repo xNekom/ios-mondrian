@@ -200,6 +200,29 @@ layout: per-pin offsets come from the SoC's pinctrl table, so a guessed
 `bias-pull-down, drive-strength 2, output-low`, i.e. the tree's own idea of the
 chip being off.
 
+Measured with `btuart power` (read only), which is what the vote will be written
+against:
+
+```
+btpower: smpb11 addr 0x40000 want 966 mV aux 4 bytes
+btpower: smpb10 addr 0x40700 want 1800 mV aux 4 bytes
+btpower: smpc1 addr 0x40200 want 1900 mV aux 4 bytes
+btpower: smpb12 addr 0x40100 want 1350 mV aux 4 bytes
+btpower: ldoe7 addr 0x41600 want 2800 mV aux 4 bytes
+btpower: smpe3 addr 0x43400 want 2200 mV aux 4 bytes
+btpower: gpio 79 cfg 0x1 io 0x0
+btpower: gpio 80 cfg 0x1 io 0x0
+btpower: gpio 81 cfg 0x1 io 0x0
+btpower: gpio 82 cfg 0x1 io 0x0
+btpower: gpio 204 cfg 0x801 io 0x0
+```
+
+All six resources are in the cmd-db under the names the tree uses, so the vote
+needs no name translation; the aux data is 4 bytes (a single kind value, not the
+linear range the GPU rails carry). The four pins the chip drives read
+`cfg 0x1` — alternate function 1, chosen by the loader, not GPIO — and `io 0x0`.
+Pin 204's page is at `0x0f100000 + 0xcc000` and reads `cfg 0x801`.
+
 Before writing either, dump what the vendor kernel leaves behind: an OrangeFox
 `fastboot boot` (ten seconds, writes nothing) reports the rails
 (`/sys/class/regulator/*/state`) and the pin state
