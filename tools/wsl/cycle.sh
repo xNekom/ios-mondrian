@@ -63,7 +63,7 @@ bash tools/wsl/image.sh || exit 1
 
 # 2. The phone has to be in fastboot before anything is loaded.
 attach() {
-	local b
+	local b i
 
 	# By USB id, not by a fixed port: the phone moves, and a stale bus id
 	# leaves every attach failing while `fastboot devices` keeps answering.
@@ -72,7 +72,12 @@ attach() {
 	[ -n "${BUSID:-}" ] && b=$BUSID
 	[ -n "$b" ] || return 1
 	usbipd.exe attach --wsl --busid "$b" > /dev/null 2>&1
-	sleep 5
+	# usbipd returns before cdc_ether binds and the netdev appears: a fixed
+	# sleep raced it and the ring looked dead on a phone that was up.
+	for i in $(seq 1 15); do
+		[ -e "/sys/class/net/$IFACE" ] && break
+		sleep 1
+	done
 	ip link set "$IFACE" up 2>/dev/null
 	ip addr add 192.168.7.1/24 dev "$IFACE" 2>/dev/null
 }

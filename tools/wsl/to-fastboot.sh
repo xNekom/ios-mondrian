@@ -28,12 +28,17 @@ busid() {
 }
 
 try_attach() {
-	local b
+	local b i
 
 	b=$(busid)
 	[ -n "$b" ] || return 1
 	usbipd.exe attach --wsl --busid "$b" > /dev/null 2>&1
-	sleep 3
+	# usbipd returns before cdc_ether binds and the netdev appears, so wait
+	# for the interface instead of a fixed sleep.
+	for i in $(seq 1 15); do
+		[ -e "/sys/class/net/$IFACE" ] && break
+		sleep 1
+	done
 }
 
 "$FB" devices 2>/dev/null | grep -q fastboot && { echo "already in fastboot"; exit 0; }
