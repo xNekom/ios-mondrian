@@ -69,15 +69,15 @@ echo '== read the pins back (SW_CTRL is the part saying it is up)'
 timeout 60 python3 tools/usb-ring.py btuart power 2>&1 | tail -14
 echo "pos: $(pos)"
 
-if [ "${BTBAUD:-0}" = 1 ]; then
-	echo '== the UART on its 14745600 root'
-	timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6
+if [ "${BTHCI:-1}" = 1 ]; then
+	echo '== HCI_Reset at 115200 (root 14745600, gated while it moves)'
+	timeout 120 python3 tools/usb-ring.py btuart hci115 2>&1 | tail -9
 	echo "pos: $(pos)"
 fi
 
-if [ "${BTHCI:-0}" = 1 ]; then
-	echo '== HCI_Reset on the wire'
-	timeout 120 python3 tools/usb-ring.py btuart hci 2>&1 | tail -8
+if [ "${BTBAUD:-0}" = 1 ]; then
+	echo '== the UART loopback on its 14745600 root'
+	timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6
 	echo "pos: $(pos)"
 fi
 

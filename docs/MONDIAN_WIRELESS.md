@@ -252,6 +252,32 @@ The pin encoding is the touch driver's, which already drives this controller:
 `(function << 2) | pull | (drive << 6) | (output << 9)`, level written to
 `IN_OUT` before `CFG` so enabling the output does not drive a stale value.
 
+`btuart on` does that with **no rail vote at all**, and the part came up
+(measured):
+
+```
+btpower: bt_en low, 50 ms
+btpower: bt_en high, xo on
+btpower: sw_ctrl 1 (the part says it is up)
+btpower: gpio 79 cfg 0x1 io 0x1
+btpower: gpio 80 cfg 0x1 io 0x0
+btpower: gpio 81 cfg 0x2c0 io 0x3
+btpower: gpio 82 cfg 0x0 io 0x1
+btpower: gpio 204 cfg 0xac0 io 0x0
+```
+
+So the loader's supply is enough for the chip to run its ROM, and the only
+things missing were the three lines: `BT_EN` (81) ends as output high
+(`cfg 0x2c0`, `io 0x3`), `SW_CTRL` (82) is an input reading **1**, and the XO
+buffer (204) is back low after the switch. Voting the rails is therefore *not*
+on the path to the first HCI packet; `btuart vote` keeps it for later.
+
+Voting them is also what took the command channel down once: `btuart vote`
+writes the six voltages and enables through one RPMh TCS each, and those SMPS
+are shared, with 4 bytes of aux data instead of the linear range the GPU rails
+carry. That path is opt-in and unproven until there is evidence the loader
+leaves them off.
+
 Before writing either, dump what the vendor kernel leaves behind: an OrangeFox
 `fastboot boot` (ten seconds, writes nothing) reports the rails
 (`/sys/class/regulator/*/state`) and the pin state

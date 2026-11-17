@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..db41766
+index 0000000..b69329b
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,790 @@
+@@ -0,0 +1,811 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -312,8 +312,17 @@ index 0000000..db41766
 +static int
 +mondrian_bt_rcg_14745600(vm_offset_t gcc, char *out, size_t len, int n)
 +{
-+	uint32_t cfg, cmd;
++	uint32_t cfg, cmd, vote;
 +	char line[192];
++
++	/*
++	 * The branch is enabled at this point and the engine is live; dropping
++	 * SE5's vote gates it for the duration of the parent and divider change,
++	 * which is what the clock framework does around set_parent().
++	 */
++	vote = mondrian_bt_rd(gcc, MONDRIAN_BT_VOTE_REG);
++	mondrian_bt_wr(gcc, MONDRIAN_BT_VOTE_REG, vote & ~MONDRIAN_BT_SE5);
++	delay(1000);
 +
 +	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_M_RCGR, MONDRIAN_BT_RCG_M);
 +	mondrian_bt_wr(gcc, MONDRIAN_BT_SE5_N_RCGR,
@@ -339,6 +348,9 @@ index 0000000..db41766
 +		}
 +		delay(10);
 +	}
++
++	mondrian_bt_wr(gcc, MONDRIAN_BT_VOTE_REG, vote);
++	delay(1000);
 +
 +	snprintf(line, sizeof(line),
 +	    "btuart: rcg cmd 0x%x cfg 0x%x m 0x%x n 0x%x d 0x%x -> %u Hz\n",
@@ -790,6 +802,15 @@ index 0000000..db41766
 +		n = mondrian_bt_send(se, &one, 1, out, len, n);
 +		n = mondrian_bt_recv(se, buf, sizeof(buf), 20, out, len, n);
 +		mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_LOOPBACK, 0);
++		return n;
++	}
++	if (mode != NULL && strcmp(mode, "hci115") == 0) {
++		static const uint8_t reset[4] = { 0x01, 0x03, 0x0c, 0x00 };
++
++		n = mondrian_bt_rcg_14745600(gcc, out, len, n);
++		n = mondrian_bt_uart_init(se, 8, 14745600u, 0, out, len, n);
++		n = mondrian_bt_send(se, reset, sizeof(reset), out, len, n);
++		n = mondrian_bt_recv(se, buf, sizeof(buf), 400, out, len, n);
 +		return n;
 +	}
 +	if (mode != NULL && strcmp(mode, "hci") == 0) {
