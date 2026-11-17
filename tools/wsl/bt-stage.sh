@@ -1,8 +1,8 @@
 #!/bin/bash
-# The Bluetooth UART and power stages, on the phone, in one boot.
+# The Bluetooth stages, on the phone, in one boot.
 #
-#   tools/wsl/bt-stage.sh              # probe twice, baud twice
-#   BTHCI=1 tools/wsl/bt-stage.sh      # also run the wire stage (see the warning)
+#   tools/wsl/bt-stage.sh              # power the part, then the baud stage
+#   BTHCI=1 tools/wsl/bt-stage.sh      # also send HCI_Reset (see the warning)
 #
 # The image carries `mondrianreset=240`: `0127`/`0133`/`0220` flush the ring,
 # point the BCB at `boot-fastboot` and reset the SoC, so a kernel that wedges
@@ -10,14 +10,16 @@
 # `mondrianreset=0`, so the substitution below is the whole reason this script
 # exists.
 #
-# Every stage is repeated on purpose: the probes that died did so at the command
-# *after* them, and a single run cannot tell "this stage wedged" from "the last
-# one left something behind". `pos` between stages is the cheap tripwire.
+# Stages, in the order that isolates them:
+#   btuart power   read-only: cmd-db addresses and the five pins
+#   btuart on      the vote plus BT_EN / XO / SW_CTRL, the vendor's sequence
+#   btuart baud    the UART on its 14745600 root, proved by loopback
+#   btuart hci     HCI_Reset on the wire, only with BTHCI=1
 #
-# `BTHCI=1` is off by default: `btuart hci` drives the physical TX pin into an
-# unpowered chip and, in two boots, left the command channel dead (ICMP fine,
-# UDP 5141 silent). docs/MONDIAN_WIRELESS.md has the reasoning; it stays behind
-# a flag until the pinmux and the SE interrupt are ours.
+# `btuart baud` has wedged the command channel when it followed a `btuart
+# power` in the same boot, twice, while two bauds back to back survive; a single
+# run cannot tell which of the two is responsible, so `pos` after every stage is
+# the tripwire and the split is deliberate.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 IF=${IFACE:-enx02005e77ee01}
@@ -57,32 +59,24 @@ done
 timeout 250 python3 tools/usb-ring.py dump "$OUT" > /dev/null 2>&1
 echo "got:  $(grep -a -o -m1 'Darwin Kernel Version[^;]*' "$OUT")"
 
-echo '== power probe, first run (read only)'
+echo '== what powering the chip touches (read only)'
 timeout 60 python3 tools/usb-ring.py btuart power 2>&1 | tail -14
 echo "pos: $(pos)"
 
-echo '== power probe, second run: does the probe itself wedge?'
-timeout 60 python3 tools/usb-ring.py btuart power 2>&1 | tail -14
+echo '== power the part: rails, then BT_EN / XO / SW_CTRL'
+timeout 90 python3 tools/usb-ring.py btuart on 2>&1 | tail -12
 echo "pos: $(pos)"
 
-echo '== exact 115200 (root 14745600, divider 8)'
+echo '== the UART on its 14745600 root'
 timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6
-echo "pos: $(pos)"
-
-echo '== the same again'
-timeout 90 python3 tools/usb-ring.py btuart baud 2>&1 | tail -6
-echo "pos: $(pos)"
-
-echo '== loopback at the XO rate (120000), the reference'
-timeout 90 python3 tools/usb-ring.py btuart loop 2>&1 | tail -5
 echo "pos: $(pos)"
 
 if [ "${BTHCI:-0}" = 1 ]; then
 	echo '== HCI_Reset on the wire (see the warning in this script)'
-	timeout 120 python3 tools/usb-ring.py btuart hci 2>&1 | tail -6
+	timeout 120 python3 tools/usb-ring.py btuart hci 2>&1 | tail -8
 	echo "pos: $(pos)"
 fi
 
 timeout 250 python3 tools/usb-ring.py dump "$OUT" > /dev/null 2>&1
 echo '== the same lines, on the ring'
-grep -a 'btuart:' "$OUT" | tail -24
+grep -a -e 'btpower:' -e 'btuart:' "$OUT" | tail -26

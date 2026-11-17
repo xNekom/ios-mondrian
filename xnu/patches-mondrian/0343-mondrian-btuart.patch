@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..1e08130
+index 0000000..3ef451c
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,785 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -127,6 +127,10 @@ index 0000000..1e08130
 +#define MONDRIAN_BT_TLMM_PAGE(n)	(MONDRIAN_BT_TLMM_BASE + 0x1000UL * (n))
 +#define MONDRIAN_BT_TLMM_CFG		0x0
 +#define MONDRIAN_BT_TLMM_IN_OUT		0x4
++#define MONDRIAN_BT_TLMM_OUTPUT		(1u << 9)
++#define MONDRIAN_BT_TLMM_DRIVE_8MA	3
++#define MONDRIAN_BT_RPMH_VOLTAGE	0x0
++#define MONDRIAN_BT_RPMH_ENABLE		0x4
 +
 +#define MONDRIAN_BT_GPIO_WAKEUP		79
 +#define MONDRIAN_BT_GPIO_WL_RESET	80
@@ -136,6 +140,7 @@ index 0000000..1e08130
 +
 +extern uint32_t mondrian_cmd_db_addr(const char *id);
 +extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
++extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
 +#define MONDRIAN_BT_RCG_ROOT_OFF	(1u << 31)
 +#define MONDRIAN_BT_RCG_ROOT_EN		(1u << 1)
 +#define MONDRIAN_BT_RCG_UPDATE		(1u << 0)
@@ -664,6 +669,86 @@ index 0000000..1e08130
 +	return n;
 +}
 +
++/* One pad as a push-pull output at 8 mA: level first, then the config. */
++static void
++mondrian_bt_gpio_out(vm_offset_t page, int level)
++{
++	mondrian_bt_wr(page, MONDRIAN_BT_TLMM_IN_OUT, level ? 2 : 0);
++	mondrian_bt_wr(page, MONDRIAN_BT_TLMM_CFG,
++	    (MONDRIAN_BT_TLMM_DRIVE_8MA << 6) | MONDRIAN_BT_TLMM_OUTPUT);
++}
++
++/*
++ * The rails and the two lines that bring the QCA6490 out of reset. Addresses
++ * are the cmd-db's (measured with `btpower`), and the voltage each rail wants
++ * is the minimum of the node's own qcom,bt-vdd-*-config.
++ */
++static int
++mondrian_bt_power_on(char *out, size_t len, int n)
++{
++	static const struct {
++		const char *name;
++		uint32_t addr;
++		uint32_t mv;
++	} rails[] = {
++		{ "smpb11", 0x40000, 966 },
++		{ "smpb10", 0x40700, 1800 },
++		{ "smpc1", 0x40200, 1900 },
++		{ "smpb12", 0x40100, 1350 },
++		{ "ldoe7", 0x41600, 2800 },
++		{ "smpe3", 0x43400, 2200 },
++	};
++	char line[160];
++	vm_offset_t bt_en, xo, sw_ctrl;
++	uint32_t got;
++
++	for (size_t i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		uint32_t addr = mondrian_cmd_db_addr(rails[i].name);
++
++		if (addr == 0) {
++			addr = rails[i].addr;
++		}
++		(void)mondrian_rpmh_write_one(addr + MONDRIAN_BT_RPMH_VOLTAGE,
++		    rails[i].mv);
++		(void)mondrian_rpmh_write_one(addr + MONDRIAN_BT_RPMH_ENABLE, 1);
++		snprintf(line, sizeof(line), "btpower: %s 0x%x <- %u mV on\n",
++		    rails[i].name, addr, rails[i].mv);
++		n = mondrian_bt_step(out, len, n, line);
++	}
++	delay(20000);
++
++	bt_en = ml_io_map(MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_RESET), 0x1000);
++	xo = ml_io_map(MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_XO_CLK), 0x1000);
++	sw_ctrl = ml_io_map(MONDRIAN_BT_TLMM_PAGE(MONDRIAN_BT_GPIO_SW_CTRL),
++	    0x1000);
++	if (bt_en == 0 || xo == 0 || sw_ctrl == 0) {
++		return mondrian_bt_step(out, len, n,
++		    "btpower: cannot map the pins\n");
++	}
++
++	/* BT_EN low, the part off and the rails settling. */
++	mondrian_bt_gpio_out(bt_en, 0);
++	n = mondrian_bt_step(out, len, n, "btpower: bt_en low, 50 ms\n");
++	delay(50000);
++
++	/* XO first: the part latches its clock before it comes out of reset. */
++	mondrian_bt_gpio_out(xo, 1);
++	delay(200);
++	mondrian_bt_gpio_out(bt_en, 1);
++	n = mondrian_bt_step(out, len, n, "btpower: bt_en high, xo on\n");
++	delay(5000);
++	mondrian_bt_gpio_out(xo, 0);
++	delay(50000);
++
++	/* SW_CTRL is an input: the part drives it high once it is running. */
++	mondrian_bt_wr(sw_ctrl, MONDRIAN_BT_TLMM_CFG, 0);
++	got = mondrian_bt_rd(sw_ctrl, MONDRIAN_BT_TLMM_IN_OUT) & 1u;
++	snprintf(line, sizeof(line),
++	    "btpower: sw_ctrl %u %s\n", got,
++	    got ? "(the part says it is up)" : "(still low)");
++	return mondrian_bt_step(out, len, n, line);
++}
++
 +int
 +mondrian_btuart_run(const char *mode, char *out, size_t len)
 +{
@@ -688,6 +773,9 @@ index 0000000..1e08130
 +	}
 +	if (mode != NULL && strcmp(mode, "power") == 0) {
 +		return mondrian_bt_power_probe(gcc, out, len, n);
++	}
++	if (mode != NULL && strcmp(mode, "on") == 0) {
++		return mondrian_bt_power_on(out, len, n);
 +	}
 +	if (mode != NULL && strcmp(mode, "baud") == 0) {
 +		uint8_t one = 0x5a;

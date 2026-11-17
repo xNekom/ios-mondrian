@@ -64,17 +64,28 @@ btuart         identity registers with the clocks voted
 btuart loop    programs 8N1 and sends a byte into its own loopback
 btuart baud    the same, on the 14745600 root: 115200 exactly
 btuart power   the rails and pins powering the chip would touch (read only)
+btuart on      the vote plus BT_EN / XO / SW_CTRL, the vendor's sequence
 btuart hci     sends HCI_Reset (01 03 0c 00) and prints the answer
 ```
 
 A stage that prints more than the reply buffer holds **corrupts the kernel**.
-`mondrian_bt_step()` appends with `snprintf(out + n, len - n, ...)`, and `n`
-past `len` underflows that size into a huge one: `btuart power`'s seventeen
-lines ran past the handler's buffer, the answer came back truncated with binary
-junk, and the command channel was dead from the next command on — the same
-symptom as the wire stage, from an unrelated cause. Both ends are fixed now
-(the accumulator stops appending and keeps printing to the ring, and the handler
-owns 1152 bytes, one datagram under the interface MTU).
+`mondrian_bt_step()` appends with `snprintf(out + n, len - n, ...)`, and `n` past
+`len` underflows that size into a huge one: `btuart power`'s seventeen lines ran
+past the handler's buffer, the answer came back truncated with binary junk, and
+the command channel was dead from the next command on — the same symptom as the
+wire stage, from an unrelated cause. Both ends are fixed now (the accumulator
+stops appending and keeps printing to the ring, and the handler owns 1152 bytes,
+one datagram under the interface MTU).
+
+One wedge is still open and reproducible: `btuart baud` takes the command channel
+down when it runs **after** another stage in the same boot (twice measured, with
+`pos` answering right up to it and the phone then at 19-38 ms latency, i.e.
+spinning), while two baud stages back to back survive. The suspect is the RCG
+update with the engine already running: `mondrian_bt_rcg_14745600()` writes the
+M/N/D, the new parent and the dual-edge mode in a single `CMD_UPDATE`, where the
+clock framework does `clk_set_parent` and `clk_set_rate` as two updates, and the
+first read of the SE afterwards is what never returns. Gate the engine (or split
+the update the way the framework does) before trusting the stage in a sequence.
 
 Measured on the kernel of 2026-11-16, with the control channel still answering
 afterwards (`pos` and `thermal` both came back, so the reads do not wedge the
@@ -222,6 +233,24 @@ needs no name translation; the aux data is 4 bytes (a single kind value, not the
 linear range the GPU rails carry). The four pins the chip drives read
 `cfg 0x1` — alternate function 1, chosen by the loader, not GPIO — and `io 0x0`.
 Pin 204's page is at `0x0f100000 + 0xcc000` and reads `cfg 0x801`.
+
+The sequence is the vendor driver's (`drivers/bluetooth/btpower.c`,
+`bluetooth_power(on = 1)`), and its names matter more than its register writes:
+
+- **GPIO 81 is `BT_EN`**, an active-high *enable*, not a reset pulse: drive it
+  low first, sleep 50 ms, and the part is off while the rails settle.
+- **GPIO 204 is the XO clock buffer**: raise it 100-200 µs *before* `BT_EN`, and
+  drop it again a few ms after, because the part latches its clock at reset
+  release.
+- **GPIO 82 is `SW_CTRL`, an input**: after 50 ms the part drives it high to say
+  it is running, so it is the first thing to read once `BT_EN` is high. A low
+  level means the part did not come up (the vendor then asserts a debug GPIO).
+- The rails come first, then the pins; the tree's own `bt_en_sleep` state
+  (`output-low`) is `BT_EN` low, i.e. the chip off.
+
+The pin encoding is the touch driver's, which already drives this controller:
+`(function << 2) | pull | (drive << 6) | (output << 9)`, level written to
+`IN_OUT` before `CFG` so enabling the output does not drive a stale value.
 
 Before writing either, dump what the vendor kernel leaves behind: an OrangeFox
 `fastboot boot` (ten seconds, writes nothing) reports the rails
