@@ -123,9 +123,12 @@ boot each, so the three columns differ only in what changed:
 - **The GPU was at its idle OPP** (index 2, 285 MHz) for the whole session
   because the HFI vote is sent once at GMU start and kgsl on Android re-sends
   it per submission. `gpuperf 13` at run time gives the top OPP and, by
-  itself, 3.2x less GPU time per submission and +15 % frames. Index 13 in the
-  boot vote does not come back to fastboot; the run-time vote does
-  (`docs/MONDIAN_GPU.md`).
+  itself, 3.2x less GPU time per submission and +15 % frames; `0349` sends
+  that vote from the first submission of the session, so nothing has to be
+  asked for after a boot (`MONDRIAN GPU: active vote 13 (900 MHz) acked`).
+  With the vote automatic and no ring command, the same swipe gives 55-58 fps.
+  Index 13 in the *boot* vote does not come back to fastboot; the run-time vote
+  does (`docs/MONDIAN_GPU.md`).
 - **The scheduler treated all seven cores as equal**: `NO_ECORE`,
   `MAX_CPU_CLUSTERS 1` and `cluster-type` 0 in every ADT CPU node left
   `__ARM_AMP__` undefined, one `PSET_SMP`, and 68 % of frames finishing on an

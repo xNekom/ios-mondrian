@@ -1136,22 +1136,30 @@ them has Metal. That is the path this port follows.
   below the text area and outside the console -- ignored the flag and had to be
   gated on the same switch. The ring keeps every line, and
   `mondrianfb_noconsole=0` in the extra args brings the screen console back.
-- **The GMU is voted once, at the idle OPP, and that is what the frame rate
-  was hitting.** The boot prints `MONDRIAN GPU: hfi power gpu 2 bus 2,
+- **The GPU used to sit at its idle OPP for the whole session, and the session
+  now votes on its own.** The boot prints `MONDRIAN GPU: hfi power gpu 2 bus 2,
   285 MHz`: the HFI power vote carries perf index 2, which this port's table
   maps to 285 MHz and which kgsl uses while no client asks for anything. kgsl
-  sends a fresh DCVS vote per submission, so on Android the GPU runs at the OPP
-  the load needs; here the vote sent when the GMU starts stands for the whole
-  session. `gpuperf` (ring command, `0346`) reads the index and `gpuperf N`
-  re-sends the vote at run time -- after the CP is running, which is where
-  kgsl's does; voting index 13 at boot does not come back to fastboot.
-  Measured 2026-11-17 with the same eight page swipes in one boot: 285 MHz
-  gives 41-47 fps and 7.1 ms of GPU time per submission, 900 MHz gives 48-52
-  fps and 2.24 ms (the 3.2x the clock implies), and the copy to the panel
-  drops from 4.2 to 3.5 ms. `gpustat` prints the accounting behind that
-  (`gpuacct`: submissions, dwords, fence waits and their time, doorbell to
-  fence summed against the wall clock), which is how "the GPU is 14% busy"
-  and "the frame is still 19 ms" can be said in the same breath.
+  then sends a fresh DCVS vote per submission, so on Android the GPU runs at
+  the OPP the load needs; here the vote sent when the GMU starts stood for the
+  whole session. Measured 2026-11-17 with the same eight page swipes in one
+  boot: 285 MHz gives 41-47 fps and 7.1 ms of GPU time per submission, index 13
+  (900 MHz) gives 48-52 fps and 2.24 ms -- the 3.2x the clock implies -- and
+  the copy to the panel drops from 4.2 to 3.5 ms.
+  `0349` sends that vote from the first submission of the session (the state
+  kgsl votes in: CP running, a client asking for work) and the boot logs
+  `MONDRIAN GPU: active vote 13 (900 MHz) acked`. `gpuactive=N` picks the index
+  (`0` keeps the boot vote for an A/B) and `gpuperf N` (`0346`) moves it at run
+  time. Index 13 in the *boot* vote is the trap: that message carries the power
+  table the GMU builds itself, and the boot then does not come back to fastboot.
+  Measured after `0349`, with no ring command at all, the same swipe produces
+  55-58 fps with 599 of 600 frames ending on a P core.
+  The cost is that there is no down-vote: the GPU stays at 900 MHz while the
+  UI idles. A quiet-period timer is the missing half.
+  `gpustat` prints the accounting behind the clock (`gpuacct`: submissions,
+  dwords, fence waits and their time, doorbell to fence summed against the wall
+  clock), which is how "the GPU is 14% busy" and "the frame is still 19 ms" can
+  be said in the same breath.
 - **The wallpaper is a killed poster, and its renderer cannot work here.**
   CollectionsPoster makes the poster surface (`MONDRIAN SURF: CollectionsPoster
   create id 11 1326x1326 fmt 0x4c303038`) and dies before it draws one frame --

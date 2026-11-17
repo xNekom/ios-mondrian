@@ -1,0 +1,82 @@
+xnu 0349: the GPU leaves its idle OPP by itself
+
+The boot-time HFI vote carries perf index 2 (285 MHz) and stands for the whole
+session, where kgsl on Android re-sends a DCVS vote per submission. `gpuperf`
+(0346) proved that the same vote sent at run time with index 13 gives 900 MHz,
+41-47 -> 48-52 fps and 7.1 -> 2.24 ms of GPU time per submission, but it has to
+be issued after every boot.
+
+The first submission of the session now sends that vote itself, from the same
+state the ring command was measured in (the CP is running, a client is asking
+for work). `gpuactive=N` picks the index (13 is the top OPP, 0 keeps the
+boot-time vote for an A/B) and `gpuperf` still moves it at run time.
+
+The GPU then stays at 900 MHz for the rest of the session: there is no DCVS
+down-vote when the UI goes idle, which is power spent doing nothing. A
+down-vote needs a quiet-period timer and is not in this patch.
+--- p349/bsd/dev/mondrian_gpu.c	2026-11-17 15:49:47.763028500 +0100
++++ p349new/bsd/dev/mondrian_gpu.c	2026-11-17 15:51:41.811796800 +0100
+@@ -1129,6 +1129,20 @@
+  */
+ static uint32_t mondrian_gpu_perf = 2;
+ 
++/*
++ * The perf index the run-time vote uses, and whether it was sent yet. kgsl
++ * sends a DCVS vote per submission, so on Android the GPU leaves the idle OPP
++ * the moment a client asks for something; here the boot-time vote stands for
++ * the whole session unless it is re-sent, and `gpuactive=0` keeps it (285 MHz)
++ * for an A/B. Index 13 (900 MHz) in the *boot* vote does not come back to
++ * fastboot -- that message carries the power table the GMU builds itself --
++ * but the same index in a vote sent once the CP is running does, which is what
++ * the ring's `gpuperf 13` measured: 44 -> 51 fps and 7.1 -> 2.24 ms of GPU
++ * time per submission.
++ */
++static uint32_t mondrian_uc_active_perf = 13;
++static int mondrian_uc_voted;
++
+ static const struct mondrian_power_level mondrian_power_levels[13] = {
+ 	{ 0x35a4e900u, 0x1a0u, 0x1a0u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
+ 	{ 0x33611380u, 0x180u, 0x180u, 0xbu, 0xbu, 0xbu, 0x882b5ffdu },
+@@ -4881,6 +4895,31 @@
+ 		return -1;
+ 	}
+ 	ring = (uint32_t *)mondrian_cp_ring.va;
++	/*
++	 * The session's first submission moves the vote, from the idle OPP to
++	 * the top of the table. Done here and not at CP start because this is
++	 * the state in which the ring command was measured.
++	 */
++	if (!mondrian_uc_voted) {
++		mondrian_uc_voted = 1;
++		if (mondrian_uc_active_perf != 0 && mondrian_uc_gmu != 0) {
++			uint32_t was = mondrian_gpu_perf;
++			int acked;
++
++			mondrian_gpu_perf = mondrian_uc_active_perf > 13 ? 13 :
++			    mondrian_uc_active_perf;
++			acked = mondrian_gpu_hfi_vote(mondrian_uc_gmu, 1);
++			if (acked != 1) {
++				mondrian_gpu_perf = was;
++			}
++			printf("MONDRIAN GPU: active vote %u (%u MHz) %s\n",
++			    mondrian_gpu_perf, mondrian_gpu_perf != 0 ?
++			    mondrian_power_levels[13 - mondrian_gpu_perf].hz /
++			    1000000u : 0, acked == 1 ? "acked" : (acked == 0 ?
++			    "no answer" : "refused"));
++			mondrian_log_flush_now();
++		}
++	}
+ 	/* Everything from here reads GPU registers, the diagnostics too. */
+ 	seq = mondrian_uc_fence + 1;
+ 	/*
+@@ -5887,6 +5926,10 @@
+ 		if (PE_parse_boot_argn("gpuperf", &perf, sizeof(perf))) {
+ 			mondrian_gpu_perf = (uint32_t)(perf < 0 ? 0 : (perf > 13 ? 13 : perf));
+ 		}
++		if (PE_parse_boot_argn("gpuactive", &perf, sizeof(perf))) {
++			mondrian_uc_active_perf =
++			    (uint32_t)(perf < 0 ? 0 : (perf > 13 ? 13 : perf));
++		}
+ 	}
+ 	(void)PE_parse_boot_argn("gpublind", &mondrian_cp_blind,
+ 	    sizeof(mondrian_cp_blind));
