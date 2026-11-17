@@ -1,0 +1,163 @@
+xnu 0351: the console stops painting the panel when the UI takes it
+
+Measured 2026-11-17 on a boot whose UI was live: the screen showed kernel log
+text over the App Library, and the ring counted 3.4 million characters painted
+on the panel in one session -- about six lines a second. The bootstrap console
+paints the log tail by default even after the compositor owns the panel, and a
+scroll moves the frame buffer's own pixels up half a screen and fills the rows it
+frees with black; with the compositor only repainting what changed, that is a
+blurred backdrop that comes out sheared and blocky and turns black after a few
+seconds.
+
+Three changes, all of them about who owns the panel:
+
+- The framebuffer quiets the text console at its first swap unless
+  mondrianfb_noconsole=0 asks for it. The ring is unaffected (it is fed before
+  any quiet flag) and a panic still paints.
+- A panic that painted before the UI existed leaves early_panicking set, and
+  from then on every log line and status row paints over the UI for the rest of
+  the boot: mondrian_early_ui_owns() forgets that state at the first swap, and a
+  new panic sets it again.
+- A kernel fault under copyin/copyout is recovered and happens on any boot;
+  it painted six register rows at the top of the panel each time. Only the
+  fault that is about to panic paints now, and it turns the console on for
+  itself (mondrian_early_panic_begin()).
+
+diff --git a/osfmk/arm64/mondrian_early.c b/osfmk/arm64/mondrian_early.c
+--- a/osfmk/arm64/mondrian_early.c
++++ b/osfmk/arm64/mondrian_early.c
+@@ -338,6 +338,40 @@
+ }
+ 
+ /*
++ * The UI has taken the panel (MondrianFramebuffer.cpp, its first swap): the
++ * console keeps the ring but paints no more pixels. A panic that painted
++ * before that point and left early_panicking set -- one the machine survived --
++ * would otherwise put every later log line and every status row over the UI for
++ * the rest of the boot, and a console scroll moves the frame buffer's own
++ * pixels up half a screen and blacks the rows it frees. A new panic sets the
++ * flags again.
++ */
++void
++mondrian_early_ui_owns(void)
++{
++	early_panicking = 0;
++	early_forced = 0;
++	early_text = 0;
++	early_started = 0;
++	early_row = 0;
++	early_col = 0;
++}
++
++/*
++ * A kernel fault that is about to panic: its registers are worth the screen,
++ * and at that point nothing has painted it yet (a recovered fault does not come
++ * here, see sleh.c), so the console is turned on for it.
++ */
++void
++mondrian_early_panic_begin(void)
++{
++	early_panicking = 1;
++	early_forced = 1;
++	early_row = 0;
++	early_col = 0;
++}
++
++/*
+  * A panic row, written by position instead of through the console cursor.
+  * The log thread paints the console from another CPU and owns early_row and
+  * early_col; a panic that shared them lost its first rows to the painter's
+diff --git a/osfmk/arm64/mondrian_early.h b/osfmk/arm64/mondrian_early.h
+--- a/osfmk/arm64/mondrian_early.h
++++ b/osfmk/arm64/mondrian_early.h
+@@ -21,6 +21,8 @@
+ extern uint64_t mondrian_early_fb_backup;
+ void mondrian_early_beacon(uint64_t pc, uint64_t count);
+ void mondrian_early_text(int on);
++void mondrian_early_ui_owns(void);
++void mondrian_early_panic_begin(void);
+ #else
+ static inline void mondrian_early_mark(unsigned int stage, const char *label)
+ {
+@@ -29,6 +31,8 @@
+ }
+ static inline void mondrian_early_disable(void) {}
+ static inline void mondrian_early_text(int on) { (void)on; }
++static inline void mondrian_early_ui_owns(void) {}
++static inline void mondrian_early_panic_begin(void) {}
+ static inline uint64_t mondrian_early_fb_va(void) { return 0; }
+ static inline void mondrian_early_set_fb_va(uint64_t va) { (void)va; }
+ static inline void mondrian_early_beacon(uint64_t pc, uint64_t count)
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1523,15 +1523,22 @@
+ 	thread_t thread = current_thread();
+ 	bool recover = find_copyio_recovery_entry(state) != 0;
+ #if defined(MONDRIAN)
+-	{
++	/*
++	 * A fault under copyin/copyout is recovered below and happens on any boot
++	 * (a page of the caller's buffer not resident yet): painting its six
++	 * register rows put text on top of a live UI, several times a second,
++	 * and said nothing that the ring did not. Only a fault that is about to
++	 * panic is worth the screen -- and then the console is turned on for it,
++	 * because a boot that has not panicked yet has not painted anything.
++	 */
++	if (!recover) {
+ 		extern void mondrian_early_reg(const char *name, uint64_t value);
+-		extern void mondrian_early_cursor_top(void);
++		extern void mondrian_early_panic_begin(void);
+ 		extern void mondrian_early_status(const char *s);
+ 		extern const char *mondrian_panic_format;
+ 		uint64_t k_cpsr = get_saved_state_cpsr(state);
+ 
+-		/* The panic print left the console on the HUD row. */
+-		mondrian_early_cursor_top();
++		mondrian_early_panic_begin();
+ 
+ 		mondrian_early_reg("KABORT esr", esr);
+ 		mondrian_early_reg("KABORT far", fault_addr);
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -1950,22 +1950,28 @@
+ 	fLastPresentTicks = began;
+ 
+ 	if (!fConsolePaused) {
+-		int quiet = 0;
++		int quiet = 1;
+ 
+ 		fConsolePaused = true;
+-		if (PE_parse_boot_argn("mondrianfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+-			/*
+-			 * Stop the screen console without unmapping it:
+-			 * PE_initialize_console(kPEDisableScreen) tears the panel
+-			 * alias out of the pmap and this board panics in
+-			 * pmap_remove_pv. _cnputs() drops everything once this is
+-			 * set, and the persistent ring still records it.
+-			 */
+-			extern int disableConsoleOutput;
++		/*
++		 * The panel is the compositor's from its first frame, so the
++		 * console stops painting text over it here. Left on (the old
++		 * default) every log line was painted on the panel -- measured
++		 * 2026-11-17: 3.4 million characters in a session, about six
++		 * lines a second -- and a console scroll moves the frame
++		 * buffer's own pixels up half a screen and blacks the rows it
++		 * frees, which is a sheared, blocky backdrop that turns black
++		 * after a few seconds. mondrianfb_noconsole=0 keeps the old
++		 * behaviour for a bring-up boot; the ring loses nothing either
++		 * way, and a panic still paints (mondrian_early_panicking).
++		 */
++		(void)PE_parse_boot_argn("mondrianfb_noconsole", &quiet, sizeof(quiet));
++		if (quiet != 0) {
+ 			extern int mondrian_fbcon_quiet;
++			extern void mondrian_early_ui_owns(void);
+ 
+-			disableConsoleOutput = 1;
+ 			mondrian_fbcon_quiet = 1;
++			mondrian_early_ui_owns();
+ 		}
+ 	}
+ 
