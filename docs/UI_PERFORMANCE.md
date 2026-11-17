@@ -79,8 +79,8 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   the same boot has *zero* `flush_submit_list` errors, the fence gate never
   fires, and `fps` ramps to 60 with the home screen on the glass. The loop is a
   bring-up diagnostic (it proves ordering across two ring laps); it must not run
-  in an image that is meant to be used, and `tools/boards.py` carries the
-  argument.
+  in an image that is meant to be used, so `0344` leaves it off unless
+  `cpstress=1` is passed.
 - **`/private/var/vm` keeps the previous boot's hook.** `kern_exec` injects the
   copy in `/private/var/vm` when it exists, and launchd and xpcproxy exec before
   the kernel rewrites it, so they load the previous build. A hook change reaches

@@ -331,21 +331,24 @@ MONDRIAN = Board(
     cmdline=('debug=0xc serial=0 cpus=8 cpufreq=2 usb=2 keepsyms=1 -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
-             'wdt=-1 mondrianfb_noconsole=1 mondrianfb_hz=60 mondrianfb_fps=1 '
+             'wdt=-1 mondrianfb_noconsole=1 mondrianfb_fps=1 '
              # The driver's fallback blank: seconds without a present and
              # without a touch, then it paints black and a touch wakes it. The
              # default of 1 turned the panel off the first second the compositor
              # quieted; 30 is the idle timeout this boot is testing.
              'mondrianfb_blank=30 '
-             # The hook only in SpringBoard (0x4) renders: lock screen, home
-             # screen, Control Center, apps. Any bit that puts it in launchd,
-             # backboardd or runningboardd leaves the glass black, measured
-             # 2026-11-16 (docs/MONDIAN_GPU.md). `mondriankeepawake=0` takes
-             # both idle-timer holds off for a boot; the idle timer still never
-             # fires, so the holds are the default (docs/MONDIAN_PORT.md).
-             # `mondrianautolock=N` writes the root's auto-lock preference
-             # (measured missing: SBLockScreenAutoLockTime; the hook prints it).
-             'mondrian_ui_hook=4 mondriankeepawake=0 '
+             # The hook in SpringBoard (0x4) renders: lock screen, home screen,
+             # Control Center, apps; the whole hook in backboardd or
+             # runningboardd leaves the glass black, measured 2026-11-16
+             # (docs/MONDIAN_GPU.md). Bit 2 is backboardd, and `mondrian_gpu_hook=1`
+             # gives it the injector instead of the hook, so CoreAnimation's
+             # GLES renderer can be used there (xnu/patches-mondrian/0344).
+             # `mondriankeepawake=0` takes both idle-timer holds off for a boot;
+             # the idle timer still never fires, so the holds are the default
+             # (docs/MONDIAN_PORT.md). `mondrianautolock=N` writes the root's
+             # auto-lock preference (measured missing: SBLockScreenAutoLockTime;
+             # the hook prints it).
+             'mondrian_ui_hook=6 mondrian_gpu_hook=1 mondriankeepawake=0 '
              'mondriansample=logd,backboardd,SpringBoard '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push

@@ -218,8 +218,6 @@ sends `0x29` -- a wake cannot wait for a frame. The fallback timer
 (`mondriankeepawake=0`); iOS's timer never arms -- `SBLockScreenAutoLockTime` was
 missing and the hook writes it, and `SBLockScreenManager` has no
 `_idleTimerPolicyAggregator`. `0305` sets the brightness, `0304` the battery.
-The GPU's pixels never reach memory, so the UI is rasterized on the CPU in
-`backboardd` and a GL flush costs 10-12 ms on some frames (`docs/MONDIAN_GPU.md`);
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
 
 ### 4. The touch
@@ -270,7 +268,8 @@ ones:
 | `cpus=8` | every core the tree has, which is seven: the X2, the three A710s and three of the A510s. The A510 at Aff1 0 runs the shim and is parked, left out of the device tree (PSCI `CPU_OFF` does not take it down on this TZ). `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
-| `mondrianfb_noconsole=1` `mondrianfb_hz=60` | stop drawing kernel text over the GUI (panics are still drawn); the vsync rate the display presents at, on a panel whose own rate is 120 Hz |
+| `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn); the frame tick is a compile-time 60 Hz (`MONDRIAN_FB_REFRESH_HZ`), not a boot argument |
+| `mondrian_gpu_hook=1` | bit 2 of `mondrian_ui_hook` hands `backboardd` `/private/var/vm/mondrian-inject.dylib` instead of the hook, the only configuration in which CoreAnimation can pick its GLES renderer (`0344`); without the blob backboardd is left alone |
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen and re-requests it every minute |
 | `mondriankeepawake=0` | the hook stops holding `UIApplication`'s idle timer down (it does that every two seconds on purpose: the first time iOS blanked the display by itself the frames never came back). One boot with it off is how the idle path gets watched |

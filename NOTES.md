@@ -65,8 +65,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas (480x1066
   pt at scale 3); `docs/UI_PERFORMANCE.md` has the frame meter, `0282` the
-  two-record tick. `mondrian_ui_hook=0x4` brings up the lock screen, the home
-  screen, the Control Center and `exec Preferences` on a tap.
+  two-record tick. `mondrian_ui_hook=6 mondrian_gpu_hook=1` brings up the lock
+  screen, the home screen, the Control Center and `exec Preferences` on a tap.
 
 Current blockers, in order:
 

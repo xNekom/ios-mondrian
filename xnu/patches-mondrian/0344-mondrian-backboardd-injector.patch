@@ -1,0 +1,144 @@
+xnu 0344: the window server can carry the injector, and the CP stress is opt-in
+
+CoreAnimation composes in `backboardd` and picks its renderer once per process:
+Metal, else OpenGL ES, else software. This port publishes no Metal device, so
+the GLES renderer is the only accelerated one, and the only library that turns
+it over to Mesa is the injector; the hook in the same process is what takes the
+window server off the CPU. Measured 2026-11-17 with `mondrian_ui_hook=4`: the
+compositor runs `mode copy`, every `MONDRIAN MEM` sample reads `gpu 0MiB/0`, and
+no process in the display path loads the injector.
+
+`mondrian_gpu_hook=1` gives the bit 2 target
+`/private/var/vm/mondrian-inject.dylib` -- the copy `glblob=1` writes -- instead
+of the hook. When that blob is not there `backboardd` gets nothing, rather than
+falling back to the hook. Bit 2 without the argument is unchanged.
+
+The CP bring-up stress (2 000 submissions) is now off unless `cpstress=1`: it is
+a diagnostic, and on a boot whose ring has anything wrong one submission costs
+its 2 s timeout, while on a healthy boot it only fills the ring the submission
+path is read from.
+
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+index a704116..5a6fd70 100644
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -156,13 +156,14 @@ static int mondrian_cp_scache = 1;
+  */
+ static int mondrian_cp_trap_watch;
+ /*
+- * The 2000-submission stress in the CP bring-up: a diagnostic, on by default
+- * because it is what proves the ring, the fence slots and the order. cpstress=0
+- * skips it, for a boot where the point is to get past the bring-up: with
+- * anything wrong in the ring one submission costs its 2 s room timeout, and
+- * 2000 of those keep userland from ever starting.
++ * The 2000-submission stress in the CP bring-up: a diagnostic, off by default.
++ * It proves the ring, the fence slots and the order, but it runs on every boot
++ * and with anything wrong in the ring one submission costs its 2 s room
++ * timeout, which keeps userland from ever starting; the ring it leaves also
++ * hid Mesa's submissions in the trace (docs/UI_PERFORMANCE.md). cpstress=1
++ * turns it back on for a bring-up boot.
+  */
+-static int mondrian_cp_stress = 1;
++static int mondrian_cp_stress;
+ /*
+  * Measured: with the door thread on, the 71-dword stream never fences and the
+  * UI freezes at 0 fps; written inline, it completes in 14 ms. Keep the thread
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 85bfb6f..90ca14b 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5644,15 +5644,17 @@ bad:
+  */
+ #define MONDRIAN_HOOK_XPCPROXY          0x40
+ 
++/*
++ * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
++ * them there once the root turns writable, so before that, or with glblob=0,
++ * the path handed to a process would name a file dyld cannot open.
++ */
+ static bool
+-mondrian_ui_hook_in_vm(void)
++mondrian_dylib_in_vm(const char *path)
+ {
+ 	vnode_t vp = NULLVP;
+-	int error;
+ 
+-	error = vnode_lookup("/private/var/vm/mondrian-ui-hook.dylib", 0, &vp,
+-	    vfs_context_kernel());
+-	if (error != 0) {
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
+ 		return false;
+ 	}
+ 	vnode_put(vp);
+@@ -5680,15 +5682,20 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	 * read-only. The UI hook in /usr/libexec only dlopens the injector as a
+ 	 * library, and the injector arms itself for a named set of processes.
+ 	 */
+-	const char poster[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-inject.dylib";
++	const char injector[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-inject.dylib";
++	const char injector_path[] = "/private/var/vm/mondrian-inject.dylib";
+ 
+-	/* A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster extensions. */
++	/*
++	 * A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster
++	 * extensions, 16 runningboardd, 32 launchd, 64 xpcproxy. Bit 2 follows
++	 * mondrian_gpu_hook above: the injector when it is set, the hook otherwise.
++	 */
+ 	if (!PE_parse_boot_argn("mondrian_ui_hook", &targets, sizeof(targets)) ||
+ 	    targets <= 0 || imgp->ip_ndp == NULL) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
+-	if (name == NULL || sizeof(library) > size || sizeof(poster) > size) {
++	if (name == NULL || sizeof(library) > size || sizeof(injector) > size) {
+ 		return false;
+ 	}
+ 	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
+@@ -5715,6 +5722,31 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	if (wanted == 0 || (targets & wanted) == 0) {
+ 		return false;
+ 	}
++	/*
++	 * mondrian_gpu_hook=1 gives backboardd the injector itself instead of the
++	 * hook. The window server is where CoreAnimation composes and where it
++	 * picks its renderer (Metal, else OpenGL ES, else software), so backboardd
++	 * is the only process in which the injector turns the renderer over to
++	 * Mesa; the hook is what takes the window server off the CPU instead
++	 * (docs/MONDIAN_GPU.md). The blob is the boot's own copy in
++	 * /private/var/vm, and when it is not there yet backboardd is left alone
++	 * rather than handed the hook.
++	 */
++	if (wanted == MONDRIAN_HOOK_BACKBOARDD) {
++		int gpu_hook = 0;
++
++		if (PE_parse_boot_argn("mondrian_gpu_hook", &gpu_hook,
++		    sizeof(gpu_hook)) && gpu_hook != 0) {
++			if (!mondrian_dylib_in_vm(injector_path)) {
++				printf("MONDRIAN HOOK: backboardd stays clean, "
++				    "no injector in /private/var/vm\n");
++				return false;
++			}
++			printf("MONDRIAN HOOK: backboardd gets the injector\n");
++			strlcpy(env, injector, size);
++			return true;
++		}
++	}
+ 	if (wanted == MONDRIAN_HOOK_POSTER) {
+ 		static unsigned told;
+ 
+@@ -5722,12 +5754,13 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 			printf("MONDRIAN HOOK: poster target \"%.*s\" (mask 0x%x)\n",
+ 			    (int)imgp->ip_ndp->ni_cnd.cn_namelen, name, targets);
+ 		}
+-		strlcpy(env, poster, size);
++		strlcpy(env, injector, size);
+ 		return true;
+ 	}
+ 	{
+ 		static unsigned vm_told;
+-		bool in_vm = mondrian_ui_hook_in_vm();
++		bool in_vm = mondrian_dylib_in_vm(
++		    "/private/var/vm/mondrian-ui-hook.dylib");
+ 
+ 		if (vm_told++ < 4) {
+ 			printf("MONDRIAN HOOK: %.*s uses the %s copy\n",

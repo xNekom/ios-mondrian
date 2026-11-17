@@ -1333,9 +1333,16 @@ in the ring (`brightness level hooked`, `display link rates hooked`,
 `MONDRIAN TZ: localtime .../US/Pacific -> .../Europe/Madrid`). The bits that
 were measured before that fix -- `0x1` leaving 0 layers and SpringBoard 2
 threads, `0x4` parking the panel on the Apple logo -- were the stale dylib, not
-the bits. `0x4` is the configuration in `tools/boards.py`; the remaining bits
-(backboardd, runningboardd, launchd, poster, xpcproxy) are still unmeasured
-with the fixed hook.
+the bits. `tools/boards.py` carries `0x6` with `mondrian_gpu_hook=1` (`0344`):
+bit 2 hands `backboardd` `/private/var/vm/mondrian-inject.dylib` instead of the
+hook, which is the only way the window server can pick the GLES renderer
+described above; when that blob has not been written yet, backboardd is left
+alone rather than handed the hook. Unmeasured as of 2026-11-17, and so are the
+remaining bits (runningboardd, launchd, poster, xpcproxy) with the fixed hook.
+Measured 2026-11-17 with `0x4`: the compositor stays in `mode copy`, every
+`MONDRIAN MEM` sample reads `gpu 0MiB/0`, and the injector the hook loads in
+SpringBoard is the stale `/usr/libexec` copy, which returns at once because its
+constructor arms for `backboardd` alone.
 
 ### The hook that was measured was not the hook in the tree
 
