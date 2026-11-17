@@ -486,7 +486,20 @@ Measured strings in the iOS 16.7.16 root:
   looks for an `AppleBluetoothModule` service. The kernel only has to provide
   an HCI transport and the firmware loader; no Bluetooth protocol code is
   needed in the kernel. The transport and the vendor checks live in
-  `bluetoothd`, and this root is ours to patch.
+  `bluetoothd`, and this root is ours to patch. Measured on 16.7.16: the primary
+  path is an IOKit service — it opens `AppleBTHci`/`AppleBTMgmt` through
+  `AppleBluetoothModuleUserClient`/`AppleBTHciUC`/`AppleBTMgmtUC` and reads a
+  `ControllerChipset` property — which Apple ships inside the kernelcache, not
+  in this root and not in stock XNU. The fallback is a character device: at
+  `0x100026af8` it opens `/dev/cu.bluetooth` and, when that fails, at
+  `0x100026b10` `/dev/uart.bluetooth`, both before logging "No valid serial port
+  found (tried cu.bluetooth and uart.bluetooth)". `/usr/sbin/BlueTool` (9.7 MB)
+  is the firmware loader the stack drives.
+
+The root image is **HFSX** (`HX` signature), so `tools`' usual reader does not
+open it: `hpmount` only accepts a native `H+` volume. 7-Zip reads it
+(`7z l ios-root.raw`, paths under `iOSRoot/`), which is enough to inventory and
+extract single binaries without booting the helper VM.
 
 ## What other ports teach
 
