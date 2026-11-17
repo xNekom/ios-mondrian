@@ -156,14 +156,24 @@ boot each, so the three columns differ only in what changed:
   GPU had retired the frame in most of them -- and the swap rate is 59-61 with
   `late max` 4.0-4.4 ms. It is off by default: what it buys is ordering, not
   frames.
-- **Corruption in the image is inside CoreAnimation's canvas, not the path to
-  the glass.** A frame with huge diagonal stair edges, black holes and icons
-  from an earlier frame (`2026-11-17`, landscape, App Library) is drawn into the
-  canvas with the layer geometry the driver logs intact, so the copy, the
-  double buffer and the panel are not where it starts: it is a texture, and the
-  texture path is the one `docs/COREANIMATION_GLES.md` records as failing
-  (`glTexImage2D: 0x505`). Measure that path in a boot where the UI is on the
-  home screen before touching the framebuffer again.
+- **Corruption in the image is one layer's content, not the path to the glass.**
+  Measured 2026-11-17 on the App Library, finger held still on the glass: the
+  blurred backdrop is drawn sheared -- a sawtooth of black blocks and a blue
+  gradient cut on a diagonal -- while the status-bar clock, the cards
+  (`Suggestions`, `Utilities`) and the dock icons in the same frame are crisp.
+  The ring at that moment reads `fps 0`, `touch 355/s`, `0 textures refilled
+  from IOSurfaces`, `0 pictures copied out` and no GL error, and the frames
+  before it carry the usual 629-676 calls and 109 draws. The corruption
+  survives new frames (the clock advances 1:06 -> 1:07 with the backdrop still
+  sheared) and it survives the finger being held, so it is redrawn, not
+  retained.
+  A pitch or stride error in the copy would shear the clock and the dock too and
+  they are correct, so the canvas, the double buffer and the panel are not where
+  it starts: the backdrop layer's own content is wrong, and the candidate there
+  is the picture path `0 pictures copied out` and the blur that feeds it.
+  `mondriangeom=1` walks the view tree and prints the frame and any
+  non-identity transform of every view, which is how to tell a layer placed
+  wrong from a layer with wrong pixels, on the next boot where it shows.
 - **The copy-out path is a cliff, not a slope**: some frames take
   `1 textures refilled from IOSurfaces (18400 KB)` plus 10-13 ms of
   `copying out` for two or three draws. It shows up at boot and on app launch,
