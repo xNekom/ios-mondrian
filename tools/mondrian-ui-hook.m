@@ -5457,10 +5457,50 @@ mondrian_wall_snapshot(void)
 }
 
 /*
- * CoreGraphics will not draw a 32-bit bitmap labelled as grey, and CoreAnimation hands
- * it to the GPU as grey: one byte of every four reaches the screen. The bytes are a
- * picture; the label is wrong. This copies them into an image that says so.
+ * A colour picture under a grey label.
+ *
+ * Measured 2026-11-17: the App Library's background arrives as a CGImage of four
+ * bytes a pixel whose colour space says "monochrome", and those bytes are a colour
+ * picture (`f47c5b`, `68a4d9` -- the wallpaper and the icons). CoreGraphics draws
+ * them anyway; CoreAnimation's GLES renderer believes the label and hands a grey
+ * image to the GPU one byte a pixel, so one byte of every four reaches the screen
+ * and the result is the 4-px striping behind the library.
+ *
+ * The fix is the label, not the picture: the same bytes under an RGB colour space,
+ * keeping the alpha and byte order the source declared. The guard matters -- a
+ * truly grey 32-bit bitmap has equal channels, and relabelling that would invent
+ * colour -- so the data is sampled before anything is rebuilt.
  */
+static int
+mondrian_picture_has_colour(CGDataProviderRef provider, size_t width, size_t height,
+    size_t bytesPerRow)
+{
+	CFDataRef data = provider != NULL ? CGDataProviderCopyData(provider) : NULL;
+	const uint8_t *bytes;
+	CFIndex length;
+	int colour = 0;
+
+	if (data == NULL) {
+		return 0;
+	}
+	bytes = CFDataGetBytePtr(data);
+	length = CFDataGetLength(data);
+	if (bytes != NULL) {
+		for (unsigned i = 0; i < 96 && !colour; i++) {
+			size_t x = (width * (size_t)((i * 37) % 96)) / 96;
+			size_t y = (height * (size_t)((i * 53) % 96)) / 96;
+			size_t at = y * bytesPerRow + x * 4;
+
+			if ((CFIndex)(at + 4) <= length &&
+			    (bytes[at] != bytes[at + 1] || bytes[at + 1] != bytes[at + 2])) {
+				colour = 1;
+			}
+		}
+	}
+	CFRelease(data);
+	return colour;
+}
+
 static CGImageRef
 mondrian_wall_relabel(CGImageRef image)
 {
@@ -5471,19 +5511,26 @@ mondrian_wall_relabel(CGImageRef image)
 	CGImageRef made;
 
 	if (image == NULL || CGImageGetBitsPerPixel(image) != 32 ||
+	    CGImageGetBitsPerComponent(image) != 8 ||
+	    CGColorSpaceGetModel(CGImageGetColorSpace(image)) != kCGColorSpaceModelMonochrome ||
 	    CGImageGetBytesPerRow(image) < CGImageGetWidth(image) * 4) {
 		return NULL;
 	}
 	source = CGImageGetDataProvider(image);
-	data = source != NULL ? CGDataProviderCopyData(source) : NULL;
+	if (!mondrian_picture_has_colour(source, CGImageGetWidth(image), CGImageGetHeight(image),
+	    CGImageGetBytesPerRow(image))) {
+		return NULL;
+	}
+	data = CGDataProviderCopyData(source);
 	if (data == NULL) {
 		return NULL;
 	}
 	provider = CGDataProviderCreateWithCFData(data);
 	rgb = CGColorSpaceCreateDeviceRGB();
+	/* The source's own alpha and byte order: only the colour model is wrong. */
 	made = provider != NULL ? CGImageCreate(CGImageGetWidth(image), CGImageGetHeight(image), 8, 32,
-	    CGImageGetBytesPerRow(image), rgb, kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipLast,
-	    provider, NULL, false, kCGRenderingIntentDefault) : NULL;
+	    CGImageGetBytesPerRow(image), rgb, CGImageGetBitmapInfo(image), provider, NULL, false,
+	    kCGRenderingIntentDefault) : NULL;
 	if (rgb != NULL) {
 		CGColorSpaceRelease(rgb);
 	}
@@ -5507,6 +5554,28 @@ mondrian_file_on(const char *path)
 		return 0;
 	}
 	(void)read(fd, &first, 1);
+	(void)close(fd);
+	return !(first == '0' || first == 'n');
+}
+
+/*
+ * These two fixes are on unless a file says otherwise: the wallpaper and the library's
+ * background were never drawn on this port, and without them the UI looks broken. A
+ * file holding `0` turns one off for an A/B, which needs no build and no boot.
+ */
+static int
+mondrian_fix_on(const char *path)
+{
+	char first = 0;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0) {
+		return 1;
+	}
+	if (read(fd, &first, 1) != 1) {
+		(void)close(fd);
+		return 1;
+	}
 	(void)close(fd);
 	return !(first == '0' || first == 'n');
 }
@@ -6192,6 +6261,604 @@ mondrian_live_paint(void)
 	}
 }
 
+/*
+ * The wallpaper picture, read as data and as CoreGraphics sees it.
+ *
+ * The measurement that decides the shape of the fix: if the bytes under a grey
+ * label are a colour picture, the label is the bug and the fix is to give the
+ * same bytes a label that says what they are. If they are a placeholder, no
+ * label helps and the picture has to come from somewhere else.
+ *
+ * Runs twice on its own (the lock screen after a respring shows the same
+ * replica), so the A/B costs a respring and not a visit to the library.
+ */
+static void
+mondrian_picture_report(id view, unsigned depth, unsigned *printed)
+{
+	id layer, kids, contents;
+	unsigned n, i;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 10 || *printed >= 12) {
+		return;
+	}
+	layer = mondrian_send(view, "layer");
+	contents = layer != nil ? mondrian_send(layer, "contents") : nil;
+	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
+		CGImageRef image = (CGImageRef)contents;
+		CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+		CGImageRef fixed = mondrian_wall_relabel(image);
+		char line[260];
+
+		(*printed)++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN PIC: %s %.0fx%.0f -> %zux%zu %zu/%zu bits, model %d, %zu a row\n",
+		    name != NULL ? name : "?", (double)frame.size.width, (double)frame.size.height,
+		    CGImageGetWidth(image), CGImageGetHeight(image), CGImageGetBitsPerComponent(image),
+		    CGImageGetBitsPerPixel(image), (int)CGColorSpaceGetModel(CGImageGetColorSpace(image)),
+		    CGImageGetBytesPerRow(image));
+		say(line);
+		if (fixed != NULL) {
+			say("MONDRIAN PIC:   the same bytes under an RGB label (a colour picture)\n");
+			CGImageRelease(fixed);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_picture_report([(NSArray *)kids objectAtIndex:i], depth + 1, printed);
+	}
+}
+
+/*
+ * Every picture in the wallpaper's own window and in the home screen window, on
+ * demand: the file holds a number the host changes (stat() is refused here).
+ */
+static void
+mondrian_picture_probe(void)
+{
+	static unsigned long asked;
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	FILE *file = fopen("/private/var/vm/mondrian-picture", "r");
+	unsigned long wanted = 0;
+	id app, windows;
+	unsigned count, i;
+
+	if (file == NULL) {
+		return;
+	}
+	if (fscanf(file, "%lu", &wanted) != 1) {
+		(void)fclose(file);
+		return;
+	}
+	(void)fclose(file);
+	if (wanted == asked || app_cls == Nil ||
+	    (method = class_getClassMethod(app_cls, sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	asked = wanted;
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+		unsigned printed = 0;
+
+		if (name == NULL || (strstr(name, "Wallpaper") == NULL &&
+		    strstr(name, "HomeScreenWindow") == NULL)) {
+			continue;
+		}
+		say("MONDRIAN PIC: --- window\n");
+		mondrian_picture_report(window, 0, &printed);
+	}
+}
+
+static unsigned
+mondrian_hide_walk(id view, unsigned depth, const char *needle, BOOL hidden)
+{
+	id kids;
+	unsigned n, i, hits = 0;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 10) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, needle) != NULL &&
+	    [view respondsToSelector:sel_registerName("setHidden:")]) {
+		((void (*)(id, SEL, BOOL))objc_msgSend)(view, sel_registerName("setHidden:"), hidden);
+		hits++;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_hide_walk([(NSArray *)kids objectAtIndex:i], depth + 1, needle, hidden);
+	}
+	return hits;
+}
+
+static void
+mondrian_hide_step(void)
+{
+	static unsigned said[2];
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	id app, windows;
+	unsigned count, i;
+	int wall = mondrian_file_on("/private/var/vm/mondrian-hide-wall");
+	int replica = mondrian_file_on("/private/var/vm/mondrian-hide-replica");
+	unsigned walls = 0, replicas = 0;
+
+	if (app_cls == Nil || (method = class_getClassMethod(app_cls,
+	    sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+
+		if (name == NULL) {
+			continue;
+		}
+		if (strstr(name, "Wallpaper") != NULL && [window respondsToSelector:sel_registerName("setHidden:")]) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(window, sel_registerName("setHidden:"),
+			    wall ? YES : NO);
+			walls++;
+		}
+		if (replica || (!replica && said[1] != 0)) {
+			replicas += mondrian_hide_walk(window, 0, "SnapshotReplica", replica ? YES : NO);
+		}
+	}
+	if ((wall && !said[0]) || (replica && !said[1]) || (!wall && !replica && (said[0] || said[1]))) {
+		char line[192];
+
+		said[0] = (unsigned)wall;
+		said[1] = (unsigned)replica;
+		snprintf(line, sizeof(line), "MONDRIAN HIDE: wallpaper %d (%u windows), replica %d (%u views)\n",
+		    wall, walls, replica, replicas);
+		say(line);
+	}
+}
+
+/*
+ * Every picture the UI draws arrives through -[CALayer setContents:], so fixing the
+ * label there fixes all of its consumers at once -- the library's backdrop, the lock
+ * screen, the Control Center material -- with the same bytes rather than a substitute.
+ * Armed by /private/var/vm/mondrian-relabel; `0` in it puts the pictures back exactly
+ * as they arrived, which is the A/B and needs no build.
+ */
+static void (*mondrian_set_contents)(id, SEL, id);
+static volatile int mondrian_relabel_installed;
+
+static int
+mondrian_relabel_on(void)
+{
+	static CFAbsoluteTime looked;
+	static int on;
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+	if (now - looked > 1.0 || looked == 0.0) {
+		looked = now;
+		on = mondrian_file_on("/private/var/vm/mondrian-relabel");
+	}
+	return on;
+}
+
+static void
+mondrian_layer_set_contents(id self, SEL _cmd, id contents)
+{
+	CGImageRef fixed = NULL;
+
+	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
+	    mondrian_relabel_on()) {
+		fixed = mondrian_wall_relabel((CGImageRef)contents);
+	}
+	if (fixed != NULL) {
+		static unsigned said;
+
+		if (said < 8) {
+			char line[192];
+
+			said++;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN RELABEL: %zux%zu, %zu a row, was a colour picture"
+			    " under a grey label\n", CGImageGetWidth(fixed), CGImageGetHeight(fixed),
+			    CGImageGetBytesPerRow(fixed));
+			say(line);
+		}
+	}
+	mondrian_set_contents(self, _cmd, fixed != NULL ? (id)fixed : contents);
+	if (fixed != NULL) {
+		CGImageRelease(fixed);
+	}
+}
+
+static void
+mondrian_relabel_arm(void)
+{
+	Class layer_class = objc_getClass("CALayer");
+	Method method;
+
+	if (mondrian_relabel_installed) {
+		return;
+	}
+	if (layer_class == Nil ||
+	    (method = class_getInstanceMethod(layer_class, sel_registerName("setContents:"))) == NULL) {
+		return;
+	}
+	mondrian_set_contents = (void (*)(id, SEL, id))method_getImplementation(method);
+	(void)method_setImplementation(method, (IMP)mondrian_layer_set_contents);
+	mondrian_relabel_installed = 1;
+	say("MONDRIAN RELABEL: -[CALayer setContents:] hooked\n");
+}
+
+/*
+ * The wallpaper, drawn.
+ *
+ * Measured 2026-11-17: nothing on this port fills the poster. CollectionsPoster makes
+ * the surface and dies before a frame, because its renderer is Metal and this port
+ * draws through Mesa's OpenGL ES; the glass then shows that surface's memory, which is
+ * why the lock screen and the App Library's backdrop are garbage (black on a fresh
+ * boot, fine 4-px stripes when the memory held something).
+ *
+ * So the still picture the poster was supposed to produce is produced here, in the
+ * wallpaper's own window: every layer whose contents is a picture at least half the
+ * screen wide gets one, and it is refreshed because the replica rewrites it. The App
+ * Library's material samples that window, so it gets the same picture rather than a
+ * substitute laid on top of the library.
+ *
+ * Armed by /private/var/vm/mondrian-wallpaper; `0` stops the refresh, so the A/B is a
+ * write and needs no build.
+ */
+static CGImageRef mondrian_wallpaper;
+
+static CGImageRef
+mondrian_wallpaper_image(void)
+{
+	size_t const width = 720, height = 1600, row = width * 4;
+	static const CGFloat places[4] = { 0.0, 0.45, 0.75, 1.0 };
+	static const CGFloat stops[16] = {
+		0.06, 0.09, 0.20, 1.0,          /* deep navy at the top */
+		0.10, 0.24, 0.55, 1.0,          /* a blue band in the middle */
+		0.16, 0.45, 0.78, 1.0,
+		0.30, 0.68, 0.92, 1.0,          /* light at the bottom */
+	};
+	CGColorSpaceRef rgb;
+	CGGradientRef gradient;
+	CGContextRef ctx;
+	uint8_t *pixels;
+
+	if (mondrian_wallpaper != NULL) {
+		return mondrian_wallpaper;
+	}
+	pixels = calloc(1, row * height);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	ctx = pixels != NULL ? CGBitmapContextCreate(pixels, width, height, 8, row, rgb,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+	gradient = rgb != NULL ? CGGradientCreateWithColorComponents(rgb, stops, places, 4) : NULL;
+	if (ctx != NULL && gradient != NULL) {
+		CGContextDrawLinearGradient(ctx, gradient, CGPointMake(0, (CGFloat)height),
+		    CGPointMake((CGFloat)width * 0.3, 0),
+		    kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+		mondrian_wallpaper = CGBitmapContextCreateImage(ctx);
+		if (mondrian_wallpaper != NULL) {
+			char line[128];
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN WALLPAPER: the still picture is ready, %zux%zu\n", width, height);
+			say(line);
+		}
+	}
+	if (gradient != NULL) {
+		CGGradientRelease(gradient);
+	}
+	if (ctx != NULL) {
+		CGContextRelease(ctx);
+	}
+	if (rgb != NULL) {
+		CGColorSpaceRelease(rgb);
+	}
+	free(pixels);
+	return mondrian_wallpaper;
+}
+
+static unsigned
+mondrian_wallpaper_paste(id view, unsigned depth, unsigned *printed)
+{
+	id layer, kids, contents;
+	unsigned n, i, hits = 0;
+
+	if (view == nil || depth > 12 || *printed >= 6) {
+		return 0;
+	}
+	layer = mondrian_send(view, "layer");
+	contents = layer != nil ? mondrian_send(layer, "contents") : nil;
+	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
+	    CGImageGetWidth((CGImageRef)contents) >= 640 &&
+	    (id)contents != (id)mondrian_wallpaper) {
+		char line[192];
+
+		((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"),
+		    (id)mondrian_wallpaper);
+		(*printed)++;
+		snprintf(line, sizeof(line), "MONDRIAN WALLPAPER: %s holds the picture now\n",
+		    object_getClassName(view) != NULL ? object_getClassName(view) : "?");
+		say(line);
+		hits++;
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_wallpaper_paste([(NSArray *)kids objectAtIndex:i], depth + 1, printed);
+	}
+	return hits;
+}
+
+static void
+mondrian_wallpaper_step(void)
+{
+	static CFAbsoluteTime pasted;
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	id app, windows;
+	unsigned count, i;
+
+	if (!mondrian_fix_on("/private/var/vm/mondrian-nowallpaper") || now - pasted < 2.0 ||
+	    mondrian_wallpaper_image() == NULL || app_cls == Nil ||
+	    (method = class_getClassMethod(app_cls, sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	pasted = now;
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+		unsigned printed = 0;
+
+		if (name == NULL || strstr(name, "Wallpaper") == NULL) {
+			continue;
+		}
+		(void)mondrian_wallpaper_paste(window, 0, &printed);
+	}
+}
+
+/*
+ * The App Library's own background.
+ *
+ * Measured 2026-11-17: the library's backdrop asks the window server for a capture of
+ * the wallpaper group and gets an empty surface -- black on a fresh boot, 4-px stripes
+ * when that memory held something -- even when the wallpaper window itself is right.
+ * A picture laid behind the home screen does not show either: the library draws its
+ * own quad above it.
+ *
+ * What is left is the picture the quad was supposed to show, placed inside the
+ * library's own folder view, under its cards. It is the same gradient the wallpaper
+ * carries, dimmed, because that is what the library's material does to it.
+ *
+ * Armed by /private/var/vm/mondrian-library; `0` takes the layer away again.
+ */
+static CGImageRef mondrian_library_picture;
+
+static CGImageRef
+mondrian_library_image(void)
+{
+	size_t const width = 720, height = 1600, row = width * 4;
+	static const CGFloat places[4] = { 0.0, 0.45, 0.75, 1.0 };
+	static const CGFloat stops[16] = {
+		0.03, 0.04, 0.08, 1.0,
+		0.04, 0.09, 0.20, 1.0,
+		0.06, 0.16, 0.30, 1.0,
+		0.10, 0.24, 0.36, 1.0,
+	};
+	CGColorSpaceRef rgb;
+	CGGradientRef gradient;
+	CGContextRef ctx;
+	uint8_t *pixels;
+
+	if (mondrian_library_picture != NULL) {
+		return mondrian_library_picture;
+	}
+	pixels = calloc(1, row * height);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	ctx = pixels != NULL ? CGBitmapContextCreate(pixels, width, height, 8, row, rgb,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+	gradient = rgb != NULL ? CGGradientCreateWithColorComponents(rgb, stops, places, 4) : NULL;
+	if (ctx != NULL && gradient != NULL) {
+		CGContextDrawLinearGradient(ctx, gradient, CGPointMake(0, (CGFloat)height),
+		    CGPointMake((CGFloat)width * 0.3, 0),
+		    kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+		mondrian_library_picture = CGBitmapContextCreateImage(ctx);
+		if (mondrian_library_picture != NULL) {
+			say("MONDRIAN LIBRARY: the background picture is ready\n");
+		}
+	}
+	if (gradient != NULL) {
+		CGGradientRelease(gradient);
+	}
+	if (ctx != NULL) {
+		CGContextRelease(ctx);
+	}
+	if (rgb != NULL) {
+		CGColorSpaceRelease(rgb);
+	}
+	free(pixels);
+	return mondrian_library_picture;
+}
+
+/* Find the library's folder view and put the picture under everything it holds. */
+static unsigned
+mondrian_library_paint(id view, unsigned depth, const char *needle, CGImageRef picture)
+{
+	id kids;
+	unsigned n, i, hits = 0;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 14) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, needle) != NULL) {
+		CALayer *layer = (CALayer *)mondrian_send(view, "layer");
+		CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+		NSString *key = (NSString *)@"mondrianLibraryBackground";
+
+		if (layer != nil && bounds.size.width > 100.0 && bounds.size.height > 100.0 &&
+		    [(CALayer *)layer valueForKey:key] == nil) {
+			CALayer *bg = [CALayer layer];
+			char line[192];
+
+			[bg setContents:(id)picture];
+			[bg setFrame:bounds];
+			[bg setContentsGravity:(NSString *)@"resize"];
+			[bg setMasksToBounds:YES];
+			[(CALayer *)layer setValue:bg forKey:key];
+			[(CALayer *)layer insertSublayer:bg atIndex:0];
+			snprintf(line, sizeof(line), "MONDRIAN LIBRARY: %s has the background now\n", name);
+			say(line);
+			hits++;
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_library_paint([(NSArray *)kids objectAtIndex:i], depth + 1, needle,
+		    picture);
+	}
+	return hits;
+}
+
+static void
+mondrian_library_step(void)
+{
+	static unsigned painted;
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	id app, windows;
+	unsigned count, i;
+	int on = mondrian_fix_on("/private/var/vm/mondrian-nolibrary");
+
+	if (app_cls == Nil || (method = class_getClassMethod(app_cls,
+	    sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	if (!on) {
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+
+		if (name == NULL || strstr(name, "HomeScreenWindow") == NULL) {
+			continue;
+		}
+		if (mondrian_library_image() != NULL) {
+			painted += mondrian_library_paint(window, 0, "LibraryPodFolderView",
+			    mondrian_library_image());
+		}
+		if (mondrian_wallpaper_image() != NULL) {
+			painted += mondrian_library_paint(window, 0, "SBRootFolderView",
+			    mondrian_wallpaper_image());
+		}
+	}
+}
+
+/*
+ * What the two windows actually hold, once every few seconds: every layer with
+ * contents, its class, and whether that contents is a picture, a surface or nothing.
+ * This is the measurement that says what to give the wallpaper and the library.
+ */
+static void
+mondrian_layer_report_walk(id view, unsigned depth, unsigned *printed)
+{
+	id layer, kids, contents;
+	unsigned n, i;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 12 || *printed >= 10) {
+		return;
+	}
+	layer = mondrian_send(view, "layer");
+	contents = layer != nil ? mondrian_send(layer, "contents") : nil;
+	if (contents != nil) {
+		CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+		CFTypeID type = CFGetTypeID((CFTypeRef)contents);
+		CFStringRef described = CFCopyTypeIDDescription(type);
+		char kind[64] = "?";
+		char extra[96] = "";
+
+		if (described != NULL) {
+			(void)CFStringGetCString(described, kind, sizeof(kind), kCFStringEncodingUTF8);
+			CFRelease(described);
+		}
+		if (type == CGImageGetTypeID()) {
+			snprintf(extra, sizeof(extra), " %zux%zu model %d",
+			    CGImageGetWidth((CGImageRef)contents), CGImageGetHeight((CGImageRef)contents),
+			    (int)CGColorSpaceGetModel(CGImageGetColorSpace((CGImageRef)contents)));
+		}
+		(*printed)++;
+		{
+			char line[260];
+
+			snprintf(line, sizeof(line), "MONDRIAN LAYERS: %*s%s %.0fx%.0f contents %s%s\n",
+			    (int)(depth * 2), "", name != NULL ? name : "?", (double)frame.size.width,
+			    (double)frame.size.height, kind, extra);
+			say(line);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_layer_report_walk([(NSArray *)kids objectAtIndex:i], depth + 1, printed);
+	}
+}
+
+static void
+mondrian_layer_report(void)
+{
+	static CFAbsoluteTime said;
+	CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	id app, windows;
+	unsigned count, i;
+
+	if (!mondrian_file_on("/private/var/vm/mondrian-layers") || now - said < 6.0 ||
+	    app_cls == Nil ||
+	    (method = class_getClassMethod(app_cls, sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	said = now;
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+		unsigned printed = 0;
+
+		if (name == NULL || (strstr(name, "Wallpaper") == NULL &&
+		    strstr(name, "HomeScreenWindow") == NULL)) {
+			continue;
+		}
+		say("MONDRIAN LAYERS: --- window\n");
+		mondrian_layer_report_walk(window, 0, &printed);
+	}
+}
+
 static void
 mondrian_lock_step(void *context)
 {
@@ -6277,7 +6944,13 @@ mondrian_lock_step(void *context)
 		if (backdrop_ticks % 40 == 15) {
 			mondrian_wall_snapshot();
 		}
+		mondrian_hide_step();
+		mondrian_wallpaper_step();
+		mondrian_library_step();
+		mondrian_layer_report();
+		mondrian_relabel_arm();
 		mondrian_deep_probe();
+		mondrian_picture_probe();
 		mondrian_live_paint();
 	}
 	if (boot_arg_set("mondriancct=1")) {
@@ -10445,6 +11118,7 @@ mondrian_install_ui_hooks(void)
 		}
 		return;
 	}
+	mondrian_relabel_arm();
 	NSSetUncaughtExceptionHandler(mondrian_uncaught);
 	(void)objc_setExceptionPreprocessor(mondrian_exc_pre);
 	install_number_length_hook();

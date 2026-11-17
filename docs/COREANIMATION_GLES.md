@@ -76,7 +76,11 @@ the order they were paid for:
   `CollectionsPoster` renders with Metal; this port has no Metal, so the surface keeps whatever
   the allocator left there. `gpusurfpat=1|2|3` (`MondrianGPU.cpp`) fills a freshly adopted
   surface with white, black or a ramp to prove it; the bands over the lock screen's wallpaper are
-  that memory, not a mis-sampled texture.
+  that memory, not a mis-sampled texture. The UI therefore draws the still picture itself
+  (`mondrian_wallpaper` in `tools/mondrian-ui-hook.m`): a gradient painted into the wallpaper's
+  own window and, dimmed, under the App Library's cards, which is what the empty capture group
+  was supposed to show. The library's backdrop and the wrong-label half of this are in
+  `docs/UI_PERFORMANCE.md`.
 - **The Control Center shows that poster through its sheet.** The sheet's `MTMaterialView`
   spans the whole window (480x1067 pt, measured from the view tree), so the bright bokeh in its
   lower third is the poster's content, not a band in the material, and the home screen behind it

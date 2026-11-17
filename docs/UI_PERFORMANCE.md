@@ -204,31 +204,32 @@ boot each, so the three columns differ only in what changed:
   bring-up boot, and a panic still paints either way. Measured after it: the
   lock screen of a fresh boot has no console text and no bands at all, where the
   boot before it had six `KABORT` rows and two black bands.
-- **The App Library's background is one picture, and here that picture is
-  magenta.** Measured 2026-11-17: the library's background is a single
-  full-screen quad (program 21, blend off) sampling a 1440x3200 surface; the
-  image behind it -- the `UIImageView` inside `PBUISnapshotReplicaView`, in
-  `_SBWallpaperSecureWindow` -- is a CGImage of 1440x3200, 8 bits a component,
-  32 a pixel, **colour-space model 1 (monochrome)**, whose every byte at the
-  centre, a quarter and the bottom is `ff 00 ff ff`. It is a placeholder.
-  CoreAnimation reads one byte of every four out of a 32-bit image labelled
-  grey, and that is the 4-px striping on the glass (measured in the half-scale
-  capture: columns of `(165,166,165)` and `(24,28,24)` alternating). The grey,
-  the stripes and the white blob the substitute-colour A/B turned it into are
-  that one image.
-  The wallpaper itself cannot be copied from the layer tree: it is a
-  `CALayerHost` inside `_UIScenePresentationView`, drawn by another process, and
-  the materials ask the compositor for a group this port does not serve
-  (`MTMaterialLayer` with `groupName` `WallpaperCaptureGroup`). So the fix is
-  either to give the library's own background a real picture, or to find which
-  layer draws that quad above everything else.
-  Two A/Bs not worth repeating: setting `allowsInPlaceFiltering`,
-  `allowsSubstituteColor` and `disablesOccludedBackdropBlurs` to `NO` on every
-  backdrop layer turns the grey into black with a white blob and does not fix
-  it; hiding `SBHomeScreenBackdropView` (the only `*Backdrop*` in
-  `SBHomeScreenView`) leaves the stripes, and a wallpaper-sized `CALayer`
-  inserted at the bottom of `SBHomeScreenWindow` is invisible -- the striped quad
-  is drawn above both.
+- **The App Library's background is a capture nobody fills.** Measured
+  2026-11-17: the library's background is one full-screen quad (program 21,
+  blend off) over a material that asks the window server to capture the wallpaper
+  group (`MTMaterialLayer`, `groupName` `WallpaperCaptureGroup`). On this port
+  that capture is an empty surface, so the glass shows its memory: black on a
+  fresh boot, and fine vertical stripes -- `(165,165)` then `(8,8)` per four
+  panel pixels -- when the memory held something. A picture inserted behind the
+  home screen does not show: the quad is drawn above it.
+  The picture the backdrop does receive arrives with the wrong label: a colour
+  bitmap four bytes a pixel (`f47c5b`, `68a4d9` at the sampled points) whose
+  colour space says monochrome, which CoreAnimation hands to the GPU one byte a
+  pixel. That mismatch turns any picture into the same stripes, so both ends are
+  fixed in `tools/mondrian-ui-hook.m`: `mondrian_wall_relabel` gives such a
+  bitmap its real colour space, and `mondrian_layer_set_contents` applies it to
+  the pictures the UI sets.
+  What the library shows today is drawn, not captured: the wallpaper is a still
+  picture generated in the hook (720x1600 gradient), painted as the first
+  sublayer of `SBHLibraryPodFolderView` (dimmed) and of `SBRootFolderView` (full
+  strength), and refreshed every two seconds because the views are rebuilt.
+  Measured on the glass: the library is a smooth gradient with no stripes and no
+  black. Files `/private/var/vm/mondrian-nolibrary` or `-nowallpaper` holding `0`
+  turn either one off, for an A/B with no build and no boot.
+  Not worth repeating: setting `allowsInPlaceFiltering`, `allowsSubstituteColor`
+  and `disablesOccludedBackdropBlurs` to `NO` on every backdrop layer turns the
+  grey into black with a white blob; hiding `SBHomeScreenBackdropView` (the only
+  `*Backdrop*` in `SBHomeScreenView`) leaves the stripes.
 - **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with
