@@ -17,25 +17,19 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   console draws into the splash framebuffer the ABL leaves at **0xB8000000**
   (1440x3200, stride 5760). Build with `SMALL_SHIM=1`; why is in the shim trap.
 - **Fastboot, and the only way back to it.** `fastboot devices` answers in the
-  bootloader's fastboot (power + volume down), which takes `fastboot boot`;
-  fastbootd refuses it, `fastboot reboot bootloader` keeps USB alive. ABL
-  spends one retry per boot, so after seven the slot reads
+  bootloader's fastboot (power + volume down); fastbootd refuses `fastboot boot`.
+  ABL spends one retry per boot, so after seven the slot reads
   `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
-  resets flag and budget without writing a partition. From a running iOS the
-  ring's `reboot` is the way in with no buttons: it writes the PMK8350 restart
-  reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader, 1 = recovery,
-  `0309`), flushes the ring and resets; fastboot answers about 2 s later.
-  The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
-  so a reset that only writes those boots the active slot instead.
+  resets flag and budget without writing a partition (AGENTS.md has the symptom).
+  From a running iOS the ring's `reboot` is the way in with no buttons: it writes
+  the PMK8350 restart reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader,
+  1 = recovery, `0309`), flushes the ring and resets; fastboot answers about 2 s
+  later. The BCB in `misc` and the IMEM word at 0x65c are both ignored.
   **No recovery boots here:** `fastboot boot` refuses the OrangeFox images
   (`Bad Buffer Size`) and `boot_b` lands in fastboot, so vendor blobs come from
   the ROM (`tools/super-extract.py`).
-  **`boot` itself can be refused, and only the second line says so:**
-  `Sending … OKAY` prints when the command returns `FAILED (remote: 'Failed
-  to load/authenticate boot image: Not Found')`: the image never runs and
-  `boot_b` answers, which reads like a kernel that dies before its first line.
-  Require `Booting … OKAY` *and* no `FAILED`, then use
-  `tools/wsl/flash-image.sh`, which checks the slot before writing `boot_b`.
+  **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
+  OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
@@ -158,6 +152,11 @@ This device has **no `init_boot`**.
 
 ## Traps already paid for
 
+**`kill` takes a PID; a name restarts nothing.** `kill SpringBoard` is `kill 0`
+(`kill 0 -> 3`), so the dylib in `/private/var/vm` is never mapped and a rebuilt
+probe reads as "did not run" while the old hook keeps answering.
+`tools/usb-ring.py respring` kills the PID from the kernel's own `SMP` line.
+
 **The window of RAM.** `phys_base = 0x840000000`, `mem_size = 0x240000000`
 (the clean 9 GiB run: the tree's 3 GiB and 6 GiB regions are adjacent, with no
 reservation inside). Rules that still cost resets:
@@ -174,12 +173,11 @@ reservation inside). Rules that still cost resets:
   across the window, and a page on a firmware island aborts (`Kernel data
   abort`, `far` inside the physmap).
 
-The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S`
-no longer maps it `VA=PA`: `arm_vm_init` installs a VA alias (`0295`).
-
-The **physmap slide** comes from `/chosen/random-seed`, so a random seed
-makes the boot a coin flip (about one host boot in three dies); `boards.py`
-pins the seed and `ADT_SEED` overrides it.
+The splash framebuffer (`0xb8000000`) is outside the 9 GiB window; `start.S` no
+longer maps it `VA=PA` (`0295` installs a VA alias), and the **physmap slide**
+comes from `/chosen/random-seed`, so a random seed makes the boot a coin flip
+(about one host boot in three dies); `boards.py` pins the seed, `ADT_SEED`
+overrides it.
 
 **The kernel's command line is the payload's, not ABL's.** With `fastboot
 boot`, ABL fills `/chosen/bootargs` with an Android line (~1 KiB) and
@@ -227,11 +225,9 @@ USB gadget never appears, so there is no ring and no userland left to undo it.
 `mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
 (`journal_close(NULL)` has no NULL check). Reflashing `backup/ios-root.simg` is
 the repair for a dirty volume, and `fsck.hfsplus -fy` on a copy names what a
-rebuild has to fix.
-
-**`hfs_mark_inconsistent` on this volume is usually our own check.** A catalog
-entry that claims data and owns no blocks is rejected on every open (2 560
-times for one record class), and the hard resets write that damage.
+rebuild has to fix. A catalog entry that claims data and owns no blocks is
+rejected on every open (2 560 times for one record class) and the hard resets
+write that damage, so `hfs_mark_inconsistent` here is usually our own check.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload: that travels **appended to the
@@ -253,15 +249,13 @@ A recovery needs no partition: `fastboot boot ofox.img` runs it from RAM (the
 `boot-recovery` BCB runs the active `boot` slot; `recovery_a/b` never boot).
 
 **Kernel timeouts stop after userland starts.** Threads paced by
-`tsleep(timeout)` wake once and never again; pace from work that runs (`0100`)
-or `delay()`.
+`tsleep(timeout)` wake once and never again; pace from work (`0100`) or `delay()`.
 
 **The console paints the kernel log and scrolls.** `0210` clears the panel once
-and scrolls half a screen at the last text row; `0213` moves the painting into
-the log thread. `0005` registers the fbcon unconditionally, so text lands on
-the ABL logo from the first `printf`; `mondrianfb_noconsole=1` keeps the panel
-for the UI, and `mondrianfb_noconsole=0` is the only log there is when USB is
-dead.
+and scrolls half a screen at the last text row, `0213` paints from the log thread,
+and `0005`'s unconditional fbcon puts text over the ABL logo from the first
+`printf`; `mondrianfb_noconsole=1` keeps the panel for the UI (0 is the only log
+when USB is dead).
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;

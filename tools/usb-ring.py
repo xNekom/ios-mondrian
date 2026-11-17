@@ -22,6 +22,7 @@ The kernel's USB gadget (bsd/dev/mondrian_usb.c, boot-arg usb=2) answers on
                 divider is the channel's qcom,pre-scaling, e.g. 3 for
                 vbat_sns <1 3> and 16 for usb_in_v_div_16 <1 16>)
   reboot        flush the ring, point the BCB at the bootloader and reset
+  respring      restart SpringBoard, by the PID the kernel's own SMP line names
   poweroff      flush the ring, let the gadget go and switch the SoC off
 
 Why this exists: the live log on udp/5140 only carries what is written after
@@ -30,9 +31,11 @@ read the ring, and a swipe had to be reproduced by hand at the right moment.
 With this, the whole loop is the USB cable.
 """
 import argparse
+import os
 import socket
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -181,6 +184,46 @@ def dump(path, timeout, start=None, total=None):
     with open(path, "wb") as f:
         f.write(ring)
     print(f"{len(ring)} bytes, {len(chunks)} datagrams, {holes} bytes missing -> {path}")
+    return 0
+
+
+def springboard_pid(text):
+    """The SpringBoard PID the kernel's own `SMP t=...` line carries, or None."""
+    pid = None
+    for line in text.splitlines():
+        at = line.find("SpringBoard(")
+        while at >= 0:
+            end = line.find(")", at)
+            if end > at:
+                pid = line[at + len("SpringBoard("):end]
+            at = line.find("SpringBoard(", at + 1)
+    return pid
+
+
+def respring():
+    """Restart SpringBoard.
+
+    `kill` takes a PID. `kill SpringBoard` is `kill 0` -- measured 2026-11-18: it
+    answers `kill 0 -> 3` and nothing restarts, so a rebuilt hook is never mapped
+    and every new probe reads exactly like "the new code did not run". The PID
+    comes from the kernel, which prints `SpringBoard(pid)` every few seconds.
+    """
+    fd, path = tempfile.mkstemp(suffix=".ring")
+    os.close(fd)
+    try:
+        if dump(path, 60.0) != 0:
+            return 1
+        with open(path, "r", errors="replace") as f:
+            text = f.read()
+    finally:
+        os.remove(path)
+    pid = springboard_pid(text)
+    if pid is None:
+        print("no SpringBoard pid in the ring", file=sys.stderr)
+        return 1
+    print(f"SpringBoard pid {pid}")
+    answer = simple("kill " + pid, 5.0)
+    print(answer.decode(errors="replace").strip() if answer else "no answer")
     return 0
 
 
@@ -381,7 +424,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=("dump", "prev", "wfile", "pos", "reboot", "poweroff", "mem", "tap", "swipe",
+                        choices=("dump", "prev", "wfile", "pos", "reboot", "respring", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                                  "thermal", "burn", "haps", "vib", "hapr", "hapw", "spmimap",
@@ -489,6 +532,8 @@ def main():
         simple("poweroff", 5.0)
         print("poweroff sent")
         return 0
+    if args.command == "respring":
+        return respring()
     simple("reboot", 5.0)
     print("reboot sent")
     return 0

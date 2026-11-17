@@ -230,28 +230,23 @@ boot each, so the three columns differ only in what changed:
   and `disablesOccludedBackdropBlurs` to `NO` on every backdrop layer turns the
   grey into black with a white blob; hiding `SBHomeScreenBackdropView` (the only
   `*Backdrop*` in `SBHomeScreenView`) leaves the stripes.
-- **The App Library's icons are empty squares.** Measured 2026-11-17: the cards
-  (`Suggestions`, `Utilities`, ...) draw their labels and their material and no
-  artwork at all. The home screen's icons
-  get theirs from the hook, which paints the eight `SBIconView`s the home screen
-  had when it was probed (`mondrian_icon_force_artwork`); the library builds its
-  icon views when it opens, so nothing paints them.
-  Walking the window for `SBIconView`s and painting each application icon was
-  tried and is not the road: three builds (depth 16, then 24, then a counter every
-  eight ticks) produced no line while the library was believed to be on the glass,
-  and the frames from the last one came out as a full-screen rounded layer over
-  the library with a `KABORT` row -- the shape of a layer painted at the wrong
-  bounds. That experiment is **inconclusive rather than disproved** (see the
-  capture trap below: the tick only runs with the UI unlocked, so the walk may
-  never have run), and it is not worth another blind round. The next attempt
-  reads the pod's classes first (`SBHLibraryCategoryIconViewController`,
-  `SBHLibraryCategoryFolder`) and paints where the library itself sets the image,
-  not through a generic tree walk.
-  Reading a capture from the ring is not proof that the UI is alive: after a
-  respring the panel keeps the last frame while the display sleeps, so `screen`
-  returns the previous session's App Library while `fps` is 0, `panel 0/60` and
-  the hook logs `lock screen up`. Check those three before concluding that a
-  probe "did not run".
+- **The App Library's icons are empty squares.** Measured 2026-11-18 with the
+  deep dump (`mondrian-deep`) while the library was on the glass: the cards are
+  `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, their
+  layers report no contents, and `SBHLibraryPodFolderView` 480x1067 wraps them.
+  The home screen's icons only exist because the hook paints the eight
+  `SBIconView`s the home screen carried when it was probed
+  (`mondrian_icon_force_artwork`); a card is a *folder* icon (a category's
+  preview grid), not an application icon, so that pass skips it by design.
+  What a card should show is a 2x2 grid of the category's own app icons, so the
+  fix is to compose it: ask the card's `icon` for `icons`, take four application
+  icons, load each app's AppIcon file and put four tiles in a view of ours over
+  the card. That pass is not in the tree yet. The dump is armed by writing a
+  number into `/private/var/vm/mondrian-deep` (a new number buys one dump, four a
+  process) and read out of the ring.
+  Two numbers that look like a dead UI and are not: `fps 0` and
+  `panel 0/60 sampled ticks changed` were measured while the phone was
+  responsive with the library on the glass.
 - **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with
