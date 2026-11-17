@@ -331,6 +331,34 @@ Before writing either, dump what the vendor kernel leaves behind: an OrangeFox
   Nothing powers them today: there is no PCIe host driver and no QUP UART
   driver in this kernel.
 
+### The firmware, and where it comes from
+
+The blobs are not in this tree and no recovery boots here (`AGENTS.md`), so the
+source is the stock ROM. A xiaomi.eu fastboot ROM ships `images/bluetooth.img`,
+a **FAT16** volume whose `image/` holds the whole BT firmware set:
+
+| file | size | what |
+| --- | --- | --- |
+| `hpbtfw20.tlv` | 201,560 | patch, `BTFW.HSP.2.0.1-00252-HSP_PATCH-1`, `QCA6490ROM=0200` |
+| `hpbtfw21.tlv` | 146,068 | patch, `BTFW.HSP.2.1.0-00570-PATCHZ-1`, `QCA6490ROM=0201` |
+| `hpbtfw20.ver` | 33 | the 2.0 build string as text |
+| `hpnv20.*`, `hpnv21.*` | ~6.3 KB | NVM, **one per board ID** (`hpnv21.301`, `hpnv21.b10c`, …), plus `g` variants |
+
+113 files, 3.4 MB. Which patch applies follows the ROM build (EDL version and
+build info, `0xFC00` with `0x19`/`0x20`) and which NVM follows the board ID
+(`0xFC00` with `0x23`), so the loader asks both before it picks a file — btqca's
+`qca_read_soc_version` and `qca_read_fw_board_id` do exactly that.
+
+The trees are archived outside the repo at `C:\Users\Pedro\mondrian-firmware`
+(`bluetooth/`, `vendor/`, `raw/{bluetooth,vendor}.img`). To re-extract, `7z x
+ROM.zip images/bluetooth.img` and mount the FAT. The rest of `/vendor` costs one
+more step, because the ROM's `super.img` is split into nine **independent sparse
+images of the whole partition** (each with its own header, DONT_CARE everywhere
+it carries nothing): merge with `tools/sparse-merge.py`, then
+`tools/super-extract.py super.img vendor_a vendor.img` (1.5 GB, **erofs**) and
+`mount -t erofs`. `/vendor/firmware` is only 12 MB of audio and sensor blobs;
+the Bluetooth firmware lives in the separate `bluetooth` partition.
+
 ## What iOS expects
 
 Measured strings in the iOS 16.7.16 root:

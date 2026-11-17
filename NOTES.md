@@ -27,6 +27,9 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `0309`), flushes the ring and resets; fastboot answers about 2 s later.
   The BCB in `misc` and the IMEM word at 0x65c are both ignored by this ABL,
   so a reset that only writes those boots the active slot instead.
+  **No recovery boots here:** `fastboot boot` refuses the OrangeFox images
+  (`Bad Buffer Size`) and `boot_b` lands in fastboot, so vendor blobs come from
+  the ROM (`tools/super-extract.py`).
   **`boot` itself can be refused, and only the second line says so:**
   `Sending … OKAY` prints when the command returns `FAILED (remote: 'Failed
   to load/authenticate boot image: Not Found')`: the image never runs and
@@ -110,19 +113,17 @@ and refuses `boot_a` unless `BOOT_A=1`; `tools/qemu-ios.py` boots the same
 payload (`docs/QEMU_TESTING.md`).
 
 **Reading a boot.** `0096` tees kernel and `/dev/console` output into a 4 MiB
-ring that `0174` arms before `vfs_mountroot`; the same ring is the last 4 MiB of
-`userdata` behind a `MONDLOG` header, so a boot with no USB still has its log
-(dump that tail from OrangeFox). With the kernel running, `tools/usb-ring.py
-dump` reads the live ring and `screen` captures the panel (`usbipd attach --wsl`
-first; `0298` survives a detach). `prev` prints the *previous* boot's newest
-lines over USB: `0329` copies that area into RAM before this boot's first flush
-and flushes the ring from the panic path, so a panic report reaches the host
-with no photograph. The window is the *reader's*: `mondrianprevlines=N` goes on
-the boot that reads, because the dying boot's area is replaced by the next
-boot's first flush, and a chatty writer (the iOS-side net script repeating
-`default route ... err 17` every few hundred ms) pushes the interesting lines
-out of a small window — a wedge followed by a quiet reader needs `N` in the
-thousands. `mondrianstop=N` halts at early mark N (`0174` keeps marks
+ring that `0174` arms before `vfs_mountroot`, and the same ring is the last 4 MiB
+of `userdata` behind a `MONDLOG` header, so a boot with no USB still has its log.
+`tools/usb-ring.py dump` reads the live ring and `screen` captures the panel
+(`usbipd attach --wsl` first; `0298` survives a detach). `prev` prints the
+*previous* boot's newest lines (`0329` copies that area into RAM before this
+boot's first flush), and its window is the *reader's*: `mondrianprevlines=N` goes
+on the boot that reads, because the next boot's flush overwrites the dead area,
+and a chatty writer (the iOS-side net script repeating `default route ... err
+17`) pushes the lines out of a small window — a wedge followed by a quiet reader
+needs `N` in the thousands. `mondrianstop=N` halts at early mark N (`0174` keeps
+marks
 above 20 visible once the console is off) and `mondrianreset=N` is a second
 clock: a boot that ends at about 45 s is that thread rebooting to fastboot.
 
@@ -271,12 +272,9 @@ it — GCC branch, transfer-list takeover, `hce 0x1 hcs 0x10f`, START STOP UNIT
 active on the well-known LUN `0xd0`, then TUR on LUN 0 — is in the
 `mondrian-ufs-debug` skill. The ABL leaves the UFS powered on a normal boot and
 powers it down in fastboot; the kernel brings the host up itself either way
-(`0074`-`0076`).
-
-Wait loops are spin counts, not `delay()`: a wait that never completes has to be
-non-fatal and dump `hcs/is/dbr` plus the UTRD.
-
-The write path is `0090` (WRITE(10), read-modify-write, SYNCHRONIZE CACHE).
+(`0074`-`0076`). Wait loops are spin counts, not `delay()`: a wait that never
+completes has to be non-fatal and dump `hcs/is/dbr` plus the UTRD. The write
+path is `0090` (WRITE(10), read-modify-write, SYNCHRONIZE CACHE).
 **Known debt:** `ufs_find_partition()` bounds the entry table with
 `nent * esz > BOUNCE_SIZE`, a 32-bit product a corrupt table can wrap; guard
 with `nent > BOUNCE_SIZE / esz`.
@@ -297,14 +295,13 @@ the free list (`mondrian_page_is_screen()`) or `vm_page_init`'s assert fires
 **A frozen interface is the bootloader's autorefresh.** It leaves
 `INTF_TEAR_AUTOREFRESH_CONFIG = 0x8000003c` (autorefresh, 60 frames) and
 `INTF_TEAR_CHECK_EN = 1`; clear both **before the first `CTL_START` of the
-session** and the interface runs indefinitely (measured 9,813 frames at
-59-61/s). Clearing them later does not recover it; `CTL_SW_RESET` (`0x030` = 1)
-does. `CTL_START` (`0x01c`) bit 0 self-clears on completion and stays 1 when it
-never completed.
+session** and the interface runs indefinitely (measured 9,813 frames at 59-61/s);
+clearing them later needs `CTL_SW_RESET` (`0x030` = 1). `CTL_START` (`0x01c`)
+bit 0 self-clears on completion and stays 1 when it never completed.
 
 **The kick is the default.** `MondrianFramebuffer` writes the frame, `dsb sy`,
-`CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`; the stores are Normal
-Non-cacheable. CTL0 is the active controller, INTF1 the interface; in command
+`CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`, with Normal Non-cacheable
+stores. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and `mondrianfb_defer=0`
 are diagnostics (`docs/MONDIAN_GPU.md`).
@@ -318,7 +315,7 @@ starts at `0x840000000`, so the last page of the splash carve-out, `0xbaaf0000`
 (`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>`
 (0xfff full scale), `bl LEVEL [FMT [CMD]]` and `IOMobileFramebuffer` selector 100
 (`0314`) set the level, `mondrianblfmt` the byte order; `brightness-nits` 0 means
-"display asleep", and honouring it left every boot at DBV `0x20` with a dead slider.
+"display asleep".
 
 **The battery's VADC read: sleep, never poll.** ADC7 has no polling mode, so a
 reader that polls the arbiter's EOC word takes the *previous* conversion (0.8 V
@@ -350,6 +347,4 @@ at all (`ppid 0x310`, PM8350B's SMB5) because `pmic_glink` on the ADSP reaches
 it. An `smw` write wedges the arbiter: the SPMI thread never returns and the ADC
 tick dies with it, while ping still answers.
 
-## Other ports worth reading
-
-Listed with what each one solves in `docs/MONDIAN_REFERENCE.md`.
+Other ports worth reading, with what each solves: `docs/MONDIAN_REFERENCE.md`.

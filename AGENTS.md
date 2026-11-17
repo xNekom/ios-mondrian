@@ -113,13 +113,15 @@ Pro, SM8475) is the port being done here.
 - **Ask the vendor before writing a driver.** The live device tree and the
   vendor source answer in minutes what a boot cannot.
   `raw.githubusercontent.com` rate-limits (429); `cdn.jsdelivr.net/gh/
-  <owner>/<repo>@<sha>/<path>` serves the same file. An OrangeFox boot from RAM
-  (`fastboot boot`, ten seconds, writes nothing) answers anything the kernel
-  can: `tools/vendor-dump.sh` collects its clocks, regulators, thermal zones,
-  UFS gear, panel, SPMI state and dmesg into `/root/vendor-dump` in one boot,
-  and `tools/ofox-leave-and-cycle.sh` gets the phone back out of the recovery
-  (OrangeFox ignores `adb reboot bootloader`; `adb shell reboot bootloader`
-  works, and `adb devices` reports its state as `recovery`).
+  <owner>/<repo>@<sha>/<path>` serves the same file. **A recovery is not an
+  option on this unit** (measured twice): `fastboot boot` refuses our OrangeFox
+  images with `Bad Buffer Size`, and flashing one to `boot_b` boots to fastboot
+  instead, so `tools/vendor-dump.sh` and `tools/ofox-leave-and-cycle.sh` are
+  recipes for a device that can still run one. For vendor blobs, firmware and
+  configs, read the stock ROM on the PC instead: `tools/super-extract.py
+  images/super.img vendor vendor.img` carves the logical partition out of a
+  xiaomi.eu/fastboot ROM and the archive stays local, so nothing has to be
+  pulled out of the phone twice.
 - **Declare before you build.** A missing `extern`/prototype (`delay`, `hz`,
   `sp_apid_owner`) is the commonest failure and costs a ten-minute build.
 - **Patches come from a diff of the staged series.** Hand-counted hunks have

@@ -99,9 +99,9 @@ persist and the other firmware partitions are never touched.
 
 ### 1. Back up the phone
 
-Boot a recovery (OrangeFox or any with adb root) temporarily and pull `persist`,
-`modemst1`, `modemst2`, `fsg`, `fsc`, `boot`, `dtbo` and `vbmeta`; they hold
-per-device calibration data. `.gitignore` already excludes `backup/`, `dtb/` and
+Back up the calibration data (`persist`, `modemst1`, `modemst2`, `fsg`, `fsc`,
+`boot`, `dtbo`, `vbmeta`) from a rooted Android or an EDL tool: no recovery boots
+here (see the recovery note in AGENTS.md), so that is the only route. `.gitignore` already excludes `backup/`, `dtb/` and
 `recovery/`. The shim also needs the stock DTB, which is inside the boot image:
 
 ```sh
@@ -181,9 +181,9 @@ tools/phone-boot.sh                    # phone in fastboot; writes no partition
 tools/flash-root.sh ios16-root.simg    # userdata only; asks first
 fastboot getvar current-slot           # must be b
 fastboot flash boot_b shim/out/shim-boot.img
-# A recovery needs no partition: `fastboot boot ofox-boot-b-complete.img`
-# starts OrangeFox from RAM in ten seconds and writes nothing, so `boot_b`
-# keeps the iOS image; `fastboot.exe` takes `C:\...` paths, never `/mnt/c`.
+# No recovery boots here: `fastboot boot` refuses the OrangeFox images and
+# `boot_b` lands in fastboot; vendor blobs come from the ROM instead
+# (tools/super-extract.py). `fastboot.exe` takes `C:\...`, never `/mnt/c`.
 tools/build-mondrian-ui-hook.sh out/gpu/mondrian-ui-hook.dylib
 # a kernel build embeds it (tools/gen-glblob.py); glblob=1 boots that copy
 sudo tools/install-ui-hook.sh ios16-root.img DYLIB   # or burn it into the image
