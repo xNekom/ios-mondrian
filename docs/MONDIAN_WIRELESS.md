@@ -283,6 +283,15 @@ fsel **1** (mainline's per-pin list starts with `gpio`), so the mux is
 `CFG = 1 << 2` with no pull and 2 mA, the tree's own `bias-disable,
 drive-strength 2`.
 
+GPIO 79 carries two jobs: it is the UART's RX **and** the node's wakeup source
+(`interrupts-extended` names `<pinctrl 79 4>` and `wakeup-parent = <&pdc>`).
+The loader leaves that pad's interrupt enabled (`INTR_CFG` read **0xe2**), so
+the moment the mux makes the line live, the chip's traffic is an interrupt this
+kernel does not acknowledge — and the wire stage died exactly then, with the
+same storm signature as the SE line. `btuart on` masks the pad (`INTR_CFG = 0`)
+and clears the latch (`INTR_STATUS = 0xffffffff`) before muxing, and prints both
+values back.
+
 Voting them is also what took the command channel down once: `btuart vote`
 writes the six voltages and enables through one RPMh TCS each, and those SMPS
 are shared, with 4 bytes of aux data instead of the linear range the GPU rails

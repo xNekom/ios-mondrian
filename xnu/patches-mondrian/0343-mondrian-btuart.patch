@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..239f429
+index 0000000..4d8a094
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,857 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -126,6 +126,8 @@ index 0000000..239f429
 +#define MONDRIAN_BT_TLMM_BASE		0x0f100000UL
 +#define MONDRIAN_BT_TLMM_PAGE(n)	(MONDRIAN_BT_TLMM_BASE + 0x1000UL * (n))
 +#define MONDRIAN_BT_TLMM_CFG		0x0
++#define MONDRIAN_BT_TLMM_INTR_CFG	0x8
++#define MONDRIAN_BT_TLMM_INTR_STATUS	0xc
 +#define MONDRIAN_BT_TLMM_IN_OUT		0x4
 +#define MONDRIAN_BT_TLMM_OUTPUT		(1u << 9)
 +#define MONDRIAN_BT_TLMM_DRIVE_8MA	3
@@ -775,11 +777,27 @@ index 0000000..239f429
 +		if (page == 0) {
 +			continue;
 +		}
-+		mondrian_bt_wr(page, MONDRIAN_BT_TLMM_CFG,
-+		    MONDRIAN_BT_TLMM_FUNC_QUP20);
-+		snprintf(line, sizeof(line), "btpower: gpio %u -> qup20 cfg 0x%x\n",
-+		    uart_pins[i], mondrian_bt_rd(page, MONDRIAN_BT_TLMM_CFG));
-+		n = mondrian_bt_step(out, len, n, line);
++		/*
++		 * RX (79) is also the node's wakeup line and the loader leaves
++		 * its interrupt enabled: mask it and clear the latch before the
++		 * chip starts driving the pad, or its traffic is an interrupt
++		 * nobody acknowledges.
++		 */
++		{
++			uint32_t intr = mondrian_bt_rd(page,
++			    MONDRIAN_BT_TLMM_INTR_CFG);
++
++			mondrian_bt_wr(page, MONDRIAN_BT_TLMM_INTR_CFG, 0);
++			mondrian_bt_wr(page, MONDRIAN_BT_TLMM_INTR_STATUS,
++			    0xffffffffu);
++			mondrian_bt_wr(page, MONDRIAN_BT_TLMM_CFG,
++			    MONDRIAN_BT_TLMM_FUNC_QUP20);
++			snprintf(line, sizeof(line),
++			    "btpower: gpio %u qup20 cfg 0x%x (intr was 0x%x)\n",
++			    uart_pins[i],
++			    mondrian_bt_rd(page, MONDRIAN_BT_TLMM_CFG), intr);
++			n = mondrian_bt_step(out, len, n, line);
++		}
 +	}
 +
 +	/* SW_CTRL is an input: the part drives it high once it is running. */
