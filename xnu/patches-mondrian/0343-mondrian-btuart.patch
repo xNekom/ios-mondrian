@@ -45,10 +45,10 @@ index 94f8668..9cebc34 100755
  bsd/dev/mondrian_gpu.c			standard
 diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
 new file mode 100644
-index 0000000..9677a58
+index 0000000..34663af
 --- /dev/null
 +++ b/bsd/dev/mondrian_btuart.c
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,920 @@
 +/*
 + * The Bluetooth port is serial engine 5 of QUPv3 wrapper 2. The live tree has
 + * qcom,msm-geni-serial-hs at 0x894000 (the wrapper is at 0x8C0000 and its SE
@@ -206,6 +206,8 @@ index 0000000..9677a58
 +#define MONDRIAN_BT_UART_START_TX	0x1
 +#define MONDRIAN_BT_UART_START_READ	0x1
 +#define MONDRIAN_BT_RX_FIFO_WC_MSK	0x01ffffffu
++#define MONDRIAN_BT_RX_LAST		(1u << 31)
++#define MONDRIAN_BT_RX_LAST_BYTE	(0x7u << 28)
 +#define MONDRIAN_BT_RX_LAST		(1u << 31)
 +#define MONDRIAN_BT_RX_LAST_BYTE_MSK	(0x7u << 28)
 +#define MONDRIAN_BT_RX_LAST_BYTE_SHFT	28
@@ -588,21 +590,39 @@ index 0000000..9677a58
 +	 * byte reported the reset as a lone 0x04.
 +	 */
 +	for (uint32_t t = 0; t < wait_ms; t++) {
-+		uint32_t count, drained = 0;
++		uint32_t words, drained = 0;
 +
 +		status = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
-+		count = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
-+		while (drained < count) {
-+			uint32_t word = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO);
-+			uint32_t take = (count - drained) > 4 ? 4 : count - drained;
++		words = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
++		if (words != 0) {
++			uint32_t last = (status & MONDRIAN_BT_RX_LAST_BYTE) >> 28;
++			uint32_t bytes = 4 * (words - 1);
 +
-+			for (uint32_t i = 0; i < take; i++) {
-+				if (got < cap) {
-+					buf[got] = (uint8_t)(word >> (8 * i));
-+				}
-+				got++;
++			/*
++			 * The status counts words of four bytes, and the last one may
++			 * be short: RX_LAST says it is partial and RX_LAST_BYTE_VALID
++			 * how many bytes it carries, zero meaning all four.
++			 */
++			if ((status & MONDRIAN_BT_RX_LAST) == 0 || last == 0) {
++				bytes += 4;
++			} else {
++				bytes += last;
 +			}
-+			drained += take;
++			while (drained < bytes) {
++				uint32_t word = mondrian_bt_rd(se,
++				    MONDRIAN_BT_RX_FIFO);
++				uint32_t take = (bytes - drained) > 4 ? 4 :
++				    bytes - drained;
++
++				for (uint32_t i = 0; i < take; i++) {
++					if (got < cap) {
++						buf[got] = (uint8_t)(word >>
++						    (8 * i));
++					}
++					got++;
++				}
++				drained += take;
++			}
 +		}
 +		if (drained != 0) {
 +			quiet = 0;
