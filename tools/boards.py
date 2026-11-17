@@ -333,10 +333,14 @@ MONDRIAN = Board(
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_fps=1 '
              # The driver's fallback blank: seconds without a present and
-             # without a touch, then it paints black and a touch wakes it. The
-             # default of 1 turned the panel off the first second the compositor
-             # quieted; 30 is the idle timeout this boot is testing.
-             'mondrianfb_blank=30 '
+             # without a touch, then the panel is switched off with DCS 0x28
+             # and a touch switches it back on. It is 0 (off) while
+             # CoreAnimation renders through Mesa: measured 2026-11-17, 30
+             # reset the phone about 30 s into every boot (4 of 4, back to
+             # boot_b, the panel never left the logo) and 0 booted twice of
+             # twice, so that DCS path needs fixing before the timer returns
+             # (docs/MONDIAN_GPU.md).
+             'mondrianfb_blank=0 '
              # The hook in SpringBoard (0x4) renders: lock screen, home screen,
              # Control Center, apps; the whole hook in backboardd or
              # runningboardd leaves the glass black, measured 2026-11-16

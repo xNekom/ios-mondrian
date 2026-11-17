@@ -211,13 +211,14 @@ panel is written through the console alias, which is only stopped with
 Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
 (`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
 `0302`/`0303` blank the panel on the power key and on idle sleep, and `0342`
-switches it off with DCS `0x28` instead of painting the framebuffer black: iOS
-stops presenting when it sleeps, so a key or a touch un-blanks and the tick
-sends `0x29` -- a wake cannot wait for a frame. The fallback timer
-(`mondrianfb_blank`) is 30 in the board cmdline. The hook's holds are off
-(`mondriankeepawake=0`); iOS's timer never arms -- `SBLockScreenAutoLockTime` was
-missing and the hook writes it, and `SBLockScreenManager` has no
-`_idleTimerPolicyAggregator`. `0305` sets the brightness, `0304` the battery.
+switches it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key
+or a touch un-blanks and the tick sends `0x29` -- a wake cannot wait for a
+frame. The fallback timer (`mondrianfb_blank`) is 0 in the board cmdline: the
+DCS blank resets the phone while CoreAnimation renders through Mesa
+(`docs/MONDIAN_GPU.md`); the hook's holds are off (`mondriankeepawake=0`) and
+iOS's timer never arms -- `SBLockScreenAutoLockTime` was missing and the hook
+writes it, and `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
+`0305` brightness, `0304` battery.
 sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
 
 ### 4. The touch

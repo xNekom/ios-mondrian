@@ -1344,6 +1344,15 @@ Measured 2026-11-17 with `0x4`: the compositor stays in `mode copy`, every
 SpringBoard is the stale `/usr/libexec` copy, which returns at once because its
 constructor arms for `backboardd` alone.
 
+**The idle blank resets the phone while Mesa renders.** Measured 2026-11-17 with
+`mondrian_gpu_hook=1`: `mondrianfb_blank=30` reset the phone about 30 s into
+every boot, four boots of four, before the ring answered, and `boot_b` answered
+instead; `blank=0` booted the same image twice of twice, with the injector in
+backboardd and Mesa drawing frames in the ring. The timer only starts once
+`fLastPresentTicks` is set, so the DCS `0x28` goes out while the interface is
+presenting. `tools/boards.py` carries 0 until that path is fixed, so the panel
+now stays lit when idle.
+
 ### The hook that was measured was not the hook in the tree
 
 The kernel embeds `out/gpu/mondrian-ui-hook.dylib` and writes it to

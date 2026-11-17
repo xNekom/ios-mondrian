@@ -71,13 +71,13 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 Current blockers, in order:
 
 1. **The panel sleeps, and iOS stops drawing before it does.** `mondrianfb_blank`
-   seconds (30 in the board table) without a present switches the panel off with
-   DCS `0x28`; a key or a touch switches it back on (`0x29`) from the tick, never
-   from a frame -- iOS has stopped its display link, so the tap presents nothing
-   (`0342`; `0302` painted the framebuffer black instead and destroyed the only
-   frame the panel had). The hook's holds stay off (`mondriankeepawake=0`) and
-   iOS's timer never arms: `SBLockScreenAutoLockTime` was missing (the hook
-   writes it) and `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
+   seconds (0 in the board table: the DCS blank resets the phone with the
+   injector in `backboardd`, `docs/MONDIAN_GPU.md`) without a present switches the
+   panel off with DCS `0x28`; a key or touch switches it back on (`0x29`) from the
+   tick, never from a frame -- iOS has stopped its display link, so a tap presents
+   nothing (`0342`). The holds stay off (`mondriankeepawake=0`) and iOS's timer
+   never arms: `SBLockScreenAutoLockTime` was missing (the hook writes it) and
+   `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is
    out of reach: the level is a voltage table (`0304`), anchored to the Android

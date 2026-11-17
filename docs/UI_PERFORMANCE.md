@@ -22,9 +22,10 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
   (`MONDRIAN BL: dma len 0 size 4 ... done 1`), then on the first touch
   `MONDRIAN FB: panel wake (touch)` and `MONDRIAN FB: panel on (dcs)`. Those
   lines are the check: a missing blank means frames never stopped (or the blank
-  is disabled), `panel off refused` means the panel rejected `0x28` and the
-  black-paint fallback ran, and a missing wake line means the touch never
-  reached the driver. None of it costs a rebuild.
+  is disabled -- it is, while the injector renders through Mesa: the DCS write
+  resets the phone, `docs/MONDIAN_GPU.md`), `panel off refused` means the panel
+  rejected `0x28` and the black-paint fallback ran, and a missing wake line means
+  the touch never reached the driver. None of it costs a rebuild.
   `present 0/s` in the same dump is the still screen, not a fault: the samples
   that follow a touch read 4-5/s.
 
@@ -308,7 +309,9 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   `start_heartbeat()`), and the per-process CPU line replaces it as the cheap
   default.
 - **The boot arg `mondrianfb_blank` is a fallback timer** (seconds without a
-  present, 0 disables it), not the power key. The board cmdline sets 30.
+  present, 0 disables it), not the power key. The board cmdline carried 30 and
+  now carries 0 while CoreAnimation renders through Mesa: the DCS blank resets
+  the phone (`docs/MONDIAN_GPU.md`).
 
 ## Next probes
 
