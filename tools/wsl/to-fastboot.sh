@@ -7,14 +7,32 @@
 # when it leaves iOS and when the bootloader takes over, so the attach has to be
 # repeated inside the wait instead of once before it. Asking "why is fastboot
 # not there" cost a whole dump attempt.
+#
+# The bus id is not a constant either: the phone moves ports, and a stale one
+# leaves every attach failing while `fastboot devices` (host side, no usbipd)
+# still answers, which reads like a phone that never got to the bootloader. It
+# is looked up by USB id instead, every time, because the id changes with the
+# mode (1209:0001 running, 18d1:d00d in fastboot).
 set -u
 cd "$(dirname "$0")/../.." || exit 1
-BUSID=${BUSID:-7-1}
 FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
 IFACE=${IFACE:-enx02005e77ee01}
 
+busid() {
+	if [ -n "${BUSID:-}" ]; then
+		echo "$BUSID"
+		return
+	fi
+	usbipd.exe list 2>/dev/null |
+		grep -aE '1209:0001|18d1:d00d' | awk '{print $1}' | head -1
+}
+
 try_attach() {
-	usbipd.exe attach --wsl --busid "$BUSID" > /dev/null 2>&1
+	local b
+
+	b=$(busid)
+	[ -n "$b" ] || return 1
+	usbipd.exe attach --wsl --busid "$b" > /dev/null 2>&1
 	sleep 3
 }
 

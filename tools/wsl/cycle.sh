@@ -22,7 +22,8 @@ if [ "${1:-}" = "--no-build" ]; then
 	shift
 fi
 CMDS=()
-if [ "${1#@}" != "${1:-}" ]; then
+case "${1:-}" in
+@*)
 	# "@FILE" reads one command per line. Inline commands need their spaces
 	# quoted, and a shell one level up (PowerShell calling wsl) eats those
 	# quotes: `hapr 0 0` arrived as a bare `hapr` and the block "did not
@@ -30,11 +31,15 @@ if [ "${1#@}" != "${1:-}" ]; then
 	while IFS= read -r line; do
 		[ -n "$line" ] && CMDS+=("$line")
 	done < "${1#@}"
-else
+	;;
+*)
+	# No command at all is a valid run (boot it and read the ring); `set -u`
+	# on a bare "$1" made that die with "1: unbound variable".
 	CMDS=("$@")
-fi
+	;;
+esac
 IFACE=${IFACE:-enx02005e77ee01}
-BUSID=${BUSID:-7-1}
+BUSID=${BUSID:-}
 FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
 K=xnu/out/kernel.development.mondrian
 LOG=${LOG:-/root/cycle}
@@ -58,7 +63,15 @@ bash tools/wsl/image.sh || exit 1
 
 # 2. The phone has to be in fastboot before anything is loaded.
 attach() {
-	usbipd.exe attach --wsl --busid "$BUSID" > /dev/null 2>&1
+	local b
+
+	# By USB id, not by a fixed port: the phone moves, and a stale bus id
+	# leaves every attach failing while `fastboot devices` keeps answering.
+	b=$(usbipd.exe list 2>/dev/null | grep -aE '1209:0001|18d1:d00d' |
+		awk '{print $1}' | head -1)
+	[ -n "${BUSID:-}" ] && b=$BUSID
+	[ -n "$b" ] || return 1
+	usbipd.exe attach --wsl --busid "$b" > /dev/null 2>&1
 	sleep 5
 	ip link set "$IFACE" up 2>/dev/null
 	ip addr add 192.168.7.1/24 dev "$IFACE" 2>/dev/null
