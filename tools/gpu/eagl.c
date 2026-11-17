@@ -4697,7 +4697,7 @@ gpu_self_test(void)
 	 */
 	GLint prev_fbo = 0, prev_viewport[4] = { 0, 0, 0, 0 };
 
-	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_fbo);
 	glGetIntegerv(GL_VIEWPORT, prev_viewport);
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
