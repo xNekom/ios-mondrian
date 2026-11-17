@@ -89,6 +89,28 @@ the order they were paid for:
 The rest of this file is the design. CoreAnimation draws through Mesa into the display's IOSurface
 with no copy; the no-copy path below is what does it.
 
+## Reading the system frameworks
+
+The frameworks this file talks about exist only inside the dyld shared cache; the
+`*.framework` directories in the iOS root hold resources and no code. `ipsw dyld extract` is the
+obvious tool and it does not work here: every `ipsw dyld` subcommand opens the cache's companion
+`.symbols` file first, and this workstation's copy is truncated (28 bytes), as is the main cache
+(12 MB). `tools/dsc-image.py CACHE_DIR SpringBoardHome` reads the subcaches instead -- they are
+intact -- follows the mapping tables to each segment, drops the shared `__LINKEDIT` and writes a
+thin arm64 Mach-O that `llvm-objdump` and REA's artifact reader both open:
+
+    tools/dsc-image.py /root/dsccache SpringBoardHome /tmp/SpringBoardHome.arm64
+    llvm-objdump --macho -p /tmp/SpringBoardHome.arm64
+
+REA on Windows identifies such an image but cannot analyse it: its Mach-O providers are Hopper
+(macOS), the macOS native utilities, and Ghidra, which on Windows accepts only PE and 6502.
+Rizin is the provider that does run on Windows (`REA_RIZIN_COMMAND`), and it is not installed.
+
+What the image already answers: `WallpaperCaptureGroup` is the backdrop group the library's
+materials name, and the library's background is built from `SBFFeatherBlurView`,
+`SBDarkeningImageView` and `SBFolderBackgroundView` -- a blur of the wallpaper and a darkening on
+top, which is why an empty capture is black rather than merely wrong.
+
 ## Who loads what
 
 ```
