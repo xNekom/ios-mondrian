@@ -97,21 +97,48 @@ on a still screen is normal, and what matters is whether a touch brings a frame.
 
 `MONDRIAN FB: fps` prints once a second and `mondrian-gl: frame` every 20th
 frame (and the first 40), both steered by boot args (`mondrianfb_fps=1`,
-`glframes=1`). One steady-state boot (156 frames, home screen) gives:
+`glframes=1`). `gpustat` adds `gpuacct` (submissions, fence waits and their
+time, doorbell to fence against the wall clock) and `gpuperf` moves the GPU's
+perf index at run time.
 
-| measurement | p50 | p90 | max |
+Measured 2026-11-17 with the same eight page swipes (~20 s of motion) in one
+boot each, so the three columns differ only in what changed:
+
+| | 285 MHz | 900 MHz | 900 MHz + AMP |
 | --- | --- | --- | --- |
-| frame, `mondrian-gl` total | 11.0 ms | 19.8 ms | 37 ms |
-| of which waiting for the GPU (`glFinish`) | 5.0 ms | 12.9 ms | 25.8 ms |
-| of which Mesa command encoding (the rest) | 3.4 ms | 10.0 ms | - |
-| draws per frame | 66 | 91 | 176 |
-| kernel copy of the surface into the panel | 2.4 ms | 4.4 ms | 5.5 ms |
+| frames at the panel (`intf` `fc`) | 60/s | 60/s | 60/s |
+| frames the compositor produced | 41-47/s | 48-52/s | 52-57/s |
+| `mondrian-gl` frame total | 17.1 ms | 17.1 ms | **9.2 ms** |
+| of which waiting for the GPU | 13.3 ms | 8.5-10.5 ms | **4.5 ms** |
+| CPU inside the GL calls | 7.9 ms | 7.9 ms | **3.85 ms** |
+| kernel copy into the panel | 4.2 ms | 3.5 ms | **2.4 ms** |
+| of which the cache clean | 1.2 ms | 1.2 ms | **0.49 ms** |
+| frames ending on a P core | 32 % | 32 % | **99.8 %** |
 
-- **24 % of frames miss the 16.7 ms period** (37 of 156). The cost grows with
-  the draw count, about 100 us a draw on the CPU and 40 us on the GPU, which is
-  what a scroll or a blur pays for.
-- **The panel side is healthy**: `vsync avg 16666 us`, `over20 0`,
-  `present 55-59/s`, `drop 0`. The tick is not what drops frames.
+- **The panel is not what drops frames.** The interface sends one frame every
+  tick (`intf fc` +59..+61 a second) throughout; the compositor produces
+  52-57. The frames that are missing are the ones whose work crosses the
+  period: `late` averages 7.5 ms and peaks at 11-12, the copy peaks at 3.3-5.4,
+  and that sum is where a 33 ms cadence comes from.
+- **The GPU was at its idle OPP** (index 2, 285 MHz) for the whole session
+  because the HFI vote is sent once at GMU start and kgsl on Android re-sends
+  it per submission. `gpuperf 13` at run time gives the top OPP and, by
+  itself, 3.2x less GPU time per submission and +15 % frames. Index 13 in the
+  boot vote does not come back to fastboot; the run-time vote does
+  (`docs/MONDIAN_GPU.md`).
+- **The scheduler treated all seven cores as equal**: `NO_ECORE`,
+  `MAX_CPU_CLUSTERS 1` and `cluster-type` 0 in every ADT CPU node left
+  `__ARM_AMP__` undefined, one `PSET_SMP`, and 68 % of frames finishing on an
+  A510. `0347` declares the A510 cluster `CLUSTER_TYPE_E` and the A710/X2 one
+  `CLUSTER_TYPE_P`, which halves the CPU cost of a frame and moves almost all
+  of it to the P cores. This is the single largest win measured so far and it
+  costs nothing at run time.
+- **The copy is the next cliff**: 2.4 ms of a 9.2 ms frame, `clean` included,
+  and 5.4 ms at worst. `mondrianfb_nocopy=N` skips it N seconds out of ten so
+  one boot can show what the producer sustains without it. A sliced copy (the
+  caller plus kernel threads on the efficiency cluster) was written and does
+  not boot -- the first frame it serves ends the boot -- so it is not in the
+  tree.
 - **The copy-out path is a cliff, not a slope**: some frames take
   `1 textures refilled from IOSurfaces (18400 KB)` plus 10-13 ms of
   `copying out` for two or three draws. It shows up at boot and on app launch,

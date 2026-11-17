@@ -1,0 +1,77 @@
+xnu 0347: the scheduler is told which cores are the fast ones
+
+The board header declared the SoC a single homogeneous SMP cluster
+(`MAX_CPU_CLUSTERS 1`, `NO_ECORE`, and `cluster-type` 0 in every ADT CPU
+node), so `__ARM_AMP__` was undefined and every core went into one PSET_SMP.
+XNU therefore had no notion of a performance or an efficiency cluster: no
+QoS-to-cluster recommendation, no spill, no capacity-based placement. Measured
+on the phone with the compositor running: 68% of backboardd's frames ended on
+an A510, and a frame of ~490 GL calls costs ~5 ms of CPU plus ~6 ms of
+CoreAnimation, which is what a frame running on the 4x-slower cluster looks
+like.
+
+Now the board is AMP: the A510 cluster is CLUSTER_TYPE_E and the A710/X2 one
+is CLUSTER_TYPE_P, which `ml_parse_cpu_topology` turns into two psets (one per
+type, because HAS_CLUSTER is off and the cluster id is derived from the type).
+`recommended_pset_type()` sends threads above BASEPRI_UTILITY -- the
+compositor, SpringBoard, everything the UI waits for -- to the P pset and
+leaves background work on the E cluster.
+
+MAX_CPU_CLUSTERS is 2, not 3: the physical A710 and X2 clusters share the P
+type and therefore one pset, and the array only has to hold one pset per
+cluster.
+
+The ADT's cluster-type is a one-byte property ('P'/'E'); tools/mkadt.py emits
+it per CPU from the board table.
+diff --git a/pexpert/pexpert/arm64/MONDRIAN.h b/pexpert/pexpert/arm64/MONDRIAN.h
+index 4b15aea..c7e7b61 100644
+--- a/pexpert/pexpert/arm64/MONDRIAN.h
++++ b/pexpert/pexpert/arm64/MONDRIAN.h
+@@ -25,15 +25,26 @@
+ #define _PEXPERT_ARM64_MONDRIAN_H
+ 
+ #define NO_MONITOR                1
+-#define NO_ECORE                  1
++
++/*
++ * Asymmetric multiprocessing: the SoC has an efficiency cluster (four A510)
++ * and a performance one (three A710 and the X2), and XNU builds one pset per
++ * type from the ADT's per-CPU cluster-type ('P' or 'E', one byte; see
++ * tools/mkadt.py). Without it every core is CLUSTER_TYPE_SMP and the
++ * scheduler treats the A510s as equals of the X2, which is where the
++ * compositor's threads ended up 68% of the time and why a 600-call frame
++ * costs 5 ms of CPU. MAX_CPU_CLUSTERS in board_config.h has to be > 1 for
++ * this to survive (it is 2: one pset per type, not one per physical
++ * cluster).
++ */
++#define __ARM_AMP__               1
+ 
+ #define MONDRIAN                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * All eight cores (4 x A510, 3 x A710, 1 x X2): cpus=N is clamped here. Same
++ * ISA level (ARMv9.0), 64-byte lines, PSCI CPU_ON. The firmware core stays
++ * parked in the shim, so the kernel runs on seven of them.
+  */
+ #define MONDRIAN_SMP_MAX_CPUS         8
+ 
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index db3aad9..cea8f84 100755
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,10 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+-#define MAX_CPU_CLUSTERS               1
++/* Two psets: the A510 cluster is E, the A710 and X2 count as one P cluster
++ * (ml_parse_cpu_topology derives the cluster from the type when HAS_CLUSTER
++ * is off). One cluster leaves __ARM_AMP__ undefined and every core equal. */
++#define MAX_CPU_CLUSTERS               2
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 

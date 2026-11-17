@@ -173,7 +173,11 @@ def build(board, seed=None, qemu=False, altmem=False):
             ('reg', u32(0 if qemu else cpu.aff1 << 8)),
             ('cpu-id', u32(core)),        # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(cpu.cluster)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            # One byte, read by ml_readprop as its value: 'P' or 'E' makes the
+            # core part of a performance or an efficiency cluster, which is
+            # what CONFIG_AMP/__ARM_AMP__ turns into two psets. 0
+            # (CLUSTER_TYPE_SMP) is a single pset and no cluster steering.
+            ('cluster-type', cpu.ptype.encode('ascii') if cpu.ptype else u32(0)),
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(cpu.l2)),  # distinct per-core L2 nodes in live FDT

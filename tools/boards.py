@@ -45,6 +45,10 @@ class Cpu:
     freq: int          # clock-frequency, for the device tree
     l2: int            # l2-cache-id, for the device tree
     capacity: int = 0  # capacity-dmips-mhz, the live FDT's own measure of speed
+    # 'P' or 'E': the ADT's one-byte cluster-type, which is how the kernel
+    # learns that this core belongs to a performance or an efficiency cluster
+    # (empty leaves it CLUSTER_TYPE_SMP, one pset for every core).
+    ptype: str = ''
 
 
 @dataclass(frozen=True)
@@ -302,7 +306,11 @@ MONDRIAN = Board(
             # capacity and de-prioritises the slow ones (0284).
             freq=1804000000 if i < 4 else (2496000000 if i < 7 else 2995000000),
             l2=0 if i < 4 else i,
-            capacity=1024 if i < 4 else (2253 if i < 7 else 2386))
+            capacity=1024 if i < 4 else (2253 if i < 7 else 2386),
+            # AMP: the A510 cluster is the efficiency one, the A710 and X2
+            # the performance one (patch 0347; the kernel builds one pset per
+            # type and steers UI-priority threads to P).
+            ptype='E' if i < 4 else 'P')
         for i in range(8)
     ),
     boot_core=7,                 # the X2: the firmware's core 0 is an A510

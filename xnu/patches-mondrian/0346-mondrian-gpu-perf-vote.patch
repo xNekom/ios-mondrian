@@ -1,0 +1,209 @@
+xnu 0346: the GPU's clock can be moved on a running system, and the ring says
+how much of a frame the GPU actually owns
+
+The HFI power vote carries perf-table index 2 (285 MHz) because that is what
+the bring-up sends when the GMU starts; kgsl sends a fresh one per submission,
+so on Android the GPU runs at the OPP the load needs. Nothing raises it here,
+and the measured frame cost is what a GPU at the idle OPP looks like.
+
+`gpuperf N` (ring command) sets the index and re-sends the vote, so 285 MHz and
+900 MHz can be compared in one boot instead of one boot each; `gpuperf` alone
+prints the index in effect. The vote is sent after the CP has run, which is
+where kgsl's does, and the ARC rails are already at their top level by then.
+
+`gpustat` also prints `gpuacct`: submissions, dwords, how many fence waits the
+clients did and how long they took, and the sum of doorbell-to-fence over the
+whole session beside the wall clock it spans. That sum is GPU busy time: a
+frame whose wait is the GPU drawing shows up as the same fraction of wall
+clock, and a wait that is latency with an idle GPU does not.
+
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+index 5a6fd70..794a9c6 100644
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -118,6 +118,23 @@ static struct {
+ 	uint32_t dwords;
+ } mondrian_uc_hist[MONDRIAN_UC_HIST];
+ static uint32_t mondrian_uc_hist_n;
++/*
++ * What the submissions cost, for the ring's gpustat: a submission is stamped
++ * when the doorbell rings and the fence the client waits for is read here, so
++ * the sum of those intervals is how much of the wall clock the CPU was waiting
++ * for this GPU. Compared with the wall clock it says whether the frame rate is
++ * the GPU's work or something else (a submission the CP has not started, a
++ * client that waits where it did not have to).
++ */
++#define MONDRIAN_UC_STAMP 64u
++static struct {
++	uint32_t seq;
++	uint64_t began;
++} mondrian_uc_stamp[MONDRIAN_UC_STAMP];
++static uint64_t mondrian_uc_first_submit;
++static uint64_t mondrian_uc_submits, mondrian_uc_dwords;
++static uint64_t mondrian_uc_waits, mondrian_uc_wait_us, mondrian_uc_wait_max_us;
++static uint64_t mondrian_uc_gpu_us, mondrian_uc_gpu_max_us;
+ static uint32_t mondrian_uc_wrap_n;
+ static uint32_t mondrian_uc_wrap_blind;
+ static uint32_t mondrian_uc_wrap_last;
+@@ -3944,7 +3961,62 @@ mondrian_gpu_status(void)
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_CP_CP2GMU_STATUS * 4u),
+ 	    mondrian_gpu_read(mondrian_uc_gpu, GEN7_RBBM_STATUS * 4u),
+ 	    mondrian_uc_keep, mondrian_uc_nomark);
++	if (mondrian_uc_first_submit != 0) {
++		uint64_t wall = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() -
++		    mondrian_uc_first_submit, &wall);
++		printf("MONDRIAN GPU: gpuacct submits %llu dwords %llu, waits %llu"
++		    " wait %llu us max %llu us, gpu %llu us max %llu us in %llu us,"
++		    " perf %u\n",
++		    (unsigned long long)mondrian_uc_submits,
++		    (unsigned long long)mondrian_uc_dwords,
++		    (unsigned long long)mondrian_uc_waits,
++		    (unsigned long long)mondrian_uc_wait_us,
++		    (unsigned long long)mondrian_uc_wait_max_us,
++		    (unsigned long long)mondrian_uc_gpu_us,
++		    (unsigned long long)mondrian_uc_gpu_max_us,
++		    (unsigned long long)(wall / 1000), mondrian_gpu_perf);
++	}
++	mondrian_log_flush_now();
++}
++
++/*
++ * gpuperf, at run time: the perf-table index the HFI power vote carries. The
++ * vote is sent once when the GMU starts and stands for the whole session
++ * (index 2, 285 MHz), where kgsl sends a fresh one per submission. Moving it
++ * after the CP is running is the way kgsl does it, and it is also where a high
++ * index is safe: the ARC rails are already at their top level.
++ */
++int
++mondrian_gpu_perf_get(void)
++{
++	return (int)mondrian_gpu_perf;
++}
++
++int
++mondrian_gpu_perf_set(int perf)
++{
++	uint32_t was = mondrian_gpu_perf;
++	int r;
++
++	if (mondrian_uc_up == 0 || mondrian_uc_gmu == 0) {
++		printf("MONDRIAN GPU: perf no gpu in this boot\n");
++		mondrian_log_flush_now();
++		return -1;
++	}
++	if (perf >= 0) {
++		mondrian_gpu_perf = (uint32_t)(perf > 13 ? 13 : perf);
++	}
++	/* Print before the vote: a GMU that does not come back leaves the line. */
++	printf("MONDRIAN GPU: perf %u -> %u (%u MHz) voting\n", was,
++	    mondrian_gpu_perf, mondrian_gpu_perf != 0 ?
++	    mondrian_power_levels[13 - mondrian_gpu_perf].hz / 1000000u : 0);
+ 	mondrian_log_flush_now();
++	r = mondrian_gpu_hfi_vote(mondrian_uc_gmu, 1);
++	printf("MONDRIAN GPU: perf vote %d\n", r);
++	mondrian_log_flush_now();
++	return r;
+ }
+ 
+ 
+@@ -5233,6 +5305,18 @@ mondrian_gpu_uc_submit(uint64_t ib, uint32_t dwords, uint32_t *fence)
+ 		printf("MONDRIAN GPU: uc ring door 0x%x\n", at);
+ 		mondrian_log_flush_now();
+ 	}
++	{
++		uint64_t now = mach_absolute_time();
++		unsigned slot = seq % MONDRIAN_UC_STAMP;
++
++		mondrian_uc_stamp[slot].seq = seq;
++		mondrian_uc_stamp[slot].began = now;
++		if (mondrian_uc_first_submit == 0) {
++			mondrian_uc_first_submit = now;
++		}
++		mondrian_uc_submits++;
++		mondrian_uc_dwords += dwords;
++	}
+ 	if (mondrian_uc_async != 0 && mondrian_uc_door_started != 0) {
+ 		uint32_t waited;
+ 
+@@ -5558,6 +5642,7 @@ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ {
+ 	volatile uint32_t *view = (volatile uint32_t *)mondrian_cp_memptr_view;
+ 	uint32_t spent_us = 0, limit_us, value;
++	uint64_t began = mach_absolute_time();
+ 
+ 	if (view == NULL || fence == 0 || fence > mondrian_uc_fence) {
+ 		return -1;
+@@ -5567,6 +5652,26 @@ mondrian_gpu_uc_wait(uint32_t fence, uint32_t timeout_ms)
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		value = view[mondrian_uc_fence_word(fence)];
+ 		if ((int32_t)(value - fence) >= 0) {
++			uint64_t done = mach_absolute_time(), waited = 0;
++			unsigned slot = fence % MONDRIAN_UC_STAMP;
++
++			absolutetime_to_nanoseconds(done - began, &waited);
++			mondrian_uc_waits++;
++			mondrian_uc_wait_us += waited / 1000;
++			if (waited / 1000 > mondrian_uc_wait_max_us) {
++				mondrian_uc_wait_max_us = waited / 1000;
++			}
++			if (mondrian_uc_stamp[slot].seq == fence &&
++			    done > mondrian_uc_stamp[slot].began) {
++				uint64_t busy;
++
++				absolutetime_to_nanoseconds(
++				    done - mondrian_uc_stamp[slot].began, &busy);
++				mondrian_uc_gpu_us += busy / 1000;
++				if (busy / 1000 > mondrian_uc_gpu_max_us) {
++					mondrian_uc_gpu_max_us = busy / 1000;
++				}
++			}
+ 			mondrian_uc_sysmem_state(fence);
+ 			if (mondrian_uc_logged < 10) {
+ 				mondrian_uc_logged++;
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 735e729..d9c2df7 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -1955,6 +1955,30 @@ ud_cmd_gpukeep(socket_t so, struct sockaddr_in *to, const char *line)
+ 	printf("%s", out);
+ }
+ 
++/*
++ * "gpuperf" prints the perf-table index the GPU is voted at and "gpuperf N"
++ * moves it: the boot vote stands for the whole session otherwise, where kgsl
++ * sends a fresh one per submission. 2 is the idle OPP (285 MHz), 13 the top
++ * (900); the answer is the index that is now in effect.
++ */
++static void
++ud_cmd_gpuperf(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_gpu_perf_set(int perf);
++	extern int mondrian_gpu_perf_get(void);
++	uint32_t perf = 0;
++	char out[64];
++	int n;
++
++	if (line[7] == ' ' && ud_cmd_num(line + 8, &perf) != NULL) {
++		(void)mondrian_gpu_perf_set((int)perf);
++	}
++	n = snprintf(out, sizeof(out), "gpuperf %d\n",
++	    mondrian_gpu_perf_get());
++	ud_cmd_send(so, to, out, (size_t)n);
++	printf("%s", out);
++}
++
+ /*
+  * "gpustat" logs the collapse registers; the answer is only the ack, because
+  * the numbers are lines in the ring already.
+@@ -2598,6 +2622,9 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strcmp(cmd, "gpukeep") == 0 ||
+ 			    strncmp(cmd, "gpukeep ", 8) == 0) {
+ 				ud_cmd_gpukeep(so, peer, cmd);
++			} else if (strcmp(cmd, "gpuperf") == 0 ||
++			    strncmp(cmd, "gpuperf ", 8) == 0) {
++				ud_cmd_gpuperf(so, peer, cmd);
+ 			} else if (strcmp(cmd, "gpustat") == 0) {
+ 				ud_cmd_gpustat(so, peer, cmd);
+ 			} else if (strcmp(cmd, "temp") == 0) {
