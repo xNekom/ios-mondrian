@@ -5741,6 +5741,50 @@ boot_arg_set(const char *name)
 		return 0;
 	}
 	args[sizeof(args) - 1] = 0;
+	/*
+	 * An argument that is in the payload's command line but not in this
+	 * string is invisible to every hook in the boot, and the two look
+	 * identical from the ring: the hook simply behaves as if it was never
+	 * passed. Say the length and the tail once, so the next boot answers
+	 * whether the kernel sees the whole line.
+	 */
+	{
+		static int said;
+		static const char *wanted[] = { "mondrianunlock=1",
+		    "mondriannosleep=1", "mondrianwallpaper=1" };
+		unsigned i;
+
+		if (!said) {
+			char line[256];
+			size_t len = strlen(args);
+			const char *tail = len > 100 ? args + len - 100 : args;
+
+			said = 1;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN BOOT: args %u bytes tail '%s'\n",
+			    (unsigned)len, tail);
+			say(line);
+			/* The whole string, so the head is visible too: an argument
+			 * missing from the middle says the shim rebuilt the line and
+			 * dropped it, not that it was cut off the end. */
+			{
+				size_t off;
+
+				for (off = 0; off < len && off < 640; off += 120) {
+					snprintf(line, sizeof(line),
+					    "MONDRIAN BOOT: [%03u] %.120s\n",
+					    (unsigned)off, args + off);
+					say(line);
+				}
+			}
+			for (i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN BOOT: %s %s\n", wanted[i],
+				    strstr(args, wanted[i]) != NULL ? "present" : "absent");
+				say(line);
+			}
+		}
+	}
 	return strstr(args, name) != NULL;
 }
 
