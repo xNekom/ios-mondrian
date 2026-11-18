@@ -278,7 +278,16 @@ boot each, so the three columns differ only in what changed:
   library with the same `far` (`PhotosFileProvider` and `fileproviderd`, both
   `sig 6 code 0x0`) are running one shared assert, not corrupting one variable;
   the registers say which call, the ring's `exec`/`exit` lines say what the code
-  was trying to start.
+  was trying to start. `tools/dsc-va.py CACHE --slide 0x… ADDR…` does the whole
+  lookup -- it finds the header by scanning back from the address, because the
+  split cache has no single image table -- and `--disasm N` prints the code
+  around it. Measured that way, the pair's backtrace is
+  `__pthread_kill <- pthread_kill <- abort <- libc++abi ×5 <- CoreFoundation <-
+  PlugInKit`: an exception thrown through CoreFoundation from PlugInKit reached
+  the terminate handler, so the process aborted itself and its own message went
+  to a stderr this port does not keep. Naming that exception needs a probe
+  inside the process before it aborts; `/private/var/vm/mondrian-exc` arms an
+  uncaught-exception handler in every non-UI process and prints `MONDRIAN EXC`.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper

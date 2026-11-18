@@ -102,6 +102,11 @@ thin arm64 Mach-O that `llvm-objdump` and REA's artifact reader both open:
     tools/dsc-image.py /root/dsccache SpringBoardHome /tmp/SpringBoardHome.arm64
     llvm-objdump --macho -p /tmp/SpringBoardHome.arm64
 
+`dsc-image.py` takes an image by name, and this cache holds some names twice (two
+`libc++abi.dylib`, one for DriverKit); for an address from a crash record use
+`tools/dsc-va.py` instead, which pins the image by the address itself
+(`docs/UI_PERFORMANCE.md` has the `--slide` rule).
+
 REA on Windows cannot analyse a Mach-O with its own providers: Hopper and the native utilities
 are macOS, and Ghidra on this platform accepts only PE and 6502. The provider that does run here
 is Rizin, through `execute_rizin_command`; it is installed at
