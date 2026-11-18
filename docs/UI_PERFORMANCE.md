@@ -268,18 +268,24 @@ boot each, so the three columns differ only in what changed:
   file holds `0`). A boot with the hook from before this code left 0
   `CRASH SpringBoard` entries; boots with it have left 0, 6 or 12, at one fixed
   pc, so the fault is **intermittent** and a single boot cannot attribute it.
-  What the record says: the pc is SpringBoard + 0xa4a14, which disassembles to
-  `bl` into a shared-cache stub (`0x1c9b0962c`), and `far - 0xf42` (once
-  `0xb42`) lands on a page boundary -- so the receiver was a mapped-then-unmapped
-  object page and this is a message to a freed object, reported at its call site.
-  The image extracted from the cache has no symbols and no `LC_FUNCTION_STARTS`,
-  so the function boundaries come from `__unwind_info`: an index entry is 12
-  bytes (`functionOffset` relative to the image base, second-level page offset,
-  LSDA offset) and a compressed page (kind 3) holds 4-byte entries whose low 24
-  bits are the offset from the page's first function and whose high 8 bits index
-  the encoding table. By that table the site is inside the 0x710-byte function at
-  +0xa48c0 -- at +0x154, with the `lr` at +0x124, so both are call sites of that
-  one function and not a return address from outside it.
+  What the record says: the pc is SpringBoard + 0xa4a14 and the lr +0xa49e4, both
+  inside the 0x710-byte function at +0xa48c0 (boundaries from `__unwind_info`,
+  see below), and the pc is a `bl` to `0x1c9b0962c`, which is outside the image
+  the cache extract carries. The `far` is what names the fault: the kernel also
+  dumps the map entry on each side of it, and the address falls in the hole
+  between `0x1183f0000-0x118414000` (rw) and `0x11842c000-0x11843c000`, so it is
+  not mapped at all -- and the record's `far` ends in `0xf42`, the ivar offset, so
+  the object began at `0x118428000`, inside that hole. A pointer into pages that
+  had been unmapped, which is a message to a freed object reported at its call
+  site. (Subtracting `0xf42` from a `far` that always ends in `0xf42` lands on a
+  page boundary by construction; it is not evidence, and the map lines are.)
+  The image extracted from the dyld shared cache has no symbols and no
+  `LC_FUNCTION_STARTS`, so those boundaries come from `__unwind_info`: an index
+  entry is 12 bytes (`functionOffset` relative to the image base, second-level
+  page offset, LSDA offset) and a compressed page (kind 3) holds 4-byte entries
+  whose low 24 bits are the offset from the page's first function and whose high
+  8 bits index the encoding table. That gives 29740 function starts for the
+  image, which is what the 0x710-byte function above comes from.
   Turning the App Library pass off changes nothing about a boot; turning the icon
   artwork pass off (`mondrianiconset=0` in `PREFIX_ARGS` to `image.sh`) measured
   6 in one boot against 12 in the boot before it, which is inside that spread and
