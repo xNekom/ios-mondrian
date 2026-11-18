@@ -1,0 +1,64 @@
+xnu 0367: name the blob that `csops` answers zero from
+
+`csops(CS_OPS_ENTITLEMENTS_BLOB)` answers zero bytes for every process on this
+port, and zero there is ambiguous by construction: `proc_csops` reaches it two
+ways -- the blob carries no OSEntitlements object, or it carries one whose XML
+will not serialise -- and neither sets an error. With `xnu 0366` in the boot
+saying `com.apple.assetsd: attached, count 62`, the only thing missing is which
+blob the query actually looked at.
+
+This prints the caller's pid, the blob pointer, its identity, its entitlement
+pointer and its flags for the first eight queries that end in zero, so the
+verdict can be matched against the attachment the AMFI stand-in reported for the
+same signature. A blob picked out of the vnode's list by `p_textoff`, or an
+object that serialises to nothing, then read differently.
+
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3119,6 +3119,30 @@
+ 	return copyout(start, uaddr, length);
+ }
+ 
++/*
++ * Why a process with entitlements attached still answers zero. Both silent
++ * paths in CS_OPS_ENTITLEMENTS_BLOB leave the caller with 0 and no error: no
++ * OSEntitlements object on the blob, or an object whose XML will not
++ * serialise. This prints the blob the query looked at, its identity and its
++ * flags, so the answer can be matched against the "attached, count N" line the
++ * AMFI stand-in prints when it parses a signature. It only fires when a caller
++ * asks, and only for the first few.
++ */
++static void
++mondrian_csops_note(struct cs_blob *blob, void *entitlements, const char *what)
++{
++	static unsigned told;
++	const char *identity;
++
++	if (told++ >= 8) {
++		return;
++	}
++	identity = csblob_get_identity(blob);
++	printf("MONDRIAN CSOPS[%d]: %s: %s, blob %p ent %p\n",
++	    proc_getpid(current_proc()), identity != NULL ? identity : "?",
++	    what, blob, entitlements);
++}
++
+ static int
+ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user_addr_t uaudittoken)
+ {
+@@ -3322,6 +3346,7 @@
+ 
+ 		void* osent = csblob_os_entitlements_get(blob);
+ 		if (!osent) {
++			mondrian_csops_note(blob, osent, "no entitlements object");
+ 			goto out;
+ 		}
+ 		CS_GenericBlob* xmlblob = NULL;
+@@ -3329,6 +3354,7 @@
+ 			start = (void*)xmlblob;
+ 			length = (size_t)ntohl(xmlblob->length);
+ 		} else {
++			mondrian_csops_note(blob, osent, "the object did not serialise");
+ 			goto out;
+ 		}
+ 
