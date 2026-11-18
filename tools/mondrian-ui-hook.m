@@ -13336,19 +13336,22 @@ extern bool TCCAccessCheckAuditToken(CFStringRef service, audit_token_t token,
 extern void TCCAccessRequest(CFStringRef service, CFDictionaryRef options,
     void (^reply)(bool granted)) __attribute__((weak_import));
 
+/* Defined with the stand-in itself; used by every interposer below. */
+static int mondrian_tcc_standin(void);
+
 /*
  * TCC cannot answer these binaries: the grant is in the database (measured:
  * the row reads back with auth 2, the file is checkpointed, tccd restarted) and
  * the preflight still denies, because a row is matched against the client's code
  * identity and ad-hoc binaries have none. The port has no code signatures, so
  * the query has to be answered the way 0043 answers the sandbox's: allowed.
- * Switch: /private/var/vm/mondrian-tccok.
+ * On by default; `/private/var/vm/mondrian-tccoff` turns it off for an A/B.
  */
 static int
 mondrian_tcc_preflight(CFStringRef service, CFDictionaryRef options)
 {
 	(void)options;
-	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+	if (mondrian_tcc_standin()) {
 		mondrian_probe_fmt("MONDRIAN TCC[%d]: preflight %s -> allowed\n",
 		    getpid(), service != NULL
 		        ? [(__bridge NSString *)service UTF8String] : "(null)");
@@ -13363,7 +13366,7 @@ mondrian_tcc_token(CFStringRef service, audit_token_t token,
 {
 	(void)token;
 	(void)options;
-	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+	if (mondrian_tcc_standin()) {
 		mondrian_probe_fmt("MONDRIAN TCC[%d]: token %s -> allowed\n",
 		    getpid(), service != NULL
 		        ? [(__bridge NSString *)service UTF8String] : "(null)");
@@ -13383,7 +13386,7 @@ mondrian_tcc_request(CFStringRef service, CFDictionaryRef options,
     void (^reply)(bool granted))
 {
 	(void)options;
-	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+	if (mondrian_tcc_standin()) {
 		mondrian_probe_fmt("MONDRIAN TCC[%d]: request %s -> allowed\n",
 		    getpid(), service != NULL
 		        ? [(__bridge NSString *)service UTF8String] : "(null)");
@@ -13576,7 +13579,7 @@ mondrian_privacy_access(id self, SEL _cmd, long long scope)
 {
 	BOOL answer = mondrian_privacy_original(self, _cmd, scope);
 	int preflight = mondrian_tcc_ask(CFSTR("kTCCServicePhotos"));
-	int standin = mondrian_file_on("/private/var/vm/mondrian-tccok");
+	int standin = mondrian_tcc_standin();
 	BOOL corrected = answer;
 	static int told;
 
@@ -13585,7 +13588,7 @@ mondrian_privacy_access(id self, SEL _cmd, long long scope)
 	 * kTCCServicePhotos, and the answer disagrees with what this port grants:
 	 * tccd denies it (measured: the real preflight answers 1 even though
 	 * SecTask reads the entitlement through the audit token), while the port
-	 * answers TCC itself through `mondrian-tccok`, the same way 0043 answers
+	 * answers TCC itself through this stand-in, the same way 0043 answers
 	 * the sandbox. The line keeps both values on the record; the switch forces
 	 * the answer for an A/B.
 	 */
@@ -13627,10 +13630,22 @@ mondrian_install_privacy_hook(void)
  */
 /*
  * TCC's real verdict. The port interposes `TCCAccessPreflight` and answers
- * "allowed" whenever `mondrian-tccok` is on, so asking the symbol asks the
- * interposer: measured 2026-11-18, a probe that read `preflight 0` was reading
- * its own shim, not tccd. The original lives in the interpose tuple.
+ * "allowed" for these binaries because tccd denies them (measured 2026-11-18:
+ * the original behind the tuple answers 1 while SecTask reads the entitlement
+ * through the audit token). Answering the symbol asks the interposer, so a probe
+ * that reads `preflight 0` is reading this shim, not tccd -- use
+ * `mondrian_tcc_preflight_interpose.replacee` to measure the OS.
+ *
+ * The stand-in is on by default: the working state of Photos must not depend on
+ * a file somebody seeded by hand. `/private/var/vm/mondrian-tccoff` turns it off
+ * for an A/B.
  */
+static int
+mondrian_tcc_standin(void)
+{
+	return access("/private/var/vm/mondrian-tccoff", F_OK) != 0;
+}
+
 static int
 mondrian_tcc_ask(CFStringRef service)
 {
