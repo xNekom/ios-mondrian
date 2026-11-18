@@ -571,8 +571,9 @@ mondrian_library_probe(void)
 /*
  * A change submitted through the shared library needs no bookmark, and the
  * per-library door needs one the client does not have ("Client did not provide
- * bookmarkData" for /private/var/mobile/Media/PhotoData/). Both are tried, in
- * that order, and the one that submits says which path the port can use.
+ * bookmarkData" for /private/var/mobile/Media/PhotoData/). Both are tried, plus
+ * the importer's own `PHAssetCreationRequest`, and the one that submits says
+ * which path the port can use.
  */
 static id
 mondrian_library_for(NSURL *root)
@@ -627,6 +628,142 @@ mondrian_import_submit(id library, Class request, NSURL *source,
 	mondrian_probe_fmt("MONDRIAN IMPORT[%d]: submitted via %s\n", getpid(),
 	    which);
 	return 1;
+}
+
+/* The importer's API: a creation request that names the file as a resource. */
+static int
+mondrian_import_creation(id library, NSURL *source, const char *which)
+{
+	Class creation = objc_getClass("PHAssetCreationRequest");
+
+	if (library == nil || creation == Nil ||
+	    ![creation respondsToSelector:@selector(creationRequestForAsset)]) {
+		return 0;
+	}
+	@try {
+		[library performChanges:^{
+			id request = [creation creationRequestForAsset];
+
+			if (request != nil && [request respondsToSelector:
+			    @selector(addResourceWithType:fileURL:options:)]) {
+				((void (*)(id, SEL, long, id, id))objc_msgSend)(
+				    request, @selector(addResourceWithType:
+				    fileURL:options:), 1L, source, nil);
+			}
+		} completionHandler:^(BOOL success, NSError *error) {
+			mondrian_probe_fmt(
+			    "MONDRIAN IMPORT[%d]: %s success %d error %s\n",
+			    getpid(), which, success ? 1 : 0,
+			    error != nil ? [[error description] UTF8String] : "-");
+			if (error != nil) {
+				mondrian_probe_fmt(
+				    "MONDRIAN IMPORT[%d]: %s domain %s code %ld\n",
+				    getpid(), which, [[error domain] UTF8String],
+				    (long)[error code]);
+			}
+			if (success) {
+				mondrian_touch("/private/var/vm/mondrian-imported");
+			}
+		}];
+	} @catch (id e) {
+		mondrian_probe_fmt("MONDRIAN IMPORT[%d]: %s threw %s\n", getpid(),
+		    which, [[e reason] UTF8String]);
+		return 0;
+	}
+	mondrian_probe_fmt("MONDRIAN IMPORT[%d]: submitted via %s\n", getpid(),
+	    which);
+	return 1;
+}
+
+/* A bounded directory size, for a volume that reports almost no free space. */
+static unsigned long long
+mondrian_du(const char *path, int depth)
+{
+	DIR *dir;
+	struct dirent *ent;
+	unsigned long long total = 0;
+
+	if (depth <= 0) {
+		return 0;
+	}
+	dir = opendir(path);
+	if (dir == NULL) {
+		return 0;
+	}
+	while ((ent = readdir(dir)) != NULL) {
+		char child[512];
+		struct stat st;
+
+		if (strcmp(ent->d_name, ".") == 0 ||
+		    strcmp(ent->d_name, "..") == 0) {
+			continue;
+		}
+		if (snprintf(child, sizeof(child), "%s/%s", path, ent->d_name) <= 0) {
+			continue;
+		}
+		if (lstat(child, &st) != 0) {
+			continue;
+		}
+		if (S_ISDIR(st.st_mode)) {
+			total += mondrian_du(child, depth - 1);
+		} else if (S_ISREG(st.st_mode)) {
+			total += (unsigned long long)st.st_size;
+		}
+	}
+	(void)closedir(dir);
+	return total;
+}
+
+/*
+ * The volume reports 37 MB free of 16 GB while the same root's image carried
+ * 2.4 GB, so the port's own bookkeeping is what filled it. These are the trees a
+ * boot grows: logs, caches, crash reports and the old diagnostics store. Print
+ * each one's size and let the reading decide what is regenerable.
+ * Switch: /private/var/vm/mondrian-du.
+ */
+static void *
+mondrian_du_report(void *unused)
+{
+	(void)unused;
+	static const struct {
+		const char *path;
+		int depth;
+	} trees[] = {
+		{ "/private/var", 3 },
+		{ "/private/var/mobile", 3 },
+		{ "/private/var/mobile/Library", 2 },
+		{ "/private/var/mobile/Documents", 2 },
+		{ "/private/var/staged_system_apps", 2 },
+		{ "/private/var/db", 3 },
+		{ "/private/var/log", 4 },
+		{ "/private/var/mobile/Library/Caches", 3 },
+		{ "/private/var/mobile/Media", 3 },
+		{ "/Applications", 2 },
+		{ "/usr", 2 },
+		{ "/System/Library", 2 },
+	};
+	struct statfs space;
+	unsigned i;
+
+	if (statfs("/private/var", &space) == 0) {
+		unsigned long long size = (unsigned long long)space.f_bsize;
+
+		mondrian_probe_fmt(
+		    "MONDRIAN DU[%d]: free %llu MB of %llu MB, %llu MB used\n",
+		    getpid(),
+		    (unsigned long long)space.f_bavail * size / (1024 * 1024),
+		    (unsigned long long)space.f_blocks * size / (1024 * 1024),
+		    (unsigned long long)(space.f_blocks - space.f_bavail) * size /
+		    (1024 * 1024));
+	}
+	for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+		unsigned long long bytes = mondrian_du(trees[i].path,
+		    trees[i].depth);
+
+		mondrian_probe_fmt("MONDRIAN DU[%d]: %-40s %llu MB\n", getpid(),
+		    trees[i].path, bytes / (1024 * 1024));
+	}
+	return NULL;
 }
 
 static void *
@@ -703,10 +840,29 @@ mondrian_import_thread(void *unused)
 		}
 	}
 	shared = nil;
-	if (ph != Nil && [ph respondsToSelector:@selector(sharedPhotoLibrary)]) {
-		@try {
+	{
+		struct statfs space;
+
+		if (statfs("/private/var/mobile/Media", &space) == 0) {
+			unsigned long long size = (unsigned long long)space.f_bsize;
+			unsigned long long free_mb = (unsigned long long)space.f_bavail *
+			    size / (1024 * 1024);
+			unsigned long long total_mb =
+			    (unsigned long long)space.f_blocks * size /
+			    (1024 * 1024);
+
+			mondrian_probe_fmt(
+			    "MONDRIAN IMPORT[%d]: free %llu MB of %llu MB\n",
+			    getpid(), free_mb, total_mb);
+		}
+	}
+	if (ph != Nil && [ph respondsToSelector:@selector(sharedPhotoLibrary)]) {		@try {
 			shared = [ph performSelector:@selector(sharedPhotoLibrary)];
+			mondrian_probe_fmt("MONDRIAN IMPORT[%d]: shared %s\n",
+			    getpid(), shared != nil ? "available" : "nil");
 		} @catch (id e) {
+			mondrian_probe_fmt("MONDRIAN IMPORT[%d]: shared threw %s\n",
+			    getpid(), [[e reason] UTF8String]);
 			shared = nil;
 		}
 	}
@@ -714,7 +870,10 @@ mondrian_import_thread(void *unused)
 		return NULL;
 	}
 	library = mondrian_library_for(root);
-	(void)mondrian_import_submit(library, request, source, "url");
+	if (mondrian_import_submit(library, request, source, "url")) {
+		return NULL;
+	}
+	(void)mondrian_import_creation(library, source, "creation");
 	return NULL;
 }
 
@@ -14207,9 +14366,46 @@ mondrian_privacy_access(id self, SEL _cmd, long long scope)
 	return corrected;
 }
 
+/*
+ * The client switches itself into multi-library mode while the app starts, and
+ * from then on the shared library refuses every change ("Calling single library
+ * mode API while in multi library mode") and the per-URL door wants a
+ * security-scoped bookmark this port cannot mint ("Client did not provide
+ * bookmarkData"). Measured 2026-11-18: `+isMultiLibraryModeEnabled` answers 0 at
+ * load and the shared library throws eight seconds later, so the app is the one
+ * that flips it. Nothing on this port can serve a second library, so the switch
+ * is kept from flipping.
+ */
 static void
-mondrian_install_privacy_hook(void)
+mondrian_library_mode_noop(id self, SEL _cmd)
 {
+	(void)self;
+	(void)_cmd;
+}
+
+static void
+mondrian_install_library_hook(void)
+{
+	static const char *const classes[] = {
+		"PHPhotoLibrary",
+		"PLPhotoLibraryPathManager",
+	};
+	unsigned i;
+
+	for (i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+		Class cls = objc_getClass(classes[i]);
+		Method method = cls != Nil ? class_getClassMethod(cls,
+		    sel_registerName("enableMultiLibraryMode")) : NULL;
+
+		if (method != NULL) {
+			method_setImplementation(method,
+			    (IMP)mondrian_library_mode_noop);
+		}
+	}
+}
+
+static void
+mondrian_install_privacy_hook(void){
 	Class cls = objc_getClass("PLPrivacy");
 	Method method = cls != Nil ?
 	    class_getInstanceMethod(cls,
@@ -14512,6 +14708,14 @@ mondrian_install_ui_hooks(void)
 	    getprogname() != NULL &&
 	    strcmp(getprogname(), "MobileSlideShow") == 0) {
 		mondrian_library_probe();
+		if (mondrian_file_on("/private/var/vm/mondrian-du")) {
+			pthread_t du;
+
+			if (pthread_create(&du, NULL, mondrian_du_report,
+			    NULL) == 0) {
+				(void)pthread_detach(du);
+			}
+		}
 		/*
 		 * The import itself is a second switch: `performChanges:` throws
 		 * and kills the app, so the probe has to be able to run alone.
@@ -14547,6 +14751,7 @@ mondrian_install_ui_hooks(void)
 	if (mondrian_probe_service() ||
 	    (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0)) {
 		mondrian_install_privacy_hook();
+		mondrian_install_library_hook();
 		mondrian_tcc_status_probe();
 		int fd = open("/private/var/vm/mondrian-ent", O_RDONLY);
 
