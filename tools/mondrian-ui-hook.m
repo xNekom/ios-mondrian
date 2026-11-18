@@ -12368,7 +12368,7 @@ static int
 mondrian_tcc_insert(void *db,
     int (*exec)(void *, const char *, int (*)(void *, int, char **, char **),
     void *, char **),
-    const struct mondrian_tcc_cols *cols, const char *client)
+    const struct mondrian_tcc_cols *cols, const char *client, int client_type)
 {
 	char sql[1024];
 	size_t n = 0;
@@ -12392,7 +12392,8 @@ mondrian_tcc_insert(void *db,
 	if (mondrian_tcc_has(cols, "boot_uuid"))
 		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", boot_uuid");
 	n += (size_t)snprintf(sql + n, sizeof(sql) - n,
-	    ") VALUES ('kTCCServicePhotos', '%s', 0, 2, 4, 1", client);
+	    ") VALUES ('kTCCServicePhotos', '%s', %d, 2, 4, 1", client,
+	    client_type);
 	if (mondrian_tcc_has(cols, "last_modified"))
 		n += (size_t)snprintf(sql + n, sizeof(sql) - n,
 		    ", strftime('%%s','now')");
@@ -12418,9 +12419,10 @@ mondrian_tcc_insert(void *db,
  * The grant itself. TCC.db already has an `access` table, but not the columns
  * iOS 16 documents (measured: "no column named last_reminded"), so the insert is
  * built from the columns the table really has. The clients are the ones that
- * take part: the app, the extension's host daemon and the library daemon --
- * assetsd's own message names assetsd, not Photos. Switch:
- * /private/var/vm/mondrian-tccgrant.
+ * take part -- the app, the extension's host daemon and the library daemon;
+ * assetsd's own message names assetsd, not Photos -- plus each process's own
+ * executable path, because a row is only found if the client string matches what
+ * TCC computes for the caller. Switch: /private/var/vm/mondrian-tccgrant.
  */
 static void
 mondrian_tcc_grant(void)
@@ -12460,10 +12462,29 @@ mondrian_tcc_grant(void)
 	(void)exec(db, "PRAGMA table_info(access);", mondrian_tcc_col_cb, &cols, NULL);
 	mondrian_probe_fmt("MONDRIAN TCC[%d]: columns %d\n", getpid(), cols.count);
 	for (i = 0; i < (int)(sizeof(clients) / sizeof(clients[0])); i++) {
-		int out = mondrian_tcc_insert(db, exec, &cols, clients[i]);
+		int out = mondrian_tcc_insert(db, exec, &cols, clients[i], 0);
 
 		mondrian_probe_fmt("MONDRIAN TCC[%d]: insert %s -> %d\n", getpid(),
 		    clients[i], out);
+	}
+	/*
+	 * TCC pairs a row with the client's code identity, and the client is
+	 * named either by bundle identifier (client_type 0) or by path (1). A
+	 * daemon has no bundle, so the row above is a guess at a name the
+	 * database may never be asked about. This one is not a guess: it is the
+	 * path this very process was executed from, which the process can print.
+	 */
+	{
+		char exe[PATH_MAX];
+		uint32_t size = sizeof(exe);
+		int out = -1;
+
+		if (_NSGetExecutablePath(exe, &size) == 0) {
+			out = mondrian_tcc_insert(db, exec, &cols, exe, 1);
+			mondrian_probe_fmt(
+			    "MONDRIAN TCC[%d]: insert path %s -> %d\n", getpid(),
+			    exe, out);
+		}
 	}
 	/* The override table is what `tccutil`/profiles use to allow a service for
 	 * everyone; it has no client column, so there is no code identity to
@@ -12482,7 +12503,7 @@ mondrian_tcc_grant(void)
 	    NULL);
 	(void)exec(db, "SELECT count(*) FROM access;", mondrian_tcc_row_cb, NULL,
 	    NULL);
-	(void)exec(db, "SELECT client, auth_value FROM access "
+	(void)exec(db, "SELECT client || '@' || client_type, auth_value FROM access "
 	    "WHERE service = 'kTCCServicePhotos';", mondrian_tcc_row_cb, NULL, &err);
 	if (err != NULL) {
 		mondrian_probe_fmt("MONDRIAN TCC[%d]: readback error %s\n", getpid(),

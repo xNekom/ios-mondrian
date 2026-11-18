@@ -98,10 +98,21 @@ WIMG=$(wslpath -w "$PWD/shim/out/shim-boot.img")
 # whatever image is handed to it -- a 4 KB stub is refused the same way, and so
 # is an image that booted an hour earlier. Re-activating the slot before the
 # boot clears it.
-SLOT=$("$FB" getvar current-slot 2>&1 | sed -n 's/^current-slot: *//p' | head -1)
+#
+# `getvar` on Windows ends its lines with CRLF, so the value arrives as "b\r"
+# and `--set-active=b\r` is rejected with "Slot b does not exist"; the mark then
+# survives, the next RAM boots die the same way, and each one looks like a kernel
+# that crashes. Strip the CR, and say so when the clear fails.
+SLOT=$("$FB" getvar current-slot 2>&1 | tr -d '\r' |
+	sed -n 's/^current-slot: *//p' | head -1)
 if [ -n "$SLOT" ]; then
-	"$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1
-	echo "   slot $SLOT re-activated"
+	if "$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1; then
+		echo "   slot $SLOT re-activated"
+	else
+		cat "$LOG/set-active.log"
+		echo "== could not re-activate slot $SLOT: every RAM boot will be refused" >&2
+		exit 1
+	fi
 fi
 timeout 60 "$FB" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
 # "Sending 'boot.img' ... OKAY" is printed even when the boot itself fails, and
