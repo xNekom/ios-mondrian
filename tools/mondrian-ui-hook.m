@@ -2239,6 +2239,9 @@ mondrian_ca_report(void *unused)
 	return NULL;
 }
 
+static int mondrian_fix_on(const char *path);
+static int mondrian_file_on(const char *path);
+
 static void
 mondrian_ca_count(void)
 {
@@ -2306,9 +2309,12 @@ start_heartbeat(void)
 	/*
 	 * Counting commits and display passes splits the two halves of a
 	 * stopped screen; it is one method call per transaction while on, so it
-	 * stays behind its own boot argument.
+	 * stays behind its own switch. It is a file as well as a boot argument so a
+	 * running system can be measured without a reboot
+	 * (`/private/var/vm/mondrian-ca`, `0` turns it off).
 	 */
-	if (boot_arg_set("mondrianca=1")) {
+	if (boot_arg_set("mondrianca=1") ||
+	    mondrian_fix_on("/private/var/vm/mondrian-ca")) {
 		mondrian_ca_count();
 	}
 }
@@ -3535,18 +3541,23 @@ mondrian_icon_own_report(void)
 /*
  * The App Library's category cards.
  *
- * Measured 2026-11-18 with the deep dump, library on the glass: the cards are
- * `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, their
- * layers report no contents, and what a card holds is its material
- * (`MTMaterialView` 170x170) -- the preview grid a folder icon renders is what
- * this port never produces.
+ * Measured 2026-11-18 with the card dump, library on the glass: a card is an
+ * `_SBHLibraryPodIconView` 170x184 in `_SBHLibraryPodIconListView` whose only
+ * child is an `SBFTouchPassThroughView`, whose layer carries no `contents` on
+ * three of the four cards and no `backgroundColor` on any of them. The grey
+ * square a good card shows is that layer's `contents`, so this port draws the
+ * card itself instead of waiting for the preview grid `IconServices` never
+ * produces here.
  *
- * The preview is the category's own application icons, so this composes it: ask
- * the card's icon for `icons`, draw four of the app's AppIcon files into one
- * bitmap and hang that as a sublayer of the card. A layer, not a subview: the
- * proven operation is the one the library's background uses
- * (`mondrian_library_paint`), and a subview added to an icon view is a message
- * to SpringBoard's own layout, which this port does not need to send.
+ * The preview is the category's own application icons: the card's `icon` is an
+ * `SBHLibraryPodCategoryIcon` whose only accessor is `-category`, and
+ * `SBHLibraryCategory -icons` returns one to four `SBApplicationIcon`s. They are
+ * drawn into one bitmap and hung under a card layer of ours with the material's
+ * colour, its continuous corners and the tiles inside.
+ *
+ * Layers, not subviews: the proven operation is the one the library's background
+ * uses (`mondrian_library_paint`), and a subview added to an icon view is a
+ * message to SpringBoard's own layout, which this port does not need to send.
  *
  * The bounds gate is deliberate: a class-name match alone can be a full-screen
  * container, and painting one puts a giant rounded layer over the UI.
@@ -3589,10 +3600,12 @@ static const char *const mondrian_card_lists[] = {
 	"sortedIcons", "iconsOfCategory", "children", "folderIcons",
 };
 
-/* The artwork box is the card's material, not the card: measured, a card holds
- * an `MTMaterialView` (170x170 on a 170x184 `_SBHLibraryPodIconView`) and the
- * "Suggestions" card is wider, so the card's own bounds draw the tiles outside
- * the grey square. */
+/* The artwork box is the card's material, not the card: measured, a card is a
+ * 170x184 `_SBHLibraryPodIconView` and the material on it is a 170x170 square,
+ * so the label sits in the 14 points below it. No card dumped carries a
+ * material *view* (its only child is an `SBFTouchPassThroughView`) and none has
+ * a `backgroundColor`, so the grey square is the card's layer contents; three of
+ * the four draw none. */
 static CGRect
 mondrian_card_box(id view, CGRect bounds)
 {
@@ -3608,7 +3621,7 @@ mondrian_card_box(id view, CGRect bounds)
 			    sel_registerName("frame"));
 		}
 	}
-	return bounds;
+	return CGRectMake(0, 0, bounds.size.width, bounds.size.width);
 }
 
 /* The 2x2 preview of a category, drawn on a transparent bitmap. */
@@ -3797,13 +3810,51 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 			}
 		}
 		{
-			CALayer *art_layer = [CALayer layer];
+			/*
+			 * The card under the tiles, as a layer with a background colour
+			 * and continuous corners -- the shape iOS itself gives it. Measured
+			 * 2026-11-18: three of the four cards in the library draw no
+			 * material (their layers carry no contents and no background
+			 * colour) and the fourth shows a flat slate square, which is the
+			 * color read off the panel here.
+			 *
+			 * On unless `/private/var/vm/mondrian-cardmaterial` holds `0`: the
+			 * shape is measured on the glass (four cards, SpringBoard's pid
+			 * stable while the library was displayed), and the switch is there
+			 * for an A/B because painting the same square into the tiles' own
+			 * bitmap coincided with a SpringBoard crash loop when the library
+			 * opened.
+			 */
+			CALayer *card = [CALayer layer];
 
-			[art_layer setContents:(id)art];
-			[art_layer setFrame:box];
-			[art_layer setContentsGravity:(NSString *)@"resize"];
-			[(CALayer *)layer setValue:art_layer forKey:@"mondrianCardArt"];
-			[(CALayer *)layer addSublayer:art_layer];
+			if (mondrian_fix_on("/private/var/vm/mondrian-cardmaterial")) {
+				CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+				CGFloat parts[4] = { 82.0 / 255.0, 93.0 / 255.0,
+				    107.0 / 255.0, 0.97 };
+
+				[card setCornerRadius:side * 0.16];
+				[card setMasksToBounds:YES];
+				if (rgb != NULL) {
+					CGColorRef colour = CGColorCreate(rgb, parts);
+
+					if (colour != NULL) {
+						[card setBackgroundColor:colour];
+						CGColorRelease(colour);
+					}
+					CGColorSpaceRelease(rgb);
+				}
+			}
+			[card setFrame:box];
+			{
+				CALayer *tiles = [CALayer layer];
+
+				[tiles setContents:(id)art];
+				[tiles setFrame:CGRectMake(0, 0, side, side)];
+				[tiles setContentsGravity:(NSString *)@"resize"];
+				[card addSublayer:tiles];
+			}
+			[(CALayer *)layer setValue:card forKey:@"mondrianCardArt"];
+			[(CALayer *)layer addSublayer:card];
 		}
 		CGImageRelease(art);
 		snprintf(line, sizeof(line),
@@ -3818,6 +3869,134 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 	for (i = 0; i < n; i++) {
 		hits += mondrian_library_cards([(NSArray *)subs objectAtIndex:i],
 		    depth + 1, painted);
+	}
+	return hits;
+}
+
+/* A layer's painted background, as the numbers that decide whether it shows:
+ * is there a colour, how opaque is it, does it mask itself. A view and a layer
+ * answer different selectors, so each is asked only what it has. */
+static void
+mondrian_card_layer_line(char *line, size_t size, const char *tag, unsigned n,
+    id item)
+{
+	Class ui_view = objc_getClass("UIView");
+	id layer = item;
+	id bg;
+	CGRect frame;
+	double alpha = 1.0;
+	BOOL hidden = 0, masks = 0, is_view;
+
+	if (item == NULL) {
+		snprintf(line, size, "MONDRIAN CARD %u:   %s none\n", n, tag);
+		return;
+	}
+	is_view = ui_view != Nil && [item isKindOfClass:ui_view];
+	if (is_view) {
+		layer = mondrian_send(item, "layer");
+		alpha = ((double (*)(id, SEL))objc_msgSend)(item,
+		    sel_registerName("alpha"));
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(item,
+		    sel_registerName("isHidden"));
+	}
+	if (layer == NULL) {
+		snprintf(line, size, "MONDRIAN CARD %u:   %s %s no layer\n", n, tag,
+		    object_getClassName(item));
+		return;
+	}
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("frame"));
+	if (!is_view) {
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("isHidden"));
+	}
+	if ([layer respondsToSelector:sel_registerName("masksToBounds")]) {
+		masks = ((BOOL (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("masksToBounds"));
+	}
+	bg = mondrian_send(layer, "backgroundColor");
+	{
+		id contents = mondrian_send(layer, "contents");
+		long cw = 0, ch = 0;
+
+		if (contents != NULL &&
+		    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
+			cw = (long)CGImageGetWidth((CGImageRef)contents);
+			ch = (long)CGImageGetHeight((CGImageRef)contents);
+		}
+		snprintf(line, size,
+		    "MONDRIAN CARD %u:   %s %s layer %s %.0f,%.0f %.0fx%.0f alpha %.2f"
+		    " hidden %d mask %d bg %d contents %ldx%ld\n", n, tag,
+		    object_getClassName(item), object_getClassName(layer),
+		    frame.origin.x, frame.origin.y, frame.size.width,
+		    frame.size.height, alpha, (int)hidden, (int)masks, bg != NULL,
+		    cw, ch);
+	}
+}
+
+/*
+ * What a category card is made of, once: its frame, its alpha, its own layer's
+ * paint and its children. Measured 2026-11-18 with only two cards dumped: the
+ * cards that draw no grey square carry a lone `SBFTouchPassThroughView` and two
+ * layers, so the material is not a child at all. This names the difference
+ * between a card that paints and one that does not, for every card, instead of
+ * guessing. Armed by `/private/var/vm/mondrian-cards`.
+ */
+static unsigned
+mondrian_card_tree(id view, unsigned depth, unsigned *dumped)
+{
+	const char *name = view != NULL ? object_getClassName(view) : NULL;
+	id layer, subs;
+	unsigned n, i, hits = 0;
+	char line[320];
+
+	if (view == NULL || depth > 18 || *dumped >= 6) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, "LibraryPodIconView") != NULL) {
+		CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("bounds"));
+		CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("frame"));
+		id parent = mondrian_send(view, "superview");
+
+		(*dumped)++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN CARD %u: %s frame %.0f,%.0f %.0fx%.0f bounds"
+		    " %.0fx%.0f in %s\n", *dumped, name, frame.origin.x,
+		    frame.origin.y, frame.size.width, frame.size.height,
+		    bounds.size.width, bounds.size.height,
+		    parent != NULL ? object_getClassName(parent) : "none");
+		say(line);
+		mondrian_card_layer_line(line, sizeof(line), "view", *dumped, view);
+		say(line);
+		subs = mondrian_send(view, "subviews");
+		n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+		snprintf(line, sizeof(line), "MONDRIAN CARD %u: %u subviews\n", *dumped, n);
+		say(line);
+		for (i = 0; i < n; i++) {
+			mondrian_card_layer_line(line, sizeof(line), "sub", *dumped,
+			    [(NSArray *)subs objectAtIndex:i]);
+			say(line);
+		}
+		layer = mondrian_send(view, "layer");
+		subs = layer != NULL ? mondrian_send(layer, "sublayers") : nil;
+		n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+		snprintf(line, sizeof(line), "MONDRIAN CARD %u: %u sublayers\n", *dumped, n);
+		say(line);
+		for (i = 0; i < n; i++) {
+			id sub = [(NSArray *)subs objectAtIndex:i];
+
+			mondrian_card_layer_line(line, sizeof(line), "layer", *dumped,
+			    sub);
+			say(line);
+		}
+		return 1;
+	}
+	subs = mondrian_send(view, "subviews");
+	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_card_tree([(NSArray *)subs objectAtIndex:i], depth + 1,
+		    dumped);
 	}
 	return hits;
 }
@@ -7069,6 +7248,13 @@ mondrian_library_step(void)
 			unsigned cards = 0;
 
 			(void)mondrian_library_cards(window, 0, &cards);
+		}
+		if (mondrian_fix_on("/private/var/vm/mondrian-cards")) {
+			static unsigned dumped;
+
+			if (dumped < 6) {
+				(void)mondrian_card_tree(window, 0, &dumped);
+			}
 		}
 	}
 }

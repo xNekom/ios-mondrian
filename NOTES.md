@@ -24,7 +24,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   From a running iOS the ring's `reboot` is the way in with no buttons: it writes
   the PMK8350 restart reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader,
   1 = recovery, `0309`), flushes the ring and resets; fastboot answers about 2 s
-  later. The BCB in `misc` and the IMEM word at 0x65c are both ignored.
+  later. A boot that falls back to `boot_b` answers with the previous kernel: the
+  one measured 2026-11-18 prints `Ticket spinlock timeout` and will not unlock.
   **No recovery boots here:** `fastboot boot` refuses the OrangeFox images
   (`Bad Buffer Size`) and `boot_b` lands in fastboot, so vendor blobs come from
   the ROM (`tools/super-extract.py`).

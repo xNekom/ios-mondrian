@@ -230,33 +230,44 @@ boot each, so the three columns differ only in what changed:
   and `disablesOccludedBackdropBlurs` to `NO` on every backdrop layer turns the
   grey into black with a white blob; hiding `SBHomeScreenBackdropView` (the only
   `*Backdrop*` in `SBHomeScreenView`) leaves the stripes.
-- **The App Library's icons were empty squares.** Measured 2026-11-18 with the
-  deep dump (`mondrian-deep`) while the library was on the glass: the cards are
-  `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, each card
-  holds an `MTMaterialView` 170x170, and a card's model is
-  `SBHLibraryPodCategoryIcon`, whose only accessor is `-category`. What a card
-  shows is therefore its category's own app icons -- `SBHLibraryCategory -icons`
-  returned one to four `SBApplicationIcon`s here -- so
-  `tools/mondrian-ui-hook.m` composes them into one bitmap
-  (`mondrian_card_picture`) and hangs it on the card as a sublayer.
-  The artwork box is the `MTMaterialView`'s frame, not the card's bounds: the
-  "Suggestions" card is wider, and using the card's bounds draws the tiles
-  outside the grey square. The tiles need the continuous-corner clip
-  (`CGPathCreateWithRoundedRect`, 0.2237 of the tile) or they come out as
-  squares.
-  A layer, not a subview. An earlier version added a `UIImageView` to the card
-  and the boots that followed crash-looped SpringBoard (`CRASH SpringBoard`, the
-  counter rising about four a minute, the panel ending black under a `KABORT`);
-  the layer version runs with a stable PID. That is correlation, not proof, and
-  it is why the safe shape is the one the library's background already uses.
-  One card's material still does not draw: the wide `Suggestions` card shows its
-  tiles over the wallpaper with only a sliver of material under them, which is
-  the same blur/vibrancy failure the library's background had. The tiles
-  themselves are correct, so the card reads as an icon grid without its card.
+- **The App Library's cards are drawn by the port.** Measured 2026-11-18 with the
+  card dump (`/private/var/vm/mondrian-cards`, off at `0`): every card is an
+  `_SBHLibraryPodIconView` 170x184 in `_SBHLibraryPodIconListView` with **one**
+  child, an `SBFTouchPassThroughView` of the same size, two sublayers, no
+  `MTMaterialView` anywhere and no `backgroundColor` on any of them. So the grey
+  square is the card layer's own `contents`, and on three of the four cards there
+  is none -- which is why they showed their tiles on bare wallpaper.
+  The model is a chain: the card's `icon` is an `SBHLibraryPodCategoryIcon` whose
+  only accessor is `-category`, and `SBHLibraryCategory -icons` returned one to
+  four `SBApplicationIcon`s. `tools/mondrian-ui-hook.m` composes those into one
+  bitmap (`mondrian_card_picture`, tile clip `CGPathCreateWithRoundedRect` at
+  0.2237 of the tile, or they come out as squares) and hangs it on the card as a
+  sublayer of a card layer it owns: `backgroundColor` 82/93/107 at 0.97, read off
+  the one card that drew itself, `cornerRadius` 0.16 of the side, `masksToBounds`.
+  Verified on the glass: four cards each with their material and their icons,
+  SpringBoard's pid unchanged for 30 s with the library displayed.
+  **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
+  a filled rounded rect under the tiles) is the one whose boots crash-looped
+  SpringBoard the moment the library opened -- pid changing every few seconds,
+  `CRASH SpringBoard` at a wild address. Tiles-only and separate-layer both ran
+  with a stable pid in the same session. Correlation, not proof: keep the card a
+  layer of its own, which is also what iOS does.
+- **`fps 0` means nothing was presented that second, not that the UI is dead.**
+  Measured 2026-11-18: `MONDRIAN FB: fps 0` and `panel 0/60 sampled ticks
+  changed` both read while the phone was responsive with the library on the
+  glass, because a still screen produces no frames at all. Read the meter while
+  the screen moves: continuous dragging between pages reported
+  `fps 60, 49, 45, 53, 55, 52, 46, 44, 46` second by second, and the per-tick
+  histogram beside it `tick rec0 14 rec1 44 rec2 2` -- 46 of 60 ticks carried a
+  frame, which is the number to compare against 60.
+  The CoreAnimation counters are **not** a frame meter: `ca begin 0 commit 0 slow
+  0 display 0 loop 20 in 1 s` was measured while that dragging was happening.
+  `+[CATransaction begin]`/`+commit` and `-[CALayer displayIfNeeded]` are not on
+  the path CoreAnimation takes internally; `loop` only proves the main run loop
+  is being serviced. Use `/private/var/vm/mondrian-ca` (a file, `0` turns it off)
+  for the run-loop number and the framebuffer meter for frames.
   The dump is armed by writing a number into `/private/var/vm/mondrian-deep` (a
   new number buys one dump, four a process) and read out of the ring.
-  `fps 0` and `panel 0/60 sampled ticks changed` do not mean the UI is dead: both
-  were measured while the phone was responsive with the library on the glass.
 - **Which hook is running, and whether it arrived whole.** The hook prints
   `MONDRIAN UI: hook tag cc56 uid <uid> prog <name> built <date> <time>` at load
   (`__DATE__`/`__TIME__`), and the ring holds several SpringBoard instances at
