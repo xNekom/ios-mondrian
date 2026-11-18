@@ -9,7 +9,7 @@ diff --git a/iokit/Kernel/arm/MondrianPlatformExpert.cpp b/iokit/Kernel/arm/Mond
  
  class MondrianPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(MondrianPlatformExpert);
-@@ -70,6 +71,23 @@ MondrianPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -70,8 +71,25 @@ MondrianPlatformExpert::processTopLevel(IORegistryEntry *root)
  	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
  	if (armio != NULL) {
  		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));

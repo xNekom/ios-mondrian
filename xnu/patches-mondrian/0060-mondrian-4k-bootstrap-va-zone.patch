@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -2257,6 +2257,20 @@
+@@ -2257,7 +2257,21 @@
  	mem_segments = (mem_size + 0x0FFFFFFF) >> 28;
  
  	va_l1 = dynamic_memory_begin;
