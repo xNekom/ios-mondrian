@@ -691,6 +691,18 @@ boot each, so the three columns differ only in what changed:
   tables in the handler, since the stack is already gone by the time a report is
   read. `SA_RESETHAND` restores the default action, so returning still dies the
   way the process would have.
+- **The volume is full of blocks no file owns.** Measured 2026-11-18 from the
+  app's own walk of the whole volume: every regular file on it adds up to
+  **12636 MB** while `statfs` reports **16350 MB used and 33 MB free** of
+  16384 MB, with no hard link seen. The same root's image carried 2.4 GB free
+  (`tools/hfs-audit.py`: 596409 free blocks, and every fork's size fitted the
+  blocks it owned), so about 3.7 GB are marked allocated in the bitmap with no
+  extent behind them -- the shape `BlockMarkFreeInternal` in the boot log
+  describes. A walk under the app's sandbox cannot see protected trees, so treat
+  3.7 GB as a floor; the repair is `fsck` on the host against the partition
+  image, since the volume cannot be repaired while the port mounts it. Until
+  then the system writes into 33 MB, which is both why Photos answers
+  `NotEnoughSpace` and why the next failure can be corruption.
 - **Photos has no library: TCC, then the library mode, then the volume.** Measured
   2026-11-18 with the app open and drawing its Library tab, in the order the
   chain was peeled: `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]`

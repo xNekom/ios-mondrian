@@ -715,6 +715,96 @@ mondrian_du(const char *path, int depth)
 }
 
 /*
+ * The bitmap says the volume is full; a tree-by-tree walk cannot tell "full of
+ * files" from "full of blocks no fork owns". This walks the whole volume and
+ * sums every regular file once (hard links share an inode, so a small table
+ * keeps the second link from being counted again), which separates the two.
+ * Switch: mondrian-du.
+ */
+struct mondrian_inode {
+	uint64_t dev;
+	uint64_t ino;
+};
+
+static struct mondrian_inode *mondrian_inodes;
+static unsigned mondrian_inodes_used;
+static unsigned mondrian_inodes_cap;
+
+static int
+mondrian_inode_seen(uint64_t dev, uint64_t ino)
+{
+	unsigned slot, i;
+
+	if (mondrian_inodes == NULL) {
+		mondrian_inodes_cap = 1u << 16;
+		mondrian_inodes = calloc(mondrian_inodes_cap,
+		    sizeof(*mondrian_inodes));
+		if (mondrian_inodes == NULL) {
+			mondrian_inodes_cap = 0;
+			return 0;
+		}
+	}
+	if (mondrian_inodes_cap == 0) {
+		return 0;
+	}
+	slot = (unsigned)((dev * 31u + ino) & (mondrian_inodes_cap - 1));
+	for (i = 0; i < 64; i++) {
+		unsigned at = (slot + i) & (mondrian_inodes_cap - 1);
+
+		if (mondrian_inodes[at].ino == 0) {
+			mondrian_inodes[at].dev = dev;
+			mondrian_inodes[at].ino = ino;
+			return 0;
+		}
+		if (mondrian_inodes[at].dev == dev &&
+		    mondrian_inodes[at].ino == ino) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static unsigned long long
+mondrian_du_all(const char *path)
+{
+	DIR *dir;
+	struct dirent *ent;
+	unsigned long long total = 0;
+
+	dir = opendir(path);
+	if (dir == NULL) {
+		return 0;
+	}
+	while ((ent = readdir(dir)) != NULL) {
+		char child[512];
+		struct stat st;
+
+		if (strcmp(ent->d_name, ".") == 0 ||
+		    strcmp(ent->d_name, "..") == 0) {
+			continue;
+		}
+		if (snprintf(child, sizeof(child), "%s%s%s", path,
+		    strcmp(path, "/") == 0 ? "" : "/", ent->d_name) <= 0) {
+			continue;
+		}
+		if (lstat(child, &st) != 0) {
+			continue;
+		}
+		if (S_ISDIR(st.st_mode)) {
+			total += mondrian_du_all(child);
+		} else if (S_ISREG(st.st_mode)) {
+			if (st.st_nlink > 1 && mondrian_inode_seen(st.st_dev,
+			    st.st_ino)) {
+				continue;
+			}
+			total += (unsigned long long)st.st_size;
+		}
+	}
+	(void)closedir(dir);
+	return total;
+}
+
+/*
  * The volume reports 37 MB free of 16 GB while the same root's image carried
  * 2.4 GB, so the port's own bookkeeping is what filled it. These are the trees a
  * boot grows: logs, caches, crash reports and the old diagnostics store. Print
@@ -762,6 +852,13 @@ mondrian_du_report(void *unused)
 
 		mondrian_probe_fmt("MONDRIAN DU[%d]: %-40s %llu MB\n", getpid(),
 		    trees[i].path, bytes / (1024 * 1024));
+	}
+	{
+		unsigned long long files = mondrian_du_all("/");
+
+		mondrian_probe_fmt(
+		    "MONDRIAN DU[%d]: every file %llu MB, links %u\n", getpid(),
+		    files / (1024 * 1024), mondrian_inodes_used);
 	}
 	return NULL;
 }
