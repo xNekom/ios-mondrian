@@ -12317,6 +12317,82 @@ mondrian_seed_container(const char *identifier, NSString *uuid)
  * appex cannot find -- and whether the one this hook seeded by hand is the only
  * one. Printed only when the URL test switch is on.
  */
+/*
+ * What the plug-in handshake asks for, and what it gets. The message says the
+ * extension has "invalid sandbox or container" and prints a NULL path, so the
+ * answer is the key it looked up in the reply that pkd (or the host) sent. Only
+ * keys that name a sandbox, container or plug-in are printed, so the noise stays
+ * out of the ring. Switch: /private/var/vm/mondrian-keys.
+ */
+static id (*mondrian_objkey_orig)(id, SEL, id);
+static id (*mondrian_subscript_orig)(id, SEL, id);
+
+static int
+mondrian_key_of_interest(id key)
+{
+	const char *s;
+
+	if (![key isKindOfClass:[NSString class]]) {
+		return 0;
+	}
+	s = [key UTF8String];
+	if (s == NULL) {
+		return 0;
+	}
+	return strstr(s, "sandbox") != NULL || strstr(s, "container") != NULL ||
+	    strstr(s, "Sandbox") != NULL || strstr(s, "Container") != NULL ||
+	    strstr(s, "PlugIn") != NULL || strstr(s, "plugin") != NULL;
+}
+
+static id
+mondrian_objkey(id self, SEL _cmd, id key)
+{
+	id value = mondrian_objkey_orig != NULL
+	    ? mondrian_objkey_orig(self, _cmd, key) : nil;
+
+	if (mondrian_key_of_interest(key)) {
+		mondrian_probe_fmt("MONDRIAN KEY[%d]: %s -> %s\n", getpid(),
+		    [(NSString *)key UTF8String], value != nil ? "value" : "nil");
+	}
+	return value;
+}
+
+static id
+mondrian_subscript(id self, SEL _cmd, id key)
+{
+	id value = mondrian_subscript_orig != NULL
+	    ? mondrian_subscript_orig(self, _cmd, key) : nil;
+
+	if (mondrian_key_of_interest(key)) {
+		mondrian_probe_fmt("MONDRIAN KEY[%d]: %s [ ] -> %s\n", getpid(),
+		    [(NSString *)key UTF8String], value != nil ? "value" : "nil");
+	}
+	return value;
+}
+
+static void
+mondrian_key_probe(void)
+{
+	Class cls = objc_getClass("NSDictionary");
+	Method method;
+
+	if (cls == Nil) {
+		return;
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("objectForKey:"));
+	if (method != NULL) {
+		mondrian_objkey_orig = (id (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)mondrian_objkey);
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("objectForKeyedSubscript:"));
+	if (method != NULL) {
+		mondrian_subscript_orig = (id (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)mondrian_subscript);
+	}
+	mondrian_probe_fmt("MONDRIAN KEY[%d]: hooks %d %d\n", getpid(),
+	    mondrian_objkey_orig != NULL, mondrian_subscript_orig != NULL);
+}
+
 static void
 mondrian_containers_report(void)
 {
@@ -12501,6 +12577,9 @@ mondrian_install_ui_hooks(void)
 				if (mondrian_file_on("/private/var/vm/mondrian-urltest")) {
 					mondrian_url_probe_env();
 					mondrian_containers_report();
+				}
+				if (mondrian_file_on("/private/var/vm/mondrian-keys")) {
+					mondrian_key_probe();
 				}
 			}
 		} else {

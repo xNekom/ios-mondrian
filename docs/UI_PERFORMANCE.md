@@ -319,7 +319,14 @@ boot each, so the three columns differ only in what changed:
   the new copy at their next exec, so an iteration costs a build and about two
   minutes, not a kernel build and a boot. `glblob=1` rewrites that copy from the
   kernel's blob at mount, so after a reboot the delivered dylib must be sent
-  again (or the kernel rebuilt) before the probe is armed. What worked was hooking the exception
+  again (or the kernel rebuilt) before the probe is armed. The injection itself
+  is armed by a file too -- `/private/var/vm/mondrian-probe` holding something
+  other than `0`, the same existence check the kernel already does for the dylib
+  -- so instrumenting a service no longer needs the boot argument
+  `mondrian_ui_probe=1` and therefore no longer needs a boot at all: measure, then
+  write that file, and the next exec of a target is instrumented.
+
+  What worked was hooking the exception
   at construction -- `+[NSException exceptionWithName:reason:userInfo:]` and
   `-[NSException initWithName:reason:userInfo:]` -- because CoreFoundation
   builds and throws it itself, so `-[NSException raise]`, the objc uncaught
@@ -389,6 +396,10 @@ boot each, so the three columns differ only in what changed:
   `com.apple.mobileslideshow` (directory tree plus the metadata plist an existing
   container carries, written by SpringBoard as uid 501) does not change the
   message, so libcontainer needs more than a directory with metadata to answer.
+  Nor does the container manager add one: with it running, the directory holds
+  130 containers, 3 of them photo-flavoured, and the only
+  `com.apple.mobileslideshow` is the seeded `8F2B1C64-...`, so the daemon is not
+  creating one for Photos either.
 - **launchd was skipping the container manager because of its job plist.**
   Replacing `/System/Library/LaunchDaemons/com.apple.containermanagerd.plist`
   with `tools/launchd/com.apple.containermanagerd.plist` -- the same program and
@@ -406,6 +417,24 @@ boot each, so the three columns differ only in what changed:
   black. Wake with a tap or a swipe, and check the capture for the time in the
   status bar before concluding anything about what an app draws. Photos' own
   blank state is white with the status bar, not black.
+- **The appex runs at boot, not when Photos opens.** Measured 2026-11-18: tapping
+  the Photos icon starts `MobileSlideShow` and draws its (blank) window, but no
+  `exec PhotosFileProvider` follows -- the extension appears once per boot,
+  around the time the system registers file providers. So a probe aimed at the
+  appex has to be armed before a boot, and the boot is the only way to reach it;
+  a `respring` plus a tap is enough for `assetsd` and `fileproviderd`, not for
+  this one.
+- **The appex's message is PlugInKit's, and its caller is in the cache.** The
+  string sits at PlugInKit `+0x25697`, between
+  `-[PKService launchContainingApplicationForPlugInNamed:]` and `missing data key
+  in reply`, so the failure is the plug-in launch handshake, not the sandbox
+  layer. The hook prints the raising stack as `image+0x...`; the frames land at
+  `PlugInKit+0x18d5c`, `+0x4de0`, `+0x17f44`, `+0x5998`, `+0x4d44`, which are
+  offsets inside the cache image (base `0x1aaf21000`), and `tools/dsc-va.py`
+  names the image from them. The imported calls in those frames point into the
+  stub region of the *main* cache file, which is truncated on this workstation
+  (`nowhere (below every mapping)`), so the callee has to be named by hooking it,
+  not by reading it.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
