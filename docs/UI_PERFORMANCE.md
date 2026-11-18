@@ -246,6 +246,13 @@ boot each, so the three columns differ only in what changed:
   the one card that drew itself, `cornerRadius` 0.16 of the side, `masksToBounds`.
   Verified on the glass: four cards each with their material and their icons,
   SpringBoard's pid unchanged for 30 s with the library displayed.
+  The pass is opt-in (`/private/var/vm/mondrian-cardspaint`) for now, because the
+  builds that carry this code also leave 6 to 12 `CRASH SpringBoard` entries per
+  boot at one fixed pc (`...a14`, lr `...9e4`), while a boot of the same kernel
+  with the hook from before this code left none. The pass only runs with the
+  library on the glass, so it cannot be the boot-time crasher -- the association
+  is measured and unexplained, which is the reason to keep it switchable rather
+  than on.
   **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
   a filled rounded rect under the tiles) is the one whose boots crash-looped
   SpringBoard the moment the library opened -- pid changing every few seconds,
@@ -279,7 +286,40 @@ boot each, so the three columns differ only in what changed:
   The step's liveness has its own line too: `MONDRIAN UI: lock watch <n> cycles,
   <m> steps, k with an app` says whether the watcher is posting and whether the
   posted step got past `UIApplication sharedApplication`. Without it, a dead
-  watcher and a blocked main queue look identical.
+  watcher and a blocked main queue look identical -- and `steps 0` with `cycles`
+  climbing is the main queue not draining at all, which is a wedged system, not
+  this file (`mondrian_step_calls++` is the first statement of the step).
+- **A rebuilt hook only reaches the phone through a kernel build.** Measured
+  2026-11-18: the kernel carries the hook inside itself (`tools/gen-glblob.py`
+  from `out/gpu/mondrian-ui-hook.dylib`, called by `tools/wsl/build-kernel.sh`)
+  and writes it to `/private/var/vm/` while the root is being mounted, so the
+  copy a `wfile` leaves behind is replaced by the boot's own -- and the tag line
+  loses its `built` stamp, which is how it was noticed. `wfile` plus a SpringBoard
+  restart is the cheap loop for iterating; a kernel build is what makes a change
+  survive a reboot. Anything read after a reboot without that build is describing
+  the old hook.
+  Restarting SpringBoard is not free either: measured 2026-11-18, a
+  `kill <SpringBoard pid>` was followed by `KABORT esr 0x96000047 far
+  0xfffffe3c7c480000 pc 0xfffffe007c2dfc98 lr 0xfffffe0007584a68` on the console
+  and a panel the console then drew over, which is a kernel fault and not this
+  file's, but it costs the screen. Baking the hook into the kernel and booting is
+  the clean way to get a picture.
+- **Waking the panel is half of every failed unlock.** Measured 2026-11-18: the
+  power key (`usb-ring.py key 0`) toggles, it does not wake -- pressed on a lit
+  lock screen it blanks the panel, the framebuffer keeps the last image, so the
+  screenshot looks like a lock screen that ignores every swipe and the next
+  diagnostic is about the wrong thing. Swipe first; only press the key when the
+  screenshot does not change, and then swipe again. With the panel lit,
+  `swipe 720 3050 720 900 400` unlocks; `MONDRIAN FB: panel blank (power key)` /
+  `panel wake (touch)` in the ring says which state it was in.
+- **A boot that answers with another kernel really did fall back.** Measured
+  2026-11-18: the ring is cleared at boot, so the first `Darwin Kernel Version`
+  line is the kernel running, and `tools/wsl/cycle.sh` reads exactly that. When a
+  RAM boot dies, `usb-ring.py prev` reads the *previous* boot's console out of
+  userdata -- a panic flushes into it -- which is the only way to see why it
+  died. The same day the RAM boot of the 19:21 kernel failed twice and then
+  worked with no change at all to the image: retry (the slot is re-activated
+  before every `fastboot boot`) before blaming what was built.
 - **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with

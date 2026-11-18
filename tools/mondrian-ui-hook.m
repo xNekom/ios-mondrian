@@ -3744,6 +3744,16 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 	if (view == NULL || depth > 18 || *painted >= MONDRIAN_LIBRARY_CARDS) {
 		return 0;
 	}
+	/*
+	 * Opt-in until the crash it is suspected of is pinned down: measured
+	 * 2026-11-18, the builds that carried this pass left 6 to 12 SpringBoard crash
+	 * entries per boot at one fixed pc (`...a14`, lr `...9e4`), while the build
+	 * without it left none. The pictures were right, so the pass is kept here
+	 * behind `/private/var/vm/mondrian-cardspaint` instead of being thrown away.
+	 */
+	if (!mondrian_file_on("/private/var/vm/mondrian-cardspaint")) {
+		return 0;
+	}
 	if (name != NULL && strstr(name, "LibraryPodIconView") != NULL) {
 		CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
 		    sel_registerName("bounds"));
