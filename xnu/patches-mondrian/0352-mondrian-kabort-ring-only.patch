@@ -1,0 +1,86 @@
+xnu 0352: a kernel abort leaves the panel to the UI, and parks its numbers in the ring
+
+Measured 2026-11-18 on a boot that kept running: `KABORT esr 0x96000047 far
+0xfffffe1f15edc000 pc 0xfffffe007c2dfc98` on the panel, and from that moment the
+console owned the screen -- every later log line and status row over the UI,
+the lock screen answering no touch, and only a retried boot gave a clean panel.
+
+The cause is the order in handle_kernel_abort(): the six register rows and
+mondrian_early_panic_begin() run before the handler decides anything, and the
+`vm_fault()` below can resolve the fault, after which the thread returns and the
+boot carries on -- with the panel still taken. mondrian_early_panic_begin() has
+no other caller, so a fault the machine survives is the only case it serves, and
+that case is exactly the one that should not paint.
+
+The numbers go to the ring instead, which needs no panel. A fault that really
+does panic still paints: panic_with_thread_kernel_state() calls
+mondrian_early_fault(), which sets its own forced flag and draws the panic rows
+with the full register dump and, with keepsyms=1, the symbol.
+
+Where the observed fault is: its lr (0xfffffe0007584a68) resolves to
+_mapping_free_prime_internal in the pmap pv-free path -- the same path this board
+is already documented to panic in when the panel alias is torn out (0351) -- so
+it is a pmap fault being reported, not a reason to give it the screen.
+
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1524,45 +1524,21 @@
+ 	bool recover = find_copyio_recovery_entry(state) != 0;
+ #if defined(MONDRIAN)
+ 	/*
+-	 * A fault under copyin/copyout is recovered below and happens on any boot
+-	 * (a page of the caller's buffer not resident yet): painting its six
+-	 * register rows put text on top of a live UI, several times a second,
+-	 * and said nothing that the ring did not. Only a fault that is about to
+-	 * panic is worth the screen -- and then the console is turned on for it,
+-	 * because a boot that has not panicked yet has not painted anything.
++	 * This runs before the handler knows whether the fault is fatal: the
++	 * `vm_fault` below can fix it and this thread carries on. Painting the
++	 * registers here therefore took the panel from the compositor for a fault
++	 * the machine survived -- measured 2026-11-18, `KABORT esr 0x96000047` on
++	 * the glass of a boot that kept running, the console on from that moment
++	 * and every later log line over the UI, with the lock screen answering no
++	 * touch. The numbers go to the ring instead, which needs no panel, and a
++	 * fault that really does panic paints through mondrian_early_fault() in
++	 * panic_with_thread_kernel_state().
+ 	 */
+-	if (!recover) {
+-		extern void mondrian_early_reg(const char *name, uint64_t value);
+-		extern void mondrian_early_panic_begin(void);
+-		extern void mondrian_early_status(const char *s);
+-		extern const char *mondrian_panic_format;
+-		uint64_t k_cpsr = get_saved_state_cpsr(state);
+-
+-		mondrian_early_panic_begin();
+-
+-		mondrian_early_reg("KABORT esr", esr);
+-		mondrian_early_reg("KABORT far", fault_addr);
+-		mondrian_early_reg("KABORT pc", get_saved_state_pc(state));
+-		mondrian_early_reg("KABORT lr", saved_state64(state)->lr);
+-		mondrian_early_reg("KABORT cpsr", k_cpsr);
+-		mondrian_early_reg("KABORT x0", saved_state64(state)->x[0]);
+-		if (mondrian_panic_format != NULL) {
+-			char hud[120];
+-			int n = 0;
+-
+-			hud[n++] = 'P';
+-			hud[n++] = ':';
+-			hud[n++] = ' ';
+-			for (int i = 0; mondrian_panic_format[i] != 0 &&
+-			    n < (int)sizeof(hud) - 1; i++) {
+-				char c = mondrian_panic_format[i];
+-
+-				hud[n++] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+-			}
+-			hud[n] = 0;
+-			mondrian_early_status(hud);
+-		}
+-	}
++	kprintf("MONDRIAN KABORT: %s esr 0x%x far 0x%llx pc 0x%llx lr 0x%llx"
++	    " cpsr 0x%x x0 0x%llx\n", recover ? "recovered" : "unrecovered",
++	    esr, (uint64_t)fault_addr, get_saved_state_pc(state),
++	    saved_state64(state)->lr, get_saved_state_cpsr(state),
++	    saved_state64(state)->x[0]);
+ #endif
+ 
+ #ifndef CONFIG_XNUPOST

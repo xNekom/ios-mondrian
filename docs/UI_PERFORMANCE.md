@@ -204,6 +204,24 @@ boot each, so the three columns differ only in what changed:
   bring-up boot, and a panic still paints either way. Measured after it: the
   lock screen of a fresh boot has no console text and no bands at all, where the
   boot before it had six `KABORT` rows and two black bands.
+  `0352` closes the other half, the fault the machine **survives** with no
+  copyio recovery entry: `handle_kernel_abort()` printed its six rows and called
+  `mondrian_early_panic_begin()` before it knew anything, and the `arm_fast_fault()`
+  / `vm_fault()` below can still fix such a fault, after which the thread returns
+  and the boot carries on with the panel taken -- measured 2026-11-18 as
+  `KABORT esr 0x96000047 far 0xfffffe1f15edc000` on the glass of a boot that kept
+  running, the lock screen answering no touch until a retry.
+  `mondrian_early_panic_begin()` has no other caller, so that survived fault was
+  the only case it served, and it is the one case that must not paint.
+  Those numbers now go to the ring, `MONDRIAN KABORT: recovered|unrecovered
+  esr … far … pc … lr … cpsr … x0 …`, and a fault that really panics still paints
+  through `mondrian_early_fault()`. Note for the next reader: `mondrian_early_reg()`
+  writes with `putc` alone, so the old `KABORT` rows never reached the ring and no
+  saved ring holds one -- a boot that shows them on the glass leaves no record
+  after a reboot. Where the observed one comes from: its `lr`
+  (`0xfffffe0007584a68`) resolves to `_mapping_free_prime_internal`, in the pmap
+  pv-free path this board is documented to die in when the panel alias is torn
+  out -- so the panel was being taken by a pmap fault, not by the UI.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
