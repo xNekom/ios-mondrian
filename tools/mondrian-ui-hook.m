@@ -13483,6 +13483,22 @@ mondrian_install_ui_hooks(void)
 	if (mondrian_file_on("/private/var/vm/mondrian-ent")) {
 		mondrian_ent_probe();
 	}
+	/*
+	 * A switch that was written and is still not seen: open() tells a missing
+	 * file apart from one this process may not read. Measured 2026-11-18: a
+	 * `wfile` of mondrian-ent reported 0 yet the probe never armed, so the
+	 * check's own errno is part of the answer.
+	 */
+	if (mondrian_probe_service()) {
+		int fd = open("/private/var/vm/mondrian-ent", O_RDONLY);
+
+		if (fd < 0) {
+			mondrian_probe_fmt("MONDRIAN ENT[%d]: mondrian-ent open -> errno %d\n",
+			    getpid(), errno);
+		} else {
+			(void)close(fd);
+		}
+	}
 	if (mondrian_probe_service()) {
 		if (mondrian_file_on("/private/var/vm/mondrian-images")) {
 			mondrian_exc_images();

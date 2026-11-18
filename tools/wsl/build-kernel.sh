@@ -243,10 +243,28 @@ mk() {
 
 say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 {
-	# The CoreAnimation dylibs and, when it has been built, the UI hook, so a
-	# userland change needs one kernel build plus one `fastboot boot` and not a
-	# 16 GiB userdata flash (boot-arg glblob=1). Built here, never committed: a
-	# CI run without them simply leaves the header out.
+	# The CoreAnimation dylibs and the UI hook, so a userland change needs one
+	# kernel build plus one `fastboot boot` and not a 16 GiB userdata flash
+	# (boot-arg glblob=1). Built here, never committed: a CI run without them
+	# simply leaves the header out.
+	#
+	# The hook is rebuilt from its source here because this block only *reads*
+	# out/gpu/mondrian-ui-hook.dylib: a change to tools/mondrian-ui-hook.m
+	# otherwise travels nowhere, the kernel embeds the previous copy, and the
+	# device runs a build of the hook that does not contain the change.
+	# Measured 2026-11-18: a probe added to the hook was missing after a full
+	# kernel build and looked like a probe that never fired.
+	if [ -f out/gpu/mondrian-ui-hook.dylib ] &&
+	    [ tools/mondrian-ui-hook.m -nt out/gpu/mondrian-ui-hook.dylib ]; then
+		(
+			# The kernel build exports its own SDK roots and the hook
+			# needs the iPhoneOS one this script defaults to.
+			unset IOS_SDK LD64_LLD
+			bash tools/build-mondrian-ui-hook.sh \
+				out/gpu/mondrian-ui-hook.dylib
+		) || say \
+			"warning: the UI hook did not rebuild; the kernel keeps the old copy"
+	fi
 	if [ -f out/gpu/mondrian-gl.dylib ] && [ -f out/gpu/mondrian-inject.dylib ]; then
 		probe=()
 		[ -f out/gpu/mondrian-probe.dylib ] &&

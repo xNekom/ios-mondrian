@@ -1,0 +1,92 @@
+xnu 0366: say why a signature gets no entitlements
+
+`csops(CS_OPS_ENTITLEMENTS_BLOB)` answers zero bytes for the processes that need
+Photos, while `com.apple.xpc.launchd` gets 22 -- and zero there is not an error:
+`proc_csops` returns without setting one when the blob's `csb_entitlements` is
+NULL. That is the state a userland consumer sees, and TCC is one: assetsd raises
+`NSInternalInconsistencyException` with `assetsd requires TCCPhotosService access`
+although its own signature carries `com.apple.private.tcc.allow =
+[kTCCServicePhotos]`, because the process has nothing for the check to read.
+
+Both ways the attachment gives up are silent: `csblob_get_entitlements` hands back
+XML `NULL` when the blob is not marked `CS_VALID`, and the hook skips the
+read-only blob that `csproc_get_blob` later answers `csops` from. This prints the
+branch taken for each signature, once per identity, with the entitlement count
+when the attachment succeeds. The dyld shared cache is skipped on purpose: it is
+a single vnode for every cached dylib, carries no XML, and its signatures
+consumed the whole budget of the first version of this diagnostic -- which is how
+a silent branch stays silent.
+
+--- a/bsd/kern/mondrian_amfi.c
++++ b/bsd/kern/mondrian_amfi.c
+@@ -126,6 +126,37 @@
+ }
+ 
+ /*
++ * Why a signature ended up with no entitlements. Both branches used to return
++ * in silence, so a process with nothing to answer entitlement queries with --
++ * which is what TCC reads -- left no trace at all. The counter keeps a boot
++ * readable: the first signatures are the interesting ones.
++ */
++static void
++mondrian_amfi_note(const char *identity, const char *what, int value)
++{
++	static char seen[32][40];
++	static unsigned count;
++
++	if (identity == NULL) {
++		identity = "?";
++	}
++	/* One vnode for every cached dylib, and no XML by design. */
++	/* com.apple.dyld.cache.arm64.universal and its siblings. */
++	if (strncmp(identity, "com.apple.dyld.cache", 20) == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		if (strcmp(seen[i], identity) == 0) {
++			return;
++		}
++	}
++	if (count < 32) {
++		strlcpy(seen[count++], identity, sizeof(seen[0]));
++	}
++	printf("MONDRIAN AMFI: %s: %s %d\n", identity, what, value);
++}
++
++/*
+  * Attach the parsed XML entitlements to a code signature being added. This
+  * must happen in the vnode_check_signature MAC hook, like AMFI does: later,
+  * converting a 4K-page signature to multilevel hashes drops the XML blob.
+@@ -144,7 +175,9 @@
+ 		return;
+ 	}
+ 	if (xml == NULL) {
+-		return;                 /* no XML entitlements */
++		mondrian_amfi_note(csblob_get_identity(code_signing_blob),
++		    "no XML available here, len", (int)xml_len);
++		return;
+ 	}
+ 	void *ent = mondrian_entitlements_create(xml, xml_len);
+ 	if (ent == NULL) {
+@@ -161,6 +194,8 @@
+ 		    mondrian_entitlements_string(ent, "com.apple.private.mondrian.test-array", "two"));
+ 	}
+ 	csblob_os_entitlements_set(code_signing_blob, ent);    /* takes a reference */
++	mondrian_amfi_note(csblob_get_identity(code_signing_blob), "attached, count",
++	    (int)mondrian_entitlements_count(ent));
+ 	osobject_release(ent);
+ }
+ 
+@@ -276,6 +311,12 @@
+ 	}
+ 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+ 		mondrian_amfi_attach_entitlements(cs_blob);
++	} else if (cs_blob == cs_blob->csb_ro_addr) {
++		mondrian_amfi_note(csblob_get_identity(cs_blob),
++		    "the read-only blob reached the hook, attaching", 0);
++	} else {
++		mondrian_amfi_note(csblob_get_identity(cs_blob),
++		    "entitlements already present, kept", 0);
+ 	}
+ 	return 0;
+ }
