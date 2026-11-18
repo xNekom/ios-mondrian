@@ -2241,6 +2241,7 @@ mondrian_ca_report(void *unused)
 
 static int mondrian_fix_on(const char *path);
 static int mondrian_file_on(const char *path);
+static int mondrian_file_is(const char *path, char want);
 
 static void
 mondrian_ca_count(void)
@@ -6059,6 +6060,21 @@ mondrian_file_on(const char *path)
 	(void)read(fd, &first, 1);
 	(void)close(fd);
 	return !(first == '0' || first == 'n');
+}
+
+/* The switch's first byte, for a probe with more than on/off. */
+static int
+mondrian_file_is(const char *path, char want)
+{
+	char first = 0;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0) {
+		return 0;
+	}
+	(void)read(fd, &first, 1);
+	(void)close(fd);
+	return first == want;
 }
 
 /*
@@ -11250,6 +11266,62 @@ mondrian_symbol_probe(void *unused)
 }
 
 static void *
+mondrian_cm_thread(void *unused)
+{
+	static const char *const cmds[][5] = {
+		{ "launchctl", "print", "system/com.apple.containermanagerd", NULL },
+		{ "launchctl", "kickstart", "-k", "system/com.apple.containermanagerd", NULL },
+		{ "launchctl", "list", NULL },
+	};
+	extern char **environ;
+	size_t i;
+
+	(void)unused;
+	sleep(6);
+	/*
+	 * Ask launchd itself, rather than spawning the binary: a manually spawned
+	 * containermanagerd cannot own the Mach name launchd hands to its clients,
+	 * so it would answer nothing. `print` says what state the job is in,
+	 * `kickstart` asks launchd to run it in its own context, and `list` shows
+	 * whether it appears at all.
+	 */
+	for (i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+		posix_spawn_file_actions_t actions;
+		char *argv[5];
+		int out, rc, status = 0;
+		pid_t pid = 0;
+		size_t k = 0;
+
+		while (cmds[i][k] != NULL && k < 4) {
+			argv[k] = (char *)cmds[i][k];
+			k++;
+		}
+		argv[k] = NULL;
+		out = open("/dev/console", O_WRONLY | O_NOCTTY);
+		if (out < 0) {
+			continue;
+		}
+		if (posix_spawn_file_actions_init(&actions) != 0) {
+			close(out);
+			continue;
+		}
+		(void)posix_spawn_file_actions_adddup2(&actions, out, STDOUT_FILENO);
+		(void)posix_spawn_file_actions_adddup2(&actions, out, STDERR_FILENO);
+		mondrian_probe_fmt("MONDRIAN CM: %s %s start\n", argv[1],
+		    argv[2] != NULL ? argv[2] : "");
+		rc = posix_spawn(&pid, "/bin/launchctl", &actions, NULL, argv, environ);
+		posix_spawn_file_actions_destroy(&actions);
+		close(out);
+		if (rc == 0) {
+			(void)waitpid(pid, &status, 0);
+		}
+		mondrian_probe_fmt("MONDRIAN CM: %s done rc %d status 0x%x\n",
+		    argv[1], rc, status);
+	}
+	return NULL;
+}
+
+static void *
 mondrian_launchctl_test(void *unused)
 {
 	char *argv[] = { (char *)"launchctl", (char *)"list", NULL };
@@ -11630,8 +11702,14 @@ mondrian_probe_service(void)
 	if (prog == NULL) {
 		return 0;
 	}
+	/*
+	 * PhotosFileProvider is the appex, not the daemon: when Photos opens it is
+	 * this process that dies sig 6, and a list that names only fileproviderd
+	 * leaves the one that matters uninstrumented.
+	 */
 	return strcmp(prog, "assetsd") == 0 ||
 	    strcmp(prog, "fileproviderd") == 0 ||
+	    strcmp(prog, "PhotosFileProvider") == 0 ||
 	    strcmp(prog, "photolibraryd") == 0 ||
 	    strcmp(prog, "iconservicesagent") == 0;
 }
@@ -11769,7 +11847,7 @@ mondrian_exc_terminate(void)
 }
 
 static void
-mondrian_exc_install(void)
+mondrian_exc_install(int quiet)
 {
 	void (*set_objc)(void (*)(id)) =
 	    (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT,
@@ -11777,14 +11855,25 @@ mondrian_exc_install(void)
 	int (*set_cxx)(void (*)(void)) =
 	    (int (*)(void (*)(void)))dlsym(RTLD_DEFAULT, "_ZSt13set_terminatePFvvE");
 
-	if (set_objc != NULL) {
-		set_objc(mondrian_exc_report);
+	/*
+	 * quiet: arm only the hooks that print the exception where it is built,
+	 * and leave the uncaught/terminate handlers alone. Measured 2026-11-18:
+	 * with this dylib's terminate handler in place assetsd dies `sig 11` in
+	 * its guard page instead of `sig 6`, so its own death mode stops being
+	 * evidence. The construction hooks do not perturb: they read the object
+	 * before anyone throws it.
+	 */
+	if (!quiet) {
+		if (set_objc != NULL) {
+			set_objc(mondrian_exc_report);
+		}
+		if (set_cxx != NULL) {
+			(void)set_cxx(mondrian_exc_terminate);
+		}
 	}
-	if (set_cxx != NULL) {
-		(void)set_cxx(mondrian_exc_terminate);
-	}
-	mondrian_probe_fmt("MONDRIAN EXC[%d]: armed prog %s objc %d cxx %d\n",
-	    getpid(), getprogname(), set_objc != NULL, set_cxx != NULL);
+	mondrian_probe_fmt("MONDRIAN EXC[%d]: armed prog %s objc %d cxx %d quiet %d\n",
+	    getpid(), getprogname(), quiet ? 0 : set_objc != NULL,
+	    quiet ? 0 : set_cxx != NULL, quiet);
 }
 
 /*
@@ -12080,6 +12169,110 @@ mondrian_probe_urls(void)
 	    NSHomeDirectory() != nil ? [NSHomeDirectory() UTF8String] : "nil");
 }
 
+/*
+ * Can a normal mobile-uid process resolve the containers the appex needs?
+ *
+ * The services that die raise on a nil URL, and the appex itself is awkward to
+ * reach (it only execs when the photo library is touched, and only once a
+ * session). SpringBoard is easy to restart and runs as the same uid, so this
+ * asks the same questions there: the Photos app group, the standard
+ * directories, and the home. A nil here is the port's container environment,
+ * not something the appex does; an answer here while the appex still gets nil
+ * would put the difference in its sandbox instead.
+ *
+ * Switch: /private/var/vm/mondrian-urltest (separate from the exception probe,
+ * so an ordinary boot with the UI hook never runs it).
+ */
+#define MONDRIAN_GROUP_PHOTOS "group.com.apple.mobileslideshow.PhotosFileProvider"
+
+static void
+mondrian_url_report(const char *what, id value)
+{
+	if (value == nil) {
+		mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: %s -> nil\n", getpid(),
+		    what);
+		return;
+	}
+	if ([value isKindOfClass:[NSURL class]]) {
+		NSString *p = [(NSURL *)value path];
+		mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: %s -> %s\n", getpid(),
+		    what, p != nil ? [p UTF8String] : "(no path)");
+		return;
+	}
+	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: %s -> %s\n", getpid(), what,
+	    [[value description] UTF8String]);
+}
+
+static void *
+mondrian_url_test(void *unused)
+{
+	static const struct {
+		const char *name;
+		NSUInteger directory;
+		NSUInteger domain;
+	} dirs[] = {
+		{ "Documents/user", 1, 1 },
+		{ "Library/user", 5, 1 },
+		{ "Caches/user", 6, 1 },
+		{ "ApplicationSupport/user", 13, 1 },
+		{ "Library/local", 5, 2 },
+	};
+	NSFileManager *fm;
+	SEL single = sel_registerName(
+	    "URLForDirectory:inDomains:appropriateForURL:create:error:");
+	size_t i;
+
+	(void)unused;
+	sleep(8);
+	fm = [NSFileManager defaultManager];
+	if (fm == nil) {
+		say("MONDRIAN URLLOOK: no NSFileManager\n");
+		return NULL;
+	}
+	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: prog %s uid %d home %s\n",
+	    getpid(), getprogname(), getuid(),
+	    NSHomeDirectory() != nil ? [NSHomeDirectory() UTF8String] : "nil");
+	/*
+	 * Only what this Foundation answers. Measured 2026-11-18: calling
+	 * -URLForDirectory:inDomains:appropriateForURL:create:error: directly
+	 * killed SpringBoard (sig 6, the same abort trace as the services) twenty
+	 * times in a row, and class_getInstanceMethod had already said the method
+	 * is not there. Ask, never assume.
+	 */
+	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: responds single %d dirs %d\n",
+	    getpid(), (int)[fm respondsToSelector:single],
+	    (int)[fm respondsToSelector:@selector(URLsForDirectory:inDomains:)]);
+
+	if ([fm respondsToSelector:@selector(containerURLForSecurityApplicationGroupIdentifier:)]) {
+		@try {
+			mondrian_url_report("group Photos",
+			    [fm containerURLForSecurityApplicationGroupIdentifier:
+			    @MONDRIAN_GROUP_PHOTOS]);
+			mondrian_url_report("group tipsnext",
+			    [fm containerURLForSecurityApplicationGroupIdentifier:
+			    @"group.com.apple.tipsnext"]);
+		} @catch (id other) {
+			say("MONDRIAN URLLOOK: group lookup threw\n");
+		}
+	}
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		NSArray *list;
+
+		mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: dir %s %lu/%lu\n",
+		    getpid(), dirs[i].name, (unsigned long)dirs[i].directory,
+		    (unsigned long)dirs[i].domain);
+		@try {
+			list = [fm URLsForDirectory:dirs[i].directory
+			    inDomains:dirs[i].domain];
+		} @catch (id other) {
+			say("MONDRIAN URLLOOK: dirs lookup threw\n");
+			continue;
+		}
+		mondrian_url_report(dirs[i].name, list);
+	}
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -12087,7 +12280,9 @@ mondrian_install_ui_hooks(void)
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (mondrian_probe_service()) {
 		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
-			mondrian_exc_install();
+			int quiet = mondrian_file_is("/private/var/vm/mondrian-exc", '2');
+
+			mondrian_exc_install(quiet);
 			mondrian_probe_raise();
 			mondrian_probe_urls();
 		} else {
@@ -12203,6 +12398,17 @@ mondrian_install_ui_hooks(void)
 		}
 	}
 	/*
+	 * The container question, answered in a process that is easy to
+	 * restart and runs as the same uid as the appex.
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-urltest")) {
+		pthread_t thread;
+
+		if (pthread_create(&thread, NULL, mondrian_url_test, NULL) == 0) {
+			pthread_detach(thread);
+		}
+	}
+	/*
 	 * mondrianbare=1 keeps the probe and the network link but installs none
 	 * of the SpringBoard swizzles. One boot with it answers whether FrontBoard
 	 * deadlocks on its own or because of a hook in that path.
@@ -12263,6 +12469,13 @@ mondrian_install_ui_hooks(void)
 		/* The zone file is written by a root daemon; Foundation re-reads it. */
 		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
 			pthread_detach(tz);
+		}
+		if (mondrian_file_on("/private/var/vm/mondrian-cm")) {
+			pthread_t cm;
+
+			if (pthread_create(&cm, NULL, mondrian_cm_thread, NULL) == 0) {
+				pthread_detach(cm);
+			}
 		}
 		if (mondrian_file_on("/private/var/vm/mondrian-xpc")) {
 			pthread_t xpc;

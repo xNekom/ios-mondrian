@@ -304,13 +304,14 @@ boot each, so the three columns differ only in what changed:
   ```
 
   and nobody catches it, so it reaches `std::terminate` (the type the C++
-  handler reads is `NSException`) and aborts. That is the whole family in one
-  sentence: the services are not crashing on bad memory, they are raising on a
-  path that resolved to nil -- a container or directory URL -- and treating it
-  as fatal. The probe also rules out two guesses: `com.apple.pluginkit.pkd`
-  answers `bootstrap_look_up` with 0 (the broker is registered) and
-  `containermanagerd` has its own log in the root showing it starts and finishes
-  its first-boot cleanup, so neither is missing from the root.
+  handler reads is `NSException`) and aborts. That is the shape of the family in
+  one sentence -- a path that resolved to nil, treated as fatal -- and it is
+  measured for this process, not for all five: assetsd never constructs an
+  `NSException` under the same probe (see below). The probe also rules out two
+  guesses: `com.apple.pluginkit.pkd` answers `bootstrap_look_up` with 0 (the
+  broker is registered) and `containermanagerd` has its own log in the root
+  showing it starts and finishes its first-boot cleanup, so neither is missing
+  from the root.
 
   How it was read, because the loop is cheap and worth reusing: the hook only
   needs one `wfile` of `out/gpu/mondrian-ui-hook.dylib` to
@@ -330,18 +331,41 @@ boot each, so the three columns differ only in what changed:
   the handler that `std::set_terminate` returns branches to a pointer that is not
   callable here (`pc 0xffffffffa7f9aa80`). The reason string is still valid
   because the exception is raised, and printed, before either of those.
-- **The nil URL is a group container, and the container service is what is
-  missing.** The appex carries its own entitlements (`com.apple.security.
-  application-groups` = `group.com.apple.mobileslideshow.PhotosFileProvider`) and
-  the root holds a container whose metadata claims exactly that identifier, so
-  neither the entitlement nor the directory is absent. What is absent is the
-  process that answers: measured on that boot, `containermanagerd` appears in
-  none of 2870 `exec` lines, while `bootstrap_look_up` of
-  `com.apple.containermanagerd` returns 0 -- registered, never spawned, and no
-  `EXECFAIL` or `exit` line to say why. That is the shape to chase next: a
-  service that launchd accepts a lookup for and does not start, which is
-  launchd-side and needs the hook in launchd (`mondrian_ui_hook` bit 32) or a
-  manual spawn to tell "never asked" from "asked and refused".
+- **A mobile-uid process resolves every container the appex needs, so the nil
+  URL is not a missing container service.** Measured 2026-11-18 from SpringBoard
+  (uid 501, the appex's own uid) with the URL probe (`/private/var/vm/mondrian-urltest`
+  holding something other than `0`, then a respring): `group.com.apple.
+  mobileslideshow.PhotosFileProvider` ->
+  `/private/var/mobile/Containers/Shared/AppGroup/61F74B4E-…`, `group.com.apple.
+  tipsnext` -> its own AppGroup, `NSHomeDirectory()` -> `/var/mobile`, and
+  `URLsForDirectory:inDomains:` answers for Documents, Library, Caches and
+  Application Support. That refutes the earlier guess that the nil URL is the
+  group container waiting for `containermanagerd`: the service is still never
+  exec'd (0 of 2870 `exec` lines, `bootstrap_look_up` answers 0, and this root
+  has no `launchctl` at all -- `posix_spawn("/bin/launchctl")` returns `ENOENT`
+  -- so asking launchd about a job means its private job API), and the lookups
+  work without it. Nor is it on the path that opens Photos: tapping Photos
+  starts no `fileproviderd` and no `photolibraryd`, only `assetsd`, which dies
+  30 times in the same boot.
+- **`-URLForDirectory:inDomains:appropriateForURL:create:error:` is not on this
+  Foundation, and calling it anyway aborts the caller.** `respondsToSelector:`
+  says 0 and `class_getInstanceMethod` agrees, yet a probe that called it
+  directly killed SpringBoard 20 times in a row (`sig 6`, the same
+  `__pthread_kill <- abort` trace as the services). That is what made the panel
+  go black between taps and read as "Photos draws nothing": the process drawing
+  it had died. Use `URLsForDirectory:inDomains:`, which is there, and ask
+  `respondsToSelector:` before every call into Foundation.
+- **assetsd's guard-page death is not the terminate handler's doing.** With the
+  probe in "quiet" mode (`/private/var/vm/mondrian-exc` holding `2`: only the
+  exception-construction hooks, no objc or terminate handler) assetsd still dies
+  `sig 11` in its stack guard page (`far = sp + 0x100`, `prot 0/7`) and
+  constructs no `NSException` on the way. So the death mode belongs to the
+  process, not to the handler, and assetsd's abort is not an exception that
+  reaches `+exceptionWithName:reason:userInfo:`. The only message this probe has
+  ever read is fileproviderd's. The same probe list has to name `PhotosFileProvider`
+  as well as the daemon: the kernel injected into the appex but the hook's own
+  `mondrian_probe_service()` did not know the name, so the one process that dies
+  when Photos opens armed nothing and printed nothing.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper

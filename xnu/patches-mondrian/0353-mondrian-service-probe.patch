@@ -35,7 +35,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  
  /*
   * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
-@@ -5661,6 +5669,31 @@ mondrian_dylib_in_vm(const char *path)
+@@ -5661,6 +5669,32 @@ mondrian_dylib_in_vm(const char *path)
  	return true;
  }
  
@@ -50,6 +50,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	static const char *const targets[] = {
 +		"assetsd",
 +		"fileproviderd",
++		"PhotosFileProvider",
 +		"photolibraryd",
 +		"iconservicesagent",
 +	};
@@ -67,7 +68,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static bool
  mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  {
-@@ -5698,6 +5731,20 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5698,6 +5732,20 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	if (name == NULL || sizeof(library) > size || sizeof(injector) > size) {
  		return false;
  	}
@@ -88,7 +89,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
  	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_CONTAINERMANAGERD;
-@@ -5719,7 +5766,9 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5719,7 +5767,9 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_XPCPROXY;
  	}
