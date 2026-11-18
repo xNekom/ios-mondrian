@@ -247,12 +247,18 @@ boot each, so the three columns differ only in what changed:
   Verified on the glass: four cards each with their material and their icons,
   SpringBoard's pid unchanged for 30 s with the library displayed.
   The pass is switched by `/private/var/vm/mondrian-cardspaint` (on unless the
-  file holds `0`), because the builds that carry this code also leave 6 to 12
-  `CRASH SpringBoard` entries per boot at one fixed pc (`...a14`, lr `...9e4`),
-  while a boot of the same kernel with the hook from before this code left none.
-  The pass only runs with the library on the glass, so it cannot be that
-  boot-time crasher -- the association is measured and unexplained, and turning
-  the pass off changes nothing about the boot.
+  file holds `0`). A boot with the hook from before this code left 0
+  `CRASH SpringBoard` entries; boots with it have left 0, 6 or 12, at one fixed
+  pc, so the fault is **intermittent** and a single boot cannot attribute it.
+  What the record says: the pc is SpringBoard + 0xa4a14, which disassembles to
+  `bl` into a shared-cache stub (`0x1c9b0962c`), and `far - 0xf42` (once
+  `0xb42`) lands on a page boundary -- so the receiver was a mapped-then-unmapped
+  object page and this is a message to a freed object, reported at its call site.
+  Turning the App Library pass off changes nothing about a boot; turning the icon
+  artwork pass off (`mondrianiconset=0` in `PREFIX_ARGS` to `image.sh`) measured
+  6 in one boot against 12 in the boot before it, which is inside that spread and
+  is not evidence. Finding it needs a boot that crashes and a debugger on the
+  receiver, not another A/B.
   **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
   a filled rounded rect under the tiles) is the one whose boots crash-looped
   SpringBoard the moment the library opened -- pid changing every few seconds,

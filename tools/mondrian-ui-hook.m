@@ -3745,12 +3745,14 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 		return 0;
 	}
 	/*
-	 * On unless `/private/var/vm/mondrian-cardspaint` holds `0`. The builds
-	 * that carry this pass are also the ones that leave 6 to 12 SpringBoard
-	 * crash entries per boot at one fixed pc (`...a14`, lr `...9e4`), while the
-	 * boot's own hook from before this code left none -- but the pass only runs
-	 * with the library on the glass, so it cannot be that crasher, and turning
-	 * it off changes nothing about the boot. The switch is here for the A/B.
+	 * On unless `/private/var/vm/mondrian-cardspaint` holds `0`.
+	 *
+	 * Boots with this hook have left 0, 6 or 12 `CRASH SpringBoard` entries at
+	 * one fixed pc; the pc is a `bl` at SpringBoard + 0xa4a14 and `far - 0xf42`
+	 * is page-aligned, i.e. a message to a freed object reported at its call
+	 * site. It is intermittent and this pass only runs with the library on the
+	 * glass, so it cannot be that crasher; the switch is here to take the pass
+	 * out of a session that needs a quiet boot.
 	 */
 	if (!mondrian_fix_on("/private/var/vm/mondrian-cardspaint")) {
 		return 0;
