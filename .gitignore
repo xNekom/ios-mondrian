@@ -8,8 +8,11 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
-
 /out/
+
+# the console ring is one boot's capture, not source
+/ring.bin
+/ring.txt
 
 .DS_Store
 usb-*.txt
