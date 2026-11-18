@@ -1,0 +1,92 @@
+xnu 0355: flush the root before the reset
+
+The reset paths stop at the SoC: the BCB points the bootloader and the PMIC goes
+down, and nothing writes back the root. The root is HFS+ without a journal
+(NOTES.md), so the allocation bitmap and the volume header are exactly what the
+reset drops and exactly what the next boot needs: its swap-file truncation then
+frees blocks the bitmap still calls free -- 13 ranges in one boot, measured
+2026-11-18, `hfs: BlockMarkFreeInternal() trying to free unallocated blocks`
+followed by `hfs: error truncating data fork!` -- and after a few resets the
+volume is far enough from consistent that `hfs_mark_inconsistent` floods the ring
+and the compositor stops presenting with `MONDRIAN FB: panel 0/60 sampled ticks
+changed`.
+
+`sync(2)` alone is not the flush: it asks each mount for MNT_NOWAIT, which starts
+the writes and lets the reset catch them in flight. This walks the mounts and
+asks for MNT_WAIT, on both reset paths (`reboot` from the ring, which goes to the
+bootloader, and `poweroff`, which stops the SoC).
+
+What to measure: with this patch, `reboot` on the ring must print
+"MONDRIAN: flushing the root before the reset to fastboot" and "root flushed",
+and the next boot must start with the mark count near zero instead of climbing
+into the thousands.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -29,6 +29,7 @@
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <sys/uio.h>
++#include <sys/mount_internal.h>
+ #include <sys/namei.h>
+ #include <sys/vnode_internal.h>
+ #include <machine/atomic.h>
+@@ -1549,12 +1550,49 @@
+  * reset order goes to the bootloader, neither of which leaves the phone off.
+  * Flush the ring, let the gadget go (0307) and ask PSCI for SYSTEM_OFF; the
+  * boot control block is not touched, so the next start is a normal boot.
++ *//*
++ * Flush the writable filesystems before a reset.
++ *
++ * The reset paths below stop at the SoC: the BCB points the bootloader and the
++ * PMIC goes down, nothing tells the root to write back what it has in memory.
++ * The root is HFS+ without a journal, so the allocation bitmap and the volume
++ * header are exactly what the next boot needs and exactly what the reset drops:
++ * its swap-file truncation then frees blocks the bitmap calls free (13 ranges
++ * in one boot, measured), and each such boot leaves the volume further from
++ * usable until the compositor stops presenting.
++ *
++ * `sync(2)` is not enough on its own: it asks the mount for MNT_NOWAIT, so the
++ * writes are started and the reset can catch them in flight. This asks for
++ * MNT_WAIT, which is what the volume needs before the power goes away.
+  */
++static int
++mondrian_sync_callback(mount_t mp, void *arg)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++
++	(void)arg;
++	if ((mp->mnt_flag & MNT_RDONLY) == 0 && mp->mnt_op != NULL &&
++	    mp->mnt_op->vfs_sync != NULL) {
++		(void)mp->mnt_op->vfs_sync(mp, MNT_WAIT, ctx);
++	}
++	return VFS_RETURNED;
++}
++
++static void
++mondrian_sync_before_reset(const char *why)
++{
++	printf("MONDRIAN: flushing the root before %s\n", why);
++	(void)vfs_iterate(0, mondrian_sync_callback, NULL);
++	printf("MONDRIAN: root flushed\n");
++}
++
++
+ void
+ mondrian_poweroff(void)
+ {
+ 	extern void mondrian_usb_stop(void);
+ 
++	mondrian_sync_before_reset("power off");
+ 	mondrian_log_flush_now();
+ 	mondrian_usb_stop();
+ 	mondrian_log_flush_now();
+@@ -1602,6 +1640,7 @@
+ {
+ 	extern void mondrian_usb_stop(void);
+ 
++	mondrian_sync_before_reset("the reset to fastboot");
+ 	mondrian_log_flush_now();
+ 	/* The gadget must be idle before the SoC reset (0307). */
+ 	mondrian_usb_stop();

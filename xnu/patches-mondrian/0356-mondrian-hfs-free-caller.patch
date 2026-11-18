@@ -1,0 +1,48 @@
+xnu 0356: say which process frees blocks the bitmap does not own
+
+`BlockMarkFreeInternal()` prints the range it could not free and marks the volume,
+but not who asked. Measured 2026-11-18 on a root that had just been written from
+`backup/ios-root-repaired.simg` and verified by `fsck.hfsplus` ("appears to be
+OK"), a single boot still produced eight such ranges -- <153186,5>,
+<160696,999> three times, <160985,1>, <4050321,1>, <160694,84>, <160778,76> --
+so this is not the residue of an earlier dirty reset: something in normal
+operation releases extents the allocation bitmap does not own.
+
+The name of the process at the failure is the cheapest way to tell a daemon's
+file operation from a kernel thread, and it costs one line, printed for the first
+16 failures in a boot. Without it the range says nothing about what to look at.
+
+diff --git a/bsd/mondrian_hfs/core/VolumeAllocation.c b/bsd/mondrian_hfs/core/VolumeAllocation.c
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -157,6 +157,7 @@
+ */
+ 
+ 
++#include <sys/proc.h>
+ #include <sys/types.h>
+ #include <sys/buf.h>
+ 
+@@ -3359,6 +3360,22 @@
+ #else
+ 	printf ("hfs: BlockMarkFreeInternal() trying to free unallocated blocks on volume %s <%u, %u>\n",
+ 			vcb->vcbVN, startingBlock_in, numBlocks_in);
++	/*
++	 * Who asked for it. The range alone does not say which daemon is
++	 * releasing blocks it does not own; the process name does, and it costs
++	 * one line at the failure instead of a flag day of guessing.
++	 */
++	{
++		static int mondrian_free_logged;
++		char who[24];
++
++		if (mondrian_free_logged < 16) {
++			mondrian_free_logged++;
++			proc_selfname(who, (int)sizeof(who));
++			printf("MONDRIAN HFS: free %u+%u asked by %s\n",
++			    startingBlock_in, numBlocks_in, who);
++		}
++	}
+ 	hfs_mark_inconsistent(vcb, HFS_INCONSISTENCY_DETECTED);
+ 	err = EIO;
+ 	goto Exit;

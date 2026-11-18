@@ -1,0 +1,212 @@
+xnu 0354: answer request 4 (container path) instead of refusing it
+
+Measured 2026-11-18: PhotosFileProvider dies `sig 6` with
+NSInternalInconsistencyException "plugin has invalid sandbox or container:
+error 2 path ?" from the PlugInKit frame at +0x18d5c. The container exists
+(/private/var/mobile/Containers/Data/PluginKitPlugin/<uuid>, 414 entries) and
+libcontainer returns it, so the missing piece is the sandbox query: 0043
+answers ENOENT to request 4 and leaves the caller's buffer with the "?" it
+started with -- which is the `path ?` of the message.
+
+The answer is the environment the launcher passed. RunningBoard and pkd get a
+program's container from containermanagerd and pass it as CFFIXED_USER_HOME,
+which is also where Foundation reads HOME from; exec leaves the strings at the
+top of the process stack. So the request is answered by scanning them, as
+HakiOS's minisandbox_container_path() does on the same SoC family
+(kern_minimac.c, mayfly port, SM8475), which documents this symptom: "an
+application extension hosted by PlugInKit does not run without a container".
+
+A process without the variable keeps 0043's answer, ENOENT, rather than HakiOS's
+success with the buffer untouched. Success there is a lie with consequences:
+launchd asks this question about processes that have no container, so it would
+be told the process has one and handed whatever the buffer held. HakiOS can
+return success because its switch has always answered every request with 0;
+this series had never answered 4 at all, so ENOENT is the behaviour every
+service here already lives with.
+
+Requests 5, 6 and 0x43 still fail with ENOENT.
+
+The boot that proves it: tap Photos and read whether PhotosFileProvider lives
+and whether the app draws. An extension that is given a path proves the answer
+without it: "MONDRIAN Sandbox: <prog> container <path>" for any plug-in, and
+SiriTTSSynthesizer is one that runs on its own during boot.
+
+diff --git a/bsd/kern/mondrian_amfi.c b/bsd/kern/mondrian_amfi.c
+--- a/bsd/kern/mondrian_amfi.c
++++ b/bsd/kern/mondrian_amfi.c
+@@ -28,7 +28,12 @@
+ #include <libkern/amfi/amfi.h>
+ #include <libkern/copyio.h>
+ #include <mach/kern_return.h>
++#include <mach/vm_param.h>
++#include <kern/task.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
+ #include <sys/codesign.h>
++#include <sys/proc_internal.h>
+ #include <sys/errno.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+@@ -281,10 +286,149 @@
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). MONDRIAN runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted); a container path is answered
++ * from the environment the launcher passed (see below) and extension tokens
++ * still fail with ENOENT. The first use of each operation number is logged.
+  */
++/*
++ * Request 4, "container path of a process": sandbox_container_path_for_pid()
++ * and sandbox_container_path_for_audit_token() of libsystem_sandbox. The
++ * argument is { pid, version of the pid, buffer, its size, whether the version
++ * is to be compared }.
++ *
++ * On a device the Sandbox learns the container when the program is executed
++ * (it asks containermanagerd) and confines the process to it. Nothing is
++ * confined here, but the question is still asked and the answer matters: an
++ * application extension hosted by PlugInKit does not run without a container.
++ * It starts the buffer with "?" and wants a longer string back, else
++ * "plugin has invalid sandbox or container" (-[PKService checkEnvironment:]),
++ * which is the end of every Photos extension on this port.
++ *
++ * Whoever starts a program that lives in a container -- RunningBoard an
++ * application, pkd an extension -- has had the path from containermanagerd and
++ * passes it in the environment as CFFIXED_USER_HOME, which is where Foundation
++ * takes the home directory from. So that is the answer: the path is looked for
++ * among the strings exec left at the top of the stack of the process.
++ *
++ * A process without the variable has no container and keeps 0043's answer,
++ * ENOENT. Success with the buffer untouched is not an option: launchd asks this
++ * question about processes that have no container, and success would tell it the
++ * process has one and hand it whatever the buffer held.
++ *
++ * Adapted from HakiOS's minisandbox_container_path() (kern_minimac.c, the
++ * mayfly port for SM8475), which documents this same symptom and answer.
++ */
++#define MONDRIAN_SBX_CONTAINER_PATH 4
++#define MONDRIAN_SBX_CONTAINER_VAR  "CFFIXED_USER_HOME="
++
++static int
++mondrian_sandbox_container_path(user_addr_t arg)
++{
++	struct {
++		int64_t     pid;
++		uint64_t    pidversion;
++		user_addr_t buffer;
++		user_size_t size;
++		uint64_t    check_pidversion;
++	} args;
++	const size_t prefix_len = sizeof(MONDRIAN_SBX_CONTAINER_VAR) - 1;
++	proc_t p;
++	task_t task;
++	vm_map_t map;
++	vm_map_copy_t copy = NULL;
++	vm_offset_t strings = 0;
++	vm_size_t strings_size;
++	user_addr_t user_stack;
++	size_t argslen, len;
++	const char *s, *end;
++	int error;
++
++	error = copyin(arg, &args, sizeof(args));
++	if (error != 0) {
++		return error;
++	}
++	p = proc_find((int)args.pid);
++	if (p == PROC_NULL) {
++		return ESRCH;
++	}
++	if (args.check_pidversion &&
++	    (uint64_t)proc_pidversion(p) != args.pidversion) {
++		proc_rele(p);
++		return ESRCH;
++	}
++	user_stack = p->user_stack;
++	argslen = p->p_argslen;
++	task = proc_task(p);
++	if (user_stack == 0 || argslen == 0 || task == TASK_NULL) {
++		proc_rele(p);
++		return ENOENT;
++	}
++	/* sysctl_procargsx()'s way: the task keeps the map alive */
++	task_reference(task);
++	proc_rele(p);
++	map = get_task_map_reference(task);
++	task_deallocate(task);
++	if (map == VM_MAP_NULL) {
++		return ENOENT;
++	}
++	strings_size = vm_map_round_page(argslen, vm_map_page_mask(map));
++	if (kmem_alloc(kernel_map, &strings, strings_size,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_BSD) != KERN_SUCCESS) {
++		vm_map_deallocate(map);
++		return ENOMEM;
++	}
++	if (vm_map_copyin(map, (vm_map_address_t)(user_stack - strings_size),
++	    strings_size, FALSE, &copy) != KERN_SUCCESS) {
++		copy = NULL;
++	}
++	vm_map_deallocate(map);
++	if (copy == NULL ||
++	    vm_map_copy_overwrite(kernel_map, strings, copy, strings_size,
++	    FALSE) != KERN_SUCCESS) {
++		if (copy != NULL) {
++			vm_map_copy_discard(copy);
++		}
++		kmem_free(kernel_map, strings, strings_size);
++		return ENOENT;           /* on its way out, or unmapped its stack */
++	}
++	end = (const char *)(strings + strings_size);
++	for (s = end - argslen; s < end; s += len + 1) {
++		len = strnlen(s, (size_t)(end - s));
++		if (len > prefix_len && s + len < end &&
++		    strncmp(s, MONDRIAN_SBX_CONTAINER_VAR, prefix_len) == 0) {
++			static unsigned mondrian_sbx_path_logged;
++
++			s += prefix_len;
++			len -= prefix_len;
++			error = len < args.size ? copyout(s, args.buffer, len + 1) :
++			    ENAMETOOLONG;
++			/*
++			 * Say which process got which container, the first few
++			 * times: this is the answer an extension either turns
++			 * into a live process or into its exception.
++			 */
++			if (error == 0 && mondrian_sbx_path_logged < 8) {
++				char name[32];
++				char shown[200];
++				size_t shown_len = len < sizeof(shown) - 1
++				    ? len : sizeof(shown) - 1;
++
++				mondrian_sbx_path_logged++;
++				proc_name((int)args.pid, name, sizeof(name));
++				if (copyin(args.buffer, shown, shown_len) == 0) {
++					shown[shown_len] = '\0';
++					printf("MONDRIAN Sandbox: %s container %s\n",
++					    name, shown);
++				}
++			}
++			kmem_free(kernel_map, strings, strings_size);
++			return error;
++		}
++	}
++	kmem_free(kernel_map, strings, strings_size);
++	return ENOENT;                   /* no container in its environment */
++}
++
+ static uint64_t mondrian_sandbox_seen;
+ 
+ static int
+@@ -297,7 +441,8 @@
+ 		printf("MONDRIAN Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
++	case MONDRIAN_SBX_CONTAINER_PATH:
++		return mondrian_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
