@@ -1,0 +1,116 @@
+xnu 0370: count the allocation bitmap against the free-block counter
+
+`statfs` reports `vcb->freeBlocks`, a counter the driver moves on every
+allocation and deallocation, never the bitmap. Measured 2026-11-18: the volume
+reports 46700 free blocks (182 MB) while a walk of the same volume accounts for
+12644 MB of 16384 MB, so the counter and the bitmap have to be compared before
+anyone can say whether the volume is full.
+
+This counts the free bits of the on-disk allocation bitmap once per read-write
+mount and prints both numbers with their difference. It reuses the driver's own
+read path (`ReadBitmapBlock`) and releases every block without marking it dirty,
+so the audit is read-only; a counter that disagrees with the bitmap is a volume
+header that `fsck` will recompute, and a counter that agrees means the space is
+really in files.
+
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -1945,6 +1945,68 @@
+ ;	blockRef
+ ;_______________________________________________________________________
+ */
++/*
++ * MONDRIAN: count the free bits in the on-disk allocation bitmap and compare
++ * them with the mount's free-block counter. `statfs` reports the counter, so a
++ * volume whose bitmap disagrees with it reads as full when it is not (measured
++ * 2026-11-18: the volume reported 182 MB free while a walk of it accounted for
++ * only 12.6 GB of 16.4 GB, and the bitmap answered 249 MB, 32 MB above the
++ * counter). Read-only: every bitmap block is released without being marked
++ * dirty, and the mount lock keeps the count consistent with the allocator.
++ */
++void
++hfs_free_bitmap_audit(struct hfsmount *hfsmp)
++{
++	ExtendedVCB *vcb = HFSTOVCB(hfsmp);
++	u_int32_t bitsPerBlock = vcb->vcbVBMIOSize * kBitsPerByte;
++	u_int32_t wordsPerBlock = vcb->vcbVBMIOSize / kBytesPerWord;
++	u_int32_t total = vcb->totalBlocks;
++	u_int64_t freebits = 0;
++	u_int32_t bit;
++
++	if (bitsPerBlock == 0 || wordsPerBlock == 0) {
++		printf("MONDRIAN HFSAUDIT: no bitmap geometry (%u/%u)\n",
++		    bitsPerBlock, wordsPerBlock);
++		return;
++	}
++	for (bit = 0; bit < total; bit += bitsPerBlock) {
++		u_int32_t *buffer = NULL;
++		uintptr_t blockRef = 0;
++		u_int32_t i;
++		OSErr err;
++
++		err = ReadBitmapBlock(vcb, bit, &buffer, &blockRef,
++		    HFS_ALLOC_IGNORE_RESERVED);
++		if (err != noErr) {
++			printf("MONDRIAN HFSAUDIT: bitmap read at %u failed %d\n",
++			    bit, err);
++			return;
++		}
++		for (i = 0; i < wordsPerBlock; i++) {
++			u_int32_t index = bit + i * kBitsPerWord;
++			u_int32_t word;
++
++			if (index >= total) {
++				break;
++			}
++			word = SWAP_BE32(buffer[i]);
++			if (index + kBitsPerWord <= total) {
++				freebits += __builtin_popcount(~word);
++			} else {
++				u_int32_t keep = total - index;
++				u_int32_t mask = (keep >= kBitsPerWord) ?
++				    0xffffffffu : (0xffffffffu << (kBitsPerWord - keep));
++
++				freebits += __builtin_popcount(~word & mask);
++			}
++		}
++		(void) ReleaseBitmapBlock(vcb, blockRef, false);
++	}
++	printf("MONDRIAN HFSAUDIT: total %u counter %u bitmap %llu diff %lld\n",
++	    total, (unsigned)vcb->freeBlocks, freebits,
++	    (long long)freebits - (long long)vcb->freeBlocks);
++}
++
+ static OSErr ReadBitmapBlock(ExtendedVCB		*vcb,
+ 							 u_int32_t		bit,
+ 							 u_int32_t		**buffer,
+--- a/bsd/mondrian_hfs/core/hfs.h
++++ b/bsd/mondrian_hfs/core/hfs.h
+@@ -985,6 +985,8 @@
+ extern u_int32_t hfs_free_cnids(struct hfsmount * hfsmp);
+ extern u_int32_t hfs_freeblks(struct hfsmount * hfsmp, int wantreserve);
+ 
++extern void hfs_free_bitmap_audit(struct hfsmount *hfsmp);
++
+ short MacToVFSError(OSErr err);
+ 
+ void hfs_metadatazone_init(struct hfsmount *hfsmp, int disable);
+--- a/bsd/mondrian_hfs/core/hfs_vfsops.c
++++ b/bsd/mondrian_hfs/core/hfs_vfsops.c
+@@ -1849,6 +1849,16 @@
+ 		   (hfsmp->vcbVN[0] ? (const char*) hfsmp->vcbVN : "unknown"),
+ 		   dev_name ?: "unknown device");
+ 
++	/*
++	 * What the free counter claims against what the bitmap says, once per
++	 * mount. `statfs` never counts the bitmap, so only this can tell a full
++	 * volume from a drifted counter. Measured 2026-11-18: the root reaches
++	 * this point with the mount already readable (`ronly` is set from
++	 * MNT_RDONLY and the root is remounted later), so the call is not gated on
++	 * it -- an earlier version that was printed nothing at all.
++	 */
++	hfs_free_bitmap_audit(hfsmp);
++
+ 	if (dev_name)
+ 		vnode_putname_printable(dev_name);
+ 

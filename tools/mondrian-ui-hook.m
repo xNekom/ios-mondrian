@@ -14873,11 +14873,15 @@ mondrian_install_ui_hooks(void)
 	 * then cannot process -- 80 spawns in ten minutes on a boot whose UI is
 	 * clean. The kernel's own handler already records every crash in the ring
 	 * with its pc and frame chain, so the reporter is redundant on this port
-	 * while that fault stands. `/private/var/vm/mondrian-reportcrash` turns it
-	 * back on for a session that needs the .ips files.
+	 * while that fault stands. `mondrianreportcrash=1` in the boot arguments
+	 * turns it back on for a session that needs the .ips files: a switch file
+	 * cannot serve here, because one written by `wfile` is root-owned and the
+	 * reporter cannot unlink it, so a stale file turns the loop back on and no
+	 * later write can undo it (measured 2026-11-18: three crashes in a boot
+	 * whose switch had been seeded once).
 	 */
 	if (getprogname() != NULL && strcmp(getprogname(), "ReportCrash") == 0 &&
-	    !mondrian_file_on("/private/var/vm/mondrian-reportcrash")) {
+	    !boot_arg_set("mondrianreportcrash=1")) {
 		_exit(0);
 	}
 	if (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0) {
