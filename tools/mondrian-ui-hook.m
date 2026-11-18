@@ -13,6 +13,8 @@
 #import <sys/sysctl.h>
 #import <stdlib.h>
 #import <signal.h>
+#import <pwd.h>
+#import <grp.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <mach/thread_act.h>
@@ -44,6 +46,9 @@ extern int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t message,
 /* Defined far below; the XPC wrapper above needs them. */
 static int boot_arg_set(const char *name);
 static int boot_arg_int(const char *name, int fallback);
+static void mondrian_probe_fmt(const char *fmt, ...);
+static int mondrian_file_on(const char *path);
+static void mondrian_touch(const char *path);
 
 /*
  * The bootstrap namespace lives in libSystem and the SDK ships no servers/
@@ -68,6 +73,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 #include <spawn.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <sys/sysctl.h>
 #include <stddef.h>
@@ -332,6 +338,384 @@ mondrian_frame_name(int index, const char *wanted, uint64_t off)
 		return;
 	}
 	mondrian_frame_say(index, wanted, off, "not loaded", 0, false);
+}
+
+/*
+ * ReportCrash faults inside libc++ with a libsystem_info caller, and that library
+ * is where getpwuid, getgrgid and getaddrinfo live: ReportCrash names the user
+ * and the group of the process in its report. This names the frames the crash
+ * landed in (offsets from the kernel's pc and bt, resolved against the images pid
+ * exec printed) and then asks the same lookups, so a missing or unreadable user
+ * database shows up as an errno instead of a fault.
+ * Switch: /private/var/vm/mondrian-crashsyms.
+ */
+static void
+mondrian_crash_syms(void)
+{
+	static const char *const files[] = {
+		"/etc/passwd",
+		"/etc/master.passwd",
+		"/etc/group",
+		"/var/db/dslocal/nodes/Default/users/root.plist",
+	};
+	struct passwd pw;
+	struct group gr;
+	char buf[1024];
+	struct passwd *pwp = NULL;
+	struct group *grp = NULL;
+	int pw_err, gr_err;
+	unsigned i;
+
+	mondrian_frame_name(0, "libsystem_info.dylib", 0x1ef84);
+	mondrian_frame_name(1, "libsystem_info.dylib", 0x207d4);
+	mondrian_frame_name(2, "libc++.1.dylib", 0x55e5c);
+	mondrian_frame_name(3, "libc++.1.dylib", 0x683b4);
+	for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		struct stat st;
+		int err = stat(files[i], &st);
+
+		mondrian_probe_fmt("MONDRIAN CRAX[%d]: %s stat %d size %lld\n",
+		    getpid(), files[i], err,
+		    err == 0 ? (long long)st.st_size : -1LL);
+	}
+	memset(&pw, 0, sizeof(pw));
+	pw_err = getpwuid_r(0, &pw, buf, sizeof(buf), &pwp);
+	mondrian_probe_fmt("MONDRIAN CRAX[%d]: getpwuid_r(0) -> %d ptr %s uid %d\n",
+	    getpid(), pw_err, pwp != NULL ? "set" : "nil",
+	    pwp != NULL ? (int)pw.pw_uid : -1);
+	memset(&gr, 0, sizeof(gr));
+	gr_err = getgrgid_r(0, &gr, buf, sizeof(buf), &grp);
+	mondrian_probe_fmt("MONDRIAN CRAX[%d]: getgrgid_r(0) -> %d ptr %s gid %d\n",
+	    getpid(), gr_err, grp != NULL ? "set" : "nil",
+	    grp != NULL ? (int)gr.gr_gid : -1);
+}
+
+/*
+ * ReportCrash faults inside libc++'s
+ * `std::__fs::filesystem::path::lexically_relative(path const&)`, called from
+ * libsystem_info, with a faulting address that lands in a hole between two of its
+ * own mappings and changes every run. The question the crash cannot answer is
+ * which path it was splitting, so the interposer below prints both arguments;
+ * it lives with the other interpose tuples, where the struct is defined.
+ */
+
+static const char *
+mondrian_cxx_string(const void *string)
+{
+	const unsigned char *bytes = string;
+
+	if (bytes == NULL) {
+		return "(null)";
+	}
+	if ((bytes[0] & 0x80) != 0) {
+		const char *data = *(const char *const *)string;
+
+		return data != NULL ? data : "(long, no data)";
+	}
+	return (const char *)(bytes + 1);
+}
+
+/*
+ * The library is empty, so "Photos draws its Library tab" only proves it can draw
+ * the empty state. This imports one image with PhotoKit's own API, in the app
+ * that already carries the hook, so the next launch has something to render.
+ * Switch: /private/var/vm/mondrian-import; the image is
+ * /private/var/vm/mondrian-photo.png, written from the host.
+ */
+/*
+ * Photos runs in multi-library mode here: the platform cannot resolve a system
+ * photo library URL in the app (`+systemLibraryURLIfResolvable` answers nil), so
+ * every single-library API refuses with `Calling single library mode API while
+ * in multi library mode`. That refusal killed the first import attempt by
+ * throwing on a background thread, which is a process-wide death. This prints
+ * the platform's own answers before the app runs, so the next step is decided
+ * from the mode and not from the message alone.
+ */
+static void
+mondrian_library_probe(void)
+{
+	Class pm = objc_getClass("PLPhotoLibraryPathManager");
+	Class ph = objc_getClass("PHPhotoLibrary");
+	id manager = nil;
+	id url = nil;
+	BOOL defined = NO;
+
+	if (pm != Nil) {
+		if ([pm respondsToSelector:@selector(systemLibraryPathManager)]) {
+			manager = [pm performSelector:
+			    @selector(systemLibraryPathManager)];
+		}
+		if ([pm respondsToSelector:@selector(isSystemLibraryURLDefined)]) {
+			defined = ((BOOL (*)(id, SEL))objc_msgSend)(pm,
+			    @selector(isSystemLibraryURLDefined));
+		}
+		if ([pm respondsToSelector:
+		    @selector(systemLibraryURLIfResolvable)]) {
+			url = [pm performSelector:
+			    @selector(systemLibraryURLIfResolvable)];
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN LIB[%d]: defined %d system %s\n", getpid(),
+	    defined ? 1 : 0,
+	    url != nil ? [[url absoluteString] UTF8String] : "(none)");
+	/*
+	 * The platform reports the URL as defined and yet unresolvable, and every
+	 * change request then fails for want of a security-scoped bookmark. The
+	 * registration call is the one a device uses when the system library moves,
+	 * so asking it here says whether the port can put the library back in the
+	 * single-library slot at all.
+	 */
+	if (url == nil && pm != Nil && [pm respondsToSelector:
+	    @selector(setSystemPhotoLibraryURL:error:)]) {
+		NSURL *root = [NSURL fileURLWithPath:
+		    @"/private/var/mobile/Media/PhotoData" isDirectory:YES];
+		NSError *error = nil;
+		BOOL ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(pm,
+		    @selector(setSystemPhotoLibraryURL:error:), root, &error);
+
+		mondrian_probe_fmt("MONDRIAN LIB[%d]: set %d error %s\n", getpid(),
+		    ok ? 1 : 0,
+		    error != nil ? [[error description] UTF8String] : "-");
+		if ([pm respondsToSelector:
+		    @selector(systemLibraryURLIfResolvable)]) {
+			id after = [pm performSelector:
+			    @selector(systemLibraryURLIfResolvable)];
+
+			mondrian_probe_fmt(
+			    "MONDRIAN LIB[%d]: after set system %s\n", getpid(),
+			    after != nil ? [[after absoluteString] UTF8String] :
+			    "(none)");
+		}
+	}
+	if (manager != nil &&
+	    [manager respondsToSelector:@selector(systemLibraryURL)]) {
+		id murl = [manager performSelector:@selector(systemLibraryURL)];
+
+		mondrian_probe_fmt("MONDRIAN LIB[%d]: manager %s url %s\n",
+		    getpid(), class_getName(object_getClass(manager)),
+		    murl != nil ? [[murl absoluteString] UTF8String] : "(none)");
+	}
+	if (ph != Nil && [ph respondsToSelector:@selector(sharedPhotoLibrary)]) {
+		@try {
+			id shared = [ph performSelector:
+			    @selector(sharedPhotoLibrary)];
+			id liburl = nil;
+			const char *image = class_getImageName(ph);
+
+			mondrian_probe_fmt(
+			    "MONDRIAN LIB[%d]: PHPhotoLibrary from %s\n", getpid(),
+			    image != NULL ? image : "(none)");
+			if ([ph respondsToSelector:@selector(authorizationStatus)]) {
+				int status = ((int (*)(id, SEL))objc_msgSend)(ph,
+				    @selector(authorizationStatus));
+
+				mondrian_probe_fmt(
+				    "MONDRIAN LIB[%d]: authorizationStatus %d\n",
+				    getpid(), status);
+			}
+			if ([ph respondsToSelector:
+			    @selector(authorizationStatusForAccessLevel:)]) {
+				int add = ((int (*)(id, SEL, long))objc_msgSend)(ph,
+				    @selector(authorizationStatusForAccessLevel:), 1L);
+				int rw = ((int (*)(id, SEL, long))objc_msgSend)(ph,
+				    @selector(authorizationStatusForAccessLevel:), 2L);
+
+				mondrian_probe_fmt(
+				    "MONDRIAN LIB[%d]: addOnly %d readWrite %d\n",
+				    getpid(), add, rw);
+			}
+			if (shared != nil &&
+			    [shared respondsToSelector:@selector(libraryURL)]) {
+				liburl = [shared performSelector:
+				    @selector(libraryURL)];
+			}
+			mondrian_probe_fmt(
+			    "MONDRIAN LIB[%d]: shared %s url %s\n", getpid(),
+			    shared != nil ? "ok" : "nil",
+			    liburl != nil ? [[liburl absoluteString]
+			    UTF8String] : "(none)");
+		} @catch (id e) {
+			mondrian_probe_fmt(
+			    "MONDRIAN LIB[%d]: shared threw %s\n", getpid(),
+			    [[e reason] UTF8String]);
+		}
+	}
+	{
+		DIR *dir = opendir("/private/var/mobile/Media/PhotoData");
+		struct dirent *ent;
+		char names[300];
+		size_t used = 0;
+
+		names[0] = '\0';
+		while (dir != NULL && (ent = readdir(dir)) != NULL &&
+		    used < sizeof(names) - 40) {
+			size_t len = strlen(ent->d_name);
+
+			if (strcmp(ent->d_name, ".") == 0 ||
+			    strcmp(ent->d_name, "..") == 0 || len > 30) {
+				continue;
+			}
+			memcpy(names + used, ent->d_name, len);
+			used += len;
+			names[used++] = ' ';
+			names[used] = '\0';
+		}
+		if (dir != NULL) {
+			(void)closedir(dir);
+		}
+		mondrian_probe_fmt("MONDRIAN LIB[%d]: PhotoData [%s]\n", getpid(),
+		    names);
+	}
+}
+
+/*
+ * A change submitted through the shared library needs no bookmark, and the
+ * per-library door needs one the client does not have ("Client did not provide
+ * bookmarkData" for /private/var/mobile/Media/PhotoData/). Both are tried, in
+ * that order, and the one that submits says which path the port can use.
+ */
+static id
+mondrian_library_for(NSURL *root)
+{
+	Class ph = objc_getClass("PHPhotoLibrary");
+	id instance = nil;
+
+	if (ph == Nil || root == nil ||
+	    ![ph instancesRespondToSelector:
+	    @selector(initWithPhotoLibraryURL:)]) {
+		return nil;
+	}
+	@try {
+		instance = [[ph alloc] initWithPhotoLibraryURL:root];
+	} @catch (id e) {
+		mondrian_probe_fmt("MONDRIAN IMPORT[%d]: open threw %s\n",
+		    getpid(), [[e reason] UTF8String]);
+	}
+	return instance;
+}
+
+static int
+mondrian_import_submit(id library, Class request, NSURL *source,
+    const char *which)
+{
+	if (library == nil) {
+		return 0;
+	}
+	@try {
+		[library performChanges:^{
+			[request creationRequestForAssetFromImageAtFileURL:source];
+		} completionHandler:^(BOOL success, NSError *error) {
+			mondrian_probe_fmt(
+			    "MONDRIAN IMPORT[%d]: %s success %d error %s\n",
+			    getpid(), which, success ? 1 : 0,
+			    error != nil ? [[error description] UTF8String] : "-");
+			if (error != nil) {
+				mondrian_probe_fmt(
+				    "MONDRIAN IMPORT[%d]: %s domain %s code %ld\n",
+				    getpid(), which, [[error domain] UTF8String],
+				    (long)[error code]);
+			}
+			if (success) {
+				mondrian_touch("/private/var/vm/mondrian-imported");
+			}
+		}];
+	} @catch (id e) {
+		mondrian_probe_fmt("MONDRIAN IMPORT[%d]: %s threw %s\n", getpid(),
+		    which, [[e reason] UTF8String]);
+		return 0;
+	}
+	mondrian_probe_fmt("MONDRIAN IMPORT[%d]: submitted via %s\n", getpid(),
+	    which);
+	return 1;
+}
+
+static void *
+mondrian_import_thread(void *unused)
+{
+	Class ph;
+	Class request;
+	Class asset;
+	Class options;
+	id shared;
+	id library;
+	NSURL *source;
+	NSURL *root;
+	id existing;
+	unsigned have = 0;
+
+	(void)unused;
+	sleep(8);
+	if (mondrian_file_on("/private/var/vm/mondrian-imported")) {
+		return NULL;
+	}
+	ph = objc_getClass("PHPhotoLibrary");
+	request = objc_getClass("PHAssetChangeRequest");
+	asset = objc_getClass("PHAsset");
+	options = objc_getClass("PHFetchOptions");
+	source = [NSURL fileURLWithPath:@"/private/var/vm/mondrian-photo.png"];
+	root = [NSURL fileURLWithPath:@"/private/var/mobile/Media/PhotoData"
+	    isDirectory:YES];
+	if (request == Nil || source == nil) {
+		mondrian_probe_fmt("MONDRIAN IMPORT[%d]: no PhotoKit\n", getpid());
+		return NULL;
+	}
+	if (asset != Nil && options != Nil &&
+	    [asset respondsToSelector:@selector(fetchAssetsWithOptions:)]) {
+		@try {
+			existing = [asset performSelector:
+			    @selector(fetchAssetsWithOptions:)
+			    withObject:[options new]];
+		} @catch (id e) {
+			existing = nil;
+		}
+		if (existing != nil &&
+		    [existing respondsToSelector:@selector(count)]) {
+			have = (unsigned)[existing count];
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN IMPORT[%d]: library has %u, source %s\n",
+	    getpid(), have, [[source path] UTF8String]);
+	if (have > 0) {
+		mondrian_touch("/private/var/vm/mondrian-imported");
+		return NULL;
+	}
+	/*
+	 * Read the picture from the app's own temporary directory: a sandbox
+	 * refusal on /private/var/vm would come back as an import error, not as a
+	 * permission failure, so this takes the file access out of the question.
+	 */
+	{
+		NSString *tmp = [NSTemporaryDirectory()
+		    stringByAppendingPathComponent:@"mondrian-photo.png"];
+		NSFileManager *fm = [NSFileManager defaultManager];
+		BOOL copied;
+
+		if (tmp == nil) {
+			return NULL;
+		}
+		[fm removeItemAtPath:tmp error:NULL];
+		copied = [fm copyItemAtPath:[source path] toPath:tmp
+		    error:NULL];
+		mondrian_probe_fmt("MONDRIAN IMPORT[%d]: staged %d at %s\n",
+		    getpid(), copied ? 1 : 0, [tmp UTF8String]);
+		if (copied) {
+			source = [NSURL fileURLWithPath:tmp];
+		}
+	}
+	shared = nil;
+	if (ph != Nil && [ph respondsToSelector:@selector(sharedPhotoLibrary)]) {
+		@try {
+			shared = [ph performSelector:@selector(sharedPhotoLibrary)];
+		} @catch (id e) {
+			shared = nil;
+		}
+	}
+	if (mondrian_import_submit(shared, request, source, "shared")) {
+		return NULL;
+	}
+	library = mondrian_library_for(root);
+	(void)mondrian_import_submit(library, request, source, "url");
+	return NULL;
 }
 
 static void *
@@ -6103,6 +6487,19 @@ mondrian_file_is(const char *path, char want)
 	return first == want;
 }
 
+/* A switch written from inside the process, for a step that must run once. */
+static void
+mondrian_touch(const char *path)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	if (fd < 0) {
+		return;
+	}
+	(void)write(fd, "1", 1);
+	(void)close(fd);
+}
+
 /*
  * These two fixes are on unless a file says otherwise: the wallpaper and the library's
  * background were never drawn on this port, and without them the UI looks broken. A
@@ -11738,6 +12135,7 @@ mondrian_probe_service(void)
 	    strcmp(prog, "PhotosFileProvider") == 0 ||
 	    strcmp(prog, "photolibraryd") == 0 ||
 	    strcmp(prog, "MobileSlideShow") == 0 ||
+	    strcmp(prog, "ReportCrash") == 0 ||
 	    strcmp(prog, "iconservicesagent") == 0;
 }
 
@@ -12137,6 +12535,120 @@ mondrian_exc_terminate(void)
 	abort();
 }
 
+/*
+ * A fault is a signal, and by the time the crash reporter reads it the stack is
+ * gone: the handler is the only place that still holds pc, lr and the faulting
+ * address. This names the image each address lands in by walking the dyld image
+ * list and the segment table -- memory reads only, no locks -- so the line is
+ * usable without the images table that a repeated exec would flood.
+ */
+static void
+mondrian_fault_image(uint64_t addr, char *out, size_t size)
+{
+	uint32_t count = _dyld_image_count();
+	uint32_t i;
+
+	for (i = 0; i < count; i++) {
+		const struct mach_header_64 *hdr =
+		    (const struct mach_header_64 *)_dyld_get_image_header(i);
+		intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+		const char *path = _dyld_get_image_name(i);
+		const struct load_command *cmd;
+		uint64_t low = 0, high = 0;
+		const char *base;
+
+		if (hdr == NULL || hdr->magic != MH_MAGIC_64) {
+			continue;
+		}
+		cmd = (const struct load_command *)((const char *)hdr + sizeof(*hdr));
+		for (uint32_t k = 0; k < hdr->ncmds; k++) {
+			if (cmd->cmd == LC_SEGMENT_64) {
+				const struct segment_command_64 *seg =
+				    (const struct segment_command_64 *)cmd;
+
+				if (seg->vmsize != 0) {
+					uint64_t start = seg->vmaddr + (uint64_t)slide;
+					uint64_t end = start + seg->vmsize;
+
+					if (low == 0 || start < low) {
+						low = start;
+					}
+					if (end > high) {
+						high = end;
+					}
+				}
+			}
+			if (cmd->cmdsize == 0) {
+				break;
+			}
+			cmd = (const struct load_command *)((const char *)cmd +
+			    cmd->cmdsize);
+		}
+		if (low != 0 && addr >= low && addr < high) {
+			base = path != NULL ? strrchr(path, '/') : NULL;
+			base = base != NULL ? base + 1 : path;
+
+			snprintf(out, size, "%s+0x%llx",
+			    base != NULL ? base : "?",
+			    (unsigned long long)(addr - low));
+			return;
+		}
+	}
+	snprintf(out, size, "?+0x%llx", (unsigned long long)addr);
+}
+
+static void
+mondrian_fault(int sig, siginfo_t *info, void *context)
+{
+	static int told;
+	ucontext_t *uc = (ucontext_t *)context;
+	char where[220];
+	char line[420];
+
+	if (told++ < 2 && uc != NULL) {
+		uint64_t pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+		uint64_t x0 = (uint64_t)uc->uc_mcontext->__ss.__x[0];
+		uint64_t x1 = (uint64_t)uc->uc_mcontext->__ss.__x[1];
+
+		mondrian_fault_image(pc, where, sizeof(where));
+		snprintf(line, sizeof(line),
+		    "MONDRIAN FAULT[%d]: sig %d code %d pc %s far 0x%llx x0 0x%llx x1 0x%llx\n",
+		    getpid(), sig, info != NULL ? info->si_code : -1, where,
+		    (unsigned long long)(info != NULL ?
+		    (uintptr_t)info->si_addr : 0),
+		    (unsigned long long)x0, (unsigned long long)x1);
+		mondrian_exc_say(line);
+		/*
+		 * A C++ member function takes `this` in x0 and its argument in x1;
+		 * for the paths that is the pair being split. Printed only where the
+		 * fault is inside libc++, so a wild register elsewhere does not turn
+		 * into a second fault in the handler.
+		 */
+		if (strncmp(where, "libc++", 6) == 0) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN FAULT[%d]: self '%s' base '%s'\n",
+			    getpid(), mondrian_cxx_string((const void *)(uintptr_t)x0),
+			    mondrian_cxx_string((const void *)(uintptr_t)x1));
+			mondrian_exc_say(line);
+		}
+	}
+	/* SA_RESETHAND already restored the default: returning re-executes the
+	 * faulting instruction, so the process dies the way it would have. */
+}
+
+static void
+mondrian_fault_arm(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = mondrian_fault;
+	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+	(void)sigaction(SIGSEGV, &sa, NULL);
+	(void)sigaction(SIGBUS, &sa, NULL);
+}
+
 static void
 mondrian_exc_install(int quiet)
 {
@@ -12145,7 +12657,6 @@ mondrian_exc_install(int quiet)
 	    "NSSetUncaughtExceptionHandler");
 	int (*set_cxx)(void (*)(void)) =
 	    (int (*)(void (*)(void)))dlsym(RTLD_DEFAULT, "_ZSt13set_terminatePFvvE");
-
 	/*
 	 * quiet: arm only the hooks that print the exception where it is built,
 	 * and leave the uncaught/terminate handlers alone. Measured 2026-11-18:
@@ -12161,6 +12672,7 @@ mondrian_exc_install(int quiet)
 		if (set_cxx != NULL) {
 			(void)set_cxx(mondrian_exc_terminate);
 		}
+		mondrian_fault_arm();
 	}
 	mondrian_probe_fmt("MONDRIAN EXC[%d]: armed prog %s objc %d cxx %d quiet %d\n",
 	    getpid(), getprogname(), quiet ? 0 : set_objc != NULL,
@@ -13326,6 +13838,9 @@ extern int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)
     __attribute__((weak_import));
 extern bool TCCAccessCheckAuditToken(CFStringRef service, audit_token_t token,
     CFDictionaryRef options) __attribute__((weak_import));
+extern int TCCAccessPreflightWithAuditToken(CFStringRef service,
+    audit_token_t token, CFDictionaryRef options)
+    __attribute__((weak_import));
 /*
  * The path that crashes a client: TCCAccessRequest aborts the caller when tccd
  * denies and the app has no usage description in its Info.plist, which is the
@@ -13373,6 +13888,28 @@ mondrian_tcc_token(CFStringRef service, audit_token_t token,
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The same question, asked with the token but through the preflight entry
+ * point: `PHAssetChangeRequest` submission is refused with
+ * `PHPhotosErrorAccessRestricted` (3310) while both `TCCAccessPreflight` and
+ * `TCCAccessCheckAuditToken` answer allowed here, so this is the call that was
+ * left uncovered. Same switch, same answer.
+ */
+static int
+mondrian_tcc_preflight_token(CFStringRef service, audit_token_t token,
+    CFDictionaryRef options)
+{
+	(void)token;
+	(void)options;
+	if (mondrian_tcc_standin()) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: preflightToken %s -> allowed\n",
+		    getpid(), service != NULL
+		        ? [(__bridge NSString *)service UTF8String] : "(null)");
+		return 0;
+	}
+	return 1;
 }
 
 /*
@@ -13542,9 +14079,46 @@ static const struct mondrian_interpose mondrian_tcc_token_interpose = {
 };
 
 __attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_tcc_preflight_token_interpose = {
+	(const void *)mondrian_tcc_preflight_token,
+	(const void *)TCCAccessPreflightWithAuditToken,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
 static const struct mondrian_interpose mondrian_tcc_request_interpose = {
 	(const void *)mondrian_tcc_request,
 	(const void *)TCCAccessRequest,
+};
+
+extern void
+__ZNKSt3__14__fs10filesystem4path18lexically_relativeERKS2_(void *ret,
+    const void *self, const void *arg) __attribute__((weak_import));
+
+static const struct mondrian_interpose mondrian_lexrel_interpose;
+
+static void
+mondrian_lexrel(void *ret, const void *self, const void *arg)
+{
+	static int told;
+	void (*original)(void *, const void *, const void *) =
+	    (void (*)(void *, const void *, const void *))
+	    mondrian_lexrel_interpose.replacee;
+
+	if (told++ < 8) {
+		mondrian_probe_fmt(
+		    "MONDRIAN LEXREL[%d]: self '%s' base '%s' caller %p\n",
+		    getpid(), mondrian_cxx_string(self),
+		    mondrian_cxx_string(arg), __builtin_return_address(0));
+	}
+	if (original != NULL) {
+		original(ret, self, arg);
+	}
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_lexrel_interpose = {
+	(const void *)mondrian_lexrel,
+	(const void *)__ZNKSt3__14__fs10filesystem4path18lexically_relativeERKS2_,
 };
 
 /*
@@ -13572,7 +14146,33 @@ static const struct mondrian_interpose mondrian_throw_interpose = {
  * Switch: /private/var/vm/mondrian-tccforce.
  */
 static BOOL (*mondrian_privacy_original)(id, SEL, long long);
+static long long (*mondrian_privacy_status_original)(id, SEL, long long);
 static int mondrian_tcc_ask(CFStringRef service);
+
+/*
+ * The number the public API is made of: `+[PHPhotoLibrary
+ * authorizationStatusForAccessLevel:]` answers 2 (denied) for read-write and 1
+ * (restricted) for add-only here, and a change request is then refused with
+ * `PHPhotosErrorAccessRestricted` before it ever leaves the process -- the error
+ * carries no underlying error. This is the same stand-in answering the same
+ * question one level lower, and it prints the original so the mapping from
+ * scope to status stays measured.
+ */
+static long long
+mondrian_privacy_status(id self, SEL _cmd, long long scope)
+{
+	long long answer = mondrian_privacy_status_original(self, _cmd, scope);
+	static int told;
+
+	if (told++ < 8) {
+		mondrian_probe_fmt("MONDRIAN PLSTATUS[%d]: scope %lld -> %lld\n",
+		    getpid(), scope, answer);
+	}
+	if (mondrian_tcc_standin()) {
+		return 3; /* PHAuthorizationStatusAuthorized */
+	}
+	return answer;
+}
 
 static BOOL
 mondrian_privacy_access(id self, SEL _cmd, long long scope)
@@ -13614,12 +14214,19 @@ mondrian_install_privacy_hook(void)
 	Method method = cls != Nil ?
 	    class_getInstanceMethod(cls,
 	    sel_registerName("photosAccessAllowedWithScope:")) : NULL;
+	Method status = cls != Nil ?
+	    class_getInstanceMethod(cls, sel_registerName("_authStatusForScope:")) :
+	    NULL;
 
-	if (method == NULL) {
-		return;
+	if (method != NULL) {
+		mondrian_privacy_original = (BOOL (*)(id, SEL, long long))
+		    method_setImplementation(method, (IMP)mondrian_privacy_access);
 	}
-	mondrian_privacy_original = (BOOL (*)(id, SEL, long long))
-	    method_setImplementation(method, (IMP)mondrian_privacy_access);
+	if (status != NULL) {
+		mondrian_privacy_status_original =
+		    (long long (*)(id, SEL, long long))
+		    method_setImplementation(status, (IMP)mondrian_privacy_status);
+	}
 }
 
 /*
@@ -13875,11 +14482,47 @@ mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	mondrian_throw_original = (void (*)(id))mondrian_throw_interpose.replacee;
+	/*
+	 * ReportCrash faults inside libc++'s filesystem path code
+	 * (`path::lexically_relative`), reached through a branch the dyld shared
+	 * cache pre-links, so no interposer sees the call; the faulting `this` is
+	 * unreadable and changes every run, and every crash writes the report it
+	 * then cannot process -- 80 spawns in ten minutes on a boot whose UI is
+	 * clean. The kernel's own handler already records every crash in the ring
+	 * with its pc and frame chain, so the reporter is redundant on this port
+	 * while that fault stands. `/private/var/vm/mondrian-reportcrash` turns it
+	 * back on for a session that needs the .ips files.
+	 */
+	if (getprogname() != NULL && strcmp(getprogname(), "ReportCrash") == 0 &&
+	    !mondrian_file_on("/private/var/vm/mondrian-reportcrash")) {
+		_exit(0);
+	}
 	if (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0) {
 		pthread_t opener;
 
 		if (pthread_create(&opener, NULL, mondrian_open_thread, NULL) == 0) {
 			(void)pthread_detach(opener);
+		}
+	}
+	/*
+	 * The import runs inside Photos itself: adding an asset needs the photo
+	 * library entitlement that the app has and SpringBoard does not.
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-import") &&
+	    getprogname() != NULL &&
+	    strcmp(getprogname(), "MobileSlideShow") == 0) {
+		mondrian_library_probe();
+		/*
+		 * The import itself is a second switch: `performChanges:` throws
+		 * and kills the app, so the probe has to be able to run alone.
+		 */
+		if (mondrian_file_on("/private/var/vm/mondrian-doimport")) {
+			pthread_t importer;
+
+			if (pthread_create(&importer, NULL, mondrian_import_thread,
+			    NULL) == 0) {
+				(void)pthread_detach(importer);
+			}
 		}
 	}
 	/*
@@ -13891,6 +14534,9 @@ mondrian_install_ui_hooks(void)
 		mondrian_ent_probe();
 		mondrian_tccd_probe();
 		mondrian_sec_probe();
+	}
+	if (mondrian_file_on("/private/var/vm/mondrian-crashsyms")) {
+		mondrian_crash_syms();
 	}
 	/*
 	 * A switch that was written and is still not seen: open() tells a missing

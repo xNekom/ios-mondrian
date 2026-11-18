@@ -1,0 +1,29 @@
+xnu 0369: inject the probe into ReportCrash
+
+Measured 2026-11-18: on a boot whose UI is clean -- SpringBoard once, no crashes,
+Photos alive -- ReportCrash faults `sig 11` 81 times in ten minutes with the same
+pc in a system library and the faulting address in a hole between two of its own
+mappings, and every crash produces the report it then cannot process. The kernel's
+`CRASH` line has the pc, lr and frame chain but not the images they land in, and
+that is the one thing the probe already prints at exec.
+
+The hook also arms a SIGSEGV/SIGBUS handler for the probe targets, so the line
+names the image and offset of the faulting pc instead of a bare address.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5698,6 +5698,14 @@
+ 		 * throw hook; this one needs the same.
+ 		 */
+ 		"MobileSlideShow",
++		/*
++		 * Its own death, not the UI's: measured 2026-11-18, ReportCrash
++		 * faults sig 11 with the faulting address between two of its own
++		 * mappings, 81 times in ten minutes, and every crash feeds the next
++		 * report it cannot process. The ring has the pc and the frame
++		 * chain but not the images they land in.
++		 */
++		"ReportCrash",
+ 	};
+ 	size_t i;
+ 
