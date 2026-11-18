@@ -14,6 +14,11 @@ and no rebuild.
 A boot that reaches SpringBoard and then stops drawing is not always a frame
 budget problem: the compositor only presents when something changes, so `fps 0`
 on a still screen is normal, and what matters is whether a touch brings a frame.
+`tools/usb-ring.py fps` asks the screen dump for eight rows over USB and counts
+the samples whose hash changed, so its own ceiling is how fast that round trip
+goes -- measured 10 to 21 samples a second. It proves that the glass moved, not
+how fast: a low count right after an injected `swipe` usually means the gesture
+finished before the window opened, not a slow UI.
 
 - **Idle is the driver's, not the compositor's.** Measured on a boot left
   untouched: the ring carries `MONDRIAN UI: idle timer left armed

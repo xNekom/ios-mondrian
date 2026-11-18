@@ -897,6 +897,9 @@ them has Metal. That is the path this port follows.
   `iconModel -> 1 leaf 13`, `rootFolder -> 1 leaf 9`, 79 `setIcon:` calls, the
   first with an `SBApplicationIcon` -- so what is missing is not the model and
   not the view tree, which the red probe layer proves backboardd composites.
+  A folder's icon is composed from the same artwork and shows the placeholder
+  `No content available` on the home screen for that reason, not because the
+  folder is empty: its member icons draw.
   The artwork never arrives: `assetsd` aborts on exec (`CRASH assetsd sig 6`,
   twice, right after `exec assetsd`) and `iconservicesagent` exits `0x9`, the
   same status a dozen services return on this root (keybagd, usermanagerd,
