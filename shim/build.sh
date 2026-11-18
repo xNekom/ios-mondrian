@@ -72,16 +72,19 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
 # The UFS probe has to be off: after `fastboot boot` the host is powered down,
 # so test_ufs() faults (PANIC SYNC, STAGE ufs) before it would read anything.
 [ -n "${LOGVIEW:-}" ] && CFLAGS="$CFLAGS -DLOGVIEW -DSHIM_NO_UFS"
+# PAC_PROBE=1 builds the arm64e gate: ID registers, key-register writes and
+# PACIA/AUTIA at EL1, printed to the panel, then halt.  It needs no payload.
+[ -n "${PAC_PROBE:-}" ] && CFLAGS="$CFLAGS -DPAC_PROBE"
 mkdir -p out
-for f in start.S shim.c console.c menu.c mmu.c fdt.c loader.c ufs.c libc.c lz4.c spmi.c; do
+for f in start.S shim.c console.c menu.c mmu.c fdt.c loader.c ufs.c libc.c lz4.c spmi.c pac.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
 # The image runs wherever ABL puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$($READELF -r out/shim.o out/console.o out/menu.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o out/spmi.o | grep -c ABS64 || true)
+abs=$($READELF -r out/shim.o out/console.o out/menu.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o out/spmi.o out/pac.o | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/menu.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o out/spmi.o -o out/shim.elf
+	out/start.o out/shim.o out/console.o out/menu.o out/mmu.o out/fdt.o out/loader.o out/ufs.o out/libc.o out/lz4.o out/spmi.o out/pac.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
 end=$($NM out/shim.elf | awk '$3=="_end"{print $1}')

@@ -13,6 +13,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "menu.h"
+#include "pac.h"
 #include "spmi.h"
 #include "ufs.h"
 
@@ -768,6 +769,12 @@ void shim_main(uint64_t dtb)
 	dump_facts(dtb);
 	con_skip();
 #endif
+#endif
+
+#ifdef PAC_PROBE
+	/* The arm64e gate: FEAT_PAuth, the EL1 key registers and PACIA/AUTIA.
+	 * It prints before each poke and halts, so a photo is the result. */
+	pac_probe();
 #endif
 
 	/*
