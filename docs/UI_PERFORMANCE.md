@@ -332,9 +332,9 @@ boot each, so the three columns differ only in what changed:
   builds and throws it itself, so `-[NSException raise]`, the objc uncaught
   handler and `std::terminate`'s previous handler all miss it.
 
-  Two traps in that probe, both measured: the hook's presence changes how
-  assetsd dies (without it `sig 6`, with it `sig 11` in the stack guard page,
-  `far = sp + 0x100`, so its own death mode stops being evidence), and calling
+  Two traps in that probe, both measured: a hook that recurses changes how the
+  process dies (the XPC interposer below did exactly that, so a `sig 11` in the
+  guard page is evidence about the hook first and the process second), and calling
   the handler that `std::set_terminate` returns branches to a pointer that is not
   callable here (`pc 0xffffffffa7f9aa80`). The reason string is still valid
   because the exception is raised, and printed, before either of those.
@@ -365,19 +365,56 @@ boot each, so the three columns differ only in what changed:
   go black between taps and read as "Photos draws nothing": the process drawing
   it had died. Use `URLsForDirectory:inDomains:`, which is there, and ask
   `respondsToSelector:` before every call into Foundation.
-- **assetsd's guard-page death is not the terminate handler's doing.** With the
-  probe in "quiet" mode (`/private/var/vm/mondrian-exc` holding `2`: only the
-  exception-construction hooks, no objc or terminate handler) assetsd still dies
-  `sig 11` in its stack guard page (`far = sp + 0x100`, `prot 0/7`) and
-  constructs no `NSException` on the way. So the death mode belongs to the
-  process, not to the handler, and assetsd's abort is not an exception that
-  reaches `+exceptionWithName:reason:userInfo:`. It also dies with no probe in
-  the boot at all (`sig 6`, `bt` repeating one address, `prot 0/7`): the
-  recursion is its own, and the injected dylib only changes which signal it
-  takes to die. The same probe list has to name `PhotosFileProvider`
-  as well as the daemon: the kernel injected into the appex but the hook's own
-  `mondrian_probe_service()` did not know the name, so the one process that dies
-  when Photos opens armed nothing and printed nothing.
+- **assetsd's guard-page death was the hook's own XPC interposer, and the
+  exception was never in the way.** The dylib interposes
+  `xpc_connection_create_mach_service` and asked `dlsym(RTLD_NEXT)` for the
+  original, which resolves to the *replacement*: the first call recursed into
+  itself, 0x140 of stack per level, until the guard page (`far = sp + 0x100`,
+  `prot 0/7`, `bt` repeating one return address). `pc - mh` puts the fault at
+  the interposer's second instruction, and the same trap was already paid for in
+  `sandbox_container_path_for_pid` -- a `dlsym` on an interposed symbol cannot
+  reach the definition. Taking the original from the `__interpose` tuple's
+  second field fixes it, and with the fix assetsd dies `sig 6` again, which is
+  the real abort. Reading pc against each process's own image table is what
+  named it: the table is printed at exec by `/private/var/vm/mondrian-images`,
+  `_dyld_get_image_header` already returns the slid address (adding
+  `_dyld_get_image_vmaddr_slide` doubles the slide and reads nothing), and only
+  `__TEXT` gives a usable range (a shared-cache segment at vmaddr 0 turns a
+  segment union into a base in the middle of nowhere).
+- **The exception is `NSInternalInconsistencyException`, and its reason names
+  the wall: `assetsd requires TCCPhotosService access`.** It is read at throw
+  time, not in the uncaught handler: the handler runs with 0x100 bytes of stack
+  above the guard page, `-reason` faults there, and the report collapses to
+  `reason ns 2 code 0xb: (none)`. Interposing `objc_exception_throw` (switch
+  `/private/var/vm/mondrian-throw`) prints class, name, reason and a
+  frame-pointer trace while the stack is intact, and that trace is the same one
+  the image's 25 `assetsd-*.ips` reports carry:
+
+  ```
+  MONDRIAN THROW[555]: NSInternalInconsistencyException
+     reason assetsd requires TCCPhotosService access
+     #0 assetsd+0x162f0   #1 PhotoLibraryServicesCore+0x85250
+     #2 PhotoLibraryServicesCore+0x85910   #3 Foundation+0x9de58
+  ```
+
+  So those reports are this build's, not an older one, and the failure predates
+  the filesystem work.
+- **The reason is decided by entitlements the port never attaches.** On a real
+  device `assetsd` carries `com.apple.private.tcc.allow = [kTCCServicePhotos]`
+  and TCC never prompts it; the image's own signature agrees (SuperBlob slot 5,
+  5635 bytes of XML, `magic 0xfade7171`, with the same key). But
+  `csops(CS_OPS_ENTITLEMENTS_BLOB)` answers `0` -- "no entitlements object" --
+  in *every* process with the hook, SpringBoard included, and a `0` here is not
+  an error: `proc_csops` returns it without setting one when
+  `csblob_os_entitlements_get()` is NULL. `mondrian_amfi_vnode_check_signature`
+  (`xnu 0030`) attaches them only when `cs_blob != cs_blob->csb_ro_addr`, and
+  prints nothing when it skips, so the loop from blob to process is where the
+  next measurement goes. That is also why nothing caught this earlier: the
+  sandbox stand-in (`xnu 0043`) grants every privilege without asking, so only
+  a userland consumer of entitlements -- TCC -- could notice. `mondrian-tccok`
+  does not help, and neither `TCCAccessPreflight` nor
+  `TCCAccessCheckAuditToken` is ever called by assetsd: it links
+  `TCC.framework` but imports no `TCCAccess*` symbol.
 - **The appex's death now has a message, and it is not the nil URL.** Measured
   2026-11-18 with the probe in mode 3 (`mondrian-exc` holding `3`: exception
   handlers, no URL resolvers), on the first `exec PhotosFileProvider` of a boot:
@@ -424,10 +461,10 @@ boot each, so the three columns differ only in what changed:
   <- dispatch. So an Objective-C exception is thrown from inside a library
   services operation and nothing on that path catches it: this is the blocker for
   Photos, it predates the filesystem work, and it is not the sandbox query the
-  appex raises. Those reports are from a different build (163 KiB against the
-  273 KiB binary in the image), so their offset names the mode, not the line; the
-  throw site has to come from the running process, which is what
-  `tools/mondrian-probe.m` is for.
+  appex raises. Today's throw-time trace reproduces that backtrace exactly
+  (`assetsd+0x162f0`, `PhotoLibraryServicesCore+0x85250`), so the offsets do
+  name this build's line; the reason is read at throw time, not from the
+  reports.
 - **A black capture with only a battery icon is the panel off.** Measured
   2026-11-18: `usb-ring.py key 116` is the power button, so using it to "wake"
   the phone turns the display off, and the next `screen` comes back black with
