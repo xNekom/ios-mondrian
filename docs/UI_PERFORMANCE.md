@@ -283,11 +283,17 @@ boot each, so the three columns differ only in what changed:
   split cache has no single image table -- and `--disasm N` prints the code
   around it. Measured that way, the pair's backtrace is
   `__pthread_kill <- pthread_kill <- abort <- libc++abi ×5 <- CoreFoundation <-
-  PlugInKit`: an exception thrown through CoreFoundation from PlugInKit reached
-  the terminate handler, so the process aborted itself and its own message went
-  to a stderr this port does not keep. Naming that exception needs a probe
-  inside the process before it aborts; `/private/var/vm/mondrian-exc` arms an
-  uncaught-exception handler in every non-UI process and prints `MONDRIAN EXC`.
+  PlugInKit`, and `assetsd` plus the three speech plug-in hosts
+  (`SiriTTSSynthesizer`, `KonaSynthesizer`, `MacinTalkAUSP`) share the same six
+  frames before they diverge: four services running one libc++abi terminate
+  path, which means an exception nobody caught, not a memory fault. Do not read
+  the frames below `terminate` as a call chain -- measured, they land on function
+  prologues, `bl` stubs and an address in DriverKit's half of the cache, because
+  the frame-pointer walk has lost the stack by then. Naming the exception itself
+  needs code inside the process, and `mondrian_ui_hook` injects the hook into
+  backboardd and SpringBoard only (`mondrian_ui_hook=6`), so no probe of ours
+  sees these services without widening that mask -- which puts our code inside
+  the very process being measured.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper

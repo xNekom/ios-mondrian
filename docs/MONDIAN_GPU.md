@@ -905,11 +905,19 @@ them has Metal. That is the path this port follows.
   The Photos app opens and stays blank under the same limit -- its
   `fileproviderd` and `PhotosFileProvider` abort instead of serving the library
   -- and `docs/UI_PERFORMANCE.md` has that measurement.
-  What is still missing is the service side a live composite needs: `assetsd`
-  aborts on exec (`CRASH assetsd sig 6`,
-  twice, right after `exec assetsd`) and `iconservicesagent` exits `0x9`, the
-  same status a dozen services return on this root (keybagd, usermanagerd,
-  mobileactivationd). Ask `-[SBIconView iconImageView]`'s `image` and paint the
+  What is still missing is the service side a live composite needs, and it fails
+  the same way in several hosts. Measured 2026-11-18: `assetsd` does run, then
+  aborts (`CRASH assetsd sig 6`) and is reaped as `exit assetsd status 0x6`; the
+  three speech plug-in hosts (`SiriTTSSynthesizer`, `KonaSynthesizer`,
+  `MacinTalkAUSP`) abort with a frame-pointer chain identical byte for byte. Read
+  `status` as `p_xstat`, not as an exit code: 0x6 is SIGABRT, 0x5 SIGTRAP
+  (watchdogd), 0x9 SIGKILL -- `iconservicesagent` did not die at all in that
+  boot, and the 0x9 one was `driverkitd`. The exception behind the aborts is
+  uncaught (`docs/UI_PERFORMANCE.md` has the frames), and naming it needs a probe
+  inside the process; the hook is injected by `mondrian_ui_hook`, a bitmask whose
+  6 means backboardd and SpringBoard only, so widening it puts our code inside
+  the process being measured.
+  Ask `-[SBIconView iconImageView]`'s `image` and paint the
   view's own layer (`mondrianiconpaint=1`) to tell "no image" from "not in the
   composited tree" -- a red square where the icon belongs means the view is
   there and only the image is missing. Note that `image 0 contents 0` in the
