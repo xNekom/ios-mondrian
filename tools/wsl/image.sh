@@ -10,14 +10,12 @@
 # refuses anything longer, so a test argument has to come out of something else
 # (PREV_ARGS="" drops the previous-boot line count).
 #
-# **Arguments at the end of the line are not safe.** Measured 2026-11-17: the
-# payload's line ended `... mondrianreset=0  mondrianunlock=1` and the kernel's
-# `kern.bootargs` read 631 bytes ending `... mondrianreset=0
-# mondrianprevlines=200  shim0=8785 shim1=1292 shim2=6778 shim3=7456` -- the
-# shim writes its own arguments over the tail, so an argument appended last is
-# gone before any driver or hook reads it, and the only symptom is that the
-# code behind it behaves as if it was never passed. Anything the *userland* hook
-# has to see goes in PREFIX_ARGS, at the front.
+# The shim appends nothing to the line any more: its own marks (the four phases
+# in milliseconds) go to the console, because at 631 bytes the read above failed
+# with ENOMEM, `watchdogd` aborted on every launch and launchd respawned it 34
+# times in one boot. Measured 2026-11-18 with this script: the kernel logs
+# `args 607 bytes` and the abort count is 0. The tail of the line is therefore
+# the payload's own last argument, and `EXTRA_ARGS` is safe to use.
 #
 # NEVER pipe this script through head/tail: SIGPIPE kills it after the first
 # line, the old image stays on disk, and the phone boots the previous kernel
