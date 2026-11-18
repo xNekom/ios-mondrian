@@ -256,11 +256,13 @@ with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
 draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
-whole. What stays empty is a missing service, not a drawing bug: Phone draws no
-telephony UI, the App Store stops at `LOADING` without the network, and Photos
-is blank because `fileproviderd` and `PhotosFileProvider` abort while `assetsd`
-never runs -- the same service-launch limit that leaves the home screen's Photos
-folder at `No content available`. The measurements and how to aim a tap are in
+whole. What stays empty is a missing service, not a drawing bug: Phone draws only
+its status bar and home indicator (the port brings up no modem -- `NOTES.md`
+lists it with audio and cameras as remaining), the App Store stops at `LOADING`
+without the network, and Photos is blank while `assetsd` and `fileproviderd`
+abort in the middle of their own code -- the same service-launch limit that
+leaves the home screen's Photos folder at `No content available`. The
+measurements, the abort chain and how to aim a tap are in
 `docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device
@@ -288,6 +290,7 @@ ones:
 | `mondriankeepawake=0` | the hook stops holding `UIApplication`'s idle timer down (it does that every two seconds on purpose: the first time iOS blanked the display by itself the frames never came back). One boot with it off is how the idle path gets watched |
 | `battfix=mv:pct,...` | replace `0304`'s built-in voltage table with measured points, up to four, any order (sorted by voltage). The vendor tree carries no mondrian profile, so the Android `capacity` against `voltage_now` pairs are the anchors: 3.80 V read 36 % there where the built-in table said 58 |
 | `mondriankill=none` | refuse the exec of the jobs that abort in their own code on this port (calendar, speech, `watchdogd`, `bluetoothd`, `fairplayd.H2`, `aggregated`); `0316`, replaceable at run time with `execdeny` -- not `kill`, which takes a pid. `quiet` is the built-in list. A denied exec must still create a `signature_failure_reason` (`0328`): without one the assert in `kern_exec.c` fires and the half-initialised image dies inside the shared cache -- which cost the bench 400 of its 500 execs. Measured with the UI up, one-minute windows: off 1 crash/min, the three voice daemons 12, `quiet` 55, exec count flat at 28-30/min. A refusal is a SIGKILL the crash reporter counts, so the list is a loss once the UI runs; it stays as a switch |
+| `mondrian_ui_probe=1` | inject the UI hook into `assetsd`, `fileproviderd`, `photolibraryd` and `iconservicesagent`, which the mask never covers (`0353`). In those processes the hook installs an uncaught-exception handler and returns, so the service keeps its own behaviour; `/private/var/vm/mondrian-exc` arms it (a file, so it can be turned on while the phone runs). Off unless the boot says so |
 | `-noprogress` | keep the graphical boot indicator out of the console text |
 | length | 607 bytes at most. The kernel field is 1024, but iOS userland asks for `kern.bootargs` with a 608-byte buffer and the handler copies the whole string, so one byte over is `ENOMEM` for every reader; `watchdogd` reads it on each launch and aborts, and launchd answers with a respawn loop (~28 aborts in ten minutes, measured). `tools/mkpayload.py` refuses to build past it |
 

@@ -294,6 +294,42 @@ boot each, so the three columns differ only in what changed:
   backboardd and SpringBoard only (`mondrian_ui_hook=6`), so no probe of ours
   sees these services without widening that mask -- which puts our code inside
   the very process being measured.
+- **The exception behind the abort family, named.** Measured 2026-11-18 with a
+  probe injected into the services (`mondrian_ui_probe=1`, `0353`): fileproviderd
+  raises
+
+  ```
+  NSInvalidArgumentException: *** -[NSFileManager createDirectoryAtURL:
+  withIntermediateDirectories:attributes:error:]: URL is nil
+  ```
+
+  and nobody catches it, so it reaches `std::terminate` (the type the C++
+  handler reads is `NSException`) and aborts. That is the whole family in one
+  sentence: the services are not crashing on bad memory, they are raising on a
+  path that resolved to nil -- a container or directory URL -- and treating it
+  as fatal. The probe also rules out two guesses: `com.apple.pluginkit.pkd`
+  answers `bootstrap_look_up` with 0 (the broker is registered) and
+  `containermanagerd` has its own log in the root showing it starts and finishes
+  its first-boot cleanup, so neither is missing from the root.
+
+  How it was read, because the loop is cheap and worth reusing: the hook only
+  needs one `wfile` of `out/gpu/mondrian-ui-hook.dylib` to
+  `/private/var/vm/mondrian-ui-hook.dylib` plus a `respring`; the services take
+  the new copy at their next exec, so an iteration costs a build and about two
+  minutes, not a kernel build and a boot. `glblob=1` rewrites that copy from the
+  kernel's blob at mount, so after a reboot the delivered dylib must be sent
+  again (or the kernel rebuilt) before the probe is armed. What worked was hooking the exception
+  at construction -- `+[NSException exceptionWithName:reason:userInfo:]` and
+  `-[NSException initWithName:reason:userInfo:]` -- because CoreFoundation
+  builds and throws it itself, so `-[NSException raise]`, the objc uncaught
+  handler and `std::terminate`'s previous handler all miss it.
+
+  Two traps in that probe, both measured: the hook's presence changes how
+  assetsd dies (without it `sig 6`, with it `sig 11` in the stack guard page,
+  `far = sp + 0x100`, so its own death mode stops being evidence), and calling
+  the handler that `std::set_terminate` returns branches to a pointer that is not
+  callable here (`pc 0xffffffffa7f9aa80`). The reason string is still valid
+  because the exception is raised, and printed, before either of those.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper

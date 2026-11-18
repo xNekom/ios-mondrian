@@ -1,0 +1,101 @@
+xnu 0353: the service probe gets its own boot argument, not a mask bit
+
+Measured 2026-11-18: assetsd, fileproviderd, SiriTTSSynthesizer, KonaSynthesizer
+and MacinTalkAUSP all end in the same six frames -- `__pthread_kill <-
+pthread_kill <- abort <- libc++abi` -- so one uncaught exception reaching the
+terminate handler is what kills five services, and naming that exception needs
+code inside the process. The mask cannot put it there: `mondrian_ui_hook=6`
+injects the hook into backboardd and SpringBoard only, and no service is in the
+table.
+
+Injecting our code into a process changes the process, so this is not a mask
+bit. `mondrian_ui_probe=1` names a short list -- assetsd, fileproviderd,
+photolibraryd, iconservicesagent -- and nothing else, and the hook's constructor
+returns as soon as it has armed the exception handlers for those names, so the
+service runs with no UI hooks and no extra threads of ours.
+
+The boot that answers it: `mondrian_ui_probe=1`, tap Photos, and read
+`MONDRIAN EXC: name/reason` in the ring.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5643,6 +5643,14 @@ bad:
+  * cheapest answer to "did the launch request reach the spawn at all".
+  */
+ #define MONDRIAN_HOOK_XPCPROXY          0x40
++/*
++ * Not part of the mask. The services in mondrian_probe_target() are injected
++ * only when a boot names them with mondrian_ui_probe=1, because injecting our
++ * code changes the process and the probe exists to read what kills it: five
++ * services die in one libc++abi terminate path (docs/UI_PERFORMANCE.md), and
++ * none of them is a UI process. A default boot injects nothing new.
++ */
++#define MONDRIAN_HOOK_PROBE             0x80
+ 
+ /*
+  * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
+@@ -5661,6 +5669,31 @@ mondrian_dylib_in_vm(const char *path)
+ 	return true;
+ }
+ 
++/*
++ * The services the probe can be aimed at: the photo library's hosts and the
++ * icon service behind the home screen's artwork. Matched by the name the exec
++ * is about to install, exactly as the mask below does it.
++ */
++static bool
++mondrian_probe_target(const char *name, size_t len)
++{
++	static const char *const targets[] = {
++		"assetsd",
++		"fileproviderd",
++		"photolibraryd",
++		"iconservicesagent",
++	};
++	size_t i;
++
++	for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
++		if (len == strlen(targets[i]) &&
++		    strncmp(name, targets[i], len) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5698,6 +5731,20 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	if (name == NULL || sizeof(library) > size || sizeof(injector) > size) {
+ 		return false;
+ 	}
++	/*
++	 * A service the mask never covers. This is the one way to be inside
++	 * assetsd when it aborts, and it is gated by its own argument so that no
++	 * ordinary boot changes: the hook's constructor returns as soon as it has
++	 * armed the exception handlers for these names.
++	 */
++	if (mondrian_probe_target(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen)) {
++		int probe = 0;
++
++		if (PE_parse_boot_argn("mondrian_ui_probe", &probe, sizeof(probe)) &&
++		    probe > 0) {
++			wanted = MONDRIAN_HOOK_PROBE;
++		}
++	}
+ 	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
+ 	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) {
+ 		wanted = MONDRIAN_HOOK_CONTAINERMANAGERD;
+@@ -5719,7 +5766,9 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
+ 		wanted = MONDRIAN_HOOK_XPCPROXY;
+ 	}
+-	if (wanted == 0 || (targets & wanted) == 0) {
++	/* The probe names its own processes; everything else needs its mask bit. */
++	if (wanted == 0 ||
++	    (wanted != MONDRIAN_HOOK_PROBE && (targets & wanted) == 0)) {
+ 		return false;
+ 	}
+ 	/*

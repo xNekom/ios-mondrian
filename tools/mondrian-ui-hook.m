@@ -11608,11 +11608,336 @@ mondrian_launch_thread(void *unused)
 	return NULL;
 }
 
+/*
+ * Why a service dies, in its own words. A process that aborts through
+ * libc++abi has thrown its message away by the time the kernel records `sig 6`:
+ * measured on assetsd, fileproviderd and the three speech plug-in hosts, the
+ * chain is `__pthread_kill <- pthread_kill <- abort <- libc++abi`, which says
+ * "an exception reached the terminate handler" and nothing about which one.
+ * objc's own terminate path calls the uncaught exception handler before it
+ * aborts, so installing that handler is what names the exception; the C++
+ * handler is the fallback for a throw that never went through objc.
+ *
+ * These processes only get this file for that reason, so the constructor
+ * returns right after arming it: no UI hooks, no threads, nothing that changes
+ * what the service was doing when it died.
+ */
+static int
+mondrian_probe_service(void)
+{
+	const char *prog = getprogname();
+
+	if (prog == NULL) {
+		return 0;
+	}
+	return strcmp(prog, "assetsd") == 0 ||
+	    strcmp(prog, "fileproviderd") == 0 ||
+	    strcmp(prog, "photolibraryd") == 0 ||
+	    strcmp(prog, "iconservicesagent") == 0;
+}
+
+/* Probe output goes to the console only: stderr becomes the pipe being read. */
+static void
+mondrian_exc_say(const char *message)
+{
+	if (console_fd >= 0) {
+		(void)write(console_fd, message, __builtin_strlen(message));
+	}
+}
+
+
+static void
+mondrian_exc_report(id exception)
+{
+	NSString *n = nil, *r = nil;
+
+	/*
+	 * Print before touching the exception. Measured 2026-11-18: a handler that
+	 * asked -name/-reason first died in the stack guard page (`sig 11`,
+	 * `far = sp + 0x100`, `prot 0/7`) and left no line at all, so this object
+	 * cannot be assumed readable and the plain line is the evidence that the
+	 * handler ran at all.
+	 */
+	say("MONDRIAN EXC: uncaught exception reached the handler\n");
+	@try {
+		if (exception != nil &&
+		    [exception respondsToSelector:@selector(name)] &&
+		    [exception respondsToSelector:@selector(reason)]) {
+			n = [exception name];
+			r = [exception reason];
+		}
+		if (n != nil && [n isKindOfClass:[NSString class]]) {
+			mondrian_probe_fmt("MONDRIAN EXC[%d]: name %s\n", getpid(),
+			    [n UTF8String]);
+		}
+		if (r != nil && [r isKindOfClass:[NSString class]]) {
+			mondrian_probe_fmt("MONDRIAN EXC[%d]: reason %s\n", getpid(),
+			    [r UTF8String]);
+		}
+	} @catch (id other) {
+		say("MONDRIAN EXC: the handler could not read the exception\n");
+	}
+}
+
+/* libc++abi: the thrown object sits right after its 0x70-byte exception header. */
+#define MONDRIAN_CXA_OBJECT_OFF 0x70
+
+extern void *__cxa_get_globals(void);
+
+static int
+mondrian_exc_read(const void *from, void *to, size_t len)
+{
+	vm_size_t got = 0;
+
+	return mach_vm_read_overwrite(mach_task_self(), (vm_address_t)from,
+	    len, (vm_address_t)to, &got) == KERN_SUCCESS && got == len;
+}
+
+/*
+ * The exception itself. objc throws through the C++ ABI, so the object is in
+ * libc++abi's globals; the isa is checked with dladdr before anything is
+ * messaged, because a wrong offset would fault inside the handler and lose the
+ * line that says why.
+ */
+static id
+mondrian_exc_object(void)
+{
+	void *(*get_globals)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT,
+	    "__cxa_get_globals");
+	void *caught = NULL;
+	uintptr_t isa = 0;
+	Dl_info info;
+
+	if (get_globals == NULL) {
+		return nil;
+	}
+	if (!mondrian_exc_read(get_globals(), &caught, sizeof(caught)) || caught == NULL) {
+		return nil;
+	}
+	if (!mondrian_exc_read((char *)caught + MONDRIAN_CXA_OBJECT_OFF, &isa,
+	    sizeof(isa)) || isa == 0) {
+		return nil;
+	}
+	if (dladdr((void *)isa, &info) == 0) {
+		return nil;
+	}
+	return (id)((char *)caught + MONDRIAN_CXA_OBJECT_OFF);
+}
+
+static void
+mondrian_exc_terminate(void)
+{
+	/* libc++abi's std::type_info is { vptr, const char *__type_name }. */
+	void *(*current_type)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT,
+	    "__cxa_current_exception_type");
+	const char *name = "none";
+	void *info = NULL;
+	id exception;
+
+	say("MONDRIAN EXC: terminate reached the handler\n");
+	if (current_type != NULL) {
+		info = current_type();
+	}
+	if (info != NULL) {
+		const char *at = *(const char **)((char *)info + sizeof(void *));
+
+		if (at != NULL && (uintptr_t)at > 0x10000) {
+			name = at;
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN EXC[%d]: terminate %s\n", getpid(), name);
+	exception = mondrian_exc_object();
+	if (exception != nil) {
+		@try {
+			if ([exception respondsToSelector:@selector(name)] &&
+			    [exception respondsToSelector:@selector(reason)]) {
+				NSString *n = [exception name];
+				NSString *r = [exception reason];
+
+				mondrian_probe_fmt("MONDRIAN EXC[%d]: name %s\n",
+				    getpid(), [n UTF8String]);
+				mondrian_probe_fmt("MONDRIAN EXC[%d]: reason %s\n",
+				    getpid(), [r UTF8String]);
+			}
+		} @catch (id other) {
+			say("MONDRIAN EXC: messaging the exception threw\n");
+		}
+	} else {
+		say("MONDRIAN EXC: no exception object in the globals\n");
+	}
+	abort();
+}
+
+static void
+mondrian_exc_install(void)
+{
+	void (*set_objc)(void (*)(id)) =
+	    (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT,
+	    "NSSetUncaughtExceptionHandler");
+	int (*set_cxx)(void (*)(void)) =
+	    (int (*)(void (*)(void)))dlsym(RTLD_DEFAULT, "_ZSt13set_terminatePFvvE");
+
+	if (set_objc != NULL) {
+		set_objc(mondrian_exc_report);
+	}
+	if (set_cxx != NULL) {
+		(void)set_cxx(mondrian_exc_terminate);
+	}
+	mondrian_probe_fmt("MONDRIAN EXC[%d]: armed prog %s objc %d cxx %d\n",
+	    getpid(), getprogname(), set_objc != NULL, set_cxx != NULL);
+}
+
+/*
+ * The reason string, caught where it is raised. Interposing a libsystem symbol
+ * does not take effect in this dylib (measured before this probe existed), but
+ * Objective-C swizzling does, and every NSException is raised through
+ * -[NSException raise] -- the class methods call it too. Measured 2026-11-18:
+ * the terminate handler names the type (`NSException`) and the machine dies
+ * before the object can be read out of libc++abi's globals, so this is the one
+ * place where the message is still reachable.
+ */
+static void (*mondrian_raise_original)(id, SEL);
+static id (*mondrian_exc_with_original)(id, SEL, id, id, id);
+static id (*mondrian_exc_init_original)(id, SEL, id, id, id);
+
+static void
+mondrian_exc_note(id self, const char *how)
+{
+	@try {
+		NSString *n = [self name];
+		NSString *r = [self reason];
+
+		if (n != nil && [n isKindOfClass:[NSString class]]) {
+			mondrian_probe_fmt("MONDRIAN EXC[%d]: %s name %s\n", getpid(),
+			    how, [n UTF8String]);
+		}
+		if (r != nil && [r isKindOfClass:[NSString class]]) {
+			mondrian_probe_fmt("MONDRIAN EXC[%d]: %s reason %s\n", getpid(),
+			    how, [r UTF8String]);
+		}
+	} @catch (id other) {
+		mondrian_exc_say("MONDRIAN EXC: could not read the exception\n");
+	}
+}
+
+static id
+mondrian_exc_with(id self, SEL _cmd, id name, id reason, id info)
+{
+	if (mondrian_exc_with_original != NULL) {
+		self = mondrian_exc_with_original(self, _cmd, name, reason, info);
+	}
+	mondrian_exc_note(self, "with");
+	return self;
+}
+
+static id
+mondrian_exc_init(id self, SEL _cmd, id name, id reason, id info)
+{
+	if (mondrian_exc_init_original != NULL) {
+		self = mondrian_exc_init_original(self, _cmd, name, reason, info);
+	}
+	mondrian_exc_note(self, "init");
+	return self;
+}
+
+static void
+mondrian_raise(id self, SEL _cmd)
+{
+	mondrian_exc_note(self, "raised");
+	if (mondrian_raise_original != NULL) {
+		mondrian_raise_original(self, _cmd);
+	}
+}
+
+static void
+mondrian_probe_raise(void)
+{
+	Class cls = objc_getClass("NSException");
+	Method method;
+
+	if (cls == Nil) {
+		return;
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("raise"));
+	if (method != NULL) {
+		mondrian_raise_original = (void (*)(id, SEL))method_setImplementation(
+		    method, (IMP)mondrian_raise);
+	}
+	method = class_getClassMethod(cls,
+	    sel_registerName("exceptionWithName:reason:userInfo:"));
+	if (method != NULL) {
+		mondrian_exc_with_original = (id (*)(id, SEL, id, id, id))
+		    method_setImplementation(method, (IMP)mondrian_exc_with);
+	}
+	method = class_getInstanceMethod(cls,
+	    sel_registerName("initWithName:reason:userInfo:"));
+	if (method != NULL) {
+		mondrian_exc_init_original = (id (*)(id, SEL, id, id, id))
+		    method_setImplementation(method, (IMP)mondrian_exc_init);
+	}
+	mondrian_probe_fmt("MONDRIAN EXC[%d]: exception hooks %d %d %d\n", getpid(),
+	    mondrian_raise_original != NULL, mondrian_exc_with_original != NULL,
+	    mondrian_exc_init_original != NULL);
+}
+
+/*
+ * Is a service actually registered in this port's bootstrap namespace? Five
+ * services die in PlugInKit's extension bootstrap (measured 2026-11-18: the
+ * frames sit in the code that prints "Bootstrapping; Bootstrap complete. Ready
+ * for handshake from host."), and the plug-in broker `pkd` -- whose binary and
+ * launchd job are both in the root -- never appears in the ring at all. A
+ * lookup from a process that does not own the name answers whether launchd has
+ * it, which is the difference between "the broker is broken" and "the broker
+ * was never asked".
+ */
+static void
+mondrian_xpc_probe(void)
+{
+	static const char *const names[] = {
+		"com.apple.pluginkit.pkd",
+		"com.apple.containermanagerd",
+		"com.apple.assetsd",
+		"com.apple.iconservices.agent",
+		"com.apple.runningboardd",
+		"com.apple.backboardd",
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		mach_port_t port = MACH_PORT_NULL;
+		kern_return_t kr = bootstrap_look_up(bootstrap_port, names[i], &port);
+
+		mondrian_probe_fmt("MONDRIAN XPC: %s -> %d\n", names[i], (int)kr);
+		if (kr == KERN_SUCCESS && port != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), port);
+		}
+	}
+}
+
+static void *
+mondrian_xpc_probe_thread(void *unused)
+{
+	(void)unused;
+	/* Late enough that launchd has finished bringing the session up. */
+	sleep(4);
+	mondrian_xpc_probe();
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (mondrian_probe_service()) {
+		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
+			mondrian_exc_install();
+			mondrian_probe_raise();
+		} else {
+			mondrian_exc_say("MONDRIAN EXC: switch off, probe idle\n");
+		}
+		return;
+	}
 	/*
 	 * Two processes only report, because the UI hooks break the boot in
 	 * either of them: launchd is the reaper and xpcproxy is what executes
@@ -11781,6 +12106,14 @@ mondrian_install_ui_hooks(void)
 		/* The zone file is written by a root daemon; Foundation re-reads it. */
 		if (pthread_create(&tz, NULL, mondrian_tz_thread, NULL) == 0) {
 			pthread_detach(tz);
+		}
+		if (mondrian_file_on("/private/var/vm/mondrian-xpc")) {
+			pthread_t xpc;
+
+			if (pthread_create(&xpc, NULL, mondrian_xpc_probe_thread,
+			    NULL) == 0) {
+				pthread_detach(xpc);
+			}
 		}
 		if (boot_arg_set("mondrianrbsx=1")) {
 			mondrian_install_launch_wrapper();
