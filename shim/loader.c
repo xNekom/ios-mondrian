@@ -417,20 +417,6 @@ shim_uint(char *out, uint32_t value)
 	return n;
 }
 
-/* Append " key=<value>" to the command line. String literals as arguments keep
- * the shim free of data relocations, which its position independence forbids. */
-static void
-shim_arg(char *dst, uint32_t *used, const char *key, uint32_t value)
-{
-	while (*key != 0 && *used < BOOT_LINE_LENGTH - 2) {
-		dst[(*used)++] = *key++;
-	}
-	/* A 32-bit value is at most ten digits. */
-	if (*used < BOOT_LINE_LENGTH - 12) {
-		*used += shim_uint(dst + *used, value);
-	}
-}
-
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -589,14 +575,14 @@ const char *loader_boot(uintptr_t dtb)
 		uint32_t room;
 
 		/*
-		 * The tail of the line belongs to the shim's own marks: `room` is
-		 * what the bootloader's Android line may take, and it has to leave
-		 * both the payload's line and 128 bytes for shim0..3. Without the
-		 * reservation the marks never reached the kernel (measured: no
-		 * `shim ms` line in the ring) and, when the Android line is long,
-		 * neither does the end of the payload's own line.
+		 * The tail of the line belongs to the bootloader's own arguments:
+		 * `room` is what the Android line may take, and it leaves the
+		 * payload's line and one byte for the terminator inside the 607 the
+		 * userland can read. Measured 2026-11-18: nothing is appended after
+		 * the payload's line any more -- the shim's marks go to the console --
+		 * so the whole line stays inside the ceiling.
 		 */
-#define CMDLINE_SHIM_ROOM 128u
+#define CMDLINE_SHIM_ROOM 1u
 #define CMDLINE_USERLAND_MAX 607u
 		while (p->cmdline[plen] != 0 && plen < BOOT_LINE_LENGTH - 1) {
 			plen++;
@@ -620,15 +606,17 @@ const char *loader_boot(uintptr_t dtb)
 		}
 		/*
 		 * The shim's own phases, in milliseconds: before the loader, the
-		 * window wipe, the unpack, and everything up to the jump. The
-		 * kernel prints them with the rest of the boot stamps.
+		 * window wipe, the unpack, and everything up to the jump. They go
+		 * to the console, never into CommandLine: iOS userland reads
+		 * `kern.bootargs` with a 608-byte buffer, so every byte spent here
+		 * is taken from an argument the kernel needs. Measured 2026-11-18:
+		 * a 631-byte line made that read ENOMEM and `watchdogd` aborted on
+		 * every launch, a respawn loop the ring counted 34 times a boot.
 		 */
 		ms_jump = shim_ms(t_loader);
 		ms_pre = shim_ms(shim_start_ticks);
-		shim_arg(ba->CommandLine, &used, " shim0=", ms_pre);
-		shim_arg(ba->CommandLine, &used, " shim1=", ms_wipe);
-		shim_arg(ba->CommandLine, &used, " shim2=", ms_unpack);
-		shim_arg(ba->CommandLine, &used, " shim3=", ms_jump);
+		con_hex2("SHIMT", "s0=", ms_pre, "s1=", ms_wipe);
+		con_hex2("SHIMT", "s2=", ms_unpack, "s3=", ms_jump);
 		ba->CommandLine[used] = 0;
 		con_str("CMDLINE", (const char *)ba->CommandLine);
 	}
