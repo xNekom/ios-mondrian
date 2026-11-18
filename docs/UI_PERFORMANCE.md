@@ -644,21 +644,23 @@ boot each, so the three columns differ only in what changed:
   And a `dlsym` for `TCCAccessPreflight` returns the interposer: a probe that
   reads the symbol reads its own shim (`mondrian-tccok`) and calls it the OS
   answer. Use `mondrian_tcc_preflight_interpose.replacee`.
-  That shim is switch-gated and no build creates the file: a root needs one byte
-  written to `/private/var/vm/mondrian-tccok` (`usb-ring.py wfile`), and `0`
-  turns the stand-in off again for an A/B. Without it the app aborts `sig 6`
-  again, so it is the first thing to check on a volume that has just been
-  restored.
-- **A synthetic tap is a hold, and the home screen ignores it.** Measured
-  2026-11-18: `tap x y` sends down, down, up inside one frame and iOS drops it;
-  `swipe x y x y 140` is the same point held 140 ms and works -- it opened
-  Search, dismissed dialogs and answered the Photos onboarding. Icon presses
-  still do nothing after a respring (the widgets read `Waiting...` and the icon
-  view does not react), so an app is opened from the host instead: write its
-  bundle id to `/private/var/vm/mondrian-open` and the hook in SpringBoard calls
+  The stand-in is on by default, so a restored root needs no seed: it answers
+  the preflight, the audit-token check and `TCCAccessRequest` for every service,
+  and `/private/var/vm/mondrian-tccoff` (any content) turns it off for an A/B.
+  Measured 2026-11-18 on a boot with no `wfile` at all: pressing the Photos icon
+  opened the app and it reached its Library tab, with `standin 1` in the ring.
+- **A synthetic tap is a hold, and the home screen ignores it while it settles.**
+  Measured 2026-11-18: `tap x y` sends down, down, up inside one frame and iOS
+  drops it; `swipe x y x y 140` is the same point held 140 ms and works -- it
+  opened Search, dismissed dialogs, answered the Photos onboarding, and on a
+  settled home screen a 200 ms hold on the Photos icon opened the app. What does
+  not work is a press while the home screen is still setting up: the widgets read
+  `Waiting...` and the icon view does not react, so read a screenshot first
+  (`No content available` in the Photos widget is a home screen that will
+  respond). The host launcher stays as the deterministic path: write a bundle id
+  to `/private/var/vm/mondrian-open` and the hook in SpringBoard calls
   `-[LSApplicationWorkspace openApplicationWithBundleID:]`, which answers 1 only
-  while the device is unlocked. Every rewrite of that file is a new request, so
-  an unlock followed by a write is the whole gesture.
+  while the device is unlocked, and every rewrite of the file is a new request.
 - **A private selector called unguarded in a constructor is a SpringBoard crash
   loop.** Measured 2026-11-18: a probe that called `-[PLPrivacy _TCCForScope:]`
   without `respondsToSelector:` raised inside the hook's constructor, and
