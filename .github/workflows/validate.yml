@@ -1,0 +1,20 @@
+name: validate
+
+# The repository rules that need no phone and no kernel: doc links, budgets,
+# line endings, tracked captures, credentials, board-table sync, skill front
+# matter, and the patch series. Same entry point a developer runs.
+on:
+  push:
+  pull_request:
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Repository checks
+        run: python3 tools/check-agent.py

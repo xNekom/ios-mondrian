@@ -62,6 +62,18 @@ def validate_patches(verbose=False):
         errors = []
         seen_numbers = {}
 
+        # A number that was never created. Renumbering the tail would move
+        # ids that commit messages and docs already cite by number, so the
+        # gap is declared here instead of silently forgiven.
+        declared = set()
+        gaps_file = os.path.join(full, 'GAPS')
+        if os.path.isfile(gaps_file):
+            with open(gaps_file, errors='ignore') as f:
+                for line in f:
+                    line = line.split('#', 1)[0].strip()
+                    if line.isdigit():
+                        declared.add(int(line))
+
         for path in patch_files:
             fname = os.path.basename(path)
             m = re.match(r'^(\d{4})-(.+)\.patch$', fname)
@@ -80,7 +92,10 @@ def validate_patches(verbose=False):
                 continue
 
             with open(path, 'r', errors='ignore') as f:
-                head = f.read(2048)
+                # The series files carry their commit message as a preamble
+                # (240 of 344 do), so the diff header can start well past the
+                # first block: scan the whole file, not the first 2 KiB.
+                head = f.read()
                 if not ('--- ' in head or 'diff ' in head or 'Index:' in head):
                     errors.append(f"Patch missing standard diff header: {fname}")
 
@@ -89,11 +104,15 @@ def validate_patches(verbose=False):
             sorted_nums = sorted(seen_numbers.keys())
             expected = 1
             for num in sorted_nums:
-                if num != expected:
-                    errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
-                    expected = num + 1
-                else:
+                if num == expected:
                     expected += 1
+                    continue
+                if num > expected and all(n in declared
+                                          for n in range(expected, num)):
+                    expected = num + 1
+                    continue
+                errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
+                expected = num + 1
 
         if errors:
             print(red(f"[-] Patch validation failed for {patch_dir}/ with {len(errors)} error(s):"))
@@ -101,8 +120,11 @@ def validate_patches(verbose=False):
                 print(f"    - {err}")
             ok = False
         else:
+            top = max(seen_numbers)
+            declared_note = (f", {len(declared)} declared gap(s)"
+                             if declared else '')
             print(green(f"[✓] Validated {len(patch_files)} patches in {patch_dir}/ "
-                        f"(0001-{len(patch_files):04d} contiguous, format OK)"))
+                        f"(0001-{top:04d}, format OK{declared_note})"))
     return ok
 
 

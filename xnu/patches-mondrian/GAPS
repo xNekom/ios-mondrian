@@ -1,0 +1,19 @@
+# Patch numbers that are not in the series.
+#
+# A missing number usually means a change was lost; these are the ones that are
+# missing on purpose, each with its reason. `tools/validate-repo.py` accepts a
+# declared gap and nothing else, so a new hole still fails the gate.
+#
+# Renumbering the tail is not the fix: commit messages and the docs cite
+# patches by number (`0316`, `0349`, `0351` ...), so moving a number breaks
+# every reference that already exists.
+
+0058  # deleted in b257ed1 when the software page size became 16 KiB
+0192  # deleted in b8b3e1f: its pre-submit dump answered with junk
+0237  # never created
+0238  # never created
+0253  # never created
+0297  # never created
+0331  # never created
+0345  # deleted in 515a015 (the fb double buffer was dropped)
+0348  # never created; 0347 is the amp-clusters change and 0349 follows
