@@ -257,9 +257,12 @@ say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 	if [ -f out/gpu/mondrian-ui-hook.dylib ] &&
 	    [ tools/mondrian-ui-hook.m -nt out/gpu/mondrian-ui-hook.dylib ]; then
 		(
-			# The kernel build exports its own SDK roots and the hook
-			# needs the iPhoneOS one this script defaults to.
+			# The kernel build puts its own cross clang first on PATH and
+			# exports its own SDK roots; the hook needs the host clang and
+			# the iPhoneOS SDK this script defaults to.
 			unset IOS_SDK LD64_LLD
+			PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+			export PATH
 			bash tools/build-mondrian-ui-hook.sh \
 				out/gpu/mondrian-ui-hook.dylib
 		) || say \
