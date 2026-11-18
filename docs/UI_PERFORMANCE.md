@@ -256,10 +256,10 @@ boot each, so the three columns differ only in what changed:
   Measured 2026-11-18: `MONDRIAN FB: fps 0` and `panel 0/60 sampled ticks
   changed` both read while the phone was responsive with the library on the
   glass, because a still screen produces no frames at all. Read the meter while
-  the screen moves: continuous dragging between pages reported
-  `fps 60, 49, 45, 53, 55, 52, 46, 44, 46` second by second, and the per-tick
-  histogram beside it `tick rec0 14 rec1 44 rec2 2` -- 46 of 60 ticks carried a
-  frame, which is the number to compare against 60.
+  the screen moves: two drag windows between pages reported `fps 49, 60, 45` and
+  `fps 55, 52, 46, 44, 46` second by second, and the per-tick histogram in one of
+  them `tick rec0 14 rec1 44 rec2 2` -- 46 of 60 ticks carried a frame, which is
+  the number to compare against 60.
   The CoreAnimation counters are **not** a frame meter: `ca begin 0 commit 0 slow
   0 display 0 loop 20 in 1 s` was measured while that dragging was happening.
   `+[CATransaction begin]`/`+commit` and `-[CALayer displayIfNeeded]` are not on
