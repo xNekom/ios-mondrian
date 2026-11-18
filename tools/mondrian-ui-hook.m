@@ -9,6 +9,10 @@
 #import <IOKit/IOKitLib.h>
 #import <os/log.h>
 #import <execinfo.h>
+#import <mach-o/dyld.h>
+#import <sys/sysctl.h>
+#import <stdlib.h>
+#import <signal.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
 #import <mach/thread_act.h>
@@ -12311,6 +12315,218 @@ mondrian_seed_container(const char *identifier, NSString *uuid)
 	    [base UTF8String]);
 }
 
+static void
+mondrian_pluginkit_calls(unsigned long frame);
+
+static void
+mondrian_tcc_report(void);
+
+struct mondrian_tcc_cols {
+	int count;
+	char name[32][40];
+};
+
+static int
+mondrian_tcc_col_cb(void *ctx, int n, char **vals, char **cols)
+{
+	struct mondrian_tcc_cols *c = (struct mondrian_tcc_cols *)ctx;
+
+	(void)n;
+	(void)cols;
+	if (c->count < 32 && vals[1] != NULL) {
+		snprintf(c->name[c->count], sizeof(c->name[0]), "%s", vals[1]);
+		c->count++;
+	}
+	return 0;
+}
+
+static int
+mondrian_tcc_has(const struct mondrian_tcc_cols *c, const char *name)
+{
+	int i;
+
+	for (i = 0; i < c->count; i++) {
+		if (strcmp(c->name[i], name) == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int
+mondrian_tcc_row_cb(void *ctx, int n, char **vals, char **cols)
+{
+	(void)ctx;
+	(void)n;
+	(void)cols;
+	mondrian_probe_fmt("MONDRIAN TCC[%d]: row %s auth %s\n", getpid(),
+	    vals[0] != NULL ? vals[0] : "?", vals[1] != NULL ? vals[1] : "?");
+	return 0;
+}
+
+static int
+mondrian_tcc_insert(void *db,
+    int (*exec)(void *, const char *, int (*)(void *, int, char **, char **),
+    void *, char **),
+    const struct mondrian_tcc_cols *cols, const char *client)
+{
+	char sql[1024];
+	size_t n = 0;
+
+	n += (size_t)snprintf(sql + n, sizeof(sql) - n,
+	    "INSERT OR REPLACE INTO access (service, client, client_type,"
+	    " auth_value, auth_reason, auth_version");
+	if (mondrian_tcc_has(cols, "last_modified"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", last_modified");
+	if (mondrian_tcc_has(cols, "last_reminded"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", last_reminded");
+	if (mondrian_tcc_has(cols, "flags"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", flags");
+	if (mondrian_tcc_has(cols, "indirect_object_identifier"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n,
+		    ", indirect_object_identifier");
+	if (mondrian_tcc_has(cols, "pid"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", pid");
+	if (mondrian_tcc_has(cols, "pid_version"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", pid_version");
+	if (mondrian_tcc_has(cols, "boot_uuid"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", boot_uuid");
+	n += (size_t)snprintf(sql + n, sizeof(sql) - n,
+	    ") VALUES ('kTCCServicePhotos', '%s', 0, 2, 4, 1", client);
+	if (mondrian_tcc_has(cols, "last_modified"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n,
+		    ", strftime('%%s','now')");
+	if (mondrian_tcc_has(cols, "last_reminded"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n,
+		    ", strftime('%%s','now')");
+	if (mondrian_tcc_has(cols, "flags"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", 0");
+	if (mondrian_tcc_has(cols, "indirect_object_identifier"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", ''");
+	if (mondrian_tcc_has(cols, "pid"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", NULL");
+	if (mondrian_tcc_has(cols, "pid_version"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", NULL");
+	if (mondrian_tcc_has(cols, "boot_uuid"))
+		n += (size_t)snprintf(sql + n, sizeof(sql) - n, ", NULL");
+	n += (size_t)snprintf(sql + n, sizeof(sql) - n, ");");
+	mondrian_probe_fmt("MONDRIAN TCC[%d]: sql %s\n", getpid(), sql);
+	return exec(db, sql, NULL, NULL, NULL);
+}
+
+/*
+ * The grant itself. TCC.db already has an `access` table, but not the columns
+ * iOS 16 documents (measured: "no column named last_reminded"), so the insert is
+ * built from the columns the table really has. The clients are the ones that
+ * take part: the app, the extension's host daemon and the library daemon --
+ * assetsd's own message names assetsd, not Photos. Switch:
+ * /private/var/vm/mondrian-tccgrant.
+ */
+static void
+mondrian_tcc_grant(void)
+{
+	static const char *const clients[] = {
+		"com.apple.assetsd",
+		"com.apple.mobileslideshow",
+		"com.apple.photolibraryd",
+	};
+	void *lib = dlopen("/usr/lib/libsqlite3.dylib", RTLD_NOW);
+	int (*open_v2)(const char *, void **, int, const char *) =
+	    (int (*)(const char *, void **, int, const char *))
+	    dlsym(lib != NULL ? lib : RTLD_DEFAULT, "sqlite3_open_v2");
+	int (*exec)(void *, const char *,
+	    int (*)(void *, int, char **, char **), void *, char **) =
+	    (int (*)(void *, const char *, int (*)(void *, int, char **, char **),
+	    void *, char **))dlsym(lib != NULL ? lib : RTLD_DEFAULT, "sqlite3_exec");
+	void (*close)(void *) = (void (*)(void *))
+	    dlsym(lib != NULL ? lib : RTLD_DEFAULT, "sqlite3_close");
+	struct mondrian_tcc_cols cols;
+	void *db = NULL;
+	char *err = NULL;
+	int rc, i;
+
+	if (open_v2 == NULL || exec == NULL) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: grant no sqlite\n", getpid());
+		mondrian_tcc_report();
+		return;
+	}
+	rc = open_v2("/private/var/mobile/Library/TCC/TCC.db", &db, 2, NULL);
+	if (rc != 0) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: grant open %d\n", getpid(), rc);
+		mondrian_tcc_report();
+		return;
+	}
+	cols.count = 0;
+	(void)exec(db, "PRAGMA table_info(access);", mondrian_tcc_col_cb, &cols, NULL);
+	mondrian_probe_fmt("MONDRIAN TCC[%d]: columns %d\n", getpid(), cols.count);
+	for (i = 0; i < (int)(sizeof(clients) / sizeof(clients[0])); i++) {
+		int out = mondrian_tcc_insert(db, exec, &cols, clients[i]);
+
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: insert %s -> %d\n", getpid(),
+		    clients[i], out);
+	}
+	/* The override table is what `tccutil`/profiles use to allow a service for
+	 * everyone; it has no client column, so there is no code identity to
+	 * match. */
+	mondrian_probe_fmt("MONDRIAN TCC[%d]: override photos -> %d\n", getpid(),
+	    exec(db, "INSERT OR REPLACE INTO access_overrides (service) VALUES "
+	    "('kTCCServicePhotos');", NULL, NULL, NULL));
+	mondrian_probe_fmt("MONDRIAN TCC[%d]: override photoadd -> %d\n", getpid(),
+	    exec(db, "INSERT OR REPLACE INTO access_overrides (service) VALUES "
+	    "('kTCCServicePhotosAdd');", NULL, NULL, NULL));
+	/* The rows sit in the WAL; a reader that cannot write -shm sees the old
+	 * database. Fold the WAL into the file and leave it in rollback mode. */
+	(void)exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", mondrian_tcc_row_cb,
+	    NULL, NULL);
+	(void)exec(db, "PRAGMA journal_mode=delete;", mondrian_tcc_row_cb, NULL,
+	    NULL);
+	(void)exec(db, "SELECT count(*) FROM access;", mondrian_tcc_row_cb, NULL,
+	    NULL);
+	(void)exec(db, "SELECT client, auth_value FROM access "
+	    "WHERE service = 'kTCCServicePhotos';", mondrian_tcc_row_cb, NULL, &err);
+	if (err != NULL) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: readback error %s\n", getpid(),
+		    err);
+	}
+	{
+		(void)exec(db, "PRAGMA journal_mode;", mondrian_tcc_row_cb, NULL,
+		    NULL);
+		(void)exec(db, "SELECT changes();", mondrian_tcc_row_cb, NULL, NULL);
+	}
+	if (close != NULL) {
+		close(db);
+	}
+	mondrian_tcc_report();
+}
+
+/*
+ * TCC, the privacy database. assetsd's own exception says "assetsd requires
+ * TCCPhotosService access", and nothing in the port has ever dealt with TCC: no
+ * database in the root, no grant. This asks the same function assetsd asks, from
+ * inside assetsd, and reports whether the database exists at all. Switch:
+ * /private/var/vm/mondrian-tcc.
+ */
+static void
+mondrian_tcc_report(void)
+{
+	typedef int (*preflight_t)(CFStringRef, CFDictionaryRef);
+	preflight_t preflight = (preflight_t)dlsym(RTLD_DEFAULT,
+	    "TCCAccessPreflight");
+	NSString *db = @"/private/var/mobile/Library/TCC/TCC.db";
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSDictionary *attrs = [fm attributesOfItemAtPath:db error:NULL];
+	long long size = [[attrs objectForKey:NSFileSize] longLongValue];
+	int result = -999;
+
+	if (preflight != NULL) {
+		result = preflight(CFSTR("kTCCServicePhotos"), NULL);
+	}
+	mondrian_probe_fmt(
+	    "MONDRIAN TCC[%d]: preflight %d (%s) db %d size %lld\n", getpid(),
+	    result, preflight != NULL ? "called" : "symbol missing",
+	    (int)[fm fileExistsAtPath:db], size);
+}
+
 /*
  * What the dying appex was told about itself. iOS gives a plug-in its own data
  * container under `Containers/Data/PluginKitPlugin`, not an app container under
@@ -12351,6 +12567,14 @@ mondrian_appex_report(void)
 	    env_tmp != NULL ? env_tmp : "(nil)");
 	mondrian_probe_fmt("MONDRIAN APPEX[%d]: uid %d gid %d ppid %d\n", getpid(),
 	    (int)geteuid(), (int)getegid(), (int)getppid());
+	/*
+	 * Name the calls of the function that raises the exception. The frame is
+	 * the return address into PlugInKit, measured from this boot's stacks; the
+	 * offsets have been the same every time (+0x18d5c).
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-bl")) {
+		mondrian_pluginkit_calls(0x18d5c);
+	}
 	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 		NSString *p = [NSString stringWithUTF8String:dirs[i]];
 		NSArray *list = [fm contentsOfDirectoryAtPath:p error:NULL];
@@ -12373,6 +12597,11 @@ mondrian_appex_report(void)
 
 		mondrian_probe_fmt("MONDRIAN APPEX[%d]: syms cpath_pid %d libcontainer %d\n",
 		    getpid(), path_for_pid != NULL, libc != NULL);
+		mondrian_probe_fmt(
+		    "MONDRIAN APPEX[%d]: syms path_token %d consume %d\n",
+		    getpid(),
+		    dlsym(RTLD_DEFAULT, "sandbox_container_path_for_audit_token") != NULL,
+		    dlsym(RTLD_DEFAULT, "sandbox_extension_consume") != NULL);
 		if (path_for_pid != NULL) {
 			char buf[1024];
 
@@ -12382,6 +12611,67 @@ mondrian_appex_report(void)
 			mondrian_probe_fmt(
 			    "MONDRIAN APPEX[%d]: sandbox path -> err %d path %s\n",
 			    getpid(), r, buf[0] != '\0' ? buf : "(empty)");
+		}
+	}
+	/*
+	 * The container side of the same message. The query API is asked the way
+	 * libcontainer's own clients ask it, for the appex's identifier and for
+	 * Photos', across the classes that exist; a NULL path with an error
+	 * number is the "path ?" of the exception.
+	 */
+	{
+		typedef void *mcm_query_t;
+		typedef void *mcm_container_t;
+		mcm_query_t (*q_create)(void) = (mcm_query_t (*)(void))
+		    dlsym(RTLD_DEFAULT, "container_query_create");
+		void (*q_set_id)(mcm_query_t, const char *) =
+		    (void (*)(mcm_query_t, const char *))
+		    dlsym(RTLD_DEFAULT, "container_query_set_identifiers");
+		void (*q_set_class)(mcm_query_t, int) =
+		    (void (*)(mcm_query_t, int))
+		    dlsym(RTLD_DEFAULT, "container_query_set_class");
+		void (*q_set_owners)(mcm_query_t, int) =
+		    (void (*)(mcm_query_t, int))
+		    dlsym(RTLD_DEFAULT, "container_query_set_include_other_owners");
+		mcm_container_t (*q_single)(mcm_query_t) =
+		    (mcm_container_t (*)(mcm_query_t))
+		    dlsym(RTLD_DEFAULT, "container_query_get_single_result");
+		const char *(*c_path)(mcm_container_t) =
+		    (const char *(*)(mcm_container_t))
+		    dlsym(RTLD_DEFAULT, "container_copy_path");
+		const char *ids[2];
+		int cls;
+
+		ids[0] = bid != nil ? [bid UTF8String] : "";
+		ids[1] = "com.apple.mobileslideshow";
+		mondrian_probe_fmt(
+		    "MONDRIAN APPEX[%d]: container api create %d id %d class %d single %d path %d\n",
+		    getpid(), q_create != NULL, q_set_id != NULL,
+		    q_set_class != NULL, q_single != NULL, c_path != NULL);
+		if (q_create != NULL && q_set_id != NULL && q_single != NULL) {
+			for (i = 0; i < 2; i++) {
+				for (cls = 0; cls <= 6; cls++) {
+					mcm_query_t q = q_create();
+					mcm_container_t c;
+					const char *p = NULL;
+
+					q_set_id(q, ids[i]);
+					if (q_set_class != NULL) {
+						q_set_class(q, cls);
+					}
+					if (q_set_owners != NULL) {
+						q_set_owners(q, 1);
+					}
+					c = q_single(q);
+					if (c != NULL && c_path != NULL) {
+						p = c_path(c);
+					}
+					mondrian_probe_fmt(
+					    "MONDRIAN APPEX[%d]: query %s class %d -> %s\n",
+					    getpid(), ids[i], cls,
+					    p != NULL ? p : "(no path)");
+				}
+			}
 		}
 	}
 }
@@ -12670,6 +12960,54 @@ mondrian_url_test(void *unused)
 }
 
 /*
+ * Who is running, and with which pid, so the kernel's own `kill` command can
+ * aim at the process that caches a failure. A `respring` restarts SpringBoard
+ * but not pkd, and an extension that has failed once is not requested again
+ * until something upstream forgets it. Filtered to the names that matter, so
+ * the ring keeps its room. Switch: /private/var/vm/mondrian-ps.
+ */
+static void
+mondrian_process_report(void)
+{
+	static const char *const watch[] = {
+		"launchd", "pkd", "tccd", "runningboardd", "xpcproxy", "assetsd",
+		"photolibraryd", "fileproviderd", "containermanagerd",
+		"MobileSlideShow", "PhotosFileProvid", "SpringBoard",
+	};
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	struct kinfo_proc *procs;
+	size_t size = 0, count, i;
+	size_t w;
+
+	if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) {
+		return;
+	}
+	procs = malloc(size);
+	if (procs == NULL) {
+		return;
+	}
+	if (sysctl(mib, 4, procs, &size, NULL, 0) != 0) {
+		free(procs);
+		return;
+	}
+	count = size / sizeof(*procs);
+	mondrian_probe_fmt("MONDRIAN PS[%d]: %lu processes\n", getpid(),
+	    (unsigned long)count);
+	for (i = 0; i < count; i++) {
+		for (w = 0; w < sizeof(watch) / sizeof(watch[0]); w++) {
+			if (strcmp(procs[i].kp_proc.p_comm, watch[w]) != 0) {
+				continue;
+			}
+			mondrian_probe_fmt("MONDRIAN PS[%d]: %s pid %d uid %d\n",
+			    getpid(), watch[w], (int)procs[i].kp_proc.p_pid,
+			    (int)procs[i].kp_eproc.e_ucred.cr_uid);
+			break;
+		}
+	}
+	free(procs);
+}
+
+/*
  * The port's sandbox stand-in (xnu 0043) answers ENOENT to the container-path
  * operation, which is the one query PlugInKit makes before it launches a
  * plug-in: the appex dies "plugin has invalid sandbox or container: error 2".
@@ -12682,6 +13020,128 @@ mondrian_url_test(void *unused)
  */
 extern int sandbox_container_path_for_pid(int pid, char *path, size_t size)
     __attribute__((weak_import));
+extern int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)
+    __attribute__((weak_import));
+extern bool TCCAccessCheckAuditToken(CFStringRef service, audit_token_t token,
+    CFDictionaryRef options) __attribute__((weak_import));
+
+/*
+ * TCC cannot answer these binaries: the grant is in the database (measured:
+ * the row reads back with auth 2, the file is checkpointed, tccd restarted) and
+ * the preflight still denies, because a row is matched against the client's code
+ * identity and ad-hoc binaries have none. The port has no code signatures, so
+ * the query has to be answered the way 0043 answers the sandbox's: allowed.
+ * Switch: /private/var/vm/mondrian-tccok.
+ */
+static int
+mondrian_tcc_preflight(CFStringRef service, CFDictionaryRef options)
+{
+	(void)options;
+	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: preflight %s -> allowed\n",
+		    getpid(), service != NULL
+		        ? [(__bridge NSString *)service UTF8String] : "(null)");
+		return 0;
+	}
+	return 1;
+}
+
+static bool
+mondrian_tcc_token(CFStringRef service, audit_token_t token,
+    CFDictionaryRef options)
+{
+	(void)token;
+	(void)options;
+	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: token %s -> allowed\n",
+		    getpid(), service != NULL
+		        ? [(__bridge NSString *)service UTF8String] : "(null)");
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Which calls the raising function makes. The cache image is truncated on the
+ * workstation, so the imported targets of these `bl`s cannot be named offline;
+ * here the code is read in the process and every target goes through dladdr,
+ * which names the image it really lands in.
+ */
+static void
+mondrian_pluginkit_calls(unsigned long frame)
+{
+	const char *path = NULL;
+	uintptr_t base = 0;
+	uint32_t i;
+	int image;
+
+	for (image = 0; image < 4096; image++) {
+		const struct mach_header *h = _dyld_get_image_header((uint32_t)image);
+
+		if (h == NULL) {
+			break;
+		}
+		path = _dyld_get_image_name((uint32_t)image);
+		if (path != NULL && strstr(path, "PlugInKit") != NULL &&
+		    strstr(path, "mondrian") == NULL) {
+			base = (uintptr_t)h;
+			break;
+		}
+	}
+	if (base == 0) {
+		return;
+	}
+	mondrian_probe_fmt("MONDRIAN PKCALL[%d]: PlugInKit base 0x%lx frame +0x%lx\n",
+	    getpid(), (unsigned long)base, frame);
+	/* 160 instructions ending at the raising call. */
+	for (i = 0; i < 160; i++) {
+		uintptr_t addr = base + frame - (160 - i) * 4;
+		uint32_t insn = *(const uint32_t *)addr;
+		Dl_info info;
+
+		if ((insn & 0xFC000000) != 0x94000000) {
+			continue;
+		}
+		{
+			int32_t imm = (int32_t)(insn & 0x03FFFFFF);
+
+			if (imm & 0x02000000) {
+				imm |= (int32_t)0xFC000000;
+			}
+			addr += (intptr_t)imm * 4;
+		}
+		if (dladdr((void *)addr, &info) == 0 || info.dli_fname == NULL) {
+			mondrian_probe_fmt("MONDRIAN PKCALL[%d]:   +0x%lx -> (unknown)\n",
+			    getpid(), (unsigned long)(base + frame - (160 - i) * 4));
+			continue;
+		}
+		mondrian_probe_fmt("MONDRIAN PKCALL[%d]:   +0x%lx -> %s+0x%lx\n",
+		    getpid(), (unsigned long)(base + frame - (160 - i) * 4),
+		    strrchr(info.dli_fname, '/') != NULL
+		        ? strrchr(info.dli_fname, '/') + 1 : info.dli_fname,
+		    (unsigned long)(addr - (uintptr_t)info.dli_fbase));
+	}
+}
+extern int64_t sandbox_extension_consume(const char *token)
+    __attribute__((weak_import));
+
+/*
+ * The other half of "invalid sandbox or container": the launch request carries
+ * a sandbox extension token, the appex consumes it, and 0043 answers ENOENT to
+ * that operation too (6). The kernel is permissive anyway, so a handle is all
+ * the caller needs; the log says whether the call happened at all.
+ */
+static int64_t
+mondrian_sbx_consume(const char *token)
+{
+	if (!mondrian_file_on("/private/var/vm/mondrian-sbx")) {
+		return -1;
+	}
+	mondrian_probe_fmt("MONDRIAN SBX[%d]: consume %s len %ld\n", getpid(),
+	    token != NULL ? "token" : "null",
+	    token != NULL ? (long)strlen(token) : -1L);
+	return 1;
+}
 
 static int
 mondrian_sbx_path(int pid, char *buf, size_t size)
@@ -12724,6 +13184,24 @@ static const struct mondrian_interpose mondrian_sbx_interpose = {
 	(const void *)sandbox_container_path_for_pid,
 };
 
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_sbx_consume_interpose = {
+	(const void *)mondrian_sbx_consume,
+	(const void *)sandbox_extension_consume,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_tcc_preflight_interpose = {
+	(const void *)mondrian_tcc_preflight,
+	(const void *)TCCAccessPreflight,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_tcc_token_interpose = {
+	(const void *)mondrian_tcc_token,
+	(const void *)TCCAccessCheckAuditToken,
+};
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -12763,6 +13241,12 @@ mondrian_install_ui_hooks(void)
 				if (mondrian_file_on("/private/var/vm/mondrian-appex") &&
 				    strcmp(getprogname(), "PhotosFileProvider") == 0) {
 					mondrian_appex_report();
+				}
+				if (mondrian_file_on("/private/var/vm/mondrian-tcc")) {
+					mondrian_tcc_report();
+				}
+				if (mondrian_file_on("/private/var/vm/mondrian-tccgrant")) {
+					mondrian_tcc_grant();
 				}
 			}
 		} else {
@@ -13063,6 +13547,10 @@ mondrian_install_ui_hooks(void)
 		if (pthread_create(&lc, NULL, mondrian_launchctl_test, NULL) == 0) {
 			pthread_detach(lc);
 		}
+	}
+	if (strcmp(getprogname(), "SpringBoard") == 0 &&
+	    mondrian_file_on("/private/var/vm/mondrian-ps")) {
+		mondrian_process_report();
 	}
 	start_heartbeat();
 	if (!boot_arg_set("mondriannet=0")) {
