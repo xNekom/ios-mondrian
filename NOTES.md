@@ -25,10 +25,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   the PMK8350 restart reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader,
   1 = recovery, `0309`), flushes the ring and resets; fastboot answers about 2 s
   later. A boot that falls back to `boot_b` answers with the previous kernel: the
-  one measured 2026-11-18 prints `Ticket spinlock timeout` and will not unlock.
-  **No recovery boots here:** `fastboot boot` refuses the OrangeFox images
-  (`Bad Buffer Size`) and `boot_b` lands in fastboot, so vendor blobs come from
-  the ROM (`tools/super-extract.py`).
+  one measured 2026-11-18 prints `Ticket spinlock timeout`, will not unlock, and
+  carries no HFS fix, so its shutdown marks the volume inconsistent
+  (`hfs_mark_inconsistent`) and the next mount fsck's `iOSRoot` -- a failed boot
+  costs a repair, not just a retry.
   **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
   OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
