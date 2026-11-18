@@ -11913,6 +11913,31 @@ mondrian_exc_note(id self, const char *how)
 	} @catch (id other) {
 		mondrian_exc_say("MONDRIAN EXC: could not read the exception\n");
 	}
+	/*
+	 * Who raised it. The message alone says what failed; the frames say where,
+	 * and tools/dsc-va.py turns `image+0x...` into a symbol. Printed at
+	 * construction, so it is there even when the process dies before the
+	 * handler runs.
+	 */
+	{
+		void *frames[14];
+		int n = backtrace(frames, 14);
+		int i;
+
+		for (i = 1; i < n && i < 10; i++) {
+			Dl_info info;
+			const char *base;
+
+			if (dladdr(frames[i], &info) == 0 || info.dli_fname == NULL) {
+				continue;
+			}
+			base = strrchr(info.dli_fname, '/');
+			mondrian_probe_fmt("MONDRIAN EXC[%d]:   %s #%d %s+0x%lx\n",
+			    getpid(), how, i, base != NULL ? base + 1 : info.dli_fname,
+			    (unsigned long)((uintptr_t)frames[i] -
+			    (uintptr_t)info.dli_fbase));
+		}
+	}
 }
 
 static id
@@ -12286,6 +12311,53 @@ mondrian_seed_container(const char *identifier, NSString *uuid)
 	    [base UTF8String]);
 }
 
+/*
+ * Which app containers exist, and whether one of them is Photos'. The container
+ * manager now starts, so the question is whether it created the container the
+ * appex cannot find -- and whether the one this hook seeded by hand is the only
+ * one. Printed only when the URL test switch is on.
+ */
+static void
+mondrian_containers_report(void)
+{
+	NSString *base = @"/private/var/mobile/Containers/Data/Application";
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSArray *list = [fm contentsOfDirectoryAtPath:base error:NULL];
+	NSUInteger i, n, photos = 0;
+
+	if (list == nil) {
+		say("MONDRIAN CONTAINERS: no listing\n");
+		return;
+	}
+	n = [list count];
+	mondrian_probe_fmt("MONDRIAN CONTAINERS[%d]: %lu entries\n", getpid(),
+	    (unsigned long)n);
+	for (i = 0; i < n; i++) {
+		NSString *dir = [list objectAtIndex:i];
+		NSString *meta = [base stringByAppendingPathComponent:dir];
+
+		meta = [meta stringByAppendingPathComponent:
+		    @".com.apple.mobile_container_manager.metadata.plist"];
+		@try {
+			NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
+			NSString *ident = [d objectForKey:@"MCMMetadataIdentifier"];
+
+			if (ident != nil && [ident isKindOfClass:[NSString class]] &&
+			    ([ident rangeOfString:@"photo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+			    [ident rangeOfString:@"slideshow" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+				mondrian_probe_fmt(
+				    "MONDRIAN CONTAINERS[%d]: %s -> %s\n", getpid(),
+				    [ident UTF8String], [dir UTF8String]);
+				photos++;
+			}
+		} @catch (id other) {
+			continue;
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN CONTAINERS[%d]: photos-ish %lu of %lu\n",
+	    getpid(), (unsigned long)photos, (unsigned long)n);
+}
+
 static void
 mondrian_url_probe_env(void)
 {
@@ -12406,20 +12478,30 @@ mondrian_install_ui_hooks(void)
 		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
 			int quiet = mondrian_file_is("/private/var/vm/mondrian-exc", '2');
 			int nourl = mondrian_file_is("/private/var/vm/mondrian-exc", '3');
+			int nothing = mondrian_file_is("/private/var/vm/mondrian-exc", '4');
 
-			mondrian_exc_install(quiet);
-			mondrian_probe_raise();
 			/*
-			 * 3: the exception handlers only, without the URL hooks. Measured
-			 * 2026-11-18: assetsd dies `sig 11` in its guard page with the
-			 * whole probe in place, and asking which hook does it is cheaper
-			 * than guessing.
+			 * 4: injection only. assetsd dies `sig 6` with no dylib in it
+			 * and `sig 11` in its guard page with this file loaded, so the
+			 * first question is whether the mere mapping is what changes
+			 * its death. Answering it needs a copy that installs nothing.
 			 */
-			if (!nourl) {
-				mondrian_probe_urls();
-			}
-			if (mondrian_file_on("/private/var/vm/mondrian-urltest")) {
-				mondrian_url_probe_env();
+			if (!nothing) {
+				mondrian_exc_install(quiet);
+				mondrian_probe_raise();
+				/*
+				 * 3: the exception handlers only, without the URL hooks.
+				 * Measured 2026-11-18: assetsd dies `sig 11` in its guard
+				 * page with the whole probe in place, and asking which
+				 * hook does it is cheaper than guessing.
+				 */
+				if (!nourl) {
+					mondrian_probe_urls();
+				}
+				if (mondrian_file_on("/private/var/vm/mondrian-urltest")) {
+					mondrian_url_probe_env();
+					mondrian_containers_report();
+				}
 			}
 		} else {
 			mondrian_exc_say("MONDRIAN EXC: switch off, probe idle\n");

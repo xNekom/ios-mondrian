@@ -35,10 +35,17 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  
  /*
   * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
-@@ -5661,6 +5669,32 @@ mondrian_dylib_in_vm(const char *path)
+@@ -5661,6 +5669,39 @@ mondrian_dylib_in_vm(const char *path)
  	return true;
  }
  
++/* Is the probe armed by a file this boot, so no reboot is needed to change it? */
++static bool
++mondrian_probe_switch(void)
++{
++	return mondrian_dylib_in_vm("/private/var/vm/mondrian-probe");
++}
++
 +/*
 + * The services the probe can be aimed at: the photo library's hosts and the
 + * icon service behind the home screen's artwork. Matched by the name the exec
@@ -68,7 +75,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static bool
  mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  {
-@@ -5698,6 +5732,20 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5698,6 +5739,27 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	if (name == NULL || sizeof(library) > size || sizeof(injector) > size) {
  		return false;
  	}
@@ -81,15 +88,22 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +	if (mondrian_probe_target(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen)) {
 +		int probe = 0;
 +
-+		if (PE_parse_boot_argn("mondrian_ui_probe", &probe, sizeof(probe)) &&
-+		    probe > 0) {
++		/*
++		 * A file, not only a boot argument: the boot line cannot change
++		 * while the phone runs, and a RAM boot is the least reliable step
++		 * of this loop (the ABL refuses one after a failed boot). The
++		 * existence check is the one this function already does for the
++		 * dylib, so the extra cost is a vnode lookup on five names.
++		 */
++		if ((PE_parse_boot_argn("mondrian_ui_probe", &probe,
++		    sizeof(probe)) && probe > 0) || mondrian_probe_switch()) {
 +			wanted = MONDRIAN_HOOK_PROBE;
 +		}
 +	}
  	if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("containermanagerd") - 1 &&
  	    strncmp(name, "containermanagerd", sizeof("containermanagerd") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_CONTAINERMANAGERD;
-@@ -5719,7 +5767,9 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5719,7 +5781,9 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_XPCPROXY;
  	}
