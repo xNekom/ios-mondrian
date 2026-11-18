@@ -2003,6 +2003,12 @@ static void *
 mondrian_demand_probe(void *unused)
 {
 	static const char *names[] = {
+		/*
+		 * First: the container manager is a RunAtLoad job whose Mach
+		 * name answers lookups while the process never appears, so the
+		 * message is the on-demand path's last chance to start it.
+		 */
+		"com.apple.containermanagerd",
 		"com.apple.accessories.hid",
 		"com.apple.accessories.connection-info-server",
 		"com.apple.accessories.transport-server",
@@ -12199,8 +12205,126 @@ mondrian_url_report(const char *what, id value)
 		    what, p != nil ? [p UTF8String] : "(no path)");
 		return;
 	}
+	if ([value isKindOfClass:[NSArray class]]) {
+		NSArray *list = value;
+		NSUInteger i, n = [list count];
+
+		mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: %s -> %lu path(s)\n",
+		    getpid(), what, (unsigned long)n);
+		for (i = 0; i < n && i < 3; i++) {
+			id item = [list objectAtIndex:i];
+			NSString *p = [item isKindOfClass:[NSURL class]]
+			    ? [(NSURL *)item path] : nil;
+
+			mondrian_probe_fmt("MONDRIAN URLLOOK[%d]:   %s[%lu] %s\n",
+			    getpid(), what, (unsigned long)i,
+			    p != nil ? [p UTF8String] : "(no path)");
+		}
+		return;
+	}
 	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: %s -> %s\n", getpid(), what,
 	    [[value description] UTF8String]);
+}
+
+/*
+ * "plugin has invalid sandbox or container: error 2 path ?" -- the appex dies
+ * saying it has no container, so the question is which of the paths it would be
+ * sandboxed with is missing. This runs inside the dying process, before it
+ * returns from the constructor, and prints what the sandbox handed it.
+ */
+/*
+ * "plugin has invalid sandbox or container: error 2 path ?" is ENOENT: the
+ * appex cannot be sandboxed because the app it belongs to has no data
+ * container. Photos' (`com.apple.mobileslideshow`) is not among the 129 the
+ * root ships, and the service that would create it never runs, so this builds
+ * it from the same metadata an existing container carries and lets libcontainer
+ * find it. Sandboxed processes run as mobile, and SpringBoard is mobile too.
+ */
+static void
+mondrian_seed_container(const char *identifier, NSString *uuid)
+{
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSString *base = [NSString stringWithFormat:
+	    @"/private/var/mobile/Containers/Data/Application/%@", uuid];
+	static NSString *const dirs[] = { @"Documents", @"Library",
+		@"Library/Caches", @"Library/Preferences",
+		@"Library/Application Support", @"SystemData", @"tmp" };
+	NSString *metaPath;
+	NSDictionary *meta;
+	NSUInteger i;
+	BOOL ok;
+
+	ok = [fm createDirectoryAtPath:base withIntermediateDirectories:YES
+	    attributes:nil error:NULL];
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		NSString *p = [base stringByAppendingPathComponent:dirs[i]];
+
+		(void)[fm createDirectoryAtPath:p withIntermediateDirectories:YES
+		    attributes:nil error:NULL];
+	}
+	meta = @{
+		@"MCMMetadataActiveDPClass": @(-1),
+		@"MCMMetadataContentClass": @2,
+		@"MCMMetadataIdentifier": [NSString stringWithUTF8String:identifier],
+		@"MCMMetadataInfo": @{
+			@"com.apple.MobileInstallation.ContentProtectionClass": @(-1),
+		},
+		@"MCMMetadataSchemaVersion": @1,
+		@"MCMMetadataUUID": uuid,
+		@"MCMMetadataUserIdentity": @{
+			@"posixUID": @501,
+			@"posixGID": @501,
+			@"type": @2,
+			@"version": @"2",
+		},
+		@"MCMMetadataVersion": @6,
+	};
+	metaPath = [base stringByAppendingPathComponent:
+	    @".com.apple.mobile_container_manager.metadata.plist"];
+	mondrian_probe_fmt("MONDRIAN SEED[%d]: %s dir %d meta %d at %s\n", getpid(),
+	    identifier, (int)ok, (int)[meta writeToFile:metaPath atomically:YES],
+	    [base UTF8String]);
+}
+
+static void
+mondrian_url_probe_env(void)
+{
+	static const char *const vars[] = {
+		"HOME", "CFFIXED_USER_HOME", "TMPDIR", "SANDBOX_PROFILE",
+	};
+	NSBundle *bundle = [NSBundle mainBundle];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	size_t i;
+
+	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: prog %s uid %d home %s\n",
+	    getpid(), getprogname(), getuid(),
+	    NSHomeDirectory() != nil ? [NSHomeDirectory() UTF8String] : "nil");
+	mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: bundle %s\n", getpid(),
+	    bundle != nil && [bundle bundleIdentifier] != nil
+	    ? [[bundle bundleIdentifier] UTF8String] : "nil");
+	for (i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+		const char *v = getenv(vars[i]);
+
+		mondrian_probe_fmt("MONDRIAN URLLOOK[%d]: env %s %s\n", getpid(),
+		    vars[i], v != NULL ? v : "(unset)");
+	}
+	if ([fm respondsToSelector:@selector(containerURLForSecurityApplicationGroupIdentifier:)]) {
+		@try {
+			mondrian_url_report("group Photos",
+			    [fm containerURLForSecurityApplicationGroupIdentifier:
+			    @MONDRIAN_GROUP_PHOTOS]);
+		} @catch (id other) {
+			say("MONDRIAN URLLOOK: group lookup threw\n");
+		}
+	}
+	@try {
+		mondrian_url_report("Library/user",
+		    [fm URLsForDirectory:5 inDomains:1]);
+		mondrian_url_report("Caches/user",
+		    [fm URLsForDirectory:6 inDomains:1]);
+	} @catch (id other) {
+		say("MONDRIAN URLLOOK: dirs lookup threw\n");
+	}
 }
 
 static void *
@@ -12293,6 +12417,9 @@ mondrian_install_ui_hooks(void)
 			 */
 			if (!nourl) {
 				mondrian_probe_urls();
+			}
+			if (mondrian_file_on("/private/var/vm/mondrian-urltest")) {
+				mondrian_url_probe_env();
 			}
 		} else {
 			mondrian_exc_say("MONDRIAN EXC: switch off, probe idle\n");
@@ -12414,6 +12541,27 @@ mondrian_install_ui_hooks(void)
 		pthread_t thread;
 
 		if (pthread_create(&thread, NULL, mondrian_url_test, NULL) == 0) {
+			pthread_detach(thread);
+		}
+	}
+	/*
+	 * "plugin has invalid sandbox or container": build the container the app
+	 * cannot get, so the next launch of the appex can be sandboxed.
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-seed")) {
+		mondrian_seed_container("com.apple.mobileslideshow",
+		    @"8F2B1C64-7A3D-4E52-9C1B-2D9A6E4F1C30");
+	}
+	/*
+	 * Ask launchd for the container manager by sending a message to its Mach
+	 * service: the job is RunAtLoad and its name answers lookups, yet no
+	 * process ever appears, so the on-demand path is the cheap way to find out
+	 * whether launchd refuses to start it or nothing ever asked.
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-demand")) {
+		pthread_t thread;
+
+		if (pthread_create(&thread, NULL, mondrian_demand_probe, NULL) == 0) {
 			pthread_detach(thread);
 		}
 	}

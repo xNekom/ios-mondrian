@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.apple.containermanagerd as launchd will actually start it.
+
+  The stock job never runs on this port: measured 2026-11-18, zero `exec
+  containermanagerd` lines across several boots and 2 870 execs in one of them,
+  while bootstrap_look_up answered 0 (the name is registered) and no EXECFAIL or
+  exit line explained the absence. Replacing the job with this file -- same
+  program, same Mach services, but without the #IfFeatureFlagEnabled/#Then/#Else
+  dicts in ProgramArguments and without the _PanicOnCrash dictionary -- makes
+  launchd start it: `exec containermanagerd` appears in the next boot.
+
+  KeepAlive is deliberate: with it, a daemon that exits immediately shows up as
+  a repeated exec in the ring instead of disappearing silently.
+
+  Install with:
+    tools/usb-ring.py wfile /System/Library/LaunchDaemons/com.apple.containermanagerd.plist \
+        tools/launchd/com.apple.containermanagerd.plist
+  and reboot; launchd only reads LaunchDaemons at boot.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnablePressuredExit</key>
+	<false/>
+	<key>EnableTransactions</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.apple.containermanagerd</string>
+	<key>MachServices</key>
+	<dict>
+		<key>com.apple.containermanagerd</key>
+		<true/>
+		<key>com.apple.containermanagerd.upcall</key>
+		<dict>
+			<key>HostSpecialPort</key>
+			<integer>25</integer>
+		</dict>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/libexec/containermanagerd</string>
+		<string>--runmode=agent</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>

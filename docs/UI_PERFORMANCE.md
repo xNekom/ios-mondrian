@@ -364,11 +364,48 @@ boot each, so the three columns differ only in what changed:
   `sig 11` in its stack guard page (`far = sp + 0x100`, `prot 0/7`) and
   constructs no `NSException` on the way. So the death mode belongs to the
   process, not to the handler, and assetsd's abort is not an exception that
-  reaches `+exceptionWithName:reason:userInfo:`. The only message this probe has
-  ever read is fileproviderd's. The same probe list has to name `PhotosFileProvider`
+  reaches `+exceptionWithName:reason:userInfo:`. It also dies with no probe in
+  the boot at all (`sig 6`, `bt` repeating one address, `prot 0/7`): the
+  recursion is its own, and the injected dylib only changes which signal it
+  takes to die. The same probe list has to name `PhotosFileProvider`
   as well as the daemon: the kernel injected into the appex but the hook's own
   `mondrian_probe_service()` did not know the name, so the one process that dies
   when Photos opens armed nothing and printed nothing.
+- **The appex's death now has a message, and it is not the nil URL.** Measured
+  2026-11-18 with the probe in mode 3 (`mondrian-exc` holding `3`: exception
+  handlers, no URL resolvers), on the first `exec PhotosFileProvider` of a boot:
+
+  ```
+  MONDRIAN EXC[289]: init name   NSInternalInconsistencyException
+  MONDRIAN EXC[289]: init reason plugin has invalid sandbox or container:
+                                 error 2 path ?
+  MONDRIAN EXC[289]: terminate NSException
+  ```
+
+  `error 2` is `ENOENT` and the path is literally unknown, so the appex is being
+  told it has no container to be sandboxed with. That is a different failure from
+  the `createDirectoryAtURL: URL is nil` fileproviderd raised: this one happens
+  before the appex runs any of its own code. Seeding a container by hand for
+  `com.apple.mobileslideshow` (directory tree plus the metadata plist an existing
+  container carries, written by SpringBoard as uid 501) does not change the
+  message, so libcontainer needs more than a directory with metadata to answer.
+- **launchd was skipping the container manager because of its job plist.**
+  Replacing `/System/Library/LaunchDaemons/com.apple.containermanagerd.plist`
+  with `tools/launchd/com.apple.containermanagerd.plist` -- the same program and
+  Mach services, without the `#IfFeatureFlagEnabled`/`#Then`/`#Else` dicts inside
+  `ProgramArguments` and without the `_PanicOnCrash` dictionary -- makes launchd
+  start it: `exec containermanagerd` appears in the next boot, the first time on
+  this port. The appex still raises `plugin has invalid sandbox or container`
+  with the daemon running and `KeepAlive` keeping it up, so that message is not
+  waiting on the daemon either. Install the job with `wfile` and reboot; launchd
+  reads that directory only at boot.
+- **A black capture with only a battery icon is the panel off.** Measured
+  2026-11-18: `usb-ring.py key 116` is the power button, so using it to "wake"
+  the phone turns the display off, and the next `screen` comes back black with
+  the battery and the home indicator -- which reads exactly like an app drawing
+  black. Wake with a tap or a swipe, and check the capture for the time in the
+  status bar before concluding anything about what an app draws. Photos' own
+  blank state is white with the status bar, not black.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
