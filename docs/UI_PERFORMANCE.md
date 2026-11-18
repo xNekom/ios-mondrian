@@ -672,6 +672,14 @@ boot each, so the three columns differ only in what changed:
   Measured 2026-11-18: the same probe read `-1 errno 34` for SpringBoard and
   5643 bytes for assetsd, because SpringBoard's blob is larger than the 8 KB the
   probe passed. A `-1` with errno 34 means the buffer, not the signature.
+- **ReportCrash faults on its own work and re-feeds itself.** Measured
+  2026-11-18 on a boot that had no watchdogd aborts: 81 ReportCrash crashes in
+  about ten minutes, each `sig 11` with `far` between two mappings (`map before
+  ... prot 1/1`, `map after ... prot 0/7`) and the last two frames inside
+  ReportCrash itself. It is not user-visible -- the home screen and Photos ran
+  through it -- but it is the top crash source on an otherwise clean boot, and
+  every crash produces the next report it cannot process. Read it as its own
+  defect, not as damage from the ports below it.
 - **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
   2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
   `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app
