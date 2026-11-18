@@ -12,3 +12,5 @@ __pycache__/
 /out/
 
 .DS_Store
+usb-*.txt
+!usb-ring.py
