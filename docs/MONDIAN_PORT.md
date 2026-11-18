@@ -179,10 +179,10 @@ Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the 
 16 root built by `tools/mkiosroot.sh`, prepared by `tools/ios-root-tweaks.py`
 and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
-The flattened HFS root is not a stock layout: launchd expects a Data volume and
-`/private/preboot/<uuid>/` (`.roots-installed` and the firmware tree); the
-non-journaled volume logs 10,000-13,000 `hfs_mark_inconsistent` lines once
-damaged (none after a fresh restore), yet held 60 fps in a drag (`NOTES.md`).
+One HFS+ volume holds what iOS splits into System, Data and Preboot; the pieces
+launchd looks for come from `tools/ios-root-tweaks.py`: `/private/preboot/
+<boot-manifest-hash>/usr/standalone/firmware`, the containers tree and
+`/private/var/vm`, so a missing volume is not what breaks a service (traps: `NOTES.md`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error. Read
@@ -259,11 +259,16 @@ Safari start page), so LaunchServices, the icon model and the compositor are
 whole. What stays empty is a missing service, not a drawing bug: Phone draws only
 its status bar and home indicator (the port brings up no modem -- `NOTES.md`
 lists it with audio and cameras as remaining), the App Store stops at `LOADING`
-without the network, and Photos is blank while `assetsd` and `fileproviderd`
-abort in the middle of their own code -- the same service-launch limit that
-leaves the home screen's Photos folder at `No content available`. The
-measurements, the abort chain and how to aim a tap are in
-`docs/UI_PERFORMANCE.md`.
+without the network, and Photos is blank because the extension that feeds it,
+`PhotosFileProvider`, dies in PlugInKit's launch check. That check asks for the
+process's container path through the sandbox, and `0043` answers **ENOENT** to
+that operation (4) although the container exists
+(`Containers/Data/PluginKitPlugin/<uuid>`, measured with 414 entries) -- so the
+work item is implementing operation 4 in the stand-in, not moving volumes.
+`assetsd` and `fileproviderd` abort in the middle of their own code, which is a
+separate limit, and the same one that leaves the home screen's Photos folder at
+`No content available`. The measurements, the abort chain and how to aim a tap
+are in `docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device
 

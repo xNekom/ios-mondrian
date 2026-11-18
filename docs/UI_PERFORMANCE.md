@@ -417,14 +417,25 @@ boot each, so the three columns differ only in what changed:
   black. Wake with a tap or a swipe, and check the capture for the time in the
   status bar before concluding anything about what an app draws. Photos' own
   blank state is white with the status bar, not black.
-- **A tap opens the appex, but only while the app has not seen it fail.** Measured
-  2026-11-18: on a boot where Photos has not been opened, tapping the icon starts
-  `MobileSlideShow` and then `exec PhotosFileProvider` (pid 494, right after the
-  touch) which dies `sig 6` with the PlugInKit exception. After that death the
-  same tap only brings the app's blank window back: it does not re-request the
-  extension. So the cheap loop for the appex is a `respring` (which clears the
-  app's state) plus one tap, not a boot -- and a boot is only needed when the
-  kernel's own copy has to change.
+- **A tap opens the appex, but only the launch that starts the app.** Measured
+  2026-11-18: with Photos not running, tapping the icon starts `MobileSlideShow`
+  and then `exec PhotosFileProvider` right after the touch (pids 494, 368, 319),
+  which dies in the PlugInKit check below. Once it has died, tapping the icon
+  again only brings the app's blank window back; the extension is not requested
+  a second time. A `respring` did not restore the request in one measured pass
+  (the app then opened with no new `exec`), so a fresh app launch is the trigger
+  and a boot is the reliable way to get one.
+- **The appex does have a container; the query for it is what fails.** Measured
+  2026-11-18 inside the appex: its bundle identifier is
+  `com.apple.mobileslideshow.PhotosFileProvider`, `HOME` and `NSHomeDirectory()`
+  are `/var/mobile/Containers/Data/PluginKitPlugin/9702DC55-...`, and that tree
+  exists with 414 entries (a plug-in gets a container under `PluginKitPlugin`,
+  not under `Application`, which is why seeding an app container changed
+  nothing). `sandbox_container_path_for_pid(getpid(), ...)` returns `-1` with an
+  empty buffer, and `0043` explains it: the sandbox stand-in answers **ENOENT**
+  to operation 4 (container path), 5 and 6 (extension issue/consume) and 0x43.
+  `launchd op 4` appears in the ring too, so this is not specific to the appex.
+  Error 2 is the exception's own number, so the message is that query failing.
 - **The appex's message is PlugInKit's, and its caller is in the cache.** The
   string sits at PlugInKit `+0x25697`, between
   `-[PKService launchContainingApplicationForPlugInNamed:]` and `missing data key
