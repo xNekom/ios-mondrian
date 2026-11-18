@@ -256,18 +256,18 @@ with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
 draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
-whole. What stays empty is a missing service, not a drawing bug: Phone draws only
-its status bar and home indicator (the port brings up no modem -- `NOTES.md`
-lists it with audio and cameras as remaining), the App Store stops at `LOADING`
-without the network, and Photos is blank because the extension that feeds it,
-`PhotosFileProvider`, dies in PlugInKit's launch check: the sandbox is asked for
-the process's container path, `0043` answered **ENOENT** to that operation (4),
-and `0354` now answers it from `CFFIXED_USER_HOME=` -- two extensions took
-their paths -- so whether Photos still dies there is what the next boot
-measures. `assetsd` and `fileproviderd` abort in the middle of their own code,
-which is a separate limit, and the same one that leaves the home screen's
-Photos folder at `No content available`. The measurements, the abort chain and
-how to aim a tap are in `docs/UI_PERFORMANCE.md`.
+whole. Photos opens and draws its own `Library` tab with the four tabs and
+`No Photos or Videos`. What is missing is the library, not the app:
+`+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]` answers nil while
+`isSystemLibraryURLDefined` answers 1, so a change request made against the
+library by URL comes back `com.apple.photos.error 41017, Client did not provide
+bookmarkData`. Until the system library resolves -- or the port can mint the
+security-scoped bookmark that door asks for -- Photos has nothing to render, and
+importing one picture is the test that settles it. `PhotosFileProvider` still
+dies in PlugInKit's launch check (`0354` answers the container query), `assetsd`
+and `fileproviderd` abort in their own code, and Phone, the App Store and the
+network are as before. The measurements and the probes are in
+`docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device
 

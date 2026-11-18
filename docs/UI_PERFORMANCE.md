@@ -672,14 +672,41 @@ boot each, so the three columns differ only in what changed:
   Measured 2026-11-18: the same probe read `-1 errno 34` for SpringBoard and
   5643 bytes for assetsd, because SpringBoard's blob is larger than the 8 KB the
   probe passed. A `-1` with errno 34 means the buffer, not the signature.
-- **ReportCrash faults on its own work and re-feeds itself.** Measured
-  2026-11-18 on a boot that had no watchdogd aborts: 81 ReportCrash crashes in
-  about ten minutes, each `sig 11` with `far` between two mappings (`map before
-  ... prot 1/1`, `map after ... prot 0/7`) and the last two frames inside
-  ReportCrash itself. It is not user-visible -- the home screen and Photos ran
-  through it -- but it is the top crash source on an otherwise clean boot, and
-  every crash produces the next report it cannot process. Read it as its own
-  defect, not as damage from the ports below it.
+- **ReportCrash faults on its own work, and the loop is closed by not running
+  it.** Measured 2026-11-18 on a boot whose UI was clean: 81 ReportCrash crashes
+  in ten minutes, each `sig 11` at the same `pc` in `libc++`
+  (`std::__fs::filesystem::path::lexically_relative`), reached from
+  `libsystem_info` through a branch the dyld shared cache pre-links, so no
+  interposer sees the call, with the faulting `this` unreadable and different
+  every run. Every crash writes the report it then cannot process, so it feeds
+  itself. The kernel's `CRASH` record already carries the `pc` and the frame
+  chain, so the reporter is redundant on this port: the hook exits at load in
+  that process unless `/private/var/vm/mondrian-reportcrash` exists. Measured
+  with it in place: 0 `CRASH ReportCrash` over a five-minute window, and 30
+  `exec`/`exit status 0x0` pairs.
+- **A fault handler names the image, because the crash reporter cannot.** The
+  hook arms `SIGSEGV`/`SIGBUS` for the probe targets and prints
+  `MONDRIAN FAULT[pid]: sig <n> code <n> pc <image>+0x<off> far 0x<addr>`, which
+  is how the `pc` above was named: walk the dyld image list and the segment
+  tables in the handler, since the stack is already gone by the time a report is
+  read. `SA_RESETHAND` restores the default action, so returning still dies the
+  way the process would have.
+- **Photos has no library because the system library URL never resolves.**
+  Measured 2026-11-18 with the app open and drawing its Library tab:
+  `+[PLPhotoLibraryPathManager isSystemLibraryURLDefined]` answers 1,
+  `+systemLibraryURLIfResolvable` answers nil, and
+  `+[PHPhotoLibrary authorizationStatus]` answers 2 (denied) with
+  `authorizationStatusForAccessLevel:` 1 for add-only and 2 for read-write.
+  `-[PLPrivacy _authStatusForScope:]` answers 0 (the raw TCC status, allowed)
+  for scope 7, and answering 3 (authorized) moves a change request from
+  `PHPhotosErrorDomain 3310 (AccessRestricted)` to
+  `com.apple.photos.error 41017, Client did not provide bookmarkData` against
+  `file:///private/var/mobile/Media/PhotoData/`. So the write path is gated by a
+  security-scoped bookmark the port cannot mint, not by TCC, and the empty
+  library is `PhotoData/Photos.sqlite` sitting there unopened. Probe it with
+  `/private/var/vm/mondrian-import` (prints the answers at load) and
+  `/private/var/vm/mondrian-doimport` (submits one picture); both are guarded so
+  an exception on the import thread cannot take the app down.
 - **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
   2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
   `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app
