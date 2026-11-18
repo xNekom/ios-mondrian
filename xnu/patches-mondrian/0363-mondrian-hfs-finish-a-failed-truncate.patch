@@ -1,0 +1,138 @@
+xnu 0363: finish a truncate whose blocks are already free
+
+Measured on the device: a record is written with a size and no blocks while its
+extent still names the block --
+
+    write id=84595901 size 850 blocks 0 vblocks 0 extents 4012768+1, was blocks 1
+
+and the same block is already free in the allocation bitmap, reported by the
+daemon that tries to release it --
+
+    hfs: BlockMarkFreeInternal() trying to free unallocated blocks <4012768, 1>
+    MONDRIAN HFS: free 4012768+1 asked by mobileassetd
+    MONDRIAN HFS:   4012768+1 was not handed out in this boot
+
+`TruncateFileC` sets `ff_blocks` before it frees anything (FileExtentMapping.c,
+`fcb->ff_blocks = numBlocks`) and frees extent by extent, exiting through
+`ErrorExit` on the first failure. A single extent whose blocks are already free
+therefore leaves the fork with a zeroed count and its extents still listed, and
+`hfs_update` writes that. Every later boot truncates the same file again, hits
+the same already-free block, and produces the same record; every lookup of it
+fails the size-versus-blocks check and calls `hfs_mark_inconsistent`, which is
+where the ten thousand marks of a boot come from. `fsck.hfsplus` does not look
+at that pair, so the volume stays "OK" while it degrades.
+
+Freeing blocks that are already free is a no-op, not an I/O failure, but
+`BlockMarkFreeInternal` reports it as `EIO` -- the code for a real read or write
+error -- and marks the volume on the way out, so no caller can tell the two
+apart and the damage is reported instead of repaired.
+
+Give it its own code, `hfsNotAllocatedErr`, and treat that code as success in the
+five places `TruncateFileC` frees: the whole fork, the tail of a shortened
+extent, the extents after it, the extents in the overflow file, and the loop in
+`DeallocateFork`. The truncate then finishes, the extents are zeroed, and the
+record ends consistent -- which is what heals the files already damaged, at the
+next boot, without a new image.
+
+The volume is no longer marked either: the bitmap is the truth, nothing was
+corrupted by the call, and marking forced an fsck on every mount for a state the
+kernel now repairs itself.
+diff --git a/bsd/mondrian_hfs/core/FileExtentMapping.c b/bsd/mondrian_hfs/core/FileExtentMapping.c
+index 017aa3f..83a7e48 100644
+--- a/bsd/mondrian_hfs/core/FileExtentMapping.c
++++ b/bsd/mondrian_hfs/core/FileExtentMapping.c
+@@ -498,6 +498,9 @@ static OSErr ReleaseExtents(
+ 		}
+ 
+ 		err = BlockDeallocate( vcb, extentRecord[extentIndex].startBlock, numAllocationBlocks , 0);
++		/* MONDRIAN: already free is the state we wanted; the extents go next. */
++		if ( err == hfsNotAllocatedErr )
++			err = noErr;
+ 		if ( err != noErr )
+ 			break;
+ 					
+@@ -1362,6 +1365,10 @@ OSErr TruncateFileC (
+ 		
+ 		//	Deallocate all the extents for this fork
+ 		err = DeallocateFork(vcb, fileid, forkType, fcb->fcbExtents, &recordDeleted);
++		/* MONDRIAN: blocks already free are not an error; the record still has
++		 * to be zeroed, or the fork keeps a size and no blocks. */
++		if (err == hfsNotAllocatedErr)
++			err = noErr;
+ 		if (err != noErr) goto ErrorExit;	//	got some error, so return it
+ 		
+ 		//	Update the catalog extent record (making sure it's zeroed out)
+@@ -1418,6 +1425,8 @@ OSErr TruncateFileC (
+ 				}
+ 			}
+ 			err = BlockDeallocate(vcb, startBlock, numBlocks, 0);
++			if (err == hfsNotAllocatedErr)
++				err = noErr;
+ 			if (err != noErr) goto ErrorExit;
+ 			mondrian_forget_extent(startBlock, numBlocks);
+ 			//	Adjust length of this extent
+@@ -1443,6 +1452,8 @@ OSErr TruncateFileC (
+ 		numBlocks = extentRecord[extentIndex].blockCount;
+ 		//	Deallocate this extent
+ 		err = BlockDeallocate(vcb, extentRecord[extentIndex].startBlock, numBlocks, 0);
++		if (err == hfsNotAllocatedErr)
++			err = noErr;
+ 		if (err != noErr) goto ErrorExit;
+ 		//	Update next file allocation block number
+ 		nextBlock += numBlocks;
+@@ -1469,8 +1480,11 @@ OSErr TruncateFileC (
+ 	//	to seach for their extent records and delete those allocation
+ 	//	blocks.
+ 	//
+-	if (nextBlock < physNumBlocks)
++	if (nextBlock < physNumBlocks) {
+ 		err = TruncateExtents(vcb, forkType, fileid, nextBlock, &recordDeleted);
++		if (err == hfsNotAllocatedErr)
++			err = noErr;
++	}
+ 
+ Done:
+ ErrorExit:
+diff --git a/bsd/mondrian_hfs/core/VolumeAllocation.c b/bsd/mondrian_hfs/core/VolumeAllocation.c
+index 8dd3d8f..277f677 100644
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -3475,8 +3475,16 @@ Corruption:
+ 			mondrian_explain_free(startingBlock_in, numBlocks_in);
+ 		}
+ 	}
+-	hfs_mark_inconsistent(vcb, HFS_INCONSISTENCY_DETECTED);
+-	err = EIO;
++	/*
++	 * MONDRIAN: the bitmap is the truth and this range is already free, so
++	 * there is nothing to undo. A truncate that stopped halfway through its
++	 * extent list leaves exactly this state -- blocks cleared, extent record
++	 * intact -- and every later truncate then asks to free the same blocks
++	 * again. Marking the volume here forced fsck on every mount and made the
++	 * caller abandon the record, which is what kept the damage alive. Report
++	 * the condition with its own code and let the caller finish the job.
++	 */
++	err = hfsNotAllocatedErr;
+ 	goto Exit;
+ #endif
+ }
+diff --git a/bsd/mondrian_hfs/core/hfs.h b/bsd/mondrian_hfs/core/hfs.h
+index d187a49..57bd7cd 100644
+--- a/bsd/mondrian_hfs/core/hfs.h
++++ b/bsd/mondrian_hfs/core/hfs.h
+@@ -89,6 +89,15 @@ struct cprotect;
+ 
+ #define HFS_LINK_MAX	32767
+ 
++/*
++ * MONDRIAN: a deallocation range whose blocks are already free in the bitmap.
++ * `EIO` is the code for a real read or write failure, so a caller could not
++ * tell "the record is stale, repair it" from "the disk refused". Keep the two
++ * apart so the truncate paths can finish instead of leaving a fork with a size
++ * and no blocks.
++ */
++#define hfsNotAllocatedErr	((OSErr)-4210)
++
+ #define HFS_MAX_DEFERED_ALLOC	(1024*1024)
+ 
+ #define HFS_MAX_FILES	(UINT32_MAX - kHFSFirstUserCatalogNodeID)

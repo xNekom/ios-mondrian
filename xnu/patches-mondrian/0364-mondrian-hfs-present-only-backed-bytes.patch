@@ -1,0 +1,63 @@
+xnu 0364: present only the bytes a catalog record can back
+
+`hfs_getnewvnode` refuses a file whose record claims more bytes than its blocks
+can hold: `EINVAL`, plus `hfs_mark_inconsistent`. The file is then unopenable
+rather than short, and nothing can repair a record it cannot open. Measured on
+this phone, one such file is enough to dominate the ring: `knowledgeC.db-shm` at
+32768 bytes with a single block accounts for ~8 000 marks a boot, SQLite looking
+it up again and again on the way to a failure. A handful of small files with a
+size and no blocks at all behave the same way.
+
+`0365` stops those records being written and `0363` stops the truncate that used
+to leave a size with no blocks, but the records already on disk stay. The blocks
+a record owns are what the file really has, so present that: clamp the fork to
+`cf_blocks * block_size`, and clear the extent slots when it owns nothing so the
+record written back is clean. `fp->ff_data` is a bcopy of this descriptor, so the
+cnode starts at the clamped size and the next `hfs_update` stores it.
+diff --git a/bsd/mondrian_hfs/core/hfs_cnode.c b/bsd/mondrian_hfs/core/hfs_cnode.c
+index 07a15ec..e1b839a 100644
+--- a/bsd/mondrian_hfs/core/hfs_cnode.c
++++ b/bsd/mondrian_hfs/core/hfs_cnode.c
+@@ -936,6 +936,42 @@ hfs_getnewvnode(
+ 	issystemfile = (descp->cd_flags & CD_ISMETA) && (vtype == VREG);
+ 	wantrsrc = flags & GNV_WANTRSRC;
+ 
++	/*
++	 * MONDRIAN: a record that claims more bytes than its blocks can hold is
++	 * what a deferred allocation that failed leaves behind (`0365` stops it
++	 * being written) and what a failed truncate used to leave as a size with
++	 * no blocks (`0363` stops that). The blocks a record owns are what the
++	 * file really has, so the check below refuses it with `EINVAL` --
++	 * unopenable instead of short -- and marks the volume on every lookup:
++	 * one 32768-byte file with a single block accounted for ~8 000 marks in a
++	 * boot. Present the bytes the fork can back. `fp->ff_data` below is a
++	 * bcopy of this descriptor, so the cnode starts at that size and the next
++	 * `hfs_update` stores it.
++	 */
++	if (forkp != NULL && vtype == VREG &&
++	    forkp->cf_size > hfs_blk_to_bytes(forkp->cf_blocks, hfsmp->blockSize)) {
++		static int mondrian_clamped;
++		off_t backed =
++		    hfs_blk_to_bytes(forkp->cf_blocks, hfsmp->blockSize);
++		int i;
++
++		if (mondrian_clamped++ < 8) {
++			printf("MONDRIAN HFS: id=%u was size %llu with %u block(s); "
++			    "using %llu bytes\n",
++			    (unsigned)attrp->ca_fileid,
++			    (unsigned long long)forkp->cf_size,
++			    (unsigned)forkp->cf_blocks,
++			    (unsigned long long)backed);
++		}
++		forkp->cf_size = backed;
++		if (forkp->cf_blocks == 0) {
++			for (i = 0; i < kHFSPlusExtentDensity; i++) {
++				forkp->cf_extents[i].startBlock = 0;
++				forkp->cf_extents[i].blockCount = 0;
++			}
++		}
++	}
++
+ 	/* Sanity checks: */
+ 	if (vtype == VBAD ||
+ 		(vtype != VDIR && forkp &&

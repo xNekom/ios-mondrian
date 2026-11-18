@@ -1,0 +1,50 @@
+xnu 0365: never write a catalog fork with more bytes than blocks
+
+The volume keeps gaining records that say a size and own too few blocks --
+`knowledgeC.db-shm` at 32768 bytes with one block, and a fresh 37-byte file with
+none every boot -- and each of those records is refused by `hfs_getnewvnode`
+(`EINVAL`) and marks the volume on every lookup.
+
+`ExtendFileC`'s deferred path (`kEFDeferMask`) grows `ff_size` and `ff_blocks`
+together without touching the disk. When the reservation is converted it is
+given back first (`ff_blocks -= loanedBlocks`, `ff_unallocblocks = 0`) and
+re-allocated for real, so a failure there -- from `BlockAllocate`,
+`CreateExtentRecord` or `UpdateExtentRecord` -- leaves the fork with the size
+advanced and the blocks still missing. Nothing on that path trims the size again.
+
+`hfs_prepare_fork_for_update` is the last gate before `cat_update` and its stated
+job is to keep a fork from claiming data it cannot back, but its fast path only
+looks at invalid ranges and deferred blocks:
+
+    if (!ff->ff_unallocblocks && ff->ff_size <= max_size)
+        return cf;              /* size 32768, blocks 1, written as is */
+
+Make the fast path also require that the size fits the blocks the fork owns. A
+fork that does not fit falls through to the existing trims, which cap the size at
+`cf_blocks * block_size` and at the first invalid range, so the record that
+reaches the catalog is always one whose size its blocks can hold. The file loses
+the bytes that were never allocated; nothing else changes.
+diff --git a/bsd/mondrian_hfs/core/hfs_vnops.c b/bsd/mondrian_hfs/core/hfs_vnops.c
+index d210179..7ebbdd8 100644
+--- a/bsd/mondrian_hfs/core/hfs_vnops.c
++++ b/bsd/mondrian_hfs/core/hfs_vnops.c
+@@ -6210,7 +6210,18 @@ hfs_prepare_fork_for_update(filefork_t *ff,
+ 	if (!TAILQ_EMPTY(&ff->ff_invalidranges))
+ 		max_size = TAILQ_FIRST(&ff->ff_invalidranges)->rl_start;
+ 
+-	if (!ff->ff_unallocblocks && ff->ff_size <= max_size)
++	/*
++	 * MONDRIAN: also refuse the fast path when the fork owns fewer blocks
++	 * than its size needs. `ExtendFileC` gives the deferred blocks back
++	 * before it allocates for real (`ff_blocks -= loanedBlocks`), and if
++	 * that allocation or its extent record fails the loop breaks with the
++	 * size already advanced -- measured as a 32768-byte file with one block.
++	 * Writing that record is what makes `hfs_getnewvnode` refuse the file
++	 * with EINVAL on every lookup. Trimming it here stores the bytes the
++	 * fork can actually back, and the record stays legal.
++	 */
++	if (!ff->ff_unallocblocks && ff->ff_size <= max_size &&
++	    ff->ff_size <= hfs_blk_to_bytes(ff->ff_blocks, block_size))
+ 		return cf; // Nothing to do
+ 
+ 	if (ff->ff_blocks < ff->ff_unallocblocks) {
