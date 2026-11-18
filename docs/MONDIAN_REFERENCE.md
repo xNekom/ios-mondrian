@@ -100,8 +100,18 @@ Keep the tarball out of git; it is a device dump.
 
 ## Other ports worth reading
 
-- **`UniXNU/UniXNU`** — bootstrap capacity (`0001`) and the UFS LU wake.
-- **Bergamota / Chlorophyll / HackiOS**, **`oosexgang/hakios-xnu-kernel`** —
-  CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead.
-- **`palazik/ios-dodge`**, **`MakrSas/ios-topaz`**, **`Log1nYT/ios-sweet`** —
-  TLB flush, timer quiesce, `cpus=1`, DWC3 clocks.
+Read the file named, not the project: each one below answers a question this
+port has already paid for once.
+
+| Source | What it answers | Status here |
+| --- | --- | --- |
+| `cotunjr/hakios-xnu-kernel`, branch `mayfly-port`, `xnu/files/bsd/kern/kern_minimac.c` | `minisandbox_container_path()`: request 4 is answered by scanning `CFFIXED_USER_HOME=` in the strings exec left on the target's stack. It names our exact symptom (`plugin has invalid sandbox or container`, the `?` the caller starts the buffer with) for the same SoC family (SM8475). | imported as `0354` |
+| same file, `miniamfi_policy_syscall()` | `__mac_syscall` `0x5a` (dyld policy) returns `0xff`, `0x60` (boot-arg state) returns `0x86`; `0x60` is what stops ExtensionKit waiting for a signature check this kernel cannot do, which otherwise hides every extension point. | already `0108` |
+| same file, `minisandbox_priv_grant()` | Grants a privilege when the binary carries the entitlement paired with it (40 pairs). | `0050` grants them all instead, so nothing is missing |
+| `Emilelu/UniXNU-mondrian` | Device support for the same phone (`mondrian`, SM8475) in the UniXNU tree. | not read yet |
+| `UniXNU/UniXNU` | Bootstrap capacity (`0001`) and the UFS LU wake. | `0001` |
+| Bergamota / Chlorophyll / HackiOS, `oosexgang/hakios-xnu-kernel` | CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead. | `0106` |
+| `palazik/ios-dodge`, `MakrSas/ios-topaz`, `Log1nYT/ios-sweet` | TLB flush, timer quiesce, `cpus=1`, DWC3 clocks. | in the series |
+
+`raw.githubusercontent.com` rate-limits (429); `cdn.jsdelivr.net/gh/<owner>/
+<repo>@<branch>/<path>` serves the same file when it does.

@@ -260,15 +260,14 @@ whole. What stays empty is a missing service, not a drawing bug: Phone draws onl
 its status bar and home indicator (the port brings up no modem -- `NOTES.md`
 lists it with audio and cameras as remaining), the App Store stops at `LOADING`
 without the network, and Photos is blank because the extension that feeds it,
-`PhotosFileProvider`, dies in PlugInKit's launch check. That check asks for the
-process's container path through the sandbox, and `0043` answers **ENOENT** to
-that operation (4) although the container exists
-(`Containers/Data/PluginKitPlugin/<uuid>`, measured with 414 entries) -- so the
-work item is implementing operation 4 in the stand-in, not moving volumes.
-`assetsd` and `fileproviderd` abort in the middle of their own code, which is a
-separate limit, and the same one that leaves the home screen's Photos folder at
-`No content available`. The measurements, the abort chain and how to aim a tap
-are in `docs/UI_PERFORMANCE.md`.
+`PhotosFileProvider`, dies in PlugInKit's launch check: the sandbox is asked for
+the process's container path, `0043` answered **ENOENT** to that operation (4),
+and `0354` now answers it from `CFFIXED_USER_HOME=` -- two extensions took
+their paths -- so whether Photos still dies there is what the next boot
+measures. `assetsd` and `fileproviderd` abort in the middle of their own code,
+which is a separate limit, and the same one that leaves the home screen's
+Photos folder at `No content available`. The measurements, the abort chain and
+how to aim a tap are in `docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device
 

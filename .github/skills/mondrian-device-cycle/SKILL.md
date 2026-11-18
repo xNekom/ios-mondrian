@@ -26,6 +26,11 @@ fastboot --set-active=<current-slot>  # clears the mark
 kernel that crashes, and the ring answering with the previous kernel's banner
 "confirms" the wrong diagnosis.
 
+On Windows the value arrives with a CR (`b\r`), and `--set-active=b\r` is
+rejected with `Slot b does not exist` while the mark survives: every RAM boot
+then dies the same way. Strip it (`| tr -d '\r'`) and check the command's exit
+status instead of writing its output to a log nobody reads.
+
 ## Prove the kernel before trusting any answer
 
 A RAM boot that dies falls back to `boot_b`, so "command not found" means "old

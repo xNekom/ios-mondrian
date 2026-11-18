@@ -436,6 +436,14 @@ boot each, so the three columns differ only in what changed:
   to operation 4 (container path), 5 and 6 (extension issue/consume) and 0x43.
   `launchd op 4` appears in the ring too, so this is not specific to the appex.
   Error 2 is the exception's own number, so the message is that query failing.
+- **Request 4 now answers, and a plug-in takes the path.** Measured 2026-11-18
+  with `0354`: the stand-in scans the target's stack for `CFFIXED_USER_HOME=`
+  and copies it back, logging `MONDRIAN Sandbox: <proc> container <path>`. Two
+  different extensions received theirs on their own, `SiriTTSSynthesizer` and
+  `MacinTalkAUSP`, both under `Data/PluginKitPlugin/<uuid>`. A process without
+  the variable keeps `ENOENT` (0043's answer) instead of success with the buffer
+  untouched: `launchd` asks about processes that have no container, and telling
+  it they do hands it whatever the buffer held.
 - **The appex's message is PlugInKit's, and its caller is in the cache.** The
   string sits at PlugInKit `+0x25697`, between
   `-[PKService launchContainingApplicationForPlugInNamed:]` and `missing data key
@@ -763,6 +771,30 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   still leaves 1357 marks in the next boot. Check `hfs_mark_inconsistent` first
   in any boot that stops presenting, and restore
   `backup/ios-root-repaired.simg` when it is there.
+- **A verified-clean root is not clean after one boot.** Measured 2026-11-18:
+  `backup/ios-root-repaired.simg` expanded and checked with `fsck.hfsplus`
+  ("appears to be OK"), written to `userdata`, and the first boot on it already
+  frees block ranges the bitmap does not own (`<160696,999>` three times,
+  `<4050321,1>`, `<153186,5>`, ...). So the damage is not only the residue of a
+  dirty reset: something in normal operation releases extents twice. `0356`
+  names the caller at the failure, and on that first boot there are **152 of
+  them asked by fifteen different processes** -- `mobileassetd`, `timed`,
+  `usermanagerd`, `mount_hfs`, `fseventsd`, `nehelper`, `thermalmonitord`, most
+  of them a single block. A per-daemon bug cannot explain that, so the lead is
+  the allocation accounting itself (a bit that is never set when a block is
+  handed out, or a bitmap block written from stale contents), not any one
+  service. `0355` flushes the root with `MNT_WAIT` before `reboot`/`poweroff`,
+  which removes the reset from the list of contributors.
+- **`panel 0/60` does not mean "not presenting".** It counts sampled ticks that
+  changed, so a still screen reads 0/60 too -- a lock screen with the clock, the
+  date and the camera button, captured 191 s into a repaired boot, reads 0/60.
+  The proof that nothing is being presented is the *capture*: the Apple logo of
+  the bootloader, i.e. the last image the panel was given, kept while SpringBoard
+  runs (`SMP` lines keep counting). Measured 2026-11-18 on a root with 12 000-27 000
+  marks: logo, 0/60, `present 0/s`; on the repaired root, with 2 500 marks: the
+  lock screen draws. So the number of marks does not decide presentation either;
+  the capture does, and `grep -c hfs_mark_inconsistent` only says how far the
+  volume has drifted.
 - **Measure the glass, not the counters.** `tools/usb-ring.py fps N` hashes
   eight panel rows over the ring about 30 times a second and counts the
   changes: that is the frame rate the eye gets. `fps` counts swaps, `present`
