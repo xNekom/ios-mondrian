@@ -626,16 +626,50 @@ boot each, so the three columns differ only in what changed:
   the Photos icon above it is `201,420` and the dock row sits at `y 2990`
   (`420`, `720`, `1020` for Phone, Safari, Messages). One gesture at a time --
   the gadget's command thread is busy until the swipe finishes.
-- **Photos has no library, so the app and its folder both stay empty.** Measured
-  2026-11-18: tapping the Photos icon opens the app (status bar and home
-  indicator are its own) and it draws nothing for at least 18 s, with no
-  `CRASH Photos` and no `exec assetsd` anywhere in the ring; instead
-  `PhotosFileProvider` aborts `sig 6` and `fileproviderd` aborts at the same
-  place, both `mov x16, #328; svc #0x80` (`__pthread_kill`, i.e. a self-`abort`),
-  twice each. That is the same family as the icon artwork: the home screen's
-  Photos folder shows the placeholder `No content available` for the composite
-  it cannot get, and the app has no library service to ask. Both are the port's
-  service-launch limit, not a drawing bug in either view.
+- **Photos runs once the hook is inside the app.** Measured 2026-11-18: the app
+  execs and aborts `sig 6` at the same pc, lr and backtrace on every launch
+  until `MobileSlideShow` is both injected (`xnu 0368`) and inside the hook's
+  probe gate, and then it draws the What's New screen, then its own `Library`
+  tab with `No Photos or Videos` and the four tabs, and stays alive. The abort
+  was not an Objective-C exception -- the throw hook was armed and stayed
+  silent -- and the call it dies in is `TCCAccessRequest`, whose denial aborts a
+  client that has no usage description. assetsd's
+  `assetsd requires TCCPhotosService access` is the same denial one layer in,
+  through `-[PLPrivacy photosAccessAllowedWithScope:]`, which the hook answers
+  now that the app and the daemons both carry it.
+  What the port must not believe: tccd really denies. The original behind the
+  interpose tuple answers 1 for `kTCCServicePhotos` while `SecTask` reads
+  `com.apple.private.tcc.allow` through the same process's audit token
+  (`MONDRIAN SEC`: `audit present`), so the denial is tccd's, not the kernel's.
+  And a `dlsym` for `TCCAccessPreflight` returns the interposer: a probe that
+  reads the symbol reads its own shim (`mondrian-tccok`) and calls it the OS
+  answer. Use `mondrian_tcc_preflight_interpose.replacee`.
+- **A synthetic tap is a hold, and the home screen ignores it.** Measured
+  2026-11-18: `tap x y` sends down, down, up inside one frame and iOS drops it;
+  `swipe x y x y 140` is the same point held 140 ms and works -- it opened
+  Search, dismissed dialogs and answered the Photos onboarding. Icon presses
+  still do nothing after a respring (the widgets read `Waiting...` and the icon
+  view does not react), so an app is opened from the host instead: write its
+  bundle id to `/private/var/vm/mondrian-open` and the hook in SpringBoard calls
+  `-[LSApplicationWorkspace openApplicationWithBundleID:]`, which answers 1 only
+  while the device is unlocked. Every rewrite of that file is a new request, so
+  an unlock followed by a write is the whole gesture.
+- **A private selector called unguarded in a constructor is a SpringBoard crash
+  loop.** Measured 2026-11-18: a probe that called `-[PLPrivacy _TCCForScope:]`
+  without `respondsToSelector:` raised inside the hook's constructor, and
+  SpringBoard re-exec'd 16 times with the same `sig 6`; a `grep 'exec
+  SpringBoard'` in the ring is what tells that apart from a probe that hangs.
+  Guard every private selector, and never `CFRelease` a value a getter did not
+  own.
+- **`csops` answers ERANGE when the buffer is small, not "no entitlements".**
+  Measured 2026-11-18: the same probe read `-1 errno 34` for SpringBoard and
+  5643 bytes for assetsd, because SpringBoard's blob is larger than the 8 KB the
+  probe passed. A `-1` with errno 34 means the buffer, not the signature.
+- **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
+  2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
+  `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app
+  itself now draws its library, so the extension's container query is a separate
+  defect from the app's TCC one.
 - **Which hook is running, and whether it arrived whole.** The hook prints
   `MONDRIAN UI: hook tag cc56 uid <uid> prog <name> built <date> <time>` at load
   (`__DATE__`/`__TIME__`), and the ring holds several SpringBoard instances at
