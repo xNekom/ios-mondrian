@@ -1,0 +1,53 @@
+xnu 0359: name the file that trips the vnode sanity check
+
+`hfs_getnewvnode()` marks the volume inconsistent and fails the lookup with
+EINVAL when a file's size needs more blocks than its data fork owns, when a
+symlink exceeds MAXPATHLEN, or when the type is VBAD. That check fired more than
+a hundred times on the repaired root, and `tools/hfs-audit.py` walks all 203 698
+records of that image -- resident and overflow extents -- without finding one
+that fails: the boot creates them.
+
+The id, the name, the size, the block count and the type of the first twelve say
+which operation writes a record whose size does not fit its blocks, which is the
+same disagreement that later makes a truncate free blocks the bitmap no longer
+owns.
+
+diff --git a/bsd/mondrian_hfs/core/hfs_cnode.c b/bsd/mondrian_hfs/core/hfs_cnode.c
+--- a/bsd/mondrian_hfs/core/hfs_cnode.c
++++ b/bsd/mondrian_hfs/core/hfs_cnode.c
+@@ -943,6 +943,35 @@
+ 			 howmany((uint64_t)forkp->cf_size, hfsmp->blockSize) > forkp->cf_blocks ||
+ 			 (vtype == VLNK && (uint64_t)forkp->cf_size > MAXPATHLEN)))) {
+ 		/* Mark the FS as corrupt and bail out */
++		{
++			/*
++			 * MONDRIAN: name what tripped it. The image has no record
++			 * that fails this check, so whatever does was written
++			 * during this boot and the numbers say which operation.
++			 */
++			static int mondrian_badvget;
++			char shown[40];
++			int n = 0;
++
++			if (mondrian_badvget < 12) {
++				mondrian_badvget++;
++				if (descp->cd_nameptr != NULL &&
++				    descp->cd_namelen > 0) {
++					n = descp->cd_namelen <
++					    (int)sizeof(shown) - 1 ?
++					    descp->cd_namelen :
++					    (int)sizeof(shown) - 1;
++					memcpy(shown, descp->cd_nameptr, n);
++				}
++				shown[n] = '\0';
++				printf("MONDRIAN HFS: bad vnode id=%u '%s' mode 0x%x size %llu blocks %u attr %u fork %d\n",
++				    (unsigned)attrp->ca_fileid, shown,
++				    (unsigned)attrp->ca_mode,
++				    forkp ? (unsigned long long)forkp->cf_size : 0ULL,
++				    forkp ? (unsigned)forkp->cf_blocks : 0,
++				    (unsigned)attrp->ca_blocks, forkp ? 1 : 0);
++			}
++		}
+ 		hfs_mark_inconsistent(hfsmp, HFS_INCONSISTENCY_DETECTED);
+ 		retval = EINVAL;
+ 		goto gnv_exit;

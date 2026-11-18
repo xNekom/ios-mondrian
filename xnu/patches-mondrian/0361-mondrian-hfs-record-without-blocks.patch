@@ -1,0 +1,65 @@
+xnu 0361: watch a catalog record go from having blocks to having none
+
+Three files reach `hfs_getnewvnode` with a size and zero blocks -- `prng.seed`
+(32 bytes), `launchd_cache_loader.log` (375) and
+`com.apple.mobileassetd-MobileAssetBrain` (6905) -- and every lookup of them marks
+the volume inconsistent and fails with EINVAL. `tools/hfs-audit.py` finds no such
+record in the image, so the disagreement is created during the boot or the lookup
+reads it wrong, and those are different bugs.
+
+Two prints, both only on that shape: the record as `cat_lookupbykey` reads it,
+and the fork as `catrec_update` writes it, with the values it replaces. The pair
+says whether the record is already broken on disk when it is first looked at, or
+whether a writer put it there.
+
+diff --git a/bsd/mondrian_hfs/core/hfs_catalog.c b/bsd/mondrian_hfs/core/hfs_catalog.c
+--- a/bsd/mondrian_hfs/core/hfs_catalog.c
++++ b/bsd/mondrian_hfs/core/hfs_catalog.c
+@@ -937,6 +937,22 @@
+ 			forkp->cf_size = recp->hfsPlusFile.dataFork.logicalSize;
+ 			forkp->cf_new_size = 0;
+ 			forkp->cf_blocks = recp->hfsPlusFile.dataFork.totalBlocks;
++			/*
++			 * MONDRIAN: the record on disk claims data and no
++			 * blocks. Every later lookup of it marks the volume.
++			 */
++			{
++				static int mondrian_noblocks_read;
++
++				if (forkp->cf_blocks == 0 && forkp->cf_size != 0 &&
++				    mondrian_noblocks_read++ < 8) {
++					printf("MONDRIAN HFS: read id=%u size %llu blocks 0, rsrc %llu/%u\n",
++					    (unsigned)getcnid(recp),
++					    (unsigned long long)forkp->cf_size,
++					    (unsigned long long)recp->hfsPlusFile.resourceFork.logicalSize,
++					    (unsigned)recp->hfsPlusFile.resourceFork.totalBlocks);
++				}
++			}
+ 			if ((hfsmp->hfc_stage == HFC_RECORDING) &&
+ 			    (to_bsd_time(recp->hfsPlusFile.accessDate) >= hfsmp->hfc_timebase)) {
+ 				forkp->cf_bytesread =
+@@ -1777,6 +1793,24 @@
+ 		}
+ 		if (state->s_datafork) {
+ 			forkp = state->s_datafork;
++			/*
++			 * MONDRIAN: about to write a fork with data and no
++			 * blocks. Say what it replaces, so the writer is on
++			 * record too and not just the reader.
++			 */
++			{
++				static int mondrian_noblocks_write;
++
++				if (forkp->cf_blocks == 0 && forkp->cf_size != 0 &&
++				    mondrian_noblocks_write++ < 8) {
++					printf("MONDRIAN HFS: write id=%u size %llu blocks 0 vblocks %u, was size %llu blocks %u\n",
++					    (unsigned)attrp->ca_fileid,
++					    (unsigned long long)forkp->cf_size,
++					    (unsigned)forkp->cf_vblocks,
++					    (unsigned long long)file->dataFork.logicalSize,
++					    (unsigned)file->dataFork.totalBlocks);
++				}
++			}
+ 			file->dataFork.logicalSize = forkp->cf_size;
+ 			file->dataFork.totalBlocks = forkp->cf_blocks;
+ 			bcopy(&forkp->cf_extents[0], &file->dataFork.extents,

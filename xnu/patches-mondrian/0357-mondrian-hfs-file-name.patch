@@ -1,0 +1,77 @@
+xnu 0357: print the file behind each allocation and each free
+
+0356 named the process that frees blocks the bitmap does not own, and on a root
+written from the fsck-verified image 152 such frees came from fifteen daemons,
+almost all of them a single block -- so the accounting is the lead, not a
+service. A process name still does not say which file lost its bits.
+
+This prints the catalog file id, the first 43 bytes of the name and the fork on
+both sides, for the first 24 operands of each: an extension as BlockAllocate()
+hands it out, and a truncate as BlockDeallocate() takes it back. A free whose
+file was never announced with that range, in the same boot, points at the step
+that dropped the bit; with both lines the diagnosis is a diff, not a theory.
+
+diff --git a/bsd/mondrian_hfs/core/FileExtentMapping.c b/bsd/mondrian_hfs/core/FileExtentMapping.c
+--- a/bsd/mondrian_hfs/core/FileExtentMapping.c
++++ b/bsd/mondrian_hfs/core/FileExtentMapping.c
+@@ -1078,6 +1078,31 @@
+ 						  &actualStartBlock,
+ 						  &actualNumBlocks);
+ 			}
++			if (err == noErr && actualNumBlocks != 0) {
++			{
++				static int mondrian_logged_alloc;
++				struct cnode *cp = FTOC(fcb);
++				char shown[44];
++				int n = 0;
++
++				if (mondrian_logged_alloc < 24) {
++					mondrian_logged_alloc++;
++					if (cp->c_desc.cd_nameptr != NULL &&
++					    cp->c_desc.cd_namelen > 0) {
++						n = cp->c_desc.cd_namelen <
++						    (int)sizeof(shown) - 1 ?
++						    cp->c_desc.cd_namelen :
++						    (int)sizeof(shown) - 1;
++						memcpy(shown, cp->c_desc.cd_nameptr, n);
++					}
++					shown[n] = '\0';
++					printf("MONDRIAN HFS: %s file %u '%.*s' fork %d %u+%u\n",
++					    "alloc", (unsigned)FTOC(fcb)->c_fileid, n, shown,
++					    FORK_IS_RSRC(fcb) ? 2 : 1,
++					    actualStartBlock, actualNumBlocks);
++				}
++			}
++			}
+ 		}
+ 		if (err == dskFulErr) {
+ 			if (forceContig) {
+@@ -1365,6 +1390,28 @@
+ 			//	Compute first volume allocation block to free
+ 			startBlock = extentRecord[extentIndex].startBlock + extentRecord[extentIndex].blockCount - numBlocks;
+ 			//	Free the blocks in bitmap
++			{
++				static int mondrian_logged_free;
++				struct cnode *cp = FTOC(fcb);
++				char shown[44];
++				int n = 0;
++
++				if (mondrian_logged_free < 24) {
++					mondrian_logged_free++;
++					if (cp->c_desc.cd_nameptr != NULL &&
++					    cp->c_desc.cd_namelen > 0) {
++						n = cp->c_desc.cd_namelen <
++						    (int)sizeof(shown) - 1 ?
++						    cp->c_desc.cd_namelen :
++						    (int)sizeof(shown) - 1;
++						memcpy(shown, cp->c_desc.cd_nameptr, n);
++					}
++					shown[n] = '\0';
++					printf("MONDRIAN HFS: free file %u '%.*s' fork %d %u+%u\n",
++					    (unsigned)fileid, n, shown, forkType,
++					    startBlock, numBlocks);
++				}
++			}
+ 			err = BlockDeallocate(vcb, startBlock, numBlocks, 0);
+ 			if (err != noErr) goto ErrorExit;
+ 			//	Adjust length of this extent

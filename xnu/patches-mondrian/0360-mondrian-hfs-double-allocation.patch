@@ -1,0 +1,97 @@
+xnu 0360: say when the allocator hands out blocks that are already allocated
+
+A repaired root spends every boot with the allocation bitmap disagreeing with
+the files that own blocks: a truncate frees a range the bitmap calls free, marks
+the volume, and `hfs_removefile` then marks it again because it cannot release
+the storage of the record it just deleted. `tools/hfs-audit.py` finds the shape
+of that damage in the image itself -- 12 pairs of forks claiming the same blocks,
+which `fsck.hfsplus` does not check because it only compares the bitmap with the
+union of the extents.
+
+`BlockMarkAllocatedInternal()` already knows the answer and throws it away: with
+DEBUG it panics when a bit it is about to set is already set, that is, when the
+allocator hands out a block nobody freed. This build has DEBUG off. The same mask
+test now reports the range, the allocation flags and -- from the note table of
+0358 -- the file the blocks were handed to earlier in the same boot.
+
+It issues no I/O and reads only the word the allocator already loaded: reading
+the bitmap from inside this path hangs the boot after `hfs: mounted` on this
+port, measured twice, and that trap is recorded in the UFS skill.
+
+diff --git a/bsd/mondrian_hfs/core/VolumeAllocation.c b/bsd/mondrian_hfs/core/VolumeAllocation.c
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -2874,6 +2874,16 @@
+ 	// XXXdbg
+ 	struct hfsmount *hfsmp = VCBTOHFS(vcb);
+ 
++	/*
++	 * MONDRIAN: the range as the caller asked for it, for the conflict
++	 * report below; the code that follows advances both variables. The test
++	 * itself costs a mask the allocator already computes and issues no I/O:
++	 * reading the bitmap from here hangs this port's boot after mount.
++	 */
++	const u_int32_t	mondrian_start = startingBlock;
++	const u_int32_t	mondrian_count = numBlocks;
++	static int	mondrian_conflicts;
++
+ 	if (hfs_kdebug_allocation & HFSDBG_BITMAP_ENABLED)
+ 		KERNEL_DEBUG_CONSTANT(HFSDBG_MARK_ALLOC_BITMAP | DBG_FUNC_START, startingBlock, numBlocks, flags, 0, 0);
+ 
+@@ -2963,11 +2973,16 @@
+ 			numBits = numBlocks;					//	entire allocation is inside this one word
+ 			bitMask &= ~(kAllBitsSetInWord >> (firstBit + numBits));	//	turn off bits after last
+ 		}
+-#if DEBUG
+ 		if ((*currentWord & SWAP_BE32 (bitMask)) != 0) {
++			if (mondrian_conflicts++ < 16) {
++				printf("MONDRIAN HFS: handing out blocks already set, %u+%u (flags 0x%x)\n",
++				    mondrian_start, mondrian_count, (unsigned)flags);
++				mondrian_explain_free(mondrian_start, mondrian_count);
++			}
++#if DEBUG
+ 			panic("hfs: BlockMarkAllocatedInternal: blocks already allocated!");
+-		}
+ #endif
++		}
+ 		*currentWord |= SWAP_BE32 (bitMask);		//	set the bits in the bitmap
+ 		numBlocks -= numBits;						//	adjust number of blocks left to allocate
+ 
+@@ -3002,11 +3017,16 @@
+ 			currentWord = buffer;
+ 			wordsLeft = wordsPerBlock;
+ 		}
+-#if DEBUG
+ 		if (*currentWord != 0) {
++			if (mondrian_conflicts++ < 16) {
++				printf("MONDRIAN HFS: handing out blocks already set, %u+%u (flags 0x%x)\n",
++				    mondrian_start, mondrian_count, (unsigned)flags);
++				mondrian_explain_free(mondrian_start, mondrian_count);
++			}
++#if DEBUG
+ 			panic("hfs: BlockMarkAllocatedInternal: blocks already allocated!");
+-		}
+ #endif
++		}
+ 		*currentWord = SWAP_BE32 (bitMask);
+ 		numBlocks -= kBitsPerWord;
+ 
+@@ -3039,11 +3059,16 @@
+ 
+ 			currentWord = buffer;
+ 		}
+-#if DEBUG
+ 		if ((*currentWord & SWAP_BE32 (bitMask)) != 0) {
++			if (mondrian_conflicts++ < 16) {
++				printf("MONDRIAN HFS: handing out blocks already set, %u+%u (flags 0x%x)\n",
++				    mondrian_start, mondrian_count, (unsigned)flags);
++				mondrian_explain_free(mondrian_start, mondrian_count);
++			}
++#if DEBUG
+ 			panic("hfs: BlockMarkAllocatedInternal: blocks already allocated!");
+-		}
+ #endif
++		}
+ 		*currentWord |= SWAP_BE32 (bitMask);			//	set the bits in the bitmap
+ 
+ 		//	No need to update currentWord or wordsLeft

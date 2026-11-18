@@ -1,0 +1,45 @@
+xnu 0362: name the write that drops a fork's block count
+
+A record that reaches `catrec_update` says what it replaces: `size 827 blocks 0
+vblocks 0, was size 827 blocks 1`. The record on disk is right and the fork
+arriving from the cnode has already lost the block, so the loss happens between
+the write that allocated it and the update that records it, and both ends are
+inside the kernel.
+
+This prints the name of the file and the fork's first two extents. Extents set
+with a zero count is an increment the fork never took; extents empty is a file
+that never had blocks, which is a different bug. The id in the previous print was
+84 million, far from the image's `nextCatalogID` of 1.69 million, so the name is
+the reliable handle.
+
+diff --git a/bsd/mondrian_hfs/core/hfs_catalog.c b/bsd/mondrian_hfs/core/hfs_catalog.c
+--- a/bsd/mondrian_hfs/core/hfs_catalog.c
++++ b/bsd/mondrian_hfs/core/hfs_catalog.c
+@@ -1803,10 +1803,25 @@
+ 
+ 				if (forkp->cf_blocks == 0 && forkp->cf_size != 0 &&
+ 				    mondrian_noblocks_write++ < 8) {
+-					printf("MONDRIAN HFS: write id=%u size %llu blocks 0 vblocks %u, was size %llu blocks %u\n",
+-					    (unsigned)attrp->ca_fileid,
++					char mondrian_name[32];
++					int mondrian_n = 0;
++
++					if (descp->cd_nameptr != NULL &&
++					    descp->cd_namelen > 0) {
++						mondrian_n = descp->cd_namelen < 31 ?
++						    descp->cd_namelen : 31;
++						memcpy(mondrian_name,
++						    descp->cd_nameptr, mondrian_n);
++					}
++					mondrian_name[mondrian_n] = '\0';
++					printf("MONDRIAN HFS: write id=%u '%s' size %llu blocks 0 vblocks %u extents %u+%u,%u+%u, was size %llu blocks %u\n",
++					    (unsigned)attrp->ca_fileid, mondrian_name,
+ 					    (unsigned long long)forkp->cf_size,
+ 					    (unsigned)forkp->cf_vblocks,
++					    (unsigned)forkp->cf_extents[0].startBlock,
++					    (unsigned)forkp->cf_extents[0].blockCount,
++					    (unsigned)forkp->cf_extents[1].startBlock,
++					    (unsigned)forkp->cf_extents[1].blockCount,
+ 					    (unsigned long long)file->dataFork.logicalSize,
+ 					    (unsigned)file->dataFork.totalBlocks);
+ 				}
