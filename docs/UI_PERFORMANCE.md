@@ -249,6 +249,10 @@ boot each, so the three columns differ only in what changed:
   counter rising about four a minute, the panel ending black under a `KABORT`);
   the layer version runs with a stable PID. That is correlation, not proof, and
   it is why the safe shape is the one the library's background already uses.
+  One card's material still does not draw: the wide `Suggestions` card shows its
+  tiles over the wallpaper with only a sliver of material under them, which is
+  the same blur/vibrancy failure the library's background had. The tiles
+  themselves are correct, so the card reads as an icon grid without its card.
   The dump is armed by writing a number into `/private/var/vm/mondrian-deep` (a
   new number buys one dump, four a process) and read out of the ring.
   `fps 0` and `panel 0/60 sampled ticks changed` do not mean the UI is dead: both
