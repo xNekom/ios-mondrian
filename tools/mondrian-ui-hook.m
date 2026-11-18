@@ -5871,10 +5871,28 @@ mondrian_wall_inspect(CGImageRef image)
 	}
 	CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
 	for (unsigned i = 0; i < sizeof(places) / sizeof(places[0]); i++) {
-		int at = places[i].y * (int)row + places[i].x * 4;
+		int x = places[i].x, y = places[i].y;
+		size_t at;
 
+		/*
+		 * `places` is written in full-panel coordinates (1440x3200) and this
+		 * runs on whatever image the window holds, which can be the 720x1600
+		 * wallpaper this hook draws itself: there y = 1600 and 2900 are past
+		 * the end of the buffer, and the read below lands in whatever is
+		 * mapped after it. That was the intermittent SpringBoard SEGV of
+		 * 2026-11-18: `pc` at this `ldrb`, `far` in the hole just past the
+		 * allocation. Skip a place that is not inside the image.
+		 */
+		if (x < 0 || y < 0 || (size_t)x >= width || (size_t)y >= height) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN WALL: pixel %d,%d outside %zux%zu\n",
+			    x, y, width, height);
+			say(line);
+			continue;
+		}
+		at = (size_t)y * row + (size_t)x * 4;
 		snprintf(line, sizeof(line), "MONDRIAN WALL: pixel %d,%d is %u %u %u %u\n",
-		    places[i].x, places[i].y, pixels[at + 2], pixels[at + 1], pixels[at + 0],
+		    x, y, pixels[at + 2], pixels[at + 1], pixels[at + 0],
 		    pixels[at + 3]);
 		say(line);
 	}
@@ -11659,14 +11677,48 @@ mondrian_install_ui_hooks(void)
 		}
 	}
 	install_personas_hook();
-	/* The build tag: a boot that logs it proves which hook it is running. */
+	/*
+	 * The build tag: a boot that logs it proves which hook it is running.
+	 * The base and size go with it, because a kernel crash record names
+	 * `mh` -- the main executable -- and this dylib is loaded right behind
+	 * it, so `pc - mh` only becomes an offset in this file once both are
+	 * known (measured 2026-11-18: the records' "SpringBoard + 0xa4a14" sits
+	 * past the end of that 0x98000-byte main executable, inside this dylib).
+	 */
 	{
 		char tag[160];
+		const struct mach_header_64 *hdr =
+		    (const struct mach_header_64 *)_dyld_get_image_header(0);
 
 		snprintf(tag, sizeof(tag),
 		    "MONDRIAN UI: hook tag cc56 uid %d prog %s built %s %s\n",
 		    (int)geteuid(), getprogname(), __DATE__, __TIME__);
 		say(tag);
+		if (hdr != NULL) {
+			const struct load_command *lc =
+			    (const struct load_command *)(hdr + 1);
+			uint64_t size = 0;
+
+			for (uint32_t i = 0; i < hdr->ncmds; i++) {
+				if (lc->cmd == LC_SEGMENT_64) {
+					const struct segment_command_64 *seg =
+					    (const struct segment_command_64 *)lc;
+
+					if (strcmp(seg->segname, "__TEXT") == 0) {
+						size = seg->vmsize;
+						break;
+					}
+				}
+				lc = (const struct load_command *)
+				    ((const char *)lc + lc->cmdsize);
+			}
+			snprintf(tag, sizeof(tag),
+			    "MONDRIAN UI: image0 %p size %#llx %s\n",
+			    (const void *)hdr, (unsigned long long)size,
+			    _dyld_get_image_name(0) != NULL ?
+			    _dyld_get_image_name(0) : "?");
+			say(tag);
+		}
 	}
 	/*
 	 * mondrianbare=1 keeps the probe and the network link but installs none

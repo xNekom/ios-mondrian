@@ -228,6 +228,29 @@ boot each, so the three columns differ only in what changed:
   left zero `MONDRIAN KABORT` lines, so what is verified is the mechanism -- the
   only caller of `mondrian_early_panic_begin()` is gone -- not a boot that
   exercised it.
+- **The `CRASH SpringBoard` records were this hook's own out-of-bounds read.**
+  A record names `mh`, the **main executable**, and that binary
+  (`CoreServices/SpringBoard.app/SpringBoard`) is only `0x98000` bytes: the hook
+  is loaded right behind it, so `pc - mh = 0xa4b54` is not an offset in
+  SpringBoard, it is `hook + 0xcb54`. Two things make that arithmetic safe
+  instead of a guess: the hook prints its own base and size at load
+  (`MONDRIAN UI: image0 <base> size <size> <path>`, added 2026-11-18), and the
+  same dylib's `llvm-nm` names the function at that offset. Both records of one
+  boot give the same `pc - mh`, and in the boot they came from the hook sat at
+  `mh + 0x98000`: the site is `ldrb w12, [x11, #0x2]` in
+  `mondrian_wall_inspect()`, the probe that prints `MONDRIAN WALL: pixel`.
+  `places[]` there is written in full-panel coordinates (720x300, 720x1600,
+  720x2900, 200x1600) and the probe runs on whatever image the wallpaper view
+  holds -- measured once as **192x192**, where three of the four samples read up
+  to 0.9 MB past the buffer, so the load lands in whatever is mapped after the
+  allocation, which is the hole the record's `map before`/`map after` lines
+  bracket. That is the intermittency: the same read crashes when the next page is
+  not mapped and is silently accepted when it is. The `far`'s low bits are the
+  arithmetic (`y * row + x * 4 + 2`), so treating them as an ivar offset was
+  reading tea leaves.
+  The fix skips a place outside the image and says so (`MONDRIAN WALL: pixel
+  720,1600 outside 192x192`); measured after it, the instance that survived 45
+  lock-watch cycles left 0 records where the three before it left 6 to 18.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
@@ -271,32 +294,8 @@ boot each, so the three columns differ only in what changed:
   Verified on the glass: four cards each with their material and their icons,
   SpringBoard's pid unchanged for 30 s with the library displayed.
   The pass is switched by `/private/var/vm/mondrian-cardspaint` (on unless the
-  file holds `0`). A boot with the hook from before this code left 0
-  `CRASH SpringBoard` entries; boots with it have left 0, 6 or 12, at one fixed
-  pc, so the fault is **intermittent** and a single boot cannot attribute it.
-  What the record says: the pc is SpringBoard + 0xa4a14 and the lr +0xa49e4, both
-  inside the 0x710-byte function at +0xa48c0 (boundaries from `__unwind_info`,
-  see below), and the pc is a `bl` to `0x1c9b0962c`, which is outside the image
-  the cache extract carries. The `far` is what names the fault: the kernel also
-  dumps the map entry on each side of it, and the address falls in the hole
-  between `0x1183f0000-0x118414000` (rw) and `0x11842c000-0x11843c000`, so it is
-  not mapped at all -- and the record's `far` ends in `0xf42`, the ivar offset, so
-  the object began at `0x118428000`, inside that hole. A pointer into pages that
-  had been unmapped, which is a message to a freed object reported at its call
-  site. (Subtracting `0xf42` from a `far` that always ends in `0xf42` lands on a
-  page boundary by construction; it is not evidence, and the map lines are.)
-  The image extracted from the dyld shared cache has no symbols and no
-  `LC_FUNCTION_STARTS`, so those boundaries come from `__unwind_info`: an index
-  entry is 12 bytes (`functionOffset` relative to the image base, second-level
-  page offset, LSDA offset) and a compressed page (kind 3) holds 4-byte entries
-  whose low 24 bits are the offset from the page's first function and whose high
-  8 bits index the encoding table. That gives 29740 function starts for the
-  image, which is what the 0x710-byte function above comes from.
-  Turning the App Library pass off changes nothing about a boot; turning the icon
-  artwork pass off (`mondrianiconset=0` in `PREFIX_ARGS` to `image.sh`) measured
-  6 in one boot against 12 in the boot before it, which is inside that spread and
-  is not evidence. Finding the receiver needs a boot that crashes and a debugger
-  on it, not another A/B.
+  file holds `0`). It was not the source of the `CRASH SpringBoard` records;
+  the section below has what those were.
   **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
   a filled rounded rect under the tiles) is the one whose boots crash-looped
   SpringBoard the moment the library opened -- pid changing every few seconds,
