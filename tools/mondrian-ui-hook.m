@@ -12312,6 +12312,81 @@ mondrian_seed_container(const char *identifier, NSString *uuid)
 }
 
 /*
+ * What the dying appex was told about itself. iOS gives a plug-in its own data
+ * container under `Containers/Data/PluginKitPlugin`, not an app container under
+ * `Application`, so the container seeded for `com.apple.mobileslideshow` cannot
+ * be the one this process looks for. Printed before anything can fault: the
+ * bundle identifier and NSHomeDirectory() alone say whether the process was
+ * given a container at all (a sandboxed app gets its container as HOME), and
+ * the directory listing says whether the plugin container tree exists in this
+ * root. Switch: /private/var/vm/mondrian-appex.
+ */
+static void
+mondrian_appex_report(void)
+{
+	static const char *const dirs[] = {
+		"/private/var/mobile/Containers/Data/Application",
+		"/private/var/mobile/Containers/Data/PluginKitPlugin",
+		"/private/var/mobile/Containers/Bundle/Application",
+		"/private/var/mobile/Containers/Bundle/PluginKitPlugin",
+	};
+	NSBundle *bundle = [NSBundle mainBundle];
+	NSString *bid = [bundle bundleIdentifier];
+	NSString *exe = [bundle executablePath];
+	NSString *home = NSHomeDirectory();
+	const char *env_home = getenv("HOME");
+	const char *env_cfixed = getenv("CFFIXED_USER_HOME");
+	const char *env_tmp = getenv("TMPDIR");
+	NSFileManager *fm = [NSFileManager defaultManager];
+	size_t i;
+
+	mondrian_probe_fmt("MONDRIAN APPEX[%d]: bid %s\n", getpid(),
+	    bid != nil ? [bid UTF8String] : "(nil)");
+	mondrian_probe_fmt("MONDRIAN APPEX[%d]: exe %s\n", getpid(),
+	    exe != nil ? [exe UTF8String] : "(nil)");
+	mondrian_probe_fmt("MONDRIAN APPEX[%d]: home %s env %s cfixed %s tmp %s\n",
+	    getpid(), home != nil ? [home UTF8String] : "(nil)",
+	    env_home != NULL ? env_home : "(nil)",
+	    env_cfixed != NULL ? env_cfixed : "(nil)",
+	    env_tmp != NULL ? env_tmp : "(nil)");
+	mondrian_probe_fmt("MONDRIAN APPEX[%d]: uid %d gid %d ppid %d\n", getpid(),
+	    (int)geteuid(), (int)getegid(), (int)getppid());
+	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		NSString *p = [NSString stringWithUTF8String:dirs[i]];
+		NSArray *list = [fm contentsOfDirectoryAtPath:p error:NULL];
+
+		mondrian_probe_fmt("MONDRIAN APPEX[%d]: %s exists %d entries %ld\n",
+		    getpid(), dirs[i], (int)[fm fileExistsAtPath:p],
+		    list != nil ? (long)[list count] : -1L);
+	}
+	/*
+	 * The sandbox's own answer is the one PlugInKit checks. The symbol is
+	 * private, so it is looked up and its return value printed; a missing
+	 * symbol is a result too (this process may not have the sandbox at all).
+	 */
+	{
+		typedef int (*container_path_pid_t)(int, char *, size_t);
+		container_path_pid_t path_for_pid =
+		    (container_path_pid_t)dlsym(RTLD_DEFAULT,
+		    "sandbox_container_path_for_pid");
+		void *libc = dlsym(RTLD_DEFAULT, "container_copy_path");
+
+		mondrian_probe_fmt("MONDRIAN APPEX[%d]: syms cpath_pid %d libcontainer %d\n",
+		    getpid(), path_for_pid != NULL, libc != NULL);
+		if (path_for_pid != NULL) {
+			char buf[1024];
+
+			memset(buf, 0, sizeof(buf));
+			int r = path_for_pid(getpid(), buf, sizeof(buf));
+
+			mondrian_probe_fmt(
+			    "MONDRIAN APPEX[%d]: sandbox path -> err %d path %s\n",
+			    getpid(), r, buf[0] != '\0' ? buf : "(empty)");
+		}
+	}
+}
+
+/*
  * Which app containers exist, and whether one of them is Photos'. The container
  * manager now starts, so the question is whether it created the container the
  * appex cannot find -- and whether the one this hook seeded by hand is the only
@@ -12422,10 +12497,18 @@ mondrian_key_probe(void)
 static void
 mondrian_containers_report(void)
 {
+	static const char *const watch[] = {
+		"com.apple.mobileslideshow",
+		"com.apple.Preferences",
+		"com.apple.AppStore",
+		"com.apple.mobilesafari",
+	};
 	NSString *base = @"/private/var/mobile/Containers/Data/Application";
 	NSFileManager *fm = [NSFileManager defaultManager];
 	NSArray *list = [fm contentsOfDirectoryAtPath:base error:NULL];
+	NSMutableDictionary *found = [NSMutableDictionary dictionary];
 	NSUInteger i, n, photos = 0;
+	size_t w;
 
 	if (list == nil) {
 		say("MONDRIAN CONTAINERS: no listing\n");
@@ -12444,9 +12527,12 @@ mondrian_containers_report(void)
 			NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:meta];
 			NSString *ident = [d objectForKey:@"MCMMetadataIdentifier"];
 
-			if (ident != nil && [ident isKindOfClass:[NSString class]] &&
-			    ([ident rangeOfString:@"photo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
-			    [ident rangeOfString:@"slideshow" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
+			if (ident == nil || ![ident isKindOfClass:[NSString class]]) {
+				continue;
+			}
+			[found setObject:dir forKey:ident];
+			if ([ident rangeOfString:@"photo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+			    [ident rangeOfString:@"slideshow" options:NSCaseInsensitiveSearch].location != NSNotFound) {
 				mondrian_probe_fmt(
 				    "MONDRIAN CONTAINERS[%d]: %s -> %s\n", getpid(),
 				    [ident UTF8String], [dir UTF8String]);
@@ -12458,6 +12544,18 @@ mondrian_containers_report(void)
 	}
 	mondrian_probe_fmt("MONDRIAN CONTAINERS[%d]: photos-ish %lu of %lu\n",
 	    getpid(), (unsigned long)photos, (unsigned long)n);
+	/*
+	 * Whether the container manager creates one at all: these are apps that
+	 * have no container in the image, so a container here after an app has
+	 * been launched is the daemon's work.
+	 */
+	for (w = 0; w < sizeof(watch) / sizeof(watch[0]); w++) {
+		NSString *ident = [NSString stringWithUTF8String:watch[w]];
+		NSString *dir = [found objectForKey:ident];
+
+		mondrian_probe_fmt("MONDRIAN CONTAINERS[%d]: watch %s %s\n", getpid(),
+		    watch[w], dir != nil ? [dir UTF8String] : "none");
+	}
 }
 
 static void
@@ -12571,6 +12669,61 @@ mondrian_url_test(void *unused)
 	return NULL;
 }
 
+/*
+ * The port's sandbox stand-in (xnu 0043) answers ENOENT to the container-path
+ * operation, which is the one query PlugInKit makes before it launches a
+ * plug-in: the appex dies "plugin has invalid sandbox or container: error 2".
+ * The process already knows its own container -- it is HOME, under
+ * Containers/Data/PluginKitPlugin -- so the chain is tested here first:
+ * answer that one query with HOME and nothing else changes. Switch:
+ * /private/var/vm/mondrian-sbx, because interposing is process-wide as soon as
+ * this file is loaded and the switch must be able to turn it off. The kernel
+ * fix, if this proves the cause, belongs in 0043 and not here.
+ */
+extern int sandbox_container_path_for_pid(int pid, char *path, size_t size)
+    __attribute__((weak_import));
+
+static int
+mondrian_sbx_path(int pid, char *buf, size_t size)
+{
+	/*
+	 * No call to the original: `dlsym(RTLD_NEXT)` returns the interposed
+	 * definition, so asking for it recursed into this function until the
+	 * stack guard page (measured: `sig 11`, the same return address ten
+	 * times). The stand-in in xnu 0043 answers ENOENT to every container
+	 * query, so that is what this returns when it has nothing to add.
+	 */
+	if ((pid == getpid() || pid <= 0) && buf != NULL && size > 0 &&
+	    mondrian_file_on("/private/var/vm/mondrian-sbx")) {
+		const char *home = getenv("HOME");
+
+		if (home != NULL && home[0] != '\0') {
+			snprintf(buf, size, "%s", home);
+			mondrian_probe_fmt(
+			    "MONDRIAN SBX[%d]: container path %s\n",
+			    getpid(), home);
+			return 0;
+		}
+	}
+	return ENOENT;
+}
+
+/*
+ * dyld's interpose tuple: { replacement, replacee }. Kept weak so a process
+ * that does not link libsystem_sandbox leaves the tuple pointing at nothing
+ * instead of failing to load the hook.
+ */
+struct mondrian_interpose {
+	const void *replacement;
+	const void *replacee;
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_sbx_interpose = {
+	(const void *)mondrian_sbx_path,
+	(const void *)sandbox_container_path_for_pid,
+};
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -12606,6 +12759,10 @@ mondrian_install_ui_hooks(void)
 				}
 				if (mondrian_file_on("/private/var/vm/mondrian-keys")) {
 					mondrian_key_probe();
+				}
+				if (mondrian_file_on("/private/var/vm/mondrian-appex") &&
+				    strcmp(getprogname(), "PhotosFileProvider") == 0) {
+					mondrian_appex_report();
 				}
 			}
 		} else {

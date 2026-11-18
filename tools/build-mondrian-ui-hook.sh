@@ -12,8 +12,12 @@ out=${1:?usage: build-mondrian-ui-hook.sh OUTPUT.dylib}
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$(dirname "$out")"
 
-if command -v xcrun >/dev/null 2>&1; then
-	sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+# `command -v xcrun` is not enough: a stub on PATH made the script take this
+# branch, `--show-sdk-path` answered the literal "iphoneos", and the build died
+# on 'objc/objc.h' instead of falling through to the Linux toolchain.
+if command -v xcrun >/dev/null 2>&1 &&
+    sdk=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null) &&
+    [ -d "$sdk" ] && [ -n "$(ls -A "$sdk" 2>/dev/null)" ]; then
 	xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
 		-dynamiclib -Os -fno-common -fvisibility=hidden \
 		-install_name /usr/libexec/mondrian-ui-hook.dylib \
