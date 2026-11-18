@@ -250,7 +250,9 @@ boot each, so the three columns differ only in what changed:
   reading tea leaves.
   The fix skips a place outside the image and says so (`MONDRIAN WALL: pixel
   720,1600 outside 192x192`); measured after it, the instance that survived 45
-  lock-watch cycles left 0 records where the three before it left 6 to 18.
+  lock-watch cycles left 0 records where the three before it left 6 to 18, and a
+  fresh boot of the build that carries the fix in its kernel blob left 0 records
+  where every boot of the kernel before it left 6 to 18 in the first minute.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
