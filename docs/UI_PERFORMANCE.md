@@ -230,29 +230,41 @@ boot each, so the three columns differ only in what changed:
   and `disablesOccludedBackdropBlurs` to `NO` on every backdrop layer turns the
   grey into black with a white blob; hiding `SBHomeScreenBackdropView` (the only
   `*Backdrop*` in `SBHomeScreenView`) leaves the stripes.
-- **The App Library's icons are empty squares.** Measured 2026-11-18 with the
+- **The App Library's icons were empty squares.** Measured 2026-11-18 with the
   deep dump (`mondrian-deep`) while the library was on the glass: the cards are
-  `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, their
-  layers report no contents, and `SBHLibraryPodFolderView` 480x1067 wraps them.
-  The home screen's icons only exist because the hook paints the eight
-  `SBIconView`s the home screen carried when it was probed
-  (`mondrian_icon_force_artwork`); a card is a *folder* icon (a category's
-  preview grid), not an application icon, so that pass skips it by design.
-  What a card should show is a 2x2 grid of the category's own app icons, so the
-  fix is to compose it: ask the card's `icon` for `icons`, take four application
-  icons, load each app's AppIcon file and put four tiles in a view of ours over
-  the card. That pass is not in the tree yet. The dump is armed by writing a
-  number into `/private/var/vm/mondrian-deep` (a new number buys one dump, four a
-  process) and read out of the ring.
-  Two numbers that look like a dead UI and are not: `fps 0` and
-  `panel 0/60 sampled ticks changed` were measured while the phone was
-  responsive with the library on the glass.
-  The step itself is the fragile part: `mondrian_lock_step` is posted by its own
-  thread through `dispatch_async_f`, and a boot was measured where it ran once
-  (it printed `lock screen gone` and the twenty-second icon tree) and then never
-  again, with **no** `lock step stuck` line and no periodic `MONDRIAN WALL: dump`
-  to show for it -- so the library came up striped with the fix loaded and idle.
-  Count `MONDRIAN WALL: dump` lines before blaming the paint.
+  `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, each card
+  holds an `MTMaterialView` 170x170, and a card's model is
+  `SBHLibraryPodCategoryIcon`, whose only accessor is `-category`. What a card
+  shows is therefore its category's own app icons -- `SBHLibraryCategory -icons`
+  returned one to four `SBApplicationIcon`s here -- so
+  `tools/mondrian-ui-hook.m` composes them into one bitmap
+  (`mondrian_card_picture`) and hangs it on the card as a sublayer.
+  The artwork box is the `MTMaterialView`'s frame, not the card's bounds: the
+  "Suggestions" card is wider, and using the card's bounds draws the tiles
+  outside the grey square. The tiles need the continuous-corner clip
+  (`CGPathCreateWithRoundedRect`, 0.2237 of the tile) or they come out as
+  squares.
+  A layer, not a subview. An earlier version added a `UIImageView` to the card
+  and the boots that followed crash-looped SpringBoard (`CRASH SpringBoard`, the
+  counter rising about four a minute, the panel ending black under a `KABORT`);
+  the layer version runs with a stable PID. That is correlation, not proof, and
+  it is why the safe shape is the one the library's background already uses.
+  The dump is armed by writing a number into `/private/var/vm/mondrian-deep` (a
+  new number buys one dump, four a process) and read out of the ring.
+  `fps 0` and `panel 0/60 sampled ticks changed` do not mean the UI is dead: both
+  were measured while the phone was responsive with the library on the glass.
+- **Which hook is running, and whether it arrived whole.** The hook prints
+  `MONDRIAN UI: hook tag cc56 uid <uid> prog <name> built <date> <time>` at load
+  (`__DATE__`/`__TIME__`), and the ring holds several SpringBoard instances at
+  once, so cut the log at the last tag before reading a probe: a line from the
+  previous instance reads exactly like a probe that never ran.
+  `tools/usb-ring.py wfile` now retries and only succeeds on `N of N bytes`; a
+  partial delivery leaves a truncated dylib whose first functions still run,
+  which is enough to make every later reading wrong.
+  The step's liveness has its own line too: `MONDRIAN UI: lock watch <n> cycles,
+  <m> steps, k with an app` says whether the watcher is posting and whether the
+  posted step got past `UIApplication sharedApplication`. Without it, a dead
+  watcher and a blocked main queue look identical.
 - **The framebuffer fetch extension has to stay offered.** Measured 2026-11-17
   by taking `GL_EXT_shader_framebuffer_fetch` away (write `0` to
   `/private/var/vm/mondrian-gl-fetch`, restart the window server -- an A/B with

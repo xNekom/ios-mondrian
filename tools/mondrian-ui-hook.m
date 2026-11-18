@@ -2805,6 +2805,8 @@ mondrian_install_agent_hooks(void)
  * sharedApplication] because it asserts before that object exists.
  */
 static volatile int mondrian_lock_step_pending;
+static volatile unsigned mondrian_step_calls;
+static volatile unsigned mondrian_step_works;
 static int mondrian_agent_hooks;
 static int mondrian_lock_last = -1;
 /*
@@ -3529,6 +3531,297 @@ mondrian_icon_own_report(void)
 		say(line);
 	}
 }
+
+/*
+ * The App Library's category cards.
+ *
+ * Measured 2026-11-18 with the deep dump, library on the glass: the cards are
+ * `_SBHLibraryPodIconView` 170x184 inside `_SBHLibraryPodIconListView`, their
+ * layers report no contents, and what a card holds is its material
+ * (`MTMaterialView` 170x170) -- the preview grid a folder icon renders is what
+ * this port never produces.
+ *
+ * The preview is the category's own application icons, so this composes it: ask
+ * the card's icon for `icons`, draw four of the app's AppIcon files into one
+ * bitmap and hang that as a sublayer of the card. A layer, not a subview: the
+ * proven operation is the one the library's background uses
+ * (`mondrian_library_paint`), and a subview added to an icon view is a message
+ * to SpringBoard's own layout, which this port does not need to send.
+ *
+ * The bounds gate is deliberate: a class-name match alone can be a full-screen
+ * container, and painting one puts a giant rounded layer over the UI.
+ */
+#define MONDRIAN_LIBRARY_CARDS 6
+
+static id
+mondrian_icon_file_image(NSString *path)
+{
+	unsigned f;
+	Class ui_image = objc_getClass("UIImage");
+
+	if (path == nil || ui_image == Nil) {
+		return nil;
+	}
+	for (f = 0; f < sizeof(mondrian_icon_files) /
+	    sizeof(mondrian_icon_files[0]); f++) {
+		char file[512];
+		id image;
+
+		snprintf(file, sizeof(file), "%s/%s", [path UTF8String],
+		    mondrian_icon_files[f]);
+		if (access(file, R_OK) != 0) {
+			continue;
+		}
+		image = ((id (*)(id, SEL, id))objc_msgSend)((id)ui_image,
+		    sel_registerName("imageWithContentsOfFile:"),
+		    [NSString stringWithUTF8String:file]);
+		if (image != NULL) {
+			return image;
+		}
+	}
+	return nil;
+}
+
+/* What a category icon might answer with its children; the first that returns a
+ * non-empty array wins and is named in the log, so one boot identifies it. */
+static const char *const mondrian_card_lists[] = {
+	"icons", "allIcons", "applicationIcons", "categoryIcons", "leafIcons",
+	"sortedIcons", "iconsOfCategory", "children", "folderIcons",
+};
+
+/* The artwork box is the card's material, not the card: measured, a card holds
+ * an `MTMaterialView` (170x170 on a 170x184 `_SBHLibraryPodIconView`) and the
+ * "Suggestions" card is wider, so the card's own bounds draw the tiles outside
+ * the grey square. */
+static CGRect
+mondrian_card_box(id view, CGRect bounds)
+{
+	id subs = mondrian_send(view, "subviews");
+	unsigned n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0, i;
+
+	for (i = 0; i < n; i++) {
+		id sub = [(NSArray *)subs objectAtIndex:i];
+		const char *name = sub != NULL ? object_getClassName(sub) : NULL;
+
+		if (name != NULL && strstr(name, "Material") != NULL) {
+			return ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+			    sel_registerName("frame"));
+		}
+	}
+	return bounds;
+}
+
+/* The 2x2 preview of a category, drawn on a transparent bitmap. */
+static CGImageRef
+mondrian_card_picture(id icon, double side, const char **used, unsigned *total,
+    unsigned *drawn_out)
+{
+	id icons = NULL;
+	Class ui_image = objc_getClass("UIImage");
+	size_t pixels, row;
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+	CGImageRef picture = NULL;
+	uint8_t *bytes;
+	unsigned count = 0, drawn = 0, i, k;
+	double pad, gap, cell;
+
+	*used = "none";
+	*total = 0;
+	*drawn_out = 0;
+	if (icon == NULL || ui_image == Nil || side < 1.0) {
+		return NULL;
+	}
+	for (k = 0; k < sizeof(mondrian_card_lists) / sizeof(mondrian_card_lists[0]);
+	    k++) {
+		SEL sel = sel_registerName(mondrian_card_lists[k]);
+		id candidate;
+
+		if (![icon respondsToSelector:sel]) {
+			continue;
+		}
+		candidate = mondrian_send(icon, mondrian_card_lists[k]);
+		if (candidate != NULL && [candidate isKindOfClass:[NSArray class]] &&
+		    [(NSArray *)candidate count] > 0) {
+			icons = candidate;
+			*used = mondrian_card_lists[k];
+			break;
+		}
+	}
+	if (icons == NULL) {
+		return NULL;
+	}
+	count = (unsigned)[(NSArray *)icons count];
+	*total = count;
+	pixels = (size_t)side;
+	row = pixels * 4;
+	bytes = calloc(1, row * pixels);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	ctx = bytes != NULL ? CGBitmapContextCreate(bytes, pixels, pixels, 8, row,
+	    rgb, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+	if (ctx == NULL) {
+		free(bytes);
+		if (rgb != NULL) {
+			CGColorSpaceRelease(rgb);
+		}
+		return NULL;
+	}
+	pad = side * 0.10;
+	gap = side * 0.06;
+	cell = (side - 2.0 * pad - gap) / 2.0;
+	for (i = 0; i < count && drawn < 4; i++) {
+		id child = [(NSArray *)icons objectAtIndex:i];
+		const char *child_class = child != NULL ?
+		    object_getClassName(child) : NULL;
+		NSString *path;
+		id image;
+		CGImageRef art;
+
+		if (child_class == NULL ||
+		    strstr(child_class, "ApplicationIcon") == NULL) {
+			continue;
+		}
+		path = mondrian_icon_bundle_path(child);
+		image = path != nil ? mondrian_icon_file_image(path) : nil;
+		if (image == nil) {
+			continue;
+		}
+		art = ((CGImageRef (*)(id, SEL))objc_msgSend)(image,
+		    sel_registerName("CGImage"));
+		if (art == NULL) {
+			continue;
+		}
+		{
+			/* The iOS silhouette, so the tiles are icons and not squares. */
+			CGRect rect = CGRectMake(pad + (drawn % 2) * (cell + gap),
+			    side - pad - cell - (drawn / 2) * (cell + gap), cell, cell);
+			CGPathRef path = CGPathCreateWithRoundedRect(rect,
+			    cell * 0.2237, cell * 0.2237, NULL);
+
+			if (path != NULL) {
+				CGContextSaveGState(ctx);
+				CGContextAddPath(ctx, path);
+				CGContextClip(ctx);
+				CGContextDrawImage(ctx, rect, art);
+				CGContextRestoreGState(ctx);
+				CGPathRelease(path);
+			} else {
+				CGContextDrawImage(ctx, rect, art);
+			}
+		}
+		drawn++;
+	}
+	if (drawn > 0) {
+		picture = CGBitmapContextCreateImage(ctx);
+	}
+	*drawn_out = drawn;
+	CGContextRelease(ctx);
+	CGColorSpaceRelease(rgb);
+	free(bytes);
+	return picture;
+}
+
+static unsigned
+mondrian_library_cards(id view, unsigned depth, unsigned *painted)
+{
+	const char *name = view != NULL ? object_getClassName(view) : NULL;
+	id subs;
+	unsigned n, i, hits = 0;
+
+	if (view == NULL || depth > 18 || *painted >= MONDRIAN_LIBRARY_CARDS) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, "LibraryPodIconView") != NULL) {
+		CGRect bounds = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("bounds"));
+		CGRect box = mondrian_card_box(view, bounds);
+		id icon, layer;
+		CGImageRef art;
+		double side = box.size.width;
+		char line[224];
+
+		if (side < 80.0 || side > 300.0) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN LIBRARY: card %s %.0fx%.0f skipped, not a card\n",
+			    name, side, bounds.size.height);
+			say(line);
+			return 0;
+		}
+		layer = mondrian_send(view, "layer");
+		if (layer == NULL ||
+		    [(CALayer *)layer valueForKey:@"mondrianCardArt"] != nil) {
+			return 0;
+		}
+		icon = mondrian_send(view, "icon");
+		{
+			static int dumped;
+			const char *icon_class = icon != NULL ?
+			    object_getClassName(icon) : NULL;
+
+			/* Once: which children accessor this userland's category exposes.
+			 * The log names the class and every instance method. */
+			if (!dumped) {
+				dumped = 1;
+				if (icon_class != NULL &&
+				    strstr(icon_class, "CategoryIcon") != NULL) {
+					mondrian_dump_all_methods(icon_class);
+				}
+				mondrian_dump_all_methods("SBHLibraryCategory");
+			}
+		}
+		{
+			/* The category icon carries the model, not the children:
+			 * measured 2026-11-18, its only accessor is `category`. */
+			id model = icon;
+			const char *used = "none";
+			unsigned total = 0, drew = 0;
+
+			if (icon != NULL &&
+			    [icon respondsToSelector:sel_registerName("category")]) {
+				id category = mondrian_send(icon, "category");
+
+				if (category != NULL) {
+					model = category;
+				}
+			}
+			art = mondrian_card_picture(model, side, &used, &total, &drew);
+			snprintf(line, sizeof(line),
+			    "MONDRIAN LIBRARY: card %s icon %s model %s via %s:"
+			    " %u icons, %u drawn%s\n", name,
+			    icon != NULL ? object_getClassName(icon) : "none",
+			    model != NULL ? object_getClassName(model) : "none", used,
+			    total, drew, art == NULL ? ", no artwork" : "");
+			say(line);
+			if (art == NULL) {
+				return 0;
+			}
+		}
+		{
+			CALayer *art_layer = [CALayer layer];
+
+			[art_layer setContents:(id)art];
+			[art_layer setFrame:box];
+			[art_layer setContentsGravity:(NSString *)@"resize"];
+			[(CALayer *)layer setValue:art_layer forKey:@"mondrianCardArt"];
+			[(CALayer *)layer addSublayer:art_layer];
+		}
+		CGImageRelease(art);
+		snprintf(line, sizeof(line),
+		    "MONDRIAN LIBRARY: card %s icon %s, the preview is on it\n", name,
+		    icon != NULL ? object_getClassName(icon) : "none");
+		say(line);
+		(*painted)++;
+		return 1;
+	}
+	subs = mondrian_send(view, "subviews");
+	n = subs != NULL ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_library_cards([(NSArray *)subs objectAtIndex:i],
+		    depth + 1, painted);
+	}
+	return hits;
+}
+
 
 /*
  * The wallpaper is the home screen's frame budget, not the icon drawing: HakiOS
@@ -6772,6 +7065,11 @@ mondrian_library_step(void)
 			painted += mondrian_library_paint(window, 0, "SBRootFolderView",
 			    mondrian_wallpaper_image());
 		}
+		{
+			unsigned cards = 0;
+
+			(void)mondrian_library_cards(window, 0, &cards);
+		}
 	}
 }
 
@@ -6877,6 +7175,7 @@ mondrian_lock_step(void *context)
 
 	(void)context;
 	mondrian_lock_step_pending = 0;
+	mondrian_step_calls++;
 	if (cls == Nil) {
 		return;
 	}
@@ -6902,8 +7201,14 @@ mondrian_lock_step(void *context)
 	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls, app_sel);
 	if (app == nil) {
 		/* still starting: the next tick retries */
+		static unsigned waits;
+
+		if ((waits++ % 15) == 0) {
+			say("MONDRIAN UI: step waiting for UIApplication\n");
+		}
 		return;
 	}
+	mondrian_step_works++;
 	if (boot_arg_set("mondrianwin=1")) {
 		static unsigned win_ticks;
 
@@ -7203,9 +7508,20 @@ mondrian_unlock_run(void *unused)
 	 */
 	mondrian_dock_mask = boot_arg_set("mondriandockmask=0") == 0;
 	{
-		unsigned stuck = 0;
+		static unsigned stuck;
+		unsigned cycles = 0;
 
 		for (;;) {
+			/* What the watcher itself did: without it a silent death reads as
+			 * "the step never ran", and every fix looks broken. */
+			if ((++cycles % 15) == 0) {
+				char watch[160];
+
+				snprintf(watch, sizeof(watch),
+				    "MONDRIAN UI: lock watch %u cycles, %u steps, %u with an app\n",
+				    cycles, mondrian_step_calls, mondrian_step_works);
+				say(watch);
+			}
 			if (!mondrian_lock_step_pending) {
 				stuck = 0;
 				mondrian_lock_step_pending = 1;
@@ -11092,8 +11408,8 @@ mondrian_install_ui_hooks(void)
 		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc56 uid %d prog %s\n",
-		    (int)geteuid(), getprogname());
+		    "MONDRIAN UI: hook tag cc56 uid %d prog %s built %s %s\n",
+		    (int)geteuid(), getprogname(), __DATE__, __TIME__);
 		say(tag);
 		if (strcmp(getprogname(), "xpcproxy") == 0) {
 			int argc = *_NSGetArgc();
@@ -11146,11 +11462,11 @@ mondrian_install_ui_hooks(void)
 	install_personas_hook();
 	/* The build tag: a boot that logs it proves which hook it is running. */
 	{
-		char tag[128];
+		char tag[160];
 
 		snprintf(tag, sizeof(tag),
-		    "MONDRIAN UI: hook tag cc56 uid %d prog %s\n",
-		    (int)geteuid(), getprogname());
+		    "MONDRIAN UI: hook tag cc56 uid %d prog %s built %s %s\n",
+		    (int)geteuid(), getprogname(), __DATE__, __TIME__);
 		say(tag);
 	}
 	/*
