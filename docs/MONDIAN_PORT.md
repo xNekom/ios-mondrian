@@ -251,6 +251,18 @@ GPT `userdata` partition but keeps it out of the descriptor: the core takes
 `DEPCFG` on 0x02/0x03/0x83 with status 0 and never completes a packet, even
 with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 
+### 7. The apps
+
+Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
+draw real content (a full settings list, an onboarding page with artwork, the
+Safari start page), so LaunchServices, the icon model and the compositor are
+whole. What stays empty is a missing service, not a drawing bug: Phone draws no
+telephony UI, the App Store stops at `LOADING` without the network, and Photos
+is blank because `fileproviderd` and `PhotosFileProvider` abort while `assetsd`
+never runs -- the same service-launch limit that leaves the home screen's Photos
+folder at `No content available`. The measurements and how to aim a tap are in
+`docs/UI_PERFORMANCE.md`.
+
 ## Getting the numbers off the device
 
 Boot the mutable shim (`BOARD=mondrian shim/build.sh`, `fastboot boot

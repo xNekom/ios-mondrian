@@ -892,21 +892,29 @@ them has Metal. That is the path this port follows.
   submissions unanswered, so under 400 dwords of ring in flight whatever the
   ring's size, and the cursor is published inside the buffer
   (kgsl `_wptr % KGSL_RB_DWORDS`, HakiOS `ring_at`).
-- **The icons exist; their artwork does not arrive.** Measured (ring210, with
+- **The icons exist; a folder's composite does not.** Measured (ring210, with
   `-[SBIconView setIcon:]` hooked): SpringBoard builds the home screen --
   `iconModel -> 1 leaf 13`, `rootFolder -> 1 leaf 9`, 79 `setIcon:` calls, the
   first with an `SBApplicationIcon` -- so what is missing is not the model and
   not the view tree, which the red probe layer proves backboardd composites.
-  A folder's icon is composed from the same artwork and shows the placeholder
-  `No content available` on the home screen for that reason, not because the
-  folder is empty: its member icons draw.
-  The artwork never arrives: `assetsd` aborts on exec (`CRASH assetsd sig 6`,
+  App icons do reach the glass now (measured 2026-11-18: Photos, App Store,
+  Settings, Phone, Safari and Messages all draw their artwork), out of the
+  shared icon cache dated 2026-10-28. A folder's icon is a composite of its
+  members and is not in that cache, so it shows the placeholder `No content
+  available` -- not because the folder is empty, since its member icons draw.
+  The Photos app opens and stays blank under the same limit -- its
+  `fileproviderd` and `PhotosFileProvider` abort instead of serving the library
+  -- and `docs/UI_PERFORMANCE.md` has that measurement.
+  What is still missing is the service side a live composite needs: `assetsd`
+  aborts on exec (`CRASH assetsd sig 6`,
   twice, right after `exec assetsd`) and `iconservicesagent` exits `0x9`, the
   same status a dozen services return on this root (keybagd, usermanagerd,
   mobileactivationd). Ask `-[SBIconView iconImageView]`'s `image` and paint the
   view's own layer (`mondrianiconpaint=1`) to tell "no image" from "not in the
   composited tree" -- a red square where the icon belongs means the view is
-  there and only the image is missing.
+  there and only the image is missing. Note that `image 0 contents 0` in the
+  probe is not evidence either: the icons that print it draw anyway, because
+  the bitmap reaches the layer by a path those two accessors do not see.
 
   Two traps when probing this, both paid for: `-setIcon:` is the moment the
   view has the model and **not** the artwork (the image is set afterwards from

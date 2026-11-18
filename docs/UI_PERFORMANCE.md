@@ -266,6 +266,19 @@ boot each, so the three columns differ only in what changed:
   the image by the record's own base, never by name: `dsc-image.py` takes the
   first cache image whose name matches, and SpringBoard.app, SpringBoard.framework
   and SpringBoardHome all do.
+- **Which addresses a record carries, and which of them name anything.**
+  `mondrian_crash_log()` prints run-time addresses plus `slide 0x…` and `mh 0x…`
+  (its own comment: `unslid = pc - slide`), so a cache address is named by
+  subtracting the slide and looking the result up; `pc - mh` is only useful for
+  the main executable's own code. For a `SIGABRT` the `pc` names the abort, not
+  the bug: read it as bytes and it is the return address after
+  `mov x16, #328; svc #0x80; b.lo`, and 328 in `bsd/kern/syscalls.master` is
+  `__pthread_kill` -- the thread sent itself `SIGABRT`, so the instruction after
+  the syscall is where the signal was raised. Two processes aborting in the same
+  library with the same `far` (`PhotosFileProvider` and `fileproviderd`, both
+  `sig 6 code 0x0`) are running one shared assert, not corrupting one variable;
+  the registers say which call, the ring's `exec`/`exit` lines say what the code
+  was trying to start.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
@@ -336,19 +349,39 @@ boot each, so the three columns differ only in what changed:
   for the run-loop number and the framebuffer meter for frames.
   The dump is armed by writing a number into `/private/var/vm/mondrian-deep` (a
   new number buys one dump, four a process) and read out of the ring.
-- **Which apps open, and how to aim at one.** Measured 2026-11-18 on the
-  `04:27:29` kernel: Settings launches from its icon and draws its whole list --
-  title, Sign in, Airplane Mode, Wi-Fi (Off), Notifications, Sounds, Focus,
-  Screen Time, General, Control Center, Display & Brightness, Home Screen,
-  Accessibility, Wallpaper, Siri & Search, Passcode, Emergency SOS, Exposure
-  Notifications, Battery -- so LaunchServices, the icon model and the compositor
-  agree. The App Store opens and stays at `LOADING` because it needs the network,
-  which this port does not have; that is a limit, not a drawing failure.
+- **Which apps open, and what they draw.** Measured 2026-11-18 on the
+  `04:27:29` kernel, each app launched from its icon and left eight seconds:
+  **Settings** draws its whole list -- title, Sign in, Airplane Mode, Wi-Fi
+  (Off), Notifications, Sounds, Focus, Screen Time, General, Control Center,
+  Display & Brightness, Home Screen, Accessibility, Wallpaper, Siri & Search,
+  Passcode, Emergency SOS, Exposure Notifications, Battery; **Messages** draws
+  the "Shared with You" welcome with its illustration and blue OK button;
+  **Safari** draws its start page -- Favorites (Apple, Bing, Google, Yahoo),
+  search field, toolbar. All three spawn (`exec MobileSMS`, `exec MobileSafari`)
+  and composite real content, so LaunchServices, the icon model, the graphics
+  stack and the fonts are all working. What comes up blank comes up blank for a
+  reason of its own: **Phone** draws only the status bar and home indicator (no
+  telephony stack), **Photos** does the same (its library services abort, below),
+  and the **App Store** stops at `LOADING` because it needs the network. So a
+  black screen after a tap is not one failure: read the ring's `exec` line to
+  tell "never launched" from "launched and had nothing to draw".
   `tap`/`swipe` take panel pixels (1440x3200) and `screen` returns half of that,
   so aim with the runtime's frames, not with the picture: the hook prints
-  `MONDRIAN UI: icon Settings live … frame 35,227 64x78` in points, and three
-  times that is the panel box whose centre is `201,798`. One gesture at a time --
+  `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points, and three
+  times that is the panel box whose centre is `201,798`; the grid is 3 columns, so
+  the Photos icon above it is `201,420` and the dock row sits at `y 2990`
+  (`420`, `720`, `1020` for Phone, Safari, Messages). One gesture at a time --
   the gadget's command thread is busy until the swipe finishes.
+- **Photos has no library, so the app and its folder both stay empty.** Measured
+  2026-11-18: tapping the Photos icon opens the app (status bar and home
+  indicator are its own) and it draws nothing for at least 18 s, with no
+  `CRASH Photos` and no `exec assetsd` anywhere in the ring; instead
+  `PhotosFileProvider` aborts `sig 6` and `fileproviderd` aborts at the same
+  place, both `mov x16, #328; svc #0x80` (`__pthread_kill`, i.e. a self-`abort`),
+  twice each. That is the same family as the icon artwork: the home screen's
+  Photos folder shows the placeholder `No content available` for the composite
+  it cannot get, and the app has no library service to ask. Both are the port's
+  service-launch limit, not a drawing bug in either view.
 - **Which hook is running, and whether it arrived whole.** The hook prints
   `MONDRIAN UI: hook tag cc56 uid <uid> prog <name> built <date> <time>` at load
   (`__DATE__`/`__TIME__`), and the ring holds several SpringBoard instances at
