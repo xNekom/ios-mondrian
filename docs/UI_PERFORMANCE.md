@@ -246,13 +246,13 @@ boot each, so the three columns differ only in what changed:
   the one card that drew itself, `cornerRadius` 0.16 of the side, `masksToBounds`.
   Verified on the glass: four cards each with their material and their icons,
   SpringBoard's pid unchanged for 30 s with the library displayed.
-  The pass is opt-in (`/private/var/vm/mondrian-cardspaint`) for now, because the
-  builds that carry this code also leave 6 to 12 `CRASH SpringBoard` entries per
-  boot at one fixed pc (`...a14`, lr `...9e4`), while a boot of the same kernel
-  with the hook from before this code left none. The pass only runs with the
-  library on the glass, so it cannot be the boot-time crasher -- the association
-  is measured and unexplained, which is the reason to keep it switchable rather
-  than on.
+  The pass is switched by `/private/var/vm/mondrian-cardspaint` (on unless the
+  file holds `0`), because the builds that carry this code also leave 6 to 12
+  `CRASH SpringBoard` entries per boot at one fixed pc (`...a14`, lr `...9e4`),
+  while a boot of the same kernel with the hook from before this code left none.
+  The pass only runs with the library on the glass, so it cannot be that
+  boot-time crasher -- the association is measured and unexplained, and turning
+  the pass off changes nothing about the boot.
   **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
   a filled rounded rect under the tiles) is the one whose boots crash-looped
   SpringBoard the moment the library opened -- pid changing every few seconds,
