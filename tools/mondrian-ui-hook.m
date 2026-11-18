@@ -73,6 +73,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 #include <spawn.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/attr.h>
 #include <dirent.h>
 #include <sys/wait.h>
 #include <sys/sysctl.h>
@@ -764,6 +765,19 @@ mondrian_inode_seen(uint64_t dev, uint64_t ino)
 	return 0;
 }
 
+/*
+ * A walk under a sandbox cannot enter every tree, and a skipped tree reads as
+ * empty space. Keep the first failures with their errno: without them a 3.7 GB
+ * gap between `statfs` and the file total is not evidence of anything.
+ */
+static struct {
+	char path[160];
+	int err;
+} mondrian_du_denied[12];
+static unsigned mondrian_du_denied_count;
+static unsigned mondrian_du_denied_seen;
+static unsigned mondrian_du_files;
+
 static unsigned long long
 mondrian_du_all(const char *path)
 {
@@ -773,6 +787,14 @@ mondrian_du_all(const char *path)
 
 	dir = opendir(path);
 	if (dir == NULL) {
+		if (mondrian_du_denied_seen <
+		    sizeof(mondrian_du_denied) / sizeof(mondrian_du_denied[0])) {
+			snprintf(mondrian_du_denied[mondrian_du_denied_count].path,
+			    sizeof(mondrian_du_denied[0].path), "%s", path);
+			mondrian_du_denied[mondrian_du_denied_seen].err = errno;
+			mondrian_du_denied_seen++;
+		}
+		mondrian_du_denied_count++;
 		return 0;
 	}
 	while ((ent = readdir(dir)) != NULL) {
@@ -797,6 +819,7 @@ mondrian_du_all(const char *path)
 			    st.st_ino)) {
 				continue;
 			}
+			mondrian_du_files++;
 			total += (unsigned long long)st.st_size;
 		}
 	}
@@ -823,6 +846,8 @@ mondrian_du_report(void *unused)
 		{ "/private/var/mobile", 3 },
 		{ "/private/var/mobile/Library", 2 },
 		{ "/private/var/mobile/Documents", 2 },
+		{ "/private/var/MobileSoftwareUpdate", 3 },
+		{ "/private/var/containers", 3 },
 		{ "/private/var/staged_system_apps", 2 },
 		{ "/private/var/db", 3 },
 		{ "/private/var/log", 4 },
@@ -838,13 +863,22 @@ mondrian_du_report(void *unused)
 	if (statfs("/private/var", &space) == 0) {
 		unsigned long long size = (unsigned long long)space.f_bsize;
 
+		/*
+		 * `f_bavail` is what the driver hands a writer: `freeBlocks` minus
+		 * the reserve and minus the journal and Spotlight loans. `f_bfree`
+		 * is the same counter without those subtractions, so the pair names
+		 * the layer: a healthy `f_bfree` and an empty `f_bavail` is not a
+		 * full volume, it is a reservation.
+		 */
 		mondrian_probe_fmt(
-		    "MONDRIAN DU[%d]: free %llu MB of %llu MB, %llu MB used\n",
-		    getpid(),
+		    "MONDRIAN DU[%d]: blocks %llu, free %llu (%llu MB), "
+		    "avail %llu (%llu MB), bsize %u\n", getpid(),
+		    (unsigned long long)space.f_blocks,
+		    (unsigned long long)space.f_bfree,
+		    (unsigned long long)space.f_bfree * size / (1024 * 1024),
+		    (unsigned long long)space.f_bavail,
 		    (unsigned long long)space.f_bavail * size / (1024 * 1024),
-		    (unsigned long long)space.f_blocks * size / (1024 * 1024),
-		    (unsigned long long)(space.f_blocks - space.f_bavail) * size /
-		    (1024 * 1024));
+		    (unsigned)space.f_bsize);
 	}
 	for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
 		unsigned long long bytes = mondrian_du(trees[i].path,
@@ -853,12 +887,68 @@ mondrian_du_report(void *unused)
 		mondrian_probe_fmt("MONDRIAN DU[%d]: %-40s %llu MB\n", getpid(),
 		    trees[i].path, bytes / (1024 * 1024));
 	}
+	/*
+	 * `/lost+found` is where a repair puts what it cannot attach to a name, it
+	 * is 0700 root, and it is the one tree the walk cannot enter. Its entry
+	 * count says whether the missing gigabytes are there, and `getattrlist`
+	 * answers that from the catalog without read permission on the directory.
+	 */
 	{
-		unsigned long long files = mondrian_du_all("/");
+		struct stat st;
+		struct attrlist attributes;
+		struct {
+			uint32_t length;
+			uint32_t entrycount;
+			uint32_t linkcount;
+		} __attribute__((aligned(4))) answer;
+		int err = 0;
+		int found = 0;
 
+		memset(&answer, 0, sizeof(answer));
+		if (lstat("/lost+found", &st) == 0) {
+			memset(&attributes, 0, sizeof(attributes));
+			attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+			attributes.dirattr = ATTR_DIR_ENTRYCOUNT |
+			    ATTR_DIR_LINKCOUNT;
+			/*
+			 * The returned set starts with its own length, then the
+			 * attributes in bitmap order, each aligned.
+			 */
+			if (getattrlist("/lost+found", &attributes, &answer,
+			    sizeof(answer), FSOPT_NOFOLLOW) == 0) {
+				found = 1;
+			} else {
+				err = errno;
+			}
+			mondrian_probe_fmt(
+			    "MONDRIAN DU[%d]: lost+found size %lld blocks %lld "
+			    "entries %u found %d errno %d\n", getpid(),
+			    (long long)st.st_size, (long long)st.st_blocks,
+			    found ? answer.entrycount : 0, found, err);
+		} else {
+			mondrian_probe_fmt(
+			    "MONDRIAN DU[%d]: lost+found stat errno %d\n",
+			    getpid(), errno);
+		}
+	}
+	{
+		unsigned long long files;
+		unsigned k;
+
+		mondrian_du_denied_count = 0;
+		mondrian_du_denied_seen = 0;
+		mondrian_du_files = 0;
+		files = mondrian_du_all("/");
 		mondrian_probe_fmt(
-		    "MONDRIAN DU[%d]: every file %llu MB, links %u\n", getpid(),
-		    files / (1024 * 1024), mondrian_inodes_used);
+		    "MONDRIAN DU[%d]: every file %llu MB, %u files, links %u, "
+		    "skipped %u\n", getpid(), files / (1024 * 1024),
+		    mondrian_du_files, mondrian_inodes_used,
+		    mondrian_du_denied_count);
+		for (k = 0; k < mondrian_du_denied_seen; k++) {
+			mondrian_probe_fmt("MONDRIAN DU[%d]: skipped %s errno %d\n",
+			    getpid(), mondrian_du_denied[k].path,
+			    mondrian_du_denied[k].err);
+		}
 	}
 	return NULL;
 }

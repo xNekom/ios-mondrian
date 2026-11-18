@@ -691,18 +691,28 @@ boot each, so the three columns differ only in what changed:
   tables in the handler, since the stack is already gone by the time a report is
   read. `SA_RESETHAND` restores the default action, so returning still dies the
   way the process would have.
-- **The volume is full of blocks no file owns.** Measured 2026-11-18 from the
-  app's own walk of the whole volume: every regular file on it adds up to
-  **12636 MB** while `statfs` reports **16350 MB used and 33 MB free** of
-  16384 MB, with no hard link seen. The same root's image carried 2.4 GB free
-  (`tools/hfs-audit.py`: 596409 free blocks, and every fork's size fitted the
-  blocks it owned), so about 3.7 GB are marked allocated in the bitmap with no
-  extent behind them -- the shape `BlockMarkFreeInternal` in the boot log
-  describes. A walk under the app's sandbox cannot see protected trees, so treat
-  3.7 GB as a floor; the repair is `fsck` on the host against the partition
-  image, since the volume cannot be repaired while the port mounts it. Until
-  then the system writes into 33 MB, which is both why Photos answers
-  `NotEnoughSpace` and why the next failure can be corruption.
+- **The volume's used blocks and its files disagree, and it predates this
+  session.** Measured 2026-11-18 from inside the app: `statfs` reports 4194304
+  blocks, **46700 free (182 MB)** and **4757 available (18 MB)** of 16384 MB,
+  while a walk of the whole volume sees **12644 MB in 159230 files** and cannot
+  enter 43 root-owned trees. `/lost+found` is exonerated: `getattrlist` says one
+  entry and `st_blocks` 0, so a repair left nothing there. The same root's
+  backup image already shows the gap: `tools/hfs-audit.py` finds 2.4 GB free with
+  the header agreeing with the bitmap, while a 7-Zip listing of that image
+  carries only about 7.2 GB of file data. So the missing gigabytes are not
+  something this port wrote, and no userland count settles them: the answer is
+  `tools/hfs-audit.py` against the live partition (which needs a dump) or
+  `fsck`, not a walk. `f_bfree` versus `f_bavail` also proves the shortage is
+  not a reservation: the reserve and the loans withhold only about 165 MB.
+- **The free path abandons a range at the first already-free block.**
+  `BlockMarkFreeInternal` clears the words it has read and, on a word that is
+  not entirely allocated, jumps to `Corruption`, which logs `trying to free
+  unallocated blocks`, returns `hfsNotAllocatedErr` (the port's own -4210) and
+  leaves the rest of the range allocated. `BlockDeallocate` then skips the
+  `freeBlocks` update on that error, so the counter ends below the bitmap. Read
+  it as a correctness defect on the free path: the ranges on record are 1 and 69
+  blocks, so 124 of them per boot cannot explain gigabytes, and a fix must free
+  what is set, skip what is free and add only the freed count to the counter.
 - **Photos has no library: TCC, then the library mode, then the volume.** Measured
   2026-11-18 with the app open and drawing its Library tab, in the order the
   chain was peeled: `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]`
