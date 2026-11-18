@@ -644,6 +644,11 @@ boot each, so the three columns differ only in what changed:
   And a `dlsym` for `TCCAccessPreflight` returns the interposer: a probe that
   reads the symbol reads its own shim (`mondrian-tccok`) and calls it the OS
   answer. Use `mondrian_tcc_preflight_interpose.replacee`.
+  That shim is switch-gated and no build creates the file: a root needs one byte
+  written to `/private/var/vm/mondrian-tccok` (`usb-ring.py wfile`), and `0`
+  turns the stand-in off again for an A/B. Without it the app aborts `sig 6`
+  again, so it is the first thing to check on a volume that has just been
+  restored.
 - **A synthetic tap is a hold, and the home screen ignores it.** Measured
   2026-11-18: `tap x y` sends down, down, up inside one frame and iOS drops it;
   `swipe x y x y 140` is the same point held 140 ms and works -- it opened
