@@ -410,6 +410,24 @@ boot each, so the three columns differ only in what changed:
   with the daemon running and `KeepAlive` keeping it up, so that message is not
   waiting on the daemon either. Install the job with `wfile` and reboot; launchd
   reads that directory only at boot.
+- **With the container manager running, `assetsd` starts -- and its uncaught
+  exception is what blocks Photos.** Measured 2026-11-18 on the same root: before
+  the job above was installed no `exec assetsd` appears in a boot at all; after it,
+  `assetsd` execs and dies within seconds, 18 times in half a minute, each one
+  `status 0xb` (SIGSEGV) with no `NSException` constructed, so the photo library
+  is never there when Photos asks. The image itself carries **25 identical
+  `assetsd-*.ips` reports** (2026-10-27/28; the HFS reader in `tools/hfs-audit.py`
+  copies them out of the image):
+  `EXC_CRASH`/`SIGABRT` after `std::terminate`, with `lastExceptionBacktrace`
+  `objc_exception_throw` <- `assetsd+0x162f0` <-
+  `-[PLLibraryServicesOperation _runOperationBlock:]` <- `-[NSBlockOperation main]`
+  <- dispatch. So an Objective-C exception is thrown from inside a library
+  services operation and nothing on that path catches it: this is the blocker for
+  Photos, it predates the filesystem work, and it is not the sandbox query the
+  appex raises. Those reports are from a different build (163 KiB against the
+  273 KiB binary in the image), so their offset names the mode, not the line; the
+  throw site has to come from the running process, which is what
+  `tools/mondrian-probe.m` is for.
 - **A black capture with only a battery icon is the panel off.** Measured
   2026-11-18: `usb-ring.py key 116` is the power button, so using it to "wake"
   the phone turns the display off, and the next `screen` comes back black with
