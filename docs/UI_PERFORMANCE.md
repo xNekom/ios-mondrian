@@ -254,10 +254,14 @@ boot each, so the three columns differ only in what changed:
   arithmetic (`y * row + x * 4 + 2`), so treating them as an ivar offset was
   reading tea leaves.
   The fix skips a place outside the image and says so (`MONDRIAN WALL: pixel
-  720,1600 outside 192x192`); measured after it, the instance that survived 45
-  lock-watch cycles left 0 records where the three before it left 6 to 18, and a
-  fresh boot of the build that carries the fix in its kernel blob left 0 records
-  where every boot of the kernel before it left 6 to 18 in the first minute.
+  720,1600 outside 192x192`). The counts corroborate but do not prove it, because
+  the read only crashed when the page after the buffer was unmapped: boots of the
+  kernel before the fix left 0, 6, 12 or 18 records, and one of them left 0. What
+  proves it is the skip: the three samples that were out of bounds on a 192x192
+  image are now logged and not read, so the load cannot happen at all. And match
+  the image by the record's own base, never by name: `dsc-image.py` takes the
+  first cache image whose name matches, and SpringBoard.app, SpringBoard.framework
+  and SpringBoardHome all do.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
