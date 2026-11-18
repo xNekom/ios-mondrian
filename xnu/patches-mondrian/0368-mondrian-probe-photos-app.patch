@@ -1,0 +1,33 @@
+xnu 0368: inject the probe into the Photos app
+
+Measured 2026-11-18: MobileSlideShow execs and dies `sig 6` with the same pc, lr
+and backtrace on every launch, before its scene appears, and the ring carries no
+line from inside it because `mondrian_probe_target()` names the daemons and not
+the app. The exception is the thing to read, and it is read the same way assetsd's
+death was named: `MONDRIAN THROW` prints the name and the reason where the stack
+still exists.
+
+It also matters that the app carries the hook at all. The TCC stand-in in the
+hook answers `TCCAccessRequest`, which is the call whose denial aborts a client;
+a process without the dylib keeps the real answer, which on this port is a denial
+(tccd refuses it even though SecTask reads the entitlement through the audit
+token). assetsd already survives its own check with the stand-in in place, so the
+app is the next process that needs the same treatment.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5690,6 +5690,14 @@
+ 		"PhotosFileProvider",
+ 		"photolibraryd",
+ 		"iconservicesagent",
++		/*
++		 * The app itself, measured 2026-11-18: it execs and dies `sig 6`
++		 * with the same pc, lr and backtrace on every launch, before its
++		 * scene appears, and the ring carries no line from inside it
++		 * because nothing in it was ours. assetsd's death was named by the
++		 * throw hook; this one needs the same.
++		 */
++		"MobileSlideShow",
+ 	};
+ 	size_t i;
+ 
