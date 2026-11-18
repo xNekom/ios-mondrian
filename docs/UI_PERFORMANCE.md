@@ -346,7 +346,10 @@ boot each, so the three columns differ only in what changed:
   -- so asking launchd about a job means its private job API), and the lookups
   work without it. Nor is it on the path that opens Photos: tapping Photos
   starts no `fileproviderd` and no `photolibraryd`, only `assetsd`, which dies
-  30 times in the same boot.
+  30 times in the same boot. Absence in an image proves nothing either: the root
+  ships 129 app data containers and `com.apple.Preferences` is not one of them,
+  yet Settings draws, so a container appears the first time an app asks for
+  one.
 - **`-URLForDirectory:inDomains:appropriateForURL:create:error:` is not on this
   Foundation, and calling it anyway aborts the caller.** `respondsToSelector:`
   says 0 and `class_getInstanceMethod` agrees, yet a probe that called it

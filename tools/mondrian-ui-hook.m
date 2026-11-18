@@ -12281,10 +12281,19 @@ mondrian_install_ui_hooks(void)
 	if (mondrian_probe_service()) {
 		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
 			int quiet = mondrian_file_is("/private/var/vm/mondrian-exc", '2');
+			int nourl = mondrian_file_is("/private/var/vm/mondrian-exc", '3');
 
 			mondrian_exc_install(quiet);
 			mondrian_probe_raise();
-			mondrian_probe_urls();
+			/*
+			 * 3: the exception handlers only, without the URL hooks. Measured
+			 * 2026-11-18: assetsd dies `sig 11` in its guard page with the
+			 * whole probe in place, and asking which hook does it is cheaper
+			 * than guessing.
+			 */
+			if (!nourl) {
+				mondrian_probe_urls();
+			}
 		} else {
 			mondrian_exc_say("MONDRIAN EXC: switch off, probe idle\n");
 		}
