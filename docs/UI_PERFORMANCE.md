@@ -272,11 +272,19 @@ boot each, so the three columns differ only in what changed:
   `bl` into a shared-cache stub (`0x1c9b0962c`), and `far - 0xf42` (once
   `0xb42`) lands on a page boundary -- so the receiver was a mapped-then-unmapped
   object page and this is a message to a freed object, reported at its call site.
+  The image extracted from the cache has no symbols and no `LC_FUNCTION_STARTS`,
+  so the function boundaries come from `__unwind_info`: an index entry is 12
+  bytes (`functionOffset` relative to the image base, second-level page offset,
+  LSDA offset) and a compressed page (kind 3) holds 4-byte entries whose low 24
+  bits are the offset from the page's first function and whose high 8 bits index
+  the encoding table. By that table the site is inside the 0x710-byte function at
+  +0xa48c0 -- at +0x154, with the `lr` at +0x124, so both are call sites of that
+  one function and not a return address from outside it.
   Turning the App Library pass off changes nothing about a boot; turning the icon
   artwork pass off (`mondrianiconset=0` in `PREFIX_ARGS` to `image.sh`) measured
   6 in one boot against 12 in the boot before it, which is inside that spread and
-  is not evidence. Finding it needs a boot that crashes and a debugger on the
-  receiver, not another A/B.
+  is not evidence. Finding the receiver needs a boot that crashes and a debugger
+  on it, not another A/B.
   **Do not paint the card into the tiles' bitmap.** That version (one bitmap with
   a filled rounded rect under the tiles) is the one whose boots crash-looped
   SpringBoard the moment the library opened -- pid changing every few seconds,

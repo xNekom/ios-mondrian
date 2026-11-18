@@ -254,9 +254,9 @@ A recovery needs no partition: `fastboot boot ofox.img` runs it from RAM (the
 
 **The console paints the kernel log and scrolls.** `0210` clears the panel once
 and scrolls half a screen at the last text row, `0213` paints from the log thread,
-and `0005`'s unconditional fbcon puts text over the ABL logo from the first
-`printf`; `mondrianfb_noconsole=1` keeps the panel for the UI (0 is the only log
-when USB is dead).
+and `0005`'s fbcon puts text over the ABL logo. `0351` gives the panel to the
+compositor at its first swap and `0352` sends a survived kernel abort to the ring;
+`mondrianfb_noconsole=1` takes the screen at probe, `=0` is the only log with USB dead.
 
 **dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
 `AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
