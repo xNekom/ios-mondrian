@@ -204,9 +204,9 @@ swaps, so the lock screen and the home screen draw. `0084`'s colour bars were a
 one-off packing test, off since `0208`; `0210` paints the kernel log and clears
 the boot splash. Three things had to line up: CoreAnimation needs
 `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`); the
-panel is written through the console alias, which is only stopped with
-`disableConsoleOutput` (`0115`, an `IOMemoryDescriptor` there panics
-`pmap_remove_pv`); and the dylib forces activation past MobileActivation.
+panel is written through the console alias, which `0351` stops at the first
+swap (`disableConsoleOutput` was the only way before; an `IOMemoryDescriptor`
+there panics `pmap_remove_pv`, `0115`); and the dylib forces activation.
 
 Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
 (`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
