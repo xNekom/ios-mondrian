@@ -214,14 +214,20 @@ boot each, so the three columns differ only in what changed:
   `mondrian_early_panic_begin()` has no other caller, so that survived fault was
   the only case it served, and it is the one case that must not paint.
   Those numbers now go to the ring, `MONDRIAN KABORT: recovered|unrecovered
-  esr … far … pc … lr … cpsr … x0 …`, and a fault that really panics still paints
-  through `mondrian_early_fault()`. Note for the next reader: `mondrian_early_reg()`
+  esr … far … pc … lr … cpsr … x0 …`, and a fault that really panics still paints:
+  `mondrian_early_fault()` writes its three rows with `hud_row_text()` directly,
+  past `panel_text_allowed()`. Note for the next reader: `mondrian_early_reg()`
   writes with `putc` alone, so the old `KABORT` rows never reached the ring and no
   saved ring holds one -- a boot that shows them on the glass leaves no record
   after a reboot. Where the observed one comes from: its `lr`
   (`0xfffffe0007584a68`) resolves to `_mapping_free_prime_internal`, in the pmap
   pv-free path this board is documented to die in when the panel alias is torn
   out -- so the panel was being taken by a pmap fault, not by the UI.
+  The fault has not reproduced since: three boots of the 0352 build and a
+  `respring` (18 SpringBoard crash records, a lot of mappings freed and rebuilt)
+  left zero `MONDRIAN KABORT` lines, so what is verified is the mechanism -- the
+  only caller of `mondrian_early_panic_begin()` is gone -- not a boot that
+  exercised it.
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
