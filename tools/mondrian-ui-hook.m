@@ -12350,6 +12350,22 @@ mondrian_objkey(id self, SEL _cmd, id key)
 	id value = mondrian_objkey_orig != NULL
 	    ? mondrian_objkey_orig(self, _cmd, key) : nil;
 
+	/*
+	 * The handshake failure reads "missing data key in reply", so the useful
+	 * line is the miss: a key asked for and answered with nil. Interest-based
+	 * filtering caught nothing (the reply is not read with a sandbox-looking
+	 * key name), and printing every hit floods the ring.
+	 */
+	if (value == nil && key != nil && [key isKindOfClass:[NSString class]]) {
+		static unsigned misses;
+
+		if (misses < 40) {
+			misses++;
+			mondrian_probe_fmt("MONDRIAN KEY[%d]: miss %s\n", getpid(),
+			    [(NSString *)key UTF8String]);
+		}
+		return value;
+	}
 	if (mondrian_key_of_interest(key)) {
 		mondrian_probe_fmt("MONDRIAN KEY[%d]: %s -> %s\n", getpid(),
 		    [(NSString *)key UTF8String], value != nil ? "value" : "nil");
@@ -12363,6 +12379,16 @@ mondrian_subscript(id self, SEL _cmd, id key)
 	id value = mondrian_subscript_orig != NULL
 	    ? mondrian_subscript_orig(self, _cmd, key) : nil;
 
+	if (value == nil && key != nil && [key isKindOfClass:[NSString class]]) {
+		static unsigned misses;
+
+		if (misses < 40) {
+			misses++;
+			mondrian_probe_fmt("MONDRIAN KEY[%d]: miss [ ] %s\n", getpid(),
+			    [(NSString *)key UTF8String]);
+		}
+		return value;
+	}
 	if (mondrian_key_of_interest(key)) {
 		mondrian_probe_fmt("MONDRIAN KEY[%d]: %s [ ] -> %s\n", getpid(),
 		    [(NSString *)key UTF8String], value != nil ? "value" : "nil");

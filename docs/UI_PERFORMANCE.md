@@ -417,13 +417,14 @@ boot each, so the three columns differ only in what changed:
   black. Wake with a tap or a swipe, and check the capture for the time in the
   status bar before concluding anything about what an app draws. Photos' own
   blank state is white with the status bar, not black.
-- **The appex runs at boot, not when Photos opens.** Measured 2026-11-18: tapping
-  the Photos icon starts `MobileSlideShow` and draws its (blank) window, but no
-  `exec PhotosFileProvider` follows -- the extension appears once per boot,
-  around the time the system registers file providers. So a probe aimed at the
-  appex has to be armed before a boot, and the boot is the only way to reach it;
-  a `respring` plus a tap is enough for `assetsd` and `fileproviderd`, not for
-  this one.
+- **A tap opens the appex, but only while the app has not seen it fail.** Measured
+  2026-11-18: on a boot where Photos has not been opened, tapping the icon starts
+  `MobileSlideShow` and then `exec PhotosFileProvider` (pid 494, right after the
+  touch) which dies `sig 6` with the PlugInKit exception. After that death the
+  same tap only brings the app's blank window back: it does not re-request the
+  extension. So the cheap loop for the appex is a `respring` (which clears the
+  app's state) plus one tap, not a boot -- and a boot is only needed when the
+  kernel's own copy has to change.
 - **The appex's message is PlugInKit's, and its caller is in the cache.** The
   string sits at PlugInKit `+0x25697`, between
   `-[PKService launchContainingApplicationForPlugInNamed:]` and `missing data key
