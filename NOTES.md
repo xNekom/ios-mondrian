@@ -219,16 +219,18 @@ owns that space the device is mapped nowhere and the next read is a bus abort
 (`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`), which is why `0087` re-maps GICD/GICR
 after the VM is up and the early framebuffer survives only on `0062`'s alias.
 
-**The HFS journal cannot be replayed, and a dirty volume looks like a dead
-kernel.** The `HFS_ENABLE_JOURNALING` sysctl does create a journal, and then
-every mount hangs *before* the framebuffer: the screen keeps the shim log, the
-USB gadget never appears, so there is no ring and no userland left to undo it.
-`mondriannojnl=1` mounts ignoring the journal; the disable sysctl panics
-(`journal_close(NULL)` has no NULL check). Reflashing `backup/ios-root.simg` is
-the repair for a dirty volume, and `fsck.hfsplus -fy` on a copy names what a
-rebuild has to fix. A catalog entry that claims data and owns no blocks is
-rejected on every open (2 560 times for one record class) and the hard resets
-write that damage, so `hfs_mark_inconsistent` here is usually our own check.
+**The HFS journal cannot be replayed, and a dirty volume hides as a dead kernel.**
+The `HFS_ENABLE_JOURNALING` sysctl creates one, and then every mount hangs *before*
+the framebuffer: no ring, no userland left to undo it. `mondriannojnl=1` mounts
+ignoring it; the disable sysctl panics (`journal_close(NULL)` has no NULL check),
+and `backup/ios-root-repaired.simg` repairs a volume that will not mount.
+
+**A record whose size outruns its blocks is what marks the volume.** `ExtendFileC`
+reserves blocks without touching the disk (`kEFDeferMask`) and grows the size with
+them; giving the reservation back for a real allocation that then fails leaves the
+size without the blocks, and the record goes to disk because
+`hfs_prepare_fork_for_update` only checked invalid ranges (`0365` trims it). Every
+lookup then fails `EINVAL`; `0364` presents only the bytes the blocks can back.
 
 **The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
 `/chosen/linux,initrd-start` are not the payload: that travels **appended to the
@@ -246,8 +248,6 @@ shim, not the kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
-A recovery needs no partition: `fastboot boot ofox.img` runs it from RAM (the
-`boot-recovery` BCB runs the active `boot` slot; `recovery_a/b` never boot).
 
 **Kernel timeouts stop after userland starts.** Threads paced by
 `tsleep(timeout)` wake once and never again; pace from work (`0100`) or `delay()`.

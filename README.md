@@ -225,7 +225,7 @@ tools/phone-log.sh out/boot-mondrian.img ring.txt
 | `tools/phone-boot.sh`, `phone-deploy.sh`, `flash-root.sh` | volatile boot, boot-partition deploy, root flash |
 | `tools/ios-log-pull.sh`, `ios-log.py`, `ios-crash.py` | read and symbolicate the persistent kernel log |
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | helpers |
+| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py`, `hfs-audit.py` | helpers; `hfs-audit.py` checks what `fsck` does not: bitmap against the header's count, forks sharing blocks, sizes that do not fit |
 | `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
 | `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
 | `docs/BUILD_LINUX.md` | building the kernel on Windows/WSL2, with no Mac |

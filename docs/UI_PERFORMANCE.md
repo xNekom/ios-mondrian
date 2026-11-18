@@ -771,20 +771,58 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   still leaves 1357 marks in the next boot. Check `hfs_mark_inconsistent` first
   in any boot that stops presenting, and restore
   `backup/ios-root-repaired.simg` when it is there.
-- **A verified-clean root is not clean after one boot.** Measured 2026-11-18:
+- **A verified-clean root degrades because a catalog record can claim more bytes
+  than the blocks it owns.** Measured 2026-11-18:
   `backup/ios-root-repaired.simg` expanded and checked with `fsck.hfsplus`
   ("appears to be OK"), written to `userdata`, and the first boot on it already
-  frees block ranges the bitmap does not own (`<160696,999>` three times,
-  `<4050321,1>`, `<153186,5>`, ...). So the damage is not only the residue of a
-  dirty reset: something in normal operation releases extents twice. `0356`
-  names the caller at the failure, and on that first boot there are **152 of
-  them asked by fifteen different processes** -- `mobileassetd`, `timed`,
-  `usermanagerd`, `mount_hfs`, `fseventsd`, `nehelper`, `thermalmonitord`, most
-  of them a single block. A per-daemon bug cannot explain that, so the lead is
-  the allocation accounting itself (a bit that is never set when a block is
-  handed out, or a bitmap block written from stale contents), not any one
-  service. `0355` flushes the root with `MNT_WAIT` before `reboot`/`poweroff`,
-  which removes the reset from the list of contributors.
+  produces them: `knowledgeC.db-shm` at 32768 bytes with **one** block, and a
+  fresh 37-byte file with **none** every boot (a new cnid each time, so they are
+  created then). Each such record fails `hfs_getnewvnode`'s size-versus-blocks
+  check, which returns `EINVAL` and calls `hfs_mark_inconsistent` -- ~9 000 marks
+  a boot, the number that decides whether the screen keeps presenting (see the
+  first bullet of this section). Two paths make them:
+  `ExtendFileC`'s deferred allocation (`kEFDeferMask`) grows `ff_size` and
+  `ff_blocks` together without touching the disk; when the reservation is given
+  back for a real allocation (`ff_blocks -= loanedBlocks`,
+  `ff_unallocblocks = 0`) and that allocation or its extent record fails, the loop
+  breaks with the size advanced and the blocks missing, and
+  `hfs_prepare_fork_for_update` -- the last gate before `cat_update` -- only had
+  its fast path look at invalid ranges, so the record went to disk as is. `0365`
+  makes that fast path require the size to fit the blocks, so the existing trims
+  cap it. Separately, `TruncateFileC` assigns `ff_blocks` *before* it frees and
+  leaves through `ErrorExit` on the first failed `BlockDeallocate`, and
+  `BlockMarkFreeInternal` reported a range that was already free as `EIO`, the
+  code for a real read or write failure, marking the volume on the way out: a fork
+  whose blocks were already free ended with a zeroed count and its extents still
+  listed (`write id=84595901 size 850 blocks 0 extents 4012768+1, was blocks 1`
+  next to `free 4012768+1 asked by mobileassetd`). `0363` gives that case its own
+  code and finishes the truncate: measured, the failed frees fall from **275 in
+  one boot to 4 in the next**. Neither can repair a record already on disk, because
+  the check refuses it with `EINVAL` before anything can open it -- and a file that
+  cannot be opened cannot be written back into shape. `0364` clamps that descriptor
+  to the bytes its blocks can back before the check runs, so the file opens at its
+  real length and the next `hfs_update` stores it. Measured with all three in
+  place: **0 marks and 0 bad vnodes in two consecutive boots**, no record written
+  with a size beyond its blocks (`writes 0`), and the failed frees still falling
+  (275, then 4, then 9 of a different set). The 32768-byte records healed on disk
+  during the first boot -- they are rewritten, so the clamp is stored -- and what
+  remains is four small files with a size and no blocks that nothing writes; they
+  are presented empty on every boot and mark nothing. `0355` flushes the root with
+  `MNT_WAIT` before `reboot`/`poweroff`, which keeps a hard reset from adding to it.
+- **`fsck` does not look for two forks claiming one block, and only an audit can
+  say whether there are any.** `fsck.hfsplus` compares the bitmap with the *union*
+  of every fork's extents, which passes when two files overlap. Measured
+  2026-11-18 with `tools/hfs-audit.py` on the original dump and on the repaired
+  image, byte for byte the same numbers: 0 overlaps, 0 records whose size exceeds
+  their blocks, and the bitmap's free count equal to the header's. The extents
+  overflow file does hold 3 extent records past the end of their fork, left by a
+  truncate that failed to delete them, but `SearchExtentFile` stops at the fork's
+  `totalBlocks`, so the kernel never reads them and they are not a defect. Reading
+  them anyway invents overlaps with whichever file owns those blocks today -- an
+  earlier version of the tool reported 52 that way. Keep the `totalBlocks` filter,
+  and keep a running end when sweeping: comparing each extent with the one before
+  it misses the nested claims. The tool is the check, in seconds and without a
+  boot: bitmap against the header, overlaps, and sizes against blocks.
 - **`panel 0/60` does not mean "not presenting".** It counts sampled ticks that
   changed, so a still screen reads 0/60 too -- a lock screen with the clock, the
   date and the camera button, captured 191 s into a repaired boot, reads 0/60.
