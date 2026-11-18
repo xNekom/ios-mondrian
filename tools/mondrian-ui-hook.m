@@ -1830,6 +1830,11 @@ mondrian_bootstrap_probe(void *unused)
  */
 extern xpc_connection_t xpc_connection_create_mach_service(const char *name,
     dispatch_queue_t targetq, uint64_t flags);
+struct mondrian_xpc_interpose {
+	const void *replacement;
+	const void *replacee;
+};
+extern const struct mondrian_xpc_interpose mondrian_xpc_interposer[];
 static xpc_connection_t (*real_create_mach_service)(const char *,
     dispatch_queue_t, uint64_t);
 static volatile int mondrian_acc_armed;
@@ -1838,26 +1843,40 @@ static xpc_connection_t
 mondrian_create_mach_service(const char *name, dispatch_queue_t targetq,
     uint64_t flags)
 {
+	/*
+	 * The original comes from dyld's interpose tuple, not from dlsym.
+	 * `dlsym(RTLD_NEXT, "xpc_connection_create_mach_service")` resolves to
+	 * this very function -- interposition is applied to lookups, and RTLD_NEXT
+	 * only skips the *images* before this one -- so the first call recursed
+	 * into itself. Measured on assetsd 2026-11-18: pc inside this function at
+	 * +0x4, lr at the `blr` that calls it, far = sp + 0x100, and a `bt` that
+	 * repeats one address; every level costs 0x140 of stack until the guard
+	 * page, which is why assetsd died `sig 11` with this dylib loaded and
+	 * `sig 6` without it. The tuple's second field is the definition dyld
+	 * found for the replacee, so it is the real function by construction.
+	 */
 	if (real_create_mach_service == NULL) {
+		static unsigned told;
+
 		real_create_mach_service = (xpc_connection_t (*)(const char *,
 		    dispatch_queue_t, uint64_t))
-		    dlsym(RTLD_NEXT, "xpc_connection_create_mach_service");
+		    mondrian_xpc_interposer[0].replacee;
+		if (told++ == 0) {
+			char line[160];
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN ACC[%d]: real %p self %p\n", getpid(),
+			    (void *)real_create_mach_service,
+			    (void *)mondrian_create_mach_service);
+			say(line);
+		}
 	}
 	/*
 	 * This dylib is injected into launchd, xpcproxy and every daemon in the
-	 * mask, so a NULL here would take the boot down with it: libxpc's own
-	 * image is the second way to the real function.
+	 * mask, so a NULL here would take the boot down with it.
 	 */
-	if (real_create_mach_service == NULL) {
-		void *libxpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW);
-
-		if (libxpc != NULL) {
-			real_create_mach_service = (xpc_connection_t (*)(
-			    const char *, dispatch_queue_t, uint64_t))
-			    dlsym(libxpc, "xpc_connection_create_mach_service");
-		}
-	}
-	if (real_create_mach_service == NULL) {
+	if (real_create_mach_service == NULL ||
+	    real_create_mach_service == mondrian_create_mach_service) {
 		return NULL;
 	}
 	if (mondrian_acc_armed) {
@@ -1872,10 +1891,7 @@ mondrian_create_mach_service(const char *name, dispatch_queue_t targetq,
 }
 
 __attribute__((used, section("__DATA,__interpose")))
-static const struct {
-	const void *replacement;
-	const void *replacee;
-} mondrian_xpc_interposer[] = {
+const struct mondrian_xpc_interpose mondrian_xpc_interposer[] = {
 	{ (const void *)mondrian_create_mach_service,
 	  (const void *)xpc_connection_create_mach_service },
 };
@@ -11733,6 +11749,144 @@ mondrian_exc_say(const char *message)
 	}
 }
 
+/*
+ * Which entitlements the kernel thinks this process has.
+ *
+ * assetsd raises "requires TCCPhotosService access", and its own code signature
+ * carries that entitlement: read from the image, slot 5 of the SuperBlob is a
+ * 5635-byte XML blob with com.apple.private.tcc.allow = kTCCServicePhotos. The
+ * port's AMFI stand-in (xnu 0030) answers entitlement queries from exactly that
+ * XML, but it attaches it only when `cs_blob != csb_ro_addr`, so the question
+ * "did this process get them" is a measurement, not a reading. csops returns
+ * the blob the kernel holds for the caller: zero or -1 means the stand-in never
+ * attached it, and the fix belongs in the kernel, not in a hook.
+ * Switch: /private/var/vm/mondrian-ent.
+ */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+#define MONDRIAN_CS_OPS_ENTITLEMENTS_BLOB 7
+
+static void
+mondrian_ent_probe(void)
+{
+	char buf[8192];
+	const char *blob = buf;
+	int n;
+
+	n = csops(getpid(), MONDRIAN_CS_OPS_ENTITLEMENTS_BLOB, buf, sizeof(buf));
+	if (n <= 0) {
+		mondrian_probe_fmt("MONDRIAN ENT[%d]: csops -> %d\n", getpid(), n);
+		return;
+	}
+	mondrian_probe_fmt("MONDRIAN ENT[%d]: %d bytes tcc.allow %s photos %s\n",
+	    getpid(), n,
+	    strstr(blob, "com.apple.private.tcc.allow") != NULL ? "yes" : "no",
+	    strstr(blob, "kTCCServicePhotos") != NULL ? "yes" : "no");
+}
+
+/*
+ * The exception at the moment it is thrown, where the stack still exists.
+ *
+ * The uncaught handler is the wrong place to read it: measured on assetsd
+ * 2026-11-18, the handler runs with 0x100 bytes of stack left above the guard
+ * page, `-reason` faults, and the report collapses to `reason ns 2 code 0xb:
+ * (none)` -- it can say an NSException existed and nothing about what it was.
+ * objc_exception_throw runs on the thrower's own stack, before any unwinding,
+ * so `name` and `reason` are ordinary messages there.
+ *
+ * Interposing this symbol reaches every throw in every process that loads this
+ * file, so the report is gated on /private/var/vm/mondrian-throw and on the
+ * service list above; the first eight throws are enough to name a crash loop.
+ * The re-entry flag matters because a reason that itself throws would recurse.
+ */
+extern void objc_exception_throw(id exception);
+
+static int mondrian_exc_read(const void *from, void *to, size_t len);
+
+static void (*mondrian_throw_original)(id);
+static _Thread_local int mondrian_throw_busy;
+static int mondrian_throw_armed = -1;
+static unsigned mondrian_throw_told;
+
+/*
+ * Who threw it. The reason names a condition, not a caller, and the code that
+ * builds it is not always in the binary that carries the string: assetsd holds
+ * "requires TCCPhotosService access" but never loads that literal, so the raise
+ * happens one framework up. Frame pointers are intact at throw time -- the
+ * unwinding has not started -- so the walk is ordinary memory reads, and dladdr
+ * names the image each return address belongs to.
+ */
+static void
+mondrian_throw_trace(void)
+{
+	uint64_t *fp = (uint64_t *)__builtin_frame_address(0);
+	char line[300];
+
+	for (int i = 0; i < 8; i++) {
+		uint64_t frame[2];
+		Dl_info info;
+		const char *base;
+
+		if (fp == NULL ||
+		    !mondrian_exc_read(fp, frame, sizeof(frame)) ||
+		    frame[1] == 0) {
+			return;
+		}
+		if (dladdr((void *)(uintptr_t)frame[1], &info) == 0 ||
+		    info.dli_fname == NULL) {
+			fp = (uint64_t *)(uintptr_t)frame[0];
+			continue;
+		}
+		base = strrchr(info.dli_fname, '/');
+		snprintf(line, sizeof(line), "MONDRIAN THROW[%d]:   #%d %s+0x%lx\n",
+		    getpid(), i,
+		    base != NULL ? base + 1 : info.dli_fname,
+		    (unsigned long)(frame[1] - (uint64_t)(uintptr_t)info.dli_fbase));
+		mondrian_exc_say(line);
+		fp = (uint64_t *)(uintptr_t)frame[0];
+	}
+}
+
+static void
+mondrian_throw(id exception)
+{
+	if (mondrian_throw_armed < 0) {
+		mondrian_throw_armed =
+		    mondrian_file_on("/private/var/vm/mondrian-throw") &&
+		    mondrian_probe_service();
+	}
+	if (mondrian_throw_armed && !mondrian_throw_busy && exception != nil &&
+	    mondrian_throw_told < 8) {
+		char line[360];
+		const char *reason = "(nil)";
+		const char *name = "(nil)";
+		id n = nil;
+		id r = nil;
+
+		mondrian_throw_busy = 1;
+		mondrian_throw_told++;
+		if ([exception respondsToSelector:@selector(name)]) {
+			n = [exception name];
+		}
+		if ([exception respondsToSelector:@selector(reason)]) {
+			r = [exception reason];
+		}
+		if (n != nil && [n isKindOfClass:[NSString class]]) {
+			name = [n UTF8String];
+		}
+		if (r != nil && [r isKindOfClass:[NSString class]]) {
+			reason = [r UTF8String];
+		}
+		snprintf(line, sizeof(line), "MONDRIAN THROW[%d]: %s name %s reason %s\n",
+		    getpid(), object_getClassName(exception), name, reason);
+		mondrian_exc_say(line);
+		mondrian_throw_trace();
+		mondrian_throw_busy = 0;
+	}
+	if (mondrian_throw_original != NULL) {
+		mondrian_throw_original(exception);
+	}
+}
+
 
 static void
 mondrian_exc_report(id exception)
@@ -11775,11 +11929,91 @@ extern void *__cxa_get_globals(void);
 static int
 mondrian_exc_read(const void *from, void *to, size_t len)
 {
-	vm_size_t got = 0;
+	mach_vm_size_t got = 0;
 
 	return mach_vm_read_overwrite(mach_task_self(), (vm_address_t)from,
 	    len, (vm_address_t)to, &got) == KERN_SUCCESS && got == len;
 }
+
+/*
+ * The loaded images, as a crash address needs them. The kernel prints pc, lr and
+ * a frame-pointer walk, but `pc - mh` only resolves while pc is inside the main
+ * executable: measured on assetsd, pc sits 0xD025C past a header whose image is
+ * only 0x44570 bytes, so the frame belongs to a dylib and the offset names
+ * nothing. With each image's runtime __TEXT range on record, the CRASH line can
+ * be resolved offline -- no dyld call in the faulting thread, which is what a
+ * handler that resolved addresses in place would have to do with the stack
+ * already gone.
+ *
+ * Two traps cost a round each here. `_dyld_get_image_header` already returns the
+ * runtime address: adding `_dyld_get_image_vmaddr_slide` on top printed every
+ * base one slide too high and read __TEXT from an unmapped address, 484 entries
+ * of zeros that made the crash look like it belonged to no image at all. And the
+ * union of every segment is not the image: shared-cache dylibs keep a segment at
+ * vmaddr 0, whose `vmaddr + slide` becomes a base in the middle of nowhere and
+ * an image "size" of 0x4372d000. __TEXT alone is what a pc needs.
+ *
+ * Print the whole table at exec, once: assetsd restarts every few seconds, so
+ * the last table before a CRASH line is the one that belongs to it.
+ */
+static void
+mondrian_exc_images(void)
+{
+	uint32_t count = _dyld_image_count();
+	char line[260];
+
+	mondrian_probe_fmt("MONDRIAN EXC[%d]: images %u\n", getpid(), count);
+	for (uint32_t i = 0; i < count; i++) {
+		const struct mach_header_64 *mh =
+		    (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const char *name = _dyld_get_image_name(i);
+		uint64_t size = 0;
+		struct mach_header_64 header;
+		char *cmds;
+
+		if (mh == NULL || name == NULL ||
+		    !mondrian_exc_read(mh, &header, sizeof(header)) ||
+		    header.magic != MH_MAGIC_64) {
+			continue;
+		}
+		cmds = malloc(header.sizeofcmds);
+		if (cmds == NULL ||
+		    !mondrian_exc_read((const char *)mh + sizeof(header), cmds,
+		    header.sizeofcmds)) {
+			free(cmds);
+			continue;
+		}
+		for (uint32_t c = 0, at = 0; c < header.ncmds; c++) {
+			struct load_command *cmd = (struct load_command *)(cmds + at);
+			struct segment_command_64 *seg;
+
+			if (at + sizeof(*cmd) > header.sizeofcmds ||
+			    cmd->cmdsize == 0) {
+				break;
+			}
+			if (cmd->cmd == LC_SEGMENT_64 &&
+			    at + sizeof(*seg) <= header.sizeofcmds) {
+				seg = (struct segment_command_64 *)cmd;
+				if (strncmp(seg->segname, "__TEXT", 16) == 0 &&
+				    seg->vmsize != 0) {
+					size = seg->vmsize;
+					break;
+				}
+			}
+			at += cmd->cmdsize;
+		}
+		free(cmds);
+		if (size == 0) {
+			continue;
+		}
+		snprintf(line, sizeof(line),
+		    "MONDRIAN EXC[%d]: img 0x%llx 0x%llx %s\n", getpid(),
+		    (unsigned long long)(uintptr_t)mh, (unsigned long long)size,
+		    name);
+		mondrian_exc_say(line);
+	}
+}
+
 
 /*
  * The exception itself. objc throws through the C++ ABI, so the object is in
@@ -13223,12 +13457,36 @@ static const struct mondrian_interpose mondrian_tcc_token_interpose = {
 	(const void *)TCCAccessCheckAuditToken,
 };
 
+/*
+ * The throw hook: `mondrian_throw` reads `name`/`reason` on the thrower's own
+ * stack and calls the real objc_exception_throw afterwards. Its original comes
+ * from the tuple for the reason written above `mondrian_sbx_path`: dlsym on an
+ * interposed symbol answers with the replacement.
+ */
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_throw_interpose = {
+	(const void *)mondrian_throw,
+	(const void *)objc_exception_throw,
+};
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	mondrian_throw_original = (void (*)(id))mondrian_throw_interpose.replacee;
+	/*
+	 * Outside the probe gate on purpose: the question is whether the kernel
+	 * attaches entitlements at all, so the answer has to include the processes
+	 * that have never had a problem (SpringBoard, backboardd).
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-ent")) {
+		mondrian_ent_probe();
+	}
 	if (mondrian_probe_service()) {
+		if (mondrian_file_on("/private/var/vm/mondrian-images")) {
+			mondrian_exc_images();
+		}
 		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
 			int quiet = mondrian_file_is("/private/var/vm/mondrian-exc", '2');
 			int nourl = mondrian_file_is("/private/var/vm/mondrian-exc", '3');
