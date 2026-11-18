@@ -15,10 +15,14 @@ A boot that reaches SpringBoard and then stops drawing is not always a frame
 budget problem: the compositor only presents when something changes, so `fps 0`
 on a still screen is normal, and what matters is whether a touch brings a frame.
 `tools/usb-ring.py fps` asks the screen dump for eight rows over USB and counts
-the samples whose hash changed, so its own ceiling is how fast that round trip
-goes -- measured 10 to 21 samples a second. It proves that the glass moved, not
-how fast: a low count right after an injected `swipe` usually means the gesture
-finished before the window opened, not a slow UI.
+the samples whose hash changed, so it cannot see more than 10 to 21 frames a
+second -- and it cannot see a gesture at all: `swipe` runs `ud_cmd_touch` on the
+gadget's command thread and that sleeps 8 ms per step, so the whole ~1.9 s
+gesture blocks the same thread the rows are requested from. A sampler started
+during a drag prints `no screen rows` or a low count because of that, not because
+the UI was slow; measured 2026-11-18. For frames during motion read the driver's
+own summary instead (`MONDRIAN FB: fps`, `present`, `panel n/60`, one every 3 s,
+and they stay in the ring after the gesture).
 
 - **Idle is the driver's, not the compositor's.** Measured on a boot left
   untouched: the ring carries `MONDRIAN UI: idle timer left armed
@@ -320,7 +324,10 @@ boot each, so the three columns differ only in what changed:
   the screen moves: two drag windows between pages reported `fps 49, 60, 45` and
   `fps 55, 52, 46, 44, 46` second by second, and the per-tick histogram in one of
   them `tick rec0 14 rec1 44 rec2 2` -- 46 of 60 ticks carried a frame, which is
-  the number to compare against 60.
+  the number to compare against 60. Measured again 2026-11-18 on a steady boot
+  (SpringBoard pid unchanged) with a sustained horizontal drag: `fps 47, 48, 49,
+  50, 51, 54, 59`, `present 46 to 60/s drop 0` and `panel 46/60 … 59/60 sampled
+  ticks changed`, with `copy avg 2.0 to 2.3 ms` per frame.
   The CoreAnimation counters are **not** a frame meter: `ca begin 0 commit 0 slow
   0 display 0 loop 20 in 1 s` was measured while that dragging was happening.
   `+[CATransaction begin]`/`+commit` and `-[CALayer displayIfNeeded]` are not on
@@ -329,6 +336,19 @@ boot each, so the three columns differ only in what changed:
   for the run-loop number and the framebuffer meter for frames.
   The dump is armed by writing a number into `/private/var/vm/mondrian-deep` (a
   new number buys one dump, four a process) and read out of the ring.
+- **Which apps open, and how to aim at one.** Measured 2026-11-18 on the
+  `04:27:29` kernel: Settings launches from its icon and draws its whole list --
+  title, Sign in, Airplane Mode, Wi-Fi (Off), Notifications, Sounds, Focus,
+  Screen Time, General, Control Center, Display & Brightness, Home Screen,
+  Accessibility, Wallpaper, Siri & Search, Passcode, Emergency SOS, Exposure
+  Notifications, Battery -- so LaunchServices, the icon model and the compositor
+  agree. The App Store opens and stays at `LOADING` because it needs the network,
+  which this port does not have; that is a limit, not a drawing failure.
+  `tap`/`swipe` take panel pixels (1440x3200) and `screen` returns half of that,
+  so aim with the runtime's frames, not with the picture: the hook prints
+  `MONDRIAN UI: icon Settings live … frame 35,227 64x78` in points, and three
+  times that is the panel box whose centre is `201,798`. One gesture at a time --
+  the gadget's command thread is busy until the swipe finishes.
 - **Which hook is running, and whether it arrived whole.** The hook prints
   `MONDRIAN UI: hook tag cc56 uid <uid> prog <name> built <date> <time>` at load
   (`__DATE__`/`__TIME__`), and the ring holds several SpringBoard instances at
