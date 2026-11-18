@@ -11737,6 +11737,7 @@ mondrian_probe_service(void)
 	    strcmp(prog, "fileproviderd") == 0 ||
 	    strcmp(prog, "PhotosFileProvider") == 0 ||
 	    strcmp(prog, "photolibraryd") == 0 ||
+	    strcmp(prog, "MobileSlideShow") == 0 ||
 	    strcmp(prog, "iconservicesagent") == 0;
 }
 
@@ -11770,17 +11771,63 @@ mondrian_ent_probe(void)
 {
 	char buf[8192];
 	const char *blob = buf;
+	uint32_t magic, length;
 	int n;
 
+	/*
+	 * csops returns 0 on success; the length is in the blob it copies out,
+	 * a CS_GenericBlob with a big-endian length. Reading the return value as
+	 * a size made "has 62 entitlements" look like "has none" for a whole
+	 * session.
+	 */
 	n = csops(getpid(), MONDRIAN_CS_OPS_ENTITLEMENTS_BLOB, buf, sizeof(buf));
-	if (n <= 0) {
-		mondrian_probe_fmt("MONDRIAN ENT[%d]: csops -> %d\n", getpid(), n);
+	if (n != 0) {
+		mondrian_probe_fmt("MONDRIAN ENT[%d]: csops -> %d errno %d\n",
+		    getpid(), n, errno);
 		return;
 	}
-	mondrian_probe_fmt("MONDRIAN ENT[%d]: %d bytes tcc.allow %s photos %s\n",
-	    getpid(), n,
-	    strstr(blob, "com.apple.private.tcc.allow") != NULL ? "yes" : "no",
-	    strstr(blob, "kTCCServicePhotos") != NULL ? "yes" : "no");
+	memcpy(&magic, buf, sizeof(magic));
+	memcpy(&length, buf + 4, sizeof(length));
+	magic = ntohl(magic);
+	length = ntohl(length);
+	mondrian_probe_fmt(
+	    "MONDRIAN ENT[%d]: %u bytes magic 0x%x tcc.allow %s photos %s\n",
+	    getpid(), length, magic,
+	    strstr(blob + 8, "com.apple.private.tcc.allow") != NULL ? "yes" : "no",
+	    strstr(blob + 8, "kTCCServicePhotos") != NULL ? "yes" : "no");
+}
+
+/*
+ * Whether the TCC daemon can even be reached from this process. assetsd's
+ * "requires TCCPhotosService access" is raised by a library-services operation
+ * named ActivateTCC, its own entitlement blob is present and complete, and it
+ * never calls TCCAccessPreflight or TCCAccessCheckAuditToken: the remaining path
+ * is an XPC query to tccd, which on this port is a daemon nobody has watched
+ * start. A failed bootstrap look-up says that in one line.
+ */
+static void
+mondrian_tccd_probe(void)
+{
+	mach_port_t bootstrap = MACH_PORT_NULL;
+	mach_port_t port = MACH_PORT_NULL;
+	kern_return_t (*look_up)(mach_port_t, const char *, mach_port_t *);
+	kern_return_t kr;
+
+	kr = task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT,
+	    &bootstrap);
+	look_up = (kern_return_t (*)(mach_port_t, const char *, mach_port_t *))
+	    dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+	if (kr != KERN_SUCCESS || look_up == NULL) {
+		mondrian_probe_fmt("MONDRIAN TCCD[%d]: no bootstrap 0x%x %p\n",
+		    getpid(), kr, (void *)look_up);
+		return;
+	}
+	kr = look_up(bootstrap, "com.apple.tccd", &port);
+	mondrian_probe_fmt("MONDRIAN TCCD[%d]: tccd -> 0x%x port %u\n", getpid(),
+	    kr, port);
+	if (port != MACH_PORT_NULL) {
+		mach_port_deallocate(mach_task_self(), port);
+	}
 }
 
 /*
@@ -13279,6 +13326,15 @@ extern int TCCAccessPreflight(CFStringRef service, CFDictionaryRef options)
     __attribute__((weak_import));
 extern bool TCCAccessCheckAuditToken(CFStringRef service, audit_token_t token,
     CFDictionaryRef options) __attribute__((weak_import));
+/*
+ * The path that crashes a client: TCCAccessRequest aborts the caller when tccd
+ * denies and the app has no usage description in its Info.plist, which is the
+ * `__CRASHING_DUE_TO_PRIVACY_VIOLATION__` abort MobileSlideShow and AegirPoster
+ * die of (measured 2026-11-18: same pc, lr and far in both). Interposing the
+ * preflight was never enough because an app asks, it does not preflight.
+ */
+extern void TCCAccessRequest(CFStringRef service, CFDictionaryRef options,
+    void (^reply)(bool granted)) __attribute__((weak_import));
 
 /*
  * TCC cannot answer these binaries: the grant is in the database (measured:
@@ -13314,6 +13370,31 @@ mondrian_tcc_token(CFStringRef service, audit_token_t token,
 		return true;
 	}
 	return false;
+}
+
+/*
+ * The request an app makes, which the preflight never covered: this is the call
+ * whose denial aborts the client, and the abort is the crash MobileSlideShow and
+ * AegirPoster die of. The switch is the same one that answers the preflight, so
+ * a boot either has the stand-in or has none.
+ */
+static void
+mondrian_tcc_request(CFStringRef service, CFDictionaryRef options,
+    void (^reply)(bool granted))
+{
+	(void)options;
+	if (mondrian_file_on("/private/var/vm/mondrian-tccok")) {
+		mondrian_probe_fmt("MONDRIAN TCC[%d]: request %s -> allowed\n",
+		    getpid(), service != NULL
+		        ? [(__bridge NSString *)service UTF8String] : "(null)");
+		if (reply != NULL) {
+			reply(true);
+		}
+		return;
+	}
+	if (reply != NULL) {
+		reply(false);
+	}
 }
 
 /*
@@ -13457,6 +13538,12 @@ static const struct mondrian_interpose mondrian_tcc_token_interpose = {
 	(const void *)TCCAccessCheckAuditToken,
 };
 
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_tcc_request_interpose = {
+	(const void *)mondrian_tcc_request,
+	(const void *)TCCAccessRequest,
+};
+
 /*
  * The throw hook: `mondrian_throw` reads `name`/`reason` on the thrower's own
  * stack and calls the real objc_exception_throw afterwards. Its original comes
@@ -13469,19 +13556,326 @@ static const struct mondrian_interpose mondrian_throw_interpose = {
 	(const void *)objc_exception_throw,
 };
 
+/*
+ * The check that kills assetsd, read off the binary:
+ * `-[PLPlatformLibraryServicesDelegate commonBuiltInOperations]_block_invoke_3`
+ * asks `-[PLPrivacy photosAccessAllowedWithScope:7]` and raises
+ * "assetsd requires TCCPhotosService access" when the answer is true. The class
+ * is in AssetsLibraryServices, the instance comes from +sharedInstance, and
+ * scope 7 is the only argument: the whole exception is one BOOL. Measured
+ * 2026-11-18: reading that BOOL as an object made assetsd die `sig 11` instead of
+ * `sig 6`, which is what proved the return type. The line says which way the
+ * check went; forcing NO answers whether this check alone gates the library.
+ * Switch: /private/var/vm/mondrian-tccforce.
+ */
+static BOOL (*mondrian_privacy_original)(id, SEL, long long);
+static int mondrian_tcc_ask(CFStringRef service);
+
+static BOOL
+mondrian_privacy_access(id self, SEL _cmd, long long scope)
+{
+	BOOL answer = mondrian_privacy_original(self, _cmd, scope);
+	int preflight = mondrian_tcc_ask(CFSTR("kTCCServicePhotos"));
+	int standin = mondrian_file_on("/private/var/vm/mondrian-tccok");
+	BOOL corrected = answer;
+	static int told;
+
+	/*
+	 * assetsd's own activation check asks for scope 7, its entitlement names
+	 * kTCCServicePhotos, and the answer disagrees with what this port grants:
+	 * tccd denies it (measured: the real preflight answers 1 even though
+	 * SecTask reads the entitlement through the audit token), while the port
+	 * answers TCC itself through `mondrian-tccok`, the same way 0043 answers
+	 * the sandbox. The line keeps both values on the record; the switch forces
+	 * the answer for an A/B.
+	 */
+	if (answer && (preflight == 0 || standin)) {
+		corrected = NO;
+	}
+	if (told++ < 6) {
+		mondrian_probe_fmt(
+		    "MONDRIAN PLPRIV[%d]: scope %lld says %s, tcc %d, standin %d, answer %s\n",
+		    getpid(), scope, answer ? "not allowed" : "allowed",
+		    preflight, standin, corrected ? "not allowed" : "allowed");
+	}
+	if (mondrian_file_on("/private/var/vm/mondrian-tccforce")) {
+		return NO;
+	}
+	return corrected;
+}
+
+static void
+mondrian_install_privacy_hook(void)
+{
+	Class cls = objc_getClass("PLPrivacy");
+	Method method = cls != Nil ?
+	    class_getInstanceMethod(cls,
+	    sel_registerName("photosAccessAllowedWithScope:")) : NULL;
+
+	if (method == NULL) {
+		return;
+	}
+	mondrian_privacy_original = (BOOL (*)(id, SEL, long long))
+	    method_setImplementation(method, (IMP)mondrian_privacy_access);
+}
+
+/*
+ * Why PLPrivacy says "not allowed". Two answers are possible and they need
+ * different fixes: tccd refuses the service, or PLPrivacy's own state says so
+ * without asking it. This asks both in one line -- the preflight TCC exports for
+ * each service assetsd's own entitlement names, and PLPrivacy's cached status.
+ */
+/*
+ * TCC's real verdict. The port interposes `TCCAccessPreflight` and answers
+ * "allowed" whenever `mondrian-tccok` is on, so asking the symbol asks the
+ * interposer: measured 2026-11-18, a probe that read `preflight 0` was reading
+ * its own shim, not tccd. The original lives in the interpose tuple.
+ */
+static int
+mondrian_tcc_ask(CFStringRef service)
+{
+	int (*real)(CFStringRef, CFDictionaryRef) =
+	    (int (*)(CFStringRef, CFDictionaryRef))
+	    mondrian_tcc_preflight_interpose.replacee;
+
+	if (real == NULL) {
+		return -1;
+	}
+	return real(service, NULL);
+}
+
+static void
+mondrian_tcc_status_probe(void)
+{
+	static const char *const services[] = {
+		"kTCCServicePhotos",
+		"kTCCServicePhotosAdd",
+	};
+	Class privacy = objc_getClass("PLPrivacy");
+	id shared = privacy != Nil ?
+	    ((id (*)(id, SEL))objc_msgSend)((id)privacy,
+	    sel_registerName("sharedInstance")) : nil;
+	unsigned i;
+
+	for (i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+		CFStringRef service = CFStringCreateWithCString(kCFAllocatorDefault,
+		    services[i], kCFStringEncodingUTF8);
+		int answer = mondrian_tcc_ask(service);
+
+		mondrian_probe_fmt("MONDRIAN TCCS[%d]: %s preflight %d\n",
+		    getpid(), services[i], answer);
+		CFRelease(service);
+	}
+	/*
+	 * PLPrivacy's own state, guarded: the private selectors differ between
+	 * builds and an unguarded one raises in a constructor, which is a
+	 * SpringBoard crash loop (measured 2026-11-18). Nothing here is owned by
+	 * the caller except what CF naming says, so the cached status is copied
+	 * to an int before anything else happens.
+	 */
+	if (shared != nil) {
+		int status = -1;
+		int read = -1;
+		int write = -1;
+
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(shared,
+		    sel_registerName("respondsToSelector:"),
+		    sel_registerName("photosTCCAccessStatus"))) {
+			status = ((int (*)(id, SEL))objc_msgSend)(shared,
+			    sel_registerName("photosTCCAccessStatus"));
+		}
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(shared,
+		    sel_registerName("respondsToSelector:"),
+		    sel_registerName("isPhotoLibraryReadAccessAllowed"))) {
+			read = ((BOOL (*)(id, SEL))objc_msgSend)(shared,
+			    sel_registerName("isPhotoLibraryReadAccessAllowed"));
+		}
+		if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(shared,
+		    sel_registerName("respondsToSelector:"),
+		    sel_registerName("isPhotoLibrarySharingOrModificationAllowed"))) {
+			write = ((BOOL (*)(id, SEL))objc_msgSend)(shared,
+			    sel_registerName("isPhotoLibrarySharingOrModificationAllowed"));
+		}
+		mondrian_probe_fmt(
+		    "MONDRIAN TCCS[%d]: cached status %d read %d write %d\n",
+		    getpid(), status, read, write);
+	}
+}
+
+/*
+ * What a library-services check can see. PLPrivacy answers "not allowed" while
+ * the XML blob carries kTCCServicePhotos and no TCCAccess* symbol is ever
+ * called, so the remaining question is whether the API a framework uses to read
+ * its own entitlements agrees with csops. This asks three in one line: the XML
+ * blob, the DER blob (a separate, silent path in proc_csops), and
+ * SecTaskCopyValueForEntitlement on this very process.
+ */
+static void
+mondrian_sec_probe(void)
+{
+	static char xml[8192];
+	static char der[8192];
+	CFTypeRef (*create_task)(CFAllocatorRef) =
+	    (CFTypeRef (*)(CFAllocatorRef))dlsym(RTLD_DEFAULT,
+	    "SecTaskCreateFromSelf");
+	CFTypeRef (*copy_value)(CFTypeRef, CFStringRef, CFErrorRef *) =
+	    (CFTypeRef (*)(CFTypeRef, CFStringRef, CFErrorRef *))dlsym(
+	    RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+	int nxml = csops(getpid(), 7, xml, sizeof(xml));
+	int nder = csops(getpid(), 16, der, sizeof(der));
+	char shown[200] = "no SecTask";
+	char audited[160] = "no audit task";
+	CFTypeRef (*with_token)(CFAllocatorRef, audit_token_t) =
+	    (CFTypeRef (*)(CFAllocatorRef, audit_token_t))dlsym(RTLD_DEFAULT,
+	    "SecTaskCreateWithAuditToken");
+
+	if (create_task != NULL && copy_value != NULL) {
+		CFTypeRef task = create_task(kCFAllocatorDefault);
+
+		if (task != NULL) {
+			CFTypeRef value = copy_value(task,
+			    CFSTR("com.apple.private.tcc.allow"), NULL);
+
+			if (value != NULL) {
+				CFStringRef text = CFCopyDescription(value);
+				char flat[240] = "value present";
+				CFIndex used = 0;
+
+				if (text != NULL &&
+				    CFStringGetCString(text, flat, sizeof(flat),
+				    kCFStringEncodingUTF8)) {
+					for (used = 0; flat[used] != '\0'; used++) {
+						if (flat[used] == '\n' || flat[used] == '\t') {
+							flat[used] = ' ';
+						}
+					}
+				}
+				snprintf(shown, sizeof(shown), "%.150s", flat);
+				if (text != NULL) {
+					CFRelease(text);
+				}
+				CFRelease(value);
+			} else {
+				snprintf(shown, sizeof(shown), "nil");
+			}
+			CFRelease(task);
+		} else {
+			snprintf(shown, sizeof(shown), "no task");
+		}
+	}
+	/*
+	 * The path tccd actually uses for a client: a SecTask built from the
+	 * audit token, not from self. If this one cannot see the entitlement while
+	 * the self task can, the denial is the kernel answering csops_audittoken.
+	 */
+	if (with_token != NULL && copy_value != NULL) {
+		audit_token_t token;
+		mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+
+		if (task_info(mach_task_self(), TASK_AUDIT_TOKEN,
+		    (task_info_t)&token, &count) != KERN_SUCCESS) {
+			snprintf(audited, sizeof(audited), "no token");
+		} else {
+			CFTypeRef task = with_token(kCFAllocatorDefault, token);
+
+			if (task != NULL) {
+				CFTypeRef value = copy_value(task,
+				    CFSTR("com.apple.private.tcc.allow"), NULL);
+
+				snprintf(audited, sizeof(audited), "%s",
+				    value != NULL ? "present" : "nil");
+				if (value != NULL) {
+					CFRelease(value);
+				}
+				CFRelease(task);
+			} else {
+				snprintf(audited, sizeof(audited), "no task");
+			}
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN SEC[%d]: xml %d der %d allow %s audit %s\n",
+	    getpid(), nxml, nder, shown, audited);
+}
+
+/*
+ * Opening an app from the host. A synthetic touch is delivered (the kernel logs
+ * it) but the home screen's icon view does not act on it, and the keyboard's hit
+ * areas are not where its glyphs are drawn, so neither can be scripted into
+ * opening Photos. This watches a switch and asks SpringBoard's own workspace,
+ * which is the entry an icon press ends in.
+ * Switch: /private/var/vm/mondrian-open, holding the bundle id. Every rewrite
+ * of the file -- even with the same identifier -- is a new request, so the host
+ * unlocks first and then asks, and the same boot can open several apps.
+ */
+static void *
+mondrian_open_thread(void *unused)
+{
+	struct timespec seen = { 0, 0 };
+
+	(void)unused;
+	for (;;) {
+		struct stat st;
+		FILE *file;
+		char bundle[160];
+		id workspace;
+		BOOL opened;
+
+		sleep(3);
+		if (stat("/private/var/vm/mondrian-open", &st) != 0) {
+			continue;
+		}
+		if (st.st_mtimespec.tv_sec == seen.tv_sec &&
+		    st.st_mtimespec.tv_nsec == seen.tv_nsec) {
+			continue;
+		}
+		seen = st.st_mtimespec;
+		file = fopen("/private/var/vm/mondrian-open", "r");
+		if (file == NULL || fgets(bundle, sizeof(bundle), file) == NULL) {
+			if (file != NULL) {
+				fclose(file);
+			}
+			continue;
+		}
+		fclose(file);
+		bundle[strcspn(bundle, "\r\n")] = '\0';
+		if (bundle[0] == '\0') {
+			continue;
+		}
+		workspace = ((id (*)(id, SEL))objc_msgSend)(
+		    (id)objc_getClass("LSApplicationWorkspace"),
+		    sel_registerName("defaultWorkspace"));
+		opened = workspace != nil &&
+		    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
+		    sel_registerName("openApplicationWithBundleID:"),
+		    [NSString stringWithUTF8String:bundle]);
+		mondrian_probe_fmt("MONDRIAN OPEN[%d]: %s -> %d\n", getpid(), bundle,
+		    opened ? 1 : 0);
+	}
+	return NULL;
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	mondrian_throw_original = (void (*)(id))mondrian_throw_interpose.replacee;
+	if (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0) {
+		pthread_t opener;
+
+		if (pthread_create(&opener, NULL, mondrian_open_thread, NULL) == 0) {
+			(void)pthread_detach(opener);
+		}
+	}
 	/*
 	 * Outside the probe gate on purpose: the question is whether the kernel
 	 * attaches entitlements at all, so the answer has to include the processes
 	 * that have never had a problem (SpringBoard, backboardd).
 	 */
-	if (mondrian_file_on("/private/var/vm/mondrian-ent")) {
+	if (mondrian_file_on("/private/var/vm/mondrian-images")) {
 		mondrian_ent_probe();
+		mondrian_tccd_probe();
+		mondrian_sec_probe();
 	}
 	/*
 	 * A switch that was written and is still not seen: open() tells a missing
@@ -13489,7 +13883,10 @@ mondrian_install_ui_hooks(void)
 	 * `wfile` of mondrian-ent reported 0 yet the probe never armed, so the
 	 * check's own errno is part of the answer.
 	 */
-	if (mondrian_probe_service()) {
+	if (mondrian_probe_service() ||
+	    (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0)) {
+		mondrian_install_privacy_hook();
+		mondrian_tcc_status_probe();
 		int fd = open("/private/var/vm/mondrian-ent", O_RDONLY);
 
 		if (fd < 0) {
