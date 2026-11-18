@@ -415,6 +415,29 @@ boot each, so the three columns differ only in what changed:
   does not help, and neither `TCCAccessPreflight` nor
   `TCCAccessCheckAuditToken` is ever called by assetsd: it links
   `TCC.framework` but imports no `TCCAccess*` symbol.
+- **The kernel does attach entitlements; the process still reads none.** `xnu
+  0366` prints the verdict per signature once, and a boot shows
+  `com.apple.xpc.launchd: attached, count 22`,
+  `com.apple.springboard: attached, count 395` and
+  `com.apple.assetsd: attached, count 62`, with 75 signatures that carry no XML
+  at all (ignition, fsck, the dyld shared cache). So `csblob_get_entitlements`
+  and the parser work, and the answer `csops` gives inside the same process --
+  zero -- is lost between the vnode's blob and the caller:
+  `csproc_get_blob` picks a blob by `p_textoff` out of the vnode's list, and
+  `CS_OPS_ENTITLEMENTS_BLOB` also answers zero when
+  `amfi->OSEntitlements_get_xml` fails, without setting an error. Both paths are
+  silent, which is why a `0` needs a kernel print of the blob it looked at, not
+  another hook.
+- **A hook change is only in the kernel when the kernel build rebuilds it.**
+  `tools/wsl/build-kernel.sh` embeds `out/gpu/mondrian-ui-hook.dylib` when the
+  file exists and never rebuilt it from `tools/mondrian-ui-hook.m`, so a kernel
+  built after a hook edit carried the previous copy: on 2026-11-18 a probe added
+  to the hook was absent from a fresh boot and read as a probe that never fires.
+  The build now rebuilds the hook when the source is newer. The `/private/var/vm`
+  copy is written by `glblob=1` at boot and answers `-> 30` (`EROFS`) while the
+  root is still read-only, then retries; until that write lands, execs load
+  whatever the file held from the previous boot, so compare sizes before
+  believing a new hook is running.
 - **The appex's death now has a message, and it is not the nil URL.** Measured
   2026-11-18 with the probe in mode 3 (`mondrian-exc` holding `3`: exception
   handlers, no URL resolvers), on the first `exec PhotosFileProvider` of a boot:
