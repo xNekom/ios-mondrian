@@ -257,13 +257,14 @@ Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
 draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
 whole. Photos opens and draws its own `Library` tab with the four tabs and
-`No Photos or Videos`, and an import now travels the whole path and stops on
-space: `PHPhotosErrorDomain 3305`, with `statfs` reporting 35 MB free of
-16384 MB. That is the next work item -- the root image was restored into the
-partition with 2.4 GB free, so the volume has lost about 2 GB of headroom and a
-repair is owed. `PhotosFileProvider` still dies in PlugInKit's launch check
-(`0354` answers the container query), `assetsd` and `fileproviderd` abort in
-their own code, and Phone, the App Store and the network are as before. The
+`No Photos or Videos`, and an import travels the whole path and stops on space:
+`PHPhotosErrorDomain 3305`, with `xnu 0370` counting 249 MB free by the bitmap
+and 217 MB by the counter. The volume is genuinely full, not leaking: the work
+item is space, and the 32 MB the counter sits below the bitmap belong to the
+free path in `BlockMarkFreeInternal`, which abandons a range at the first block
+that is already free. `PhotosFileProvider` still dies in PlugInKit's launch
+check (`0354` answers the container query), `assetsd` and `fileproviderd` abort
+in their own code, and Phone, the App Store and the network are as before. The
 measurements and the probes are in `docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device

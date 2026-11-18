@@ -681,9 +681,15 @@ boot each, so the three columns differ only in what changed:
   every run. Every crash writes the report it then cannot process, so it feeds
   itself. The kernel's `CRASH` record already carries the `pc` and the frame
   chain, so the reporter is redundant on this port: the hook exits at load in
-  that process unless `/private/var/vm/mondrian-reportcrash` exists. Measured
+  that process unless the boot arguments carry `mondrianreportcrash=1`. Measured
   with it in place: 0 `CRASH ReportCrash` over a five-minute window, and 30
   `exec`/`exit status 0x0` pairs.
+- **A switch written by `wfile` cannot be turned off again.** `wfile` creates the
+  file root-owned, and the process that would delete it runs as the user, so a
+  seed written once keeps applying (measured 2026-11-18: a stale
+  `mondrian-reportcrash` brought the crash loop back to three crashes in a boot
+  and no later write could undo it). A default-off switch that must never come
+  back belongs in the boot arguments, where the next boot clears it.
 - **A fault handler names the image, because the crash reporter cannot.** The
   hook arms `SIGSEGV`/`SIGBUS` for the probe targets and prints
   `MONDRIAN FAULT[pid]: sig <n> code <n> pc <image>+0x<off> far 0x<addr>`, which
@@ -691,28 +697,26 @@ boot each, so the three columns differ only in what changed:
   tables in the handler, since the stack is already gone by the time a report is
   read. `SA_RESETHAND` restores the default action, so returning still dies the
   way the process would have.
-- **The volume's used blocks and its files disagree, and it predates this
-  session.** Measured 2026-11-18 from inside the app: `statfs` reports 4194304
-  blocks, **46700 free (182 MB)** and **4757 available (18 MB)** of 16384 MB,
-  while a walk of the whole volume sees **12644 MB in 159230 files** and cannot
-  enter 43 root-owned trees. `/lost+found` is exonerated: `getattrlist` says one
-  entry and `st_blocks` 0, so a repair left nothing there. The same root's
-  backup image already shows the gap: `tools/hfs-audit.py` finds 2.4 GB free with
-  the header agreeing with the bitmap, while a 7-Zip listing of that image
-  carries only about 7.2 GB of file data. So the missing gigabytes are not
-  something this port wrote, and no userland count settles them: the answer is
-  `tools/hfs-audit.py` against the live partition (which needs a dump) or
-  `fsck`, not a walk. `f_bfree` versus `f_bavail` also proves the shortage is
-  not a reservation: the reserve and the loans withhold only about 165 MB.
+- **The volume really is full; the counter is 32 MB below the bitmap.** Measured
+  2026-11-18 with `xnu 0370`, which counts the allocation bitmap once per mount:
+  `MONDRIAN HFSAUDIT: total 4194304 counter 55600 bitmap 63774 diff 8174`, so
+  **249 MB free by the bitmap** and 217 MB by the counter `statfs` reports. The
+  volume is full of files, not of lost blocks. A userland walk cannot prove that
+  on its own: the app sees 12644 MB in 159230 files and cannot enter 43 root-owned
+  trees, and the same root's backup image carries only about 7.2 GB in a 7-Zip
+  listing while `tools/hfs-audit.py` counts 2.4 GB free, so a walk undercounts by
+  gigabytes and only the bitmap is authoritative. `/lost+found` is exonerated
+  (`getattrlist`: one entry, no blocks). `f_bfree` versus `f_bavail` rules out the
+  reservation too: the reserve and the loans withhold about 165 MB.
 - **The free path abandons a range at the first already-free block.**
   `BlockMarkFreeInternal` clears the words it has read and, on a word that is
   not entirely allocated, jumps to `Corruption`, which logs `trying to free
   unallocated blocks`, returns `hfsNotAllocatedErr` (the port's own -4210) and
   leaves the rest of the range allocated. `BlockDeallocate` then skips the
-  `freeBlocks` update on that error, so the counter ends below the bitmap. Read
-  it as a correctness defect on the free path: the ranges on record are 1 and 69
-  blocks, so 124 of them per boot cannot explain gigabytes, and a fix must free
-  what is set, skip what is free and add only the freed count to the counter.
+  `freeBlocks` update on that error, so the counter ends below the bitmap -- the
+  32 MB above, not the gigabytes. The ranges on record are 1 and 69 blocks, so
+  this is a correctness defect on the free path and a fix must free what is set,
+  skip what is free and add only the freed count to the counter.
 - **Photos has no library: TCC, then the library mode, then the volume.** Measured
   2026-11-18 with the app open and drawing its Library tab, in the order the
   chain was peeled: `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]`
@@ -725,16 +729,13 @@ boot each, so the three columns differ only in what changed:
   (`isMultiLibraryModeEnabled` is 0 at load and the shared library then throws
   `Calling single library mode API while in multi library mode`), and with that
   switch kept from flipping the shared library accepts a change and answers
-  `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. `statfs` on the volume says
-  **35 MB free of 16384 MB**, and the pictures fail there, not in PhotoKit. Free
-  space is the gate: the root image was restored into a 16 GB partition with
-  2.4 GB free (`tools/hfs-audit.py`, 596409 free blocks) and the live volume is
-  down to 35 MB, so something on the data volume is leaking blocks or the port
-  wrote 2 GB of its own. Probes: `/private/var/vm/mondrian-import` prints the
-  library answers at load, `mondrian-doimport` submits one picture,
-  `mondrian-du` prints the volume and the tree sizes. All are guarded: an
-  exception on the import thread kills the app, which is how the first attempt
-  died.
+  `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. With 217 MB of headroom the
+  picture fails there, not in PhotoKit, so the next move is space, not a driver:
+  `0370` says the bitmap agrees with the counter to within 32 MB, so nothing is
+  leaking. Probes: `/private/var/vm/mondrian-import` prints the library answers at
+  load, `mondrian-doimport` submits one picture, `mondrian-du` prints the volume
+  and the tree sizes. All are guarded: an exception on the import thread kills
+  the app, which is how the first attempt died.
 - **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
   2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
   `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app
