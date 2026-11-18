@@ -11924,6 +11924,162 @@ mondrian_xpc_probe_thread(void *unused)
 	return NULL;
 }
 
+static NSURL *(*mondrian_group_original)(id, SEL, NSString *);
+static NSURL *(*mondrian_url_for_dir_original)(id, SEL, NSUInteger, NSUInteger, NSURL *, BOOL, NSError **);
+static NSArray *(*mondrian_urls_for_dir_original)(id, SEL, NSUInteger, NSUInteger);
+
+/*
+ * Which path resolved to nil. The exception says the service passed a nil URL to
+ * -createDirectoryAtURL:, so the question is which resolver produced it: a group
+ * container, one of the standard directories, or the home the process thinks it
+ * has. Directory enum values are printed raw (1 Documents, 5 Library, 6 Caches,
+ * 13 ApplicationSupport on iOS) so the line stays short.
+ */
+static void
+mondrian_url_note(const char *what, unsigned long which, id value)
+{
+	if (value == nil) {
+		mondrian_probe_fmt("MONDRIAN URL[%d]: %s %lu -> nil\n", getpid(), what,
+		    which);
+		return;
+	}
+	if ([value isKindOfClass:[NSArray class]]) {
+		NSArray *list = value;
+
+		mondrian_probe_fmt("MONDRIAN URL[%d]: %s %lu -> %lu path %s\n",
+		    getpid(), what, which, (unsigned long)[list count],
+		    [list count] > 0
+		    ? [[[list objectAtIndex:0] path] UTF8String] : "-");
+		return;
+	}
+	{
+		NSString *s = [value isKindOfClass:[NSURL class]]
+		    ? [(NSURL *)value path] : [value description];
+
+		mondrian_probe_fmt("MONDRIAN URL[%d]: %s %lu -> %s\n", getpid(), what,
+		    which, s != nil ? [s UTF8String] : "-");
+	}
+}
+
+static NSURL *
+mondrian_group_url(id self, SEL _cmd, NSString *group)
+{
+	NSURL *result = mondrian_group_original != NULL
+	    ? mondrian_group_original(self, _cmd, group) : nil;
+
+	mondrian_probe_fmt("MONDRIAN URL[%d]: group %s\n", getpid(),
+	    group != nil ? [group UTF8String] : "-");
+	mondrian_url_note("group", 0, result);
+	return result;
+}
+
+static NSURL *
+mondrian_url_for_dir(id self, SEL _cmd, NSUInteger directory,
+    NSUInteger domains, NSURL *appropriate, BOOL create, NSError **error)
+{
+	NSURL *result = mondrian_url_for_dir_original != NULL
+	    ? mondrian_url_for_dir_original(self, _cmd, directory, domains,
+	    appropriate, create, error) : nil;
+
+	mondrian_url_note("urlForDirectory", (unsigned long)directory, result);
+	return result;
+}
+
+static NSArray *
+mondrian_urls_for_dir(id self, SEL _cmd, NSUInteger directory, NSUInteger domains)
+{
+	NSArray *result = mondrian_urls_for_dir_original != NULL
+	    ? mondrian_urls_for_dir_original(self, _cmd, directory, domains) : nil;
+
+	mondrian_url_note("urlsForDirectory", (unsigned long)directory, result);
+	return result;
+}
+
+static BOOL (*mondrian_create_dir_original)(id, SEL, NSURL *, BOOL, NSDictionary *, NSError **);
+
+/*
+ * Who asks for the nil URL. Nothing in the resolver hooks fired before the
+ * exception, so the URL is built (or left nil) elsewhere: this prints the caller
+ * of -createDirectoryAtURL: as image+offset, which tools/dsc-va.py turns into a
+ * cache image and a disassembly.
+ */
+static BOOL
+mondrian_create_dir(id self, SEL _cmd, NSURL *url, BOOL intermediate,
+    NSDictionary *attributes, NSError **error)
+{
+	static unsigned said;
+
+	if (url == nil && said < 3) {
+		void *frames[20];
+		int n = backtrace(frames, 20);
+		int i;
+
+		said++;
+		mondrian_probe_fmt("MONDRIAN URL[%d]: createDirectoryAtURL nil\n",
+		    getpid());
+		for (i = 1; i < n && i < 12; i++) {
+			Dl_info info;
+			const char *base;
+
+			if (dladdr(frames[i], &info) == 0 || info.dli_fname == NULL) {
+				continue;
+			}
+			base = strrchr(info.dli_fname, '/');
+			mondrian_probe_fmt("MONDRIAN URL[%d]:   #%d %s+0x%lx\n",
+			    getpid(), i, base != NULL ? base + 1 : info.dli_fname,
+			    (unsigned long)((uintptr_t)frames[i] -
+			    (uintptr_t)info.dli_fbase));
+		}
+	}
+	return mondrian_create_dir_original != NULL
+	    ? mondrian_create_dir_original(self, _cmd, url, intermediate,
+	    attributes, error) : NO;
+}
+
+static void
+mondrian_probe_urls(void)
+{
+	Class cls = objc_getClass("NSFileManager");
+	Method method;
+
+	if (cls == Nil) {
+		return;
+	}
+	method = class_getInstanceMethod(cls,
+	    sel_registerName("createDirectoryAtURL:withIntermediateDirectories:attributes:error:"));
+	if (method != NULL) {
+		mondrian_create_dir_original = (BOOL (*)(id, SEL, NSURL *, BOOL,
+		    NSDictionary *, NSError **))method_setImplementation(method,
+		    (IMP)mondrian_create_dir);
+	}
+	method = class_getInstanceMethod(cls,
+	    sel_registerName("containerURLForSecurityApplicationGroupIdentifier:"));
+	if (method != NULL) {
+		mondrian_group_original = (NSURL *(*)(id, SEL, NSString *))
+		    method_setImplementation(method, (IMP)mondrian_group_url);
+	}
+	method = class_getInstanceMethod(cls,
+	    sel_registerName("URLForDirectory:inDomains:appropriateForURL:create:error:"));
+	if (method != NULL) {
+		mondrian_url_for_dir_original =
+		    (NSURL *(*)(id, SEL, NSUInteger, NSUInteger, NSURL *, BOOL,
+		    NSError **))method_setImplementation(method,
+		    (IMP)mondrian_url_for_dir);
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("URLsForDirectory:inDomains:"));
+	if (method != NULL) {
+		mondrian_urls_for_dir_original = (NSArray *(*)(id, SEL, NSUInteger,
+		    NSUInteger))method_setImplementation(method,
+		    (IMP)mondrian_urls_for_dir);
+	}
+	mondrian_probe_fmt("MONDRIAN URL[%d]: hooks group %d dir %d dirs %d create %d home %s\n",
+	    getpid(), mondrian_group_original != NULL,
+	    mondrian_url_for_dir_original != NULL,
+	    mondrian_urls_for_dir_original != NULL,
+	    mondrian_create_dir_original != NULL,
+	    NSHomeDirectory() != nil ? [NSHomeDirectory() UTF8String] : "nil");
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -11933,6 +12089,7 @@ mondrian_install_ui_hooks(void)
 		if (mondrian_file_on("/private/var/vm/mondrian-exc")) {
 			mondrian_exc_install();
 			mondrian_probe_raise();
+			mondrian_probe_urls();
 		} else {
 			mondrian_exc_say("MONDRIAN EXC: switch off, probe idle\n");
 		}

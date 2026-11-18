@@ -330,6 +330,18 @@ boot each, so the three columns differ only in what changed:
   the handler that `std::set_terminate` returns branches to a pointer that is not
   callable here (`pc 0xffffffffa7f9aa80`). The reason string is still valid
   because the exception is raised, and printed, before either of those.
+- **The nil URL is a group container, and the container service is what is
+  missing.** The appex carries its own entitlements (`com.apple.security.
+  application-groups` = `group.com.apple.mobileslideshow.PhotosFileProvider`) and
+  the root holds a container whose metadata claims exactly that identifier, so
+  neither the entitlement nor the directory is absent. What is absent is the
+  process that answers: measured on that boot, `containermanagerd` appears in
+  none of 2870 `exec` lines, while `bootstrap_look_up` of
+  `com.apple.containermanagerd` returns 0 -- registered, never spawned, and no
+  `EXECFAIL` or `exit` line to say why. That is the shape to chase next: a
+  service that launchd accepts a lookup for and does not start, which is
+  launchd-side and needs the hook in launchd (`mondrian_ui_hook` bit 32) or a
+  manual spawn to tell "never asked" from "asked and refused".
 - **The App Library's background is a capture nobody fills.** Measured
   2026-11-17: the library's background is one full-screen quad (program 21,
   blend off) over a material that asks the window server to capture the wallpaper
