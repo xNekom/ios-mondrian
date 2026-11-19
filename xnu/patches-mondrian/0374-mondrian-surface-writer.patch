@@ -1,0 +1,104 @@
+xnu 0374: log who fills a picture surface
+
+Measured 2026-11-19: the picture imported into Photos draws black. The 800 x 600
+and 640 x 480 surfaces the window server shows for it read as all zero from inside
+backboardd with a seed of 1 -- one write lock and no colour -- and only the create
+names a process (backboardd). A surface is one buffer mapped into every client that
+looks it up, so what the black leaves open is who filled it: the server, the app,
+or nobody at all.
+
+Every lookup of a picture-sized surface and every lock and unlock of one now
+carries the calling process in the ring. Picture-sized means large enough to hold
+the photograph and small enough to keep the 1440 x 3200 display surfaces out.
+`options 0x1` is the read-only lock the renderer takes before it uploads what it
+was shown; `options 0x0` is a writer, and the seed on the unlock says whether that
+writer counted. A surface that is only ever read and never written says the pixels
+were never put there, which is a different fix from a surface that was written
+with zeros.
+
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -501,6 +501,43 @@ mondrian_surf_log_once(const char *what, uint32_t n)
+ 	IOLog("MONDRIAN SURF: %s %s %u\n", name, what, n);
+ }
+ 
++/*
++ * Who writes a picture surface.
++ *
++ * Measured 2026-11-19: the picture imported into Photos draws black. The 800 x
++ * 600 and 640 x 480 surfaces the window server shows for it read as all zero from
++ * inside backboardd with a seed of 1 -- one write lock and no colour -- and only
++ * the create names a process (backboardd). A surface is one buffer mapped into
++ * every client that looks it up, so the question the black leaves is who filled
++ * it: the server, the app, or nobody.
++ *
++ * Every lookup of a picture-sized surface and every lock and unlock of one is
++ * logged with the calling process. Picture-sized means large enough that it can
++ * hold the photograph, small enough that the 1440 x 3200 display surfaces stay
++ * out, and with no pixel format: every surface the window server keeps a picture
++ * in is created without one, while the wallpaper's L008 and the display's b3a8
++ * carry theirs, and those two filled the log's first run before the app had drawn
++ * anything. `options 0x1` is the read-only lock the renderer takes before
++ * uploading, `options 0` is a writer, and the seed on the unlock says whether that
++ * writer counted. A surface that is only ever read, never written, says the pixels
++ * were never put there at all.
++ */
++static void
++mondrian_surf_writer(MondrianSurface *s, const char *what, uintptr_t options)
++{
++	static unsigned told;
++	char name[32];
++
++	if (s == NULL || told >= 96 || s->width < 320 || s->height < 240 ||
++	    s->pixelFormat != 0 || (uint64_t)s->width * (uint64_t)s->height > 2000000) {
++		return;
++	}
++	told++;
++	proc_selfname(name, sizeof(name));
++	IOLog("MONDRIAN SURF: %s %s id %u %ux%u options %#lx seed %u\n", name, what,
++	    s->id, s->width, s->height, (unsigned long)options, *mondrian_surface_seed(s));
++}
++
+ bool
+ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -801,6 +838,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		MondrianSurface *s = mondrian_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+ 		if (s != NULL) {
++			mondrian_surf_writer(s, "lookup", (uintptr_t)arg0);
+ 			ret = mondrian_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
+ 			s->release();
+ 		}
+@@ -812,6 +850,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
+ 		MondrianSurface *s = OSDynamicCast(MondrianSurface, obj);
+ 		if (ret == kIOReturnSuccess) {
++			mondrian_surf_writer(s, "port", (uintptr_t)arg0);
+ 			ret = (s != NULL && mondrian_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
+ 		}
+ 		OSSafeReleaseNULL(obj);
+@@ -893,13 +932,14 @@ mondrian_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
++IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+ 	MondrianSurface *s = mondrian_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	mondrian_surf_writer(s, "lock", (uintptr_t)options);
+ 	IOReturn ret = mondrian_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -913,6 +953,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	mondrian_surf_writer(s, "unlock", (uintptr_t)options);
+ 	IOReturn ret = mondrian_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
