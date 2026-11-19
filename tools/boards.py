@@ -363,9 +363,16 @@ MONDRIAN = Board(
              # the idle timer still never fires, so the holds are the default
              # (docs/MONDIAN_PORT.md). `mondrianautolock=N` writes the root's
              # auto-lock preference (measured missing: SBLockScreenAutoLockTime;
-             # the hook prints it).
-             'mondrian_ui_hook=262 mondrian_gpu_hook=1 mondriankeepawake=0 '
-             'mondriansample=logd,backboardd,SpringBoard '
+             # the hook prints it). The holds stay on: with them off the phone
+             # locks itself mid-experiment and every UI test then needs a hand
+             # on the glass (measured 2026-11-19). `mondrianunlock=1` is what
+             # makes the boot testable without a hand: a cold boot starts at the
+             # lock screen and the hook opens it and re-requests it every
+             # minute. The sampler (`mondriansample=`) is a diagnostic and is
+             # added per experiment, not carried here: with it the line is
+             # 608 bytes and the kernel refuses every reader.
+             'mondrian_ui_hook=262 mondrian_gpu_hook=1 mondriankeepawake=1 '
+             'mondrianunlock=1 '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does
