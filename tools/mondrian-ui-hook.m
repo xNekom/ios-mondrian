@@ -1016,6 +1016,89 @@ mondrian_decode_probe(NSString *path)
 	}
 }
 
+/*
+ * The layer between the decoded file and the screen.
+ *
+ * Measured 2026-11-19: ImageIO decodes the imported file to its four coloured
+ * quadrants inside the app, the compositor uploads an 800x600x4 surface when the
+ * viewer opens, and the tile and the viewer both draw black. Those two facts do
+ * not say whether the app ever receives the image: PhotoKit's own path for a
+ * photo is a thumbnail request, and on a port without `IOSurfaceAccelerator` a
+ * scaling step can fail and hand back nothing. This asks `PHImageManager` for the
+ * first asset's thumbnail synchronously and reads the result back: a coloured
+ * UIImage here puts the loss in the upload to the layer; nil or black here puts it
+ * inside PhotoKit.
+ */
+static void
+mondrian_image_probe(void)
+{
+	Class asset_class = objc_getClass("PHAsset");
+	Class fetch_class = objc_getClass("PHFetchOptions");
+	Class manager_class = objc_getClass("PHImageManager");
+	Class request_class = objc_getClass("PHImageRequestOptions");
+	id assets, first, manager, options;
+
+	if (asset_class == Nil || fetch_class == Nil || manager_class == Nil ||
+	    request_class == Nil) {
+		mondrian_probe_fmt("MONDRIAN IMAGE[%d]: no PhotoKit\n", getpid());
+		return;
+	}
+	assets = ((id (*)(id, SEL, id))objc_msgSend)(asset_class,
+	    sel_registerName("fetchAssetsWithOptions:"), [fetch_class new]);
+	if (assets == nil ||
+	    ((unsigned long (*)(id, SEL))objc_msgSend)(assets,
+	    sel_registerName("count")) == 0) {
+		mondrian_probe_fmt("MONDRIAN IMAGE[%d]: no asset\n", getpid());
+		return;
+	}
+	first = ((id (*)(id, SEL, unsigned long))objc_msgSend)(assets,
+	    sel_registerName("objectAtIndex:"), 0);
+	manager = ((id (*)(id, SEL))objc_msgSend)(manager_class,
+	    sel_registerName("defaultManager"));
+	options = [request_class new];
+	((void (*)(id, SEL, BOOL))objc_msgSend)(options,
+	    sel_registerName("setSynchronous:"), YES);
+	((void (*)(id, SEL, id, CGSize, long, id, id))objc_msgSend)(manager,
+	    sel_registerName("requestImageForAsset:targetSize:contentMode:"
+	    "options:resultHandler:"), first, CGSizeMake(200, 200), 0, options,
+	    ^(id image, id info) {
+		CGImageRef cg;
+
+		if (image == nil) {
+			mondrian_probe_fmt("MONDRIAN IMAGE[%d]: nil image %s\n",
+			    getpid(), [[info description] UTF8String]);
+			return;
+		}
+		cg = (CGImageRef)(uintptr_t)((void *(*)(id, SEL))objc_msgSend)(
+		    image, sel_registerName("CGImage"));
+		if (cg == NULL) {
+			mondrian_probe_fmt("MONDRIAN IMAGE[%d]: no CGImage\n",
+			    getpid());
+			return;
+		}
+		{
+			unsigned char px[16];
+			CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+			CGContextRef context = CGBitmapContextCreate(px, 2, 2, 8,
+			    8, space, kCGImageAlphaPremultipliedLast);
+
+			memset(px, 0, sizeof(px));
+			if (context != NULL) {
+				CGContextDrawImage(context, CGRectMake(0, 0, 2, 2),
+				    cg);
+				mondrian_probe_fmt("MONDRIAN IMAGE[%d]: %zux%zu "
+				    "quadrants %d,%d,%d | %d,%d,%d | %d,%d,%d | "
+				    "%d,%d,%d\n", getpid(), CGImageGetWidth(cg),
+				    CGImageGetHeight(cg), px[0], px[1], px[2],
+				    px[4], px[5], px[6], px[8], px[9], px[10],
+				    px[12], px[13], px[14]);
+				CGContextRelease(context);
+			}
+			CGColorSpaceRelease(space);
+		}
+	});
+}
+
 static void *
 mondrian_import_thread(void *unused)
 {
@@ -1068,6 +1151,7 @@ mondrian_import_thread(void *unused)
 	 * decoder produces colour or black -- is independent of that.
 	 */
 	mondrian_decode_probe([source path]);
+	mondrian_image_probe();
 	if (have > 0) {
 		mondrian_touch("/private/var/vm/mondrian-imported");
 		return NULL;
