@@ -739,15 +739,34 @@ boot each, so the three columns differ only in what changed:
   `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. That answer is about space and
   nothing else: `0370` puts the bitmap within 32 MB of the counter, `0371` stops
   the mount withholding 164 MB as `f_bavail` 0, and `0372` stops the free path
-  leaking what it deletes. Probes:
-  `/private/var/vm/mondrian-import` prints the library answers at
-  load, `mondrian-doimport` submits one picture, `mondrian-du` prints the volume
-  and the tree sizes. All are guarded: an exception on the import thread kills
-  the app, which is how the first attempt died. The probes only reach the app when
-  the exec probe matches it, and an app does not exec under its bare name: it
-  arrives as `/Applications/MobileSlideShow.app/MobileSlideShow` through a
-  `posix_spawn` with no nameidata, so `0371` compares the last component and falls
-  back to the executable's vnode name.
+  leaking what it deletes.
+- **The import works and the library keeps the asset; the picture draws black.**
+  Measured 2026-11-19 on the restored volume: `library has 0`, `staged 1 at
+  /var/tmp/mondrian-photo.png`, `free 2078 MB of 16384 MB`, `shared available`,
+  `submitted via shared`, **`shared success 1`**. The Library then draws one tile
+  (black), the viewer opens on it with `Today` and its toolbar, and the next boot
+  answers `library has 1`, so the asset is in the store and survives a reboot.
+  The pixels are not the decoder's: `MONDRIAN DECODE[266]: 800x600 bpp 32
+  quadrants 208,63,53 | 54,152,195 | 230,194,44 | 48,171,88` -- ImageIO inside the
+  app returns the four coloured quadrants the file carries. The compositor logs
+  the upload at the moment the viewer opens (`1 textures refilled from IOSurfaces
+  (1875 KB)`, exactly 800x600x4), so the black sits between the decoded image and
+  the layer that shows it. The next instrument is the app's own thumbnail:
+  `PHImageManager requestImageForAsset:` and read the returned `UIImage`'s pixels;
+  colour there and black on screen puts it in the surface upload, black there puts
+  it in PhotoKit's scaling (`IOSurfaceAccelerator`), which this port does not have.
+  A `deltree` of the trees a boot regrows frees nothing on this image: their
+  catalog valence is 4, 9 and 10 and the plain readdir returns only the two dots,
+  so the entries the valence counts are not in the catalog at all. Probes:
+  `mondrian-import` prints the library answers at load and runs the import,
+  `mondrian-doimport` alone submits one picture, `mondrian-du` prints the volume
+  and the tree sizes, `mondrian-decode`'s readback is the `MONDRIAN DECODE` line.
+  They reach the app through the exec probe, and an app does not exec under its
+  bare name: it arrives as `/Applications/MobileSlideShow.app/MobileSlideShow`
+  through a `posix_spawn` with no nameidata, so `0371` compares the last component
+  and falls back to the executable's vnode name. The gate itself has to run before
+  the probe-service branch, which returns for `MobileSlideShow`: that early return
+  is why two sessions of "the import prints nothing" looked like a missing hook.
 - **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
   2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
   `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app

@@ -256,19 +256,19 @@ with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
 draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
-whole. Photos opens and draws its own `Library` tab with the four tabs and
-`No Photos or Videos`, and an import travels the whole path and stops on space:
-`PHPhotosErrorDomain 3305`. That is measured, not inferred: `xnu 0370` counts
-249 MB free by the bitmap against 217 MB by the counter, `0371` shows the mount
-withholding 164 MB of that as a free-block reserve with `f_bavail` at 0, and
-`0372` shows the free path returning 24 of the 256 blocks a 1 MiB delete should
-return, which is why the volume reached zero free blocks inside one session. The
-reserve is dropped and the free path counts what it clears; the work item is a
-volume of 16 GiB in a 242 GiB partition, and the allocation side still needs the
-same audit. `PhotosFileProvider` still dies in PlugInKit's launch
-check (`0354` answers the container query), `assetsd` and `fileproviderd` abort
-in their own code, and Phone, the App Store and the network are as before. The
-measurements and the probes are in `docs/UI_PERFORMANCE.md`.
+whole. Measured 2026-11-19 on the restored volume: Photos completes its first-run
+flow, its import answers **`shared success 1`**, the Library draws one tile, the
+viewer opens on it, and the next boot reports `library has 1` -- the asset is in
+the store and survives a reboot. The picture itself draws **black**, and the
+decoder is exonerated: ImageIO inside the app returns the four coloured
+quadrants the file carries, while the compositor logs an 1875 KB surface upload
+(800x600x4) at the moment the viewer opens, so the black sits between the decode
+and the layer. That is the next instrument. The space chain behind it is also
+measured: `0371` drops the 164 MB reserve that held `f_bavail` at 0, and `0372`
+counts the blocks a free actually clears. `PhotosFileProvider` still dies in
+PlugInKit's launch check (`0354` answers the container query), `assetsd` and
+`fileproviderd` abort in their own code, and Phone, the App Store and the network
+are as before. The measurements and the probes are in `docs/UI_PERFORMANCE.md`.
 
 ## Getting the numbers off the device
 
