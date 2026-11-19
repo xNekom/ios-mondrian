@@ -983,10 +983,14 @@ answers, and only a reset leaves it. The ring is what to read, and
 Measured 2026-11-19: the black page reproduces, but the home gesture still
 presents, so the compositor is not lost in this boot; the `AA` menu opens and
 draws white, and the address field does not focus under the synthetic touch. A
-local page is the next test: it separates the network from WebKit and the native
-chrome. With host NAT and the 1.1.1.1/8.8.8.8 resolvers the page is still black;
-the net log shows `ue0` 192.168.7.2 and the loopback routes but no `tcp
-1.1.1.1:80` or `getaddrinfo` success line, so the network leg is unproven too.
+local page at `http://192.168.7.1:8000/` opens through `mondrian-open` and loads:
+the host's HTTP server logs the page's icon GETs from 192.168.7.2, `pipelined`
+exits 0 and no WebContent crash appears -- and the page still draws black. The
+network is therefore not the cause; WebKit's page does not reach the glass,
+which is the same server-side surface path as the Photos picture. The URL path
+uses `LSApplicationWorkspace openURL:withOptions:`; the `UIApplication openURL:`
+variant aborted SpringBoard in a loop (sig 6, libc++abi terminate) because the
+`mondrian-open` thread is not the main thread.
 
 The idle path had a second cause and it was ours. Until `0342` the driver
 painted the framebuffer black when the blank fired, and the wake lived inside
