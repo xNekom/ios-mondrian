@@ -70,9 +70,9 @@ Current blockers, in order:
    injector in `backboardd`, `docs/MONDIAN_GPU.md`) without a present switches the
    panel off with DCS `0x28`; a key or touch switches it back on (`0x29`) from the
    tick, never from a frame -- iOS has stopped its display link, so a tap presents
-   nothing (`0342`). The holds stay off (`mondriankeepawake=0`) and iOS's timer
-   never arms: `SBLockScreenAutoLockTime` was missing (the hook writes it) and
-   `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
+   nothing (`0342`). The holds stay on (`mondriankeepawake=1`), and
+   `mondrianunlock=1` opens the lock screen: with the holds off the phone locked
+   itself mid-experiment (measured 2026-11-19).
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
    and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is
    out of reach: the level is a voltage table (`0304`), anchored to the Android
