@@ -1,0 +1,154 @@
+xnu 0384: a GPU buffer of the calling process's pages (0x7d)
+
+Turnip imports a texture over an IOSurface by the surface's base
+address when its surface table does not name the id, and that path asked
+the kernel for a buffer of those pages and got ENOSYS: the user client
+knew 0x7e (a surface by id) and nothing beside it. Measured 2026-11-19,
+the ring's line is "TU: error: import of host pages 0x... refused:
+Function not implemented", and m2v_test's IOSurface texture reads
+back zero because of it.
+
+0x7d describes the range with IOMemoryDescriptor::withAddressRange()
+on the calling task (which refuses an address the process does not own),
+prepares it so the pages are wired, and hands it to the same
+bufferAdopt() a surface takes: one IOVA, page by page. The descriptor is
+completed when the buffer is freed.
+
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -7,6 +7,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOUserClient.h>
+ #include <kern/clock.h>
++#include <kern/task.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ 
+@@ -38,6 +39,7 @@
+ 	kMsmSubmitQueueNew   = 0x4a,
+ 	kMsmSubmitQueueClose = 0x4b,
+ 	kMsmSubmitQueueQuery = 0x4c,
++	kMondrianUserMemory  = 0x7d,
+ 	kMondrianSurface     = 0x7e,
+ };
+ 
+@@ -115,6 +117,17 @@
+ 	uint32_t width, height, pixelFormat, planes;	/* and what they are */
+ };
+ 
++/*
++ * Pages of the calling process as a GPU buffer (0x7d). Turnip's import of an
++ * IOSurface's memory takes this path when it has the surface's base address
++ * and not its id: the texture's own pages, mapped at one IOVA, exactly as a
++ * surface's are by 0x7e.
++ */
++struct mondrian_user_memory {
++	uint64_t address, size;		/* in: pages of this process */
++	uint32_t handle, flags;		/* back: the GEM handle */
++};
++
+ #define MSM_INFO_GET_IOVA	0x01
+ #define MSM_INFO_SET_IOVA	0x04
+ #define MSM_INFO_GET_FLAGS	0x05
+@@ -203,6 +216,7 @@
+ 	IOMemoryDescriptor *memory;
+ 	bool dirty;
+ 	bool mapped;
++	bool prepared;		/* the descriptor was prepared here: complete it on free */
+ };
+ 
+ class MondrianGPU;
+@@ -226,6 +240,7 @@
+ 	IOReturn gemNew(struct msm_gem_new *request);
+ 	IOReturn gemInfo(struct msm_gem_info *request);
+ 	IOReturn surfaceBuffer(struct mondrian_surface *request);
++	IOReturn userMemory(struct mondrian_user_memory *request);
+ 	IOReturn submit(struct msm_gem_submit *request);
+ 	IOReturn expandDrawState(mondrian_buffer *src, uint32_t offset,
+ 	    uint32_t size, uint64_t *ib, uint32_t *dwords);
+@@ -677,6 +692,7 @@
+ 	 * once. After that it is only ever synced if the task maps it. */
+ 	buffer->dirty = true;
+ 	buffer->mapped = false;
++	buffer->prepared = false;
+ 	fBuffers[fBufferCount++] = buffer;
+ 	mondrian_gpu_buffer_bytes += size;
+ 	mondrian_gpu_buffer_count++;
+@@ -754,6 +770,9 @@
+ 	(void)mondrian_gpu_uc_tables_sync();
+ 	mondrian_gpu_uc_iova_free(buffer->iova, buffer->size);
+ 	if (buffer->memory != NULL) {
++		if (buffer->prepared) {
++			buffer->memory->complete(kIODirectionInOut);
++		}
+ 		buffer->memory->release();
+ 	}
+ 	mondrian_gpu_buffer_bytes -= buffer->size;
+@@ -870,6 +889,49 @@
+ }
+ 
+ /*
++ * Pages of this process as a GPU buffer (0x7d): what Turnip's host-pointer
++ * import needs when the address is an IOSurface's and the kernel's surface
++ * table is not what named it. withAddressRange() with the calling task refuses
++ * a range the process does not own, prepare() wires it, and the buffer's own
++ * free completes it, so the pages stay wired exactly while the GPU may read
++ * them. The rest is the surface path: one IOVA, page by page.
++ */
++IOReturn
++MondrianGPUUserClient::userMemory(struct mondrian_user_memory *request)
++{
++	IOMemoryDescriptor *memory;
++	mondrian_buffer *buffer;
++
++	if (request->address == 0 || request->size == 0 ||
++	    request->size > kMondrianBufferMax) {
++		return kIOReturnBadArgument;
++	}
++	/* OSPtr here is the pointer itself: withAddressRange() hands back one
++	 * reference, and bufferAdopt() takes its own. */
++	memory = IOMemoryDescriptor::withAddressRange(request->address,
++	    request->size, kIODirectionInOut, current_task());
++	if (memory == nullptr) {
++		return kIOReturnBadArgument;
++	}
++	if (memory->prepare(kIODirectionInOut) != kIOReturnSuccess) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(fLock);
++	buffer = bufferAdopt(memory, request->size);
++	IOLockUnlock(fLock);
++	if (buffer == nullptr) {
++		memory->complete(kIODirectionInOut);
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	memory->release();
++	buffer->prepared = true;
++	request->handle = buffer->handle;
++	return kIOReturnSuccess;
++}
++
++/*
+  * gpu2dfill=1: replay one of Mesa's own 2D clears, from the kernel.
+  *
+  * Nothing Mesa draws reaches memory -- with the 2D blitter and with the generic
+@@ -2279,6 +2341,7 @@
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct mondrian_surface surface;
++		struct mondrian_user_memory user;
+ 	} request;
+ 	size_t size = arguments->structureInputSize;
+ 	IOReturn result = kIOReturnSuccess;
+@@ -2367,6 +2430,9 @@
+ 		break;
+ 	case kMsmSubmitQueueQuery:
+ 		break;
++	case kMondrianUserMemory:
++		result = userMemory(&request.user);
++		break;
+ 	case kMondrianSurface:
+ 		result = surfaceBuffer(&request.surface);
+ 		break;
