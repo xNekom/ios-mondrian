@@ -37,6 +37,12 @@ and they stay in the ring after the gesture).
   the touch never reached the driver. None of it costs a rebuild.
   `present 0/s` in the same dump is the still screen, not a fault: the samples
   that follow a touch read 4-5/s.
+  Measured 2026-11-19 with `PREFIX_ARGS=mondrianfb_blank=30` (so 30 is the
+  first occurrence and the board's 0 cannot win): a 60 s idle window still
+  logged no `panel blank`, no `panel wake` and no `MONDRIAN BL` DCS line, and
+  the lock screen read `present 0/s`. The timer is gated on
+  `fLastPresentTicks != 0`, so a boot whose screen never had a CA present cannot
+  arm it; print that gate before changing the timer. The default remains 0.
 
 - **An app launch that times out freezes the compositor.** Measured chain, all
   in the ring: SpringBoard's launch thread waits on an `os_unfair_lock` inside
@@ -978,7 +984,9 @@ Measured 2026-11-19: the black page reproduces, but the home gesture still
 presents, so the compositor is not lost in this boot; the `AA` menu opens and
 draws white, and the address field does not focus under the synthetic touch. A
 local page is the next test: it separates the network from WebKit and the native
-chrome.
+chrome. With host NAT and the 1.1.1.1/8.8.8.8 resolvers the page is still black;
+the net log shows `ue0` 192.168.7.2 and the loopback routes but no `tcp
+1.1.1.1:80` or `getaddrinfo` success line, so the network leg is unproven too.
 
 The idle path had a second cause and it was ours. Until `0342` the driver
 painted the framebuffer black when the blank fired, and the wake lived inside
