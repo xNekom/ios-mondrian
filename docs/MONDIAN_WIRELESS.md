@@ -564,11 +564,25 @@ FindLocalMacAddress Local address from plist:5d:75:0d:31:3f:87.
 
 There is no "No valid serial port found" line, so the `access()` on
 `/dev/cu.bluetooth` **succeeded**: the node is visible and the failure is after
-it. The exit itself is silent, so the next lever is the daemon's own knobs,
-read out of its binary: `BT_HCI_TRANSPORT` (format `NAME:param:param`, table
-`USB`, `H4DS`, `H4BC`, `H4`, `H5`, `APPLEBT`, `VIRT`, `PCIE`, `PCIESW`),
-`BT_BAUDRATE`, `BT_CHIP` and `BT_DEVICE_ADDRESS`. The job carries them as
-`EnvironmentVariables` in the launchd table.
+it. The exit itself is silent, and the reason is the transport: `bluetoothd`
+reads `BT_HCI_TRANSPORT`, and when the variable is absent it asks the
+IORegistry for `marconi-bt` then `bluetooth` and falls back to **USB**, which
+this phone does not have on that bus - so it exits before it opens anything.
+
+The variable's format is `TRANSPORT:DRIVER[:PARAM]`, measured in the binary:
+`0x1001561a0` `strtok()`s on `:` and matches the first token against the
+transport table at `0x1007fd3e0` (`USB`, `H4DS`, `H4BC`, `H4`, `H5`, `APPLEBT`,
+`VIRT`, `PCIE`, `PCIESW`) and the second against the driver table at
+`0x1007fd430` (`USB`, `POSIX`, `APPLEBT`, `VIRT`, `PCIE`, `PCIESW`). `POSIX` is
+the driver that opens a device path, and it is also the one the daemon probes
+by hand: `access("/dev/cu.bluetooth")`, then `/dev/uart.bluetooth`, and only
+then the `IOServiceNameMatching` calls. So the value to try is `H4:POSIX`.
+
+`BT_DEVICE_ADDRESS` is not a lever: set, the daemon prints `Local address from
+ENV:...` and then `Not a valid MAC address (all 00s)` / `No bluetooth on this
+device`, exiting clean. The string it echoes and the address it parses are two
+different reads, so the variable leaves the address zero and takes the
+"no bluetooth" branch.
 
 Two ways of listening to it do not work, both measured. `/dev/console` as the
 job's `StandardErrorPath` leaves nothing in the dump while
@@ -586,13 +600,27 @@ plist whose `LaunchDaemons` dictionary is keyed by the plist path
 (`/System/Library/LaunchDaemons/com.apple.bluetoothd.plist` is the key for this
 job). The individual plists are the build input, and editing one changes
 nothing: measured, a job given a different `ProgramArguments` kept exec'ing the
-old binary across reboots, even after unlinking and recreating the plist. The
-board's command line carries `launchd_unsecure_cache=1`, which is what lets a
-table written by hand load at all; edit the job in that table instead.
+old binary across reboots, even after unlinking and recreating the plist.
 
-Two things about that table are measured. There is **no shell on this root**,
-so a job cannot be wrapped in `sh -c`: launchd refuses the spawn, and its own
-error does reach the ring as
+**The table itself stops the boot when it is edited.** Written with
+`BT_HCI_TRANSPORT` and `StandardErrorPath` in the job, the boot stops at two
+processes on both kernels: `launchd_cache_loader` reports `Cache sent to
+launchd successfully`, launchd never prints its UUID or `Early boot complete`,
+and SpringBoard never runs. Writing the image's own bytes back restores it.
+`launchd_unsecure_cache=1` is what lets a table that does not match the image
+load far enough to reach that point, so it is not a way to change a job. Two
+more details make the writes hard to reason about: a shorter write leaves the
+previous tail in place (`rf` past the end then still answers), and `del`, the
+only way to start the file over, exists only on kernels that carry `0387`.
+
+The variables therefore arrive at exec: `0388` gives `bluetoothd`
+`BT_HCI_TRANSPORT=H4:POSIX` in its new process image, the same lever `0385`
+uses for WebKit's GPU process, gated by `mondrianbt=1` so that no ordinary
+boot changes. The next measurement is the tty's own lines: `open pid`,
+`termios ispeed`, and the first `tx`/`rx`.
+
+There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
+launchd refuses the spawn, and its own error does reach the ring as
 `com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
 'com.apple.bluetoothd' Executable: '/bin/sh'`, which makes that channel the
 place to look when a job silently does not run. The redirection therefore has
@@ -636,10 +664,10 @@ without PCIe, MHI or a 802.11 stack, and it produces a visible result
 3. The node is `0386`: a tty created before `bluetoothd` looks for it, powered
    and programmed on first open, with its first packets on the ring. The
    command line carries `wlan.debug.generate-mac` because without a local
-   address the process exits before any transport. What is left is why the
-   transport selection still exits 1 with the node present: the job's stderr
-   now goes to a file that `rf` reads (`0387`), and the next measurement is
-   that file.
+   address the process exits before any transport, and `mondrianbt=1` because
+   the daemon otherwise selects USB and exits before it opens the node
+   (`0388`). The next measurement is the tty's `open`/`termios`/`tx`/`rx`
+   lines.
 4. Pairing and A2DP. SCO audio needs the SLIMbus/PCM route, which is a
    separate piece of work.
 
