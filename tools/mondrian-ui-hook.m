@@ -65,6 +65,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 #include <mach-o/nlist.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
+#include <ImageIO/ImageIO.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -953,6 +954,68 @@ mondrian_du_report(void *unused)
 	return NULL;
 }
 
+/*
+ * What the decoder makes of the picture.
+ *
+ * Measured 2026-11-19: the import succeeds (`shared success 1`), the Library
+ * draws one tile, the viewer opens on it, and both are black -- while the source
+ * PNG decodes to four coloured quadrants on the host. The compositor's log shows
+ * the upload at that moment (`1 textures refilled from IOSurfaces (1875 KB)`,
+ * exactly 800x600x4), so either the bytes were already black before the upload or
+ * the upload read them wrong. This decodes the staged file through ImageIO and
+ * reads the four quadrants back: colour here and black on screen is the upload
+ * path, black here is the decoder. Either answer names the layer.
+ */
+static void
+mondrian_decode_probe(NSString *path)
+{
+	const char *file = [path UTF8String];
+	CFURLRef url;
+	CGImageSourceRef source;
+	CGImageRef image = NULL;
+	CGColorSpaceRef space;
+	CGContextRef context;
+	unsigned char px[16];
+	size_t w = 0, h = 0;
+
+	if (file == NULL) {
+		return;
+	}
+	url = CFURLCreateFromFileSystemRepresentation(NULL,
+	    (const UInt8 *)file, (CFIndex)strlen(file), false);
+	source = url != NULL ? CGImageSourceCreateWithURL(url, NULL) : NULL;
+	if (source != NULL) {
+		image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+	}
+	if (image == NULL) {
+		mondrian_probe_fmt("MONDRIAN DECODE[%d]: no image from %s\n",
+		    getpid(), file);
+		return;
+	}
+	w = CGImageGetWidth(image);
+	h = CGImageGetHeight(image);
+	memset(px, 0, sizeof(px));
+	space = CGColorSpaceCreateDeviceRGB();
+	context = CGBitmapContextCreate(px, 2, 2, 8, 8, space,
+	    kCGImageAlphaPremultipliedLast);
+	if (context != NULL) {
+		CGContextDrawImage(context, CGRectMake(0, 0, 2, 2), image);
+		mondrian_probe_fmt("MONDRIAN DECODE[%d]: %zux%zu bpp %zu quadrants "
+		    "%d,%d,%d | %d,%d,%d | %d,%d,%d | %d,%d,%d\n", getpid(), w, h,
+		    CGImageGetBitsPerPixel(image),
+		    px[0], px[1], px[2], px[4], px[5], px[6],
+		    px[8], px[9], px[10], px[12], px[13], px[14]);
+		CGContextRelease(context);
+	}
+	CGImageRelease(image);
+	if (source != NULL) {
+		CFRelease(source);
+	}
+	if (url != NULL) {
+		CFRelease(url);
+	}
+}
+
 static void *
 mondrian_import_thread(void *unused)
 {
@@ -999,6 +1062,12 @@ mondrian_import_thread(void *unused)
 	}
 	mondrian_probe_fmt("MONDRIAN IMPORT[%d]: library has %u, source %s\n",
 	    getpid(), have, [[source path] UTF8String]);
+	/*
+	 * Before the early return: with an asset already in the library the import
+	 * has nothing to submit, but the question this probe answers -- whether the
+	 * decoder produces colour or black -- is independent of that.
+	 */
+	mondrian_decode_probe([source path]);
 	if (have > 0) {
 		mondrian_touch("/private/var/vm/mondrian-imported");
 		return NULL;
@@ -1024,6 +1093,7 @@ mondrian_import_thread(void *unused)
 		    getpid(), copied ? 1 : 0, [tmp UTF8String]);
 		if (copied) {
 			source = [NSURL fileURLWithPath:tmp];
+			mondrian_decode_probe(tmp);
 		}
 	}
 	shared = nil;
@@ -14859,6 +14929,58 @@ mondrian_open_thread(void *unused)
 	return NULL;
 }
 
+/*
+ * The app's own gate: the library answers, the volume walk and the import.
+ *
+ * It has to run before the probe-service branch, which returns: MobileSlideShow
+ * is one of the probe services (its extension is what dies `sig 6`), and that
+ * early return is why two sessions of "the import prints nothing in the ring"
+ * read like a missing hook when the hook had loaded and already left. The first
+ * line says which copy is loaded and what the switch looks like from inside the
+ * app's sandbox: a switch this process may not read and a missing switch are the
+ * same closed gate, and only the errno tells them apart.
+ */
+static void
+mondrian_app_probe(void)
+{
+	char tag[180];
+	int fd;
+
+	if (getprogname() == NULL ||
+	    strcmp(getprogname(), "MobileSlideShow") != 0) {
+		return;
+	}
+	fd = open("/private/var/vm/mondrian-import", O_RDONLY);
+	snprintf(tag, sizeof(tag),
+	    "MONDRIAN APP[%d]: import open %d errno %d uid %d\n", getpid(),
+	    fd >= 0, fd >= 0 ? 0 : errno, (int)geteuid());
+	say(tag);
+	snprintf(tag, sizeof(tag),
+	    "MONDRIAN UI: hook tag cc56 uid %d prog %s built %s %s\n",
+	    (int)geteuid(), getprogname(), __DATE__, __TIME__);
+	say(tag);
+	if (fd < 0) {
+		return;
+	}
+	(void)close(fd);
+	mondrian_library_probe();
+	if (mondrian_file_on("/private/var/vm/mondrian-du")) {
+		pthread_t du;
+
+		if (pthread_create(&du, NULL, mondrian_du_report, NULL) == 0) {
+			(void)pthread_detach(du);
+		}
+	}
+	if (mondrian_file_on("/private/var/vm/mondrian-doimport")) {
+		pthread_t importer;
+
+		if (pthread_create(&importer, NULL, mondrian_import_thread,
+		    NULL) == 0) {
+			(void)pthread_detach(importer);
+		}
+	}
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
@@ -14895,31 +15017,7 @@ mondrian_install_ui_hooks(void)
 	 * The import runs inside Photos itself: adding an asset needs the photo
 	 * library entitlement that the app has and SpringBoard does not.
 	 */
-	if (mondrian_file_on("/private/var/vm/mondrian-import") &&
-	    getprogname() != NULL &&
-	    strcmp(getprogname(), "MobileSlideShow") == 0) {
-		mondrian_library_probe();
-		if (mondrian_file_on("/private/var/vm/mondrian-du")) {
-			pthread_t du;
-
-			if (pthread_create(&du, NULL, mondrian_du_report,
-			    NULL) == 0) {
-				(void)pthread_detach(du);
-			}
-		}
-		/*
-		 * The import itself is a second switch: `performChanges:` throws
-		 * and kills the app, so the probe has to be able to run alone.
-		 */
-		if (mondrian_file_on("/private/var/vm/mondrian-doimport")) {
-			pthread_t importer;
-
-			if (pthread_create(&importer, NULL, mondrian_import_thread,
-			    NULL) == 0) {
-				(void)pthread_detach(importer);
-			}
-		}
-	}
+	mondrian_app_probe();
 	/*
 	 * Outside the probe gate on purpose: the question is whether the kernel
 	 * attaches entitlements at all, so the answer has to include the processes
