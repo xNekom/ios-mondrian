@@ -257,17 +257,18 @@ Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
 draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
 whole. Measured 2026-11-19 on the restored volume: Photos completes its first-run
-flow, its import answers **`shared success 1`**, the Library draws one tile, the
-viewer opens on it, and the next boot reports `library has 1` -- the asset is in
-the store and survives a reboot. The picture draws **black**, and both layers
-before the screen are exonerated: ImageIO and PhotoKit's own thumbnail request
-both return its four coloured quadrants. What is left is the compositor, whose
-surfaces carry `fmt 0x0`; the next instrument belongs there. The space chain is
-measured too: `0371` drops the 164 MB reserve that held `f_bavail` at 0, `0372`
-counts the blocks a free actually clears. `PhotosFileProvider` still dies in
+flow, its import answers **`shared success 1`**, the Library draws the tile and
+the viewer opens on it with the picture in colour; the next boot reports
+`library has 1`. The layer holds the picture's four coloured quadrants and
+CoreGraphics fills an IOSurface in the app, while the render server's own 640x480
+surface stays all zero after its single write lock, so the hook hands pictures to
+the layer as filled IOSurfaces (`mondrian-layercsurf-off` keeps the old path);
+the transfer inside CoreAnimation is the open cause. `0371` drops the 164 MB
+reserve that held `f_bavail` at 0, `0372` counts what a free actually clears.
+`PhotosFileProvider` still dies in
 PlugInKit's launch check (`0354` answers the container query), `assetsd` and
 `fileproviderd` abort in their own code, and Phone, the App Store and the network
-are as before. The measurements and the probes are in `docs/UI_PERFORMANCE.md`.
+are as before.
 
 ## Getting the numbers off the device
 

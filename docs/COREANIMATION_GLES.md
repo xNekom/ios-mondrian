@@ -181,6 +181,15 @@ shows whatever surface a swap names (by copying its layers into the panel's memo
   where the poster is drawn. One byte a pixel uploads as `GL_LUMINANCE`, two as
   `GL_LUMINANCE_ALPHA`, and GL converts them into the RGBA storage the texture already has.
 
+**A client CGImage does not reach the render server's surface.** Measured 2026-11-19: the layer is
+given the picture's four coloured quadrants, CoreGraphics fills an IOSurface of the same size
+correctly inside the app, and the window server creates a surface for that image, takes one write
+lock and leaves it all zero; the app never looks the surface up or locks it. A layer whose
+`contents` is such a filled IOSurface draws the picture, so `tools/mondrian-ui-hook.m` hands every
+CGImage of picture size to the layer as a surface (default; `mondrian-layercsurf-off` keeps the
+CGImage path for an A/B). The transfer inside CoreAnimation is still the open cause, and `0374`
+logs the lookups and locks that narrowed it to the server.
+
 `tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
 the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.
 `osmesa_surface_resource` accepts both CoreAnimation's plain `'BGRA'` surface and the two-plane

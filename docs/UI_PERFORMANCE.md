@@ -740,27 +740,28 @@ boot each, so the three columns differ only in what changed:
   nothing else: `0370` puts the bitmap within 32 MB of the counter, `0371` stops
   the mount withholding 164 MB as `f_bavail` 0, and `0372` stops the free path
   leaking what it deletes.
-- **The import works and the library keeps the asset; the picture draws black.**
-  Measured 2026-11-19 on the restored volume: `library has 0`, `staged 1 at
-  /var/tmp/mondrian-photo.png`, `free 2078 MB of 16384 MB`, `shared available`,
-  `submitted via shared`, **`shared success 1`**. The Library then draws one tile
-  (black), the viewer opens on it with `Today` and its toolbar, and the next boot
-  answers `library has 1`, so the asset is in the store and survives a reboot.
+- **The import works, the asset persists, and the picture draws through a client
+  surface.** Measured 2026-11-19 on the restored volume: `library has 0`,
+  `staged 1 at /var/tmp/mondrian-photo.png`, `free 2078 MB of 16384 MB`,
+  `shared available`, `submitted via shared`, **`shared success 1`**; the Library
+  draws one tile, the viewer opens on it with `Today` and its toolbar, and the
+  next boot answers `library has 1`, so the asset is in the store and survives a
+  reboot.
   The pixels are not the decoder's: `MONDRIAN DECODE[266]: 800x600 bpp 32
-  quadrants 208,63,53 | 54,152,195 | 230,194,44 | 48,171,88` -- ImageIO inside the
-  app returns the four coloured quadrants the file carries. The compositor logs
-  the upload at the moment the viewer opens (`1 textures refilled from IOSurfaces
-  (1875 KB)`, exactly 800x600x4), so the black sits between the decoded image and
-  the layer that shows it. PhotoKit is exonerated too: `PHImageManager
-  requestImageForAsset:targetSize:200x200` (synchronous) answers a 200x150 image
-  whose quadrants read back `207,63,54 | 54,152,195 | 230,194,44 | 49,171,87`. So
-  the file, the asset, the thumbnail scaling and the decode are all correct, and
-  what is left is the compositor's surface import: it logs the surfaces it hands
-  out as `MONDRIAN SURF: backboardd create id <n> 192x192 fmt 0x0 bpe 4 bpr 768
-  planes 0 size 147456`, a format of zero, and `1 textures refilled from
-  IOSurfaces (5038 KB)` for the frame that carries the picture. The next instrument
-  belongs there: print the format, size and first bytes the injector reads from a
-  refilled surface.
+  quadrants 208,63,53 | 54,152,195 | 230,194,44 | 48,171,88`, and PhotoKit's own
+  `PHImageManager requestImageForAsset:targetSize:200x200` answers a 200x150
+  image with the same four colours. The layer is given a 640 x 480 CGImage with
+  them too (`MONDRIAN LAYER[496]`), and CoreGraphics fills an IOSurface of that
+  size with the same colours inside the app (`MONDRIAN CGSURF[425] ... drew 1`).
+  What fails is the transfer into the render server: `0374` shows backboardd
+  creating the 640 x 480 surface, taking one write lock and leaving it all zero,
+  and the app never looks the surface up or locks it, so the server's own fill is
+  the layer that loses the pixels. The tile and the viewer draw the four quadrants
+  when the layer's contents is that filled IOSurface instead of a CGImage, which
+  is what `tools/mondrian-ui-hook.m` does by default for CGImages of 300 x 200 and
+  up whose width is a multiple of four; `/private/var/vm/mondrian-layercsurf-off`
+  keeps the CGImage path for an A/B. The transfer inside CoreAnimation is still
+  the open cause.
   A `deltree` of the trees a boot regrows frees nothing on this image: their
   catalog valence is 4, 9 and 10 and the plain readdir returns only the two dots,
   so the entries the valence counts are not in the catalog at all. Probes:
