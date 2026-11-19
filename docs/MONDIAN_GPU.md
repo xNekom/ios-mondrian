@@ -1675,6 +1675,34 @@ profile the GPU does its full bring-up but logs `cp start without SQE firmware`
 or publishes no `MondrianGPU` at all, and `mondrian-gl` falls back to the CPU
 renderer.
 
+## Turnip for iOS
+
+`tools/mk-turnip-ios.sh` cross-builds Mesa 25.0.7's Vulkan driver (Turnip) for
+the iOS 16 arm64 userland on Linux/WSL 2, with no Mac: host clang 18 targets
+`arm64-apple-ios16.5`, LLVM's `ld64.lld` links against the theos
+`iPhoneOS16.5.sdk` stubs (cctools-port's ld64 predates `.tbd`), and cctools'
+`ar` and `install_name_tool` finish the file.
+
+Turnip speaks the same msm DRM requests as the GL build, which `MondrianGPU`
+already answers: `GEM_NEW`, `GEM_INFO`, `GEM_SUBMIT`, `WAIT_FENCE`,
+`SUBMITQUEUE_NEW/CLOSE/QUERY`, `GET_PARAM`, `GEM_CPU_PREP/FINI` and the `0x7e`
+IOSurface request. `tools/mesa/turnip-drm` is the libdrm stand-in, ported from
+HackiOS (`oosexgang/hakios-xnu-kernel`, `tools/mesa/{hakios-drm,
+turnip-darwin.patch}`): its syncobjs, which are Turnip's fences and semaphores,
+live in the process over the kernel's fence numbers. `turnip-ir3-nocache.patch`
+is the same no-disk-cache edit the GL build needs, since a Mach-O dylib has no
+build id.
+
+Measured 2026-11-19: 612 of 612 targets build into an 11.5 MB
+`out/mesa-turnip/stage/libvulkan_freedreno.dylib` (arm64, ad-hoc signed), and
+`tools/gpu/vk_test.c` builds beside it. `vk_test` fills 4 MB through Turnip and
+checks every word.
+
+The boot carries userland tests: the UI hook spawns the first line of
+`/private/var/vm/mondrian-run` once and logs `MONDRIAN RUN: <path> pid ... rc`
+and `MONDRIAN RUN: exit 0x...`, with the program's own output on the console
+ring. A test is a `wfile` and one boot, with no image and no launchd job.
+
 ## Boot time
 
 The seven cores the ADT lists already start (`cpus=8` selects all of them; the
