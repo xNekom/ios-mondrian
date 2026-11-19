@@ -1695,13 +1695,67 @@ build id.
 
 Measured 2026-11-19: 612 of 612 targets build into an 11.5 MB
 `out/mesa-turnip/stage/libvulkan_freedreno.dylib` (arm64, ad-hoc signed), and
-`tools/gpu/vk_test.c` builds beside it. `vk_test` fills 4 MB through Turnip and
-checks every word.
+`tools/gpu/vk_test.c` builds beside it.
+
+On the phone, Turnip enumerates the GPU and runs work:
+
+```
+TU: info: Found compatible device MondrianGPU (msm).
+vk_test: device "Turnip Adreno (TM) 725", Vulkan 1.4.305, driver 0x6400007,
+         vendor 0x5143 device 0x7030002
+vk_test: device made
+vk_test: the GPU filled 1048576 of 1048576 words with 0x600dc0de in 1.18 ms
+vk_test: 100 fills of 4 MB, each submitted and waited for: 0.414 ms on
+         average, 0.336 at best
+```
+
+That is the whole path: instance, physical device, device, queue, command
+buffer, `vkCmdFillBuffer`, one CP submission and its fence, and every word
+read back. The first run after the dylib was replaced left 16 words (one
+64-byte line, at word 913296) unwritten; the run after it was clean, so treat
+a one-off hole as cold-start state, not as a fill bug, and re-run before
+chasing it.
+
+Three kernel answers Turnip needs, each measured by its absence:
+
+- `MSM_PARAM_FAULTS` / `MSM_PARAM_SUSPENDS` (`0382`). Without them the user
+  client answers `kIOReturnBadArgument`, and `vkCreateDevice` fails with
+  "Failed to get initial fault count: -22".
+- `MSM_INFO_SET_IOVA` is the kernel's, not the client's: the request accepts
+  only the address the buffer already has, so `turnip-iova.patch` makes Turnip
+  ask for the kernel's IOVA (`MSM_INFO_GET_IOVA`), the path kgsl devices take.
+  Without it: "MSM_INFO_SET_IOVA failed! -78" and no device.
+- `MSM_PARAM_PRIORITIES` returns 1 (one submitqueue priority). Turnip maps the
+  default medium priority to 0 of 1, which is valid; do not widen it without a
+  reason.
+
+`wfile` carries the dylib: `0381` raises its ceiling to 32 MiB and allocates
+the file's size instead of the ceiling, and `tools/usb-ring.py` sends a window
+at a time and asks `wstat` how much of the contiguous prefix landed. Unpaced,
+the 11.5 MB dylib arrived 0 of 11539920 bytes on three attempts; paced, it
+lands in about 13 s.
 
 The boot carries userland tests: the UI hook spawns the first line of
 `/private/var/vm/mondrian-run` once and logs `MONDRIAN RUN: <path> pid ... rc`
 and `MONDRIAN RUN: exit 0x...`, with the program's own output on the console
-ring. A test is a `wfile` and one boot, with no image and no launchd job.
+ring. A test is a `wfile` and one boot, with no image and no launchd job; a
+rewritten run file starts a new run in the same boot, with no respring.
+
+### A warm reboot can leave the boot core unstarted
+
+The shim hands the kernel to the X2 with PSCI `CPU_ON` and the console ends at
+`BOOTCPU` / `CPUON` / `STAGE`. Measured 2026-11-19: after several RAM boots the
+console stopped there, `CPUON` reported success and `STAGE` stayed 0, so the
+core never entered the kernel and the screen kept the shim's text. The same
+image booted after a full power cycle. A RAM boot that dies this way falls back
+to `boot_b`, and `reboot-bootloader` does not clear it: power off for ten
+seconds and start with power and volume down. The first boot after that is the
+reliable one; retry the RAM boot once before blaming a build.
+
+### Turnip's directory
+
+`out/mesa-turnip/` holds the source, the build and `stage/` (the dylib plus
+`vk_test`). `out/` is ignored; nothing here is committed.
 
 ## Boot time
 

@@ -257,9 +257,9 @@ Settings, Messages and Safari launch and draw real content (a settings list, an
 onboarding page, the Safari start page), so LaunchServices, the icon model and
 the compositor are whole. Safari's page content is black: the WebKit GPU
 process's `w30r` surfaces stay zero (`0379`/`0380`), because it renders through
-Metal, which this port lacks; the local page loads. Metal is the open work
-item; the UniXNU PongMetal stack creates a device on this GPU but does not
-present yet. Measured 2026-11-19 on the restored volume: Photos completes its first-run
+Metal, which this port lacks; the local page loads. Turnip now runs on the GPU
+(`docs/MONDIAN_GPU.md`): Vulkan device, a 4 MB fill and its fence, 0.4 ms a
+submission. metal2vulkan over it, then the WebKit GPU process, is the work. Measured 2026-11-19 on the restored volume: Photos completes its first-run
 flow, its import answers **`shared success 1`**, the Library draws the tile and
 the viewer opens on it with the picture in colour; the next boot reports
 `library has 1`. A default boot (mask bit 0x100, no probe file) draws both: the app
