@@ -31,6 +31,7 @@ read the ring, and a swipe had to be reproduced by hand at the right moment.
 With this, the whole loop is the USB cable.
 """
 import argparse
+import errno
 import os
 import socket
 import struct
@@ -75,15 +76,16 @@ WINDOW = 24
 
 
 def wfile_attempt(path, data):
-    """One delivery attempt. Returns how many bytes the kernel took."""
+    """One delivery attempt. Returns (bytes the kernel took, write errno)."""
     answer = simple(f"wfile {path} {len(data)}", 5.0)
     if answer is None:
         print("no answer to wfile", file=sys.stderr)
-        return 0
+        return 0, 0
     print(answer.decode(errors="replace").strip(), file=sys.stderr)
 
     s = open_socket(1.0)
     got = 0
+    err = 0
     try:
         stalls = 0
         while got < len(data):
@@ -113,9 +115,29 @@ def wfile_attempt(path, data):
             stalls = 0 if moved else stalls + 1
             if stalls >= 40:            # ten seconds with no byte: give up
                 break
+        if got >= len(data):
+            # The kernel answers the last byte with the write's own result,
+            # "wfile PATH LEN bytes -> errno". Without this read a write that
+            # failed (ENOSPC, EROFS) looked exactly like a delivered one: the
+            # file is created, truncated and left empty, and the next boot
+            # loads nothing (measured 2026-11-20).
+            s.settimeout(3.0)
+            try:
+                reply = s.recv(512)
+            except OSError:
+                reply = b""
+            text = reply.decode(errors="replace").strip()
+            if text:
+                print(text, file=sys.stderr)
+            tail = text.rsplit("->", 1)
+            if len(tail) == 2:
+                try:
+                    err = int(tail[1])
+                except ValueError:
+                    err = 0
     finally:
         s.close()
-    return got
+    return got, err
 
 
 def wfile(path, local):
@@ -136,14 +158,21 @@ def wfile(path, local):
     got = 0
     # A 22 MB dylib stalls more often than a 3 KB one, and a truncated dylib is
     # refused by dyld with no message anywhere: the process simply keeps the
-    # Metal it would have had. Give the big ones more attempts.
+    # Metal it would have had. Give the big ones more attempts. A write error is
+    # not retried: the delivery worked, the filesystem refused the file.
     attempts = 9 if len(data) > (4 << 20) else 3
     for attempt in range(1, attempts + 1):
-        got = wfile_attempt(path, data)
-        if got >= len(data):
+        got, err = wfile_attempt(path, data)
+        if got >= len(data) and err == 0:
             print(f"wfile {path}: {got} of {len(data)} bytes delivered")
             time.sleep(0.5)
             return 0
+        if got >= len(data):
+            hint = " (the root is full)" if err == errno.ENOSPC else ""
+            print(f"wfile {path}: the kernel refused the write, errno {err}"
+                  f"{hint}; the file on the phone is empty or truncated",
+                  file=sys.stderr)
+            return 1
         print(f"wfile {path}: {got} of {len(data)} on attempt {attempt}, retrying",
               file=sys.stderr)
         time.sleep(1.0)
