@@ -259,11 +259,14 @@ say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 		(
 			# The kernel build puts its own cross clang first on PATH and
 			# exports its own SDK roots; the hook needs the host clang and
-			# the iPhoneOS SDK this script defaults to.
-			unset IOS_SDK LD64_LLD
-			PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-			export PATH
-			bash tools/build-mondrian-ui-hook.sh \
+			# the iPhoneOS SDK this script defaults to. `env -i` keeps every
+			# one of those out: measured 2026-11-19, the rebuild died on
+			# `objc/objc.h` not found and the kernel embedded the previous
+			# hook, so the ring's hook tag was 90 minutes older than the
+			# source while the boot looked successful.
+			env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+				HOME="$HOME" \
+				bash tools/build-mondrian-ui-hook.sh \
 				out/gpu/mondrian-ui-hook.dylib
 		) || say \
 			"warning: the UI hook did not rebuild; the kernel keeps the old copy"

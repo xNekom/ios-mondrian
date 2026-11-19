@@ -14717,14 +14717,85 @@ mondrian_privacy_access(id self, SEL _cmd, long long scope)
  * security-scoped bookmark this port cannot mint ("Client did not provide
  * bookmarkData"). Measured 2026-11-18: `+isMultiLibraryModeEnabled` answers 0 at
  * load and the shared library throws eight seconds later, so the app is the one
- * that flips it. Nothing on this port can serve a second library, so the switch
- * is kept from flipping.
+ * that flips it.
+ *
+ * Measured 2026-11-19: with the flip blocked, Photos dies earlier, asking for
+ * `file:///var/mobile/Library/Photos/Libraries/Syndication.photoslibrary/`
+ * while the path manager is still in single-library mode. The two faults are
+ * the same switch seen from both sides, so the hook now lets the app flip it
+ * and records the call; the throw hook names whatever fails next.
  */
+static struct {
+	Class cls;
+	IMP original;
+} mondrian_multilib[2];
+static unsigned mondrian_multilib_count;
+
 static void
-mondrian_library_mode_noop(id self, SEL _cmd)
+mondrian_library_mode_log(id self, SEL _cmd)
 {
-	(void)self;
-	(void)_cmd;
+	unsigned i;
+	IMP original = NULL;
+
+	for (i = 0; i < mondrian_multilib_count; i++) {
+		if ((id)mondrian_multilib[i].cls == self) {
+			original = mondrian_multilib[i].original;
+			break;
+		}
+	}
+	mondrian_probe_fmt(
+	    "MONDRIAN LIBURL[%d]: enableMultiLibraryMode %s caller %p\n",
+	    getpid(), class_getName((Class)self), __builtin_return_address(0));
+	if (original != NULL) {
+		((void (*)(id, SEL))original)(self, _cmd);
+	}
+	if ([(id)self respondsToSelector:
+	    @selector(isMultiLibraryModeEnabled)]) {
+		BOOL on = ((BOOL (*)(id, SEL))objc_msgSend)(self,
+		    @selector(isMultiLibraryModeEnabled));
+
+		mondrian_probe_fmt(
+		    "MONDRIAN LIBURL[%d]: multi library now %d\n", getpid(),
+		    on ? 1 : 0);
+	}
+}
+
+/*
+ * Which URL loses the comparison.
+ *
+ * Measured 2026-11-19: Photos dies `sig 6` on every launch with
+ * `NSInternalInconsistencyException` "Requesting different library while in
+ * single library mode", and the symbols cache puts the throw in
+ * `-[PLPhotoLibraryPathManager throwMultiLibraryAPIMisuseForLibraryPath:]`
+ * called from `-[PLPhotoLibraryPathManager setOrCompareLibraryURL:]` (its
+ * +0xf8), reached from `-[PLPhotoLibraryBundle initWithLibraryURL:...]` and
+ * `-[PLPhotoLibraryBundleController newPhotoLibraryBundleWithLibraryURL:]`.
+ * The reason names no path, so one launch has to print both sides: the
+ * manager's own URL and the one the bundle asks for, with the caller's address
+ * for `tools/dsc-va.py`.
+ */
+static void (*mondrian_seturl_original)(id, SEL, id);
+
+static void
+mondrian_seturl_log(id self, SEL _cmd, id url)
+{
+	static int told;
+	id current = nil;
+
+	if ([self respondsToSelector:@selector(libraryURL)]) {
+		current = ((id (*)(id, SEL))objc_msgSend)(self,
+		    @selector(libraryURL));
+	}
+	if (told++ < 12) {
+		mondrian_probe_fmt(
+		    "MONDRIAN LIBURL[%d]: %s current %s requested %s caller %p\n",
+		    getpid(), class_getName(object_getClass(self)),
+		    current != nil ? [[current absoluteString] UTF8String] :
+		    "(none)",
+		    url != nil ? [[url absoluteString] UTF8String] : "(none)",
+		    __builtin_return_address(0));
+	}
+	mondrian_seturl_original(self, _cmd, url);
 }
 
 static void
@@ -14741,9 +14812,24 @@ mondrian_install_library_hook(void)
 		Method method = cls != Nil ? class_getClassMethod(cls,
 		    sel_registerName("enableMultiLibraryMode")) : NULL;
 
-		if (method != NULL) {
+		if (method != NULL && mondrian_multilib_count < 2) {
+			mondrian_multilib[mondrian_multilib_count].cls = cls;
+			mondrian_multilib[mondrian_multilib_count].original =
+			    method_getImplementation(method);
+			mondrian_multilib_count++;
 			method_setImplementation(method,
-			    (IMP)mondrian_library_mode_noop);
+			    (IMP)mondrian_library_mode_log);
+		}
+	}
+	{
+		Class pm = objc_getClass("PLPhotoLibraryPathManager");
+		Method compare = pm != Nil ? class_getInstanceMethod(pm,
+		    sel_registerName("setOrCompareLibraryURL:")) : NULL;
+
+		if (compare != NULL) {
+			mondrian_seturl_original = (void (*)(id, SEL, id))
+			    method_setImplementation(compare,
+			    (IMP)mondrian_seturl_log);
 		}
 	}
 }
@@ -15501,6 +15587,17 @@ mondrian_app_probe(void)
 	    strcmp(getprogname(), "MobileSlideShow") != 0) {
 		return;
 	}
+	/*
+	 * The CGImage-to-surface bridge is the working state of Photos, not a
+	 * probe: measured 2026-11-19, the Library tile draws its four coloured
+	 * quadrants when this is installed and is black without it. It used to
+	 * sit behind /private/var/vm/mondrian-import, so a boot with no seeded
+	 * file lost the bridge and the tile went black -- the functional state
+	 * depended on a file somebody wrote by hand. Install it for every launch
+	 * of this app; the import and library probes stay behind their switch.
+	 */
+	mondrian_cg_surface_probe();
+	mondrian_layer_probe_install();
 	fd = open("/private/var/vm/mondrian-import", O_RDONLY);
 	snprintf(tag, sizeof(tag),
 	    "MONDRIAN APP[%d]: import open %d errno %d uid %d\n", getpid(),
@@ -15514,8 +15611,6 @@ mondrian_app_probe(void)
 		return;
 	}
 	(void)close(fd);
-	mondrian_cg_surface_probe();
-	mondrian_layer_probe_install();
 	mondrian_library_probe();
 	if (mondrian_file_on("/private/var/vm/mondrian-du")) {
 		pthread_t du;

@@ -355,12 +355,16 @@ MONDRIAN = Board(
              # (docs/MONDIAN_GPU.md). Bit 2 is backboardd, and `mondrian_gpu_hook=1`
              # gives it the injector instead of the hook, so CoreAnimation's
              # GLES renderer can be used there (xnu/patches-mondrian/0344).
+             # Bit 8 (0x100) is MobileSlideShow: the CGImage-to-surface bridge
+             # is what makes Photos' Library tiles and viewer draw (measured
+             # 2026-11-19), so it belongs to the default mask and not to a
+             # probe file. 6 | 0x100 = 262.
              # `mondriankeepawake=0` takes both idle-timer holds off for a boot;
              # the idle timer still never fires, so the holds are the default
              # (docs/MONDIAN_PORT.md). `mondrianautolock=N` writes the root's
              # auto-lock preference (measured missing: SBLockScreenAutoLockTime;
              # the hook prints it).
-             'mondrian_ui_hook=6 mondrian_gpu_hook=1 mondriankeepawake=0 '
+             'mondrian_ui_hook=262 mondrian_gpu_hook=1 mondriankeepawake=0 '
              'mondriansample=logd,backboardd,SpringBoard '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push

@@ -1,0 +1,73 @@
+xnu 0378: give Photos the UI hook without a probe file
+
+Measured 2026-11-19: with the CGImage-to-surface bridge installed, Photos draws
+its Library tile and opens the viewer on the imported picture; without it the
+tile is black. The bridge itself is now installed on every launch of
+MobileSlideShow (tools/mondrian-ui-hook.m), but the app only receives the dylib
+while /private/var/vm/mondrian-probe exists, so a default boot still shows a
+black tile.
+
+Add bit 8 (0x100) to the hook mask for MobileSlideShow and match the last path
+component, the same rule the probe names use. The probe bit keeps priority when
+mondrian-probe is present. boards.py carries 6 | 0x100 = 262.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index cdedd47..ff7180b 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5651,6 +5651,15 @@ bad:
+  * none of them is a UI process. A default boot injects nothing new.
+  */
+ #define MONDRIAN_HOOK_PROBE             0x80
++/*
++ * Photos (MobileSlideShow) is the one app whose picture path needs the hook:
++ * the CGImage-to-surface bridge is what makes its Library tiles and its viewer
++ * draw (measured 2026-11-19), and the app enables multi-library mode itself,
++ * which the hook has to observe rather than block. Unlike the probe names
++ * above, this bit is part of the default mask: the working state must not
++ * depend on a file in /private/var/vm.
++ */
++#define MONDRIAN_HOOK_PHOTOS            0x100
+ 
+ /*
+  * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
+@@ -5784,6 +5793,28 @@ mondrian_probe_app_env(struct image_params *imgp, char *env, size_t size)
+ 	return true;
+ }
+ 
++/*
++ * An app does not exec under its bare name: measured 2026-11-19, MobileSlideShow
++ * arrives as /Applications/MobileSlideShow.app/MobileSlideShow while SpringBoard
++ * and the poster extensions arrive plain. Compare the last path component, the
++ * same rule mondrian_probe_target() already uses for the probe names.
++ */
++static bool
++mondrian_name_is(const char *name, size_t len, const char *want)
++{
++	const char *base = name;
++	size_t wantlen = strlen(want);
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		if (name[i] == '/') {
++			base = name + i + 1;
++		}
++	}
++	return (size_t)(name + len - base) == wantlen &&
++	    strncmp(base, want, wantlen) == 0;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5866,6 +5897,10 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("xpcproxy") - 1 &&
+ 	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
+ 		wanted = MONDRIAN_HOOK_XPCPROXY;
++	} else if (wanted == 0 &&
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "MobileSlideShow")) {
++		wanted = MONDRIAN_HOOK_PHOTOS;
+ 	}
+ 	/* The probe names its own processes; everything else needs its mask bit. */
+ 	if (wanted == 0 ||
