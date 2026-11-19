@@ -12662,7 +12662,7 @@ mondrian_exc_say(const char *message)
  * "did this process get them" is a measurement, not a reading. csops returns
  * the blob the kernel holds for the caller: zero or -1 means the stand-in never
  * attached it, and the fix belongs in the kernel, not in a hook.
- * Switch: /private/var/vm/mondrian-ent.
+ * Switch: /private/var/vm/mondrian-images (shared with the image dump).
  */
 extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #define MONDRIAN_CS_OPS_ENTITLEMENTS_BLOB 7
