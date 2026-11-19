@@ -91,7 +91,7 @@ Written — the allow-list; everything else is off:
 | `boot_b` | the shim slot | the routine target of the port |
 | `boot_a` | stock Android, the escape hatch | the deploy tooling refuses it (`BOOT_A=1` is the deliberate override); a verified backup precedes any write |
 | `vendor_boot` | the shim reads its live device tree from it | dump verified by SHA256 first |
-| `misc` | the A/B boot-control block; dual boot writes it from the kernel | wrong content only selects the wrong slot; `fastboot --set-active` fixes it without flashing |
+| `misc` | the A/B boot-control block; the shim menu's slot switch is not wired yet | wrong content only selects the wrong slot; `fastboot --set-active` fixes it without flashing |
 | `init_boot`, `recovery` | untouched so far (this device has no `init_boot`) | the same safeguards whenever a write is needed |
 | `userdata` | the iOS root | erasing Android user data here is acceptable and recoverable; `tools/flash-root.sh` writes it and asks first |
 
@@ -263,11 +263,10 @@ the viewer opens on it with the picture in colour; the next boot reports
 CoreGraphics fills an IOSurface in the app, while the render server's own 640x480
 surface stays all zero after its single write lock, so the hook hands pictures to
 the layer as filled IOSurfaces (`mondrian-layercsurf-off` keeps the old path);
-the transfer inside CoreAnimation is the open cause. `0371` drops the 164 MB
-reserve that held `f_bavail` at 0, `0372` counts what a free actually clears.
-`PhotosFileProvider` still dies in
-PlugInKit's launch check (`0354` answers the container query), `assetsd` and
-`fileproviderd` abort in their own code, and Phone, the App Store and the network
+the transfer inside CoreAnimation is the open cause. `assetsd` now reads its
+entitlements (`csops` 5643 bytes, TCC preflight 1) but still aborts in an
+uncaught C++ exception; `PhotosFileProvider` dies in PlugInKit's container
+check, `fileproviderd` in its own code, and Phone, the App Store and the network
 are as before.
 
 ## Getting the numbers off the device

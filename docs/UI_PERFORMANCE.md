@@ -415,19 +415,14 @@ boot each, so the three columns differ only in what changed:
   does not help, and neither `TCCAccessPreflight` nor
   `TCCAccessCheckAuditToken` is ever called by assetsd: it links
   `TCC.framework` but imports no `TCCAccess*` symbol.
-- **The kernel does attach entitlements; the process still reads none.** `xnu
-  0366` prints the verdict per signature once, and a boot shows
-  `com.apple.xpc.launchd: attached, count 22`,
-  `com.apple.springboard: attached, count 395` and
-  `com.apple.assetsd: attached, count 62`, with 75 signatures that carry no XML
-  at all (ignition, fsck, the dyld shared cache). So `csblob_get_entitlements`
-  and the parser work, and the answer `csops` gives inside the same process --
-  zero -- is lost between the vnode's blob and the caller:
-  `csproc_get_blob` picks a blob by `p_textoff` out of the vnode's list, and
-  `CS_OPS_ENTITLEMENTS_BLOB` also answers zero when
-  `amfi->OSEntitlements_get_xml` fails, without setting an error. Both paths are
-  silent, which is why a `0` needs a kernel print of the blob it looked at, not
-  another hook.
+- **Measured 2026-11-19: the blob reaches the process.** `0367` prints the blob
+  `CS_OPS_ENTITLEMENTS_BLOB` looked at, and with `/private/var/vm/mondrian-images`
+  armed, `assetsd` answers `5643 bytes magic 0xfade7171 tcc.allow yes photos
+  yes`; `SecTask` gives the same `kTCCServicePhotos` and TCC preflight answers 1.
+  The old `0` was the blob lookup, not the signature. `assetsd` still aborts
+  `sig 6`, now in an uncaught C++ exception (the trace ends in `libc++abi`
+  `terminate`), and `mondrian-probe` injects the hook into it; a boot without
+  that file is the next measurement, not another entitlement change.
 - **A hook change is only in the kernel when the kernel build rebuilds it.**
   `tools/wsl/build-kernel.sh` embeds `out/gpu/mondrian-ui-hook.dylib` when the
   file exists and never rebuilt it from `tools/mondrian-ui-hook.m`, so a kernel
@@ -974,6 +969,11 @@ execs again, `pipelined` crashes, and from there `MONDRIAN FB: present 0/s` with
 black panel with a live ring as this state, not as a dead kernel: the USB channel
 answers, and only a reset leaves it. The ring is what to read, and
 `MONDRIAN FB: present`/`ev` are the two numbers that name it.
+Measured 2026-11-19: the black page reproduces, but the home gesture still
+presents, so the compositor is not lost in this boot; the `AA` menu opens and
+draws white, and the address field does not focus under the synthetic touch. A
+local page is the next test: it separates the network from WebKit and the native
+chrome.
 
 The idle path had a second cause and it was ours. Until `0342` the driver
 painted the framebuffer black when the blank fired, and the wake lived inside

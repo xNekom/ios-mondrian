@@ -1196,7 +1196,9 @@ them has Metal. That is the path this port follows.
   Metal is the A11's GPU and this port draws through Mesa/freedreno OpenGL ES:
   a Metal poster renderer has nothing to talk to. The home screen's correct
   answer here is a still image behind the icons, not a live poster; fix the
-  check-in only for the GL extensions.
+  check-in only for the GL extensions. The hook's static wallpaper is that still
+  image and draws on the lock and home screens (measured 2026-11-19); the live
+  poster remains the open part.
 - **One ring, one lock.** Every `MondrianGPU` client (backboardd,
   SpringBoard, the poster extensions, mediaserverd) submits to the same CP
   ring, whose cursor, fence sequence and memptr slots are file-static in
@@ -1731,5 +1733,5 @@ the home screen draw -- 59.9 fps over 180 s with no frame held (`mondriananim=1`
 
 Open: the jagged 1125x2436 -> 1440x3200 upscale (the DPU SSPP scaler is the
 candidate), the idle-timer sleep (the hook's fix is not boot-verified), the
-wallpaper (the poster extension draws no frame), the panel's report rate
+live wallpaper poster (the hook's still image draws), the panel's report rate
 (`0xC0`), `cpufreq`, the release kernel and the boot-time measurements.
