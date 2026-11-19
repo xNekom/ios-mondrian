@@ -258,11 +258,14 @@ draw real content (a full settings list, an onboarding page with artwork, the
 Safari start page), so LaunchServices, the icon model and the compositor are
 whole. Photos opens and draws its own `Library` tab with the four tabs and
 `No Photos or Videos`, and an import travels the whole path and stops on space:
-`PHPhotosErrorDomain 3305`, with `xnu 0370` counting 249 MB free by the bitmap
-and 217 MB by the counter. The volume is genuinely full, not leaking: the work
-item is space, and the 32 MB the counter sits below the bitmap belong to the
-free path in `BlockMarkFreeInternal`, which abandons a range at the first block
-that is already free. `PhotosFileProvider` still dies in PlugInKit's launch
+`PHPhotosErrorDomain 3305`. That is measured, not inferred: `xnu 0370` counts
+249 MB free by the bitmap against 217 MB by the counter, `0371` shows the mount
+withholding 164 MB of that as a free-block reserve with `f_bavail` at 0, and
+`0372` shows the free path returning 24 of the 256 blocks a 1 MiB delete should
+return, which is why the volume reached zero free blocks inside one session. The
+reserve is dropped and the free path counts what it clears; the work item is a
+volume of 16 GiB in a 242 GiB partition, and the allocation side still needs the
+same audit. `PhotosFileProvider` still dies in PlugInKit's launch
 check (`0354` answers the container query), `assetsd` and `fileproviderd` abort
 in their own code, and Phone, the App Store and the network are as before. The
 measurements and the probes are in `docs/UI_PERFORMANCE.md`.

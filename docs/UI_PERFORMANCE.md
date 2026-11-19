@@ -697,26 +697,33 @@ boot each, so the three columns differ only in what changed:
   tables in the handler, since the stack is already gone by the time a report is
   read. `SA_RESETHAND` restores the default action, so returning still dies the
   way the process would have.
-- **The volume really is full; the counter is 32 MB below the bitmap.** Measured
-  2026-11-18 with `xnu 0370`, which counts the allocation bitmap once per mount:
-  `MONDRIAN HFSAUDIT: total 4194304 counter 55600 bitmap 63774 diff 8174`, so
-  **249 MB free by the bitmap** and 217 MB by the counter `statfs` reports. The
-  volume is full of files, not of lost blocks. A userland walk cannot prove that
-  on its own: the app sees 12644 MB in 159230 files and cannot enter 43 root-owned
-  trees, and the same root's backup image carries only about 7.2 GB in a 7-Zip
-  listing while `tools/hfs-audit.py` counts 2.4 GB free, so a walk undercounts by
-  gigabytes and only the bitmap is authoritative. `/lost+found` is exonerated
-  (`getattrlist`: one entry, no blocks). `f_bfree` versus `f_bavail` rules out the
-  reservation too: the reserve and the loans withhold about 165 MB.
-- **The free path abandons a range at the first already-free block.**
-  `BlockMarkFreeInternal` clears the words it has read and, on a word that is
-  not entirely allocated, jumps to `Corruption`, which logs `trying to free
-  unallocated blocks`, returns `hfsNotAllocatedErr` (the port's own -4210) and
-  leaves the rest of the range allocated. `BlockDeallocate` then skips the
-  `freeBlocks` update on that error, so the counter ends below the bitmap -- the
-  32 MB above, not the gigabytes. The ranges on record are 1 and 69 blocks, so
-  this is a correctness defect on the free path and a fix must free what is set,
-  skip what is free and add only the freed count to the counter.
+- **The volume really is full, and `f_bavail` was zero with 164 MB free.**
+  Measured 2026-11-18 with `xnu 0370`, which counts the allocation bitmap once per
+  mount: `MONDRIAN HFSAUDIT: total 4194304 counter 55600 bitmap 63774 diff 8174`,
+  so **249 MB free by the bitmap** and 217 MB by the counter `statfs` reports. The
+  volume is full of files, not of lost blocks: a userland walk sees 12644 MB in
+  159230 files and cannot enter 43 root-owned trees, and the same root's backup
+  image carries only about 7.2 GB in a 7-Zip listing while `tools/hfs-audit.py`
+  counts 2.4 GB free, so a walk undercounts by gigabytes and only the bitmap is
+  authoritative. `/lost+found` is exonerated (`getattrlist`: one entry, no
+  blocks). Measured 2026-11-19: `statfs` answered **f_bfree 41946 (164 MB) with
+  f_bavail 3 (12 KB)** because the root mount withholds one percent of the volume
+  as a free-block reserve (`HFS_MINFREE`). Every writer that honours the available
+  count refused, PhotoKit answered `3305 (NotEnoughSpace)`, and 164 MB sat
+  unusable. `0371` drops the reserve for this mount; `f_bavail` then equals
+  `f_bfree`.
+- **The free path leaked every range it did not own entirely, and the volume hit
+  zero.** Measured 2026-11-19: deleting a 1 MiB file moved the counter from 0 to
+  **24 blocks of its 256**, because `BlockMarkFreeInternal` abandoned the range at
+  the first word that was not entirely allocated, returned `hfsNotAllocatedErr`
+  and left the rest marked allocated, and `BlockDeallocate` skipped the counter on
+  that error. Every log rotation therefore leaked what it had just written: the
+  volume fell from 164 MB free to 0 inside one session, and a full volume is what
+  makes app launches, catalog writes and log rotation fail. `0372` clears the bits
+  that are set, counts them and adds that count to `freeBlocks`. The disagreement
+  runs both ways -- deleting the 348 KB `mondrian-gl.dylib` afterwards returned
+  **no** blocks because the bitmap already called them free while the file still
+  held them -- so the allocation side is the next audit, not a settled story.
 - **Photos has no library: TCC, then the library mode, then the volume.** Measured
   2026-11-18 with the app open and drawing its Library tab, in the order the
   chain was peeled: `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]`
@@ -729,13 +736,18 @@ boot each, so the three columns differ only in what changed:
   (`isMultiLibraryModeEnabled` is 0 at load and the shared library then throws
   `Calling single library mode API while in multi library mode`), and with that
   switch kept from flipping the shared library accepts a change and answers
-  `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. With 217 MB of headroom the
-  picture fails there, not in PhotoKit, so the next move is space, not a driver:
-  `0370` says the bitmap agrees with the counter to within 32 MB, so nothing is
-  leaking. Probes: `/private/var/vm/mondrian-import` prints the library answers at
+  `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. That answer is about space and
+  nothing else: `0370` puts the bitmap within 32 MB of the counter, `0371` stops
+  the mount withholding 164 MB as `f_bavail` 0, and `0372` stops the free path
+  leaking what it deletes. Probes:
+  `/private/var/vm/mondrian-import` prints the library answers at
   load, `mondrian-doimport` submits one picture, `mondrian-du` prints the volume
   and the tree sizes. All are guarded: an exception on the import thread kills
-  the app, which is how the first attempt died.
+  the app, which is how the first attempt died. The probes only reach the app when
+  the exec probe matches it, and an app does not exec under its bare name: it
+  arrives as `/Applications/MobileSlideShow.app/MobileSlideShow` through a
+  `posix_spawn` with no nameidata, so `0371` compares the last component and falls
+  back to the executable's vnode name.
 - **PhotosFileProvider still aborts `sig 6` in the PlugInKit check.** Measured
   2026-11-18: `PhotosFileProvider` and `fileproviderd` die at the same
   `mov x16, #328; svc #0x80` (`__pthread_kill`, a self-`abort`) while the app
