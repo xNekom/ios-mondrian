@@ -109,5 +109,26 @@ clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fobjc-arc \
 	-framework Foundation -framework Metal -framework IOSurface -framework CoreFoundation -lc++ \
 	-Wl,-platform_version,ios,16.0,16.0 --ld-path=$(command -v ld64.lld-21 || echo /usr/lib/llvm-18/bin/ld64.lld)
 
+echo "== libmondrianmetal.dylib"
+# The same device as a dylib a process can dlopen or be given by name, for
+# WebKit's GPU process: the frontend and the runtime, plus the interposer in
+# tools/gpu/mondrian-metal-provider.m that makes MTLCreateSystemDefaultDevice
+# answer with it. Installed at /private/var/vm/ by wfile, not flashed.
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fobjc-arc -c \
+	-x objective-c "$root/tools/gpu/mondrian-metal-provider.m" -o out/provider.o
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fobjc-arc -dynamiclib \
+	-o out/libmondrianmetal.dylib out/provider.o out/frontend.o out/libadreno_metal_bridge.a \
+	-framework Foundation -framework Metal -framework IOSurface -framework CoreFoundation -lc++ \
+	-Wl,-platform_version,ios,16.0,16.0 \
+	-Wl,-install_name,/private/var/vm/libmondrianmetal.dylib \
+	--ld-path=$(command -v ld64.lld-21 || echo /usr/lib/llvm-18/bin/ld64.lld)
+
+echo "== metal_probe"
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fobjc-arc \
+	-o out/metal_probe -x objective-c "$root/tools/gpu/metal_probe.m" -x none \
+	-framework Foundation -framework Metal \
+	-Wl,-platform_version,ios,16.0,16.0 \
+	--ld-path=$(command -v ld64.lld-21 || echo /usr/lib/llvm-18/bin/ld64.lld)
+
 echo "mk-m2v-ios.sh: $B/out:"
 ls -l out
