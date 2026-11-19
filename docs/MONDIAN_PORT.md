@@ -259,12 +259,11 @@ Safari start page), so LaunchServices, the icon model and the compositor are
 whole. Measured 2026-11-19 on the restored volume: Photos completes its first-run
 flow, its import answers **`shared success 1`**, the Library draws one tile, the
 viewer opens on it, and the next boot reports `library has 1` -- the asset is in
-the store and survives a reboot. The picture itself draws **black**, and the
-decoder is exonerated: ImageIO inside the app returns the four coloured
-quadrants the file carries, while the compositor logs an 1875 KB surface upload
-(800x600x4) at the moment the viewer opens, so the black sits between the decode
-and the layer. That is the next instrument. The space chain behind it is also
-measured: `0371` drops the 164 MB reserve that held `f_bavail` at 0, and `0372`
+the store and survives a reboot. The picture draws **black**, and both layers
+before the screen are exonerated: ImageIO and PhotoKit's own thumbnail request
+both return its four coloured quadrants. What is left is the compositor, whose
+surfaces carry `fmt 0x0`; the next instrument belongs there. The space chain is
+measured too: `0371` drops the 164 MB reserve that held `f_bavail` at 0, `0372`
 counts the blocks a free actually clears. `PhotosFileProvider` still dies in
 PlugInKit's launch check (`0354` answers the container query), `assetsd` and
 `fileproviderd` abort in their own code, and Phone, the App Store and the network

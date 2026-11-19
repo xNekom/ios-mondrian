@@ -751,10 +751,16 @@ boot each, so the three columns differ only in what changed:
   app returns the four coloured quadrants the file carries. The compositor logs
   the upload at the moment the viewer opens (`1 textures refilled from IOSurfaces
   (1875 KB)`, exactly 800x600x4), so the black sits between the decoded image and
-  the layer that shows it. The next instrument is the app's own thumbnail:
-  `PHImageManager requestImageForAsset:` and read the returned `UIImage`'s pixels;
-  colour there and black on screen puts it in the surface upload, black there puts
-  it in PhotoKit's scaling (`IOSurfaceAccelerator`), which this port does not have.
+  the layer that shows it. PhotoKit is exonerated too: `PHImageManager
+  requestImageForAsset:targetSize:200x200` (synchronous) answers a 200x150 image
+  whose quadrants read back `207,63,54 | 54,152,195 | 230,194,44 | 49,171,87`. So
+  the file, the asset, the thumbnail scaling and the decode are all correct, and
+  what is left is the compositor's surface import: it logs the surfaces it hands
+  out as `MONDRIAN SURF: backboardd create id <n> 192x192 fmt 0x0 bpe 4 bpr 768
+  planes 0 size 147456`, a format of zero, and `1 textures refilled from
+  IOSurfaces (5038 KB)` for the frame that carries the picture. The next instrument
+  belongs there: print the format, size and first bytes the injector reads from a
+  refilled surface.
   A `deltree` of the trees a boot regrows frees nothing on this image: their
   catalog valence is 4, 9 and 10 and the plain readdir returns only the two dots,
   so the entries the valence counts are not in the catalog at all. Probes:
