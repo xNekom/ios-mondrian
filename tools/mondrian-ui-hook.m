@@ -49,6 +49,7 @@ static int boot_arg_int(const char *name, int fallback);
 static void mondrian_probe_fmt(const char *fmt, ...);
 static int mondrian_file_on(const char *path);
 static void mondrian_touch(const char *path);
+static void *mondrian_surface_owner(void *unused);
 
 /*
  * The bootstrap namespace lives in libSystem and the SDK ships no servers/
@@ -66,6 +67,7 @@ extern kern_return_t bootstrap_look_up(mach_port_t bootstrap_port,
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <ImageIO/ImageIO.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -3037,6 +3039,7 @@ start_display_link_probe(void)
 	(void)pthread_create(&thread, NULL, mondrian_demand_probe, NULL);
 	(void)pthread_create(&thread, NULL, mondrian_acc_probe, NULL);
 	(void)pthread_create(&thread, NULL, mondrian_addr_watch, NULL);
+	(void)pthread_create(&thread, NULL, mondrian_surface_owner, NULL);
 }
 
 /*
@@ -15014,6 +15017,116 @@ mondrian_open_thread(void *unused)
 }
 
 /*
+ * Who owns the pixels of a picture the window server shows.
+ *
+ * Measured 2026-11-19: the imported picture draws black, and the 800 x 600 and
+ * 640 x 480 surfaces the window server shows for it read as all zero from inside
+ * backboardd, with a seed of 1 -- one write lock and no colour. Every surface is
+ * one IOBufferMemoryDescriptor mapped into each task that looks it up, so either
+ * what filled it wrote zeros or the two mappings are not the same memory. This
+ * asks every hooked process -- SpringBoard, backboardd and the app -- to look the
+ * same id up and read its four corners, and lets Photos write a marker into them.
+ * The marker seen from another process means the memory is shared and the fill
+ * wrote nothing; the marker missing there means the mappings are not the same.
+ *
+ * The id arrives in /private/var/vm/mondrian-surf-id (a `wfile`), which is why
+ * this polls instead of running once: the surface only exists once the server has
+ * drawn the picture, and its id changes with every launch.
+ */
+static void *
+mondrian_surface_owner(void *unused)
+{
+	const char *path = "/private/var/vm/mondrian-surf-id";
+	const char *me = getprogname() != NULL ? getprogname() : "?";
+	unsigned last = 0;
+
+	(void)unused;
+	for (;;) {
+		char buf[32];
+		ssize_t n;
+		int fd;
+		unsigned id;
+		IOSurfaceRef s;
+
+		sleep(2);
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			continue;
+		}
+		n = read(fd, buf, sizeof(buf) - 1);
+		(void)close(fd);
+		if (n <= 0) {
+			continue;
+		}
+		buf[n] = '\0';
+		id = (unsigned)strtoul(buf, NULL, 10);
+		if (id == 0 || id == last) {
+			continue;
+		}
+		last = id;
+		s = IOSurfaceLookup(id);
+		if (s == NULL) {
+			mondrian_probe_fmt("MONDRIAN XSURF[%s]: %u not found\n", me, id);
+			continue;
+		}
+		{
+			size_t w = IOSurfaceGetWidth(s);
+			size_t h = IOSurfaceGetHeight(s);
+			size_t row = IOSurfaceGetBytesPerRow(s);
+			size_t bpe = IOSurfaceGetBytesPerElement(s);
+			unsigned fmt = (unsigned)IOSurfaceGetPixelFormat(s);
+			uint32_t seed = 0;
+			uint8_t quad[4][4];
+			const uint8_t *base = NULL;
+			unsigned i;
+			int read = 0;
+
+			memset(quad, 0, sizeof(quad));
+			if (IOSurfaceLock(s, kIOSurfaceLockReadOnly, &seed) == 0) {
+				base = IOSurfaceGetBaseAddress(s);
+				if (base != NULL && bpe == 4 && w > 8 && h > 8) {
+					for (i = 0; i < 4; i++) {
+						size_t x = (i & 1) ? 3 * w / 4 : w / 4;
+						size_t y = (i & 2) ? 3 * h / 4 : h / 4;
+
+						memcpy(quad[i], base + row * y + x * 4, 4);
+					}
+					read = 1;
+				}
+				IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+			}
+			mondrian_probe_fmt("MONDRIAN XSURF[%s]: %u %zux%zu %zu a row, format %#x, seed %u, base %d: "
+			    "%02x%02x%02x%02x | %02x%02x%02x%02x | %02x%02x%02x%02x | %02x%02x%02x%02x\n", me, id, w, h,
+			    row, fmt, seed, base != NULL, quad[0][0], quad[0][1], quad[0][2], quad[0][3],
+			    quad[1][0], quad[1][1], quad[1][2], quad[1][3], quad[2][0], quad[2][1],
+			    quad[2][2], quad[2][3], quad[3][0], quad[3][1], quad[3][2], quad[3][3]);
+			if (read && strcmp(me, "MobileSlideShow") == 0 && IOSurfaceLock(s, 0, &seed) == 0) {
+				uint8_t *write = IOSurfaceGetBaseAddress(s);
+				static const uint8_t ink[4][4] = {
+					{ 0x00, 0x00, 0xff, 0xff },     /* red, in the order of bgra memory */
+					{ 0x00, 0xff, 0x00, 0xff },     /* green */
+					{ 0xff, 0x00, 0x00, 0xff },     /* blue */
+					{ 0x00, 0xff, 0xff, 0xff },     /* yellow */
+				};
+
+				if (write != NULL) {
+					for (i = 0; i < 4; i++) {
+						size_t x = (i & 1) ? 3 * w / 4 : w / 4;
+						size_t y = (i & 2) ? 3 * h / 4 : h / 4;
+
+						memcpy(write + row * y + x * 4, ink[i], 4);
+					}
+				}
+				IOSurfaceUnlock(s, 0, &seed);
+				mondrian_probe_fmt("MONDRIAN XSURF[%s]: %u wrote the four corners, seed %u\n", me, id, seed);
+			}
+		}
+		CFRelease(s);
+	}
+	return NULL;
+}
+
+/*
  * The app's own gate: the library answers, the volume walk and the import.
  *
  * It has to run before the probe-service branch, which returns: MobileSlideShow
@@ -15024,6 +15137,335 @@ mondrian_open_thread(void *unused)
  * app's sandbox: a switch this process may not read and a missing switch are the
  * same closed gate, and only the errno tells them apart.
  */
+/*
+ * Does CoreGraphics fill an IOSurface on this port?
+ *
+ * Measured 2026-11-19 in the kernel ring: the window server creates the 640 x 480
+ * surface the Library tile shows, takes one write lock on it, and the bytes are
+ * all zero, while the app never touches the surface at all. The fill therefore
+ * happens inside backboardd, and the two candidates are CoreGraphics drawing the
+ * image into the surface and CoreAnimation's own image transfer. This settles the
+ * first: the app creates a surface of the picture's size, draws the same PNG into
+ * it through CGBitmapContextCreate over the surface's memory, and reads the four
+ * corners back -- with the same draw into malloc'd memory as the control. Colour
+ * in both clears CoreGraphics and the surface memory; colour in the control only
+ * puts the fault in the surface-backed context, which is a memory or layout
+ * question this port owns.
+ */
+static void
+mondrian_cg_surface_probe(void)
+{
+	static const char *path = "/private/var/vm/mondrian-photo.png";
+	CFMutableDictionaryRef props;
+	IOSurfaceRef surface;
+	CGImageSourceRef source;
+	CGImageRef image;
+	CGColorSpaceRef space;
+	CGContextRef context;
+	uint8_t *plain;
+	uint8_t quad[4][4];
+	uint32_t seed = 0;
+	unsigned width = 640, height = 480, row = width * 4;
+	int created = 0, locked = 0, drew = 0;
+
+	if (!mondrian_file_on("/private/var/vm/mondrian-cgsurf")) {
+		return;
+	}
+	props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (props != NULL) {
+		CFNumberRef n;
+
+#define MONDRIAN_SURF_NUM(key, value)                                          \
+	do {                                                                   \
+		int v = (value);                                                \
+		n = CFNumberCreate(NULL, kCFNumberIntType, &v);                 \
+		CFDictionarySetValue(props, CFSTR(key), n);                     \
+		CFRelease(n);                                                   \
+	} while (0)
+
+		MONDRIAN_SURF_NUM("IOSurfaceWidth", width);
+		MONDRIAN_SURF_NUM("IOSurfaceHeight", height);
+		MONDRIAN_SURF_NUM("IOSurfaceBytesPerElement", 4);
+		MONDRIAN_SURF_NUM("IOSurfaceBytesPerRow", row);
+		MONDRIAN_SURF_NUM("IOSurfacePixelFormat", 'BGRA');
+#undef MONDRIAN_SURF_NUM
+	}
+	surface = props != NULL ? IOSurfaceCreate(props) : NULL;
+	if (props != NULL) {
+		CFRelease(props);
+	}
+	if (surface == NULL) {
+		mondrian_probe_fmt("MONDRIAN CGSURF[%d]: no surface\n", getpid());
+		return;
+	}
+	created = 1;
+	if (IOSurfaceLock(surface, 0, &seed) != 0) {
+		mondrian_probe_fmt("MONDRIAN CGSURF[%d]: surface %u will not lock\n",
+		    getpid(), IOSurfaceGetID(surface));
+	} else {
+		locked = 1;
+	}
+	source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL
+	    fileURLWithPath:[NSString stringWithUTF8String:path]], NULL);
+	image = source != NULL ? CGImageSourceCreateImageAtIndex(source, 0, NULL) : NULL;
+	space = CGColorSpaceCreateDeviceRGB();
+	if (image != NULL && locked) {
+		context = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface),
+		    width, height, 8, row, space,
+		    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+		if (context != NULL) {
+			CGContextDrawImage(context, CGRectMake(0, 0, width, height),
+			    image);
+			CGContextFlush(context);
+			CGContextRelease(context);
+			drew = 1;
+		}
+	}
+	if (drew) {
+		const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+		unsigned i;
+
+		for (i = 0; i < 4; i++) {
+			unsigned x = (i & 1) ? 3 * width / 4 : width / 4;
+			unsigned y = (i & 2) ? 3 * height / 4 : height / 4;
+
+			memcpy(quad[i], base + (size_t)y * row + (size_t)x * 4, 4);
+		}
+		mondrian_probe_fmt("MONDRIAN CGSURF[%d]: surface %u %ux%u drew %d: "
+		    "%02x%02x%02x%02x | %02x%02x%02x%02x | %02x%02x%02x%02x | "
+		    "%02x%02x%02x%02x\n", getpid(), IOSurfaceGetID(surface), width,
+		    height, drew, quad[0][0], quad[0][1], quad[0][2], quad[0][3],
+		    quad[1][0], quad[1][1], quad[1][2], quad[1][3], quad[2][0],
+		    quad[2][1], quad[2][2], quad[2][3], quad[3][0], quad[3][1],
+		    quad[3][2], quad[3][3]);
+	}
+	/*
+	 * The control: the same image, the same size, plain malloc'd memory. A
+	 * blank surface with colour here is the surface's memory, not the draw.
+	 */
+	plain = calloc((size_t)height, row);
+	if (plain != NULL && image != NULL) {
+		context = CGBitmapContextCreate(plain, width, height, 8, row, space,
+		    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+		if (context != NULL) {
+			unsigned i;
+
+			CGContextDrawImage(context, CGRectMake(0, 0, width, height),
+			    image);
+			CGContextFlush(context);
+			for (i = 0; i < 4; i++) {
+				unsigned x = (i & 1) ? 3 * width / 4 : width / 4;
+				unsigned y = (i & 2) ? 3 * height / 4 : height / 4;
+
+				memcpy(quad[i], plain + (size_t)y * row + (size_t)x * 4,
+				    4);
+			}
+			mondrian_probe_fmt("MONDRIAN CGSURF[%d]: the control: "
+			    "%02x%02x%02x%02x | %02x%02x%02x%02x | %02x%02x%02x%02x | "
+			    "%02x%02x%02x%02x\n", getpid(), quad[0][0], quad[0][1],
+			    quad[0][2], quad[0][3], quad[1][0], quad[1][1],
+			    quad[1][2], quad[1][3], quad[2][0], quad[2][1],
+			    quad[2][2], quad[2][3], quad[3][0], quad[3][1],
+			    quad[3][2], quad[3][3]);
+			CGContextRelease(context);
+		}
+		free(plain);
+	}
+	if (space != NULL) {
+		CGColorSpaceRelease(space);
+	}
+	if (image != NULL) {
+		CGImageRelease(image);
+	}
+	if (source != NULL) {
+		CFRelease(source);
+	}
+	if (locked) {
+		IOSurfaceUnlock(surface, 0, &seed);
+	}
+	if (created) {
+		CFRelease(surface);
+	}
+}
+
+/*
+ * The image on its way to the window server.
+ *
+ * Measured 2026-11-19: the app decodes the imported picture, PhotoKit hands a
+ * thumbnail back in colour, CoreGraphics fills an IOSurface from the same file in
+ * colour, and the window server creates a surface of the picture's size, takes one
+ * write lock, and leaves it all zero. The server has the size, so the client sent
+ * an image; what is missing is the pixels. This reads the image the layer is
+ * actually given, before CoreAnimation serialises it, so the two halves can be
+ * told apart: colour here means the client had it and the transfer lost it, zero
+ * here means the layer was handed an empty image and the fix is upstream of the
+ * transfer.
+ *
+ * Only CGImages of a picture's size are read, and only a handful of lines, so the
+ * ring stays legible.
+ */
+static void (*mondrian_layer_contents_orig)(id, SEL, id);
+static unsigned mondrian_layer_lines;
+static unsigned mondrian_layer_made;
+
+/*
+ * Pictures reach the screen as surfaces, not as CGImages.
+ *
+ * Measured 2026-11-19: the layer is given a 640 x 480 CGImage whose four corners
+ * decode to the picture's colours, and the window server creates a surface of the
+ * same size, write-locks it once and shows it all zero -- the pixels never cross
+ * that transfer. The same app fills an IOSurface of the same size from the same
+ * image correctly (MONDRIAN CGSURF), and a layer whose contents is that surface
+ * draws the four quadrants on the glass. So on this port a client surface is the
+ * path CoreAnimation can show and a CGImage is not, and this hands every picture
+ * to the layer as the surface it already knows how to display.
+ *
+ * The switch is the off side: `/private/var/vm/mondrian-layercsurf-off` keeps the
+ * CGImages as they are, for an A/B that shows the transfer failing on its own. The
+ * loss itself is in CoreAnimation's server-side fill and is still the open work
+ * item; this is what makes the system usable while it is.
+ *
+ * A surface's row must be a multiple of the kernel's 16-byte alignment, which is
+ * why only widths divisible by four are converted; the rest keep their CGImage so
+ * a bad stride cannot be mistaken for a bad idea.
+ */
+static IOSurfaceRef
+mondrian_image_surface(CGImageRef image)
+{
+	size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+	size_t row = width * 4;
+	CFMutableDictionaryRef props;
+	IOSurfaceRef surface;
+	CGColorSpaceRef space;
+	CGContextRef context;
+	uint32_t seed = 0;
+
+	if (width < 8 || height < 8 || row * height > 64u * 1024 * 1024) {
+		return NULL;
+	}
+	props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (props == NULL) {
+		return NULL;
+	}
+	{
+		CFNumberRef n;
+		int values[5] = { (int)width, (int)height, 4, (int)row, 'BGRA' };
+		const char *keys[5] = { "IOSurfaceWidth", "IOSurfaceHeight",
+		    "IOSurfaceBytesPerElement", "IOSurfaceBytesPerRow",
+		    "IOSurfacePixelFormat" };
+		unsigned i;
+
+		for (i = 0; i < 5; i++) {
+			CFStringRef key = CFStringCreateWithCString(NULL, keys[i],
+			    kCFStringEncodingUTF8);
+
+			n = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
+			CFDictionarySetValue(props, key, n);
+			CFRelease(n);
+			CFRelease(key);
+		}
+	}
+	surface = IOSurfaceCreate(props);
+	CFRelease(props);
+	if (surface == NULL) {
+		return NULL;
+	}
+	if (IOSurfaceLock(surface, 0, &seed) != 0) {
+		CFRelease(surface);
+		return NULL;
+	}
+	space = CGColorSpaceCreateDeviceRGB();
+	context = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface), width,
+	    height, 8, row, space,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(space);
+	if (context == NULL) {
+		IOSurfaceUnlock(surface, 0, &seed);
+		CFRelease(surface);
+		return NULL;
+	}
+	CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+	CGContextFlush(context);
+	CGContextRelease(context);
+	IOSurfaceUnlock(surface, 0, &seed);
+	return surface;
+}
+
+static void
+mondrian_layer_contents(id self, SEL cmd, id contents)
+{
+	IOSurfaceRef surface = NULL;
+
+	if (contents != NULL &&
+	    !mondrian_file_on("/private/var/vm/mondrian-layercsurf-off") &&
+	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
+		CGImageRef image = (CGImageRef)contents;
+		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+
+		if (w >= 300 && h >= 200 && w % 4 == 0) {
+			surface = mondrian_image_surface(image);
+			if (surface != NULL) {
+				contents = (id)surface;
+				if (mondrian_layer_made++ < 8) {
+					mondrian_probe_fmt("MONDRIAN LAYER[%d]: "
+					    "%zux%zu as surface %u\n", getpid(), w,
+					    h, IOSurfaceGetID(surface));
+				}
+			}
+		}
+	}
+	if (mondrian_layer_contents_orig != NULL) {
+		mondrian_layer_contents_orig(self, cmd, contents);
+	}
+	if (surface != NULL) {
+		CFRelease(surface);     /* the contents retain it */
+	}
+	if (contents == NULL || mondrian_layer_lines >= 12 ||
+	    !mondrian_file_on("/private/var/vm/mondrian-layers")) {
+		return;
+	}
+	if (CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
+		CGImageRef image = (CGImageRef)contents;
+		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+
+		if (w >= 300 && h >= 200) {
+			unsigned char px[16];
+			CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+			CGContextRef context = CGBitmapContextCreate(px, 2, 2, 8, 8,
+			    space, kCGImageAlphaPremultipliedLast);
+
+			memset(px, 0, sizeof(px));
+			mondrian_layer_lines++;
+			if (context != NULL) {
+				CGContextDrawImage(context, CGRectMake(0, 0, 2, 2),
+				    image);
+				mondrian_probe_fmt("MONDRIAN LAYER[%d]: %zux%zu "
+				    "quadrants %d,%d,%d | %d,%d,%d | %d,%d,%d | "
+				    "%d,%d,%d\n", getpid(), w, h, px[0], px[1], px[2],
+				    px[4], px[5], px[6], px[8], px[9], px[10],
+				    px[12], px[13], px[14]);
+				CGContextRelease(context);
+			}
+			CGColorSpaceRelease(space);
+		}
+	}
+}
+
+static void
+mondrian_layer_probe_install(void)
+{
+	Class layer = objc_getClass("CALayer");
+	Method m = layer != NULL
+	    ? class_getInstanceMethod(layer, sel_registerName("setContents:")) : NULL;
+
+	if (m != NULL) {
+		mondrian_layer_contents_orig = (void (*)(id, SEL, id))
+		    method_setImplementation(m, (IMP)mondrian_layer_contents);
+	}
+}
+
 static void
 mondrian_app_probe(void)
 {
@@ -15047,6 +15489,8 @@ mondrian_app_probe(void)
 		return;
 	}
 	(void)close(fd);
+	mondrian_cg_surface_probe();
+	mondrian_layer_probe_install();
 	mondrian_library_probe();
 	if (mondrian_file_on("/private/var/vm/mondrian-du")) {
 		pthread_t du;
