@@ -593,13 +593,17 @@ creates a log file there (`rf` answers ENOENT). `0387` adds
 `StandardErrorPath` under `/private/var/tmp`, `tools/usb-ring.py rf PATH OFFSET
 LEN` is how the stack explains itself.
 
-A file that `wfile` **creates** is not readable in the same boot: `wfile`
-reports every byte delivered, and `rf` then answers `0` bytes for it, in
-`/private/var/tmp` and `/private/var/vm` alike (measured 2026-11-20). Only the
-next boot's mount makes the size real; overwriting a file that already exists
-reads back at once. So an upload meant to be read - a dylib for the next boot,
-a log target for the next run - lands on one boot and is verified on the
-next.
+A `wfile` the filesystem refuses is silent in the client and reads like a
+delivery: the host prints `N of N bytes delivered` from its own accounting, the
+kernel creates the target with `O_TRUNC`, the write that follows fails, and an
+empty file is what remains. Measured 2026-11-20: every upload answered
+`MONDRIAN WFILE: <path> <n> bytes -> 28` (ENOSPC) with the root 22 MB from
+full, and the dylib it was meant to replace stayed 0 bytes, so dyld had nothing
+to load and the process it was injected into ran unchanged. Freeing that 22 MB
+made the same upload answer `-> 0`. `tools/usb-ring.py` reads the kernel's
+verdict now and reports a refused write as an error, and `MONDRIAN WFILE` in
+the ring carries the errno either way; a 0-byte file the ring also answers with
+`rf ... at 0: 0`.
 
 Changing a job at all has its own trap, and it is bigger than a cache: launchd
 does **not** read `/System/Library/LaunchDaemons/*.plist`. `launchd_cache_loader`
@@ -624,8 +628,25 @@ only way to start the file over, exists only on kernels that carry `0387`.
 The variables therefore arrive at exec: `0388` gives `bluetoothd`
 `BT_HCI_TRANSPORT=H4:POSIX` in its new process image, the same lever `0385`
 uses for WebKit's GPU process, gated by `mondrianbt=1` so that no ordinary
-boot changes. The next measurement is the tty's own lines: `open pid`,
-`termios ispeed`, and the first `tx`/`rx`.
+boot changes. `0389` carries a dylib there instead of the literal, and
+`tools/mondrian-bt.c` is that dylib: it sets the transport and the baud rate,
+then claims descriptors 1 and 2 for a log file. The job runs as `mobile`
+(`UserName` in its table entry), so its log lands in
+`/private/var/mobile/Library/Preferences/mondrian-bt.log` and not in
+`/private/var/tmp`, which its sandbox denies. Measured 2026-11-20, the file
+carries the daemon's own startup:
+
+```
+mondrian-bt[882]: init uid 501 log "/private/var/mobile/Library/Preferences/mondrian-bt.log" transport "H4:POSIX" port access 0
+com.apple.server.bluetooth: Bluetooth Super Server Robot Destroyer
+...
+FindLocalMacAddress Local address from plist:25:9a:f2:86:6e:39.
+```
+
+so the shim loads and the address is found. The next line is the next
+process's `init`: the daemon leaves right after the address, before the
+transport prints anything, and `_exit` runs no `atexit` handler - which is why
+the shim interposes `_exit` and logs the status with the call addresses.
 
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
