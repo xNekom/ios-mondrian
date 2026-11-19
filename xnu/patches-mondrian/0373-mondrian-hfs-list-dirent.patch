@@ -1,0 +1,81 @@
+xnu 0373: list a directory with the plain readdir the driver actually fills
+
+`VNODE_READDIR_EXTENDED` answers an empty buffer with no error, even for a
+directory that has entries: measured 2026-11-19, `/private/var/vm` listed its
+twenty entries on a kernel that asked for plain `struct dirent` and listed nothing
+on one that asked for `struct direntry`. The plain call has its own quirk -- it
+writes the two dot entries as `struct hfs_stddotentry`, 12 bytes each, and only
+then packs `struct dirent` -- so the walk starts 24 bytes in and treats a record
+that does not fit as the end of the batch.
+
+This matters because the volume loses tens of megabytes a minute to something the
+port cannot name: `/private/var/log` and `/private/var/db/diagnostics` answer
+`deltree -> 0 files` while their catalog valence is 5 and 10, so the files eating
+the disk are invisible until the listing works.
+
+--- a/bsd/mondrian_hfs/core/hfs_vfsops.c
++++ b/bsd/mondrian_hfs/core/hfs_vfsops.c
+@@ -188,6 +188,8 @@
+ #define MONDRIAN_TREE_PATH  448
+ #define MONDRIAN_TREE_BUFSZ 4096
+ #define MONDRIAN_TREE_VALENCE 100000
++/* two `struct hfs_stddotentry` (12 bytes each) precede the first `struct dirent` */
++#define MONDRIAN_TREE_DOTS    24
+ 
+ static char mondrian_tree_pend[MONDRIAN_TREE_MAX][MONDRIAN_TREE_PATH];
+ static char mondrian_tree_batch[MONDRIAN_TREE_BATCH][NAME_MAX + 1];
+@@ -218,9 +220,17 @@
+ }
+ 
+ /*
+- * Up to `max` names of one directory, read as `struct direntry` records so that
+- * the dot entries and the real ones share one layout. Returns the count and the
+- * offset that follows them; `*errp` is set when the directory could not be read.
++ * Up to `max` names of one directory, read as `struct dirent` records. Returns the
++ * count and the offset that follows them; `*errp` is set when the directory could
++ * not be read.
++ *
++ * Not the extended form: measured 2026-11-19, `VNODE_READDIR_EXTENDED` answers
++ * an empty buffer and no error even for a directory with entries, while the plain
++ * call lists them. The plain call has its own quirk -- it writes the two dot
++ * entries as `struct hfs_stddotentry` (12 bytes each, an HFS structure) and only
++ * then packs `struct dirent` -- so the walk starts after those 24 bytes and
++ * resynchronises nothing: a record that does not fit ends the batch, and the
++ * caller asks again from the same offset.
+  */
+ static int
+ mondrian_tree_names(vnode_t dvp, off_t off, off_t *next, int *errp)
+@@ -244,8 +254,8 @@
+ 	auio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
+ 	uio_addiov(auio, CAST_USER_ADDR_T(mondrian_tree_buf),
+ 	    MONDRIAN_TREE_BUFSZ);
+-	error = VNOP_READDIR(dvp, auio, VNODE_READDIR_EXTENDED, &eofflag,
+-	    &numdirent, vfs_context_kernel());
++	error = VNOP_READDIR(dvp, auio, 0, &eofflag, &numdirent,
++	    vfs_context_kernel());
+ 	total = MONDRIAN_TREE_BUFSZ - (size_t)uio_resid(auio);
+ 	*next = uio_offset(auio);
+ 	uio_free(auio);
+@@ -258,12 +268,19 @@
+ 		*errp = error;
+ 		return 0;
+ 	}
+-	for (pos = 0; pos + sizeof(struct direntry) <= total &&
++	pos = (off == 0) ? MONDRIAN_TREE_DOTS : 0;
++	if (pos > total) {
++		pos = 0;
++	}
++	for (; pos + sizeof(struct dirent) <= total &&
+ 	    count < MONDRIAN_TREE_BATCH; ) {
+-		struct direntry *de = (struct direntry *)(void *)
++		struct dirent *de = (struct dirent *)(void *)
+ 		    (mondrian_tree_buf + pos);
+ 
+-		if (de->d_reclen == 0 || pos + de->d_reclen > total) {
++		if (de->d_reclen < sizeof(struct dirent) ||
++		    pos + de->d_reclen > total) {
++			/* Ask again from the same offset rather than guess. */
++			*next = off;
+ 			break;
+ 		}
+ 		if (de->d_namlen > 0 && de->d_namlen <= NAME_MAX &&
