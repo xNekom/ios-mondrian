@@ -265,7 +265,8 @@ surface stays all zero after its single write lock, so the hook hands pictures t
 the layer as filled IOSurfaces (`mondrian-layercsurf-off` keeps the old path);
 the transfer inside CoreAnimation is the open cause. `assetsd` now reads its
 entitlements (`csops` 5643 bytes, TCC preflight 1) but still aborts in an
-uncaught C++ exception; `PhotosFileProvider` dies in PlugInKit's container
+uncaught C++ exception, with or without the hook; `PhotosFileProvider` dies in
+PlugInKit's container
 check, `fileproviderd` in its own code, and Phone, the App Store and the network
 are as before.
 

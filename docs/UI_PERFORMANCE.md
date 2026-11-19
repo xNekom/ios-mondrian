@@ -421,8 +421,8 @@ boot each, so the three columns differ only in what changed:
   yes`; `SecTask` gives the same `kTCCServicePhotos` and TCC preflight answers 1.
   The old `0` was the blob lookup, not the signature. `assetsd` still aborts
   `sig 6`, now in an uncaught C++ exception (the trace ends in `libc++abi`
-  `terminate`), and `mondrian-probe` injects the hook into it; a boot without
-  that file is the next measurement, not another entitlement change.
+  `terminate`); a boot without `mondrian-probe` shows the same crash at the same
+  pc, so the hook is not the cause.
 - **A hook change is only in the kernel when the kernel build rebuilds it.**
   `tools/wsl/build-kernel.sh` embeds `out/gpu/mondrian-ui-hook.dylib` when the
   file exists and never rebuilt it from `tools/mondrian-ui-hook.m`, so a kernel
@@ -614,6 +614,11 @@ boot each, so the three columns differ only in what changed:
   and the **App Store** stops at `LOADING` because it needs the network. So a
   black screen after a tap is not one failure: read the ring's `exec` line to
   tell "never launched" from "launched and had nothing to draw".
+- **The keyboard is not reachable with the synthetic touch.** Measured
+  2026-11-19: the Messages search field and Safari's address field do not focus
+  on a tap or a hold, and no keyboard window appears; the hook's own note says
+  the keyboard's hit areas are not where its glyphs are drawn. A real finger on
+  the panel is the next test -- the USB injector is not the touchscreen.
   `tap`/`swipe` take panel pixels (1440x3200) and `screen` returns half of that,
   so aim with the runtime's frames, not with the picture: the hook prints
   `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points, and three
