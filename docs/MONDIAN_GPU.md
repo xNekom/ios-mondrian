@@ -1735,11 +1735,41 @@ at a time and asks `wstat` how much of the contiguous prefix landed. Unpaced,
 the 11.5 MB dylib arrived 0 of 11539920 bytes on three attempts; paced, it
 lands in about 13 s.
 
+That buffer is neither contiguous nor permanent (`0383`). The grow path frees
+the old buffer, and `KMA_PERMANENT` may not be freed: `vm_map_delete` panics
+with "Attempting to remove permanent VM map entry". Measured 2026-11-19: the
+first upload of a boot arrives whole (21.5 MB), and the next, larger one
+(22.2 MB) leaves the phone answering pings and nothing else -- the ring, the
+run watcher and every UDP command gone, with that panic on the panel. Plain
+`kmem_alloc` without `KMA_PERMANENT` does both jobs; the buffer is only copied
+into and given to the VFS, so contiguity was never needed.
+
 The boot carries userland tests: the UI hook spawns the first line of
 `/private/var/vm/mondrian-run` once and logs `MONDRIAN RUN: <path> pid ... rc`
 and `MONDRIAN RUN: exit 0x...`, with the program's own output on the console
 ring. A test is a `wfile` and one boot, with no image and no launchd job; a
 rewritten run file starts a new run in the same boot, with no respring.
+`tools/wsl/run-test.sh LOCAL [REMOTE] [ARGS...]` is that whole round: attach,
+upload, arm, wait for a new exit line, print the program's lines.
+
+### Metal on Vulkan over Turnip
+
+`tools/mk-m2v-ios.sh` builds UniXNU's Metal frontend and steelbrain's
+metal2vulkan runtime over the same Turnip, and `tools/gpu/m2v_test.m` runs it
+inside a boot. Measured 2026-11-19 on the kernel with `0383`: the device is made
+in 141 ms as a `NativeBridgeMetalDevice` over "Turnip Adreno (TM) 725", a 4 MB
+blit fill lands 1048576 of 1048576 words in 2.74 ms, a 1080x2400 clear
+2592000 of 2592000 pixels in 2.20 ms, and 100 committed clears average
+1.469 ms (1.008 at best). Device, queue, blit encoder and render encoder all
+work, so WebKit's GPU process is a client this stack can serve.
+
+Two host-memory paths do not: a texture made over an IOSurface reads back zero
+and a GPU clear into it never reaches the CPU's view, and
+`-newBufferWithBytesNoCopy:length:options:deallocator:` is refused with
+"HostMemory ... NotRepresentable". The runtime carries a `Shadow` policy for
+host-page textures (`HostPageTexturePolicy`, copies instead of aliasing), which
+is the first thing to try; neither path is reachable from the AdrenoMetal
+bridge as pinned, whose device takes the production policy.
 
 ### A warm reboot can leave the boot core unstarted
 
