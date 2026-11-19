@@ -1,0 +1,100 @@
+xnu 0376: print the blank timer and its gate
+
+Measured 2026-11-19: `mondrianfb_blank=30` was on the command line, the kernel's
+own boot line showed it, and the driver still logged no idle blank, while the
+same driver blanked on the power key and, with the default of 1 s, blanked by
+itself. Print the parsed seconds at setup and, behind `mondrianbtrace=1`, the
+age of the last present and the input grace once every ten seconds.
+
+The line answered it on the first boot: the parsed seconds read 0, because
+`PE_parse_boot_argn` keeps the last occurrence of a key and the board's
+`mondrianfb_blank=0` came after the test value. With the test value last, the
+same trace counted the gate to 30 and the driver logged `panel blank after 30
+s without a frame`, `panel wake (touch)` and `panel on (dcs)`. It changes no
+decision.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+index abc30da..af48e89 100644
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -547,6 +547,8 @@ public:
+ 	 */
+ 	bool          fBlanked;
+ 	uint32_t      fBlankAfter;
++	bool          fBlankTrace;        /* mondrianbtrace: print the gate */
++	uint64_t      fBlankTraceTicks;   /* when the gate last printed */
+ 	uint64_t      fBlankFirstPresent; /* first present in the current burst */
+ 	uint32_t      fBlankPresents;     /* presents in the current burst */
+ 	bool          fBlankRequest;      /* the power key asked for black now */
+@@ -902,6 +904,8 @@ AppleCLCD::start(IOService *provider)
+ 	fResetDone = false;
+ 	fBlanked = false;
+ 	fBlankAfter = 1;
++	fBlankTrace = false;
++	fBlankTraceTicks = 0;
+ 	fBlankFirstPresent = 0;
+ 	fBlankPresents = 0;
+ 	fBlankRequest = false;
+@@ -990,11 +994,15 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	{
+-		int blank = 1;
++		int blank = 1, trace = 0;
+ 
+ 		if (PE_parse_boot_argn("mondrianfb_blank", &blank, sizeof(blank))) {
+ 			fBlankAfter = blank > 0 ? (uint32_t)blank : 0;
+ 		}
++		fBlankTrace = PE_parse_boot_argn("mondrianbtrace", &trace,
++		    sizeof(trace)) && trace != 0;
++		IOLog("MONDRIAN FB: blank timer %u s trace %d\n", fBlankAfter,
++		    fBlankTrace ? 1 : 0);
+ 	}
+ 	(void)PE_parse_boot_argn("mondrianfb_probe", &mondrian_fb_probe,
+ 	    sizeof(mondrian_fb_probe));
+@@ -1321,6 +1329,45 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		bool idle = false;
+ 		uint64_t hold;
+ 
++		/*
++		 * Three inputs decide the idle blank and a boot cannot say
++		 * which one holds it: the parsed seconds, the age of the last
++		 * present and the input grace. Print them while the question is
++		 * open, once every ten seconds.
++		 */
++		if (fb->fBlankTrace) {
++			uint64_t ten;
++
++			nanoseconds_to_absolutetime(10000000000ULL, &ten);
++			if (fb->fBlankTraceTicks == 0 ||
++			    now - fb->fBlankTraceTicks >= ten) {
++				int64_t lastSec = -1;
++				int64_t actSec = 0;
++
++				fb->fBlankTraceTicks = now;
++				if (fb->fLastPresentTicks != 0 &&
++				    now > fb->fLastPresentTicks) {
++					uint64_t ns = 0;
++
++					absolutetime_to_nanoseconds(now -
++					    fb->fLastPresentTicks, &ns);
++					lastSec = (int64_t)(ns / 1000000000ULL);
++				}
++				if (fb->fActivityTicks > now) {
++					uint64_t ns = 0;
++
++					absolutetime_to_nanoseconds(fb->fActivityTicks -
++					    now, &ns);
++					actSec = (int64_t)(ns / 1000000000ULL);
++				} else if (fb->fActivityTicks != 0) {
++					actSec = -1;
++				}
++				IOLog("MONDRIAN FB: blank gate after %u s last %lld s activity %lld s\n",
++				    fb->fBlankAfter, (long long)lastSec,
++				    (long long)actSec);
++			}
++		}
++
+ 		/*
+ 		 * The power key asks for black now. The timer is the fallback
+ 		 * for sleeps iOS starts itself, and 0 disables only the timer.
