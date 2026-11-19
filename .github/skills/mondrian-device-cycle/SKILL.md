@@ -36,6 +36,13 @@ A RAM boot after an XNU run can also die at the shim handoff and fall back to
 booted the image, so retry (`ATTEMPTS=N`, which `cycle.sh` does) instead of
 waiting for a power cycle that nobody is there to perform.
 
+The retry has one trap of its own: `boot_b` **leaves fastboot**, so the next
+attempt's `fastboot getvar` blocks for ever on `< waiting for any device >` and
+the run looks like a boot that hung instead of a device that is simply not in
+the bootloader any more. `cycle.sh` checks `fastboot devices` before each
+attempt and asks the running kernel for fastboot again when it is gone; time
+bound the `getvar` and `--set-active` too.
+
 ## When the ring goes silent
 
 `pos` and `wfile` stop answering while ICMP on the same link still does: the
