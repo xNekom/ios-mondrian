@@ -1835,6 +1835,16 @@ the page surface belongs to the GPU process, so "WebContent creates no surface"
 is expected; what is unexplained is that the GPU process locks its surface,
 paints nothing into it, and never asks Metal for a device.
 
+Measured 2026-11-19 with the page actually fetched (`GET / 200` twice from the
+served page, so there was something to paint), the GPU process reaches **none**
+of the drawing entry points that were probed, and the `crash` counter never
+moves: Metal's factory (`device_probe`), CoreGraphics' `CGBitmapContextCreate`,
+`CGContextFillRect`, `CGContextDrawImage` (`cg_probe`), and GLES' `glClear`,
+`glDrawArrays`, `glTexImage2D` (`gles_probe`). The surface is created, locked and
+unlocked still at zero. So the missing link is upstream of any paint: no layer
+content arrives to draw, and the next suspect is the layer tree from WebContent
+rather than the drawing API.
+
 
 ### A warm reboot can leave the boot core unstarted
 
