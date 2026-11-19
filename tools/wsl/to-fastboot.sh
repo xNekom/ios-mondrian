@@ -54,8 +54,19 @@ else
 	timeout 25 python3 tools/usb-ring.py reboot > /dev/null 2>&1
 fi
 
+# The phone lands in fastboot as 18d1:d00d, and `fastboot devices` only sees it
+# while usbipd is NOT holding the device: the wait has to look at usbipd's list
+# and hand the device back to Windows, or every check runs against a fastboot
+# that is attached to WSL and answers nothing. Measured 2026-11-19: the phone
+# was in fastboot with the id visible in `usbipd list` while this script spent
+# 160 s asking a Windows fastboot that could not see it.
 for i in $(seq 1 40); do
 	sleep 4
+	b=$(usbipd.exe list 2>/dev/null | grep -a '18d1:d00d' | awk '{print $1}' | head -1)
+	if [ -n "$b" ]; then
+		usbipd.exe detach --busid "$b" > /dev/null 2>&1
+		sleep 1
+	fi
 	"$FB" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
 	try_attach
 	"$FB" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
