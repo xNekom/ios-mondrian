@@ -257,10 +257,10 @@ Settings, Messages and Safari launch and draw real content (a settings list, an
 onboarding page, the Safari start page), so LaunchServices, the icon model and
 the compositor are whole. Safari's page content is black: the WebKit GPU
 process's `w30r` surfaces stay zero (`0379`/`0380`), because it renders through
-Metal. Metal on Vulkan runs now (`docs/MONDIAN_GPU.md`): a device in 141 ms, a
-4 MB blit fill in 2.74 ms, a 1080x2400 clear in 2.20 ms; a texture over an
-IOSurface is still refused (`Function not implemented` on Turnip's host-page
-import), and a userptr request beside `0x7e` is the fix, then the GPU process. Measured 2026-11-19 on the restored volume: Photos completes its first-run
+Metal. Metal on Vulkan runs now (`docs/MONDIAN_GPU.md`): a device in 125 ms, a
+4 MB blit fill in 2.13 ms, a 1080x2400 clear in 1.76 ms, and host memory too
+(`0384`, a GPU buffer of the process's own pages), so m2v_test passes end to
+end; the WebKit GPU process is what is left. Measured 2026-11-19 on the restored volume: Photos completes its first-run
 flow, its import answers **`shared success 1`**, the Library draws the tile and
 the viewer opens on it with the picture in colour; the next boot reports
 `library has 1`. A default boot (mask bit 0x100, no probe file) draws both: the app

@@ -1763,13 +1763,13 @@ blit fill lands 1048576 of 1048576 words in 2.74 ms, a 1080x2400 clear
 1.469 ms (1.008 at best). Device, queue, blit encoder and render encoder all
 work, so WebKit's GPU process is a client this stack can serve.
 
-Two host-memory paths do not: a texture made over an IOSurface reads back zero
-and a GPU clear into it never reaches the CPU's view, and
-`-newBufferWithBytesNoCopy:length:options:deallocator:` is refused with
-"HostMemory ... NotRepresentable". The runtime carries a `Shadow` policy for
-host-page textures (`HostPageTexturePolicy`, copies instead of aliasing), which
-is the first thing to try; neither path is reachable from the AdrenoMetal
-bridge as pinned, whose device takes the production policy.
+Host memory works too, with `0384` (a GPU buffer of the calling process's
+pages, request `0x7d`): m2v_test passes end to end. An IOSurface the CPU writes
+and the GPU copies lands 65536 of 65536 pixels; the same pages through a no-copy
+buffer, 65536 of 65536; a GPU clear of the IOSurface, read back by the CPU,
+65536 of 65536. Before it the ring said "TU: error: import of host pages ...
+refused: Function not implemented", and the runtime's `Shadow` policy was not
+needed.
 
 ### A warm reboot can leave the boot core unstarted
 
