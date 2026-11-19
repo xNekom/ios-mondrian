@@ -84,7 +84,10 @@ The shim takes the framebuffer and the UFS host from the device tree, and
   earlier. `fastboot --set-active=<current-slot>` clears it. `cycle.sh` does
   this before every boot; without it, the refusal reads as a kernel that
   crashes, and the ring answering with the previous kernel's banner "confirms"
-  it.
+  it. A boot after an XNU run can also die at the shim handoff; measured
+  2026-11-19, two attempts died and the third booted in the same session, so
+  `cycle.sh` retries (`ATTEMPTS=N`, three by default) instead of stopping to ask
+  for a power cycle.
 - **Prove the kernel before trusting any answer.** A RAM boot that dies falls
   back to `boot_b`, so "command not found" means "old kernel" as often as
   "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the kernel
@@ -96,7 +99,11 @@ The shim takes the framebuffer and the UFS host from the device tree, and
   and the new command "does not exist" - and `bash tools/flash-root.sh IMG |
   tail -6` throws away the `fastboot flash` progress and its failure, so a
   flash that never started looks like one that finished and the image gets
-  blamed. Log to a file and read the exit status. The same goes for editing a
+  blamed. Log to a file and read the exit status. A pipe also outlives the
+  script when the script starts a daemon: `bash serve.sh | tail` never returns
+  because the daemon inherits the write end, which is what an "eternal wait"
+  looks like from the outside. Start daemons with `setsid ... </dev/null >
+  log 2>&1 &` and never pipe the script. The same goes for editing a
   script that is still running.
 - **Every WSL script attaches the phone itself.** WSL shuts down between tool
   calls, so `usbipd attach --wsl` and the `192.168.7.1` address must be redone
