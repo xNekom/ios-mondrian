@@ -373,6 +373,13 @@ MONDRIAN = Board(
              # 608 bytes and the kernel refuses every reader.
              'mondrian_ui_hook=262 mondrian_gpu_hook=1 mondriankeepawake=1 '
              'mondrianunlock=1 '
+             # bluetoothd only evaluates a serial transport when it has a local
+             # Bluetooth address, and the address comes from the preference it
+             # reads only when this token is in kern.bootargs: without it the
+             # process exits 0 at startup and never looks at /dev/cu.bluetooth
+             # (docs/MONDIAN_WIRELESS.md). The value it generates itself is
+             # persisted, so the token is all that is needed.
+             'wlan.debug.generate-mac '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does

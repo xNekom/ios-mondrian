@@ -1,0 +1,530 @@
+xnu 0386: /dev/cu.bluetooth, the HCI transport bluetoothd opens
+
+On iOS 16.7.16 bluetoothd's primary transport is an IOKit
+AppleBluetoothModule service, which this kernel does not have, and its
+fallback is a serial port: it calls access("/dev/cu.bluetooth"), then
+access("/dev/uart.bluetooth"), and logs "No valid serial port found (tried
+cu.bluetooth and uart.bluetooth)" when both are missing. The binary imports
+tcgetattr, tcsetattr, cfsetspeed and cfmakeraw, so the node must be a tty:
+a plain cdev would fail the termios conversation before the first HCI packet.
+
+The node therefore exists from boot, because bluetoothd is started by launchd
+long before a ring command could create anything: `mondrian_bt_tty_init()` runs
+in the root-mount probe block. The part is powered and the wire programmed on
+the first open, which is the first moment the chip has to be alive, and that
+reuses the measured `btuart on` sequence (pins, 14745600 Hz root, 8N1) instead
+of a second copy of it; the SE root is changed **once** per boot, which is the
+constraint 0343 measured.
+
+Input is drained into the line discipline from a one-tick timeout instead of an
+interrupt: SPI 587 has no handler in this kernel, and enabling a level line
+nothing acknowledges is what 0343 avoids. One tick is 10 ms, 115 bytes at
+115200, below the engine's 128-byte RX FIFO, and the FIFO asserts RFR well
+before it fills.
+
+The port is raw by default (no ICANON, no echo) so HCI bytes are not mangled
+before bluetoothd calls cfmakeraw(), and the first eight packets in each
+direction are printed as `MONDRIAN BTTTY: tx/rx ...` lines: the process that
+uses the port cannot log anywhere, so the ring is the read-back channel.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9cebc34..c34682e 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
+ bsd/dev/mondrian_haptics.c		standard
+ bsd/dev/mondrian_btuart.c		standard
++bsd/dev/mondrian_bt_tty.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+diff --git a/bsd/dev/mondrian_bt_tty.c b/bsd/dev/mondrian_bt_tty.c
+new file mode 100755
+index 0000000..3c4165b
+--- /dev/null
++++ b/bsd/dev/mondrian_bt_tty.c
+@@ -0,0 +1,329 @@
++/*
++ * /dev/cu.bluetooth: the HCI transport bluetoothd opens on this phone.
++ *
++ * Measured on iOS 16.7.16: bluetoothd's primary path is an IOKit
++ * AppleBluetoothModule service (absent here), and its fallback checks
++ * access("/dev/cu.bluetooth") and then access("/dev/uart.bluetooth") before
++ * giving up and logging "No valid serial port found". It imports tcgetattr,
++ * tcsetattr, cfsetspeed and cfmakeraw, so the node has to behave like a serial
++ * port, not like a pipe: this is a tty whose output goes to the QUP wrapper 2
++ * engine (bsd/dev/mondrian_btuart.c) and whose input is drained into the line
++ * discipline from a one-tick timeout.
++ *
++ * The node exists from boot because that is when bluetoothd looks for it: the
++ * process starts during early userspace, before any ring command could create
++ * anything. The chip is powered and the wire is programmed on the first open,
++ * which is also the first moment the part has to be alive.
++ *
++ * The process that uses this port cannot log (its stderr is discarded and the
++ * ring is not reachable from its sandbox), so the driver prints the first
++ * packets it carries: `MONDRIAN BTTTY:` lines in the console ring are the
++ * read-back channel.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/tty.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/termios.h>
++#include <miscfs/devfs/devfs.h>
++
++extern int hz;
++
++extern int mondrian_btuart_tty_open(void);
++extern int mondrian_btuart_tty_write(const void *buf, size_t len);
++extern int mondrian_btuart_tty_read(void *buf, size_t cap);
++
++static struct tty *mondrian_bt_tty;
++static int mondrian_bt_tty_polling;
++static int mondrian_bt_tty_tx_lines;
++static int mondrian_bt_tty_rx_lines;
++static uint32_t mondrian_bt_tty_tx_bytes;
++static uint32_t mondrian_bt_tty_rx_bytes;
++
++static void mondrian_bt_tty_start(struct tty *tp);
++static void mondrian_bt_tty_out(struct tty *tp);
++static void mondrian_bt_tty_poll(void *arg);
++
++static void
++mondrian_bt_tty_log(const char *what, const uint8_t *buf, int n)
++{
++	char line[112];
++	int m;
++
++	m = snprintf(line, sizeof(line), "MONDRIAN BTTTY: %s %d", what, n);
++	for (int i = 0; i < n && i < 16 && m < (int)sizeof(line) - 4; i++) {
++		m += snprintf(line + m, sizeof(line) - (size_t)m, " %02x",
++		    buf[i]);
++	}
++	printf("%s\n", line);
++}
++
++static int
++mondrian_bt_tty_open(dev_t dev, int flag, int devtype, proc_t p)
++{
++	struct tty *tp = mondrian_bt_tty;
++	int error;
++
++	tty_lock(tp);
++	tp->t_oproc = mondrian_bt_tty_start;
++	tp->t_param = NULL;
++	tp->t_dev = dev;
++	if (!(tp->t_state & TS_ISOPEN)) {
++		/*
++		 * Raw by default: this port carries HCI packets, and a byte
++		 * eaten by ICANON or echoed back would corrupt the protocol
++		 * before bluetoothd has had a chance to call cfmakeraw().
++		 */
++		tp->t_iflag = 0;
++		tp->t_oflag = 0;
++		tp->t_lflag = 0;
++		tp->t_cflag = CREAD | CS8 | CLOCAL;
++		tp->t_ispeed = tp->t_ospeed = 115200;
++		termioschars(&tp->t_termios);
++		ttsetwater(tp);
++	} else if ((tp->t_state & TS_XCLUDE) && proc_suser(p)) {
++		error = EBUSY;
++		goto out;
++	}
++
++	tp->t_state |= TS_CARR_ON;      /* the port is always "connected" */
++	error = (*linesw[tp->t_line].l_open)(dev, tp);
++	if (error != 0) {
++		goto out;
++	}
++
++	if (!mondrian_bt_tty_polling) {
++		mondrian_bt_tty_polling = 1;
++		timeout(mondrian_bt_tty_poll, tp, 1);
++	}
++out:
++	tty_unlock(tp);
++	if (error != 0) {
++		return error;
++	}
++
++	/*
++	 * Powers the part and programs the wire. The node is the contract:
++	 * bluetoothd opened it, so the UART has to be ready before the first
++	 * write arrives.
++	 */
++	error = mondrian_btuart_tty_open();
++	if (error != 0) {
++		printf("MONDRIAN BTTTY: open failed %d\n", error);
++		return error;
++	}
++	printf("MONDRIAN BTTTY: open pid %d flag 0x%x\n", proc_pid(p), flag);
++	return 0;
++}
++
++static int
++mondrian_bt_tty_close(dev_t dev, int flag, int devtype, proc_t p)
++{
++	struct tty *tp = mondrian_bt_tty;
++	int error;
++
++	mondrian_bt_tty_polling = 0;
++	untimeout(mondrian_bt_tty_poll, tp);
++
++	tty_lock(tp);
++	error = (*linesw[tp->t_line].l_close)(tp, flag);
++	ttyclose(tp);
++	tty_unlock(tp);
++
++	printf("MONDRIAN BTTTY: close pid %d tx %u rx %u\n", proc_pid(p),
++	    mondrian_bt_tty_tx_bytes, mondrian_bt_tty_rx_bytes);
++	return error;
++}
++
++static int
++mondrian_bt_tty_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	struct tty *tp = mondrian_bt_tty;
++	int error;
++
++	tty_lock(tp);
++	error = (*linesw[tp->t_line].l_read)(tp, uio, ioflag);
++	tty_unlock(tp);
++	return error;
++}
++
++static int
++mondrian_bt_tty_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	struct tty *tp = mondrian_bt_tty;
++	int error;
++
++	tty_lock(tp);
++	error = (*linesw[tp->t_line].l_write)(tp, uio, ioflag);
++	tty_unlock(tp);
++	return error;
++}
++
++static int
++mondrian_bt_tty_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, proc_t p)
++{
++	struct tty *tp = mondrian_bt_tty;
++	int error;
++
++	/* ttioctl takes the tty lock itself. */
++	error = ttioctl(tp, cmd, data, flag, p);
++	if (error == 0 && (cmd == TIOCSETA || cmd == TIOCSETAW ||
++	    cmd == TIOCSETAF)) {
++		struct termios *t = (struct termios *)data;
++
++		printf("MONDRIAN BTTTY: termios ispeed %lu ospeed %lu "
++		    "cflag 0x%lx lflag 0x%lx\n", (unsigned long)t->c_ispeed,
++		    (unsigned long)t->c_ospeed, (unsigned long)t->c_cflag,
++		    (unsigned long)t->c_lflag);
++	}
++	return error;
++}
++
++/* Output: the tty layer's queue, drained into the engine four bytes at a time. */
++static void
++mondrian_bt_tty_out(struct tty *tp)
++{
++	uint8_t buf[128];
++	int cc;
++
++	while (tp->t_outq.c_cc > 0) {
++		cc = ndqb(&tp->t_outq, 0);
++		if (cc <= 0) {
++			break;
++		}
++		if (cc > (int)sizeof(buf)) {
++			cc = (int)sizeof(buf);
++		}
++		cc = q_to_b(&tp->t_outq, buf, cc);
++		if (cc <= 0) {
++			break;
++		}
++		mondrian_bt_tty_tx_bytes += (uint32_t)cc;
++		if (mondrian_bt_tty_tx_lines < 8) {
++			mondrian_bt_tty_tx_lines++;
++			mondrian_bt_tty_log("tx", buf, cc);
++		}
++		if (mondrian_btuart_tty_write(buf, (size_t)cc) < 0) {
++			printf("MONDRIAN BTTTY: engine refused %d bytes\n", cc);
++			break;
++		}
++	}
++	tp->t_state &= ~TS_BUSY;
++	(*linesw[tp->t_line].l_start)(tp);
++}
++
++static void
++mondrian_bt_tty_start(struct tty *tp)
++{
++	if (tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP)) {
++		goto out;
++	}
++	if (tp->t_outq.c_cc == 0) {
++		goto out;
++	}
++	tp->t_state |= TS_BUSY;
++	mondrian_bt_tty_out(tp);
++	return;
++out:
++	(*linesw[tp->t_line].l_start)(tp);
++}
++
++/*
++ * One tick is 10 ms: at 115200 that is 115 bytes, under the engine's 128-byte
++ * RX FIFO, and the FIFO asserts RFR (hardware flow control) well before it
++ * fills, so the part stops on its own if userspace falls behind.
++ */
++static void
++mondrian_bt_tty_poll(void *arg)
++{
++	struct tty *tp = arg;
++	uint8_t buf[64];
++	int n;
++
++	if (!mondrian_bt_tty_polling) {
++		return;
++	}
++	tty_lock(tp);
++	if (!(tp->t_state & TS_ISOPEN)) {
++		tty_unlock(tp);
++		return;
++	}
++	n = mondrian_btuart_tty_read(buf, sizeof(buf));
++	for (int i = 0; i < n; i++) {
++		(void)ttyinput(buf[i], tp);
++	}
++	tty_unlock(tp);
++
++	if (n > 0) {
++		mondrian_bt_tty_rx_bytes += (uint32_t)n;
++		if (mondrian_bt_tty_rx_lines < 8) {
++			mondrian_bt_tty_rx_lines++;
++			mondrian_bt_tty_log("rx", buf, n);
++		}
++	}
++	timeout(mondrian_bt_tty_poll, tp, 1);
++}
++
++static int
++mondrian_bt_tty_stop(struct tty *tp, int rw)
++{
++	(void)tp;
++	(void)rw;
++	return 0;
++}
++
++static int
++mondrian_bt_tty_reset(int uban)
++{
++	(void)uban;
++	return 0;
++}
++
++static const struct cdevsw mondrian_bt_cdevsw = {
++	.d_open = mondrian_bt_tty_open,
++	.d_close = mondrian_bt_tty_close,
++	.d_read = mondrian_bt_tty_read,
++	.d_write = mondrian_bt_tty_write,
++	.d_ioctl = mondrian_bt_tty_ioctl,
++	.d_stop = mondrian_bt_tty_stop,
++	.d_reset = mondrian_bt_tty_reset,
++	.d_ttys = &mondrian_bt_tty,
++	.d_select = ttselect,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++/*
++ * Called from the root-mount path (bsd/dev/mondrian_ufs.c), before launchd
++ * and therefore before bluetoothd's access() check.
++ */
++void
++mondrian_bt_tty_init(void)
++{
++	int major;
++	dev_t dev;
++
++	mondrian_bt_tty = ttymalloc();
++	if (mondrian_bt_tty == NULL) {
++		printf("MONDRIAN BTTTY: no tty\n");
++		return;
++	}
++	major = cdevsw_add(-1, &mondrian_bt_cdevsw);
++	if (major < 0) {
++		printf("MONDRIAN BTTTY: cdevsw_add failed %d\n", major);
++		return;
++	}
++	dev = makedev(major, 0);
++	mondrian_bt_tty->t_dev = dev;
++	if (devfs_make_node(dev, DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666,
++	    "cu.bluetooth") == NULL) {
++		printf("MONDRIAN BTTTY: devfs_make_node failed\n");
++		return;
++	}
++	printf("MONDRIAN BTTTY: /dev/cu.bluetooth major %d\n", major);
++}
+diff --git a/bsd/dev/mondrian_btuart.c b/bsd/dev/mondrian_btuart.c
+index 8a264ba..02da437 100644
+--- a/bsd/dev/mondrian_btuart.c
++++ b/bsd/dev/mondrian_btuart.c
+@@ -28,6 +28,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <libkern/libkern.h>
++#include <sys/errno.h>
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(MONDRIAN)
+@@ -1080,4 +1081,123 @@ mondrian_btuart_run(const char *mode, char *out, size_t len)
+ 	return n;
+ }
+ 
++/*
++ * The tty behind /dev/cu.bluetooth (bsd/dev/mondrian_bt_tty.c). bluetoothd
++ * owns the HCI protocol; the kernel only powers the part, programs the wire
++ * and moves bytes. This is the first path in which the peer is a real stack
++ * rather than a probe, so the engine must honour CTS here.
++ */
++static int mondrian_bt_tty_ready;
++
++int
++mondrian_btuart_tty_open(void)
++{
++	vm_offset_t gcc, wrap, se;
++	char out[1024];
++	int n = 0;
++
++	if (mondrian_bt_tty_ready) {
++		return 0;
++	}
++	if (!mondrian_bt_map(&gcc, &wrap, &se)) {
++		printf("MONDRIAN BTTTY: cannot map the engine\n");
++		return ENXIO;
++	}
++	out[0] = 0;
++	mondrian_bt_power(gcc);
++	n = mondrian_bt_power_on(0, out, sizeof(out), n);
++	n = mondrian_bt_rcg_14745600(gcc, out, sizeof(out), n);
++	n = mondrian_bt_uart_init(se, 8, 14745600u, 0, out, sizeof(out), n);
++	mondrian_bt_wr(se, MONDRIAN_BT_SE_UART_TX_CFG, 0);
++	printf("%s", out);
++	printf("MONDRIAN BTTTY: prepared, tx_cfg 0x%x\n",
++	    mondrian_bt_rd(se, MONDRIAN_BT_SE_UART_TX_CFG));
++	mondrian_bt_tty_ready = 1;
++	return 0;
++}
++
++int
++mondrian_btuart_tty_write(const void *buf, size_t len)
++{
++	vm_offset_t gcc, wrap, se;
++	char trace[512];
++
++	if (!mondrian_bt_tty_ready || len == 0) {
++		return -1;
++	}
++	if (!mondrian_bt_map(&gcc, &wrap, &se)) {
++		return -1;
++	}
++	trace[0] = 0;
++	mondrian_bt_send(se, (const uint8_t *)buf, (uint32_t)len, trace,
++	    sizeof(trace), 0);
++	{
++		/* No strstr in the kernel: the trace's only failure is `done 0`. */
++		const char *p = trace;
++		int stalled = 0;
++
++		while (*p != 0) {
++			if (strncmp(p, "done 0", 6) == 0) {
++				stalled = 1;
++				break;
++			}
++			p++;
++		}
++		if (stalled) {
++			printf("MONDRIAN BTTTY: tx %u stalled: %s",
++			    (unsigned)len, trace);
++			return -1;
++		}
++	}
++	return (int)len;
++}
++
++int
++mondrian_btuart_tty_read(void *buf, size_t cap)
++{
++	vm_offset_t gcc, wrap, se;
++	uint8_t *dst = buf;
++	uint32_t status, words, last, bytes, got = 0;
++
++	if (!mondrian_bt_tty_ready) {
++		return 0;
++	}
++	if (!mondrian_bt_map(&gcc, &wrap, &se)) {
++		return 0;
++	}
++	status = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO_STATUS);
++	words = status & MONDRIAN_BT_RX_FIFO_WC_MSK;
++	/*
++	 * The FIFO is 32 words: a larger count is the same stale-status noise
++	 * the polling path clamps, and draining it would read registers that
++	 * hold nothing.
++	 */
++	if (words > 32) {
++		words = 32;
++	}
++	if (words == 0) {
++		return 0;
++	}
++	last = (status & MONDRIAN_BT_RX_LAST_BYTE_MSK) >>
++	    MONDRIAN_BT_RX_LAST_BYTE_SHFT;
++	bytes = 4 * (words - 1);
++	if ((status & MONDRIAN_BT_RX_LAST) == 0 || last == 0) {
++		bytes += 4;
++	} else {
++		bytes += last;
++	}
++	while (got < bytes) {
++		uint32_t word = mondrian_bt_rd(se, MONDRIAN_BT_RX_FIFO);
++		uint32_t take = MIN(4, bytes - got);
++
++		for (uint32_t i = 0; i < take; i++) {
++			if (got < cap) {
++				dst[got] = (uint8_t)(word >> (8 * i));
++			}
++			got++;
++		}
++	}
++	return (int)MIN(got, cap);
++}
++
+ #endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index a3fd984..10d40b4 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2178,11 +2178,13 @@ mondrian_log_start(void)
+ 		extern int mondrian_gpu_probe(void);
+ 		extern void mondrian_touch_probe(void);
+ 		extern void mondrian_usb_probe(void);
++		extern void mondrian_bt_tty_init(void);
+ 		extern void mondrian_spmi_probe(void);
+ 
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
++		mondrian_bt_tty_init();
+ 		mondrian_spmi_probe();
+ 	}
+ }
