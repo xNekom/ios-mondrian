@@ -2032,12 +2032,105 @@ install_server_hook(void)
 	}
 }
 
+/*
+ * A userland test the boot carries: the first line of
+ * /private/var/vm/mondrian-run is a command line, spawn it once with its
+ * output on the console, and log the exit status. The ring is the only
+ * channel a test program has before there is a shell, and writing the file
+ * is one wfile. Runs in SpringBoard only: that is the process the heartbeat
+ * thread belongs to, and a spawn from every hooked daemon would multiply it.
+ */
+static void *
+run_waiter(void *argument)
+{
+	pid_t pid = (pid_t)(intptr_t)argument;
+	int status = 0;
+
+	(void)waitpid(pid, &status, 0);
+	mondrian_probe_fmt("MONDRIAN RUN: exit 0x%x\n", status);
+	return NULL;
+}
+
+static void
+mondrian_run_once(void)
+{
+	static char done[512];
+	char text[512], command[512];
+	char *argv[17];
+	posix_spawn_file_actions_t actions;
+	ssize_t n;
+	int fd, argc = 0, out = -1, rc;
+	pid_t pid = 0;
+	pthread_t thread;
+
+	if (__builtin_strcmp(getprogname(), "SpringBoard") != 0) {
+		return;
+	}
+	fd = open("/private/var/vm/mondrian-run", O_RDONLY);
+	if (fd < 0) {
+		return;
+	}
+	n = read(fd, text, sizeof(text) - 1);
+	(void)close(fd);
+	if (n <= 0) {
+		return;
+	}
+	text[n] = '\0';
+	while (n > 0 && (text[n - 1] == '\n' || text[n - 1] == '\r' ||
+	    text[n - 1] == ' ' || text[n - 1] == '\t')) {
+		text[--n] = '\0';
+	}
+	if (n == 0 || __builtin_strcmp(text, done) == 0) {
+		return;
+	}
+	(void)strlcpy(done, text, sizeof(done));
+	(void)strlcpy(command, text, sizeof(command));
+	for (char *p = strtok(command, " \t"); p != NULL && argc < 16;
+	    p = strtok(NULL, " \t")) {
+		argv[argc++] = p;
+	}
+	argv[argc] = NULL;
+	/*
+	 * /dev/console is the framebuffer console here, which is also the ring:
+	 * a test's printf lands beside the kernel's lines.
+	 */
+	out = open("/dev/console", O_WRONLY);
+	if (out >= 0) {
+		(void)posix_spawn_file_actions_init(&actions);
+		(void)posix_spawn_file_actions_adddup2(&actions, out, STDOUT_FILENO);
+		(void)posix_spawn_file_actions_adddup2(&actions, out, STDERR_FILENO);
+	} else {
+		(void)posix_spawn_file_actions_init(&actions);
+	}
+	/*
+	 * wfile writes the bytes and not the mode: a test uploaded that way is
+	 * not executable until this says so.
+	 */
+	(void)chmod(argv[0], 0755);
+	extern char **environ;
+	errno = 0;
+	rc = posix_spawn(&pid, argv[0], &actions, NULL, argv, environ);
+	mondrian_probe_fmt("MONDRIAN RUN: %s pid %d rc %d errno %d\n",
+	    argv[0], (int)pid, rc, errno);
+	(void)posix_spawn_file_actions_destroy(&actions);
+	if (out >= 0) {
+		(void)close(out);
+	}
+	if (rc == 0) {
+		if (pthread_create(&thread, NULL, run_waiter,
+		    (void *)(intptr_t)pid) == 0) {
+			(void)pthread_detach(thread);
+		}
+	}
+}
+
 static void *
 heartbeat(void *unused)
 {
 	(void)unused;
 	for (int i = 0; i < 30; i++) {
 		sleep(2);
+		mondrian_run_once();
 		say("MONDRIAN UI: heartbeat\n");
 		/*
 		 * Opt-in through a marker file: this probe runs in every hooked
