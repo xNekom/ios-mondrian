@@ -547,9 +547,28 @@ board's command line carries it.
 Measured 2026-11-19, that token moves the failure and does not remove it: the
 same kernel prints `MONDRIAN BTTTY: /dev/cu.bluetooth major 19` at root mount,
 and the boot's `bluetoothd` goes from `status 0x0` (no address, it exits before
-any transport) to `status 0x100` (exit 1, restarted by XPC traffic) with the
-port still never opened. The address gate is the first of two; the second is
-inside transport selection, which logs nowhere the ring can see.
+any transport) to `status 0x100` (exit 1, restarted a few times) with the port
+still never opened. With the job's stderr on a file that `rf` reads back, the
+daemon says how far it gets and then stops:
+
+```
+com.apple.server.bluetooth: Bluetooth Super Server Robot Destroyer
+could not find BT_DEVICE_ADDRESS env variable
+marconi-bt: Unable to match bluetooth service in device tree.
+marconi-bt: Not a valid MAC address (all 00s).
+bluetooth: Unable to match bluetooth service in device tree.
+bluetooth: Not a valid MAC address (all 00s).
+FindLocalMacAddress found wlan.debug.generate-mac
+FindLocalMacAddress Local address from plist:5d:75:0d:31:3f:87.
+```
+
+There is no "No valid serial port found" line, so the `access()` on
+`/dev/cu.bluetooth` **succeeded**: the node is visible and the failure is after
+it. The exit itself is silent, so the next lever is the daemon's own knobs,
+read out of its binary: `BT_HCI_TRANSPORT` (format `NAME:param:param`, table
+`USB`, `H4DS`, `H4BC`, `H4`, `H5`, `APPLEBT`, `VIRT`, `PCIE`, `PCIESW`),
+`BT_BAUDRATE`, `BT_CHIP` and `BT_DEVICE_ADDRESS`. The job carries them as
+`EnvironmentVariables` in the launchd table.
 
 Two ways of listening to it do not work, both measured. `/dev/console` as the
 job's `StandardErrorPath` leaves nothing in the dump while
@@ -559,6 +578,25 @@ creates a log file there (`rf` answers ENOENT). `0387` adds
 `rf PATH [OFFSET [LEN]]`, which reads a file back over the ring; with
 `StandardErrorPath` under `/private/var/tmp`, `tools/usb-ring.py rf PATH OFFSET
 LEN` is how the stack explains itself.
+
+Changing a job at all has its own trap, and it is bigger than a cache: launchd
+does **not** read `/System/Library/LaunchDaemons/*.plist`. `launchd_cache_loader`
+hands it the compiled table in `/System/Library/xpc/launchd.plist`, a binary
+plist whose `LaunchDaemons` dictionary is keyed by the plist path
+(`/System/Library/LaunchDaemons/com.apple.bluetoothd.plist` is the key for this
+job). The individual plists are the build input, and editing one changes
+nothing: measured, a job given a different `ProgramArguments` kept exec'ing the
+old binary across reboots, even after unlinking and recreating the plist. The
+board's command line carries `launchd_unsecure_cache=1`, which is what lets a
+table written by hand load at all; edit the job in that table instead.
+
+Two things about that table are measured. There is **no shell on this root**,
+so a job cannot be wrapped in `sh -c`: launchd refuses the spawn, and its own
+error does reach the ring as
+`com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
+'com.apple.bluetoothd' Executable: '/bin/sh'`, which makes that channel the
+place to look when a job silently does not run. The redirection therefore has
+to be a job key (`StandardErrorPath`) rather than a wrapper.
 
 ## What other ports teach
 
