@@ -187,8 +187,10 @@ correctly inside the app, and the window server creates a surface for that image
 lock and leaves it all zero; the app never looks the surface up or locks it. A layer whose
 `contents` is such a filled IOSurface draws the picture, so `tools/mondrian-ui-hook.m` hands every
 CGImage of picture size to the layer as a surface (default; `mondrian-layercsurf-off` keeps the
-CGImage path for an A/B). The transfer inside CoreAnimation is still the open cause, and `0374`
-logs the lookups and locks that narrowed it to the server.
+CGImage path for an A/B). The transfer inside CoreAnimation is still the open cause: `0374` logs
+the lookups and locks, and `0375` shows one QuartzCore function (`+0x140a10`) creating the surface,
+write-locking it (`+0x140a2c`) and unlocking it (`+0x140a40`) with no store between, from callers
+`+0x1848a0 -> +0x182078 -> +0xa3448 -> +0x6bafc -> +0x54bf8`.
 
 `tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
 the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.

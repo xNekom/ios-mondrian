@@ -754,9 +754,16 @@ boot each, so the three columns differ only in what changed:
   them too (`MONDRIAN LAYER[496]`), and CoreGraphics fills an IOSurface of that
   size with the same colours inside the app (`MONDRIAN CGSURF[425] ... drew 1`).
   What fails is the transfer into the render server: `0374` shows backboardd
-  creating the 640 x 480 surface, taking one write lock and leaving it all zero,
-  and the app never looks the surface up or locks it, so the server's own fill is
-  the layer that loses the pixels. The tile and the viewer draw the four quadrants
+  creating the surface for the tile (1105 x 1160 this run), taking one write lock
+  and leaving it all zero, and the app never looks it up or locks it; the
+  compositor's own `photo surface 43 ... seed 1` readback is zero in the four
+  quadrants. `0375` puts the user stack on that sequence: one QuartzCore function
+  creates the surface (`+0x140a10`), write-locks it (`+0x140a2c`) and unlocks it
+  (`+0x140a40`) with no store in between, then takes a read-only lock at seed 1,
+  and its callers are `+0x1848a0 -> +0x182078 -> +0xa3448 -> +0x6bafc ->
+  +0x54bf8`. The `Failed to create IOSurfaceAccelerator` message is referenced
+  from QuartzCore `+0x1e1c68/+0x1e3d7c`, off this stack; whether that path runs
+  earlier is not measured. The tile and the viewer draw the four quadrants
   when the layer's contents is that filled IOSurface instead of a CGImage, which
   is what `tools/mondrian-ui-hook.m` does by default for CGImages of 300 x 200 and
   up whose width is a multiple of four; `/private/var/vm/mondrian-layercsurf-off`
