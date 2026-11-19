@@ -1803,6 +1803,25 @@ made and counters for command buffers, commits, presents and waits. Whether
 those lines ever reach the ring from the GPU process is exactly what the abort
 probe is for.
 
+Measured 2026-11-19, two answers that settle what was open:
+
+- **The insertion happens.** `tools/gpu/load_probe.c` aborts in its constructor;
+  installed at the provider path and with Safari restarted, the GPU process dies
+  with `sig 6` right after `exec com.apple.WebKit.GPU`, and the hook's `crash`
+  counter moves by exactly one per attempt. So dyld loads the library in that
+  process, and the black page is not a failed injection.
+- **WebKit never asks for a Metal device.** `tools/gpu/device_probe.m` interposes
+  `MTLCreateSystemDefaultDevice` and aborts there; with it installed the GPU
+  process does not crash, the `crash` counter stays put and new `w30r` surfaces
+  are created. The GPU process therefore draws through something else -- the
+  compositor's GL renderer in `backboardd` is what puts frames on the glass --
+  and the zero surface has to be explained in WebKit's own drawing path, not in
+  the Metal provider.
+
+So the provider is the wrong lever for the black page until something asks it
+for a device.
+
+
 ### A warm reboot can leave the boot core unstarted
 
 The shim hands the kernel to the X2 with PSCI `CPU_ON` and the console ends at
