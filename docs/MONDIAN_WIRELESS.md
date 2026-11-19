@@ -593,6 +593,14 @@ creates a log file there (`rf` answers ENOENT). `0387` adds
 `StandardErrorPath` under `/private/var/tmp`, `tools/usb-ring.py rf PATH OFFSET
 LEN` is how the stack explains itself.
 
+A file that `wfile` **creates** is not readable in the same boot: `wfile`
+reports every byte delivered, and `rf` then answers `0` bytes for it, in
+`/private/var/tmp` and `/private/var/vm` alike (measured 2026-11-20). Only the
+next boot's mount makes the size real; overwriting a file that already exists
+reads back at once. So an upload meant to be read - a dylib for the next boot,
+a log target for the next run - lands on one boot and is verified on the
+next.
+
 Changing a job at all has its own trap, and it is bigger than a cache: launchd
 does **not** read `/System/Library/LaunchDaemons/*.plist`. `launchd_cache_loader`
 hands it the compiled table in `/System/Library/xpc/launchd.plist`, a binary
