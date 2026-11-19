@@ -134,7 +134,10 @@ def wfile(path, local):
     """
     data = open(local, "rb").read()
     got = 0
-    attempts = 3
+    # A 22 MB dylib stalls more often than a 3 KB one, and a truncated dylib is
+    # refused by dyld with no message anywhere: the process simply keeps the
+    # Metal it would have had. Give the big ones more attempts.
+    attempts = 9 if len(data) > (4 << 20) else 3
     for attempt in range(1, attempts + 1):
         got = wfile_attempt(path, data)
         if got >= len(data):
