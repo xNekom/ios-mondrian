@@ -260,10 +260,10 @@ whole. Measured 2026-11-19 on the restored volume: Photos completes its first-ru
 flow, its import answers **`shared success 1`**, the Library draws the tile and
 the viewer opens on it with the picture in colour; the next boot reports
 `library has 1`. The layer holds the picture's four coloured quadrants and
-CoreGraphics fills an IOSurface in the app, while the render server's own 640x480
-surface stays all zero after its single write lock, so the hook hands pictures to
-the layer as filled IOSurfaces (`mondrian-layercsurf-off` keeps the old path);
-the transfer inside CoreAnimation is the open cause. `assetsd` now reads its
+CoreGraphics fills an IOSurface in the app, while the render server receives the
+image with zero data (`CA::Render::Image::retain_iosurface` creates a surface,
+`copy_cgimage` only wraps the data pointer), so the hook hands pictures to the
+layer as filled IOSurfaces; that transfer is the open cause. `assetsd` now reads its
 entitlements (`csops` 5643 bytes, TCC preflight 1) but still aborts in an
 uncaught C++ exception, with or without the hook; `PhotosFileProvider` dies in
 PlugInKit's container

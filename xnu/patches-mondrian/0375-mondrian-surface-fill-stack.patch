@@ -13,6 +13,12 @@ names each frame in QuartzCore. The lock and unlock are the fill's own
 brackets; the create says which function allocates the surface the fill leaves
 empty.
 
+Follow-up 2026-11-19: the decompressed symbols cache names the function:
+`CA::Render::Image::retain_iosurface() const` only creates the surface and its
+lock/unlock move the image's seed; the upload (`CA::OGL::GLESContext::retain_image`)
+reads the image's data pointer through `CA::Render::Image::copy_cgimage()`, and
+that pointer is zero. The loss is the app-to-server image data, not the surface.
+
 
 --- a/iokit/Kernel/arm/MondrianSurface.cpp
 +++ b/iokit/Kernel/arm/MondrianSurface.cpp

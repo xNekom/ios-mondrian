@@ -766,18 +766,25 @@ boot each, so the three columns differ only in what changed:
   creating the surface for the tile (1105 x 1160 this run), taking one write lock
   and leaving it all zero, and the app never looks it up or locks it; the
   compositor's own `photo surface 43 ... seed 1` readback is zero in the four
-  quadrants. `0375` puts the user stack on that sequence: one QuartzCore function
-  creates the surface (`+0x140a10`), write-locks it (`+0x140a2c`) and unlocks it
-  (`+0x140a40`) with no store in between, then takes a read-only lock at seed 1,
-  and its callers are `+0x1848a0 -> +0x182078 -> +0xa3448 -> +0x6bafc ->
-  +0x54bf8`. The `Failed to create IOSurfaceAccelerator` message is referenced
-  from QuartzCore `+0x1e1c68/+0x1e3d7c`, off this stack; whether that path runs
-  earlier is not measured. The tile and the viewer draw the four quadrants
-  when the layer's contents is that filled IOSurface instead of a CGImage, which
-  is what `tools/mondrian-ui-hook.m` does by default for CGImages of 300 x 200 and
-  up whose width is a multiple of four; `/private/var/vm/mondrian-layercsurf-off`
-  keeps the CGImage path for an A/B. The transfer inside CoreAnimation is still
-  the open cause.
+  quadrants. `0375` puts the user stack on that sequence, and the decompressed
+  symbols cache names it (`tools/dsc-sym.py`):
+  `CA::Render::Image::retain_iosurface() const` creates the surface (`+0x14060c`,
+  the create at `+0x140a10`), and its lock and unlock (`+0x140a2c`, `+0x140a40`)
+  only move the image's seed -- there is no store between them. The fill is not
+  there and not expected to be: the GL context
+  (`CA::OGL::GLESContext::retain_image`, `+0x184794`) uploads the image with
+  `glTexImage2D` from a CPU pointer, and `CA::Render::Image::copy_cgimage()`
+  (`+0x140bec`) only wraps that pointer in a bitmap context. The
+  `mondrian-gl: a 650x683 picture ... 0 of 2600 bytes 0xff` line reads that
+  pointer: it is all zero before any surface is involved, so the render server
+  received an image whose data is zero. The `Failed to create
+  IOSurfaceAccelerator` message belongs to `CA::HDRProcessorInternal`
+  (`+0x1e1c68/+0x1e3d7c`), off this path. The tile and the viewer draw the four
+  quadrants when the layer's contents is that filled IOSurface instead of a
+  CGImage, which is what `tools/mondrian-ui-hook.m` does by default for CGImages
+  of 300 x 200 and up whose width is a multiple of four;
+  `/private/var/vm/mondrian-layercsurf-off` keeps the CGImage path for an A/B.
+  The open cause is the app-to-server image data, not the surface.
   A `deltree` of the trees a boot regrows frees nothing on this image: their
   catalog valence is 4, 9 and 10 and the plain readdir returns only the two dots,
   so the entries the valence counts are not in the catalog at all. Probes:

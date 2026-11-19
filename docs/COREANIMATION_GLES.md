@@ -107,6 +107,18 @@ thin arm64 Mach-O that `llvm-objdump` and REA's artifact reader both open:
 `tools/dsc-va.py` instead, which pins the image by the address itself
 (`docs/UI_PERFORMANCE.md` has the `--slide` rule).
 
+The offset still needs a function name, which the cache image does not carry.
+The companion `.symbols` file does: on this workstation it is a decmpfs type-14
+resource fork (LZBITMAP, 64 KiB chunks), and `apfs-fuse`'s `DecompressLZBITMAP`
+expands it to a second 592 MB dyld cache whose header at 0x4000 lists 8.7M
+symbols. That decoder is GPL and stays outside the tree; `tools/dsc-sym.py`
+reads the expanded file and prints the symbol with the largest value <= the
+address:
+
+    tools/dsc-sym.py /root/symbols.txt 0x1883c460c 0x1884088a0
+    0x1883c460c -> __ZNK2CA6Render5Image16retain_iosurfaceEv +0x0
+    0x1884088a0 -> __ZN2CA3OGL11GLESContext12retain_imageEPNS0_5ImageEPNS_6Render7TextureEb +0x10c
+
 REA on Windows cannot analyse a Mach-O with its own providers: Hopper and the native utilities
 are macOS, and Ghidra on this platform accepts only PE and 6502. The provider that does run here
 is Rizin, through `execute_rizin_command`; it is installed at
@@ -181,16 +193,18 @@ shows whatever surface a swap names (by copying its layers into the panel's memo
   where the poster is drawn. One byte a pixel uploads as `GL_LUMINANCE`, two as
   `GL_LUMINANCE_ALPHA`, and GL converts them into the RGBA storage the texture already has.
 
-**A client CGImage does not reach the render server's surface.** Measured 2026-11-19: the layer is
+**A client CGImage does not reach the render server.** Measured 2026-11-19: the layer is
 given the picture's four coloured quadrants, CoreGraphics fills an IOSurface of the same size
 correctly inside the app, and the window server creates a surface for that image, takes one write
-lock and leaves it all zero; the app never looks the surface up or locks it. A layer whose
-`contents` is such a filled IOSurface draws the picture, so `tools/mondrian-ui-hook.m` hands every
-CGImage of picture size to the layer as a surface (default; `mondrian-layercsurf-off` keeps the
-CGImage path for an A/B). The transfer inside CoreAnimation is still the open cause: `0374` logs
-the lookups and locks, and `0375` shows one QuartzCore function (`+0x140a10`) creating the surface,
-write-locking it (`+0x140a2c`) and unlocking it (`+0x140a40`) with no store between, from callers
-`+0x1848a0 -> +0x182078 -> +0xa3448 -> +0x6bafc -> +0x54bf8`. A local WebKit page loads -- the
+lock and leaves it all zero; the app never looks the surface up or locks it. The symbols cache
+(`tools/dsc-sym.py`) names the create path: `CA::Render::Image::retain_iosurface() const`
+(`+0x14060c`) creates the surface and its lock/unlock only move the seed, while
+`CA::OGL::GLESContext::retain_image` (`+0x184794`) uploads the image from a CPU pointer that
+`CA::Render::Image::copy_cgimage()` (`+0x140bec`) only wraps in a bitmap context. That pointer is
+zero, so the loss is the image data the render server received, before any surface is involved.
+A layer whose `contents` is a filled IOSurface draws the picture, so `tools/mondrian-ui-hook.m`
+hands every CGImage of picture size to the layer as a surface (default; `mondrian-layercsurf-off`
+keeps the CGImage path for an A/B). A local WebKit page loads -- the
 host's HTTP server logs its icon GETs -- and still draws black, so the same server-side surface
 path keeps both the picture and the page off the glass.
 
