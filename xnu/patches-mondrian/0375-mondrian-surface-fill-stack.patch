@@ -1,0 +1,140 @@
+xnu 0375: name the function that creates and fills a picture surface
+
+Measured 2026-11-19: the window server creates the 640 x 480 surface the Library
+tile is drawn from, takes one write lock and leaves it all zero, while the layer
+in the app holds the picture's four coloured quadrants. The fill that loses the
+pixels is therefore inside backboardd's CoreAnimation, and `0374` only names the
+process.
+
+This prints six frames of the frame-pointer chain, in the user space of the
+caller, at the first create, lock and unlock of a picture surface, with the
+shared cache slide on the same line so `tools/dsc-va.py CACHE --slide 0x...`
+names each frame in QuartzCore. The lock and unlock are the fill's own
+brackets; the create says which function allocates the surface the fill leaves
+empty.
+
+
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -39,6 +39,12 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <mach/arm/thread_status.h>
++#include <vm/vm_map.h>
++
++extern "C" arm_saved_state_t *find_user_regs(thread_t);
++extern "C" kern_return_t vm_map_read_user(vm_map_t, vm_map_offset_t, void *, vm_size_t);
++extern "C" uint64_t mondrian_task_slide(task_t);
+ 
+ enum {
+ 	kMondrianSurfaceCreate             = 0,
+@@ -522,6 +528,58 @@ mondrian_surf_log_once(const char *what, uint32_t n)
+  * writer counted. A surface that is only ever read, never written, says the pixels
+  * were never put there at all.
+  */
++/*
++ * The stack that creates and fills a picture surface.
++ *
++ * Measured 2026-11-19: the window server creates the 640 x 480 surface the
++ * Library tile is drawn from, write-locks it once and leaves it all zero. That
++ * runs inside backboardd's CoreAnimation, and the process name is all the
++ * previous instrument could say. The stack says which function: six frames of
++ * the frame-pointer chain, with the shared cache slide on the same line so
++ * `tools/dsc-va.py CACHE --slide 0x...` names the frame in QuartzCore. Kept to
++ * the first three events (create, lock, unlock of the first picture surface) so
++ * it costs one screen of the ring.
++ */
++static void
++mondrian_surf_fill_stack(MondrianSurface *s, const char *what)
++{
++	static unsigned told;
++	thread_t thread = current_thread();
++	task_t task = current_task();
++	arm_saved_state_t *ss;
++	uint64_t slide, fp;
++	unsigned i;
++
++	if (told >= 3 || s == NULL || s->pixelFormat != 0 || s->width < 320 ||
++	    s->height < 240 || (uint64_t)s->width * (uint64_t)s->height > 2000000) {
++		return;
++	}
++	told++;
++	slide = mondrian_task_slide(task);
++	ss = find_user_regs(thread);
++	if (ss == NULL || !is_saved_state64(ss)) {
++		IOLog("MONDRIAN SURF: %s id %u: no user state (slide %#llx)\n", what,
++		    s->id, slide);
++		return;
++	}
++	IOLog("MONDRIAN SURF: %s id %u pc %#llx lr %#llx slide %#llx\n", what, s->id,
++	    get_saved_state_pc(ss), get_saved_state_lr(ss), slide);
++	fp = get_saved_state_fp(ss);
++	for (i = 0; i < 6 && fp != 0 && (fp & 7) == 0; i++) {
++		uint64_t frame[2];
++
++		if (vm_map_read_user(get_task_map(task), fp, frame, sizeof(frame)) !=
++		    KERN_SUCCESS) {
++			break;
++		}
++		IOLog("MONDRIAN SURF:   %s frame %u %#llx\n", what, i, frame[1]);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++}
++
+ static void
+ mondrian_surf_writer(MondrianSurface *s, const char *what, uintptr_t options)
+ {
+@@ -805,6 +863,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOLog("MONDRIAN SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		mondrian_surf_fill_stack(s, "create");
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+@@ -940,6 +999,7 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
+ 		return kIOReturnNotFound;
+ 	}
+ 	mondrian_surf_writer(s, "lock", (uintptr_t)options);
++	mondrian_surf_fill_stack(s, "lock");
+ 	IOReturn ret = mondrian_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+@@ -954,6 +1014,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 		return kIOReturnNotFound;
+ 	}
+ 	mondrian_surf_writer(s, "unlock", (uintptr_t)options);
++	mondrian_surf_fill_stack(s, "unlock");
+ 	IOReturn ret = mondrian_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -839,6 +839,23 @@ unsigned mondrian_proc_denied;
+ void mondrian_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+ static void mondrian_crash_strings(const char *name);
+ 
++/*
++ * The shared cache slide of a task, for the stack instruments in other files
++ * that cannot see `struct vm_shared_region` (it is private to osfmk).
++ */
++uint64_t
++mondrian_task_slide(task_t task)
++{
++	uint64_t slide = 0;
++	vm_shared_region_t sr = vm_shared_region_get(task);
++
++	if (sr != NULL) {
++		slide = sr->sr_slide;
++		vm_shared_region_deallocate(sr);
++	}
++	return slide;
++}
++
+ void
+ mondrian_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+ {
