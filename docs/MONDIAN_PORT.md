@@ -253,22 +253,21 @@ with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
 
 ### 7. The apps
 
-Measured 2026-11-18: Settings, Messages and Safari launch from their icons and
-draw real content (a full settings list, an onboarding page with artwork, the
-Safari start page), so LaunchServices, the icon model and the compositor are
-whole. Measured 2026-11-19 on the restored volume: Photos completes its first-run
+Settings, Messages and Safari launch and draw real content (a settings list, an
+onboarding page, the Safari start page), so LaunchServices, the icon model and
+the compositor are whole. Safari's page content is black: the WebKit GPU
+process's `w30r` surfaces stay zero (`0379`/`0380`), because it renders through
+Metal, which this port lacks; the local page loads. Metal is the open work
+item; the UniXNU PongMetal stack creates a device on this GPU but does not
+present yet. Measured 2026-11-19 on the restored volume: Photos completes its first-run
 flow, its import answers **`shared success 1`**, the Library draws the tile and
 the viewer opens on it with the picture in colour; the next boot reports
 `library has 1`. A default boot (mask bit 0x100, no probe file) draws both: the app
 needs `enableMultiLibraryMode` to open its Syndication library, and the hook's
 CGImage-to-surface bridge puts the picture on the layer. The render server still
 receives the image with zero data (`retain_iosurface` creates a surface,
-`copy_cgimage` only wraps the pointer); that transfer is the open cause. `assetsd` now reads its
-entitlements (`csops` 5643 bytes, TCC preflight 1) but still aborts in an
-uncaught C++ exception, with or without the hook; `PhotosFileProvider` dies in
-PlugInKit's container
-check, `fileproviderd` in its own code, and Phone, the App Store and the network
-are as before.
+`copy_cgimage` only wraps the pointer); that transfer is the open cause. `assetsd` still aborts in an uncaught C++ exception and `PhotosFileProvider` in
+PlugInKit's container check; Phone, the App Store and the network are as before.
 
 ## Getting the numbers off the device
 

@@ -1006,9 +1006,18 @@ presents, so the compositor is not lost in this boot; the `AA` menu opens and
 draws white, and the address field does not focus under the synthetic touch. A
 local page at `http://192.168.7.1:8000/` opens through `mondrian-open` and loads:
 the host's HTTP server logs the page's icon GETs from 192.168.7.2, `pipelined`
-exits 0 and no WebContent crash appears -- and the page still draws black. The
-network is therefore not the cause; WebKit's page does not reach the glass,
-which is the same server-side surface path as the Photos picture. The URL path
+exits 0 and no WebContent crash appears -- and the page still draws black.
+Measured 2026-11-19: the `com.apple.WebKit.GPU` process creates 1440 x 1536,
+1440 x 2622 and 1440 x 2625 surfaces with format `0x77333072` (`w30r`, 10-bit
+RGB), and `0379`/`0380` read the first 16 bytes at both ends of its write lock:
+all zero, seed 0, every time. SpringBoard's own `w30r` surfaces draw, so the
+format is not the fault: the GPU process never renders into its page surfaces
+because it draws through Metal, and this port has no Metal driver. Writing
+`UseGPUProcessForDOMRenderingEnabled` and `WebKit2GPUProcessForDOMRendering` as
+false in the app and global WebKit defaults does not stop the GPU process: it is
+launched for the remote layer tree, not only for DOM rendering. The network and
+the surface transfer are not the cause; the page does not reach the glass
+because its renderer never runs. The URL path
 uses `LSApplicationWorkspace openURL:withOptions:`; the `UIApplication openURL:`
 variant aborted SpringBoard in a loop (sig 6, libc++abi terminate) because the
 `mondrian-open` thread is not the main thread.
