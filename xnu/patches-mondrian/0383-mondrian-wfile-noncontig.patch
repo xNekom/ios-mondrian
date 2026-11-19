@@ -1,0 +1,47 @@
+xnu 0383: wfile buffer is neither contiguous nor permanent
+
+A 22 MB wfile left the phone unable to answer anything but pings: the
+handler allocates the file size (0381) and the grow path frees the
+previous buffer, kmem_alloc_contig waited for a gap of that size in a
+fragmented kernel map, and the old buffer carried KMA_PERMANENT, which
+vm_map_delete refuses to remove. Measured 2026-11-19: the 21.5 MB first
+upload of a boot arrived whole, the 22 MB one that followed panicked on
+the screen. Plain kmem_alloc without KMA_PERMANENT does both jobs; the
+buffer is only copied into and given to the VFS.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2388,9 +2388,9 @@
+ 	}
+ 	/*
+ 	 * The buffer is the file's size, not the ceiling: an 11.5 MB dylib is a
+-	 * normal upload here (Turnip), and a 32 MB contiguous allocation for a
+-	 * 66 KB program would fail on a fragmented kernel map. It grows, and is
+-	 * never given back: the next large upload reuses it.
++	 * normal upload here (Turnip), and a 32 MB buffer for a 66 KB program
++	 * would waste the kernel map. It grows, and is never given back: the
++	 * next large upload reuses it.
+ 	 */
+ 	if ((vm_size_t)len > ud_wfile_cap) {
+ 		vm_offset_t buf = 0;
+@@ -2402,8 +2402,18 @@
+ 			ud_wfile_buf = NULL;
+ 			ud_wfile_cap = 0;
+ 		}
+-		if (kmem_alloc_contig(kernel_map, &buf, need, PAGE_MASK,
+-		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		/*
++		 * Plain kmem_alloc, and not permanent. The buffer is only
++		 * copied into and handed to the VFS, so no run of pages is
++		 * needed, and kmem_alloc_contig waits for a gap that size in a
++		 * kernel map iOS has fragmented. KMA_PERMANENT must not be
++		 * set: the grow below frees the old buffer, and vm_map_delete
++		 * panics on a permanent entry ("Attempting to remove permanent
++		 * VM map entry", measured on the phone 2026-11-19 when a 22 MB
++		 * upload followed the 21.5 MB one in the same boot).
++		 */
++		if (kmem_alloc(kernel_map, &buf, need,
++		    KMA_DATA | KMA_ZERO,
+ 		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			n = snprintf(out, sizeof(out), "wfile has no memory\n");
+ 			ud_cmd_send(so, to, out, (size_t)n);
