@@ -1821,6 +1821,15 @@ Measured 2026-11-19, two answers that settle what was open:
 So the provider is the wrong lever for the black page until something asks it
 for a device.
 
+Measured the same day, the surfaces say where the page stops: the GPU process
+creates its `w30r` surface and locks it, **the WebContent process creates none at
+all**, and its processes leave with `status 0x9` (SIGKILL) after being started
+again and again (`exec com.apple.WebKit.WebContent` four times in one boot,
+`exit ... status 0x9` twice). Safari's own UI surfaces do draw, and
+`backboardd`'s GL renderer keeps presenting frames, so the compositor is fine:
+there is no page content to composite. The next question is why WebContent is
+killed, not how the page is painted.
+
 
 ### A warm reboot can leave the boot core unstarted
 
