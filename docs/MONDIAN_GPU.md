@@ -1845,6 +1845,14 @@ unlocked still at zero. So the missing link is upstream of any paint: no layer
 content arrives to draw, and the next suspect is the layer tree from WebContent
 rather than the drawing API.
 
+A direct 512x512 red PNG served at its own URL is fetched by the phone
+(`GET /red.png 200`) and shows the same black page, so the failure is not HTML,
+layout or fonts: even image decoding produces no pixels in that surface. Note
+for driving Safari: `mondrian-open` with an `http://` URL goes through
+`openURL:withOptions:`, which answers **1** and navigates, while
+`openApplicationWithBundleID:` answers 0 and launches nothing -- the URL path is
+the reliable one.
+
 
 ### A warm reboot can leave the boot core unstarted
 
