@@ -1771,6 +1771,18 @@ buffer, 65536 of 65536; a GPU clear of the IOSurface, read back by the CPU,
 refused: Function not implemented", and the runtime's `Shadow` policy was not
 needed.
 
+### Giving the device to a process
+
+`tools/gpu/mondrian-metal-provider.m` interposes `MTLCreateSystemDefaultDevice`
+and hands back the m2v device, and `tools/mk-m2v-ios.sh` links it with the
+frontend and the runtime into `/private/var/vm/libmondrianmetal.dylib` (22 MB).
+It has to arrive at launch. Measured 2026-11-19 with `tools/gpu/metal_probe.m`:
+the device is nil before `dlopen` of that file and still nil after, because dyld
+bound the main image's call at launch and a library loaded later does not rebind
+it. So WebKit's GPU process gets it through `DYLD_INSERT_LIBRARIES` from
+`mondrian_ui_hook_env`, the same place the hook is chosen by process name, and
+not by a `dlopen` in the hook.
+
 ### A warm reboot can leave the boot core unstarted
 
 The shim hands the kernel to the X2 with PSCI `CPU_ON` and the console ends at
