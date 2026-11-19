@@ -1,0 +1,104 @@
+xnu 0377: trace the app's picture surface, not only the server's
+
+Measured 2026-11-19: `0374`/`0375` trace the first fmt-0 surface of the boot,
+which is backboardd's 1105 x 1160 tile, and the create line stops after 64
+surfaces, so a surface the app creates later never appears. Before the
+app-to-server transfer can be blamed, one boot has to say whether Photos creates
+the 650 x 683 surface itself or the render server is the only creator.
+
+Give `MobileSlideShow`/`Photos` its own three stack traces and 32 lock lines,
+and raise the create-line cap to 4096. The filter is by process name, so the
+window server's own budget is unchanged.
+
+diff --git a/iokit/Kernel/arm/MondrianSurface.cpp b/iokit/Kernel/arm/MondrianSurface.cpp
+index db329d6..bebf211 100644
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <string.h>
+ #include <mach/arm/thread_status.h>
+ #include <vm/vm_map.h>
+ 
+@@ -543,18 +544,38 @@ mondrian_surf_log_once(const char *what, uint32_t n)
+ static void
+ mondrian_surf_fill_stack(MondrianSurface *s, const char *what)
+ {
+-	static unsigned told;
++	static unsigned told, told_app;
+ 	thread_t thread = current_thread();
+ 	task_t task = current_task();
+ 	arm_saved_state_t *ss;
+ 	uint64_t slide, fp;
+ 	unsigned i;
++	bool app;
+ 
+-	if (told >= 3 || s == NULL || s->pixelFormat != 0 || s->width < 320 ||
++	{
++		char pname[32];
++
++		proc_selfname(pname, sizeof(pname));
++		app = strncmp(pname, "MobileSlideShow", 15) == 0 ||
++		    strncmp(pname, "Photos", 6) == 0;
++	}
++	/*
++	 * The first three surfaces in a boot are the window server's own tile,
++	 * not the app's picture. Keep a budget for the app that hands the
++	 * picture over, so its create is traced too.
++	 */
++	if ((app ? told_app : told) >= 3) {
++		return;
++	}
++	if (s == NULL || s->pixelFormat != 0 || s->width < 320 ||
+ 	    s->height < 240 || (uint64_t)s->width * (uint64_t)s->height > 2000000) {
+ 		return;
+ 	}
+-	told++;
++	if (app) {
++		told_app++;
++	} else {
++		told++;
++	}
+ 	slide = mondrian_task_slide(task);
+ 	ss = find_user_regs(thread);
+ 	if (ss == NULL || !is_saved_state64(ss)) {
+@@ -583,15 +604,25 @@ mondrian_surf_fill_stack(MondrianSurface *s, const char *what)
+ static void
+ mondrian_surf_writer(MondrianSurface *s, const char *what, uintptr_t options)
+ {
+-	static unsigned told;
++	static unsigned told, told_app;
+ 	char name[32];
++	bool app;
+ 
+-	if (s == NULL || told >= 96 || s->width < 320 || s->height < 240 ||
++	if (s == NULL || s->width < 320 || s->height < 240 ||
+ 	    s->pixelFormat != 0 || (uint64_t)s->width * (uint64_t)s->height > 2000000) {
+ 		return;
+ 	}
+-	told++;
+ 	proc_selfname(name, sizeof(name));
++	app = strncmp(name, "MobileSlideShow", 15) == 0 ||
++	    strncmp(name, "Photos", 6) == 0;
++	if (app ? told_app >= 32 : told >= 512) {
++		return;
++	}
++	if (app) {
++		told_app++;
++	} else {
++		told++;
++	}
+ 	IOLog("MONDRIAN SURF: %s %s id %u %ux%u options %#lx seed %u\n", name, what,
+ 	    s->id, s->width, s->height, (unsigned long)options, *mondrian_surface_seed(s));
+ }
+@@ -856,7 +887,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || mondrian_surface_creates_logged < 64) {
++	if (ret != kIOReturnSuccess || mondrian_surface_creates_logged < 4096) {
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+ 		mondrian_surface_creates_logged++;
