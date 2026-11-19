@@ -1,0 +1,82 @@
+xnu 0388: bluetoothd is handed its transport at exec
+
+The daemon reads BT_HCI_TRANSPORT, then the IORegistry, then falls back to
+USB, and there is no USB device here: it exits before it opens a port. The
+value is `TRANSPORT:DRIVER[:PARAM]` - measured in /usr/sbin/bluetoothd at
+0x1001561a0, which strtok()s on ':' and matches the first token against the
+transport table (USB, H4DS, H4BC, H4, H5, APPLEBT, VIRT, PCIE, PCIESW) and
+the second against the driver table (USB, POSIX, APPLEBT, VIRT, PCIE,
+PCIESW). POSIX is the driver that opens a device path, and it is the one the
+daemon probes by hand: `access("/dev/cu.bluetooth")` runs before the
+IORegistry lookup.
+
+The variable cannot come from the launchd job table. Writing
+/System/Library/xpc/launchd.plist with `BT_HCI_TRANSPORT` and
+`StandardErrorPath` (2026-11-20) left the boot at two processes on both
+kernels - launchd loads the cache and never prints its UUID, so SpringBoard
+never runs. The table is load-bearing for early boot; the exec path is not.
+
+So this is the same lever 0385 uses for WebKit's GPU process: one env string
+added to the new process image. Gated by `mondrianbt=1`, since a default boot
+must not touch bluetoothd's transport.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2889d30..9287311 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5821,6 +5821,47 @@ mondrian_name_is(const char *name, size_t len, const char *want)
+ 	    strncmp(base, want, wantlen) == 0;
+ }
+ 
++/*
++ * bluetoothd reads its transport from BT_HCI_TRANSPORT, then from the
++ * IORegistry, then it falls back to USB - and there is no USB device here, so
++ * it exits before it ever opens a port (measured 2026-11-20: the daemon's
++ * stderr stops after the local address, no transport line, exit status
++ * 0x100). The value is TRANSPORT:DRIVER[:PARAM]: /usr/sbin/bluetoothd parses
++ * it at 0x1001561a0 with strtok(":"), matches the first token against the
++ * transport table at 0x1007fd3e0 (USB, H4DS, H4BC, H4, H5, APPLEBT, VIRT,
++ * PCIE, PCIESW) and the second against the driver table at 0x1007fd430 (USB,
++ * POSIX, APPLEBT, VIRT, PCIE, PCIESW). POSIX is the driver that opens a
++ * device path, and it is also the only one the daemon checks for by hand: it
++ * access()es /dev/cu.bluetooth before it looks at the IORegistry.
++ *
++ * It arrives at exec because the launchd job table is not an option: writing
++ * /System/Library/xpc/launchd.plist with the same variables left the boot at
++ * two processes, launchd never printing its UUID (measured 2026-11-20, twice,
++ * on both kernels - the table is load-bearing for early boot).
++ */
++static bool
++mondrian_bt_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	const char *name;
++	const char transport[] = "BT_HCI_TRANSPORT=H4:POSIX";
++
++	if (!PE_parse_boot_argn("mondrianbt", &enabled, sizeof(enabled)) ||
++	    !enabled || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(transport) > size) {
++		return false;
++	}
++	if (!mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "bluetoothd")) {
++		return false;
++	}
++	strlcpy(env, transport, size);
++	return true;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -6206,6 +6247,8 @@ exec_extract_strings(struct image_params *imgp)
+ 			injected = "UI hook";
+ 		} else if (mondrian_probe_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "probe";
++		} else if (mondrian_bt_env(imgp, inject_env, sizeof(inject_env))) {
++			injected = "bluetooth transport";
+ 		}
+ 		if (injected != NULL) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);

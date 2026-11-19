@@ -380,6 +380,12 @@ MONDRIAN = Board(
              # (docs/MONDIAN_WIRELESS.md). The value it generates itself is
              # persisted, so the token is all that is needed.
              'wlan.debug.generate-mac '
+             # Hand bluetoothd its transport at exec (0388): without it the
+             # daemon falls back to USB, has no such device, and exits before
+             # it opens /dev/cu.bluetooth. The launchd job table is not an
+             # option for this - writing it stops the boot at two processes
+             # (docs/MONDIAN_WIRELESS.md).
+             'mondrianbt=1 '
              # The firehose subsystem is 11600: a receive with id 11600 on
              # logd is a buffer registration, 11601 is the synchronous push
              # that blocks a writer. Resolved by name so the traced pid does
