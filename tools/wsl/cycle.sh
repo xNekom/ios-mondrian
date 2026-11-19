@@ -115,10 +115,19 @@ ATTEMPTS=${ATTEMPTS:-3}
 BOOTED=0
 for attempt in $(seq 1 "$ATTEMPTS"); do
 	echo "== boot attempt $attempt of $ATTEMPTS"
-	SLOT=$("$FB" getvar current-slot 2>&1 | tr -d '\r' |
+	# A RAM boot that dies falls back to boot_b, and that boot leaves fastboot:
+	# the next attempt's `getvar` would then block for ever on
+	# "< waiting for any device >" (measured: the retry never reached a second
+	# `fastboot boot`, and the run was read as a hung boot). Ask the running
+	# kernel again instead of waiting on a device that is gone.
+	if ! "$FB" devices 2>/dev/null | grep -q fastboot; then
+		echo "== fastboot is gone; asking the running kernel again"
+		bash tools/wsl/to-fastboot.sh || { sleep 5; continue; }
+	fi
+	SLOT=$(timeout 30 "$FB" getvar current-slot 2>&1 | tr -d '\r' |
 		sed -n 's/^current-slot: *//p' | head -1)
 	if [ -n "$SLOT" ]; then
-		if "$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1; then
+		if timeout 60 "$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1; then
 			echo "   slot $SLOT re-activated"
 		else
 			cat "$LOG/set-active.log"
