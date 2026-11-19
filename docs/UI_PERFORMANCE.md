@@ -30,19 +30,22 @@ and they stay in the ring after the gesture).
   frame` (the seconds are `mondrianfb_blank`) with the DCS write that follows it
   (`MONDRIAN BL: dma len 0 size 4 ... done 1`), then on the first touch
   `MONDRIAN FB: panel wake (touch)` and `MONDRIAN FB: panel on (dcs)`. Those
-  lines are the check: a missing blank means frames never stopped (or the blank
-  is disabled -- it is, while the injector renders through Mesa: the DCS write
-  resets the phone, `docs/MONDIAN_GPU.md`), `panel off refused` means the panel
-  rejected `0x28` and the black-paint fallback ran, and a missing wake line means
-  the touch never reached the driver. None of it costs a rebuild.
+  lines are the check: a missing blank means frames never stopped (the home
+  screen presents at least every ten seconds, so its timer never reaches 30),
+  `panel off refused` means the panel rejected `0x28` and the black-paint
+  fallback ran, and a missing wake line means the touch never reached the
+  driver. None of it costs a rebuild.
   `present 0/s` in the same dump is the still screen, not a fault: the samples
   that follow a touch read 4-5/s.
-  Measured 2026-11-19 with `PREFIX_ARGS=mondrianfb_blank=30` (so 30 is the
-  first occurrence and the board's 0 cannot win): a 60 s idle window still
-  logged no `panel blank`, no `panel wake` and no `MONDRIAN BL` DCS line, and
-  the lock screen read `present 0/s`. The timer is gated on
-  `fLastPresentTicks != 0`, so a boot whose screen never had a CA present cannot
-  arm it; print that gate before changing the timer. The default remains 0.
+  Measured 2026-11-19 with `EXTRA_ARGS=mondrianfb_blank=30 mondrianbtrace=1`
+  (the appended value, so it wins) and the trace of `0376`: the setup line read
+  `blank timer 30 s`, the gate counted to `last 25 s`, the blank and wake lines
+  appeared as above, and the boot kept running. The earlier "no blank" with
+  `PREFIX_ARGS` was the argument order, not the gate: `PE_parse_boot_argn` keeps
+  the last occurrence of a key, so the prefixed 30 lost to the board's later 0.
+  The board now carries 30 by default; the 2026-11-17 resets at ~30 s belong to
+  a boot stage where the panel never left the logo, so no CA present had armed
+  this timer.
 
 - **An app launch that times out freezes the compositor.** Measured chain, all
   in the ring: SpringBoard's launch thread waits on an `os_unfair_lock` inside

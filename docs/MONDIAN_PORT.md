@@ -143,9 +143,6 @@ carve-outs, 885 MiB behind a 139 MiB hole and 30 MiB loose, so one contiguous
 window cannot hold them all. The rules behind the window and the measured map
 are in `NOTES.md` ("The window of RAM" and "Measured hardware facts").
 
-The splash framebuffer is outside this window; the early console paints it
-through the explicit kernel VA alias `arm_vm_init` installs (`0295`).
-
 **Measured 2026-11-09**: iOS 16 boots to SpringBoard on the 9 GiB window, 208
 processes and 5.2 GiB free. The 864 MiB window had the page queues full (616
 MiB) and the compressor at another 221-251 MiB. The high-window boot is
@@ -154,8 +151,11 @@ on the root after an unclean reset.
 
 **A plain `fastboot boot` boots it.** ABL's `/chosen/bootargs` (its Android
 line) used to fill the 1024-byte command line and push `rd=ufsroot0` out; the
-shim now reserves the payload's room first. `fastboot boot --cmdline "..."`
-still overrides: XNU keeps the first occurrence of each key.
+shim now reserves the payload's room first and puts the Android line in front.
+`PE_parse_boot_argn` keeps the **last** occurrence of a key (measured
+2026-11-19), so the payload wins over a key the Android line repeats, and
+`fastboot boot --cmdline` cannot override the payload. Inside the payload,
+`EXTRA_ARGS` lands last and overrides a board default; `PREFIX_ARGS` loses.
 
 ## Page size
 
