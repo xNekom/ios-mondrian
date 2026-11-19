@@ -1,0 +1,34 @@
+Turnip on mondrian: let the kernel choose the IOVAs
+
+Measured 2026-11-19: with 0382 in, Turnip enumerates the A730 and vkCreateDevice
+goes one step further, then fails in BO init:
+
+    TU: error: MSM_INFO_SET_IOVA failed! -78 (No such file or directory)
+    TU: error: tu_device.cc:2615: BO init (VK_ERROR_OUT_OF_HOST_MEMORY)
+
+MSM_INFO_SET_IOVA in MondrianGPU answers kIOReturnUnsupported for any address
+but the buffer's own, so Turnip's client-chosen IOVA path cannot work here; the
+kernel already answers MSM_INFO_GET_IOVA, which is the path kgsl devices take.
+
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -1085,8 +1085,19 @@
+       goto fail;
+    }
+ 
++#if defined(__APPLE__)
++   /*
++    * mondrian's kernel is the IOVA authority: MSM_INFO_SET_IOVA accepts only
++    * the address the kernel already gave the buffer and answers EINVAL for any
++    * other, which Turnip reads as "BO init failed" and turns into no device at
++    * all (measured 2026-11-19). Ask for the kernel's address instead.
++    */
++   device->has_set_iova = false;
++   (void)tu_drm_get_va_prop(device, &device->va_start, &device->va_size);
++#else
+    device->has_set_iova = !tu_drm_get_va_prop(device, &device->va_start,
+                                               &device->va_size);
++#endif
+    device->has_raytracing = tu_drm_get_raytracing(device);
+ 
+    device->has_preemption = tu_drm_has_preemption(device);

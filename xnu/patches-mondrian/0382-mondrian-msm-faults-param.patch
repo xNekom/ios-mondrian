@@ -1,0 +1,34 @@
+xnu 0382: answer MSM_PARAM_FAULTS, or Turnip makes no device
+
+Measured 2026-11-19 on the phone: Turnip enumerates the A730 through
+MondrianGPU ("Turnip Adreno (TM) 725", Vulkan 1.4.305, chip 0x07030002) and
+then vkCreateDevice returns VK_ERROR_INITIALIZATION_FAILED, with the driver's
+own line in the ring: "Failed to get initial fault count: -22". The parameter
+is not in mondrian_gpu_uc_param's switch, so the user client answers
+kIOReturnBadArgument and the stand-in for libdrm turns it into EINVAL.
+
+Answer it (and the suspend count beside it) with zero: the port has no fault
+counter yet, and zero is the truth it can state.
+
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4098,6 +4098,19 @@
+ 	case 0x07:			/* MSM_PARAM_PRIORITIES */
+ 		*value = 1;
+ 		return 0;
++	case 0x09:			/* MSM_PARAM_FAULTS */
++		/*
++		 * Turnip reads the fault count once before it creates a device
++		 * (tu_knl_drm_msm.cc: "Failed to get initial fault count") and
++		 * again on every status check; an unhandled parameter is EINVAL,
++		 * which is VK_ERROR_INITIALIZATION_FAILED and no device at all.
++		 * The port does not count faults yet: say none.
++		 */
++		*value = 0;
++		return 0;
++	case 0x0a:			/* MSM_PARAM_SUSPENDS */
++		*value = 0;
++		return 0;
+ 	case 0x0e:			/* MSM_PARAM_VA_START */
+ 		*value = MONDRIAN_UC_IOVA_BASE;
+ 		return 0;

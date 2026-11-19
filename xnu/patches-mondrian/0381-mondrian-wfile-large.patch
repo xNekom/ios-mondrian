@@ -1,0 +1,58 @@
+xnu 0381: wfile takes a dylib, not just a 1 MiB patch
+
+Measured 2026-11-19: the control channel refused an 11.5 MB upload with
+"wfile needs a length up to 1048576", and that is the size of the Turnip dylib
+a phone test has to carry. The ceiling is now 32 MiB and the buffer is the
+file's size rather than the ceiling, so a 66 KB program does not ask the kernel
+map for 32 MB contiguous. The host (tools/usb-ring.py) sends a window at a time
+and asks wstat how much of the contiguous prefix landed: unpaced, the same file
+arrived 0 of 11539920 bytes on three attempts.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2349,9 +2349,10 @@
+  * "wstat" reports how much has arrived, so the host can resend a file whose
+  * datagrams the gadget dropped instead of starting over blind.
+  */
+-#define UD_WFILE_MAX    (1u << 20)
++#define UD_WFILE_MAX    (32u << 20)
+ 
+ static unsigned char *ud_wfile_buf;
++static vm_size_t ud_wfile_cap;
+ static uint32_t ud_wfile_len;
+ static uint32_t ud_wfile_got;
+ static char     ud_wfile_path[96];
+@@ -2385,10 +2386,23 @@
+ 		ud_cmd_send(so, to, out, (size_t)n);
+ 		return;
+ 	}
+-	if (ud_wfile_buf == NULL) {
++	/*
++	 * The buffer is the file's size, not the ceiling: an 11.5 MB dylib is a
++	 * normal upload here (Turnip), and a 32 MB contiguous allocation for a
++	 * 66 KB program would fail on a fragmented kernel map. It grows, and is
++	 * never given back: the next large upload reuses it.
++	 */
++	if ((vm_size_t)len > ud_wfile_cap) {
+ 		vm_offset_t buf = 0;
++		vm_size_t need = round_page((vm_size_t)len);
+ 
+-		if (kmem_alloc_contig(kernel_map, &buf, UD_WFILE_MAX, PAGE_MASK,
++		if (ud_wfile_buf != NULL) {
++			kmem_free(kernel_map, (vm_offset_t)ud_wfile_buf,
++			    ud_wfile_cap);
++			ud_wfile_buf = NULL;
++			ud_wfile_cap = 0;
++		}
++		if (kmem_alloc_contig(kernel_map, &buf, need, PAGE_MASK,
+ 		    0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+ 		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			n = snprintf(out, sizeof(out), "wfile has no memory\n");
+@@ -2396,6 +2410,7 @@
+ 			return;
+ 		}
+ 		ud_wfile_buf = (unsigned char *)(uintptr_t)buf;
++		ud_wfile_cap = need;
+ 	}
+ 	memcpy(ud_wfile_path, path, path_len);
+ 	ud_wfile_path[path_len] = 0;

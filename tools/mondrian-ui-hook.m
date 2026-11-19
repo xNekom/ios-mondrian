@@ -2124,13 +2124,28 @@ mondrian_run_once(void)
 	}
 }
 
+/*
+ * The heartbeat stops after a minute; a test can be uploaded at any time, so
+ * the run file gets a watcher of its own that never stops asking. It costs one
+ * open() every two seconds and says nothing unless it has something to run.
+ */
+static void *
+run_watcher(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		sleep(2);
+		mondrian_run_once();
+	}
+	return NULL;
+}
+
 static void *
 heartbeat(void *unused)
 {
 	(void)unused;
 	for (int i = 0; i < 30; i++) {
 		sleep(2);
-		mondrian_run_once();
 		say("MONDRIAN UI: heartbeat\n");
 		/*
 		 * Opt-in through a marker file: this probe runs in every hooked
@@ -3302,6 +3317,7 @@ start_heartbeat(void)
 
 	mondrian_main_thread = mach_thread_self();
 	(void)pthread_create(&thread, NULL, heartbeat, NULL);
+	(void)pthread_create(&thread, NULL, run_watcher, NULL);
 	start_display_link_probe();
 	/*
 	 * The stack sampler follows the busiest thread in the process with a

@@ -66,6 +66,12 @@ def simple(command, timeout=2.0):
 
 
 CHUNK = 1200
+# Datagrams in flight before asking how far the kernel got. Sending a whole
+# file unpaced loses nearly all of it: measured 2026-11-19, an 11.5 MB dylib
+# arrived 0 of 11539920 bytes on all three attempts, while a 66 KB program went
+# through, because the kernel counts only the contiguous prefix and the phone
+# drops what arrives ahead of a hole.
+WINDOW = 24
 
 
 def wfile_attempt(path, data):
@@ -77,24 +83,36 @@ def wfile_attempt(path, data):
     print(answer.decode(errors="replace").strip(), file=sys.stderr)
 
     s = open_socket(1.0)
+    got = 0
     try:
-        offset = 0
-        while offset < len(data):
-            body = data[offset:offset + CHUNK - 8]
-            s.sendto(b"RLW1" + struct.pack("<I", offset) + body, PHONE)
-            offset += len(body)
-        # The write happens when the last byte lands; wstat says whether the
-        # kernel got the whole file before answering.
-        got = 0
-        for _ in range(40):
-            reply = simple("wstat", 1.0)
-            if reply is not None:
-                parts = reply.decode(errors="replace").split()
-                if len(parts) >= 2 and parts[0] == "wstat":
-                    got = int(parts[1])
-                    if got >= len(data):
-                        break
-            time.sleep(0.25)
+        stalls = 0
+        while got < len(data):
+            # Send from the contiguous prefix only, a window at a time: the
+            # kernel accepts an offset at or before what it already has, and
+            # refuses anything ahead of it.
+            offset = got
+            end = min(len(data), got + WINDOW * (CHUNK - 8))
+            while offset < end:
+                body = data[offset:offset + CHUNK - 8]
+                s.sendto(b"RLW1" + struct.pack("<I", offset) + body, PHONE)
+                offset += len(body)
+            # The write happens when the last byte lands; wstat says whether
+            # the kernel got there, and how much of the prefix it holds.
+            moved = False
+            for _ in range(50):
+                reply = simple("wstat", 1.0)
+                if reply is not None:
+                    parts = reply.decode(errors="replace").split()
+                    if len(parts) >= 2 and parts[0] == "wstat":
+                        now = int(parts[1])
+                        if now > got:
+                            got = now
+                            moved = True
+                            break
+                time.sleep(0.03)
+            stalls = 0 if moved else stalls + 1
+            if stalls >= 40:            # ten seconds with no byte: give up
+                break
     finally:
         s.close()
     return got

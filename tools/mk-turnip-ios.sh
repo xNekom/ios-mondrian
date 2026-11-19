@@ -62,6 +62,8 @@ if [ ! -f "$src/.turnip-patched" ]; then
 	(cd "$src" && patch -p1 --forward < "$root/tools/mesa/turnip-darwin.patch")
 	# A Mach-O dylib has no build id: ir3 keeps no disk cache, as in the GL build.
 	(cd "$src" && patch -p1 --forward < "$root/tools/mesa/turnip-ir3-nocache.patch")
+	# MondrianGPU is the IOVA authority: Turnip asks for the kernel's address.
+	(cd "$src" && patch -p1 --forward < "$root/tools/mesa/turnip-iova.patch")
 	# the stand-in for libdrm, where the patch's meson hunk looks for it
 	rm -rf "$src/src/mondrian-turnip-drm"
 	cp -R "$root/tools/mesa/turnip-drm" "$src/src/mondrian-turnip-drm"
