@@ -1783,6 +1783,26 @@ it. So WebKit's GPU process gets it through `DYLD_INSERT_LIBRARIES` from
 `mondrian_ui_hook_env`, the same place the hook is chosen by process name, and
 not by a `dlopen` in the hook.
 
+Two traps around that injection, both measured 2026-11-19:
+
+- **A truncated delivery is silent.** The 22 MB file stalled at 17.4 MB and the
+  kernel's `wfile` kept the prefix; dyld then refused the library and the
+  process simply never had Metal, with no message anywhere. `wfile` in
+  `tools/usb-ring.py` now retries a large file nine times and reports an
+  incomplete delivery as an error; treat any `INCOMPLETE` as "this experiment is
+  void", not as a slow upload.
+- **The GPU process cannot log.** Its stderr goes nowhere, `/dev/console` is
+  refused by its sandbox and `NSLog` did not appear in the ring either, while
+  the UI hook's own lines do reach it from SpringBoard and backboardd. Assume
+  nothing about that process is observable from inside it: use a dylib whose
+  only job is to abort on load to prove the insertion, and read the surface
+  bytes for everything else.
+
+The provider now prints a line when it is loaded, another when the device is
+made and counters for command buffers, commits, presents and waits. Whether
+those lines ever reach the ring from the GPU process is exactly what the abort
+probe is for.
+
 ### A warm reboot can leave the boot core unstarted
 
 The shim hands the kernel to the X2 with PSCI `CPU_ON` and the console ends at

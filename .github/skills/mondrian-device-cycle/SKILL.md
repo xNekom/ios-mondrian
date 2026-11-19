@@ -45,6 +45,20 @@ them brings it back; `fastboot devices` shows nothing because the gadget is
 still the XNU one. There is no remote recovery: ask for a power cycle (10 s off,
 power + volume down) and check nothing is left holding a pipe while you wait.
 
+## Driving the UI with taps
+
+`mondrianfb_blank=30` switches the panel off when nothing has been presented for
+30 s, and **the first touch only wakes it**: that touch does not reach the app.
+A tap that "does nothing" is usually this, not a wrong coordinate (measured
+2026-11-19: the same dock tap opened Safari on one attempt and was swallowed on
+the next). Send a throwaway tap at a harmless point, wait two seconds, then the
+real one. `respring` plus `key 3` (home) puts the phone on a known screen between
+attempts, and a `screen` capture costs about a minute when you need to be sure.
+
+The upload is the expensive part of a round, not the taps: 22 MB over the
+windowed `wfile` takes ten to fifteen minutes, so keep a dylib on the phone
+across experiments and upload it once per boot rather than once per test.
+
 ## Prove the kernel before trusting any answer
 
 A RAM boot that dies falls back to `boot_b`, so "command not found" means "old
