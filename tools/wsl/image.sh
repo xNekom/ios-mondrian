@@ -6,6 +6,9 @@
 #   EXTRA_ARGS="thermalthr=30" tools/wsl/image.sh
 #   PREFIX_ARGS="mondrianunlock=1" tools/wsl/image.sh   # an argument the hook must see
 #
+# A duplicate key is last-wins in XNU (measured 2026-11-19): `EXTRA_ARGS`
+# overrides a key the board already carries, `PREFIX_ARGS` loses to it.
+#
 # iOS gives kern.bootargs 607 bytes: the length is printed, and mkpayload
 # refuses anything longer, so a test argument has to come out of something else
 # (PREV_ARGS="" drops the previous-boot line count).

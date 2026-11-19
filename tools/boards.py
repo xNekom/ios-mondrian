@@ -342,14 +342,13 @@ MONDRIAN = Board(
              'wdt=-1 mondrianfb_noconsole=1 mondrianfb_fps=1 '
              # The driver's fallback blank: seconds without a present and
              # without a touch, then the panel is switched off with DCS 0x28
-             # and a touch switches it back on. It stays 0 (off): measured
-             # 2026-11-19 with 30 as the first occurrence, a 60 s idle window
-             # logged no blank and no wake, because the timer is gated on
-             # fLastPresentTicks != 0 and this boot had present 0/s. The
-             # earlier 30 s reset (2026-11-17, 4 of 4) predates that test;
-             # instrument the gate before enabling it
-             # (docs/UI_PERFORMANCE.md).
-             'mondrianfb_blank=0 '
+             # and the first touch switches it back on. 30 s, measured
+             # 2026-11-19: the lock screen blanked three times and woke on
+             # touch with no reset, while the home screen keeps presenting so
+             # its timer never fires. A duplicate key is last-wins
+             # (`PE_parse_boot_argn`), so override this one with EXTRA_ARGS,
+             # never PREFIX_ARGS (docs/UI_PERFORMANCE.md).
+             'mondrianfb_blank=30 '
              # The hook in SpringBoard (0x4) renders: lock screen, home screen,
              # Control Center, apps; the whole hook in backboardd or
              # runningboardd leaves the glass black, measured 2026-11-16

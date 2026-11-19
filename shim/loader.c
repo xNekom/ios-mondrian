@@ -551,13 +551,14 @@ const char *loader_boot(uintptr_t dtb)
 	/*
 	 * The payload carries this board's command line, and it has to reach
 	 * XNU whole: boot_args.CommandLine holds 1024 bytes and PE_parse_boot_argn
-	 * keeps the first occurrence of every key. The bootloader's
-	 * /chosen/bootargs is only sometimes useful -- booted with `fastboot
-	 * boot`, ABL fills it with its own Android line (console=ttyMSM0...,
-	 * androidboot.*), which XNU does not parse and which is long enough to
-	 * push ours out of the buffer. Give the payload its room first and let
-	 * the bootloader's line take only what is left in front of it; a short
-	 * `fastboot boot --cmdline "..."` still comes first and overrides.
+	 * keeps the last occurrence of every key (measured 2026-11-19). The
+	 * bootloader's /chosen/bootargs is only sometimes useful -- booted with
+	 * `fastboot boot`, ABL fills it with its own Android line
+	 * (console=ttyMSM0..., androidboot.*), which XNU does not parse and
+	 * which is long enough to push ours out of the buffer. Give the payload
+	 * its room first and let the bootloader's line take only what is left in
+	 * front of it: the payload goes last, so it wins a key the Android line
+	 * also carries, and `fastboot boot --cmdline` cannot override it.
 	 *
 	 * The 1024 is the kernel's, not the reader's: iOS userland asks for
 	 * kern.bootargs with a 608-byte buffer and XNU copies the whole string
