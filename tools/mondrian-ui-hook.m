@@ -15006,10 +15006,35 @@ mondrian_open_thread(void *unused)
 		workspace = ((id (*)(id, SEL))objc_msgSend)(
 		    (id)objc_getClass("LSApplicationWorkspace"),
 		    sel_registerName("defaultWorkspace"));
-		opened = workspace != nil &&
-		    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
-		    sel_registerName("openApplicationWithBundleID:"),
-		    [NSString stringWithUTF8String:bundle]);
+		if (strncmp(bundle, "http://", 7) == 0 ||
+		    strncmp(bundle, "https://", 8) == 0) {
+			/*
+			 * A URL opens the page in Safari without its address bar:
+			 * the USB injector cannot focus that, so a local page is
+			 * the only way to tell a network failure from WebKit.
+			 */
+			id url = ((id (*)(id, SEL, id))objc_msgSend)(
+			    (id)objc_getClass("NSURL"), sel_registerName("URLWithString:"),
+			    [NSString stringWithUTF8String:bundle]);
+			BOOL responds = workspace != nil &&
+			    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(workspace,
+			    sel_registerName("respondsToSelector:"),
+			    sel_registerName("openURL:withOptions:"));
+
+			/*
+			 * LSApplicationWorkspace is the thread-safe entry. UIApplication
+			 * openURL: from this pthread aborts SpringBoard in a loop (sig 6,
+			 * libc++abi terminate), measured 2026-11-19.
+			 */
+			opened = responds && url != nil &&
+			    ((BOOL (*)(id, SEL, id, id))objc_msgSend)(workspace,
+			    sel_registerName("openURL:withOptions:"), url, nil);
+		} else {
+			opened = workspace != nil &&
+			    ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace,
+			    sel_registerName("openApplicationWithBundleID:"),
+			    [NSString stringWithUTF8String:bundle]);
+		}
 		mondrian_probe_fmt("MONDRIAN OPEN[%d]: %s -> %d\n", getpid(), bundle,
 		    opened ? 1 : 0);
 	}
