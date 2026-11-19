@@ -1,0 +1,37 @@
+xnu 0380: let the WebKit surface trace see 1440 x 2622
+
+Measured 2026-11-19: 0379 allowed the 'w30r' format but kept the 2 Mpx ceiling,
+and the page's surfaces are 1440 x 2622 (3.8 Mpx), so the writer still dropped
+every lock and no content line appeared. Raise the ceiling to 5 Mpx for
+com.apple.WebKit only; its 24-line budget bounds the output.
+
+diff --git a/iokit/Kernel/arm/MondrianSurface.cpp b/iokit/Kernel/arm/MondrianSurface.cpp
+index ce3273a..67a8b5f 100644
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -609,14 +609,23 @@ mondrian_surf_writer(MondrianSurface *s, const char *what, uintptr_t options)
+ 	bool app, webkit;
+ 
+ 	if (s == NULL || s->width < 320 || s->height < 240 ||
+-	    (s->pixelFormat != 0 && s->pixelFormat != 0x77333072) ||
+-	    (uint64_t)s->width * (uint64_t)s->height > 2000000) {
++	    (s->pixelFormat != 0 && s->pixelFormat != 0x77333072)) {
+ 		return;
+ 	}
+ 	proc_selfname(name, sizeof(name));
+ 	app = strncmp(name, "MobileSlideShow", 15) == 0 ||
+ 	    strncmp(name, "Photos", 6) == 0;
+ 	webkit = strncmp(name, "com.apple.WebKit", 16) == 0;
++	/*
++	 * The 2 Mpx cap was there to keep the main framebuffer out of the log.
++	 * The WebKit GPU process's page surfaces are 1440 x 2622 (3.8 Mpx), so
++	 * the cap hid exactly the locks this probe exists to read. The larger
++	 * ceiling is only for WebKit: its 24-line budget bounds the output.
++	 */
++	if ((uint64_t)s->width * (uint64_t)s->height >
++	    (webkit ? 5000000u : 2000000u)) {
++		return;
++	}
+ 	if (webkit ? told_webkit >= 24 : (app ? told_app >= 32 : told >= 512)) {
+ 		return;
+ 	}

@@ -1,0 +1,79 @@
+xnu 0379: read the WebKit GPU process's w30r surfaces
+
+Measured 2026-11-19: Safari's local page is black while
+com.apple.WebKit.GPU creates 1440 x 1536, 1440 x 2622 and 1440 x 2625 surfaces
+with pixel format 0x77333072 ('w30r', 10-bit RGB). The surface probe skipped
+every non-zero format, so no line says whether the GPU process filled them or
+the compositor cannot sample that format.
+
+Allow 0x77333072 in the writer, give com.apple.WebKit.GPU its own budget, and
+print the first 16 bytes at both ends of the lock. All zero is a GPU process
+that never drew; non-zero puts the black page in the compositor's w30r path.
+
+diff --git a/iokit/Kernel/arm/MondrianSurface.cpp b/iokit/Kernel/arm/MondrianSurface.cpp
+index bebf211..ce3273a 100644
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -604,27 +604,55 @@ mondrian_surf_fill_stack(MondrianSurface *s, const char *what)
+ static void
+ mondrian_surf_writer(MondrianSurface *s, const char *what, uintptr_t options)
+ {
+-	static unsigned told, told_app;
++	static unsigned told, told_app, told_webkit;
+ 	char name[32];
+-	bool app;
++	bool app, webkit;
+ 
+ 	if (s == NULL || s->width < 320 || s->height < 240 ||
+-	    s->pixelFormat != 0 || (uint64_t)s->width * (uint64_t)s->height > 2000000) {
++	    (s->pixelFormat != 0 && s->pixelFormat != 0x77333072) ||
++	    (uint64_t)s->width * (uint64_t)s->height > 2000000) {
+ 		return;
+ 	}
+ 	proc_selfname(name, sizeof(name));
+ 	app = strncmp(name, "MobileSlideShow", 15) == 0 ||
+ 	    strncmp(name, "Photos", 6) == 0;
+-	if (app ? told_app >= 32 : told >= 512) {
++	webkit = strncmp(name, "com.apple.WebKit", 16) == 0;
++	if (webkit ? told_webkit >= 24 : (app ? told_app >= 32 : told >= 512)) {
+ 		return;
+ 	}
+-	if (app) {
++	if (webkit) {
++		told_webkit++;
++	} else if (app) {
+ 		told_app++;
+ 	} else {
+ 		told++;
+ 	}
+-	IOLog("MONDRIAN SURF: %s %s id %u %ux%u options %#lx seed %u\n", name, what,
+-	    s->id, s->width, s->height, (unsigned long)options, *mondrian_surface_seed(s));
++	IOLog("MONDRIAN SURF: %s %s id %u %ux%u fmt %#x options %#lx seed %u\n",
++	    name, what, s->id, s->width, s->height, s->pixelFormat,
++	    (unsigned long)options, *mondrian_surface_seed(s));
++	/*
++	 * The WebKit GPU process asks for 'w30r' (10-bit RGB), not the BGRA the
++	 * app path uses. Reading the first bytes at both ends of the lock says
++	 * whether the process rendered into the surface at all: all zero is a
++	 * GPU process that never drew, non-zero puts the black page in the
++	 * compositor's handling of that format.
++	 */
++	if (webkit && s->pixelFormat == 0x77333072 &&
++	    (strcmp(what, "lock") == 0 || strcmp(what, "unlock") == 0)) {
++		uint8_t *p = (uint8_t *)s->kernelAddress();
++		char bytes[3 * 16 + 1];
++		size_t used = 0;
++		unsigned i;
++
++		if (p != NULL) {
++			for (i = 0; i < 16; i++) {
++				used += snprintf(bytes + used, sizeof(bytes) - used,
++				    "%02x", p[i]);
++			}
++			IOLog("MONDRIAN SURF: %s %s id %u first %s\n", name, what,
++			    s->id, bytes);
++		}
++	}
+ }
+ 
+ bool
