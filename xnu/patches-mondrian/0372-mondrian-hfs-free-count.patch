@@ -1,0 +1,169 @@
+xnu 0372: free the blocks a delete actually owns
+
+Measured 2026-11-19: deleting a 1 MiB file (`/private/var/vm/mondrian-fill`) moved
+`statfs` from 0 to 24 free blocks, not 256. `BlockMarkFreeInternal` abandoned the
+whole range at the first word that was not entirely allocated and returned
+`hfsNotAllocatedErr`, and `BlockDeallocate` skipped the counter on that error. The
+rest of the range stayed marked allocated in the bitmap and was lost: every log
+rotation leaks the blocks it just wrote, which is why the volume fell from 164 MB
+free to zero inside one session.
+
+The free path now clears the bits that are set, skips the ones that are already
+clear, and counts what it cleared. `BlockDeallocate` adds that count to
+`freeBlocks` (and to `hfs_freed_block_count`) instead of the requested range, so
+the counter and the bitmap stay in step. A range that held nothing but free
+blocks still answers `hfsNotAllocatedErr`, which is the signal the callers act on
+and the case the old comment describes.
+
+That is also the 32 MB the audit measured between the counter and the bitmap: the
+same defect, over the ranges freed since the image was written.
+
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -390,7 +390,8 @@
+ 		ExtendedVCB	*vcb,
+ 		u_int32_t	startingBlock,
+ 		u_int32_t	numBlocks, 
+-		Boolean 	do_validate);
++		Boolean 	do_validate,
++		u_int32_t	*freedOut);
+ 
+ 
+ static OSErr ReadBitmapRange (struct hfsmount *hfsmp, uint32_t offset, uint32_t iosize,
+@@ -1691,7 +1692,9 @@
+ 
+ 	(void) hfs_release_summary (hfsmp, firstBlock, numBlocks);
+ 
+-	err = BlockMarkFreeInternal(vcb, firstBlock, numBlocks, true);
++	u_int32_t freed = 0;
++
++	err = BlockMarkFreeInternal(vcb, firstBlock, numBlocks, true, &freed);
+ 
+ 	if (err) {
+ 		goto Exit;
+@@ -1706,10 +1709,10 @@
+ 	 * when a volume is being truncated.  
+ 	 */
+ 	if ((flags & HFS_ALLOC_SKIPFREEBLKS) == 0) {
+-		vcb->freeBlocks += numBlocks;
++		vcb->freeBlocks += freed;
+ 	}
+ 
+-	vcb->hfs_freed_block_count += numBlocks;
++	vcb->hfs_freed_block_count += freed;
+ 
+ 	if (vcb->nextAllocation == (firstBlock + numBlocks)) {
+ 		HFS_UPDATE_NEXT_ALLOCATION(vcb, (vcb->nextAllocation - numBlocks));
+@@ -3162,7 +3165,7 @@
+ 		u_int32_t		startingBlock,
+ 		register u_int32_t	numBlocks)
+ {
+-	return BlockMarkFreeInternal(vcb, startingBlock, numBlocks, true);
++	return BlockMarkFreeInternal(vcb, startingBlock, numBlocks, true, NULL);
+ }
+ 
+ 
+@@ -3215,7 +3218,7 @@
+ 	if (curNumBlocks > numBlocks) {
+ 		curNumBlocks = numBlocks;
+ 	}
+-	error = BlockMarkFreeInternal(vcb, startingBlock, curNumBlocks, false);
++	error = BlockMarkFreeInternal(vcb, startingBlock, curNumBlocks, false, NULL);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -3242,7 +3245,7 @@
+ 			curNumBlocks = numBlocks;
+ 		}
+ 		if (hfs_isallocated(hfsmp, startingBlock, curNumBlocks) == true) {
+-			error = BlockMarkFreeInternal(vcb, startingBlock, curNumBlocks, false);
++			error = BlockMarkFreeInternal(vcb, startingBlock, curNumBlocks, false, NULL);
+ 			if (error) {
+ 				return error;
+ 			}
+@@ -3278,9 +3281,17 @@
+ 		ExtendedVCB		*vcb,
+ 		u_int32_t		startingBlock_in,
+ 		register u_int32_t	numBlocks_in,
+-		Boolean 		do_validate)
++		Boolean 		do_validate,
++		u_int32_t		*freedOut)
+ {
+ 	OSErr		err;
++	/*
++	 * MONDRIAN: how many bits this call actually cleared. The range says what
++	 * the caller believes it owns; the bitmap says which of those blocks were
++	 * still marked allocated, and that is the number the free counter has to
++	 * grow by.
++	 */
++	u_int32_t	freed = 0;
+ 	u_int32_t	startingBlock = startingBlock_in;
+ 	u_int32_t	numBlocks = numBlocks_in;
+ 	uint32_t	unmapStart = startingBlock_in;
+@@ -3393,10 +3404,15 @@
+ 			numBits = numBlocks;					//	entire allocation is inside this one word
+ 			bitMask &= ~(kAllBitsSetInWord >> (currentBit + numBits));	//	turn off bits after last
+ 		}
+-		if ((do_validate == true) && 
+-				(*currentWord & SWAP_BE32 (bitMask)) != SWAP_BE32 (bitMask)) {
+-			goto Corruption;
+-		}
++		/*
++		 * MONDRIAN: clear the bits that are set and keep going. Measured
++		 * 2026-11-19: deleting a 1 MiB file returned 24 of its 256 blocks,
++		 * because the first word that was not entirely allocated abandoned
++		 * the rest of the range. Every log rotation then leaked the blocks
++		 * it had just written, and the volume reached zero free blocks
++		 * inside one session.
++		 */
++		freed += __builtin_popcount(*currentWord & SWAP_BE32(bitMask));
+ 		*currentWord &= SWAP_BE32 (~bitMask);		//	clear the bits in the bitmap
+ 		numBlocks -= numBits;						//	adjust number of blocks left to free
+ 
+@@ -3430,10 +3446,7 @@
+ 			currentWord = buffer;
+ 			wordsLeft = wordsPerBlock;
+ 		}
+-		if ((do_validate == true) && 
+-				(*currentWord != SWAP_BE32 (kAllBitsSetInWord))) {
+-			goto Corruption;
+-		}
++		freed += __builtin_popcount(*currentWord);
+ 		*currentWord = 0;							//	clear the entire word
+ 		numBlocks -= kBitsPerWord;
+ 
+@@ -3466,15 +3479,20 @@
+ 
+ 			currentWord = buffer;
+ 		}
+-		if ((do_validate == true) && 
+-				(*currentWord & SWAP_BE32 (bitMask)) != SWAP_BE32 (bitMask)) {
+-			goto Corruption;
+-		}
++		freed += __builtin_popcount(*currentWord & SWAP_BE32(bitMask));
+ 		*currentWord &= SWAP_BE32 (~bitMask);			//	clear the bits in the bitmap
+ 
+ 		//	No need to update currentWord or wordsLeft
+ 	}
+ 
++	/*
++	 * A range that held nothing but free blocks has nothing to clear: that is
++	 * still the condition the callers act on, so it keeps its own error.
++	 */
++	if (freed == 0) {
++		goto Corruption;
++	}
++
+ 	//
+ 	// Look for a range of free blocks immediately after the range we just freed
+ 	// (up to the end of the current bitmap block).
+@@ -3504,6 +3522,9 @@
+ 	if (buffer)
+ 		(void)ReleaseBitmapBlock(vcb, blockRef, true);
+ 
++	if (freedOut != NULL) {
++		*freedOut = freed;
++	}
+ 	if (err == noErr) {
+ 		hfs_unmap_free_extent(vcb, unmapStart, unmapCount);
+ 	}
