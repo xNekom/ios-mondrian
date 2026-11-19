@@ -31,6 +31,20 @@ rejected with `Slot b does not exist` while the mark survives: every RAM boot
 then dies the same way. Strip it (`| tr -d '\r'`) and check the command's exit
 status instead of writing its output to a log nobody reads.
 
+A RAM boot after an XNU run can also die at the shim handoff and fall back to
+`boot_b`. Measured 2026-11-19: two attempts died, the third in the same session
+booted the image, so retry (`ATTEMPTS=N`, which `cycle.sh` does) instead of
+waiting for a power cycle that nobody is there to perform.
+
+## When the ring goes silent
+
+`pos` and `wfile` stop answering while ICMP on the same link still does: the
+kernel is up and its ring thread is not. Draining udp/5141, re-attaching with
+`usbipd`, and a detach/attach bus reset were all measured 2026-11-19 and none of
+them brings it back; `fastboot devices` shows nothing because the gadget is
+still the XNU one. There is no remote recovery: ask for a power cycle (10 s off,
+power + volume down) and check nothing is left holding a pipe while you wait.
+
 ## Prove the kernel before trusting any answer
 
 A RAM boot that dies falls back to `boot_b`, so "command not found" means "old
