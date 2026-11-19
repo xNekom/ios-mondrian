@@ -1090,6 +1090,79 @@ row_spread(const uint8_t *rowbytes, unsigned width)
 	return high - low;
 }
 
+/* Four bytes at four quadrant centres: a picture against a blank, without a copy. */
+static void
+photo_quadrants(const uint8_t *base, size_t row, unsigned width, unsigned height, unsigned pixel, char *out, size_t size)
+{
+	size_t used = 0;
+
+	if (base == NULL || out == NULL || size == 0) {
+		return;
+	}
+	out[0] = '\0';
+	if (pixel == 0 || width < 8 || height < 8) {
+		return;
+	}
+	for (unsigned i = 0; i < 4 && used + 16 < size; i++) {
+		unsigned x = (i & 1) ? (3 * width / 4) : (width / 4);
+		unsigned y = (i & 2) ? (3 * height / 4) : (height / 4);
+		const uint8_t *at = base + row * (size_t)y + (size_t)x * pixel;
+
+		used += (size_t)snprintf(out + used, size - used, "%s%02x%02x%02x%02x", i ? " | " : "", at[0],
+		    pixel > 1 ? at[1] : 0, pixel > 2 ? at[2] : 0, pixel > 3 ? at[3] : 0);
+	}
+}
+
+/*
+ * The photograph that never lands.
+ *
+ * Measured 2026-11-19: the imported picture's file, its asset and PhotoKit's own
+ * thumbnail all carry the four coloured quadrants, while the Library tile and the
+ * viewer draw black. The surfaces the window server shows for those two sizes
+ * (640 x 480 and 800 x 600, no pixel format, created by backboardd) read as all
+ * zero the first time they are shown. A surface can legitimately be empty when it
+ * is first shown and filled after, so this asks again at every refill, keyed by
+ * the surface's seed: the same bytes with a seed that never moves mean nothing
+ * ever wrote it, a seed that moves while the bytes stay zero means what wrote it
+ * wrote zeros, and colour here means the loss is after the upload.
+ */
+static void
+photo_surface_probe(struct image *image, const uint8_t *base, size_t row, bool planar)
+{
+	static struct {
+		uint32_t id, seed;
+	} told[16];
+	static unsigned count, lines;
+	uint32_t id, seed;
+	unsigned pixel = IOSurfaceGetBytesPerElement(image->surface);
+	char quadrants[128];
+
+	if (planar || base == NULL || image->width < 320 || image->height < 240 || pixel != 4) {
+		return;
+	}
+	if (access("/private/var/vm/mondrian-glphoto", F_OK) != 0) {
+		return;
+	}
+	id = IOSurfaceGetID(image->surface);
+	seed = IOSurfaceGetSeed(image->surface);
+	for (unsigned i = 0; i < count; i++) {
+		if (told[i].id == id && told[i].seed == seed) {
+			return;
+		}
+	}
+	if (count >= sizeof(told) / sizeof(told[0]) || lines >= 24) {
+		return;
+	}
+	told[count].id = id;
+	told[count].seed = seed;
+	count++;
+	lines++;
+	photo_quadrants(base, row, (unsigned)image->width, (unsigned)image->height, pixel, quadrants, sizeof(quadrants));
+	say("mondrian-gl: photo surface %u, %d x %d, %zu a row, pixel format %#x, seed %u, shown %d drawn %d shared %d: "
+	    "quadrants %s\n", id, image->width, image->height, row, (unsigned)IOSurfaceGetPixelFormat(image->surface),
+	    seed, image->wrapped, image->target, image->shared, quadrants);
+}
+
 static void
 upload_check(struct eagl *e, struct image *image, size_t row, const uint8_t *base, unsigned pixel, bool planar)
 {
@@ -1225,6 +1298,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 		return;
 	}
 	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	photo_surface_probe(image, base, row, planar);
 	/*
 	 * A shown 32-bit surface of somebody else's memory (and any of 256 x 256 or less): which of
 	 * its bytes is the opacity, decided here (it is not in the surface) before the copy and the
@@ -4576,25 +4650,33 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 			note_created((GLuint)bound_texture, width, height, internal, type, 0);
 		}
 		/*
-		 * A big picture handed over by the window server: is it a photograph or
+		 * A picture handed over by the window server: is it a photograph or
 		 * a coverage mask? The lock screen's wallpaper is a 1326x1326 surface
 		 * whose bytes are 0xFF everywhere, and painted as the picture it is,
 		 * that is a white rectangle. Eight bytes and the share of 0xFF in the
-		 * first row say which it is, once per size.
+		 * first row say which it is, once per size. The four quadrant pixels
+		 * also say whether an image arrived coloured or already blank, which
+		 * is the question the black photograph leaves: it is 800 x 600, so
+		 * the old one-megapixel floor never asked about it.
 		 */
-		if (pixels != NULL && (size_t)width * (size_t)height >= (1u << 20) && level == 0 &&
+		if (pixels != NULL && (size_t)width * (size_t)height >= 320u * 240u && level == 0 &&
 		    (format == GL_BGRA || format == 0x1908) && type == GL_UNSIGNED_BYTE) {
 			static unsigned said;
 			const uint8_t *bytes = pixels;
+			GLint unpack = 0;
 			size_t count = (size_t)width * 4, all = 0;
+			size_t stride;
+			char quadrants[128];
 
 			for (size_t at = 0; at < count; at++) {
 				all += bytes[at] == 0xff;
 			}
-			if (said++ < 8) {
-				say("mondrian-gl: a %dx%d picture: %02x %02x %02x %02x %02x %02x %02x %02x, %zu of %zu bytes 0xff\n",
-				    width, height, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-				    all, count);
+			glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpack);
+			stride = ((size_t)unpack > 0 ? (size_t)unpack : (size_t)width) * 4;
+			photo_quadrants(bytes, stride, (unsigned)width, (unsigned)height, 4, quadrants, sizeof(quadrants));
+			if (said++ < 16) {
+				say("mondrian-gl: a %dx%d picture (format %#x, %zu bytes a row): quadrants %s, %zu of %zu bytes "
+				    "0xff\n", width, height, format, stride, quadrants, all, count);
 			}
 		}
 	}
