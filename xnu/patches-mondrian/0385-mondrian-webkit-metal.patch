@@ -1,0 +1,78 @@
+xnu 0385: WebKit's GPU process gets the Metal provider at exec
+
+The GPU process renders its page surfaces through Metal and they stay
+zero (0379/0380) because this port has no Metal device to offer. The
+device now exists (AdrenoMetal over metal2vulkan over Turnip, m2v_test
+passing end to end with 0384), and it reaches a process only through
+DYLD_INSERT_LIBRARIES: measured 2026-11-19, a dylib dlopen'd after the
+call bound does not change MTLCreateSystemDefaultDevice.
+
+So the process name is a target beside the others, and its line is the
+provider dylib in /private/var/vm instead of the hook. Gated by
+mondrian_probe_switch(), so a default boot injects nothing new.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5660,6 +5660,12 @@
+  * depend on a file in /private/var/vm.
+  */
+ #define MONDRIAN_HOOK_PHOTOS            0x100
++/*
++ * WebKit's GPU process: not part of the mask, and off unless a probe switch is
++ * there, because it changes what that process renders with. The page surfaces
++ * it makes stay zero without it (0379/0380).
++ */
++#define MONDRIAN_HOOK_METAL             0x200
+ 
+ /*
+  * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
+@@ -5838,6 +5844,16 @@
+ 	 */
+ 	const char injector[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-inject.dylib";
+ 	const char injector_path[] = "/private/var/vm/mondrian-inject.dylib";
++	/*
++	 * WebKit's GPU process renders through Metal. This port's Metal is
++	 * AdrenoMetal's objects over metal2vulkan over Turnip
++	 * (tools/mk-m2v-ios.sh), and that dylib interposes Metal's device
++	 * factory: it has to arrive at exec, because dyld binds the call then
++	 * and a dlopen later does not rebind it (measured 2026-11-19,
++	 * tools/gpu/metal_probe.m).
++	 */
++	const char metal[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/libmondrianmetal.dylib";
++	const char metal_path[] = "/private/var/vm/libmondrianmetal.dylib";
+ 
+ 	/*
+ 	 * A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster
+@@ -5901,10 +5917,15 @@
+ 	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
+ 	    "MobileSlideShow")) {
+ 		wanted = MONDRIAN_HOOK_PHOTOS;
++	} else if (wanted == 0 &&
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "com.apple.WebKit.GPU")) {
++		wanted = MONDRIAN_HOOK_METAL;
+ 	}
+ 	/* The probe names its own processes; everything else needs its mask bit. */
+ 	if (wanted == 0 ||
+-	    (wanted != MONDRIAN_HOOK_PROBE && (targets & wanted) == 0)) {
++	    (wanted != MONDRIAN_HOOK_PROBE && wanted != MONDRIAN_HOOK_METAL &&
++	    (targets & wanted) == 0)) {
+ 		return false;
+ 	}
+ 	/*
+@@ -5917,6 +5938,15 @@
+ 	 * /private/var/vm, and when it is not there yet backboardd is left alone
+ 	 * rather than handed the hook.
+ 	 */
++	if (wanted == MONDRIAN_HOOK_METAL) {
++		if (!mondrian_probe_switch() || !mondrian_dylib_in_vm(metal_path)) {
++			return false;
++		}
++		printf("MONDRIAN HOOK: WebKit's GPU process gets the Metal "
++		    "provider\n");
++		strlcpy(env, metal, size);
++		return true;
++	}
+ 	if (wanted == MONDRIAN_HOOK_BACKBOARDD) {
+ 		int gpu_hook = 0;
+ 
