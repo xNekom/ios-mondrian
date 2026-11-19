@@ -499,7 +499,66 @@ Measured strings in the iOS 16.7.16 root:
 The root image is **HFSX** (`HX` signature), so `tools`' usual reader does not
 open it: `hpmount` only accepts a native `H+` volume. 7-Zip reads it
 (`7z l ios-root.raw`, paths under `iOSRoot/`), which is enough to inventory and
-extract single binaries without booting the helper VM.
+extract single binaries without booting the helper VM. That is how the two
+facts below were measured: `bluetoothd` (8.9 MB) imports `_open`, `_close`,
+`_read`, `_write`, `_ioctl`, `_select`, `_tcgetattr`, `_tcsetattr`,
+`_cfsetspeed` and `_cfmakeraw`, and its startup calls `access(path, F_OK)` on
+the two device paths before matching `IOServiceNameMatching("marconi-bt")` and
+then `"bluetooth"`; the serial path is a termios conversation, not a pipe.
+
+### The tty bluetoothd opens
+
+`0386` answers that fallback: the kernel creates `/dev/cu.bluetooth` from the
+root-mount path, so the node exists before `bluetoothd` runs its `access()`
+check. It has to be a tty rather than a plain character device, because the
+termios imports above are called before the first HCI packet; a cdev without a
+line discipline fails the conversation and the stack gives up.
+
+The part is powered and the wire programmed on the first `open`, reusing the
+`btuart on` sequence (pins, the 14745600 Hz SE root, 8N1). That is one RCG
+change per boot, the constraint `0343` measured, and it means no ring command
+has to run first. Input is drained into the line discipline from a one-tick
+timeout rather than an interrupt, because SPI 587 has no handler: 10 ms is 115
+bytes at 115200, under the engine's 128-byte RX FIFO, and RFR asserts before
+it fills. The port opens raw (no `ICANON`, no echo) so HCI bytes survive until
+`cfmakeraw()`.
+
+Nothing in that process can log, so the driver prints the first eight packets
+in each direction as `MONDRIAN BTTTY: tx|rx ...`, and `open`/`termios`/`close`
+lines beside them. Those lines are the measurement: `bluetoothd` opening the
+node, setting termios and sending `01 03 0c 00` is the transport working, and
+the boot stops logging `exit bluetoothd ... status 0x0` at startup. What comes
+after is the stack's opinion of a ROM-only chip, which is where the kernel-side
+firmware load enters.
+
+Before any transport, though, `bluetoothd` refuses to run without a local
+Bluetooth address: every boot until now logged `exec bluetoothd` and
+`exit bluetoothd ... status 0x0` a second later, and its job has
+`KeepAlive = SuccessfulExit`, so a clean exit is final. Its
+`FindLocalMacAddress` reads `kern.bootargs` for `wlan.debug.generate-mac` (or a
+`wlan.factory=` whose low value has bit 2 set), then
+`CFPreferencesCopyAppValue("SelfGeneratedLocalAddress",
+"com.apple.BTServer")`; when that preference is missing it fills six bytes
+from `arc4random_uniform`, stores `%02x:%02x:...` and carries on. The stock
+root's `/private/var/mobile/Library/Preferences/com.apple.BTServer.plist` is an
+empty dictionary, so the command line's token is the whole missing piece; the
+board's command line carries it.
+
+Measured 2026-11-19, that token moves the failure and does not remove it: the
+same kernel prints `MONDRIAN BTTTY: /dev/cu.bluetooth major 19` at root mount,
+and the boot's `bluetoothd` goes from `status 0x0` (no address, it exits before
+any transport) to `status 0x100` (exit 1, restarted by XPC traffic) with the
+port still never opened. The address gate is the first of two; the second is
+inside transport selection, which logs nowhere the ring can see.
+
+Two ways of listening to it do not work, both measured. `/dev/console` as the
+job's `StandardErrorPath` leaves nothing in the dump while
+`mondrianfb_noconsole=1`, so the ring does not carry userland console writes.
+And `/private/var/vm` is not writable by the job's user, so launchd never
+creates a log file there (`rf` answers ENOENT). `0387` adds
+`rf PATH [OFFSET [LEN]]`, which reads a file back over the ring; with
+`StandardErrorPath` under `/private/var/tmp`, `tools/usb-ring.py rf PATH OFFSET
+LEN` is how the stack explains itself.
 
 ## What other ports teach
 
@@ -536,10 +595,13 @@ without PCIe, MHI or a 802.11 stack, and it produces a visible result
    the ROM version over the QUP UART, the way `hci_qca` starts.
 2. Download the RAM patch and NVM, reset, and check that HCI Reset and Read
    Local Version answer.
-3. Expose the port as `/dev/cu.bluetooth` and make `bluetoothd` use `H4`
-   (its plist environment is ours). Measure whether it reaches
-   `StackStarted`, and whether the Broadcom `BlueTool` script is skipped on
-   the third-party-chipset path.
+3. The node is `0386`: a tty created before `bluetoothd` looks for it, powered
+   and programmed on first open, with its first packets on the ring. The
+   command line carries `wlan.debug.generate-mac` because without a local
+   address the process exits before any transport. What is left is why the
+   transport selection still exits 1 with the node present: the job's stderr
+   now goes to a file that `rf` reads (`0387`), and the next measurement is
+   that file.
 4. Pairing and A2DP. SCO audio needs the SLIMbus/PCM route, which is a
    separate piece of work.
 
