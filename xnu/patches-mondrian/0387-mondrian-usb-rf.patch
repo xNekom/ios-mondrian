@@ -1,0 +1,139 @@
+xnu 0387: a ring command that reads a file back
+
+The command channel could write a file (`wfile`) and not read one, which is
+why a daemon's explanation of a failure was unreadable: launchd can be pointed
+at a log file with `StandardErrorPath`, but nothing could bring the file back.
+Writing to `/dev/console` is not the way out either - with `mondrianfb_noconsole=1`
+the kernel console does not carry userland writes into the ring (measured: a
+bluetoothd job pointed at /dev/console left nothing in the dump).
+
+`rf PATH [OFFSET [LEN]]` reads LEN bytes (1000 by default, one datagram) at
+OFFSET through the same root the writer uses and answers with them raw, so the
+host can `> file` the result. The read side is `mondrian_root_read()` next to
+`mondrian_root_write()`, `vn_open` plus `vn_rdwr(UIO_READ)`, with the residual
+count turned into the number of bytes read.
+
+Not a general file server: 1000 bytes per call, no directory, no write. It
+exists to make a process that cannot log observable, and the first user is
+`bluetoothd`.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 10d40b4..47c788a 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2245,6 +2245,35 @@ out:
+  */
+ int mondrian_root_write(const char *path, const void *data, unsigned len);
+ 
++/*
++ * The read side of `wfile`: a daemon's stderr can be pointed at a file, and
++ * this is what brings it back over the command channel ("rf" in
++ * mondrian_usb.c). Returns the bytes read, or a negative errno.
++ */
++int
++mondrian_root_read(const char *path, void *data, unsigned len, off_t off)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int resid = 0;
++	int error;
++
++	if (len == 0) {
++		return -EINVAL;
++	}
++	error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_READ, vp, (caddr_t)data, (int)len, off,
++		    UIO_SYSSPACE, IO_NODELOCKED, vfs_context_ucred(ctx), &resid,
++		    vfs_context_proc(ctx));
++		vnode_close(vp, FREAD, ctx);
++	}
++	if (error != 0) {
++		return -error;
++	}
++	return (int)len - resid;
++}
++
+ int
+ mondrian_root_write(const char *path, const void *data, unsigned len)
+ {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 93f682b..a8fbd90 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2188,6 +2188,65 @@ ud_cmd_btuart(socket_t so, struct sockaddr_in *to, const char *line)
+ 	ud_cmd_send(so, to, out, (size_t)n);
+ }
+ 
++/*
++ * "rf PATH [OFFSET [LEN]]": read LEN bytes (1000 by default) of a file at
++ * OFFSET and answer with them raw. The ring had a writer (`wfile`) and no
++ * reader, which is why a daemon's stderr was unreadable: a launchd job can be
++ * pointed at a file, but nothing could bring the file back. Reading is done
++ * through the same root the writer uses.
++ */
++#define UD_RF_MAX       1000
++
++static void
++ud_cmd_rf(socket_t so, struct sockaddr_in *to, const char *line)
++{
++	extern int mondrian_root_read(const char *path, void *data,
++	    unsigned len, off_t off);
++	char path[128];
++	char buf[UD_RF_MAX];
++	const char *p = line + 2;
++	const char *q;
++	uint32_t off = 0;
++	uint32_t len = UD_RF_MAX;
++	size_t path_len;
++	char out[160];
++	int n;
++
++	while (*p == ' ' || *p == '\t') {
++		p++;
++	}
++	for (q = p; *q != 0 && *q != ' ' && *q != '\t'; q++) {
++		;
++	}
++	path_len = (size_t)(q - p);
++	if (path_len == 0 || path_len >= sizeof(path)) {
++		n = snprintf(out, sizeof(out), "rf needs a path\n");
++		ud_cmd_send(so, to, out, (size_t)n);
++		return;
++	}
++	memcpy(path, p, path_len);
++	path[path_len] = 0;
++	p = q;
++	if ((p = ud_cmd_num(p, &off)) == NULL) {
++		off = 0;
++		p = q;
++	}
++	if (ud_cmd_num(p, &len) == NULL) {
++		len = UD_RF_MAX;
++	}
++	if (len == 0 || len > UD_RF_MAX) {
++		len = UD_RF_MAX;
++	}
++	n = mondrian_root_read(path, buf, len, (off_t)off);
++	if (n <= 0) {
++		n = snprintf(out, sizeof(out), "rf %s at %u: %d\n", path, off,
++		    n);
++		ud_cmd_send(so, to, out, (size_t)n);
++		return;
++	}
++	ud_cmd_send(so, to, buf, (size_t)n);
++}
++
+ static void
+ ud_cmd_hapreg(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+@@ -2725,6 +2784,9 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strcmp(cmd, "btuart") == 0 ||
+ 			    strncmp(cmd, "btuart ", 7) == 0) {
+ 				ud_cmd_btuart(so, peer, cmd);
++			} else if (strcmp(cmd, "rf") == 0 ||
++			    strncmp(cmd, "rf ", 3) == 0) {
++				ud_cmd_rf(so, peer, cmd);
+ 			} else if (strncmp(cmd, "hapr ", 5) == 0 ||
+ 			    strncmp(cmd, "hapw ", 5) == 0) {
+ 				ud_cmd_hapreg(so, peer, cmd);

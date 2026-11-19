@@ -476,7 +476,7 @@ def main():
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                                  "thermal", "burn", "haps", "vib", "hapr", "hapw", "spmimap",
                                  "btuart",
-                                 "kill", "fps", "del", "deltree", "ls", "wait"))
+                                 "rf", "kill", "fps", "del", "deltree", "ls", "wait"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -507,6 +507,22 @@ def main():
             print("no answer", file=sys.stderr)
             return 1
         print(answer.decode(errors="replace").strip())
+        return 0
+    if args.command == "rf":
+        # Raw bytes on stdout: a daemon's stderr log is not text the ring can
+        # format, and a short read must not be mistaken for an error line.
+        if not args.args:
+            print("usage: usb-ring.py rf PATH [OFFSET [LEN]]", file=sys.stderr)
+            return 2
+        path = args.args[0]
+        off = args.args[1] if len(args.args) > 1 else "0"
+        length = args.args[2] if len(args.args) > 2 else "1000"
+        answer = simple("rf %s %s %s" % (path, off, length), 5.0)
+        if answer is None:
+            print("no answer", file=sys.stderr)
+            return 1
+        sys.stdout.buffer.write(answer)
+        sys.stdout.buffer.flush()
         return 0
     if args.command == "mem":
         simple("mem")
