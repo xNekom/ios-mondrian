@@ -151,7 +151,8 @@ fi
 # 4. The commands.
 for c in "${CMDS[@]}"; do
 	echo "-- $c"
-	timeout 120 python3 tools/usb-ring.py $c 2>&1 | tail -4
+	# a tree walk can run for minutes; the timeout is a ceiling, not a target
+	timeout 600 python3 tools/usb-ring.py $c 2>&1 | tail -4
 done
 
 echo "== ring: MONDRIAN lines"

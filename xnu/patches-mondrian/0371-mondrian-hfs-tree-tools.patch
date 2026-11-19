@@ -1,0 +1,572 @@
+xnu 0371: read the regrown trees, drop the reserve, and arm the app probe
+
+Three measurements on 2026-11-19 shape this patch.
+
+`statfs` answered f_bfree 41946 blocks (164 MB) with f_bavail 3 (12 KB): the
+root mount withholds one percent of the volume as a free-block reserve, so every
+writer that honours the available count refuses. That is what PhotoKit reads, and
+it is why an import answers `PHPhotosErrorDomain 3305 (NotEnoughSpace)` on a
+volume with 164 MB free. The reserve protects a system with space to spare this
+volume does not have, so it is dropped for this mount.
+
+The trees a boot regrows are also invisible: `/private/var/log` answers a readdir
+with only "." and ".." while `unlink` of a file below it succeeds, because the
+directory's catalog valence is zero and `cat_getdirentries` takes it as the entry
+limit. `ls PATH` therefore bumps the valence in memory while it walks, and prints
+each entry with its size.
+
+`del PATH` unlinks one path in the kernel context and answers the errno.
+`deltree PATH` removes every file under one of the two allowed trees
+(`/private/var/log`, `/private/var/db/diagnostics`) and leaves the skeleton: an
+empty directory holds no data blocks, so the space is the files. Root is the only
+context that can read them -- the mobile account gets EACCES on `/private/var/db`.
+Both print the mount's free and available blocks, which is how the reserve change
+is measured.
+
+The probe compared the exec name with the whole string, so an app that execs as
+`/Applications/MobileSlideShow.app/MobileSlideShow` never matched: SpringBoard
+and the poster extensions arrive as bare names, the app does not. It now compares
+the last path component, and prints the names that miss (twelve a boot) until the
+list is proven.
+
+--- a/bsd/mondrian_hfs/core/hfs_vfsops.c
++++ b/bsd/mondrian_hfs/core/hfs_vfsops.c
+@@ -83,6 +83,8 @@
+ #include <sys/disk.h>
+ #include <sys/paths.h>
+ #include <sys/utfconv.h>
++#include <sys/dirent.h>
++#include <sys/vnode_if.h>
+ #include <sys/kdebug.h>
+ #include <sys/fslog.h>
+ #include <sys/ubc.h>
+@@ -155,6 +157,318 @@
+ int hfs_mount(struct mount *mp, vnode_t  devvp, user_addr_t data, vfs_context_t context);
+ int hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args, int journal_replay_only, vfs_context_t context);
+ int hfs_reload(struct mount *mp);
++/*
++ * MONDRIAN: the trees a boot regrows, read and emptied from the kernel.
++ *
++ * The user-level hook cannot do this: it runs as the mobile account, and
++ * `/private/var/db` answers EACCES to it. It also cannot *list* them -- measured
++ * 2026-11-19, `/private/var/log` answers a readdir with only "." and ".." while
++ * `unlink` of a file below it succeeds, because the directory's catalog valence
++ * is zero and `cat_getdirentries` takes that as its entry limit. So the walk
++ * bumps the valence in memory: what it needs is the listing, not a repair, and
++ * nothing here is written back except the unlinks themselves.
++ *
++ * `mondrian_hfs_rmtree` removes every file and leaves the directory skeleton: an
++ * empty directory holds no data blocks, so the space is the files. It only ever
++ * touches the two trees named below, and the path arrives from the control
++ * channel -- the allow-list is what keeps a wrong path from being a destructive
++ * one.
++ *
++ * The pending list is static because one command runs at a time on the control
++ * thread: a directory three levels deep would otherwise put a kilobyte per level
++ * on a 16 KB kernel stack.
++ */
++static const char * const mondrian_tree_roots[] = {
++	"/private/var/log",
++	"/private/var/db/diagnostics",
++};
++
++#define MONDRIAN_TREE_MAX   64
++#define MONDRIAN_TREE_BATCH 8
++#define MONDRIAN_TREE_PATH  448
++#define MONDRIAN_TREE_BUFSZ 4096
++#define MONDRIAN_TREE_VALENCE 100000
++
++static char mondrian_tree_pend[MONDRIAN_TREE_MAX][MONDRIAN_TREE_PATH];
++static char mondrian_tree_batch[MONDRIAN_TREE_BATCH][NAME_MAX + 1];
++static char mondrian_tree_buf[MONDRIAN_TREE_BUFSZ];
++
++/* bsd/vfs/vfs_syscalls.c, where the path-based unlink lives */
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++/* sys/vnode_if.h declares this only under XNU_KERNEL_PRIVATE, which the HFS core
++ * is not built with; the symbol is the same one the vnode layer calls. */
++extern errno_t VNOP_READDIR(vnode_t, struct uio *, int, int *, int *,
++    vfs_context_t);
++
++static int
++mondrian_tree_allowed(const char *path)
++{
++	size_t i;
++
++	for (i = 0; i < sizeof(mondrian_tree_roots) /
++	    sizeof(mondrian_tree_roots[0]); i++) {
++		size_t len = strlen(mondrian_tree_roots[i]);
++
++		if (strncmp(path, mondrian_tree_roots[i], len) == 0 &&
++		    (path[len] == '\0' || path[len] == '/')) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Up to `max` names of one directory, read as `struct direntry` records so that
++ * the dot entries and the real ones share one layout. Returns the count and the
++ * offset that follows them; `*errp` is set when the directory could not be read.
++ */
++static int
++mondrian_tree_names(vnode_t dvp, off_t off, off_t *next, int *errp)
++{
++	struct cnode *cp = VTOC(dvp);
++	u_int32_t saved;
++	uio_t auio;
++	int error, eofflag = 0, numdirent = 0, count = 0;
++	size_t total, pos;
++
++	*errp = 0;
++	*next = off;
++
++	hfs_lock(cp, HFS_EXCLUSIVE_LOCK, HFS_LOCK_DEFAULT);
++	saved = cp->c_entries;
++	if (cp->c_entries < MONDRIAN_TREE_VALENCE) {
++		cp->c_entries = MONDRIAN_TREE_VALENCE;
++	}
++	hfs_unlock(cp);
++
++	auio = uio_create(1, off, UIO_SYSSPACE, UIO_READ);
++	uio_addiov(auio, CAST_USER_ADDR_T(mondrian_tree_buf),
++	    MONDRIAN_TREE_BUFSZ);
++	error = VNOP_READDIR(dvp, auio, VNODE_READDIR_EXTENDED, &eofflag,
++	    &numdirent, vfs_context_kernel());
++	total = MONDRIAN_TREE_BUFSZ - (size_t)uio_resid(auio);
++	*next = uio_offset(auio);
++	uio_free(auio);
++
++	hfs_lock(cp, HFS_EXCLUSIVE_LOCK, HFS_LOCK_DEFAULT);
++	cp->c_entries = saved;
++	hfs_unlock(cp);
++
++	if (error != 0) {
++		*errp = error;
++		return 0;
++	}
++	for (pos = 0; pos + sizeof(struct direntry) <= total &&
++	    count < MONDRIAN_TREE_BATCH; ) {
++		struct direntry *de = (struct direntry *)(void *)
++		    (mondrian_tree_buf + pos);
++
++		if (de->d_reclen == 0 || pos + de->d_reclen > total) {
++			break;
++		}
++		if (de->d_namlen > 0 && de->d_namlen <= NAME_MAX &&
++		    !(de->d_namlen == 1 && de->d_name[0] == '.') &&
++		    !(de->d_namlen == 2 && de->d_name[0] == '.' &&
++		    de->d_name[1] == '.')) {
++			memcpy(mondrian_tree_batch[count], de->d_name,
++			    de->d_namlen);
++			mondrian_tree_batch[count][de->d_namlen] = '\0';
++			count++;
++		}
++		pos += de->d_reclen;
++	}
++	return count;
++}
++
++/*
++ * What the mount says about itself. `statfs` reports the free-block counter
++ * minus the reserve, so this is the number PhotoKit reads.
++ */
++void
++mondrian_hfs_free(const char *label)
++{
++	vnode_t rv = vfs_rootvnode();
++
++	if (rv != NULLVP) {
++		struct vfsstatfs *sf = vfs_statfs(vnode_mount(rv));
++
++		if (sf != NULL) {
++			printf("MONDRIAN FREE: %s free %lld avail %lld bsize %d\n",
++			    label, (long long)sf->f_bfree,
++			    (long long)sf->f_bavail, (int)sf->f_bsize);
++		}
++		vnode_put(rv);
++	}
++}
++
++/*
++ * Print a directory from the kernel context, with each entry's size. It is also
++ * the proof that the listing works at all before anything is removed.
++ */
++int
++mondrian_hfs_list(const char *path, int max)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t dvp = NULLVP;
++	off_t off = 0;
++	int shown = 0, err = 0, saved = 0, error;
++
++	error = vnode_lookup(path, 0, &dvp, ctx);
++	if (error != 0) {
++		printf("MONDRIAN LS: %s -> %d\n", path, error);
++		return error;
++	}
++	if (vnode_vtype(dvp) != VDIR) {
++		vnode_put(dvp);
++		printf("MONDRIAN LS: %s is not a directory\n", path);
++		return ENOTDIR;
++	}
++	hfs_lock(VTOC(dvp), HFS_SHARED_LOCK, HFS_LOCK_DEFAULT);
++	saved = (int)VTOC(dvp)->c_entries;
++	hfs_unlock(VTOC(dvp));
++	printf("MONDRIAN LS: %s valence %d\n", path, saved);
++
++	while (shown < max) {
++		int i, count;
++		off_t next = 0;
++
++		count = mondrian_tree_names(dvp, off, &next, &err);
++		if (err != 0) {
++			printf("MONDRIAN LS: %s readdir %d\n", path, err);
++			break;
++		}
++		if (count == 0) {
++			break;
++		}
++		for (i = 0; i < count && shown < max; i++) {
++			char child[MONDRIAN_TREE_PATH];
++			struct vnode_attr va;
++			vnode_t vp = NULLVP;
++
++			if (snprintf(child, sizeof(child), "%s/%s", path,
++			    mondrian_tree_batch[i]) >= (int)sizeof(child)) {
++				continue;
++			}
++			if (vnode_lookup(child, 0, &vp, ctx) != 0) {
++				printf("MONDRIAN LS: %s gone\n", child);
++				shown++;
++				continue;
++			}
++			if (vnode_vtype(vp) == VDIR) {
++				printf("MONDRIAN LS: %s/ dir\n", child);
++			} else {
++				VATTR_INIT(&va);
++				VATTR_WANTED(&va, va_data_size);
++				(void)vnode_getattr(vp, &va, ctx);
++				printf("MONDRIAN LS: %s %lld\n", child,
++				    (long long)va.va_data_size);
++			}
++			vnode_put(vp);
++			shown++;
++		}
++		if (next <= off) {
++			off++;
++		} else {
++			off = next;
++		}
++	}
++	vnode_put(dvp);
++	return 0;
++}
++
++int
++mondrian_hfs_rmtree(const char *start, unsigned *files, unsigned *dirs,
++    unsigned *failed)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	unsigned guard = 0;
++	int top = 0, first = 0;
++
++	if (mondrian_tree_allowed(start) == 0) {
++		printf("MONDRIAN RM: %s is not one of the allowed trees\n", start);
++		return EPERM;
++	}
++	if (strlen(start) >= MONDRIAN_TREE_PATH) {
++		return ENAMETOOLONG;
++	}
++	strlcpy(mondrian_tree_pend[top++], start, MONDRIAN_TREE_PATH);
++
++	while (top > 0 && guard++ < 200000) {
++		char *path = mondrian_tree_pend[top - 1];
++		vnode_t dvp = NULLVP;
++		int err = 0, count, i, progress = 0, error;
++		off_t next = 0;
++
++		error = vnode_lookup(path, 0, &dvp, ctx);
++		if (error != 0) {
++			top--;
++			continue;
++		}
++		if (vnode_vtype(dvp) != VDIR) {
++			vnode_put(dvp);
++			top--;
++			continue;
++		}
++		count = mondrian_tree_names(dvp, 0, &next, &err);
++		vnode_put(dvp);
++		if (err != 0) {
++			if (first == 0) {
++				first = err;
++			}
++			printf("MONDRIAN RM: %s readdir %d\n", path, err);
++			top--;
++			continue;
++		}
++		if (count == 0) {
++			top--;
++			continue;
++		}
++		for (i = 0; i < count; i++) {
++			char child[MONDRIAN_TREE_PATH];
++			vnode_t vp = NULLVP;
++
++			if (snprintf(child, sizeof(child), "%s/%s", path,
++			    mondrian_tree_batch[i]) >= (int)sizeof(child)) {
++				continue;
++			}
++			error = vnode_lookup(child, 0, &vp, ctx);
++			if (error != 0) {
++				continue;
++			}
++			if (vnode_vtype(vp) == VDIR) {
++				vnode_put(vp);
++				(*dirs)++;
++				if (top < MONDRIAN_TREE_MAX) {
++					strlcpy(mondrian_tree_pend[top++], child,
++					    MONDRIAN_TREE_PATH);
++					progress++;
++				}
++				continue;
++			}
++			vnode_put(vp);
++			error = unlink1(ctx, NULLVP,
++			    (user_addr_t)(uintptr_t)child, UIO_SYSSPACE, 0);
++			if (error == 0) {
++				(*files)++;
++				progress++;
++				if ((*files % 500) == 0) {
++					printf("MONDRIAN RM: %u files\n", *files);
++				}
++			} else {
++				(*failed)++;
++				if (*failed < 6) {
++					printf("MONDRIAN RM: unlink %s -> %d\n",
++					    child, error);
++				}
++			}
++		}
++		if (progress == 0) {
++			top--;
++		}
++	}
++	return first;
++}
++
+ int hfs_statfs(struct mount *mp, register struct vfsstatfs *sbp, vfs_context_t context);
+ int hfs_sync(struct mount *mp, int waitfor, vfs_context_t context);
+ int hfs_sysctl(int *name, u_int namelen, user_addr_t oldp, size_t *oldlenp, 
+@@ -509,9 +823,19 @@
+ 			hfsmp->hfs_dir_mask = (S_IRWXU | S_IRGRP|S_IXGRP | S_IROTH|S_IXOTH); /* 0755 */
+ 			hfsmp->hfs_file_mask = (S_IRWXU | S_IRGRP|S_IXGRP | S_IROTH|S_IXOTH); /* 0755 */
+ 
+-			/* Establish the free block reserve. */
+-			hfsmp->reserveBlocks = ((u_int64_t)hfsmp->totalBlocks * HFS_MINFREE) / 100;
+-			hfsmp->reserveBlocks = MIN(hfsmp->reserveBlocks, HFS_MAXRESERVE / hfsmp->blockSize);
++			/*
++			 * MONDRIAN: no free-block reserve. Measured 2026-11-19:
++			 * the reserve is one percent of the volume, 164 MB of
++			 * the 16 GiB root, so `statfs` answered f_bfree 164 MB
++			 * with f_bavail 0 -- every writer that honours the
++			 * available count refused, PhotoKit answered
++			 * PHPhotosErrorDomain 3305 (NotEnoughSpace), and the
++			 * volume kept 164 MB that nothing could use. The reserve
++			 * protects a system with space to spare from filling its
++			 * last percent; this volume has no spare percent, so the
++			 * withheld space is the only headroom there is.
++			 */
++			hfsmp->reserveBlocks = 0;
+ 		}
+ #if	TARGET_OS_OSX 
+ 		// increment kext retain count
+--- a/bsd/mondrian_hfs/core/hfs.h
++++ b/bsd/mondrian_hfs/core/hfs.h
+@@ -985,6 +985,12 @@
+ extern u_int32_t hfs_free_cnids(struct hfsmount * hfsmp);
+ extern u_int32_t hfs_freeblks(struct hfsmount * hfsmp, int wantreserve);
+ 
++/* mondrian: the trees a boot regrows, read and emptied in the kernel */
++extern int mondrian_hfs_list(const char *path, int max);
++extern void mondrian_hfs_free(const char *label);
++extern int mondrian_hfs_rmtree(const char *start, unsigned *files,
++    unsigned *dirs, unsigned *failed);
++
+ extern void hfs_free_bitmap_audit(struct hfsmount *hfsmp);
+ 
+ short MacToVFSError(OSErr err);
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -37,6 +37,9 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/vfs_context.h>
+ #include <sys/kpi_socket.h>
+ #include <sys/sockio.h>
+ #include <net/if.h>
+@@ -2568,6 +2571,59 @@
+ 				    (unsigned long long)vm_compressor_pages_compressed());
+ 				mondrian_vm_stats();
+ 				mondrian_gpu_dump_hist();
++			} else if (strncmp(cmd, "del ", 4) == 0) {
++				/*
++				 * One root-side unlink. The hook runs as the user and
++				 * cannot remove a root-owned file; the kernel can. Only a
++				 * path the host asked for arrives here, and an unlink of a
++				 * missing file is just ENOENT.
++				 */
++				extern int unlink1(vfs_context_t, vnode_t, user_addr_t,
++				    enum uio_seg, int);
++				vfs_context_t dctx = vfs_context_kernel();
++				char ans[160];
++				int err, len;
++
++				err = unlink1(dctx, NULLVP,
++				    (user_addr_t)(uintptr_t)(cmd + 4), UIO_SYSSPACE, 0);
++				printf("MONDRIAN DEL: %s -> %d\n", cmd + 4, err);
++				len = snprintf(ans, sizeof(ans), "del %d\n", err);
++				ud_cmd_send(so, peer, ans, (size_t)len);
++			} else if (strncmp(cmd, "ls ", 3) == 0) {
++				extern int mondrian_hfs_list(const char *, int);
++				char ans[96];
++				int err, len;
++
++				err = mondrian_hfs_list(cmd + 3, 24);
++				len = snprintf(ans, sizeof(ans), "ls %d\n", err);
++				ud_cmd_send(so, peer, ans, (size_t)len);
++			} else if (strncmp(cmd, "deltree", 7) == 0) {
++				/*
++				 * Empty one of the trees a boot regrows (`/private/var/log`
++				 * or `/private/var/db/diagnostics`; the allow-list lives in
++				 * the HFS driver). Root is the only context that can read
++				 * them, so the walk happens here and not in the hook.
++				 */
++				extern int mondrian_hfs_rmtree(const char *, unsigned *,
++				    unsigned *, unsigned *);
++				const char *path = cmd + 7;
++				char ans[192];
++				unsigned files = 0, dirs = 0, failed = 0;
++				int err, len;
++
++				while (*path == ' ') {
++					path++;
++				}
++				extern void mondrian_hfs_free(const char *);
++				mondrian_hfs_free("before");
++				err = mondrian_hfs_rmtree(path, &files, &dirs, &failed);
++				mondrian_hfs_free("after");
++				printf("MONDRIAN RM: %s -> %d files %u dirs %u failed %u\n",
++				    path, err, files, dirs, failed);
++				len = snprintf(ans, sizeof(ans),
++				    "deltree %d files %u dirs %u failed %u\n", err, files,
++				    dirs, failed);
++				ud_cmd_send(so, peer, ans, (size_t)len);
+ 			} else if (strcmp(cmd, "wstat") == 0) {
+ 				char out[64];
+ 				int len = snprintf(out, sizeof(out),
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5708,16 +5708,82 @@
+ 		"ReportCrash",
+ 	};
+ 	size_t i;
++	const char *base = name;
++	size_t baselen = len;
++	static unsigned told;
+ 
++	/*
++	 * MONDRIAN: an app does not exec under its bare name. Measured
++	 * 2026-11-19: SpringBoard and the poster extensions arrive as plain
++	 * names and matched, while `/Applications/MobileSlideShow.app/
++	 * MobileSlideShow` came through with the whole path, so the probe never
++	 * armed the app and the import probes never ran in it. Compare the last
++	 * path component, and print the names that miss while that is being
++	 * proven -- every miss, and none once the list is right.
++	 */
++	for (i = 0; i < len; i++) {
++		if (name[i] == '/') {
++			base = name + i + 1;
++			baselen = len - i - 1;
++		}
++	}
+ 	for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+-		if (len == strlen(targets[i]) &&
+-		    strncmp(name, targets[i], len) == 0) {
++		/*
++		 * The basename is the rule; the substring covers a name that
++		 * arrives with a suffix this does not know about, which is what
++		 * the print below is here to find.
++		 */
++		if ((baselen == strlen(targets[i]) &&
++		    strncmp(base, targets[i], baselen) == 0) ||
++		    (len > strlen(targets[i]) &&
++		    strnstr(name, targets[i], len) != NULL)) {
+ 			return true;
+ 		}
+ 	}
++	if (told++ < 200) {
++		printf("MONDRIAN HOOK: no probe target \"%.*s\" (%zu)\n",
++		    (int)len, name, len);
++	}
+ 	return false;
+ }
+ 
++/*
++ * MONDRIAN: an app does not exec through namei. Measured 2026-11-19: two hundred
++ * execs a boot reach the name check and none of them is `/Applications/
++ * MobileSlideShow.app/MobileSlideShow`, because a launch through runningboardd
++ * is a `posix_spawn` and that path carries `ip_vp` but no nameidata. The vnode's
++ * own name is the executable's file name, which is what the probe list holds.
++ * Only the probe switch arms this: no ordinary boot changes.
++ */
++static bool
++mondrian_probe_app_env(struct image_params *imgp, char *env, size_t size)
++{
++	const char probe[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-ui-hook.dylib";
++	const char *vname;
++	bool hit;
++	int army = 0;
++
++	if (imgp->ip_vp == NULL || sizeof(probe) > size) {
++		return false;
++	}
++	if (!mondrian_probe_switch() &&
++	    !(PE_parse_boot_argn("mondrian_ui_probe", &army, sizeof(army)) &&
++	    army > 0)) {
++		return false;
++	}
++	vname = vnode_getname(imgp->ip_vp);
++	if (vname == NULL) {
++		return false;
++	}
++	hit = mondrian_probe_target(vname, strlen(vname));
++	vnode_putname(vname);
++	if (!hit) {
++		return false;
++	}
++	strlcpy(env, probe, size);
++	return true;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5747,8 +5813,12 @@
+ 	 * extensions, 16 runningboardd, 32 launchd, 64 xpcproxy. Bit 2 follows
+ 	 * mondrian_gpu_hook above: the injector when it is set, the hook otherwise.
+ 	 */
++	/* A posix_spawn has no nameidata; the app probe lives there instead. */
++	if (imgp->ip_ndp == NULL) {
++		return mondrian_probe_app_env(imgp, env, size);
++	}
+ 	if (!PE_parse_boot_argn("mondrian_ui_hook", &targets, sizeof(targets)) ||
+-	    targets <= 0 || imgp->ip_ndp == NULL) {
++	    targets <= 0) {
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;

@@ -455,7 +455,7 @@ def main():
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                                  "thermal", "burn", "haps", "vib", "hapr", "hapw", "spmimap",
                                  "btuart",
-                                 "kill", "fps"))
+                                 "kill", "fps", "del", "deltree", "ls", "wait"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -518,6 +518,13 @@ def main():
                         "rtc", "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                         "thermal", "burn", "haps", "vib", "hapr", "hapw",
                         "spmimap", "kill", "btuart"):
+        answer = simple(" ".join([args.command] + list(args.args)))
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+        return 0
+    if args.command == "wait":
+        time.sleep(float(args.args[0]) if args.args else 1.0)
+        return 0
+    if args.command in ("del", "deltree", "ls"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
