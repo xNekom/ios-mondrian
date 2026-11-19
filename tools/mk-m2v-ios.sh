@@ -130,5 +130,11 @@ clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -fobjc-arc \
 	-Wl,-platform_version,ios,16.0,16.0 \
 	--ld-path=$(command -v ld64.lld-21 || echo /usr/lib/llvm-18/bin/ld64.lld)
 
+echo "== kill_proc"
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 \
+	-o out/kill_proc "$root/tools/gpu/kill_proc.c" \
+	-Wl,-platform_version,ios,16.0,16.0 \
+	--ld-path=$(command -v ld64.lld-21 || echo /usr/lib/llvm-18/bin/ld64.lld)
+
 echo "mk-m2v-ios.sh: $B/out:"
 ls -l out

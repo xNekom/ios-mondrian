@@ -12,7 +12,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -23,11 +25,35 @@ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t regi
 
 static pthread_once_t mondrian_metal_once = PTHREAD_ONCE_INIT;
 static id mondrian_metal_device;
+static int mondrian_metal_console = -1;
+
+/* stderr in a WebKit process goes nowhere: the ring is /dev/console. */
+static void
+mondrian_metal_say(const char *format, ...)
+{
+	char line[512];
+	va_list args;
+	int n;
+
+	va_start(args, format);
+	n = vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	if (n <= 0) {
+		return;
+	}
+	if (mondrian_metal_console < 0) {
+		mondrian_metal_console = open("/dev/console", O_WRONLY);
+	}
+	if (mondrian_metal_console >= 0) {
+		(void)write(mondrian_metal_console, line, (size_t)n);
+	}
+	(void)write(STDERR_FILENO, line, (size_t)n);
+}
 
 static void
 mondrian_metal_missing(const char *class, const char *selector)
 {
-	fprintf(stderr, "mondrian-metal: missing -[%s %s]\n", class, selector);
+	mondrian_metal_say("mondrian-metal: missing -[%s %s]\n", class, selector);
 }
 
 static void
@@ -35,10 +61,10 @@ mondrian_metal_make(void)
 {
 	mondrian_metal_device = native_bridge_metal_open(TURNIP, CACHE, 0, mondrian_metal_missing);
 	if (mondrian_metal_device != nil) {
-		fprintf(stderr, "mondrian-metal: device \"%s\" for %s\n",
+		mondrian_metal_say("mondrian-metal: device \"%s\" for %s\n",
 		    [[mondrian_metal_device name] UTF8String], getprogname());
 	} else {
-		fprintf(stderr, "mondrian-metal: no device for %s\n", getprogname());
+		mondrian_metal_say("mondrian-metal: no device for %s\n", getprogname());
 	}
 }
 
