@@ -48,7 +48,7 @@ needs, and where the numbers come from. The boot history and the traps are in
 `0085` (the framebuffer presentation driver) is in this series. `MondrianFramebuffer`
 presents userland IOSurface swaps and kicks the command-mode interface, so the
 lock screen and the home screen render on-device. UI probe `0106` injects a
-diagnostic dylib into the UI daemons selected by `mondrian_ui_hook` (`0112`);
+diagnostic dylib into the processes selected by `mondrian_ui_hook` (`0112`; bit 8/0x100 is MobileSlideShow, `0378`);
 dyld needs the `AMFI` answer to `__mac_syscall` 0x5a (`0108`) or drops `DYLD_INSERT_LIBRARIES`. **A stale copy in
 `/private/var/vm` is what kept the glass black; check which copy the ring says a
 process loaded (`docs/MONDIAN_GPU.md`).** Build with the script named there.
@@ -259,11 +259,11 @@ Safari start page), so LaunchServices, the icon model and the compositor are
 whole. Measured 2026-11-19 on the restored volume: Photos completes its first-run
 flow, its import answers **`shared success 1`**, the Library draws the tile and
 the viewer opens on it with the picture in colour; the next boot reports
-`library has 1`. The layer holds the picture's four coloured quadrants and
-CoreGraphics fills an IOSurface in the app, while the render server receives the
-image with zero data (`CA::Render::Image::retain_iosurface` creates a surface,
-`copy_cgimage` only wraps the data pointer), so the hook hands pictures to the
-layer as filled IOSurfaces; that transfer is the open cause. `assetsd` now reads its
+`library has 1`. A default boot (mask bit 0x100, no probe file) draws both: the app
+needs `enableMultiLibraryMode` to open its Syndication library, and the hook's
+CGImage-to-surface bridge puts the picture on the layer. The render server still
+receives the image with zero data (`retain_iosurface` creates a surface,
+`copy_cgimage` only wraps the pointer); that transfer is the open cause. `assetsd` now reads its
 entitlements (`csops` 5643 bytes, TCC preflight 1) but still aborts in an
 uncaught C++ exception, with or without the hook; `PhotosFileProvider` dies in
 PlugInKit's container

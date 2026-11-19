@@ -635,14 +635,15 @@ boot each, so the three columns differ only in what changed:
   the Photos icon above it is `201,420` and the dock row sits at `y 2990`
   (`420`, `720`, `1020` for Phone, Safari, Messages). One gesture at a time --
   the gadget's command thread is busy until the swipe finishes.
-- **Photos runs once the hook is inside the app.** Measured 2026-11-18: the app
-  execs and aborts `sig 6` at the same pc, lr and backtrace on every launch
-  until `MobileSlideShow` is both injected (`xnu 0368`) and inside the hook's
-  probe gate, and then it draws the What's New screen, then its own `Library`
-  tab with `No Photos or Videos` and the four tabs, and stays alive. The abort
-  was not an Objective-C exception -- the throw hook was armed and stayed
-  silent -- and the call it dies in is `TCCAccessRequest`, whose denial aborts a
-  client that has no usage description. assetsd's
+- **Photos runs on a default boot.** Measured 2026-11-19: the app calls
+  `+[PHPhotoLibrary enableMultiLibraryMode]` at launch and then opens
+  `file:///var/mobile/Library/Photos/Libraries/Syndication.photoslibrary/`.
+  Keeping the flip off -- what the hook did on 2026-11-18 -- makes that open
+  throw `Requesting different library while in single library mode` and the app
+  dies `sig 6` before its first frame; allowing it reaches the Library and the
+  viewer. Before the TCC stand-in, the same launch died one layer earlier in
+  `TCCAccessRequest`. The app now carries the hook through the kernel mask's
+  Photos bit (0x100), not through a file in `/private/var/vm`. assetsd's
   `assetsd requires TCCPhotosService access` is the same denial one layer in,
   through `-[PLPrivacy photosAccessAllowedWithScope:]`, which the hook answers
   now that the app and the daemons both carry it.
@@ -733,22 +734,21 @@ boot each, so the three columns differ only in what changed:
   runs both ways -- deleting the 348 KB `mondrian-gl.dylib` afterwards returned
   **no** blocks because the bitmap already called them free while the file still
   held them -- so the allocation side is the next audit, not a settled story.
-- **Photos has no library: TCC, then the library mode, then the volume.** Measured
-  2026-11-18 with the app open and drawing its Library tab, in the order the
-  chain was peeled: `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]`
-  answers nil while `isSystemLibraryURLDefined` answers 1;
-  `+[PHPhotoLibrary authorizationStatus]` answers 2 (denied);
-  `-[PLPrivacy _authStatusForScope:]` answers 0 (the raw TCC status, allowed) and
-  answering 3 moves a change request from `PHPhotosErrorDomain 3310
-  (AccessRestricted)` to the next layer; the app itself calls
-  `+[PHPhotoLibrary enableMultiLibraryMode]` within eight seconds of loading
-  (`isMultiLibraryModeEnabled` is 0 at load and the shared library then throws
-  `Calling single library mode API while in multi library mode`), and with that
-  switch kept from flipping the shared library accepts a change and answers
-  `PHPhotosErrorDomain 3305 (NotEnoughSpace)`. That answer is about space and
-  nothing else: `0370` puts the bitmap within 32 MB of the counter, `0371` stops
-  the mount withholding 164 MB as `f_bavail` 0, and `0372` stops the free path
-  leaking what it deletes.
+- **Photos needs multi-library mode, then the volume.** Measured 2026-11-19:
+  `+[PLPhotoLibraryPathManager systemLibraryURLIfResolvable]` answers nil while
+  `isSystemLibraryURLDefined` answers 1; `+[PHPhotoLibrary authorizationStatus]`
+  answers 2 (denied), and `-[PLPrivacy _authStatusForScope:]` answers 0 (the raw
+  TCC status, allowed). The app calls `+[PHPhotoLibrary enableMultiLibraryMode]`
+  within eight seconds of loading and then opens its Syndication library. The
+  hook used to keep that switch from flipping, which turned the open into
+  `Requesting different library while in single library mode` and killed the
+  app; with the flip allowed the app draws its Library. The
+  `Calling single library mode API while in multi library mode` death that the
+  old block was avoiding belongs to the import probe's `performChanges`, not to
+  the app: removing `mondrian-import` removes it. The volume side is unchanged:
+  a change answers `PHPhotosErrorDomain 3305 (NotEnoughSpace)` until `0370` puts
+  the bitmap within 32 MB of the counter, `0371` stops the mount withholding
+  164 MB as `f_bavail` 0, and `0372` stops the free path leaking what it deletes.
 - **The import works, the asset persists, and the picture draws through a client
   surface.** Measured 2026-11-19 on the restored volume: `library has 0`,
   `staged 1 at /var/tmp/mondrian-photo.png`, `free 2078 MB of 16384 MB`,
@@ -781,10 +781,16 @@ boot each, so the three columns differ only in what changed:
   IOSurfaceAccelerator` message belongs to `CA::HDRProcessorInternal`
   (`+0x1e1c68/+0x1e3d7c`), off this path. The tile and the viewer draw the four
   quadrants when the layer's contents is that filled IOSurface instead of a
-  CGImage, which is what `tools/mondrian-ui-hook.m` does by default for CGImages
-  of 300 x 200 and up whose width is a multiple of four;
+  CGImage, which is what `tools/mondrian-ui-hook.m` does for CGImages of
+  300 x 200 and up whose width is a multiple of four;
   `/private/var/vm/mondrian-layercsurf-off` keeps the CGImage path for an A/B.
-  The open cause is the app-to-server image data, not the surface.
+  The bridge is installed on every launch of the app, not behind
+  `mondrian-import`: with that file absent the tile went black, so the working
+  state depended on a seed. `0378` gives the app the hook through the kernel
+  mask's Photos bit (0x100, `mondrian_ui_hook=262`), and on that default boot --
+  `mondrian-probe` and `mondrian-import` both absent -- the Library tile and the
+  viewer draw the four quadrants. The open cause is the app-to-server image
+  data, not the surface.
   A `deltree` of the trees a boot regrows frees nothing on this image: their
   catalog valence is 4, 9 and 10 and the plain readdir returns only the two dots,
   so the entries the valence counts are not in the catalog at all. Probes:
@@ -824,7 +830,12 @@ boot each, so the three columns differ only in what changed:
   loses its `built` stamp, which is how it was noticed. `wfile` plus a SpringBoard
   restart is the cheap loop for iterating; a kernel build is what makes a change
   survive a reboot. Anything read after a reboot without that build is describing
-  the old hook.
+  the old hook. The rebuild itself can fail without failing the kernel build:
+  measured 2026-11-19, the kernel's cross environment left `objc/objc.h`
+  unfound, the warning was one line among the build's output, and the kernel
+  embedded a hook whose `built` stamp was 90 minutes older than the source.
+  `tools/wsl/build-kernel.sh` now runs the hook build under `env -i`, and the
+  tag's `built` time is the first thing to compare with the source's.
   Restarting SpringBoard is not free either: measured 2026-11-18, a
   `kill <SpringBoard pid>` was followed by `KABORT esr 0x96000047 far
   0xfffffe3c7c480000 pc 0xfffffe007c2dfc98 lr 0xfffffe0007584a68` on the console
