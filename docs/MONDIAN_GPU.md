@@ -1823,12 +1823,17 @@ for a device.
 
 Measured the same day, the surfaces say where the page stops: the GPU process
 creates its `w30r` surface and locks it, **the WebContent process creates none at
-all**, and its processes leave with `status 0x9` (SIGKILL) after being started
-again and again (`exec com.apple.WebKit.WebContent` four times in one boot,
-`exit ... status 0x9` twice). Safari's own UI surfaces do draw, and
-`backboardd`'s GL renderer keeps presenting frames, so the compositor is fine:
-there is no page content to composite. The next question is why WebContent is
-killed, not how the page is painted.
+all**, and the GPU process's surface still reads zero after `unlock`. Safari's
+own UI surfaces do draw and `backboardd`'s GL renderer keeps presenting frames,
+so the compositor is healthy and the page surface is simply never painted.
+
+The `status 0x9` exits around WebContent are **not** a killer: that batch
+(`MobileSafari`, the poster extensions, `extensionkitserv`, `WebKit`) is the
+`respring` the tests were doing, which SIGKILLs everything SpringBoard owns.
+Restart Safari without `respring` and WebContent starts and stays up. On iOS 16
+the page surface belongs to the GPU process, so "WebContent creates no surface"
+is expected; what is unexplained is that the GPU process locks its surface,
+paints nothing into it, and never asks Metal for a device.
 
 
 ### A warm reboot can leave the boot core unstarted
