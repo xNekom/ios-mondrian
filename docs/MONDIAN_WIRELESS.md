@@ -698,10 +698,16 @@ the first keychain call.
 
 That next failure is still the keychain: `failed to update keychain data ...
 result -25300` (item not found, expected) is followed by `Failed to add
-attributes ... result -25291` (`errSecNotAvailable`). The database is not the
-problem - `/private/var/Keychains/keychain-2.db` is a valid SQLite file of more
-than 400 KB - and `securityd` has been up since boot; deleting the database and
-booting rebuilds it and changes nothing.
+attributes ... result -25291` (`errSecNotAvailable`). Measured 2026-11-20, the
+database is the difference. With a `keychain-2.db` left from an earlier boot
+the daemon reached its HCI setup; after that file was deleted - it was a valid
+SQLite file - `securityd` never creates a new one. After a full boot none of
+`keychain-2.db`, `-wal`, `-shm` or `keychain-2-debug.db` exists, while
+`/private/var/Keychains` is writable (`wfile` of a probe file succeeds), and
+`bluetoothd` dies seven times with `-25291` and `_exit(1)`. So the database is
+created only when `securityd` decides the keychain is available, and nothing on
+this port tells it: `0392` stores the notification port and never posts a lock
+state, so the first `SecItemAdd` opens nothing and reports unavailable.
 
 The selector answers were the problem. `kAKSWrapKey` takes two scalars - the bag
 and the **protection class** - and returns one: the class the item must be stored
@@ -718,12 +724,12 @@ notification port, `GetBagUUID`, `GetConfiguration` and `Generation`. `0392`
 mirrors it. The keychain's class keys are therefore not a reason to build a real
 keybag: a reversible wrap is enough, which is what that reference says it uses.
 
-With `0392` and a database rebuilt by it, the daemon stops dying: measured
-2026-11-20, one `exec bluetoothd` and **no exit** for the whole boot, the
-keychain database back with a `-wal`, and `kAKSUnwrapKey` answering `0x0` where
-the old-format blobs had answered `kIOReturnBadArgument`. The database has to be
-deleted once after the format changes - unwrap rejects a blob with the old mark,
-and that reads exactly like a keychain failure.
+With `0392` and the database that boot already had, the daemon stopped dying:
+measured 2026-11-20, one `exec bluetoothd` and **no exit** for the whole boot,
+`kAKSUnwrapKey` answering `0x0` where the old-format blobs had answered
+`kIOReturnBadArgument`. Deleting that database to clear the old format does not
+rebuild it (above), so the boot after the delete dies again: the wrap is no
+longer what blocks the daemon.
 
 What is left on this front is the transport: the daemon now reaches its HCI
 configuration and the port node is opened by hand between boots, but nothing in
