@@ -167,6 +167,53 @@ bt_backtrace(const char *why)
 	}
 }
 
+static void
+bt_std_string(const char *what, uintptr_t value)
+{
+	char buf[257];
+	char *data = (char *)value;
+	unsigned char flag = 0;
+	vm_size_t got = 0;
+	size_t i;
+
+	if (value < 0x1000) {
+		return;
+	}
+	/*
+	 * libc++ keeps short strings inline and the long ones behind a pointer;
+	 * bit 7 of the byte at +0x17 says which. The restart helper takes its
+	 * context as a std::string, so this is where the text lives.
+	 */
+	if (vm_read_overwrite(mach_task_self(), (vm_address_t)(value + 0x17), 1,
+	    (vm_address_t)(uintptr_t)&flag, &got) != KERN_SUCCESS) {
+		return;
+	}
+	if (flag & 0x80) {
+		uintptr_t p = 0;
+
+		if (vm_read_overwrite(mach_task_self(), (vm_address_t)value,
+		    sizeof(p), (vm_address_t)(uintptr_t)&p, &got) != KERN_SUCCESS ||
+		    p < 0x1000) {
+			return;
+		}
+		data = (char *)p;
+	}
+	if (vm_read_overwrite(mach_task_self(), (vm_address_t)data,
+	    sizeof(buf) - 1, (vm_address_t)(uintptr_t)buf, &got) != KERN_SUCCESS) {
+		return;
+	}
+	buf[sizeof(buf) - 1] = 0;
+	for (i = 0; i < sizeof(buf) - 1; i++) {
+		if ((unsigned char)buf[i] < 0x20 || (unsigned char)buf[i] > 0x7e) {
+			buf[i] = 0;
+			break;
+		}
+	}
+	if (buf[0] != 0) {
+		bt_log("  %s as std::string: \"%s\"\n", what, buf);
+	}
+}
+
 static void bt_backtrace(const char *why);
 
 /* Global on purpose: the trampoline below is assembler, and a static symbol
@@ -180,6 +227,7 @@ bt_report_exit(int status, uintptr_t r19, uintptr_t r20)
 	bt_log("_exit(%d) x19=0x%lx x20=0x%lx\n", status,
 	    (unsigned long)r19, (unsigned long)r20);
 	bt_string("x19", r19);
+	bt_std_string("x19", r19);
 	bt_string("x20", r20);
 	bt_backtrace("exit");
 }
