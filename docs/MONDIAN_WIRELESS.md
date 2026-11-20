@@ -681,6 +681,24 @@ identity root, and it treats that as fatal. The keychain itself is half there -
 boot), which is the secure store this needs. Bluetooth is behind a working
 keystore, not behind the UART.
 
+That selector is `kAKSWrapKey`: the class keys the keychain keeps are wrapped
+with the device key, which on hardware lives in the SEP. `0391` answers it, and
+`kAKSUnwrapKey` with it, from the kernel's own store (the blob is eight bytes
+longer than the key, the shape AES key wrap has). Measured on the boot after:
+both selectors answer `0x0`, `securityd` keeps the keychain and calls nothing
+else on that path, and `bluetoothd` runs to its next failure instead of dying at
+the first keychain call.
+
+That next failure is still the keychain: `failed to update keychain data ...
+result -25300` (item not found, expected) is followed by `Failed to add
+attributes ... result -25291` (`errSecNotAvailable`). The database is not the
+problem - `/private/var/Keychains/keychain-2.db` is a valid SQLite file of more
+than 400 KB - and `securityd` has been up since boot, so the add fails where the
+class key is applied. The likely cause is that the database was created while
+selector 10 still answered unsupported, so its class keys were written under a
+wrap that never existed; deleting it lets `securityd` build one against the
+working wrap.
+
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
 `com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
