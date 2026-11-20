@@ -108,10 +108,32 @@ port has already paid for once.
 | `cotunjr/hakios-xnu-kernel`, branch `mayfly-port`, `xnu/files/bsd/kern/kern_minimac.c` | `minisandbox_container_path()`: request 4 is answered by scanning `CFFIXED_USER_HOME=` in the strings exec left on the target's stack. It names our exact symptom (`plugin has invalid sandbox or container`, the `?` the caller starts the buffer with) for the same SoC family (SM8475). | imported as `0354` |
 | same file, `miniamfi_policy_syscall()` | `__mac_syscall` `0x5a` (dyld policy) returns `0xff`, `0x60` (boot-arg state) returns `0x86`; `0x60` is what stops ExtensionKit waiting for a signature check this kernel cannot do, which otherwise hides every extension point. | already `0108` |
 | same file, `minisandbox_priv_grant()` | Grants a privilege when the binary carries the entitlement paired with it (40 pairs). | `0050` grants them all instead, so nothing is missing |
-| `Emilelu/UniXNU-mondrian` | Device support for the same phone (`mondrian`, SM8475) in the UniXNU tree. | not read yet |
+| `Emilelu/UniXNU-mondrian` | Device support for the same phone (`mondrian`, SM8475) in the UniXNU tree. | read 2026-11-20; see the notes below |
 | `UniXNU/UniXNU` | Bootstrap capacity (`0001`) and the UFS LU wake. | `0001` |
 | Bergamota / Chlorophyll / HackiOS, `oosexgang/hakios-xnu-kernel` | CPU fallback, persona hook `0106`, `eagl.c`, one revision ahead. | `0106` |
 | `palazik/ios-dodge`, `MakrSas/ios-topaz`, `Log1nYT/ios-sweet` | TLB flush, timer quiesce, `cpus=1`, DWC3 clocks. | in the series |
+
+The mondrian port is the closest sibling and is ahead on some subsystems. Read
+it for these facts, not for its code:
+
+- `docs/engineering/BOOT-ARGS.md`: the same 607-byte budget, `platform-sleep=1`
+  and `k60_slp` for the sleep path, `p120`/`vsync=120` for the panel timing, and
+  the warning that `k60_backlight_control=1` crashed backboardd before the first
+  frame.
+- `pong_surface_pitch`: it reports `alignUp(width*bpe, 64)` instead of the
+  client's `IOSurfaceBytesPerRow`; the 5888-vs-5760 mismatch made its scanout
+  blit a 46 ms linear-texture copy instead of a 1.9 ms blit. Check what this
+  port reports before blaming `MondrianFramebuffer`.
+- `docs/engineering/GPU-IOSURFACE-ROOT-CAUSE.md`: a Metal plugin deployed to
+  `/private/var/ngpu/addons` while the injector read `/private/var/pong` never
+  loaded, so every Metal path returned nil. Prove the dylib is in the target
+  process before treating an IOSurface failure as a kernel bug.
+- `docs/engineering/BATTERY-INTEGRATION.md` and `PITFALLS.md`: the PMIC-GLINK
+  battery is blocked behind an authenticated PAS1 lease (the coulomb counter is
+  not a missing table); the pitfalls worth reading first are `P-117` (an init
+  whose `__TEXT` exceeds one 16 KiB page), `P-118` (missing `debug=0x140` /
+  `applog=1` leaves a zero-byte log), `P-129` (never infer a protocol from a
+  driver name) and `★34` (a sibling's record beats a generic official driver).
 
 `raw.githubusercontent.com` rate-limits (429); `cdn.jsdelivr.net/gh/<owner>/
 <repo>@<branch>/<path>` serves the same file when it does.
