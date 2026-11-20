@@ -7,12 +7,11 @@
  * the ring. So the shim claims descriptors 1 and 2 for the first file it can
  * open, and hands the daemon the transport it needs.
  *
- * Its failure report is unreadable (an os_log message built at runtime), so
- * the account comes from the registers it leaves behind: the restart helper
- * keeps the reason in x19 and the context string in x20 across its own call
- * to the logger, and the trampoline below reads both at `_exit`. Each is also
- * read back as a string through mach_vm_read_overwrite, which answers an
- * error instead of faulting on a bad address.
+ * Its failure reports leave through os_log, with formats that are messages in
+ * their own right, so the `_os_log_*_impl` interposers write the ones that
+ * mention Bluetooth, transport, HCI or an error to the same file. The `_exit`
+ * interposer adds the status, the caller's x19/x20 and a resolved backtrace;
+ * those are what named the call in `main` that gives up.
  *
  * The job runs as `mobile`, not root, so a sandboxed daemon is denied most
  * paths: /private/var/tmp answered ENOENT to `rf` after a boot whose shim
@@ -25,6 +24,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <mach/mach.h>
+#include <os/log.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -63,6 +63,60 @@ bt_log(const char *fmt, ...)
 	va_end(ap);
 	write(STDERR_FILENO, line, strlen(line));
 }
+
+static const char *const interesting[] = {
+	"Bluetooth", "bluetooth", "transport", "Transport", "HCI", "restart",
+	"Switch", "switch", "failed", "Failed", "error", "Error",
+};
+
+static int
+wanted(const char *format)
+{
+	size_t i;
+
+	if (format == NULL) {
+		return 0;
+	}
+	for (i = 0; i < sizeof(interesting) / sizeof(interesting[0]); i++) {
+		if (strstr(format, interesting[i]) != NULL) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+log_format(const char *kind, const char *format, const uint8_t *buf,
+    unsigned size)
+{
+	char hex[3 * 25];
+	unsigned i;
+	size_t n = 0;
+
+	if (!wanted(format)) {
+		return;
+	}
+	for (i = 0; i < size && i < 24; i++) {
+		n += (size_t)snprintf(hex + n, sizeof(hex) - n, "%02x",
+		    buf != NULL ? buf[i] : 0);
+	}
+	hex[n] = 0;
+	bt_log("oslog.%s %s | args %s\n", kind, format, hex);
+}
+
+#define INTERPOSE_LOG(fn, kind)						\
+	static void							\
+	my_##fn(void *dso, os_log_t log, os_log_type_t type,		\
+	    const char *format, uint8_t *buf, unsigned size)		\
+	{								\
+		(void)dso; (void)log; (void)type;			\
+		log_format(kind, format, buf, size);			\
+	}
+
+INTERPOSE_LOG(os_log_impl, "default")
+INTERPOSE_LOG(os_log_error_impl, "error")
+INTERPOSE_LOG(os_log_fault_impl, "fault")
+INTERPOSE_LOG(os_log_debug_impl, "debug")
 
 static void
 bt_string(const char *what, uintptr_t value)
@@ -158,6 +212,10 @@ static const struct {
 	const void *replacee;
 } interposers[] __attribute__((used, section("__DATA,__interpose"))) = {
 	{ (const void *)mondrian_bt_exit, (const void *)_exit },
+	{ (const void *)my_os_log_impl, (const void *)_os_log_impl },
+	{ (const void *)my_os_log_error_impl, (const void *)_os_log_error_impl },
+	{ (const void *)my_os_log_fault_impl, (const void *)_os_log_fault_impl },
+	{ (const void *)my_os_log_debug_impl, (const void *)_os_log_debug_impl },
 };
 
 __attribute__((constructor))
