@@ -7,15 +7,16 @@
  * the ring. So the shim claims descriptors 1 and 2 for the first file it can
  * open, and hands the daemon the transport it needs.
  *
+ * Its failure report is unreadable (an os_log message built at runtime), so
+ * the account comes from the registers it leaves behind: the restart helper
+ * keeps the reason in x19 and the context string in x20 across its own call
+ * to the logger, and the trampoline below reads both at `_exit`. Each is also
+ * read back as a string through mach_vm_read_overwrite, which answers an
+ * error instead of faulting on a bad address.
+ *
  * The job runs as `mobile`, not root, so a sandboxed daemon is denied most
  * paths: /private/var/tmp answered ENOENT to `rf` after a boot whose shim
- * could not open it. The candidate list starts in mobile's own Library, which
- * is where the preferences it already reads live.
- *
- * The daemon leaves through `_exit`, which runs no atexit handler, so the
- * interposer below logs the status and the call addresses. They are printed as
- * offsets from the main image, which is what the disassembly of
- * /usr/sbin/bluetoothd uses.
+ * could not open it. The candidate list starts in mobile's own Library.
  *
  * The transport is set here rather than on the kernel's command line so that
  * changing it costs a `wfile` and a boot, not a kernel build.
@@ -23,7 +24,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
-#include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -63,27 +64,93 @@ bt_log(const char *fmt, ...)
 	write(STDERR_FILENO, line, strlen(line));
 }
 
-/*
- * The daemon's own failure path ends in `_exit`, so this is the only place
- * that can report where it gave up.
- */
-__attribute__((noreturn))
 static void
-mondrian_bt_exit(int status)
+bt_string(const char *what, uintptr_t value)
 {
-	void *frames[24];
+	char buf[129];
+	vm_size_t got = 0;
+	kern_return_t kr;
+	size_t i;
+
+	memset(buf, 0, sizeof(buf));
+	kr = vm_read_overwrite(mach_task_self(), (vm_address_t)value,
+	    sizeof(buf) - 1, (vm_address_t)(uintptr_t)buf, &got);
+	if (kr != KERN_SUCCESS) {
+		return;
+	}
+	for (i = 0; i < sizeof(buf) - 1; i++) {
+		if (buf[i] < 0x20 || buf[i] > 0x7e) {
+			buf[i] = 0;
+			break;
+		}
+	}
+	if (buf[0] != 0) {
+		bt_log("  %s as text: \"%s\"\n", what, buf);
+	}
+}
+
+static void
+bt_backtrace(const char *why)
+{
+	void *frames[20];
 	int n;
 	int i;
-	uintptr_t base = (uintptr_t)_dyld_get_image_header(0);
 
-	bt_log("_exit(%d)\n", status);
+	bt_log("%s from %p\n", why, __builtin_return_address(0));
 	n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
 	for (i = 0; i < n; i++) {
-		bt_log("  frame %d 0x%lx\n", i,
-		    (unsigned long)((uintptr_t)frames[i] - base));
+		Dl_info info;
+
+		if (dladdr(frames[i], &info) == 0 || info.dli_fname == NULL) {
+			bt_log("  frame %d %p ?\n", i, frames[i]);
+			continue;
+		}
+		bt_log("  frame %d %s + 0x%lx\n", i,
+		    strrchr(info.dli_fname, '/') != NULL ?
+		    strrchr(info.dli_fname, '/') + 1 : info.dli_fname,
+		    (unsigned long)((uintptr_t)frames[i] -
+		    (uintptr_t)info.dli_fbase));
 	}
-	syscall(SYS_exit, status);
-	__builtin_unreachable();
+}
+
+static void bt_backtrace(const char *why);
+
+/* Global on purpose: the trampoline below is assembler, and a static symbol
+ * left undefined by -undefined dynamic_lookup crashes at the first call. */
+void
+bt_report_exit(int status, uintptr_t r19, uintptr_t r20)
+{
+	if (status == 0) {
+		return;
+	}
+	bt_log("_exit(%d) x19=0x%lx x20=0x%lx\n", status,
+	    (unsigned long)r19, (unsigned long)r20);
+	bt_string("x19", r19);
+	bt_string("x20", r20);
+	bt_backtrace("exit");
+}
+
+/*
+ * `_exit(status)` arrives with w0 = status, and the caller's x19/x20 still
+ * holding what the restart helper was given. A naked entry is the only way to
+ * read them before the C prologue decides about them.
+ */
+__attribute__((naked, noreturn))
+static void
+mondrian_bt_exit(void)
+{
+	__asm__ volatile(
+		"sub	sp, sp, #32\n"
+		"stp	x19, x20, [sp, #16]\n"
+		"str	w0, [sp, #8]\n"
+		"mov	x1, x19\n"
+		"mov	x2, x20\n"
+		"ldr	w0, [sp, #8]\n"
+		"bl	_bt_report_exit\n"
+		"ldr	w0, [sp, #8]\n"
+		"mov	x16, #1\n"
+		"svc	#0x80\n"
+		"brk	#0\n");
 }
 
 static const struct {
@@ -114,6 +181,13 @@ mondrian_bt_init(void)
 	}
 	setenv("BT_HCI_TRANSPORT", TRANSPORT, 1);
 	setenv("BT_BAUDRATE", BAUDRATE, 1);
+	/*
+	 * A file descriptor is fully buffered, and the daemon leaves through
+	 * _exit, which discards the buffer: with buffering on, the log ends at
+	 * whatever the last 4 KB flush happened to catch (measured 2026-11-20).
+	 */
+	setvbuf(stdout, NULL, _IONBF, 0);
+	setvbuf(stderr, NULL, _IONBF, 0);
 	bt_log("init uid %d log \"%s\" transport \"%s\" baud \"%s\" port %d\n",
 	    getuid(),
 	    chosen != NULL ? chosen : "(none)",

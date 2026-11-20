@@ -1,0 +1,49 @@
+xnu 0390: the root's free space, one line per boot
+
+A full root fails quietly here. `mondrian_root_write` opens the target with
+O_TRUNC, the write that follows fails with ENOSPC, and the file stays empty -
+while the host counts the datagrams it sent and reports every byte delivered.
+Measured twice on 2026-11-20: a dylib injected at exec was 0 bytes on the
+phone, dyld had nothing to load, and the process simply ran the old code. The
+same volume also refused the launchd table and every log the port wanted to
+read back.
+
+So the mount prints what is left: free KiB, total KiB and free inodes, right
+after /private/var/vm is confirmed. It is three numbers on a boot that already
+prints twenty, and it turns "the write failed and nothing said so" into a
+reading.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 47c788a..166e7cb 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2328,6 +2328,30 @@ mondrian_root_fixups(void)
+ 		error = mondrian_root_mkdir("/private/var/vm", 0755);
+ 		printf("MONDRIAN ROOT: mkdir /private/var/vm -> %d\n", error);
+ 	}
++	/*
++	 * How much room the volume has. A full root does not fail loudly: a
++	 * write is created empty and its data is dropped with ENOSPC, and the
++	 * next boot loads a file that is 0 bytes (measured 2026-11-20, twice,
++	 * while a dylib upload kept reporting every byte delivered). One line
++	 * per boot turns that into a number.
++	 */
++	{
++		struct vfsstatfs *sfs;
++		mount_t rmp = NULL;
++
++		if (vnode_lookup("/", 0, &vp, ctx) == 0) {
++			rmp = vnode_mount(vp);
++			vnode_put(vp);
++		}
++		sfs = rmp != NULL ? vfs_statfs(rmp) : NULL;
++		if (sfs != NULL) {
++			printf("MONDRIAN ROOT: %llu KiB free of %llu KiB, "
++			    "%llu inodes free\n",
++			    (unsigned long long)(sfs->f_bavail * sfs->f_bsize / 1024),
++			    (unsigned long long)(sfs->f_blocks * sfs->f_bsize / 1024),
++			    (unsigned long long)sfs->f_ffree);
++		}
++	}
+ #if __has_include("mondrian_glblob.h")
+ 	{
+ 		int blob = 0;
