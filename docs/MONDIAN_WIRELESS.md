@@ -648,6 +648,20 @@ process's `init`: the daemon leaves right after the address, before the
 transport prints anything, and `_exit` runs no `atexit` handler - which is why
 the shim interposes `_exit` and logs the status with the call addresses.
 
+That log needs one more thing to be readable: `stderr` on a file descriptor is
+block-buffered, and a process that leaves with `_exit` throws the buffer away.
+Measured 2026-11-20, the file ended at the same line in every run, which reads
+as "the daemon dies here" when it only means "the last 4 KB flush stopped
+here". The shim sets `_IONBF` on both streams; a daemon's log that stops
+cleanly at a message is worth suspecting of this before anything else.
+
+The exit's backtrace names where it happens: `main` calls `0x100429030` with
+the string `com.apple.bluetoothd`, and a non-zero answer there goes to the
+restart helper (`0x100090734`, "Bluetooth error - restarting") through
+`0x90778`. So the daemon is past the local address and into its own stack
+startup, and the failure is that call's status - not the port node, which was
+accepted by `access()` and never opened.
+
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
 `com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
