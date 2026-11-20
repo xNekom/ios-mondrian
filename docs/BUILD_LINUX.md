@@ -115,7 +115,11 @@ host.
 
 ## Linux-specific code
 
-- `tools/wsl/patches/0001-linux-host-tools.patch` — `XCRUN`, `PLUTIL`, `PAX`
+The host-tool, kalloc, crypto, link-shim, iig and symbol-set changes are
+`xnu/patches-mondrian/0294-mondrian-linux-build-gaps.patch`; each bullet
+names the file it changes.
+
+- `XCRUN`, `PLUTIL`, `PAX`
   and `HOST_CODESIGN` are hardcoded `/usr/bin` paths in `MakeInc.cmd`; `?=`
   lets the shims be used. macOS sees the same values.
 - `tools/wsl/sdk/usr/include/TargetConditionals.h` — the kernel includes it
@@ -136,26 +140,33 @@ host.
   extensions for `kalloc_type`. Upstream clang has none of them, so the fallback
   reports data-only batches: the static asserts hold and the type-metadata fast
   paths (and their runtime checks) are gone.
-- `tools/wsl/patches/0003-linux-crypto-asm-syntax.patch` — the SHA/AES macros in
+- the SHA/AES macros in
   `arm64_isa_compatibility.h` use `qN` register names unless
   `__apple_build_version__` is new enough; upstream clang does not define it and
   its assembler rejects `sha256su0 q0, q1`.
-- `tools/wsl/patches/0004-linux-link-shims.patch` — `bsd/pgo/profile_runtime.c`
+- `bsd/pgo/profile_runtime.c`
   and libkern's C++ bootstrap reference Apple's compiler-rt profile helpers and
   `__cxa_atexit`; `osfmk/vm/vm_link_compat.c` provides empty versions.
-- `tools/wsl/patches/0005-linux-iig-forwarders.patch` — the DriverKit forwarder
+- the DriverKit forwarder
   `IOUserClient::CreateActionKernelCompletion` is emitted by Apple's `iig` into
   the generated `.iig.cpp`, which the Linux `iig` leaves as a declaration.
-- `tools/wsl/patches/0006-linux-skip-symbolsets.patch` — the symbolset and
+- the symbolset and
   export/import check compares the kernel's symbol table with Apple's `.exports`
   lists; the Linux `iig` emits a different set of DriverKit `_Invoke` overloads
   and OSAction subclasses, so the check cannot pass. Symbol sets only feed kext
   linking, so the build takes the branch xnu already has for library builds.
-- `tools/wsl/patches/0007-linux-skip-san-symbolsets.patch` — `0006` skips the
+- `config/Makefile` skips the
   sets in `config/Makefile`, but the Kcov and Kasan rules in `san/coverage` and
   `san/memory` also run from `config_all` and need `config/allsymbols`, which
   only the finished kernel produces. A clean build stops there before the
   kernel exists; those makefiles take the `xnu_libraries` branch too.
+- `0395-mondrian-symbolsets-link.patch` - skipping the sets in
+  `config/Makefile` is not enough: `makedefs/MakeInc.def` still lists
+  `symbolsets.plist` in `LDFILES_KERNEL_ONLY` and asks `ld` for the
+  `__LINKINFO` section, so a cache that never generated it dies at the link
+  with `No rule to make target '.../symbolsets.plist'`. A cache that still
+  carries the file from an older build hides it. `0395` drops both when
+  `XNU_SKIP_SYMBOLSETS=1`.
 
 ## Verifying a build
 
