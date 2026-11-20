@@ -1,0 +1,127 @@
+xnu 0391: wrap and unwrap the keychain's class keys
+
+`securityd` called selector 10 with 32 bytes in and 40 out and answered
+`kIOReturnUnsupported` every time, so the keychain could not create its class
+keys: bluetoothd's "Failed to set new identity root!" and its `_exit(1)` came
+from that, not from the UART, the port node or the local address, which were all
+in place and never used.
+
+The output keeps the shape the caller reserves - exactly eight bytes longer than
+the key, which is what AES key wrap produces - and the transform is this kernel's
+own, because the device key would live in the SEP and there is none here. It has
+to unwrap again after a reboot and reject anything it did not write, so the
+header is checked and the mask is constant. A test unit has nothing to protect in
+a keychain that never leaves the phone.
+diff --git a/iokit/Kernel/arm/MondrianKeyStore.cpp b/iokit/Kernel/arm/MondrianKeyStore.cpp
+index cc28a57..fa13986 100644
+--- a/iokit/Kernel/arm/MondrianKeyStore.cpp
++++ b/iokit/Kernel/arm/MondrianKeyStore.cpp
+@@ -170,6 +170,79 @@ mondrian_aks_struct_out_size(IOExternalMethodArguments *args)
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++/* Copy the caller's input structure, inband or from its descriptor. */
++static uint32_t
++mondrian_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t max)
++{
++	uint32_t len = args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() :
++	    args->structureInputSize;
++
++	if (len > max) {
++		len = max;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		args->structureInputDescriptor->readBytes(0, buf, len);
++	} else if (args->structureInput != NULL && len > 0) {
++		memcpy(buf, args->structureInput, len);
++	} else {
++		len = 0;
++	}
++	return len;
++}
++
++#define MONDRIAN_AKS_WRAP_MAGIC "MNDRKW01"
++
++/*
++ * The keychain's class keys are wrapped with the device key, which on hardware
++ * lives in the SEP. There is no SEP here, so the wrap is this kernel's own: the
++ * blob is exactly eight bytes longer than the key, the shape AES key wrap has,
++ * and the transform is a repeat-XOR under a constant mask - the blob has to
++ * unwrap again after a reboot and there is nothing secret to protect on a test
++ * unit. The header rejects anything this code did not write.
++ */
++static const uint8_t mondrian_aks_mask[16] = {
++	0x6d, 0x6f, 0x6e, 0x64, 0x72, 0x69, 0x61, 0x6e,
++	0x6b, 0x65, 0x79, 0x73, 0x74, 0x6f, 0x72, 0x65,
++};
++
++static IOReturn
++mondrian_aks_wrap(IOExternalMethodArguments *args, int unwrap)
++{
++	uint8_t in[256], out[264];
++	uint32_t len = mondrian_aks_struct_in(args, in, sizeof(in));
++	uint32_t outmax = mondrian_aks_struct_out_size(args);
++	uint32_t n, i;
++
++	if (unwrap) {
++		if (len < 8 || memcmp(in, MONDRIAN_AKS_WRAP_MAGIC, 8) != 0) {
++			return kIOReturnBadArgument;
++		}
++		n = len - 8;
++		if (n > outmax) {
++			return kIOReturnNoSpace;
++		}
++		for (i = 0; i < n; i++) {
++			out[i] = in[8 + i] ^ mondrian_aks_mask[i % sizeof(mondrian_aks_mask)];
++		}
++	} else {
++		if (len == 0 || len + 8 > outmax) {
++			return kIOReturnNoSpace;
++		}
++		n = len + 8;
++		memcpy(out, MONDRIAN_AKS_WRAP_MAGIC, 8);
++		for (i = 0; i < len; i++) {
++			out[8 + i] = in[i] ^ mondrian_aks_mask[i % sizeof(mondrian_aks_mask)];
++		}
++	}
++	IOReturn ret = mondrian_aks_struct_out(args, out, n);
++	if (ret == kIOReturnSuccess && args->scalarOutputCount > 0) {
++		args->scalarOutput[0] = n;
++		args->scalarOutputCount = 1;
++	}
++	return ret;
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -227,16 +300,24 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = mondrian_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		args->scalarOutputCount = 0;
++		ret = mondrian_aks_wrap(args, 0);
++		break;
++	case kAKSUnwrapKey:
++		args->scalarOutputCount = 0;
++		ret = mondrian_aks_wrap(args, 1);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
+ 	/*
+-	 * securityd retries the selectors this emulation does not implement
+-	 * (kAKSWrapKey) in a tight loop, and a line per call buries every
+-	 * other message the boot has to say. Three lines per selector are
+-	 * enough to see which methods the userland actually uses.
++	 * securityd retries a selector this emulation does not implement in a
++	 * tight loop, and a line per call buries every other message the boot
++	 * has to say. Three lines per selector are enough to see which methods
++	 * the userland actually uses.
+ 	 */
+ 	static uint16_t aks_logged[128];
+ 	if (selector < 128 && aks_logged[selector]++ < 3) {
