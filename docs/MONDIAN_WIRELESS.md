@@ -662,6 +662,25 @@ restart helper (`0x100090734`, "Bluetooth error - restarting") through
 startup, and the failure is that call's status - not the port node, which was
 accepted by `access()` and never opened.
 
+The messages that name it are `os_log` with runtime strings, so the shim
+interposes `_os_log_impl` and its three siblings and writes the formats that
+mention Bluetooth, transport, HCI or an error. Measured 2026-11-20, the last
+lines before `_exit(1)` are the keychain:
+
+```
+oslog.error failed to update keychain data for device %{public}s with result %d. trying to add it now
+oslog.error Failed to add attributes to keychain for device %{public}s with result %d. File a radar to Bluetooth (new bugs) | iOS
+oslog.fault Failed to set new identity root!
+oslog.error Failed to set new identity root!
+```
+
+So the transport is not what stops Bluetooth: the daemon cannot store its
+identity root, and it treats that as fatal. The keychain itself is half there -
+`securityd` runs and answers AKS requests, but selector 10 comes back
+`0xe00002c7` (`kIOReturnUnsupported`) on every call (measured on the same
+boot), which is the secure store this needs. Bluetooth is behind a working
+keystore, not behind the UART.
+
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
 `com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
