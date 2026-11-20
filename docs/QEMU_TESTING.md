@@ -56,11 +56,11 @@ the root, execs `/sbin/launchd`, and init exits before it can start anything.
 journaled; a run killed mid-flight leaves errors the next boot inherits), and
 forces it onto `virtio-mmio-bus.0`: `mkadt.py` states the first transport
 (`0xa000000`) and without `bus=` QEMU hands the device to the last. The kernel
-prints `MONDRIAN VBLK: virtio-blk, N MiB` when the two agree. Under TCG a boot
-to `bsd_init` takes a minute, so `--secs 240` is the minimum worth typing.
-The run directory has to be on the Linux side: QEMU's QMP socket fails to bind
-under `/mnt/c` ("Operation not supported") and the run exits 1 before the guest
-starts.
+prints `MONDRIAN VBLK: virtio-blk, N MiB` when the two agree. `--persist`
+keeps the writes, for a change that has to be checked with `fsck.hfsplus`
+afterwards. Under TCG a boot to `bsd_init` takes a minute, so `--secs 240` is
+the minimum worth typing. The run directory has to be on the Linux side:
+QEMU's QMP socket fails to bind under `/mnt/c` ("Operation not supported").
 
 A run carries the dylib the *image* holds, not the kernel's blob
 (`tools/wsl/hfs-tool.sh put IMAGE /private/var/vm DIR` replaces it).
