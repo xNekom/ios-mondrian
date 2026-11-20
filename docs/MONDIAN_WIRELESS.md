@@ -698,36 +698,58 @@ the first keychain call.
 
 That next failure is still the keychain: `failed to update keychain data ...
 result -25300` (item not found, expected) is followed by `Failed to add
-attributes ... result -25291` (`errSecNotAvailable`). Measured 2026-11-20, the
-database is the difference. With a `keychain-2.db` left from an earlier boot
-the daemon reached its HCI setup; after that file was deleted - it was a valid
-SQLite file - `securityd` never creates a new one. After a full boot none of
-`keychain-2.db`, `-wal`, `-shm` or `keychain-2-debug.db` exists, while
-`/private/var/Keychains` is writable (`wfile` of a probe file succeeds), and
-`bluetoothd` dies seven times with `-25291` and `_exit(1)`.
+attributes ... result -25291` (`errSecNotAvailable`). Measured 2026-11-20 with
+the `0396` open trace, `securityd` reaches the database and the creation fails
+for lack of space:
 
-Seeding that path with a valid empty SQLite file before boot changes the
-outcome for exactly one boot: `securityd` keeps it (`rf` opens it, errno 0) and
-`bluetoothd` runs once with **no exit**, against seven exits without it. The
-next boot starts with the file gone again (`rf` returns -2) and seven exits
-back, so this `securityd` deletes a database it did not write. The gate is not
-the contents of the file: it is `securityd`'s own decision to create one, and
-nothing on this port triggers it - `0392` keeps no notification port
-(`registerNotificationPort` releases it), so there is no lock-state event to
-act on. Adding one would not help: the reference `MiniAppleKeyStore` releases
-the port the same way. The job runs as `_securityd`
-(`com.apple.securityd.plist` sets `UserName`) and the root images are installed
-**noowners**, so a file-ownership mismatch is not the explanation either; what
-stops the creation is inside `securityd`, which is also why the injected shim
-was tried first.
+```
+MONDRIAN OPEN: securityd /private/var/Keychains/keychain-2.db flags 0x9000102 -> 2
+MONDRIAN OPEN: securityd /private/var/Keychains/keychain-2.db flags 0x9000100 -> 2
+MONDRIAN OPEN: securityd /private/var/Keychains/keychain-2.db flags 0x9000302 -> 28
+```
 
-The selector answers were the problem. `kAKSWrapKey` takes two scalars - the bag
-and the **protection class** - and returns one: the class the item must be stored
-under. This answered with the wrapped length, so every item went in under a class
-that does not exist and the add failed with a database that was fine. The class
-also belongs in the blob, and the device state has to say what this device is:
-`ss` bit 1 (no passcode) and lock state 3, "disabled". Reporting a plain unlocked
-state instead makes the caller look for a passcode keybag that is not there.
+`2` is `ENOENT` and `28` is `ENOSPC`; the third call is the one that creates
+the file. The volume says why: `MONDRIAN HFSAUDIT: total 4194304 counter 0
+bitmap 574 diff 574` - the free-block counter is zero while the allocation
+bitmap still has 574 blocks (2.3 MB), and `hfs_block_alloc_int` refuses every
+allocation while that counter is zero, so every write that needs a new block
+fails. `UMD_INIT` cannot write `/private/var/keybags` for the same reason
+(`No space left on device`). `0397` adopts the bitmap count at mount, because
+the bitmap is what actually says which blocks are free.
+
+Those 2.3 MB only cover the file's first page, and the volume is full again by
+the time the rest is written. The space on this unit comes from `/private/var/vm`,
+where the GPU probes left `m2v_test` (22 MB, rebuilt by `tools/mk-m2v-ios.sh`);
+deleting it through the ring's `del` restores 21.8 MB (`free 5321 avail 5321`).
+Two consecutive boots with that space keep one `exec bluetoothd` and **no exit**,
+and the Bluetooth log goes from `Failed to add attributes ... -25291` and
+`Failed to set new identity root!` to no add error at all: the database is
+written (its first page in `keychain-2.db`, the rest in `keychain-2.db-wal`
+until checkpoint), and the queries that remain return `-25292`
+(`errSecInteractionNotAllowed`), which the daemon survives. The volume is the
+gate, not `securityd` and not the AKS class.
+
+The volume is 16 GiB by construction (`mkiosroot.sh`'s default) inside a much
+larger `userdata`; growing it in place is not available, because `hfs_extendfs`
+requires a journal and this root is deliberately unjournaled (`0355`). A larger
+root needs a bigger image built and flashed, or the content copied into a new
+volume; 21.8 MB of headroom is not enough for Photos or a browser cache.
+
+The seeded-database reading was this cause seen from the other side: the file
+was readable while it existed, and the next boot started without it (measured);
+with no block for its journal, that is what the failed open leaves behind
+(expected). It is the volume, not a decision inside `securityd`, and not file
+ownership: the job runs as `_securityd` (`com.apple.securityd.plist` sets
+`UserName`) and the root images are installed **noowners**.
+
+The selector answers had been the problem before that. `kAKSWrapKey` takes two
+scalars - the bag and the **protection class** - and returns one: the class the
+item must be stored under. This answered with the wrapped length, so every item
+went in under a class that does not exist and the add failed with a database
+that was fine. The class also belongs in the blob, and the device state has to
+say what this device is: `ss` bit 1 (no passcode) and lock state 3, "disabled".
+Reporting a plain unlocked state instead makes the caller look for a passcode
+keybag that is not there.
 
 That shape comes from `oosexgang/hackios-xnu-kernel`'s `MiniAppleKeyStore`, which
 reports a working keychain for exactly this fixed situation (no passcode, never
@@ -740,8 +762,8 @@ With `0392` and the database that boot already had, the daemon stopped dying:
 measured 2026-11-20, one `exec bluetoothd` and **no exit** for the whole boot,
 `kAKSUnwrapKey` answering `0x0` where the old-format blobs had answered
 `kIOReturnBadArgument`. Deleting that database to clear the old format does not
-rebuild it (above), so the boot after the delete dies again: the wrap is no
-longer what blocks the daemon.
+rebuild it while the volume cannot allocate a block (above), so the boot after
+the delete dies again: the wrap is no longer what blocks the daemon.
 
 What is left on this front is the transport: the daemon now reaches its HCI
 configuration and the port node is opened by hand between boots, but nothing in
