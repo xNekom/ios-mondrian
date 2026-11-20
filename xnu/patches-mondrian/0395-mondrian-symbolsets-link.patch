@@ -1,0 +1,37 @@
+xnu 0395: the Linux kernel link runs without kext symbol sets
+
+XNU_SKIP_SYMBOLSETS=1 stops config/Makefile from generating symbolsets.plist,
+but makedefs/MakeInc.def still lists it in LDFILES_KERNEL_ONLY and asks ld
+for the __LINKINFO section that carries it, so the kernel link dies with
+
+  No rule to make target .../symbolsets.plist
+
+Measured 2026-11-20 on a cache that had never generated them; a cache that
+still holds the file from before the flag hides the bug. The plists only feed
+kext linking, which this kernel-only build never does.
+
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -850,10 +850,18 @@
+ LDFLAGS_KERNEL_ONLY  +=   \
+ 		  $($(addsuffix $(CURRENT_ARCH_CONFIG), $(addsuffix $(CURRENT_KERNEL_CONFIG),LDFLAGS_KERNEL_ONLY_CONFIG_))) \
+ 		  $($(addsuffix $(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),LDFLAGS_KERNEL_ONLY_SUBARCH_)) \
+-		  -Wl,-alias_list,$(TARGET)/all-alias.exp \
+-		  -Wl,-sectcreate,__LINKINFO,__symbolsets,$(TARGET)/symbolsets.plist -Wl,-segprot,__LINKINFO,r--,r--
++		  -Wl,-alias_list,$(TARGET)/all-alias.exp
+ 
+-LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/symbolsets.plist
++LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp
++
++# XNU_SKIP_SYMBOLSETS=1 is the Linux build (see config/Makefile): the kext
++# symbol sets are never generated, so the link must not ask ld for the
++# __LINKINFO section that carries them. They only feed kext linking, which this
++# kernel-only build never does.
++ifneq ($(XNU_SKIP_SYMBOLSETS),1)
++LDFLAGS_KERNEL_ONLY += -Wl,-sectcreate,__LINKINFO,__symbolsets,$(TARGET)/symbolsets.plist -Wl,-segprot,__LINKINFO,r--,r--
++LDFILES_KERNEL_ONLY += $(TARGET)/symbolsets.plist
++endif
+ 
+ #
+ # Default runtime libraries to be linked with the kernel
