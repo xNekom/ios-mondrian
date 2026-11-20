@@ -35,9 +35,9 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
   the device well-known LUN, the GPT parsed, `userdata` located, HFS+ root
-  mounted and `launchd` exec'd. The console ring is armed at the end of the
-  UFS probe, before `vfs_mountroot` (`0174`), so a failed mount leaves its
-  error on disk.
+  mounted and `launchd` exec'd. `0398` grows the 16 GiB volume to the device
+  (`userdata`, 223.6 GiB here) on the first read-write mount; the 4 MiB ring
+  at the end of the partition stays outside it.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel, injects input and

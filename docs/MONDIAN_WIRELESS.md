@@ -717,23 +717,27 @@ fails. `UMD_INIT` cannot write `/private/var/keybags` for the same reason
 (`No space left on device`). `0397` adopts the bitmap count at mount, because
 the bitmap is what actually says which blocks are free.
 
-Those 2.3 MB only cover the file's first page, and the volume is full again by
-the time the rest is written. The space on this unit comes from `/private/var/vm`,
-where the GPU probes left `m2v_test` (22 MB, rebuilt by `tools/mk-m2v-ios.sh`);
-deleting it through the ring's `del` restores 21.8 MB (`free 5321 avail 5321`).
-Two consecutive boots with that space keep one `exec bluetoothd` and **no exit**,
-and the Bluetooth log goes from `Failed to add attributes ... -25291` and
-`Failed to set new identity root!` to no add error at all: the database is
-written (its first page in `keychain-2.db`, the rest in `keychain-2.db-wal`
-until checkpoint), and the queries that remain return `-25292`
+The 2.3 MB only cover the file's first page, and the volume is full again by
+the time the rest is written. The 21.8 MB that `/private/var/vm`'s `m2v_test`
+and the GPU probes held proved the gate from the other side: two consecutive
+boots with that space keep one `exec bluetoothd` and **no exit**, and the
+Bluetooth log goes from `Failed to add attributes ... -25291` and `Failed to
+set new identity root!` to no add error at all: the database is written (its
+first page in `keychain-2.db`, the rest in `keychain-2.db-wal` until
+checkpoint), and the queries that remain return `-25292`
 (`errSecInteractionNotAllowed`), which the daemon survives. The volume is the
 gate, not `securityd` and not the AKS class.
 
-The volume is 16 GiB by construction (`mkiosroot.sh`'s default) inside a much
-larger `userdata`; growing it in place is not available, because `hfs_extendfs`
-requires a journal and this root is deliberately unjournaled (`0355`). A larger
-root needs a bigger image built and flashed, or the content copied into a new
-volume; 21.8 MB of headroom is not enough for Photos or a browser cache.
+`0398` removes the gate. The root is a 16 GiB image inside `userdata` (223.6
+GiB on this unit) and HFS administers only the blocks the volume header names;
+the patch lets `hfs_extendfs` run on the unjournaled root, arms it from the
+read-write upgrade the userland performs, and grows to the device from a thread
+call one second later. The UFS driver reports a device that ends before the
+console ring, so the volume cannot allocate over it. Measured 2026-11-20: the
+extend went from 4,194,304 to 58,615,226 blocks (223.61 GiB) on a boot whose
+bitmap had zero free blocks, and the next boot's audit read `total 58615226
+counter 54400880 bitmap 54400880 diff 0` - about 207.5 GiB free, with the
+keychain database and the BT dylibs still in place.
 
 The seeded-database reading was this cause seen from the other side: the file
 was readable while it existed, and the next boot started without it (measured);
