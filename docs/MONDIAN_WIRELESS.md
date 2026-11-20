@@ -714,7 +714,12 @@ back, so this `securityd` deletes a database it did not write. The gate is not
 the contents of the file: it is `securityd`'s own decision to create one, and
 nothing on this port triggers it - `0392` keeps no notification port
 (`registerNotificationPort` releases it), so there is no lock-state event to
-act on.
+act on. Adding one would not help: the reference `MiniAppleKeyStore` releases
+the port the same way. The job runs as `_securityd`
+(`com.apple.securityd.plist` sets `UserName`) and the root images are installed
+**noowners**, so a file-ownership mismatch is not the explanation either; what
+stops the creation is inside `securityd`, which is also why the injected shim
+was tried first.
 
 The selector answers were the problem. `kAKSWrapKey` takes two scalars - the bag
 and the **protection class** - and returns one: the class the item must be stored
