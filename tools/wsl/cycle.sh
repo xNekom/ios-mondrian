@@ -168,14 +168,24 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
 		continue
 	fi
 	timeout 250 python3 tools/usb-ring.py dump "$LOG/ring.txt" > "$LOG/dump.txt" 2>&1
-	GOT=$(grep -a -m1 -o 'Darwin Kernel Version[^;]*' "$LOG/ring.txt")
+	GOT=$(grep -a -o 'Darwin Kernel Version[^;]*' "$LOG/ring.txt" | tail -1)
+	# The banner alone cannot tell a fresh boot from the running one when the
+	# kernel was not rebuilt: both answer with the same text. The kernel prints
+	# its uptime in the SMP line, so a stale answer shows minutes or hours past
+	# the dump that just fetched it. Take the last value, not the first: the
+	# ring keeps stale DRAM lines from earlier boots.
+	SECS=$(grep -a -o 'SMP t=[0-9]*' "$LOG/ring.txt" | tail -1 | tr -dc '0-9')
 	echo "   want: ${WANT:-?}"
-	echo "   got:  ${GOT:-?}"
-	if [ "${WANT:-x}" = "${GOT:-y}" ]; then
+	echo "   got:  ${GOT:-?} (uptime ${SECS:-?} s)"
+	if [ "${WANT:-x}" = "${GOT:-y}" ] && [ -n "$SECS" ] && [ "$SECS" -lt 240 ]; then
 		BOOTED=1
 		break
 	fi
-	echo "== attempt $attempt answered with another kernel (ring in $LOG/ring.txt)"
+	if [ "${WANT:-x}" = "${GOT:-y}" ]; then
+		echo "== attempt $attempt answered with the same banner from an old boot" >&2
+	else
+		echo "== attempt $attempt answered with another kernel (ring in $LOG/ring.txt)" >&2
+	fi
 done
 if [ "$BOOTED" != 1 ]; then
 	echo "== NOT this build after $ATTEMPTS attempts: the RAM boot keeps dying at the" >&2
