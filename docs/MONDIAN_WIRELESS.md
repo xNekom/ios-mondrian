@@ -711,6 +711,18 @@ notification port, `GetBagUUID`, `GetConfiguration` and `Generation`. `0392`
 mirrors it. The keychain's class keys are therefore not a reason to build a real
 keybag: a reversible wrap is enough, which is what that reference says it uses.
 
+With `0392` and a database rebuilt by it, the daemon stops dying: measured
+2026-11-20, one `exec bluetoothd` and **no exit** for the whole boot, the
+keychain database back with a `-wal`, and `kAKSUnwrapKey` answering `0x0` where
+the old-format blobs had answered `kIOReturnBadArgument`. The database has to be
+deleted once after the format changes - unwrap rejects a blob with the old mark,
+and that reads exactly like a keychain failure.
+
+What is left on this front is the transport: the daemon now reaches its HCI
+configuration and the port node is opened by hand between boots, but nothing in
+the log says it opened `/dev/cu.bluetooth`, and the SM8475's controller is not
+behind that tty yet.
+
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
 `com.apple.xpc.launchd ... <Error>: Missing executable detected. Job:
