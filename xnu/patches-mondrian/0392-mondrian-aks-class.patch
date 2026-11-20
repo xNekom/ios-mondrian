@@ -1,0 +1,258 @@
+xnu 0392: the keychain's class comes back from the wrap
+
+`securityd` sends two scalars to `kAKSWrapKey` - the bag and the protection
+class - and reads one back: the class the item should be stored under. This
+answered with the wrapped length instead, so every item went in under a class
+that does not exist and `SecItemAdd` came back `errSecNotAvailable` while the
+database was fine. The blob carries the class too, and the device state says
+what this device is: no passcode (`ss` bit 1) and lock state 3, "disabled".
+Reporting a plain unlocked state instead made the caller look for a passcode
+keybag that is not there.
+
+The rest of the shape follows MiniAppleKeyStore (oosexgang/hackios-xnu-kernel),
+which reports a working keychain for the same no-passcode situation: the same
+eight-byte overhead, `GetBagUUID`, `GetConfiguration`, `Generation`, the lock
+and prewarm selectors, the notification port, and an output descriptor that is
+prepared before it is written.
+diff --git a/iokit/Kernel/arm/MondrianKeyStore.cpp b/iokit/Kernel/arm/MondrianKeyStore.cpp
+index fa13986..db5668a 100644
+--- a/iokit/Kernel/arm/MondrianKeyStore.cpp
++++ b/iokit/Kernel/arm/MondrianKeyStore.cpp
+@@ -40,24 +40,36 @@ enum {
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
++	kAKSLockDevice       = 8,
+ 	kAKSGetDeviceState   = 17,
++	kAKSGetBagUUID       = 23,
++	kAKSGetConfiguration = 31,
++	kAKSLockDeviceNow    = 32,
++	kAKSGeneration       = 40,
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
++	kAKSAssertPromote    = 100,
+ 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
+ 	kAKSUnloadSessionBags = 55,
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
++	kAKSPrewarm          = 115,
+ };
+ 
+ /* The system (device) bag handle. */
+ #define MONDRIAN_AKS_SYSTEM_HANDLE 0
+ 
+ /*
+- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * aks lock state bits: bit 1 "no passcode", bit 2 "unlocked since boot"
++ * (MobileKeyBag MKBDeviceUnlockedSinceBoot). The lock state itself is 3,
++ * "disabled - no passcode", which is what a device without one reports; a
++ * plain 0 there reads as "unlocked with a passcode" and then the keybag work
++ * that follows has nothing to unlock against (MiniAppleKeyStore, which reports
++ * a working keychain on the same fixed situation, uses these two values).
+  */
+-#define MONDRIAN_AKS_LOCK_STATE    0x4
++#define MONDRIAN_AKS_STATE_FLAGS   0x6
++#define MONDRIAN_AKS_LOCK_STATE    3
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -85,6 +97,8 @@ class AppleKeyStoreUserClient : public IOUserClient {
+ 
+ public:
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
++	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+@@ -99,15 +113,32 @@ AppleKeyStoreUserClient::clientClose(void)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* keybagd asks to be told about bags to save; there never are any. */
++IOReturn
++AppleKeyStoreUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
++    io_user_reference_t refCon)
++{
++	releaseNotificationPort(port);
++	return kIOReturnSuccess;
++}
++
+ /* Copy len bytes to the caller's output structure (inband or descriptor). */
+ static IOReturn
+ mondrian_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
++		IOMemoryDescriptor *out = args->structureOutputDescriptor;
++		IOReturn ret;
++
++		if (len > out->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		ret = out->prepare();
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		out->writeBytes(0, buf, len);
++		out->complete();
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -150,8 +181,9 @@ mondrian_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", MONDRIAN_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+-		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
++		{ "sb", 0 }, { "sr", 0 }, { "ss", MONDRIAN_AKS_STATE_FLAGS },
++		{ "sas", 0 }, { "sfa", 0 }, { "sgs", 0 },
++		{ "sls", MONDRIAN_AKS_LOCK_STATE }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+ 	uint32_t n = 2;
+@@ -163,6 +195,21 @@ mondrian_aks_device_state(IOExternalMethodArguments *args)
+ 	return mondrian_aks_struct_out(args, buf, n);
+ }
+ 
++/* The settings keybagd asks for; nothing is limited on a device without a passcode. */
++static IOReturn
++mondrian_aks_configuration(IOExternalMethodArguments *args)
++{
++	uint8_t buf[64];
++	uint32_t n = 2;
++
++	n += mondrian_aks_der_pair(buf + n, "bd", 0);
++	n += mondrian_aks_der_pair(buf + n, "gp", 0);
++	n += mondrian_aks_der_pair(buf + n, "mua", 10);
++	buf[0] = 0x31;
++	buf[1] = (uint8_t)(n - 2);
++	return mondrian_aks_struct_out(args, buf, n);
++}
++
+ static uint32_t
+ mondrian_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+@@ -206,41 +253,59 @@ static const uint8_t mondrian_aks_mask[16] = {
+ 	0x6b, 0x65, 0x79, 0x73, 0x74, 0x6f, 0x72, 0x65,
+ };
+ 
++static void
++mondrian_aks_mix(uint8_t *bytes, uint32_t length)
++{
++	uint32_t i;
++
++	for (i = 0; i < length; i++) {
++		bytes[i] ^= mondrian_aks_mask[i % sizeof(mondrian_aks_mask)];
++	}
++}
++
++/*
++ * kAKSWrapKey and kAKSUnwrapKey. A wrapped key is eight bytes longer than the
++ * key, which is the size callers reserve (AES key wrap grows by exactly that):
++ * a mark, the protection class, three zero bytes, and the key. The first
++ * scalar in is the class and the first scalar out is the class the caller
++ * should use - measured 2026-11-20, returning the wrapped length there made
++ * securityd store every item under a class that does not exist, and the add
++ * came back errSecNotAvailable with nothing wrong in the database.
++ */
+ static IOReturn
+ mondrian_aks_wrap(IOExternalMethodArguments *args, int unwrap)
+ {
+ 	uint8_t in[256], out[264];
++	static const uint8_t mark[4] = { 'M', 'N', 'K', 'w' };
+ 	uint32_t len = mondrian_aks_struct_in(args, in, sizeof(in));
+ 	uint32_t outmax = mondrian_aks_struct_out_size(args);
+ 	uint32_t n, i;
+ 
+ 	if (unwrap) {
+-		if (len < 8 || memcmp(in, MONDRIAN_AKS_WRAP_MAGIC, 8) != 0) {
++		if (len <= 8 || len - 8 > outmax ||
++		    memcmp(in, mark, sizeof(mark)) != 0) {
+ 			return kIOReturnBadArgument;
+ 		}
+ 		n = len - 8;
+-		if (n > outmax) {
+-			return kIOReturnNoSpace;
+-		}
+-		for (i = 0; i < n; i++) {
+-			out[i] = in[8 + i] ^ mondrian_aks_mask[i % sizeof(mondrian_aks_mask)];
+-		}
+-	} else {
+-		if (len == 0 || len + 8 > outmax) {
+-			return kIOReturnNoSpace;
+-		}
+-		n = len + 8;
+-		memcpy(out, MONDRIAN_AKS_WRAP_MAGIC, 8);
+-		for (i = 0; i < len; i++) {
+-			out[8 + i] = in[i] ^ mondrian_aks_mask[i % sizeof(mondrian_aks_mask)];
+-		}
++		memcpy(out, in + 8, n);
++		mondrian_aks_mix(out, n);
++		return mondrian_aks_struct_out(args, out, n);
++	}
++
++	if (len == 0 || len + 8 > outmax || args->scalarInputCount < 2) {
++		return kIOReturnBadArgument;
+ 	}
+-	IOReturn ret = mondrian_aks_struct_out(args, out, n);
+-	if (ret == kIOReturnSuccess && args->scalarOutputCount > 0) {
+-		args->scalarOutput[0] = n;
++	memcpy(out, mark, sizeof(mark));
++	out[4] = (uint8_t)args->scalarInput[1];
++	out[5] = out[6] = out[7] = 0;
++	memcpy(out + 8, in, len);
++	mondrian_aks_mix(out + 8, len);
++	if (args->scalarOutputCount > 0) {
++		args->scalarOutput[0] = args->scalarInput[1];
+ 		args->scalarOutputCount = 1;
+ 	}
+-	return ret;
++	(void)i;
++	return mondrian_aks_struct_out(args, out, len + 8);
+ }
+ 
+ IOReturn
+@@ -263,6 +328,10 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSUnlockDevice:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
++	case kAKSPrewarm:
++	case kAKSAssertPromote:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+@@ -270,6 +339,28 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSNotifyStateSet:
+ 		args->scalarOutputCount = 0;
+ 		break;
++	case kAKSGeneration:
++		if (out_scalars < 1) {
++			ret = kIOReturnBadArgument;
++			break;
++		}
++		args->scalarOutput[0] = 0;
++		args->scalarOutputCount = 1;
++		break;
++	case kAKSGetBagUUID:
++	{
++		static const uint8_t baguuid[16] = {
++			0x6d, 0x6f, 0x6e, 0x64, 0x72, 0x69, 0x61, 0x6e,
++			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
++		};
++		args->scalarOutputCount = 0;
++		ret = mondrian_aks_struct_out(args, baguuid, sizeof(baguuid));
++		break;
++	}
++	case kAKSGetConfiguration:
++		args->scalarOutputCount = 0;
++		ret = mondrian_aks_configuration(args);
++		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
