@@ -1,0 +1,307 @@
+xnu 0398: grow the root volume to the device on the first writable boot
+
+The iOS root is a 16 GiB HFS+ image written into a 207.6 GiB userdata
+partition, and HFS administers only the blocks its volume header names. The
+volume fills: measured 2026-11-20, every open of keychain-2.db answers ENOSPC
+(28), statfs reports zero free blocks, and the keychain, Photos and Safari
+cannot write at all while the partition has 190 GiB unused.
+
+hfs_extendfs already grows a mounted volume, but it refuses an unjournaled one,
+and this root is HFS+ without a journal (0355). The extend path itself uses the
+journal only for two optional steps: invalidating the old alternate volume
+header and resizing the journal. Run it without a journal instead of refusing,
+and guard those two steps.
+
+The root mount is remembered when it happens, and the grow is armed from the
+read-write upgrade the userland performs seconds later (the root is mounted
+read-only first). It runs from a thread call, outside the mount operation, one
+second later; a poll every second covers the case where the upgrade is late.
+The grow target is the device size. The last blocks of userdata are not the
+file system's -- the firmware blob area and the console ring live there and are
+written by absolute LBA -- so the UFS driver reports a block device that ends in
+front of them; the grown volume's alternate volume header then lands just
+before the ring instead of on it.
+
+The extend tries ExtendFileC in the existing free space first and falls back to
+AddFileExtent in the newly added blocks, so it works with zero free blocks. The
+volume header is written once at the end; a failure before that write restores
+the fork and the size, and the volume stays at its old size.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 47c788a..c34f747 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -853,6 +853,8 @@ mondrian_ufs_userdata_sectors(void)
+ 	return su.ready ? su.nblocks * (UFS_BLOCK / 512) : 0;
+ }
+ 
++static uint64_t mondrian_ufs_usable_sectors(void);
++
+ static int
+ mondrian_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+     __unused struct proc *p, int is_char)
+@@ -877,7 +879,7 @@ mondrian_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fl
+ 		*f = UFS_BLOCK;
+ 		return 0;
+ 	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++		*o = mondrian_ufs_usable_sectors();
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+ 		*f = 1;
+@@ -939,7 +941,7 @@ mondrian_ufs_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *
+ static int
+ mondrian_ufs_psize(__unused dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	return su.ready ? (int)MIN(mondrian_ufs_usable_sectors(), INT_MAX) : -1;
+ }
+ 
+ static int
+@@ -1218,6 +1220,26 @@ mondrian_ufs_rootdev(dev_t *dev)
+  * the touch driver, which cannot use the file system at that point.
+  */
+ #define MONDRIAN_FW_BLOCKS      (256u << 10) / UFS_BLOCK
++
++/*
++ * The last blocks of the partition are not the file system's: the firmware
++ * blob sits in front of the console ring and both are written by absolute
++ * LBA. The block device reports a size that ends in front of them, so a file
++ * system mounted on it cannot allocate over the ring; the HFS root is grown
++ * to exactly this size on its first writable boot.
++ */
++static uint64_t
++mondrian_ufs_usable_sectors(void)
++{
++	uint64_t blocks = su.nblocks;
++	uint64_t tail = MONDRIAN_FW_BLOCKS + MONDRIAN_LOG_BLOCKS;
++
++	if (blocks > tail) {
++		blocks -= tail;
++	}
++	return blocks * UFS_BLOCK / su.secsize;
++}
++
+ #define MONDRIAN_LOG_TICKS      5
+ 
+ static char mondrian_log_ring[MONDRIAN_LOG_SIZE];
+diff --git a/bsd/mondrian_hfs/core/hfs_resize.c b/bsd/mondrian_hfs/core/hfs_resize.c
+index c91adb7..6c34429 100644
+--- a/bsd/mondrian_hfs/core/hfs_resize.c
++++ b/bsd/mondrian_hfs/core/hfs_resize.c
+@@ -86,8 +86,14 @@ hfs_extendfs(struct hfsmount *hfsmp, u_int64_t newsize, vfs_context_t context)
+ 	 * - Journaling must be enabled.
+ 	 * - No embedded volumes.
+ 	 */
++	/*
++	 * MONDRIAN: an unjournaled volume is not a reason to refuse. This root
++	 * is HFS+ without a journal (0355) and the extend path below accepts
++	 * one: the transaction helpers handle a NULL journal, and the only
++	 * journal calls it makes are guarded. An interrupted extend has no
++	 * transaction to replay, so a backup is the cost of growing this one.
++	 */
+ 	if ((vcb->vcbSigWord == kHFSSigWord) ||
+-        (hfsmp->jnl == NULL) ||
+         (vcb->hfsPlusIOPosOffset != 0)) {
+ 		return (EPERM);
+ 	}
+@@ -416,11 +422,18 @@ hfs_extendfs(struct hfsmount *hfsmp, u_int64_t newsize, vfs_context_t context)
+ 		if (buf_meta_bread(hfsmp->hfs_devvp,
+                            HFS_PHYSBLK_ROUNDDOWN(prev_fs_alt_sector, hfsmp->hfs_log_per_phys),
+                            hfsmp->hfs_physical_block_size, NOCRED, &bp) == 0) {
+-			journal_modify_block_start(hfsmp->jnl, bp);
+-            
+-			bzero((char *)buf_dataptr(bp) + HFS_ALT_OFFSET(hfsmp->hfs_physical_block_size), kMDBSize);
+-            
+-			journal_modify_block_end(hfsmp->jnl, bp, NULL, NULL);
++			if (hfsmp->jnl != NULL) {
++				journal_modify_block_start(hfsmp->jnl, bp);
++				bzero((char *)buf_dataptr(bp) + HFS_ALT_OFFSET(hfsmp->hfs_physical_block_size), kMDBSize);
++				journal_modify_block_end(hfsmp->jnl, bp, NULL, NULL);
++			} else {
++				/*
++				 * No journal to log the zeroing in: write the
++				 * sector straight out (buf_bwrite releases bp).
++				 */
++				bzero((char *)buf_dataptr(bp) + HFS_ALT_OFFSET(hfsmp->hfs_physical_block_size), kMDBSize);
++				(void) buf_bwrite(bp);
++			}
+ 		} else if (bp) {
+ 			buf_brelse(bp);
+ 		}
+@@ -471,11 +484,17 @@ hfs_extendfs(struct hfsmount *hfsmp, u_int64_t newsize, vfs_context_t context)
+ 		transaction_begun = 0;
+ 	}
+     
+-	/* Increase the journal size, if required. */
+-	error = hfs_extend_journal(hfsmp, sector_size, sector_count, context);
+-	if (error) {
+-		printf ("hfs_extendfs: Could not extend journal size\n");
+-		goto out_noalloc;
++	/*
++	 * Increase the journal size, if required. MONDRIAN: only when there is
++	 * a journal; on an unjournaled volume this call would try to relocate
++	 * (that is, create) one after the blocks were already added.
++	 */
++	if (hfsmp->jnl != NULL) {
++		error = hfs_extend_journal(hfsmp, sector_size, sector_count, context);
++		if (error) {
++			printf ("hfs_extendfs: Could not extend journal size\n");
++			goto out_noalloc;
++		}
+ 	}
+     
+ 	/* Log successful extending */
+diff --git a/bsd/mondrian_hfs/core/hfs_vfsops.c b/bsd/mondrian_hfs/core/hfs_vfsops.c
+index e1de70f..03546e5 100644
+--- a/bsd/mondrian_hfs/core/hfs_vfsops.c
++++ b/bsd/mondrian_hfs/core/hfs_vfsops.c
+@@ -93,6 +93,8 @@
+ 
+ /* for parsing boot-args */
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
+ 
+ 
+ #include <kern/locks.h>
+@@ -155,6 +157,94 @@ void hfs_initialize_allocator (struct hfsmount *hfsmp);
+ int hfs_teardown_allocator (struct hfsmount *hfsmp);
+ 
+ int hfs_mount(struct mount *mp, vnode_t  devvp, user_addr_t data, vfs_context_t context);
++
++/*
++ * MONDRIAN: the root is a 16 GiB image inside a much larger userdata, and
++ * nothing ever grows it: HFS administers only the blocks its volume header
++ * names. The root mount is remembered here, and the grow runs from a thread
++ * call: outside the mount operation (which holds the VFS mount lock), and a
++ * second after the read-write upgrade the userland performs, because the
++ * volume has to be writable for hfs_extendfs.
++ */
++static struct hfsmount *mondrian_grow_hfsmp;
++static thread_call_t mondrian_grow_call;
++static int mondrian_grow_tries;
++
++static int mondrian_hfs_grow_root(void);
++
++static void
++mondrian_grow_call_fn(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	int error = mondrian_hfs_grow_root();
++
++	/*
++	 * EAGAIN: the mount is still read-only, the userland has not remounted
++	 * it yet. Retry for a while, and let the read-write upgrade arm it
++	 * again if it takes longer than that.
++	 */
++	if (error == EAGAIN && ++mondrian_grow_tries < 300) {
++		uint64_t deadline;
++
++		clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
++		(void) thread_call_enter_delayed(mondrian_grow_call, deadline);
++	}
++}
++
++static void
++mondrian_grow_start(void)
++{
++	uint64_t deadline;
++
++	if (mondrian_grow_call == NULL) {
++		return;
++	}
++	mondrian_grow_tries = 0;
++	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
++	(void) thread_call_enter_delayed(mondrian_grow_call, deadline);
++}
++
++static int
++mondrian_hfs_grow_root(void)
++{
++	struct hfsmount *hfsmp = mondrian_grow_hfsmp;
++	u_int64_t oldsize, newsize;
++	u_int32_t sector_size;
++	u_int64_t sector_count;
++	vfs_context_t ctx = vfs_context_kernel();
++	int error;
++
++	if (hfsmp == NULL) {
++		return 0;
++	}
++	if (hfsmp->hfs_devvp == NULL ||
++	    (hfsmp->hfs_flags & HFS_READ_ONLY)) {
++		return EAGAIN;
++	}
++	if (VNOP_IOCTL(hfsmp->hfs_devvp, DKIOCGETBLOCKSIZE,
++	    (caddr_t)&sector_size, 0, ctx) != 0 ||
++	    VNOP_IOCTL(hfsmp->hfs_devvp, DKIOCGETBLOCKCOUNT,
++	    (caddr_t)&sector_count, 0, ctx) != 0) {
++		printf("MONDRIAN GROW: device size ioctl failed\n");
++		mondrian_grow_hfsmp = NULL;
++		return ENXIO;
++	}
++	oldsize = (u_int64_t)hfsmp->totalBlocks * hfsmp->blockSize;
++	newsize = (u_int64_t)sector_size * sector_count;
++	if (newsize <= oldsize) {
++		printf("MONDRIAN GROW: volume %llu of device %llu bytes\n",
++		    oldsize, newsize);
++		mondrian_grow_hfsmp = NULL;
++		return 0;
++	}
++	printf("MONDRIAN GROW: volume %llu -> device %llu bytes\n",
++	    oldsize, newsize);
++	error = hfs_extendfs(hfsmp, newsize, ctx);
++	printf("MONDRIAN GROW: %llu bytes -> %d (volume now %llu bytes)\n",
++	    newsize, error,
++	    (u_int64_t)hfsmp->totalBlocks * hfsmp->blockSize);
++	mondrian_grow_hfsmp = NULL;
++	return error;
++}
+ int hfs_mountfs(struct vnode *devvp, struct mount *mp, struct hfs_mount_args *args, int journal_replay_only, vfs_context_t context);
+ int hfs_reload(struct mount *mp);
+ /*
+@@ -829,6 +919,16 @@ hfs_mount(struct mount *mp, vnode_t devvp, user_addr_t data, vfs_context_t conte
+ 			printf("hfs_mount: hfs_changefs returned %d for %s\n", retval, hfsmp->vcbVN);
+ 		}
+ 
++		/*
++		 * MONDRIAN: the root just went read-write. Grow it to the
++		 * device from the thread call, not from inside the mount
++		 * operation; the call runs a second from now.
++		 */
++		if (retval == 0 && vfs_iswriteupgrade(mp) &&
++		    (vfs_flags(mp) & MNT_ROOTFS)) {
++			mondrian_grow_start();
++		}
++
+ 	} else /* not an update request */ {
+ 		if (devvp == NULL) {
+ 			retval = EINVAL;
+@@ -875,6 +975,18 @@ hfs_mount(struct mount *mp, vnode_t devvp, user_addr_t data, vfs_context_t conte
+ 			 * withheld space is the only headroom there is.
+ 			 */
+ 			hfsmp->reserveBlocks = 0;
++
++			/*
++			 * MONDRIAN: the volume is a 16 GiB image inside a much
++			 * larger userdata partition, and HFS administers only
++			 * the blocks its volume header names. Remember the mount
++			 * and grow the volume to the device; a root that is
++			 * still read-only here is armed again by the upgrade.
++			 */
++			mondrian_grow_hfsmp = hfsmp;
++			if (!vfs_isrdonly(mp)) {
++				mondrian_grow_start();
++			}
+ 		}
+ #if	TARGET_OS_OSX 
+ 		// increment kext retain count
+@@ -2982,6 +3094,9 @@ hfs_init(__unused struct vfsconf *vfsp)
+ 	done = 1;
+ 	hfs_chashinit();
+ 
++	/* MONDRIAN: the root's grow is armed by its mounts; allocate once. */
++	mondrian_grow_call = thread_call_allocate(mondrian_grow_call_fn, NULL);
++
+ 	BTReserveSetup();
+ 	
+ 	hfs_lock_attr    = lck_attr_alloc_init();

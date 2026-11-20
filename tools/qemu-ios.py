@@ -245,6 +245,7 @@ def main():
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     ap.add_argument('--board', default='sweet', help='sweet | mondrian (the framebuffer to decode)')
     ap.add_argument('--disk', help='raw disk image served through virtio-blk (the kernel root, rd=vblk0)')
+    ap.add_argument('--persist', action='store_true', help='let the guest write to --disk instead of a temporary overlay')
     a = ap.parse_args()
     set_board(a.board)
     if a.cpu is None:
@@ -311,8 +312,10 @@ def main():
                 # snapshot=on: the guest writes into a temporary overlay, so the
                 # image stays pristine. Without it a killed run leaves the
                 # volume dirty (no journal) and the next boot inherits the
-                # errors and reports them as runtime corruption.
-                '-drive', f'file={os.path.abspath(a.disk)},format=raw,if=none,id=vblk0,snapshot=on',
+                # errors and reports them as runtime corruption. --persist is
+                # for a change that has to be read back and checked (a resize).
+                '-drive', f'file={os.path.abspath(a.disk)},format=raw,if=none,id=vblk0'
+                          + ('' if a.persist else ',snapshot=on'),
                 # slot 0 of the mmio bank, which is the address mkadt.py states:
                 # without bus= the machine hands the device to the last free
                 # transport (bus 31 at 0xa003e00), not the first.

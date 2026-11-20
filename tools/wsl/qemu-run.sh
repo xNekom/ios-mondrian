@@ -15,6 +15,9 @@ SECS=${1:-120}
 OUT=${OUT:-/root/qemu-run}
 DISK=${DISK:-/root/ios-root.raw}
 K=${K:-xnu/out/kernel.development.mondrian}
+# PERSIST=1 keeps the guest's writes in DISK (rehearse a volume change, then
+# check the image with fsck.hfsplus); without it QEMU writes to an overlay.
+PERSIST=${PERSIST:-}
 CMDLINE='debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=vblk0 mondrianspmi=0 launchd_unsecure_cache=1 unentitled_ios_sim_launch=1 rootrw=1 ignition_level=1 wdt=-1 mondriankill=quiet'
 
 rm -rf "$OUT"
@@ -32,7 +35,8 @@ python3 tools/mkpayload.py "$K" /root/qemu.adt /root/qemu-payload.bin \
 }
 
 python3 tools/qemu-ios.py /root/qemu-payload.bin "$OUT" --secs "$SECS" \
-	--board mondrian --kernel "$K" --disk "$DISK" > "$OUT/run.log" 2>&1
+	--board mondrian --kernel "$K" --disk "$DISK" ${PERSIST:+--persist} \
+	> "$OUT/run.log" 2>&1
 echo "exit $?"
 
 echo "== result"
