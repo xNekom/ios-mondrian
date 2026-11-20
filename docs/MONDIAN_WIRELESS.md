@@ -506,6 +506,29 @@ facts below were measured: `bluetoothd` (8.9 MB) imports `_open`, `_close`,
 the two device paths before matching `IOServiceNameMatching("marconi-bt")` and
 then `"bluetooth"`; the serial path is a termios conversation, not a pipe.
 
+### The client session, and the node it needs
+
+`bluetoothd` is half of the stack. Every client (SpringBoard, Settings, and
+anything built on `BluetoothManager`) attaches its own session first, and on
+this port that attach refused with `BTResult 9` before any IPC: no connection
+reached the daemon, and neither the `com.apple.bluetooth.system` entitlement
+(SpringBoard has it) nor the TCC stand-in nor a `MobileGestalt` answer changed
+the result. The refusal is inside `MobileBluetooth`'s
+`BTSessionAttachWithQueue`, whose prologue looks an IOKit service up --
+`IOServiceNameMatching("marconi-bt")`, then `"bluetooth"` -- and returns 9 when
+neither exists. The shim answers those two lookups inside `bluetoothd` only, so
+every other process saw an empty registry.
+
+Adding `/arm-io/bluetooth` to the ADT (`tools/mkadt.py`) with
+`local-mac-address` (the address the shim publishes), `transport-encoding`,
+`transport-speed` and `compatible = "marconi-bt"` makes the attach return 0,
+and is the only change that has done so. It also makes SpringBoard crash at
+boot (`SIGSEGV`, `far 0xc0`, pc in a shared-cache framework, four SpringBoard
+frames under it) while the same kernel without the node boots; the node is
+therefore not in the default ADT until that crash is understood. Userspace
+interposition of `IOServiceGetMatchingService` is not a substitute: the client
+looks the service up through paths the hook does not see.
+
 ### The control bluetoothd opens
 
 Measured in 16.7.16, `H4:POSIX` does not select a tty. The POSIX driver is a
