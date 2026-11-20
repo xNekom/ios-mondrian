@@ -693,11 +693,13 @@ That next failure is still the keychain: `failed to update keychain data ...
 result -25300` (item not found, expected) is followed by `Failed to add
 attributes ... result -25291` (`errSecNotAvailable`). The database is not the
 problem - `/private/var/Keychains/keychain-2.db` is a valid SQLite file of more
-than 400 KB - and `securityd` has been up since boot, so the add fails where the
-class key is applied. The likely cause is that the database was created while
-selector 10 still answered unsupported, so its class keys were written under a
-wrap that never existed; deleting it lets `securityd` build one against the
-working wrap.
+than 400 KB - and `securityd` has been up since boot. Deleting the database and
+booting changes nothing either: `securityd` rebuilds the file and the add still
+answers `-25291` (measured 2026-11-20). The class key the add needs comes from
+the keybag, and this keystore has a handle and a lock state but no bag behind
+them, so Bluetooth waits on a real keybag with class keys - a larger piece than
+the selector table, and one that also gates Wi-Fi passwords and every other
+keychain user.
 
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as
