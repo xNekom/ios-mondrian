@@ -1,0 +1,38 @@
+xnu 0397: let the bitmap's free count unblock the allocator
+
+Measured 2026-11-20 with the 0370 audit: the root reaches SpringBoard with
+`total 4194304 counter 0 bitmap 574 diff 574`. `hfs_block_alloc_int` refuses
+every allocation while the free-block counter is zero (`dskFulErr`), so no
+write that needs a new block succeeds: `UMD_INIT` cannot write its keybags
+(ENOSPC 28), SQLite cannot create /private/var/Keychains/keychain-2.db,
+securityd answers SecItemAdd with errSecNotAvailable and bluetoothd aborts.
+
+The bitmap is the authority on which blocks are free; the counter is a cache
+that the old deallocation bug (0372) left at zero, and the blocks it lost are
+gone from the bitmap too. Adopting the bitmap count at mount lets the
+allocator use the blocks that are actually free. The correction only raises
+the counter, and the audit line still prints both numbers.
+
+diff --git a/bsd/mondrian_hfs/core/VolumeAllocation.c b/bsd/mondrian_hfs/core/VolumeAllocation.c
+index a11add4..69a0f26 100644
+--- a/bsd/mondrian_hfs/core/VolumeAllocation.c
++++ b/bsd/mondrian_hfs/core/VolumeAllocation.c
+@@ -2008,6 +2008,18 @@ hfs_free_bitmap_audit(struct hfsmount *hfsmp)
+ 	printf("MONDRIAN HFSAUDIT: total %u counter %u bitmap %llu diff %lld\n",
+ 	    total, (unsigned)vcb->freeBlocks, freebits,
+ 	    (long long)freebits - (long long)vcb->freeBlocks);
++	/*
++	 * MONDRIAN: the bitmap is the authority on which blocks are free; the
++	 * counter is a cache that the old deallocation bug left at zero, and
++	 * hfs_block_alloc_int refuses every allocation while it is zero. Adopt
++	 * the bitmap count so the blocks that are actually free can be used.
++	 * The correction only raises the counter; a counter above the bitmap is
++	 * left alone for fsck to explain.
++	 */
++	if (freebits > (u_int64_t)vcb->freeBlocks &&
++	    freebits <= (u_int64_t)0xffffffffu) {
++		vcb->freeBlocks = (u_int32_t)freebits;
++	}
+ }
+ 
+ static OSErr ReadBitmapBlock(ExtendedVCB		*vcb,
