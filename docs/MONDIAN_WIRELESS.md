@@ -681,6 +681,13 @@ identity root, and it treats that as fatal. The keychain itself is half there -
 boot), which is the secure store this needs. Bluetooth is behind a working
 keystore, not behind the UART.
 
+A shim inside `securityd` cannot be used to see that decision: measured
+2026-11-20, the kernel injects the variable (`MONDRIAN exec: injected
+securityd log` in the ring) and the loader ignores it - the full shim and a
+15-line constructor with no interpose section both leave no file, while the
+same boot loads the Bluetooth shim into `bluetoothd` (`mondrian-bt[85]: init`).
+Instrument the client that does load, or the database, not `securityd`.
+
 That selector is `kAKSWrapKey`: the class keys the keychain keeps are wrapped
 with the device key, which on hardware lives in the SEP. `0391` answers it, and
 `kAKSUnwrapKey` with it, from the kernel's own store (the blob is eight bytes
