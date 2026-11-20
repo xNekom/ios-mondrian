@@ -1,0 +1,72 @@
+xnu 0393: give MobileSafari the CPU rendering path
+
+WebKit draws page content in its GPU process by default. On this port that
+process creates and locks its surface, paints nothing, and never reaches a
+single drawing entry point that was probed - Metal's factory, CoreGraphics'
+context creation and fill and image calls, GLES' clear and draw - so Safari's
+page stays black while its chrome draws. WebKit bug 247483 reports the same
+symptom on iOS 16 and the same fix: turn off "GPU Process: DOM Rendering", and
+the WebContent process paints the layers itself into a mappable IOSurface.
+
+That flag is an experimental feature, and WebKit reads its override from the
+application's own defaults under `WebKitExperimental<key>`
+(WebsiteDataStoreCocoa.mm). The dylib this injects sets it in a constructor,
+which runs before WebKit reads it, and writes a log line `rf` can read so the
+next boot says whether it ran.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9551d87..2180ba2 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5878,6 +5878,43 @@ mondrian_bt_env(struct image_params *imgp, char *env, size_t size)
+ 	return true;
+ }
+ 
++/*
++ * MobileSafari: the page is black because WebKit draws DOM content in its GPU
++ * process by default and that process never reaches a drawing entry point on
++ * this port (measured 2026-11-19). `GPU Process: DOM Rendering` is an
++ * experimental feature whose override WebKit reads from the application's own
++ * defaults (`WebKitExperimental<key>`); with it off, the WebContent process
++ * paints the layers itself into a mappable IOSurface, the path this port
++ * serves. tools/mondrian-safari.m sets it in a constructor, before WebKit
++ * reads it, and this is the same opt-in and the same gate as the BT shim.
++ */
++static bool
++mondrian_safari_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	const char *name;
++	const char inject[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-safari.dylib";
++	const char inject_path[] = "/private/var/vm/mondrian-safari.dylib";
++
++	if (!PE_parse_boot_argn("mondrianbt", &enabled, sizeof(enabled)) ||
++	    !enabled || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(inject) > size) {
++		return false;
++	}
++	if (!mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "MobileSafari")) {
++		return false;
++	}
++	if (!mondrian_dylib_in_vm(inject_path)) {
++		return false;
++	}
++	strlcpy(env, inject, size);
++	return true;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -6265,6 +6302,8 @@ exec_extract_strings(struct image_params *imgp)
+ 			injected = "probe";
+ 		} else if (mondrian_bt_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "bluetooth transport";
++		} else if (mondrian_safari_env(imgp, inject_env, sizeof(inject_env))) {
++			injected = "safari dom flag";
+ 		}
+ 		if (injected != NULL) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
