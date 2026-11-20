@@ -506,30 +506,32 @@ facts below were measured: `bluetoothd` (8.9 MB) imports `_open`, `_close`,
 the two device paths before matching `IOServiceNameMatching("marconi-bt")` and
 then `"bluetooth"`; the serial path is a termios conversation, not a pipe.
 
-### The tty bluetoothd opens
+### The control bluetoothd opens
 
-`0386` answers that fallback: the kernel creates `/dev/cu.bluetooth` from the
-root-mount path, so the node exists before `bluetoothd` runs its `access()`
-check. It has to be a tty rather than a plain character device, because the
-termios imports above are called before the first HCI packet; a cdev without a
-line discipline fails the conversation and the stack gives up.
+Measured in 16.7.16, `H4:POSIX` does not select a tty. The POSIX driver is a
+kernel-control client: it creates a `PF_SYSTEM` socket, resolves
+`com.apple.uart.sk.bluetooth` with `CTLIOCGINFO` (`0x100066d34`), connects, and
+reads a 72-byte termios (`0x40487413`) and a 16-byte channel UUID
+(`0x40105412`). The UUID goes to `os_channel_create()`; with no Skywalk nexus
+it returns NULL, and the driver falls back to `write(2)` (`0x1000676a4`) and
+`read(2)` (`0x100067a9c`) on the same socket.
 
-The part is powered and the wire programmed on the first `open`, reusing the
-`btuart on` sequence (pins, the 14745600 Hz SE root, 8N1). That is one RCG
-change per boot, the constraint `0343` measured, and it means no ring command
-has to run first. Input is drained into the line discipline from a one-tick
-timeout rather than an interrupt, because SPI 587 has no handler: 10 ms is 115
-bytes at 115200, under the engine's 128-byte RX FIFO, and RFR asserts before
-it fills. The port opens raw (no `ICANON`, no echo) so HCI bytes survive until
-`cfmakeraw()`.
+`/dev/cu.bluetooth` is therefore not the HCI transport. `FindLocalMacAddress`
+`access()`es it (and `/dev/uart.bluetooth`) to decide that a serial port exists
+before it tries the IORegistry; `0386` keeps the node because that check comes
+first, and the tty stays as the debugging path for the same engine.
 
-Nothing in that process can log, so the driver prints the first eight packets
-in each direction as `MONDRIAN BTTTY: tx|rx ...`, and `open`/`termios`/`close`
-lines beside them. Those lines are the measurement: `bluetoothd` opening the
-node, setting termios and sending `01 03 0c 00` is the transport working, and
-the boot stops logging `exit bluetoothd ... status 0x0` at startup. What comes
-after is the stack's opinion of a ROM-only chip, which is where the kernel-side
-firmware load enters.
+`0399` registers the control and moves its bytes through the QUP wrapper 2
+engine, with the same one-tick poll the tty used: 10 ms is 115 bytes at 115200,
+under the engine's 128-byte RX FIFO, and RFR asserts before it fills. The
+termios and the 12-byte UART option are accepted; the UUID names no nexus,
+which is what selects the read/write fallback.
+
+Nothing in `bluetoothd` can log, so both the control and the tty print the
+first eight packets in each direction (`MONDRIAN BTCTL:` and `MONDRIAN BTTTY:`).
+Those lines are the measurement: a `01 03 0c 00` from the daemon and an answer
+from the part is the transport working. What comes after is the stack's opinion
+of a ROM-only chip, which is where the firmware load enters.
 
 Before any transport, though, `bluetoothd` refuses to run without a local
 Bluetooth address: every boot until now logged `exec bluetoothd` and
