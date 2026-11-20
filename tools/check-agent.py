@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the repository the way AGENTS.md says it must be checked.
 
-Every check has an id (R01...R08). AGENTS.md carries the same ids in its
+Every check has an id (R01...R09). AGENTS.md carries the same ids in its
 "Repository checks" table and this script fails when the two disagree: a rule
 that is only prose is a red build, not a wish.
 
@@ -13,6 +13,7 @@ that is only prose is a red build, not a wish.
 Exit status 1 when any check fails.
 """
 import argparse
+import glob
 import importlib.util
 import math
 import os
@@ -337,6 +338,26 @@ def check_patch_series(verbose=False):
     return True, 'patch series and script syntax', []
 
 
+def check_tests(verbose=False):
+    """R09: the first-party tests under tools/tests pass."""
+    files = sorted(glob.glob(os.path.join(REPO, 'tools', 'tests',
+                                          'test_*.py')))
+    if not files:
+        return False, 'no tests found', ['tools/tests/test_*.py']
+    problems = []
+    for path in files:
+        res = subprocess.run([sys.executable, path], cwd=REPO,
+                             capture_output=True, text=True, encoding='utf-8',
+                             errors='replace')
+        if res.returncode != 0:
+            rel = os.path.relpath(path, REPO)
+            problems.append(f'{rel}: failed')
+            tail = [line for line in (res.stdout + res.stderr).splitlines()
+                    if line.strip()][-6:]
+            problems.extend(tail)
+    return not problems, f'{len(files)} files', problems
+
+
 CHECKS = {
     'R01': ('doc links resolve', check_doc_links),
     'R02': ('documented length budgets', doc_budgets),
@@ -346,6 +367,7 @@ CHECKS = {
     'R06': ('boards.py == shim/board.h', check_board_sync),
     'R07': ('skill front matter', check_skills),
     'R08': ('patch series and tool syntax', check_patch_series),
+    'R09': ('first-party tests pass', check_tests),
 }
 
 

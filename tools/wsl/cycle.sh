@@ -68,6 +68,9 @@ fi
 WANT=$(grep -a -o -m1 'Darwin Kernel Version[^;]*' "$K" | head -1)
 echo "== image"
 bash tools/wsl/image.sh || exit 1
+# image.sh already recorded and verified; this re-reads the manifest after the
+# file has been closed, so a write that lost a race cannot reach `fastboot boot`.
+python3 tools/verify-image.py || exit 1
 
 # 2. The phone has to be in fastboot before anything is loaded.
 attach() {

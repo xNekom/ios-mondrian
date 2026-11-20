@@ -45,4 +45,13 @@ BOARD=mondrian SMALL_SHIM=1 DTB=dtb/mondrian-live.dtb \
 	tail -20 /tmp/shim.log
 	exit 1
 }
+# Record what this build produced, and prove the arguments reached the payload
+# instead of the shell.  A step above can fail after writing a partial file and
+# leave the previous image in place; the phone would then boot the old kernel
+# while the new command looks like it does not exist.  This is milliseconds,
+# a boot is 2.5 minutes.
+python3 tools/verify-image.py --record || exit 1
+if [ -n "${PREFIX_ARGS:-}${EXTRA_ARGS:-}" ]; then
+	python3 tools/verify-image.py --expect-args "${PREFIX_ARGS:-} ${EXTRA_ARGS:-}" || exit 1
+fi
 ls -l shim/out/shim-boot.img

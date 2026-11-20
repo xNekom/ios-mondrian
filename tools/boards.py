@@ -428,7 +428,7 @@ MONDRIAN = Board(
              'glblob=1 '
              # 0: no kernel timer resets to fastboot. A reset is a debugging
              # aid and must be asked for explicitly.
-             'mondrianreset=0 '),
+             'mondrianreset=0'),
 )
 
 BOARDS = {b.name: b for b in (SWEET, MONDRIAN)}
