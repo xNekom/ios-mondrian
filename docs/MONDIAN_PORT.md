@@ -187,7 +187,8 @@ launchd looks for come from `tools/ios-root-tweaks.py`: `/private/preboot/
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error. Read
 a prior boot over USB with `tools/usb-ring.py prev` (`0329`), or on the panel
-with a dump kernel (`mondriandump=1`).
+with a dump kernel (`mondriandump=1`). `ls`/`deltree` list and empty the root
+from the kernel (`0390`: HFS+ packs a 12-byte header; `statfs` clamps f_bfree).
 
 ### 2. The UFS root device
 
@@ -202,11 +203,10 @@ The panel is command mode, not a scanout the ABL keeps running: it needs one
 "Display"). `0083` reserves the panel memory and `0085` presents IOSurface
 swaps, so the lock screen and the home screen draw. `0084`'s colour bars were a
 one-off packing test, off since `0208`; `0210` paints the kernel log and clears
-the boot splash. Three things had to line up: CoreAnimation needs
-`TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`); the
-panel is written through the console alias, which `0351` stops at the first
-swap (`disableConsoleOutput` was the only way before; an `IOMemoryDescriptor`
-there panics `pmap_remove_pv`, `0115`); and the dylib forces activation.
+the boot splash. CoreAnimation needs `TimingElements`/`ColorElements` and an
+`IOAcceleratorES` service (`0114`); the panel goes through the console alias,
+which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
+`pmap_remove_pv`, `0115`); the dylib forces activation.
 
 Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
 (`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
@@ -218,8 +218,8 @@ DCS blank resets the phone while CoreAnimation renders through Mesa
 (`docs/MONDIAN_GPU.md`); the hook's holds are off (`mondriankeepawake=0`) and
 iOS's timer never arms -- `SBLockScreenAutoLockTime` was missing and the hook
 writes it, and `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
-`0305` brightness, `0304` battery.
-sweet's `0056` and `0079` (`RequestPowerChange`) still need a rebase.
+`0305` brightness and `0304` battery; sweet's `0056`/`0079`
+(`RequestPowerChange`) still need a rebase.
 
 ### 4. The touch
 
@@ -248,8 +248,8 @@ Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
 `tools/usb-ring.py` (see `README.md`). `0335` carries a read-only disk over the
 GPT `userdata` partition but keeps it out of the descriptor: the core takes
-`DEPCFG` on 0x02/0x03/0x83 with status 0 and never completes a packet, even
-with the per-OUT-endpoint RX FIFO (`GRXFIFOSIZ`) sized. `usb=1` probes.
+`DEPCFG` on 0x02/0x03/0x83 with status 0 and never completes a packet, even with
+`GRXFIFOSIZ` sized; `usb=1` probes.
 
 ### 7. The apps
 
@@ -260,15 +260,15 @@ process's `w30r` surfaces stay zero (`0379`/`0380`), because it renders through
 Metal. Metal on Vulkan runs now (`docs/MONDIAN_GPU.md`): a device in 125 ms, a
 4 MB blit fill in 2.13 ms, a 1080x2400 clear in 1.76 ms, and host memory too
 (`0384`, a GPU buffer of the process's own pages), so m2v_test passes end to
-end; the WebKit GPU process is what is left. Measured 2026-11-19 on the restored volume: Photos completes its first-run
-flow, its import answers **`shared success 1`**, the Library draws the tile and
-the viewer opens on it with the picture in colour; the next boot reports
-`library has 1`. A default boot (mask bit 0x100, no probe file) draws both: the app
-needs `enableMultiLibraryMode` to open its Syndication library, and the hook's
-CGImage-to-surface bridge puts the picture on the layer. The render server still
-receives the image with zero data (`retain_iosurface` creates a surface,
-`copy_cgimage` only wraps the pointer); that transfer is the open cause. `assetsd` still aborts in an uncaught C++ exception and `PhotosFileProvider` in
-PlugInKit's container check; Phone, the App Store and the network are as before.
+end; the WebKit GPU process is what is left.
+Photos completes its first-run flow and its import answers **`shared success 1`**;
+the Library draws the tile and the viewer opens with the picture in colour (a
+default boot draws both - the app needs `enableMultiLibraryMode` for its
+Syndication library, and the hook's CGImage-to-surface bridge puts the picture
+on the layer). The render server still receives the image with zero data
+(`retain_iosurface` creates a surface, `copy_cgimage` only wraps the pointer);
+that transfer is the open cause. `assetsd` still aborts in an uncaught C++
+exception and `PhotosFileProvider` in PlugInKit's container check; Phone still fails.
 
 ## Getting the numbers off the device
 
