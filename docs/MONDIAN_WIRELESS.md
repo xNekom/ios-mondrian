@@ -693,13 +693,23 @@ That next failure is still the keychain: `failed to update keychain data ...
 result -25300` (item not found, expected) is followed by `Failed to add
 attributes ... result -25291` (`errSecNotAvailable`). The database is not the
 problem - `/private/var/Keychains/keychain-2.db` is a valid SQLite file of more
-than 400 KB - and `securityd` has been up since boot. Deleting the database and
-booting changes nothing either: `securityd` rebuilds the file and the add still
-answers `-25291` (measured 2026-11-20). The class key the add needs comes from
-the keybag, and this keystore has a handle and a lock state but no bag behind
-them, so Bluetooth waits on a real keybag with class keys - a larger piece than
-the selector table, and one that also gates Wi-Fi passwords and every other
-keychain user.
+than 400 KB - and `securityd` has been up since boot; deleting the database and
+booting rebuilds it and changes nothing.
+
+The selector answers were the problem. `kAKSWrapKey` takes two scalars - the bag
+and the **protection class** - and returns one: the class the item must be stored
+under. This answered with the wrapped length, so every item went in under a class
+that does not exist and the add failed with a database that was fine. The class
+also belongs in the blob, and the device state has to say what this device is:
+`ss` bit 1 (no passcode) and lock state 3, "disabled". Reporting a plain unlocked
+state instead makes the caller look for a passcode keybag that is not there.
+
+That shape comes from `oosexgang/hackios-xnu-kernel`'s `MiniAppleKeyStore`, which
+reports a working keychain for exactly this fixed situation (no passcode, never
+locked, unlocked since boot) and carries the same eight-byte overhead, the
+notification port, `GetBagUUID`, `GetConfiguration` and `Generation`. `0392`
+mirrors it. The keychain's class keys are therefore not a reason to build a real
+keybag: a reversible wrap is enough, which is what that reference says it uses.
 
 There is **no shell on this root**, so a job cannot be wrapped in `sh -c`:
 launchd refuses the spawn, and its own error does reach the ring as

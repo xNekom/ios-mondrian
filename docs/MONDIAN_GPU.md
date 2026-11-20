@@ -1821,6 +1821,25 @@ Measured 2026-11-19, two answers that settle what was open:
 So the provider is the wrong lever for the black page until something asks it
 for a device.
 
+### The page is drawn in the wrong process
+
+WebKit draws DOM content in its GPU process by default. On this port that
+process creates its surface, locks it, unlocks it and never reaches a single
+drawing entry point, which is what "no layer content arrives" looks like from
+the inside. The preference decides it: **`GPU Process: DOM Rendering`**, an
+experimental feature whose override WebKit reads from the application's own
+defaults as `WebKitExperimentalUseGPUProcessForDOMRenderingEnabled`
+(`WebsiteDataStoreCocoa.mm`). WebKit bug 247483 reports the same black page on
+iOS 16 and the same fix: with the feature off, the WebContent process paints
+the layers itself into a mappable IOSurface, a path this port already serves.
+
+`0393` injects `tools/mondrian-safari.m` into MobileSafari at exec through the
+same gate as the BT shim; its constructor sets the flag before WebKit reads it
+and appends a line to `/private/var/mobile/Library/Preferences/mondrian-safari.log`
+so the next boot says whether it ran. Building it is
+`tools/build-mondrian-safari.sh out/mondrian-safari.dylib`, and the file goes to
+`/private/var/vm` with `wfile` like the other injected dylibs.
+
 Measured the same day, the surfaces say where the page stops: the GPU process
 creates its `w30r` surface and locks it, **the WebContent process creates none at
 all**, and the GPU process's surface still reads zero after `unlock`. Safari's
