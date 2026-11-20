@@ -704,10 +704,17 @@ the daemon reached its HCI setup; after that file was deleted - it was a valid
 SQLite file - `securityd` never creates a new one. After a full boot none of
 `keychain-2.db`, `-wal`, `-shm` or `keychain-2-debug.db` exists, while
 `/private/var/Keychains` is writable (`wfile` of a probe file succeeds), and
-`bluetoothd` dies seven times with `-25291` and `_exit(1)`. So the database is
-created only when `securityd` decides the keychain is available, and nothing on
-this port tells it: `0392` stores the notification port and never posts a lock
-state, so the first `SecItemAdd` opens nothing and reports unavailable.
+`bluetoothd` dies seven times with `-25291` and `_exit(1)`.
+
+Seeding that path with a valid empty SQLite file before boot changes the
+outcome: `securityd` keeps it (`rf` opens it, errno 0) and `bluetoothd` runs
+once with **no exit** for the whole boot, against seven exits without it. The
+gate is therefore the existence of the database, not its contents: this
+`securityd` does not create it, and a plausible empty file is enough to pass
+(an empty `sqlite3` database with one table created and dropped, written with
+`usb-ring.py wfile` before boot). `0392` keeps no notification port
+(`registerNotificationPort` releases it), so nothing on this port triggers the
+creation.
 
 The selector answers were the problem. `kAKSWrapKey` takes two scalars - the bag
 and the **protection class** - and returns one: the class the item must be stored
