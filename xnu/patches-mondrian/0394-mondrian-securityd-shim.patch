@@ -1,0 +1,58 @@
+xnu 0394: inject a logging shim into securityd
+
+securityd is the only process that sees the keychain refuse an item, and it
+writes nowhere this port can read. The kernel side is not the blocker: measured
+2026-11-20, selectors 14, 10 and 11 all answer 0x0 and SecItemAdd still returns
+errSecNotAvailable, so the reason exists only inside that process.
+
+The shim redirects stderr to a file `rf` reads, interposes the os_log entry
+points for the messages that name the keychain or a bag, and reports any
+non-zero exit with a backtrace. This branch injects it under the same
+`mondrianbt` gate as the Bluetooth and Safari dylibs.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2180ba2..c76eee9 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5915,6 +5915,33 @@ mondrian_safari_env(struct image_params *imgp, char *env, size_t size)
+ 	return true;
+ }
+ 
++static bool
++mondrian_securityd_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	const char *name;
++	const char inject[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-securityd.dylib";
++	const char inject_path[] = "/private/var/vm/mondrian-securityd.dylib";
++
++	if (!PE_parse_boot_argn("mondrianbt", &enabled, sizeof(enabled)) ||
++	    !enabled || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(inject) > size) {
++		return false;
++	}
++	if (!mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "securityd")) {
++		return false;
++	}
++	if (!mondrian_dylib_in_vm(inject_path)) {
++		return false;
++	}
++	strlcpy(env, inject, size);
++	return true;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -6304,6 +6331,8 @@ exec_extract_strings(struct image_params *imgp)
+ 			injected = "bluetooth transport";
+ 		} else if (mondrian_safari_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "safari dom flag";
++		} else if (mondrian_securityd_env(imgp, inject_env, sizeof(inject_env))) {
++			injected = "securityd log";
+ 		}
+ 		if (injected != NULL) {
+ 			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_env), UIO_SYSSPACE, TRUE);
