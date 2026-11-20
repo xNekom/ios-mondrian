@@ -15168,6 +15168,7 @@ static void *
 mondrian_open_thread(void *unused)
 {
 	struct timespec seen = { 0, 0 };
+	char last[160] = { 0 };
 
 	(void)unused;
 	for (;;) {
@@ -15181,11 +15182,6 @@ mondrian_open_thread(void *unused)
 		if (stat("/private/var/vm/mondrian-open", &st) != 0) {
 			continue;
 		}
-		if (st.st_mtimespec.tv_sec == seen.tv_sec &&
-		    st.st_mtimespec.tv_nsec == seen.tv_nsec) {
-			continue;
-		}
-		seen = st.st_mtimespec;
 		file = fopen("/private/var/vm/mondrian-open", "r");
 		if (file == NULL || fgets(bundle, sizeof(bundle), file) == NULL) {
 			if (file != NULL) {
@@ -15198,6 +15194,21 @@ mondrian_open_thread(void *unused)
 		if (bundle[0] == '\0') {
 			continue;
 		}
+		/*
+		 * The timestamp alone is not a request: this HFS answers a write
+		 * without moving the mtime (measured 2026-11-20, the kernel logged
+		 * `WFILE /private/var/vm/mondrian-open 38 bytes -> 0` and this
+		 * thread never ran). The contents are the request, so a URL that
+		 * carries a fresh query is a new one; the timestamp still covers a
+		 * repeated bundle id.
+		 */
+		if (strcmp(bundle, last) == 0 &&
+		    st.st_mtimespec.tv_sec == seen.tv_sec &&
+		    st.st_mtimespec.tv_nsec == seen.tv_nsec) {
+			continue;
+		}
+		strlcpy(last, bundle, sizeof(last));
+		seen = st.st_mtimespec;
 		workspace = ((id (*)(id, SEL))objc_msgSend)(
 		    (id)objc_getClass("LSApplicationWorkspace"),
 		    sel_registerName("defaultWorkspace"));
