@@ -1,0 +1,93 @@
+xnu 0390: `ls` lists a directory instead of only its valence
+
+`mondrian_hfs_list` answered every directory with its count and no entries, and
+`mondrian_hfs_rmtree` deletes nothing for the same reason, so a full root could
+not be emptied or even measured. Three causes, all measured 2026-11-20.
+
+The vnode came from `vnode_lookup`, which is enough to getattr a file and not
+enough for `VNOP_READDIR` here: the driver lists an open directory, so it is
+`vnode_open`/`vnode_close` now. The first read of a directory carries the two
+dot entries and nothing else, which the loop took as the end - it now advances
+the offset and asks again. And the record sanity check compared `d_reclen` with
+`sizeof(struct dirent)`, while HFS+ packs `sizeof(struct dirent) - (NAME_MAX+1)`
+bytes of header and then the name; every record failed it, which is the reason
+the listing was empty rather than the reason it came back short.
+
+`deltree` prints the mount's free-block counters around its walk, and that is
+how the regression showed: 2.3 GiB free in the image, 38 MB at first reading,
+zero blocks on the next boot, with `del` answering ENOENT to the swap files it
+could not read back.
+diff --git a/bsd/mondrian_hfs/core/hfs_vfsops.c b/bsd/mondrian_hfs/core/hfs_vfsops.c
+index 17a359b..e1de70f 100644
+--- a/bsd/mondrian_hfs/core/hfs_vfsops.c
++++ b/bsd/mondrian_hfs/core/hfs_vfsops.c
+@@ -190,6 +190,14 @@ static const char * const mondrian_tree_roots[] = {
+ #define MONDRIAN_TREE_VALENCE 100000
+ /* two `struct hfs_stddotentry` (12 bytes each) precede the first `struct dirent` */
+ #define MONDRIAN_TREE_DOTS    24
++/*
++ * A packed record is a `struct dirent` without its name array: a 12-byte
++ * header and then the name, padded to four. Reading the fields through
++ * `struct dirent` is fine (same order), but comparing `d_reclen` with
++ * `sizeof(struct dirent)` rejected every entry - and that is why every
++ * listing was empty and `deltree` never removed anything.
++ */
++#define MONDRIAN_DIRENT_MIN    ((sizeof(struct dirent) - (NAME_MAX + 1)) + 4)
+ 
+ static char mondrian_tree_pend[MONDRIAN_TREE_MAX][MONDRIAN_TREE_PATH];
+ static char mondrian_tree_batch[MONDRIAN_TREE_BATCH][NAME_MAX + 1];
+@@ -277,7 +285,7 @@ mondrian_tree_names(vnode_t dvp, off_t off, off_t *next, int *errp)
+ 		struct dirent *de = (struct dirent *)(void *)
+ 		    (mondrian_tree_buf + pos);
+ 
+-		if (de->d_reclen < sizeof(struct dirent) ||
++		if (de->d_reclen < MONDRIAN_DIRENT_MIN ||
+ 		    pos + de->d_reclen > total) {
+ 			/* Ask again from the same offset rather than guess. */
+ 			*next = off;
+@@ -330,13 +338,18 @@ mondrian_hfs_list(const char *path, int max)
+ 	off_t off = 0;
+ 	int shown = 0, err = 0, saved = 0, error;
+ 
+-	error = vnode_lookup(path, 0, &dvp, ctx);
++	/*
++	 * Open, not just look up: measured 2026-11-20, a vnode from
++	 * vnode_lookup() answers VNOP_READDIR with zero entries, with or
++	 * without the valence forced - the driver lists an open directory.
++	 */
++	error = vnode_open(path, FREAD, 0, 0, &dvp, ctx);
+ 	if (error != 0) {
+ 		printf("MONDRIAN LS: %s -> %d\n", path, error);
+ 		return error;
+ 	}
+ 	if (vnode_vtype(dvp) != VDIR) {
+-		vnode_put(dvp);
++		vnode_close(dvp, FREAD, ctx);
+ 		printf("MONDRIAN LS: %s is not a directory\n", path);
+ 		return ENOTDIR;
+ 	}
+@@ -355,6 +368,15 @@ mondrian_hfs_list(const char *path, int max)
+ 			break;
+ 		}
+ 		if (count == 0) {
++			/*
++			 * A first read can carry the two dot entries and nothing
++			 * else (measured 2026-11-20, every directory): the offset
++			 * moved, so the listing continues instead of ending here.
++			 */
++			if (next > off) {
++				off = next;
++				continue;
++			}
+ 			break;
+ 		}
+ 		for (i = 0; i < count && shown < max; i++) {
+@@ -389,7 +411,7 @@ mondrian_hfs_list(const char *path, int max)
+ 			off = next;
+ 		}
+ 	}
+-	vnode_put(dvp);
++	vnode_close(dvp, FREAD, ctx);
+ 	return 0;
+ }
+ 
