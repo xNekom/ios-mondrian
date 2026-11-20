@@ -181,7 +181,10 @@ if [ ! -f "$PREFIX/lib/libhostcompat.a" ] ||
 fi
 
 say "checking the toolchain"
-"$PREFIX/cctools/bin/ld" -v 2>&1 | head -2
+# `|| true`: ld prints two lines and exits, head closes the pipe, and with
+# pipefail that SIGPIPE became the script's status (141) after a complete
+# install, so the next run looked like a build that had failed.
+"$PREFIX/cctools/bin/ld" -v 2>&1 | head -2 || true
 "$PREFIX/bin/migcom" -version 2>&1 | head -1 || true
 echo
 echo "toolchain ready in $PREFIX"
