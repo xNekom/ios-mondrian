@@ -15,14 +15,14 @@ if command -v xcrun >/dev/null 2>&1 &&
     sdk=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null) &&
     [ -d "$sdk" ] && [ -n "$(ls -A "$sdk" 2>/dev/null)" ]; then
 	xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
-		-dynamiclib -Os -fno-common -fvisibility=hidden \
+		-dynamiclib -Os -fblocks -fno-common -fvisibility=hidden \
 		-install_name /private/var/vm/mondrian-bt.dylib \
 		-o "$out" "$root/tools/mondrian-bt.c"
 else
 	sdk=${IOS_SDK:-/root/sdks/iPhoneOS16.5.sdk}
 	ld=${LD64_LLD:-/usr/lib/llvm-18/bin/ld64.lld}
-	clang -target arm64-apple-ios16.0 -isysroot "$sdk" -c -Os -fno-common \
-		-fvisibility=hidden "$root/tools/mondrian-bt.c" -o "$out.o"
+	clang -target arm64-apple-ios16.0 -isysroot "$sdk" -c -Os -fblocks \
+		-fno-common -fvisibility=hidden "$root/tools/mondrian-bt.c" -o "$out.o"
 	"$ld" -arch arm64 -platform_version ios 16.0 16.0 -dylib \
 		-install_name /private/var/vm/mondrian-bt.dylib \
 		-syslibroot "$sdk" -L"$sdk/usr/lib" -undefined dynamic_lookup \

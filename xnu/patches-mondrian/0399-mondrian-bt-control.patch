@@ -1,0 +1,409 @@
+xnu 0399: com.apple.uart.sk.bluetooth, the HCI transport bluetoothd uses
+
+0386 put the HCI transport behind /dev/cu.bluetooth on the strength of the
+access() pair and the termios imports in bluetoothd. The disassembly of
+/usr/sbin/bluetoothd (16.7.16) says otherwise: BT_HCI_TRANSPORT=H4:POSIX
+parses to the H4 transport and the POSIX driver, and that driver creates a
+PF_SYSTEM socket, resolves "com.apple.uart.sk.bluetooth" with CTLIOCGINFO at
+0x100066d34, connects, and asks the control for a termios (0x40487413) and a
+16-byte UUID (0x40105412). The UUID is fed to os_channel_create(); with no
+Skywalk nexus behind it that call returns NULL, and the same driver falls back
+to write(2) at 0x1000676a4 and read(2) at 0x100067a9c on the control socket.
+The tty is never opened by the transport: the access() check only decides that
+FindLocalMacAddress should not look for an IORegistry node.
+
+This adds the control the POSIX driver connects to. It forwards write(2) to
+the existing QUP wrapper 2 engine and polls the engine every 10 ms into
+ctl_enqueuedata(), the same rate the tty used: 115 bytes at 115200 fit the
+128-byte RX FIFO. The termios and UART options the daemon sets are accepted
+and printed; the engine stays at the measured 14745600 Hz root and 8N1.
+
+The control is registered from the root-mount probe block, next to
+mondrian_bt_tty_init(), before launchd starts bluetoothd. /dev/cu.bluetooth
+stays, because FindLocalMacAddress looks for it before the control is used.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c34682e..d579bb6 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/mondrian_thermal.c		standard
+ bsd/dev/mondrian_haptics.c		standard
+ bsd/dev/mondrian_btuart.c		standard
+ bsd/dev/mondrian_bt_tty.c		standard
++bsd/dev/mondrian_btctl.c		standard
+ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+diff --git a/bsd/dev/mondrian_bt_tty.c b/bsd/dev/mondrian_bt_tty.c
+index 3c4165b..aa4607b 100755
+--- a/bsd/dev/mondrian_bt_tty.c
++++ b/bsd/dev/mondrian_bt_tty.c
+@@ -1,19 +1,19 @@
+ /*
+- * /dev/cu.bluetooth: the HCI transport bluetoothd opens on this phone.
++ * /dev/cu.bluetooth: the node bluetoothd looks for before it uses this port.
+  *
+- * Measured on iOS 16.7.16: bluetoothd's primary path is an IOKit
+- * AppleBluetoothModule service (absent here), and its fallback checks
+- * access("/dev/cu.bluetooth") and then access("/dev/uart.bluetooth") before
+- * giving up and logging "No valid serial port found". It imports tcgetattr,
+- * tcsetattr, cfsetspeed and cfmakeraw, so the node has to behave like a serial
+- * port, not like a pipe: this is a tty whose output goes to the QUP wrapper 2
+- * engine (bsd/dev/mondrian_btuart.c) and whose input is drained into the line
+- * discipline from a one-tick timeout.
++ * Measured on iOS 16.7.16: the H4:POSIX transport is the kernel control in
++ * bsd/dev/mondrian_btctl.c, not this tty. What touches /dev/cu.bluetooth is
++ * FindLocalMacAddress, which access()es it (then /dev/uart.bluetooth) to
++ * decide that a serial port exists before it tries the IORegistry. The node
++ * must exist from boot because bluetoothd starts during early userspace,
++ * before a ring command could create anything.
+  *
+- * The node exists from boot because that is when bluetoothd looks for it: the
+- * process starts during early userspace, before any ring command could create
+- * anything. The chip is powered and the wire is programmed on the first open,
+- * which is also the first moment the part has to be alive.
++ * The tty itself stays as the debugging path for the same engine: its output
++ * goes to the QUP wrapper 2 engine (bsd/dev/mondrian_btuart.c) and its input
++ * is drained into the line discipline from a one-tick timeout. The chip is
++ * powered and the wire programmed on the first open, which makes an explicit
++ * open of this node (or the control's connect) the moment the part has to be
++ * alive.
+  *
+  * The process that uses this port cannot log (its stderr is discarded and the
+  * ring is not reachable from its sandbox), so the driver prints the first
+diff --git a/bsd/dev/mondrian_btctl.c b/bsd/dev/mondrian_btctl.c
+new file mode 100644
+index 0000000..9c9d16c
+--- /dev/null
++++ b/bsd/dev/mondrian_btctl.c
+@@ -0,0 +1,311 @@
++/*
++ * com.apple.uart.sk.bluetooth: the HCI transport bluetoothd opens on this
++ * phone.
++ *
++ * Measured in /usr/sbin/bluetoothd (16.7.16): with BT_HCI_TRANSPORT=H4:POSIX
++ * the daemon does not open /dev/cu.bluetooth. The POSIX driver creates a
++ * PF_SYSTEM socket, asks the kernel control named "com.apple.uart.sk.bluetooth"
++ * for its id (CTLIOCGINFO at 0x100066d34), connects to it, and asks for two
++ * private options: a 72-byte termios (0x40487413) and a 16-byte channel UUID
++ * (0x40105412), which it feeds to os_channel_create. When that channel cannot
++ * be created - there is no Skywalk nexus behind it here - the same driver
++ * falls back to write(2) and read(2) on the control socket (0x1000676a4 and
++ * 0x100067a9c). This control is that socket: the bytes go to the QUP wrapper 2
++ * engine in bsd/dev/mondrian_btuart.c, the same engine the tty used.
++ *
++ * The node /dev/cu.bluetooth still exists: FindLocalMacAddress in the same
++ * binary access()es it to decide that a serial port is present, before it
++ * tries the IORegistry.
++ *
++ * The options are Darwin's _IO* encoding, so they arrive with their size and
++ * direction bits intact. The 12-byte UART option is
++ * { maxReadSize=1024, rxWatermark=63, txWatermark=63 } as measured at
++ * 0x100675260 in the daemon; it only matters to the channel path, which is
++ * not used.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kern_control.h>
++#include <sys/mbuf.h>
++#include <sys/errno.h>
++#include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/termios.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++
++extern int mondrian_btuart_tty_open(void);
++extern int mondrian_btuart_tty_write(const void *buf, size_t len);
++extern int mondrian_btuart_tty_read(void *buf, size_t cap);
++
++#define MONDRIAN_BTCTL_NAME     "com.apple.uart.sk.bluetooth"
++
++#define MONDRIAN_BTCTL_GET_TERMIOS      0x40487413      /* _IOR('t', 0x13, struct termios) */
++#define MONDRIAN_BTCTL_GET_UUID         0x40105412      /* _IOR('t', 0x12, uuid_t) */
++#define MONDRIAN_BTCTL_SET_UART         0x800c5414      /* _IOW('T', 0x14, 12) */
++#define MONDRIAN_BTCTL_SET_TERMIOS      0x80487414      /* _IOW('t', 0x14, struct termios) */
++
++#define MONDRIAN_BTCTL_POLL_MS          10
++#define MONDRIAN_BTCTL_RX_MAX           128
++#define MONDRIAN_BTCTL_LOG_PACKETS      8
++
++static LCK_GRP_DECLARE(mondrian_btctl_grp, "mondrian_btctl");
++static LCK_MTX_DECLARE(mondrian_btctl_lock, &mondrian_btctl_grp);
++
++static kern_ctl_ref mondrian_btctl_kref;
++static thread_call_t mondrian_btctl_call;
++
++static struct {
++	kern_ctl_ref kref;
++	uint32_t unit;
++	int active;
++	int tx_logged;
++	int rx_logged;
++} mondrian_btctl;
++
++static void mondrian_btctl_poll(thread_call_param_t, thread_call_param_t);
++
++static void
++mondrian_btctl_dump(const char *what, const uint8_t *buf, int n)
++{
++	char line[128];
++	int m;
++
++	m = snprintf(line, sizeof(line), "MONDRIAN BTCTL: %s %d", what, n);
++	for (int i = 0; i < n && i < 24 && m < (int)sizeof(line) - 4; i++) {
++		m += snprintf(line + m, sizeof(line) - (size_t)m, " %02x",
++		    buf[i]);
++	}
++	printf("%s\n", line);
++}
++
++static errno_t
++mondrian_btctl_connect(kern_ctl_ref kref, struct sockaddr_ctl *sac,
++    void **unitinfo)
++{
++	int error;
++
++	lck_mtx_lock(&mondrian_btctl_lock);
++	if (mondrian_btctl.active) {
++		lck_mtx_unlock(&mondrian_btctl_lock);
++		printf("MONDRIAN BTCTL: connect refused, already open\n");
++		return EBUSY;
++	}
++	mondrian_btctl.kref = kref;
++	mondrian_btctl.unit = sac->sc_unit;
++	mondrian_btctl.tx_logged = 0;
++	mondrian_btctl.rx_logged = 0;
++	mondrian_btctl.active = 1;
++	lck_mtx_unlock(&mondrian_btctl_lock);
++
++	error = mondrian_btuart_tty_open();
++	if (error != 0) {
++		lck_mtx_lock(&mondrian_btctl_lock);
++		mondrian_btctl.active = 0;
++		lck_mtx_unlock(&mondrian_btctl_lock);
++		printf("MONDRIAN BTCTL: engine open failed %d\n", error);
++		return error;
++	}
++	printf("MONDRIAN BTCTL: connected unit %u\n", mondrian_btctl.unit);
++	*unitinfo = &mondrian_btctl;
++	mondrian_btctl_poll(NULL, NULL);
++	return 0;
++}
++
++static errno_t
++mondrian_btctl_disconnect(__unused kern_ctl_ref kref, __unused uint32_t unit,
++    __unused void *unitinfo)
++{
++	lck_mtx_lock(&mondrian_btctl_lock);
++	mondrian_btctl.active = 0;
++	lck_mtx_unlock(&mondrian_btctl_lock);
++	printf("MONDRIAN BTCTL: disconnected\n");
++	return 0;
++}
++
++static errno_t
++mondrian_btctl_send(__unused kern_ctl_ref kref, __unused uint32_t unit,
++    __unused void *unitinfo, mbuf_t m, __unused int flags)
++{
++	mbuf_t head = m;
++	int total = 0;
++
++	for (; m != NULL; m = mbuf_next(m)) {
++		size_t len = mbuf_len(m);
++		const uint8_t *data = (const uint8_t *)mbuf_data(m);
++
++		if (len == 0) {
++			continue;
++		}
++		if (mondrian_btctl.tx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {
++			mondrian_btctl.tx_logged++;
++			mondrian_btctl_dump("tx", data,
++			    (int)MIN(len, (size_t)24));
++		}
++		if (mondrian_btuart_tty_write(data, len) < 0) {
++			m_freem(head);
++			return EIO;
++		}
++		total += (int)len;
++	}
++	m_freem(head);
++	return total > 0 ? 0 : EINVAL;
++}
++
++static errno_t
++mondrian_btctl_getopt(__unused kern_ctl_ref kref, __unused uint32_t unit,
++    __unused void *unitinfo, int opt, void *data, size_t *len)
++{
++	struct termios t;
++
++	switch (opt) {
++	case MONDRIAN_BTCTL_GET_TERMIOS:
++		if (*len < sizeof(t)) {
++			*len = sizeof(t);
++			return ENOMEM;
++		}
++		bzero(&t, sizeof(t));
++		/* cfmakeraw() and cfsetspeed() in the daemon fix the rest. */
++		t.c_ispeed = 115200;
++		t.c_ospeed = 115200;
++		bcopy(&t, data, sizeof(t));
++		*len = sizeof(t);
++		return 0;
++
++	case MONDRIAN_BTCTL_GET_UUID:
++		/*
++		 * A UUID that names no nexus: os_channel_create() returns NULL
++		 * and bluetoothd uses read/write on this socket.
++		 */
++		if (*len < 16) {
++			*len = 16;
++			return ENOMEM;
++		}
++		{
++			static const uint8_t no_nexus[16] = {
++				0x4d, 0x4f, 0x4e, 0x44, 0x52, 0x49, 0x41,
++				0x4e, 0x42, 0x54, 0x43, 0x54, 0x4c, 0x30,
++				0x30, 0x31
++			};
++
++			bcopy(no_nexus, data, sizeof(no_nexus));
++		}
++		*len = 16;
++		return 0;
++
++	default:
++		return ENOTSUP;
++	}
++}
++
++static errno_t
++mondrian_btctl_setopt(__unused kern_ctl_ref kref, __unused uint32_t unit,
++    __unused void *unitinfo, int opt, void *data, size_t len)
++{
++	switch (opt) {
++	case MONDRIAN_BTCTL_SET_UART:
++		if (len >= 12) {
++			const uint32_t *v = (const uint32_t *)data;
++
++			printf("MONDRIAN BTCTL: uart cfg %u %u %u\n",
++			    v[0], v[1], v[2]);
++		}
++		return 0;
++
++	case MONDRIAN_BTCTL_SET_TERMIOS:
++		if (len >= sizeof(struct termios)) {
++			const struct termios *t = (const struct termios *)data;
++
++			printf("MONDRIAN BTCTL: termios iflag 0x%lx "
++			    "oflag 0x%lx cflag 0x%lx lflag 0x%lx "
++			    "ispeed %lu ospeed %lu\n",
++			    (unsigned long)t->c_iflag,
++			    (unsigned long)t->c_oflag,
++			    (unsigned long)t->c_cflag,
++			    (unsigned long)t->c_lflag,
++			    (unsigned long)t->c_ispeed,
++			    (unsigned long)t->c_ospeed);
++		}
++		return 0;
++
++	default:
++		return ENOTSUP;
++	}
++}
++
++static void
++mondrian_btctl_poll(thread_call_param_t p0, thread_call_param_t p1)
++{
++	uint8_t buf[MONDRIAN_BTCTL_RX_MAX];
++	kern_ctl_ref kref;
++	uint32_t unit;
++	size_t space = 0;
++	int active, n;
++
++	(void)p0;
++	(void)p1;
++
++	lck_mtx_lock(&mondrian_btctl_lock);
++	active = mondrian_btctl.active;
++	kref = mondrian_btctl.kref;
++	unit = mondrian_btctl.unit;
++	lck_mtx_unlock(&mondrian_btctl_lock);
++
++	if (!active) {
++		return;
++	}
++	if (ctl_getenqueuespace(kref, unit, &space) == 0 && space > 0) {
++		size_t cap = MIN(space, sizeof(buf));
++
++		n = mondrian_btuart_tty_read(buf, cap);
++		if (n > 0) {
++			if (mondrian_btctl.rx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {
++				mondrian_btctl.rx_logged++;
++				mondrian_btctl_dump("rx", buf,
++				    MIN(n, 24));
++			}
++			(void) ctl_enqueuedata(kref, unit, buf, (size_t)n, 0);
++		}
++	}
++
++	lck_mtx_lock(&mondrian_btctl_lock);
++	if (mondrian_btctl.active) {
++		uint64_t deadline;
++
++		clock_interval_to_deadline(MONDRIAN_BTCTL_POLL_MS,
++		    NSEC_PER_MSEC, &deadline);
++		(void) thread_call_enter_delayed(mondrian_btctl_call, deadline);
++	}
++	lck_mtx_unlock(&mondrian_btctl_lock);
++}
++
++void
++mondrian_bt_ctl_init(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t error;
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, MONDRIAN_BTCTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_sendsize = 64 * 1024;
++	reg.ctl_recvsize = 64 * 1024;
++	reg.ctl_connect = mondrian_btctl_connect;
++	reg.ctl_disconnect = mondrian_btctl_disconnect;
++	reg.ctl_send = mondrian_btctl_send;
++	reg.ctl_getopt = mondrian_btctl_getopt;
++	reg.ctl_setopt = mondrian_btctl_setopt;
++
++	mondrian_btctl_call = thread_call_allocate(mondrian_btctl_poll, NULL);
++	if (mondrian_btctl_call == NULL) {
++		printf("MONDRIAN BTCTL: no thread call\n");
++		return;
++	}
++	error = ctl_register(&reg, &mondrian_btctl_kref);
++	if (error != 0) {
++		printf("MONDRIAN BTCTL: ctl_register failed %d\n", error);
++		return;
++	}
++	printf("MONDRIAN BTCTL: control \"%s\" registered\n",
++	    MONDRIAN_BTCTL_NAME);
++}
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index c34f747..80f0307 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2201,12 +2201,14 @@ mondrian_log_start(void)
+ 		extern void mondrian_touch_probe(void);
+ 		extern void mondrian_usb_probe(void);
+ 		extern void mondrian_bt_tty_init(void);
++		extern void mondrian_bt_ctl_init(void);
+ 		extern void mondrian_spmi_probe(void);
+ 
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
+ 		mondrian_bt_tty_init();
++		mondrian_bt_ctl_init();
+ 		mondrian_spmi_probe();
+ 	}
+ }
