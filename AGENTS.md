@@ -31,6 +31,7 @@ in this file has no check, so a rule cannot be prose only.
 | R06 | `tools/boards.py` and `shim/board.h` carry the same numbers |
 | R07 | Every `.github/skills/*/SKILL.md` names its own directory |
 | R08 | Patch numbering, hunk headers and tool syntax (`tools/validate-repo.py`) |
+| R09 | The first-party tests under `tools/tests` pass |
 
 `--only R06` runs one check, `--list` prints the ids, `--verbose` adds detail.
 CI runs the same file (`.github/workflows/validate.yml`), so a local pass is
