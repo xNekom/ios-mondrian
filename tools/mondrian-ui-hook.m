@@ -39,6 +39,16 @@ typedef struct _xpc_connection_s *xpc_connection_t;
 typedef struct _xpc_object_s *xpc_object_t;
 extern xpc_object_t xpc_connection_send_message_with_reply_sync(
     xpc_connection_t connection, xpc_object_t message);
+extern xpc_connection_t xpc_connection_create_mach_service(const char *name,
+    dispatch_queue_t targetq, uint64_t flags);
+extern void xpc_connection_resume(xpc_connection_t connection);
+extern xpc_object_t xpc_dictionary_create(const char *const *keys,
+    xpc_object_t *values, size_t count);
+extern void xpc_dictionary_set_string(xpc_object_t dictionary, const char *key,
+    const char *value);
+extern void xpc_connection_send_message(xpc_connection_t connection,
+    xpc_object_t message);
+extern void xpc_release(xpc_object_t object);
 extern const char *xpc_connection_get_name(xpc_connection_t connection);
 extern char *xpc_copy_description(xpc_object_t object);
 extern int xpc_pipe_routine(xpc_object_t pipe, xpc_object_t message,
@@ -2125,6 +2135,844 @@ mondrian_run_once(void)
 }
 
 /*
+ * bluetoothd only powers the chip when a client asks it to, and the Control
+ * Center toggle stays inert while the daemon reports no controller. SpringBoard
+ * is where the toggle would run, so ask through the same private framework from
+ * here: an unsigned child process cannot exec on this root (measured: the hook's
+ * posix_spawn of /private/var/vm/bt-power fails), but a dylib injected into
+ * SpringBoard runs with its entitlements. The marker file arms it and the loop
+ * retries until the daemon reports powered, or forty tries have gone by.
+ */
+static void
+bluetooth_power_dump(id instance)
+{
+	unsigned int count = 0;
+	Method *methods;
+	Ivar *ivars;
+	unsigned int i;
+
+	methods = class_copyMethodList(object_getClass(instance), &count);
+	mondrian_probe_fmt("MONDRIAN BTPOWER: %u methods\n", count);
+	for (i = 0; i < count; i++) {
+		const char *name = sel_getName(method_getName(methods[i]));
+
+		if (strstr(name, "ower") != NULL || strstr(name, "XPC") != NULL ||
+		    strstr(name, "send") != NULL || strstr(name, "connect") != NULL) {
+			mondrian_probe_fmt("MONDRIAN BTPOWER:   - %s\n", name);
+		}
+	}
+	free(methods);
+	ivars = class_copyIvarList(object_getClass(instance), &count);
+	mondrian_probe_fmt("MONDRIAN BTPOWER: %u ivars\n", count);
+	for (i = 0; i < count; i++) {
+		const char *name = ivar_getName(ivars[i]);
+		const char *type = ivar_getTypeEncoding(ivars[i]);
+		id value;
+
+		if (type == NULL || type[0] != '@') {
+			mondrian_probe_fmt("MONDRIAN BTPOWER:   %s %s\n", name,
+			    type != NULL ? type : "?");
+			continue;
+		}
+		value = object_getIvar(instance, ivars[i]);
+		mondrian_probe_fmt("MONDRIAN BTPOWER:   %s -> %s\n", name,
+		    value != nil ? class_getName(object_getClass(value)) : "nil");
+	}
+	free(ivars);
+}
+
+static int
+bluetooth_has_ivar(Class cls, const char *needle)
+{
+	unsigned int count = 0;
+	Ivar *ivars;
+	unsigned int i;
+	int found = 0;
+
+	ivars = class_copyIvarList(cls, &count);
+	for (i = 0; i < count; i++) {
+		const char *name = ivar_getName(ivars[i]);
+
+		if (name != NULL && strstr(name, needle) != NULL) {
+			found = 1;
+		}
+	}
+	free(ivars);
+	return found;
+}
+
+static void
+bluetooth_power_native(id instance, void *library)
+{
+	static const char *const names[] = {
+		"BTLocalDeviceSetPowerState",
+		"BTLocalDeviceGetPowerState",
+		"BTLocalDeviceGetDefault",
+		"BTSessionAttachWithQueue",
+		"BTSessionDetachWithQueue",
+		"BluetoothLocalDeviceSetPowerState",
+		"BTLocalDevicePower",
+	};
+	Class cls = object_getClass(instance);
+	Ivar device_ivar = class_getInstanceVariable(cls, "_localDevice");
+	Ivar session_ivar = class_getInstanceVariable(cls, "_session");
+	Ivar available_ivar = class_getInstanceVariable(cls, "_available");
+	void *device = NULL;
+	void *session = NULL;
+	int available = -99;
+	unsigned int i;
+
+	if (device_ivar != NULL) {
+		device = *(void **)((char *)instance + ivar_getOffset(device_ivar));
+	}
+	if (session_ivar != NULL) {
+		session = *(void **)((char *)instance + ivar_getOffset(session_ivar));
+	}
+	if (available_ivar != NULL) {
+		available = *(int *)((char *)instance + ivar_getOffset(available_ivar));
+	}
+	mondrian_probe_fmt("MONDRIAN BTPOWER: ivars device %p session %p available %d\n",
+	    device, session, available);
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		void *symbol = dlsym(library != NULL ? library : RTLD_DEFAULT, names[i]);
+
+		mondrian_probe_fmt("MONDRIAN BTPOWER: sym %s %p\n", names[i], symbol);
+	}
+	if (device != NULL) {
+		int (*set_state)(void *, int) = (int (*)(void *, int))
+		    dlsym(library != NULL ? library : RTLD_DEFAULT,
+		    "BTLocalDeviceSetPowerState");
+
+		if (set_state != NULL) {
+			int result = set_state(device, 1);
+
+			mondrian_probe_fmt("MONDRIAN BTPOWER: C set state 1 -> %d\n",
+			    result);
+		}
+	}
+}
+
+static void
+bluetooth_scan_once(id manager)
+{
+	static int done;
+	static const char *const candidates[] = {
+		"startScan",
+		"startScanning",
+		"scan",
+		"startDiscovery",
+		"startScanForDevices",
+		"scanForDevices",
+	};
+	Class cls = object_getClass(manager);
+	unsigned int i;
+
+	if (done) {
+		return;
+	}
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+		SEL sel = sel_registerName(candidates[i]);
+		Method method = class_getInstanceMethod(cls, sel);
+
+		if (method == NULL) {
+			continue;
+		}
+		mondrian_probe_fmt("MONDRIAN BTSCAN: %s args %u type %s\n",
+		    candidates[i], method_getNumberOfArguments(method),
+		    method_getTypeEncoding(method));
+		if (method_getNumberOfArguments(method) == 2) {
+			((void (*)(id, SEL))objc_msgSend)(manager, sel);
+			mondrian_probe_fmt("MONDRIAN BTSCAN: called %s\n",
+			    candidates[i]);
+			done = 1;
+			return;
+		}
+	}
+	/*
+	 * None of the guessed selectors exists with no arguments: list what
+	 * the class actually has so the next build calls the right one.
+	 */
+	{
+		unsigned int count = 0;
+		Method *methods = class_copyMethodList(cls, &count);
+
+		for (i = 0; i < count; i++) {
+			const char *name = sel_getName(method_getName(methods[i]));
+
+			if (strstr(name, "can") != NULL ||
+			    strstr(name, "Scan") != NULL ||
+			    strstr(name, "iscover") != NULL ||
+			    strstr(name, "Discover") != NULL) {
+				mondrian_probe_fmt("MONDRIAN BTSCAN: - %s args %u\n",
+				    name, method_getNumberOfArguments(methods[i]));
+			}
+		}
+		free(methods);
+		done = 1;
+	}
+}
+
+/*
+ * The Settings row for Bluetooth is drawn only when BluetoothManager reports a
+ * controller, so the root list hides it while the daemon has no client. The
+ * pane itself still exists (Preferences.app carries the prefs:root=Bluetooth
+ * specifier), and opening it by URL tells the two cases apart: a pane that
+ * loads with a working toggle means only the row is gated; a pane that says
+ * unavailable points at the daemon's client path.
+ */
+static void
+bluetooth_open_pane(void)
+{
+	static int attempt;
+	static const char *const urls[] = {
+		"app-prefs:root=Bluetooth",
+		"App-prefs:Bluetooth",
+		"prefs:root=Bluetooth",
+	};
+	static NSURL *url;
+	static int done;
+	Class workspace_class;
+	id workspace;
+	BOOL opened;
+
+	if (done || !mondrian_file_on("/private/var/vm/bt-openpane") ||
+	    __builtin_strcmp(getprogname(), "SpringBoard") != 0) {
+		return;
+	}
+	if (attempt >= (int)(sizeof(urls) / sizeof(urls[0]))) {
+		done = 1;
+		return;
+	}
+	/*
+	 * The Preferences bundle declares the app-prefs scheme (measured from
+	 * its Info.plist), so a prefs: URL is not the one to hand to
+	 * LaunchServices. Try one per tick and stop at the first that opens.
+	 */
+	url = [NSURL URLWithString:[NSString stringWithUTF8String:
+	    urls[attempt]]];
+	attempt++;
+	workspace_class = objc_getClass("LSApplicationWorkspace");
+	workspace = workspace_class != Nil ?
+	    ((id (*)(id, SEL))objc_msgSend)((id)workspace_class,
+	    sel_registerName("defaultWorkspace")) : nil;
+	mondrian_probe_fmt("MONDRIAN BTPANE: %s workspace %p url %p\n",
+	    urls[attempt - 1], workspace, url);
+	if (workspace != nil && url != nil) {
+		opened = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(workspace,
+		    sel_registerName("openSensitiveURL:withOptions:"), url, nil);
+		mondrian_probe_fmt("MONDRIAN BTPANE: open -> %d\n", opened);
+		done = opened;
+	}
+}
+
+/*
+ * BluetoothManager leaves _session NULL on this root, so nothing asks the
+ * daemon for a local device and Settings hides the row. The framework's own
+ * private C API is the reliable way in: attach a session with a callback, then
+ * take the default local device and power it. The event numbers are logged
+ * rather than decoded, because the header is not in the SDK.
+ */
+typedef struct BTSessionImpl *BTSession;
+typedef struct BTLocalDeviceImpl *BTLocalDevice;
+typedef void (*bt_session_callback_t)(BTSession session, int event,
+    int result);
+
+static void *bluetooth_manager_library;
+
+static void
+bluetooth_session_event(BTSession session, int event, int result)
+{
+	BTLocalDevice device = NULL;
+	int (*get_default)(BTSession, BTLocalDevice *);
+	int (*set_power)(BTLocalDevice, int);
+	int status = -1;
+
+	mondrian_probe_fmt("MONDRIAN BTSESSION: event %d result %d session %p\n",
+	    event, result, session);
+	if (result != 0 || session == NULL) {
+		return;
+	}
+	get_default = (int (*)(BTSession, BTLocalDevice *))
+	    dlsym(bluetooth_manager_library, "BTLocalDeviceGetDefault");
+	if (get_default != NULL) {
+		status = get_default(session, &device);
+	}
+	mondrian_probe_fmt("MONDRIAN BTSESSION: device %p result %d\n",
+	    device, status);
+	set_power = (int (*)(BTLocalDevice, int))
+	    dlsym(bluetooth_manager_library, "BTLocalDeviceSetPowerState");
+	if (device != NULL && set_power != NULL) {
+		mondrian_probe_fmt("MONDRIAN BTSESSION: power 1 -> %d\n",
+		    set_power(device, 1));
+	}
+}
+
+static void
+bluetooth_session_attach(void)
+{
+	static int attached;
+	int (*attach)(char *, bt_session_callback_t, void *, dispatch_queue_t);
+	int result;
+
+	if (attached || bluetooth_manager_library == NULL ||
+	    !mondrian_file_on("/private/var/vm/bt-client")) {
+		return;
+	}
+	attached = 1;
+	attach = (int (*)(char *, bt_session_callback_t, void *,
+	    dispatch_queue_t))dlsym(bluetooth_manager_library,
+	    "BTSessionAttachWithQueue");
+	if (attach == NULL) {
+		mondrian_probe_fmt("MONDRIAN BTSESSION: no attach\n");
+		return;
+	}
+	result = attach("MondrianSettings", bluetooth_session_event, NULL,
+	    dispatch_get_main_queue());
+	mondrian_probe_fmt("MONDRIAN BTSESSION: attach -> %d\n", result);
+}
+
+/*
+ * Everything the client side can be refused on, in one dump: the framework's
+ * own init error, the entitlements SecTask sees for this process, and whether
+ * the legacy Mach channel to bluetoothd opens at all. The attach itself fails
+ * with 9 here, and none of these three is visible from the daemon side.
+ */
+static void
+bluetooth_diag(id manager)
+{
+	static const char *const entitlements[] = {
+		"com.apple.bluetooth.system",
+		"com.apple.bluetooth.internal",
+		"com.apple.bluetooth",
+	};
+	void *security;
+	void *(*create_from_self)(CFAllocatorRef);
+	CFTypeRef (*copy_entitlement)(void *, CFStringRef, void *);
+	mach_port_t (*server_port)(void);
+	unsigned int i;
+
+	mondrian_probe_fmt("MONDRIAN BTDIAG: lastInitError %d\n",
+	    ((int (*)(id, SEL))objc_msgSend)(object_getClass(manager),
+	    sel_registerName("lastInitError")));
+	server_port = (mach_port_t (*)(void))dlsym(bluetooth_manager_library,
+	    "ServerPort");
+	if (server_port != NULL) {
+		mondrian_probe_fmt("MONDRIAN BTDIAG: ServerPort -> %u\n",
+		    server_port());
+	} else {
+		mondrian_probe_fmt("MONDRIAN BTDIAG: no ServerPort\n");
+	}
+	security = dlopen("/System/Library/Frameworks/Security.framework/"
+	    "Security", RTLD_NOW);
+	create_from_self = security != NULL ?
+	    dlsym(security, "SecTaskCreateFromSelf") : NULL;
+	copy_entitlement = security != NULL ?
+	    dlsym(security, "SecTaskCopyValueForEntitlement") : NULL;
+	if (create_from_self == NULL || copy_entitlement == NULL) {
+		mondrian_probe_fmt("MONDRIAN BTDIAG: no SecTask\n");
+		return;
+	}
+	{
+		void *task = create_from_self(kCFAllocatorDefault);
+
+		for (i = 0; i < sizeof(entitlements) / sizeof(entitlements[0]);
+		    i++) {
+			CFStringRef name = CFStringCreateWithCString(
+			    kCFAllocatorDefault, entitlements[i],
+			    kCFStringEncodingUTF8);
+			CFTypeRef value = copy_entitlement(task, name, NULL);
+			int granted = value != NULL &&
+			    CFGetTypeID(value) == CFBooleanGetTypeID() &&
+			    CFBooleanGetValue(value);
+
+			mondrian_probe_fmt("MONDRIAN BTDIAG: %s -> %d\n",
+			    entitlements[i], granted);
+			if (value != NULL) {
+				CFRelease(value);
+			}
+			CFRelease(name);
+		}
+		CFRelease(task);
+	}
+}
+
+/*
+ * The attach fails with no IPC, no TCC query and no MobileGestalt answer, so
+ * the refusal is inside the client framework. Its own strings name the check:
+ * scan the loaded images of BluetoothManager and MobileBluetooth for the few
+ * keywords that can gate an attach and print them.
+ */
+static void
+bluetooth_scan_strings(const char *path, uintptr_t base,
+    const struct mach_header_64 *header)
+{
+	static const char *const keywords[] = {
+		"entitl", "thoriz", "TCC", "not supported", "unavailable",
+		"com.apple.bluetooth",
+	};
+	static int budget = 80;
+	const struct load_command *command;
+	uint64_t text_vmaddr = 0;
+	uint32_t index;
+
+	if (budget <= 0 || header->magic != MH_MAGIC_64) {
+		return;
+	}
+	command = (const struct load_command *)(header + 1);
+	for (index = 0; index < header->ncmds && budget > 0; index++) {
+		const struct segment_command_64 *segment;
+		const unsigned char *bytes;
+		uint64_t size;
+		uint64_t at;
+		unsigned int k;
+
+		if (command->cmd != LC_SEGMENT_64) {
+			command = (const struct load_command *)
+			    ((uintptr_t)command + command->cmdsize);
+			continue;
+		}
+		segment = (const struct segment_command_64 *)command;
+		if (strcmp(segment->segname, "__TEXT") == 0) {
+			text_vmaddr = segment->vmaddr;
+		}
+		/* Shared-cache images carry their preferred addresses. */
+		bytes = (const unsigned char *)(segment->vmaddr + base -
+		    text_vmaddr);
+		size = segment->vmsize;
+		if (text_vmaddr == 0 ||
+		    strcmp(segment->segname, "__LINKEDIT") == 0) {
+			size = 0;
+		}
+		for (at = 0; at + 5 < size && budget > 0; at++) {
+			char run[160];
+			uint64_t start = at;
+			uint64_t length;
+
+			if (bytes[at] < 0x20 || bytes[at] > 0x7e) {
+				continue;
+			}
+			while (at < size && bytes[at] >= 0x20 &&
+			    bytes[at] <= 0x7e) {
+				at++;
+			}
+			length = at - start;
+			if (length < 8) {
+				continue;
+			}
+			if (length > sizeof(run) - 1) {
+				length = sizeof(run) - 1;
+			}
+			memcpy(run, bytes + start, (size_t)length);
+			run[length] = '\0';
+			for (k = 0; k < sizeof(keywords) / sizeof(keywords[0]);
+			    k++) {
+				if (strstr(run, keywords[k]) != NULL) {
+					budget--;
+					mondrian_probe_fmt(
+					    "MONDRIAN BTFW: %s: %.140s\n",
+					    path, run);
+					break;
+				}
+			}
+		}
+		command = (const struct load_command *)
+		    ((uintptr_t)command + command->cmdsize);
+	}
+}
+
+static void
+bluetooth_dump_framework_strings(void)
+{
+	unsigned int count = _dyld_image_count();
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		const struct mach_header *header = _dyld_get_image_header(i);
+		const char *path = _dyld_get_image_name(i);
+
+		if (header == NULL || path == NULL) {
+			continue;
+		}
+		if (strstr(path, "BluetoothManager.framework") == NULL &&
+		    strstr(path, "MobileBluetooth.framework") == NULL) {
+			continue;
+		}
+		mondrian_probe_fmt("MONDRIAN BTFW: image %s at %p\n", path,
+		    header);
+		bluetooth_scan_strings(path, (uintptr_t)header,
+		    (const struct mach_header_64 *)header);
+	}
+}
+
+/*
+ * The attach refuses with 9 after the entitlement queries come back true, so
+ * the branch that refuses is in the function itself. Its code is written as
+ * hex from the loaded image: the framework lives in the shared cache, whose
+ * file is not on this root, and 2 KB around the entry point is enough to see
+ * the test that returns the error.
+ */
+static void
+bluetooth_dump_attach_code(void)
+{
+	void *function = dlsym(bluetooth_manager_library,
+	    "BTSessionAttachWithQueue");
+	char path[] = "/private/var/mobile/Library/Preferences/bt-fn.hex";
+	unsigned char bytes[2048];
+	Dl_info info;
+	int fd;
+	int written;
+
+	if (function == NULL || dladdr(function, &info) == 0) {
+		mondrian_probe_fmt("MONDRIAN BTCODE: no function\n");
+		return;
+	}
+	mondrian_probe_fmt("MONDRIAN BTCODE: %p %s+0x%lx\n", function,
+	    info.dli_fname,
+	    (unsigned long)((uintptr_t)function - (uintptr_t)info.dli_fbase));
+	memcpy(bytes, function, sizeof(bytes));
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		mondrian_probe_fmt("MONDRIAN BTCODE: open %d\n", errno);
+		return;
+	}
+	for (written = 0; written < (int)sizeof(bytes); written += 32) {
+		char line[80];
+		int at = 0;
+		int index;
+
+		for (index = 0; index < 32; index++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at,
+			    "%02x", bytes[written + index]);
+		}
+		line[at++] = '\n';
+		if (write(fd, line, (size_t)at) != at) {
+			break;
+		}
+	}
+	close(fd);
+	mondrian_probe_fmt("MONDRIAN BTCODE: %d bytes written\n", written);
+}
+
+/* Name the function behind a PLT stub: symbol first, then its GOT slot. */
+static void
+bluetooth_name_stub(void *target)
+{
+	const uint32_t *code = target;
+	uint64_t adrp = 0;
+	Dl_info info;
+	int index;
+
+	if (dladdr(target, &info) != 0 && info.dli_sname != NULL) {
+		mondrian_probe_fmt("MONDRIAN BTCALL: %p %s\n", target,
+		    info.dli_sname);
+		return;
+	}
+	for (index = 0; index < 4; index++) {
+		uint32_t word = code[index];
+
+		if ((word & 0x9F000000u) == 0x90000000u) {
+			int64_t immhi = (int64_t)((word >> 5) & 0x7FFFF);
+			int64_t imm = (immhi << 2) | ((word >> 29) & 3);
+			uint64_t pc = (uintptr_t)target +
+			    (uint64_t)index * 4;
+
+			if (imm & (1 << 20)) {
+				imm -= (1 << 21);
+			}
+			adrp = (pc & ~0xFFFull) + (uint64_t)(imm << 12);
+			continue;
+		}
+		if ((word & 0xFFC00000u) == 0xF9400000u && adrp != 0) {
+			void *pointer = *(void **)(adrp +
+			    (((word >> 10) & 0xFFF) * 8));
+
+			if (dladdr(pointer, &info) != 0) {
+				mondrian_probe_fmt(
+				    "MONDRIAN BTCALL: %p -> %s\n", target,
+				    info.dli_sname != NULL ? info.dli_sname :
+				    info.dli_fname);
+			}
+			return;
+		}
+	}
+	mondrian_probe_fmt("MONDRIAN BTCALL: %p unresolved\n", target);
+}
+
+/*
+ * Two C-string arguments gate the attach with inverted polarity, and their
+ * pages are far enough from the image that the dump above cannot resolve them.
+ * Decoding ADRP+ADD in the entry point recovers both literals, and each BL
+ * lands in a stub whose image dladdr names.
+ */
+static void
+bluetooth_dump_call_strings(void)
+{
+	void *function = dlsym(bluetooth_manager_library,
+	    "BTSessionAttachWithQueue");
+	const uint32_t *code = function;
+	uint64_t adrp = 0;
+	int index;
+
+	if (function == NULL) {
+		return;
+	}
+	for (index = 0; index < 120; index++) {
+		uint32_t word = code[index];
+		uint64_t pc = (uintptr_t)function + (uint64_t)index * 4;
+
+		if ((word & 0x9F000000u) == 0x90000000u &&
+		    (word & 0x1Fu) == 0) {
+			int64_t immhi = (int64_t)((word >> 5) & 0x7FFFF);
+			int64_t imm = (immhi << 2) | ((word >> 29) & 3);
+
+			if (imm & (1 << 20)) {
+				imm -= (1 << 21);
+			}
+			adrp = (pc & ~0xFFFull) + (uint64_t)(imm << 12);
+			continue;
+		}
+		if ((word & 0xFFC00000u) == 0x91000000u &&
+		    ((word >> 5) & 0x1Fu) == 0 && adrp != 0) {
+			const char *text = (const char *)(adrp +
+			    ((word >> 10) & 0xFFF));
+
+			mondrian_probe_fmt("MONDRIAN BTSTR: %p %.120s\n",
+			    text, text);
+			adrp = 0;
+			continue;
+		}
+		if ((word & 0xFC000000u) == 0x94000000u) {
+			int64_t imm = word & 0x3FFFFFF;
+			void *target;
+			Dl_info info;
+
+			if (imm & 0x2000000) {
+				imm -= 0x4000000;
+			}
+			target = (void *)(pc + (uint64_t)(imm << 2));
+			if (dladdr(target, &info) != 0) {
+				mondrian_probe_fmt("MONDRIAN BTCALL: %s+0x%lx\n",
+				    info.dli_fname, (unsigned long)
+				    ((uintptr_t)target -
+				    (uintptr_t)info.dli_fbase));
+			}
+			bluetooth_name_stub(target);
+		}
+	}
+}
+
+/*
+ * The whole __cstring of MobileBluetooth, written to the app's own container
+ * so the host can read the vocabulary of the framework: the error the attach
+ * returns and the names it tests are strings, and guessing them from a keyword
+ * filter has already missed twice.
+ */
+static void
+bluetooth_dump_cstrings(void)
+{
+	char path[] = "/private/var/mobile/Library/Preferences/bt-cstr.bin";
+	unsigned int count = _dyld_image_count();
+	unsigned int image;
+
+	for (image = 0; image < count; image++) {
+		const struct mach_header_64 *header =
+		    (const struct mach_header_64 *)_dyld_get_image_header(image);
+		const char *name = _dyld_get_image_name(image);
+		const struct load_command *command;
+		uint64_t text_base = 0;
+		uint64_t text_vmaddr = 0;
+		uint32_t index;
+
+		if (header == NULL || name == NULL ||
+		    strstr(name, "MobileBluetooth.framework") == NULL ||
+		    header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const struct load_command *)(header + 1);
+		for (index = 0; index < header->ncmds; index++) {
+			const struct segment_command_64 *segment;
+
+			if (command->cmd != LC_SEGMENT_64) {
+				command = (const struct load_command *)
+				    ((uintptr_t)command + command->cmdsize);
+				continue;
+			}
+			segment = (const struct segment_command_64 *)command;
+			if (strcmp(segment->segname, "__TEXT") == 0) {
+				text_base = (uintptr_t)header;
+				text_vmaddr = segment->vmaddr;
+			}
+			if (text_vmaddr != 0 &&
+			    strcmp(segment->segname, "__TEXT") == 0) {
+				const struct section_64 *section =
+				    (const struct section_64 *)(segment + 1);
+				uint32_t at;
+
+				for (at = 0; at < segment->nsects; at++) {
+					if (strcmp(section[at].sectname,
+					    "__cstring") != 0) {
+						continue;
+					}
+					{
+						const void *bytes = (const void *)
+						    (section[at].addr + text_base -
+						    text_vmaddr);
+						int fd = open(path, O_WRONLY |
+						    O_CREAT | O_TRUNC, 0644);
+						size_t size = section[at].size;
+
+						if (size > 65536) {
+							size = 65536;
+						}
+						if (fd < 0) {
+							mondrian_probe_fmt(
+							    "MONDRIAN CSTR: open %d\n",
+							    errno);
+							return;
+						}
+						mondrian_probe_fmt(
+						    "MONDRIAN CSTR: %lu bytes\n",
+						    (unsigned long)size);
+						(void)write(fd, bytes, size);
+						close(fd);
+					}
+				}
+			}
+			command = (const struct load_command *)
+			    ((uintptr_t)command + command->cmdsize);
+		}
+	}
+}
+
+static void
+bluetooth_power_once(void)
+{
+	static Class manager_class;
+	static id manager_instance;
+	static void *manager_library;
+	static SEL responds_sel;
+	static SEL set_powered_sel;
+	static SEL powered_sel;
+	static SEL available_sel;
+	static SEL set_value_sel;
+	static int attempts;
+	static int dumped;
+	BOOL (*responds_to)(id, SEL, SEL);
+	BOOL (*is_powered)(id, SEL);
+	void (*set_powered_fn)(id, SEL, BOOL);
+
+	if (attempts >= 40 || __builtin_strcmp(getprogname(), "SpringBoard") != 0) {
+		return;
+	}
+	if (!mondrian_file_on("/private/var/vm/bt-power")) {
+		return;
+	}
+	attempts++;
+	if (manager_class == Nil) {
+		void *library;
+
+		library = dlopen("/System/Library/PrivateFrameworks/"
+		    "BluetoothManager.framework/BluetoothManager", RTLD_NOW);
+		manager_library = library;
+		bluetooth_manager_library = library;
+		mondrian_probe_fmt("MONDRIAN BTPOWER: dlopen %s\n",
+		    library != NULL ? "ok" : dlerror());
+		manager_class = objc_getClass("BluetoothManager");
+		if (manager_class == Nil) {
+			return;
+		}
+		responds_sel = sel_registerName("respondsToSelector:");
+		set_powered_sel = sel_registerName("setPowered:");
+		powered_sel = sel_registerName("powered");
+		available_sel = sel_registerName("available");
+		set_value_sel = sel_registerName("setValue:forKey:");
+		manager_instance = ((id (*)(id, SEL))objc_msgSend)((id)manager_class,
+		    sel_registerName("sharedInstance"));
+		mondrian_probe_fmt("MONDRIAN BTPOWER: instance %p\n", manager_instance);
+	}
+	if (manager_instance == Nil) {
+		return;
+	}
+	bluetooth_session_attach();
+	responds_to = (BOOL (*)(id, SEL, SEL))objc_msgSend;
+	is_powered = (BOOL (*)(id, SEL))objc_msgSend;
+	if (!dumped) {
+		static const char *const services[] = {
+			"com.apple.server.bluetooth",
+			"com.apple.bluetooth.xpc",
+			"com.apple.BlueTool",
+		};
+		unsigned int service;
+
+		dumped = 1;
+		bluetooth_power_dump(manager_instance);
+		bluetooth_power_native(manager_instance, manager_library);
+		bluetooth_diag(manager_instance);
+		if (mondrian_file_on("/private/var/vm/bt-lookup")) {
+			bluetooth_dump_framework_strings();
+			bluetooth_dump_attach_code();
+			bluetooth_dump_call_strings();
+			bluetooth_dump_cstrings();
+		}
+		for (service = 0; service < 3; service++) {
+			mach_port_t port = MACH_PORT_NULL;
+			kern_return_t kr;
+
+			kr = bootstrap_look_up(bootstrap_port, services[service], &port);
+			mondrian_probe_fmt("MONDRIAN BTPOWER: lookup %s kr %d port %u\n",
+			    services[service], kr, port);
+			if (port != MACH_PORT_NULL) {
+				mach_port_deallocate(mach_task_self(), port);
+			}
+		}
+		mondrian_probe_fmt("MONDRIAN BTPOWER: available %d powered %d\n",
+		    responds_to(manager_instance, responds_sel, available_sel) ?
+		    is_powered(manager_instance, available_sel) : -1,
+		    is_powered(manager_instance, powered_sel));
+		/*
+		 * The framework refuses to send the power message while it believes
+		 * there is no controller. KVC reaches the ivar behind the readonly
+		 * property, so set it and let the regular path send the request.
+		 */
+		if (responds_to(manager_instance, responds_sel,
+		    sel_registerName("setValue:forKey:")) &&
+		    bluetooth_has_ivar(object_getClass(manager_instance),
+		    "vailable")) {
+			((void (*)(id, SEL, id, id))objc_msgSend)(manager_instance,
+			    set_value_sel, (id)kCFBooleanTrue, (id)CFSTR("available"));
+			mondrian_probe_fmt("MONDRIAN BTPOWER: available forced\n");
+		} else {
+			mondrian_probe_fmt("MONDRIAN BTPOWER: no available ivar\n");
+		}
+	}
+	if (attempts % 5 == 0) {
+		mondrian_probe_fmt("MONDRIAN BTPOWER: try %d available %d powered %d\n",
+		    attempts,
+		    responds_to(manager_instance, responds_sel, available_sel) ?
+		    is_powered(manager_instance, available_sel) : -1,
+		    is_powered(manager_instance, powered_sel));
+	}
+	if (is_powered(manager_instance, powered_sel)) {
+		mondrian_probe_fmt("MONDRIAN BTPOWER: powered after %d tries\n",
+		    attempts);
+		bluetooth_scan_once(manager_instance);
+		attempts = 40;
+		return;
+	}
+	if (!responds_to(manager_instance, responds_sel, set_powered_sel)) {
+		mondrian_probe_fmt("MONDRIAN BTPOWER: no setPowered:\n");
+		attempts = 40;
+		return;
+	}
+	set_powered_fn = (void (*)(id, SEL, BOOL))objc_msgSend;
+	if (attempts <= 3 || attempts % 10 == 0) {
+		mondrian_probe_fmt("MONDRIAN BTPOWER: setPowered YES (try %d)\n",
+		    attempts);
+	}
+	set_powered_fn(manager_instance, set_powered_sel, YES);
+}
+
+/*
  * The heartbeat stops after a minute; a test can be uploaded at any time, so
  * the run file gets a watcher of its own that never stops asking. It costs one
  * open() every two seconds and says nothing unless it has something to run.
@@ -2136,6 +2984,8 @@ run_watcher(void *unused)
 	for (;;) {
 		sleep(2);
 		mondrian_run_once();
+		bluetooth_power_once();
+		bluetooth_open_pane();
 	}
 	return NULL;
 }
@@ -8425,6 +9275,454 @@ mondrian_layer_report(void)
 	}
 }
 
+/*
+ * A switch of the hook's own, because the glass cannot say which of a UISwitch's
+ * layers is missing: in Settings the row's track is drawn and its knob is not
+ * (measured 2026-11-20, the Airplane Mode row). One built here, in SpringBoard,
+ * goes through the same render server, and printing its whole layer tree says
+ * whether the knob is a layer that is not composed, a picture whose contents
+ * never arrive, or a colour a filter removes.
+ *
+ * Switch: /private/var/vm/mondrian-switch, a number the hook has not seen.
+ * 1 adds the switch and dumps it, 2 sets it on, 3 sets it off, 4 dumps again;
+ * every request dumps on this tick and the next, because the first one is
+ * before the layout has run.
+ */
+static id mondrian_switch_view;
+static unsigned long mondrian_switch_seen;
+static unsigned mondrian_switch_pending;
+
+/*
+ * What a picture layer's CGImage actually holds, because "invisible" has two
+ * meanings here: the image may be empty (nothing decoded) or full of pixels the
+ * transfer drops. Four quadrant samples and a nonzero count separate them. Skips
+ * anything bigger than 4 Mpixel: the probe must not allocate a full screen.
+ */
+static void
+mondrian_image_sample(CGImageRef image, char *out, size_t len)
+{
+	size_t width, height, row, x, y, nonzero = 0, total = 0;
+	uint8_t *pixels;
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+
+	snprintf(out, len, " sample -");
+	if (image == NULL) {
+		return;
+	}
+	width = CGImageGetWidth(image);
+	height = CGImageGetHeight(image);
+	if (width == 0 || height == 0 || width * height > 4 * 1024 * 1024) {
+		return;
+	}
+	row = width * 4;
+	pixels = calloc(1, row * height);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	ctx = pixels != NULL && rgb != NULL ? CGBitmapContextCreate(pixels, width, height,
+	    8, row, rgb, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+	if (ctx != NULL) {
+		CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+		for (y = 0; y < height; y += height / 4 > 0 ? height / 4 : 1) {
+			for (x = 0; x < width; x += width / 4 > 0 ? width / 4 : 1) {
+				if (*(uint32_t *)(pixels + y * row + x * 4) != 0) {
+					nonzero++;
+				}
+				total++;
+			}
+		}
+		snprintf(out, len, " sample %02x%02x%02x%02x nz %zu/%zu",
+		    pixels[0], pixels[1], pixels[2], pixels[3], nonzero, total);
+	}
+	if (ctx != NULL) {
+		CGContextRelease(ctx);
+	}
+	if (rgb != NULL) {
+		CGColorSpaceRelease(rgb);
+	}
+	free(pixels);
+}
+
+static void
+mondrian_switch_colour(id layer, char *out, size_t len){
+	CGColorRef colour;
+	const CGFloat *parts;
+	size_t n;
+
+	snprintf(out, len, "-");
+	if (layer == nil ||
+	    ![layer respondsToSelector:sel_registerName("backgroundColor")]) {
+		return;
+	}
+	colour = (CGColorRef)((id (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("backgroundColor"));
+	if (colour == NULL) {
+		return;
+	}
+	parts = CGColorGetComponents(colour);
+	n = CGColorGetNumberOfComponents(colour);
+	if (parts == NULL || n == 0) {
+		snprintf(out, len, "pattern");
+	} else if (n >= 4) {
+		snprintf(out, len, "%02x%02x%02x%02x", (unsigned)(parts[0] * 255.0 + 0.5),
+		    (unsigned)(parts[1] * 255.0 + 0.5), (unsigned)(parts[2] * 255.0 + 0.5),
+		    (unsigned)(parts[3] * 255.0 + 0.5));
+	} else if (n == 1) {
+		snprintf(out, len, "%02x", (unsigned)(parts[0] * 255.0 + 0.5));
+	}
+}
+
+static void
+mondrian_switch_layer(id layer, unsigned depth, unsigned *printed)
+{
+	char line[440], bg[16], kind[48] = "-", extra[220] = "";
+	id contents, subs;
+	unsigned n, i, filters = 0;
+	CGRect frame = CGRectZero;
+	float opacity = -1.0f, scale = -1.0f;
+	BOOL hidden = NO, masks = NO;
+	CGFloat corner = -1.0, border = -1.0;
+	const char *name;
+
+	if (layer == nil || depth > 6 || *printed >= 48) {
+		return;
+	}
+	name = object_getClassName(layer);
+	if ([layer respondsToSelector:sel_registerName("frame")]) {
+		frame = ((CGRect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("frame"));
+	}
+	if ([layer respondsToSelector:sel_registerName("opacity")]) {
+		opacity = ((float (*)(id, SEL))objc_msgSend)(layer, sel_registerName("opacity"));
+	}
+	if ([layer respondsToSelector:sel_registerName("contentsScale")]) {
+		scale = ((float (*)(id, SEL))objc_msgSend)(layer, sel_registerName("contentsScale"));
+	}
+	if ([layer respondsToSelector:sel_registerName("isHidden")]) {
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel_registerName("isHidden"));
+	}
+	if ([layer respondsToSelector:sel_registerName("masksToBounds")]) {
+		masks = ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel_registerName("masksToBounds"));
+	}
+	if ([layer respondsToSelector:sel_registerName("cornerRadius")]) {
+		corner = ((CGFloat (*)(id, SEL))objc_msgSend)(layer, sel_registerName("cornerRadius"));
+	}
+	if ([layer respondsToSelector:sel_registerName("borderWidth")]) {
+		border = ((CGFloat (*)(id, SEL))objc_msgSend)(layer, sel_registerName("borderWidth"));
+	}
+	if ([layer respondsToSelector:sel_registerName("filters")]) {
+		id list = mondrian_send(layer, "filters");
+		filters = list != nil ? (unsigned)[(NSArray *)list count] : 0;
+	}
+	mondrian_switch_colour(layer, bg, sizeof(bg));
+	contents = mondrian_send(layer, "contents");
+	if (contents != nil) {
+		CFTypeID type = CFGetTypeID((CFTypeRef)contents);
+		CFStringRef described = CFCopyTypeIDDescription(type);
+
+		if (described != NULL) {
+			(void)CFStringGetCString(described, kind, sizeof(kind),
+			    kCFStringEncodingUTF8);
+			CFRelease(described);
+		}
+		if (type == CGImageGetTypeID()) {
+			size_t row = CGImageGetBytesPerRow((CGImageRef)contents);
+
+			snprintf(extra, sizeof(extra), " %zux%zu model %d bpc %zu bpp %zu row %zu"
+			    " alpha %d",
+			    CGImageGetWidth((CGImageRef)contents),
+			    CGImageGetHeight((CGImageRef)contents),
+			    (int)CGColorSpaceGetModel(CGImageGetColorSpace((CGImageRef)contents)),
+			    CGImageGetBitsPerComponent((CGImageRef)contents),
+			    CGImageGetBitsPerPixel((CGImageRef)contents), row,
+			    (int)CGImageGetAlphaInfo((CGImageRef)contents));
+			mondrian_image_sample((CGImageRef)contents,
+			    extra + strlen(extra), sizeof(extra) - strlen(extra));
+		} else if (type == IOSurfaceGetTypeID()) {
+			snprintf(extra, sizeof(extra), " %zux%zu fmt %08x",
+			    IOSurfaceGetWidth((IOSurfaceRef)contents),
+			    IOSurfaceGetHeight((IOSurfaceRef)contents),
+			    (unsigned)IOSurfaceGetPixelFormat((IOSurfaceRef)contents));
+		}
+	}
+	(*printed)++;
+	snprintf(line, sizeof(line),
+	    "MONDRIAN SW: L%u %*s%s %.0f,%.0f %.0fx%.0f op %.2f hid %d mask %d bg %s"
+	    " corner %.1f border %.1f scale %.2f filters %u contents %s%s\n",
+	    depth, (int)(depth * 2), "", name != NULL ? name : "?", (double)frame.origin.x,
+	    (double)frame.origin.y, (double)frame.size.width, (double)frame.size.height,
+	    (double)opacity, (int)hidden, (int)masks, bg, (double)corner, (double)border,
+	    (double)scale, filters, contents != nil ? kind : "none", extra);
+	say(line);
+	subs = mondrian_send(layer, "sublayers");
+	n = subs != nil ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_switch_layer([(NSArray *)subs objectAtIndex:i], depth + 1, printed);
+	}
+}
+
+/*
+ * The knob, and the two ways the knob's picture can be lost on this port: the
+ * colour space says monochrome while the data is four bytes a pixel (the transfer
+ * then reads one byte a pixel), and a CGImage's pixels do not cross to the window
+ * server at all. `/private/var/vm/mondrian-switch-fix` picks which repair this
+ * run applies to every picture layer inside the switch: 1 a copy whose colour
+ * space is really RGB, 2 a client surface holding the same pixels, 3 both.
+ */
+static IOSurfaceRef
+mondrian_switch_surface(CGImageRef image)
+{
+	size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
+	size_t row = (width * 4 + 15) & ~(size_t)15;
+	CFMutableDictionaryRef props;
+	IOSurfaceRef surface;
+	CGColorSpaceRef space;
+	CGContextRef context;
+	uint32_t seed = 0;
+	int values[5];
+	const char *keys[5] = { "IOSurfaceWidth", "IOSurfaceHeight", "IOSurfaceBytesPerElement",
+		"IOSurfaceBytesPerRow", "IOSurfacePixelFormat" };
+	unsigned i;
+
+	if (width < 4 || height < 4 || row * height > 32u * 1024 * 1024) {
+		return NULL;
+	}
+	props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (props == NULL) {
+		return NULL;
+	}
+	values[0] = (int)width;
+	values[1] = (int)height;
+	values[2] = 4;
+	values[3] = (int)row;
+	values[4] = 'BGRA';
+	for (i = 0; i < 5; i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+		CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
+
+		CFDictionarySetValue(props, key, number);
+		CFRelease(number);
+		CFRelease(key);
+	}
+	surface = IOSurfaceCreate(props);
+	CFRelease(props);
+	if (surface == NULL || IOSurfaceLock(surface, 0, &seed) != 0) {
+		if (surface != NULL) {
+			CFRelease(surface);
+		}
+		return NULL;
+	}
+	space = CGColorSpaceCreateDeviceRGB();
+	context = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface), width, height, 8, row,
+	    space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(space);
+	if (context != NULL) {
+		CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+		CGContextFlush(context);
+		CGContextRelease(context);
+	}
+	IOSurfaceUnlock(surface, 0, &seed);
+	return surface;
+}
+
+static unsigned
+mondrian_switch_repair(id layer, unsigned depth, unsigned mode, unsigned *printed)
+{
+	id contents, subs;
+	unsigned n, i, hits = 0;
+
+	if (layer == nil || depth > 6) {
+		return 0;
+	}
+	contents = mondrian_send(layer, "contents");
+	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
+		CGImageRef image = (CGImageRef)contents;
+		CGImageRef copy = NULL;
+		IOSurfaceRef surface = NULL;
+		char line[220];
+
+		if (mode == 1 || mode == 3) {
+			CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+
+			if (rgb != NULL) {
+				copy = CGImageCreateCopyWithColorSpace(image, rgb);
+				CGColorSpaceRelease(rgb);
+			}
+		}
+		if (mode == 2 || mode == 3) {
+			surface = mondrian_switch_surface(copy != NULL ? copy : image);
+		}
+		if (surface != NULL) {
+			((void (*)(id, SEL, id))objc_msgSend)(layer,
+			    sel_registerName("setContents:"), (id)surface);
+			snprintf(line, sizeof(line), "MONDRIAN SW: repaired %s %zux%zu as surface %u\n",
+			    object_getClassName(layer), CGImageGetWidth(image),
+			    CGImageGetHeight(image), IOSurfaceGetID(surface));
+			say(line);
+			CFRelease(surface);
+			(*printed)++;
+			hits++;
+		} else if (copy != NULL) {
+			((void (*)(id, SEL, id))objc_msgSend)(layer,
+			    sel_registerName("setContents:"), (id)copy);
+			snprintf(line, sizeof(line), "MONDRIAN SW: repaired %s %zux%zu as RGB copy\n",
+			    object_getClassName(layer), CGImageGetWidth(image),
+			    CGImageGetHeight(image));
+			say(line);
+			CFRelease(copy);
+			(*printed)++;
+			hits++;
+		} else if (copy != NULL) {
+			CFRelease(copy);
+		}
+	}
+	subs = mondrian_send(layer, "sublayers");
+	n = subs != nil ? (unsigned)[(NSArray *)subs count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_switch_repair([(NSArray *)subs objectAtIndex:i], depth + 1, mode,
+		    printed);
+	}
+	return hits;
+}
+
+static void
+mondrian_switch_view_walk(id view, unsigned depth, unsigned *printed){
+	CGRect frame = CGRectZero;
+	BOOL hidden = NO;
+	CGFloat alpha = -1.0;
+	id kids;
+	unsigned n, i;
+	const char *name;
+
+	if (view == nil || depth > 4 || *printed >= 24) {
+		return;
+	}
+	name = object_getClassName(view);
+	if ([view respondsToSelector:sel_registerName("frame")]) {
+		frame = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("frame"));
+	}
+	if ([view respondsToSelector:sel_registerName("isHidden")]) {
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view, sel_registerName("isHidden"));
+	}
+	if ([view respondsToSelector:sel_registerName("alpha")]) {
+		alpha = ((CGFloat (*)(id, SEL))objc_msgSend)(view, sel_registerName("alpha"));
+	}
+	(*printed)++;
+	{
+		char line[200];
+
+		snprintf(line, sizeof(line), "MONDRIAN SW: V%u %*s%s %.0f,%.0f %.0fx%.0f hid %d"
+		    " alpha %.2f\n", depth, (int)(depth * 2), "", name != NULL ? name : "?",
+		    (double)frame.origin.x, (double)frame.origin.y, (double)frame.size.width,
+		    (double)frame.size.height, (int)hidden, (double)alpha);
+		say(line);
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_switch_view_walk([(NSArray *)kids objectAtIndex:i], depth + 1, printed);
+	}
+}
+
+static void
+mondrian_switch_probe(id app)
+{
+	static unsigned dumped;
+	FILE *file;
+	unsigned long wanted = 0;
+	id window = nil, windows;
+	unsigned count, i, printed = 0;
+	char line[128];
+
+	file = fopen("/private/var/vm/mondrian-switch", "r");
+	if (file == NULL) {
+		return;
+	}
+	if (fscanf(file, "%lu", &wanted) != 1) {
+		(void)fclose(file);
+		return;
+	}
+	(void)fclose(file);
+	if (wanted == 0 || (wanted == mondrian_switch_seen && mondrian_switch_pending == 0)) {
+		return;
+	}
+	if (wanted != mondrian_switch_seen) {
+		mondrian_switch_seen = wanted;
+		dumped = 0;
+		mondrian_switch_pending = 2;
+		if (mondrian_switch_view == nil && (wanted == 1 || wanted == 2 || wanted == 3)) {
+			Class switch_cls = objc_getClass("UISwitch");
+
+			windows = mondrian_send(app, "windows");
+			count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+			window = mondrian_send(app, "keyWindow");
+			for (i = 0; window == nil && i < count; i++) {
+				id candidate = [(NSArray *)windows objectAtIndex:i];
+				const char *name = object_getClassName(candidate);
+
+				if (name != NULL && strstr(name, "HomeScreenWindow") != NULL) {
+					window = candidate;
+				}
+			}
+			if (switch_cls == Nil || window == nil) {
+				say("MONDRIAN SW: no UISwitch or no window\n");
+				return;
+			}
+			mondrian_switch_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+			    ((id (*)(id, SEL))objc_msgSend)((id)switch_cls,
+			    sel_registerName("alloc")), sel_registerName("initWithFrame:"),
+			    CGRectMake(40.0, 120.0, 51.0, 31.0));
+			if (mondrian_switch_view == nil) {
+				say("MONDRIAN SW: UISwitch refused\n");
+				return;
+			}
+			((void (*)(id, SEL, id))objc_msgSend)(window,
+			    sel_registerName("addSubview:"), mondrian_switch_view);
+			((void (*)(id, SEL, id))objc_msgSend)(window,
+			    sel_registerName("bringSubviewToFront:"), mondrian_switch_view);
+			snprintf(line, sizeof(line), "MONDRIAN SW: added to %s\n",
+			    object_getClassName(window) != NULL ? object_getClassName(window) : "?");
+			say(line);
+		} else if (mondrian_switch_view != nil && (wanted == 2 || wanted == 3)) {
+			((void (*)(id, SEL, BOOL, BOOL))objc_msgSend)(mondrian_switch_view,
+			    sel_registerName("setOn:animated:"), wanted == 2 ? YES : NO, NO);
+		}
+	}
+	if (mondrian_switch_view == nil || mondrian_switch_pending == 0 || dumped >= 6) {
+		return;
+	}
+	mondrian_switch_pending--;
+	dumped++;
+	snprintf(line, sizeof(line), "MONDRIAN SW: dump %u, on %d, frame %.0fx%.0f\n", dumped,
+	    (int)((BOOL (*)(id, SEL))objc_msgSend)(mondrian_switch_view, sel_registerName("isOn")),
+	    (double)((CGRect (*)(id, SEL))objc_msgSend)(mondrian_switch_view,
+	    sel_registerName("frame")).size.width,
+	    (double)((CGRect (*)(id, SEL))objc_msgSend)(mondrian_switch_view,
+	    sel_registerName("frame")).size.height);
+	say(line);
+	mondrian_switch_view_walk(mondrian_switch_view, 0, &printed);
+	mondrian_switch_layer(mondrian_send(mondrian_switch_view, "layer"), 0, &printed);
+	{
+		FILE *fix = fopen("/private/var/vm/mondrian-switch-fix", "r");
+		unsigned mode = 0;
+
+		if (fix != NULL) {
+			if (fscanf(fix, "%u", &mode) != 1) {
+				mode = 0;
+			}
+			(void)fclose(fix);
+		}
+		if (mode != 0) {
+			unsigned changed = 0;
+
+			(void)mondrian_switch_repair(mondrian_send(mondrian_switch_view, "layer"), 0,
+			    mode, &changed);
+			if (changed == 0) {
+				say("MONDRIAN SW: nothing to repair\n");
+			}
+		}
+	}
+}
+
 static void
 mondrian_lock_step(void *context)
 {
@@ -8523,6 +9821,7 @@ mondrian_lock_step(void *context)
 		mondrian_layer_report();
 		mondrian_relabel_arm();
 		mondrian_deep_probe();
+		mondrian_switch_probe(app);
 		mondrian_picture_probe();
 		mondrian_live_paint();
 	}
@@ -14666,6 +15965,319 @@ struct mondrian_interpose {
 	const void *replacee;
 };
 
+/* Defined with the interpose tables below; the replacements call through. */
+static const struct mondrian_interpose mondrian_bootstrap_interpose;
+static const struct mondrian_interpose mondrian_bootstrap_look_up2_interpose;
+
+/*
+ * BTSessionAttachWithQueue returns 9 before any XPC connection reaches the
+ * daemon, so whatever it looks up in the bootstrap namespace is the missing
+ * link. Every lookup in this process is logged while
+ * /private/var/vm/bt-lookup exists; the tuple's replacee is the real
+ * implementation, which dlsym(RTLD_NEXT) could not reach in the daemon's case.
+ */
+static int mondrian_bt_lookup_armed = -1;
+
+static int
+mondrian_bt_lookup_on(void)
+{
+	if (mondrian_bt_lookup_armed < 0) {
+		mondrian_bt_lookup_armed =
+		    access("/private/var/vm/bt-lookup", F_OK) == 0;
+	}
+	return mondrian_bt_lookup_armed;
+}
+
+static kern_return_t
+mondrian_bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *port)
+{
+	static int budget = 300;
+	kern_return_t (*real)(mach_port_t, const char *, mach_port_t *);
+	kern_return_t result;
+
+	real = (kern_return_t (*)(mach_port_t, const char *,
+	    mach_port_t *))mondrian_bootstrap_interpose.replacee;
+	result = real != NULL ? real(bp, name, port) : (kern_return_t)5;
+	if (mondrian_bt_lookup_on() && budget > 0 && name != NULL) {
+		budget--;
+		mondrian_probe_fmt("MONDRIAN BSL: %s -> %d port %u\n", name,
+		    result, port != NULL ? *port : 0);
+	}
+	return result;
+}
+
+/* Not in this SDK's bootstrap.h; the interpose tuple needs the symbol. */
+extern kern_return_t bootstrap_look_up2(mach_port_t, const char *,
+    mach_port_t *, pid_t, uint64_t) __attribute__((weak_import));
+
+static kern_return_t
+mondrian_bootstrap_look_up2(mach_port_t bp, const char *name, mach_port_t *port,
+    pid_t target, uint64_t flags)
+{
+	static int budget = 300;
+	kern_return_t (*real)(mach_port_t, const char *, mach_port_t *, pid_t,
+	    uint64_t);
+	kern_return_t result;
+
+	real = (kern_return_t (*)(mach_port_t, const char *, mach_port_t *, pid_t,
+	    uint64_t))mondrian_bootstrap_look_up2_interpose.replacee;
+	result = real != NULL ? real(bp, name, port, target, flags) :
+	    (kern_return_t)5;
+	if (mondrian_bt_lookup_on() && budget > 0 && name != NULL) {
+		budget--;
+		mondrian_probe_fmt("MONDRIAN BSL2: %s -> %d port %u\n", name,
+		    result, port != NULL ? *port : 0);
+	}
+	return result;
+}
+
+/*
+ * The attach returns 9 without a single bootstrap lookup and without a TCC
+ * preflight, which leaves the capability query: MobileGestalt is what tells a
+ * client whether this hardware has Bluetooth at all, and a "no" there is a
+ * local refusal with no IPC to see. Logged for keys that mention it while the
+ * same marker is set.
+ */
+extern Boolean MGGetBoolAnswer(CFStringRef) __attribute__((weak_import));
+extern CFTypeRef MGCopyAnswer(CFStringRef) __attribute__((weak_import));
+
+static const struct mondrian_interpose mondrian_mg_bool_interpose;
+static const struct mondrian_interpose mondrian_mg_copy_interpose;
+
+static int
+mondrian_mg_interesting(const char *name)
+{
+	return name != NULL && (strstr(name, "luetooth") != NULL ||
+	    strstr(name, "BT") != NULL || strstr(name, "bt") != NULL);
+}
+
+static Boolean
+mondrian_mg_bool(CFStringRef key)
+{
+	static int budget = 200;
+	Boolean (*real)(CFStringRef) = (Boolean (*)(CFStringRef))
+	    mondrian_mg_bool_interpose.replacee;
+	Boolean result = real != NULL ? real(key) : 0;
+	const char *name = key != NULL ?
+	    [(__bridge NSString *)key UTF8String] : NULL;
+
+	if (mondrian_bt_lookup_on() && budget > 0 &&
+	    mondrian_mg_interesting(name)) {
+		budget--;
+		mondrian_probe_fmt("MONDRIAN MG: bool %s -> %d\n", name, result);
+	}
+	return result;
+}
+
+static CFTypeRef
+mondrian_mg_copy(CFStringRef key)
+{
+	static int budget = 200;
+	CFTypeRef (*real)(CFStringRef) = (CFTypeRef (*)(CFStringRef))
+	    mondrian_mg_copy_interpose.replacee;
+	CFTypeRef result = real != NULL ? real(key) : NULL;
+	const char *name = key != NULL ?
+	    [(__bridge NSString *)key UTF8String] : NULL;
+
+	if (mondrian_bt_lookup_on() && budget > 0 &&
+	    mondrian_mg_interesting(name)) {
+		budget--;
+		mondrian_probe_fmt("MONDRIAN MG: copy %s -> %p\n", name, result);
+	}
+	return result;
+}
+
+/*
+ * A client framework that gates its attach on an entitlement would refuse a
+ * process that lacks it without any IPC, which is exactly the measured
+ * behaviour. Under the same marker this answers every com.apple.bluetooth*
+ * query with true, so the next attach says whether that was the gate.
+ */
+extern CFTypeRef SecTaskCopyValueForEntitlement(void *, CFStringRef,
+    CFErrorRef *) __attribute__((weak_import));
+
+static const struct mondrian_interpose mondrian_sectask_interpose;
+
+static CFTypeRef
+mondrian_sectask_entitlement(void *task, CFStringRef entitlement,
+    CFErrorRef *error)
+{
+	CFTypeRef (*real)(void *, CFStringRef, CFErrorRef *);
+	CFTypeRef value;
+	const char *name = entitlement != NULL ?
+	    [(__bridge NSString *)entitlement UTF8String] : NULL;
+
+	real = (CFTypeRef (*)(void *, CFStringRef, CFErrorRef *))
+	    mondrian_sectask_interpose.replacee;
+	value = real != NULL ? real(task, entitlement, error) : NULL;
+	if (name != NULL && strncmp(name, "com.apple.bluetooth", 18) == 0 &&
+	    mondrian_bt_lookup_on()) {
+		int granted = value != NULL &&
+		    CFGetTypeID(value) == CFBooleanGetTypeID() &&
+		    CFBooleanGetValue(value);
+
+		if (!granted) {
+			mondrian_probe_fmt("MONDRIAN ENT: %s forced\n", name);
+			if (value != NULL) {
+				CFRelease(value);
+			}
+			value = CFRetain(kCFBooleanTrue);
+		}
+	}
+	return value;
+}
+
+/*
+ * The attach gate, decoded from MobileBluetooth's BTSessionAttachWithQueue:
+ * IOServiceNameMatching("marconi-bt"), then IOServiceGetMatchingService, and a
+ * second name if the first finds nothing; both failing returns 9 before any
+ * IPC. This port's kernel publishes no such node (the bluetoothd shim already
+ * answers the same two calls for the daemon), so the hook answers them here
+ * too: the service is a bare Mach port and the property read supplies the
+ * address the daemon also uses.
+ */
+static io_service_t mondrian_bt_service;
+static const uint8_t mondrian_bt_mac[6] = {
+	0xb1, 0x80, 0xed, 0x2e, 0xed, 0x13,
+};
+
+static const struct mondrian_interpose mondrian_io_service_interpose;
+static const struct mondrian_interpose mondrian_io_property_interpose;
+
+static int
+mondrian_bt_matching(CFDictionaryRef matching)
+{
+	static const CFStringRef keys[] = { CFSTR("IONameMatch") };
+	unsigned int index;
+
+	if (matching == NULL ||
+	    CFGetTypeID(matching) != CFDictionaryGetTypeID()) {
+		return 0;
+	}
+	for (index = 0; index < 2; index++) {
+		CFStringRef name = index == 0 ?
+		    (CFStringRef)CFDictionaryGetValue(matching,
+		    CFSTR("IONameMatch")) :
+		    (CFStringRef)CFDictionaryGetValue(matching,
+		    CFSTR("IOProviderClass"));
+		char text[32];
+
+		(void)keys;
+		if (name == NULL || CFGetTypeID(name) != CFStringGetTypeID() ||
+		    !CFStringGetCString(name, text, sizeof(text),
+		    kCFStringEncodingUTF8)) {
+			continue;
+		}
+		if (strcmp(text, "marconi-bt") == 0 ||
+		    strcmp(text, "bluetooth") == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static io_service_t
+mondrian_io_service_get(mach_port_t main_port, CFDictionaryRef matching)
+{
+	io_service_t (*real)(mach_port_t, CFDictionaryRef);
+	io_service_t service = 0;
+
+	real = (io_service_t (*)(mach_port_t, CFDictionaryRef))
+	    mondrian_io_service_interpose.replacee;
+	/*
+	 * /private/var/vm/bt-iokit keeps the synthetic answer for a boot without
+	 * the device-tree node; with the node in the ADT the real registry is
+	 * what has to be measured, so the default is to pass through.
+	 */
+	if (real == NULL || !mondrian_file_on("/private/var/vm/bt-iokit")) {
+		return real != NULL ? real(main_port, matching) : 0;
+	}
+	if (!mondrian_bt_matching(matching)) {
+		return real(main_port, matching);
+	}
+	if (mondrian_bt_service != 0) {
+		return mondrian_bt_service;
+	}
+	if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+	    &service) != KERN_SUCCESS) {
+		return 0;
+	}
+	if (mach_port_insert_right(mach_task_self(), service, service,
+	    MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+		mondrian_probe_fmt("MONDRIAN IOKIT: no send right\n");
+	}
+	mondrian_bt_service = service;
+	mondrian_probe_fmt("MONDRIAN IOKIT: synthetic bluetooth service %u\n",
+	    mondrian_bt_service);
+	return mondrian_bt_service;
+}
+
+static CFTypeRef
+mondrian_io_property(io_registry_entry_t entry, const char *plane,
+    CFStringRef key, CFAllocatorRef allocator, IOOptionBits options)
+{
+	CFTypeRef (*real)(io_registry_entry_t, const char *, CFStringRef,
+	    CFAllocatorRef, IOOptionBits);
+
+	if (entry != mondrian_bt_service) {
+		real = (CFTypeRef (*)(io_registry_entry_t, const char *,
+		    CFStringRef, CFAllocatorRef, IOOptionBits))
+		    mondrian_io_property_interpose.replacee;
+		return real != NULL ? real(entry, plane, key, allocator,
+		    options) : NULL;
+	}
+	if (key == NULL) {
+		return NULL;
+	}
+	if (CFEqual(key, CFSTR("local-mac-address"))) {
+		return CFDataCreate(allocator, mondrian_bt_mac,
+		    sizeof(mondrian_bt_mac));
+	}
+	return NULL;
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_io_service_interpose = {
+	(const void *)mondrian_io_service_get,
+	(const void *)IOServiceGetMatchingService,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_io_property_interpose = {
+	(const void *)mondrian_io_property,
+	(const void *)IORegistryEntrySearchCFProperty,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_sectask_interpose = {
+	(const void *)mondrian_sectask_entitlement,
+	(const void *)SecTaskCopyValueForEntitlement,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_bootstrap_interpose = {
+	(const void *)mondrian_bootstrap_look_up,
+	(const void *)bootstrap_look_up,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_bootstrap_look_up2_interpose = {
+	(const void *)mondrian_bootstrap_look_up2,
+	(const void *)bootstrap_look_up2,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_mg_bool_interpose = {
+	(const void *)mondrian_mg_bool,
+	(const void *)MGGetBoolAnswer,
+};
+
+__attribute__((used, section("__DATA,__interpose")))
+static const struct mondrian_interpose mondrian_mg_copy_interpose = {
+	(const void *)mondrian_mg_copy,
+	(const void *)MGCopyAnswer,
+};
+
 __attribute__((used, section("__DATA,__interpose")))
 static const struct mondrian_interpose mondrian_sbx_interpose = {
 	(const void *)mondrian_sbx_path,
@@ -15565,14 +17177,19 @@ static IOSurfaceRef
 mondrian_image_surface(CGImageRef image)
 {
 	size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
-	size_t row = width * 4;
+	size_t row = (width * 4 + 15) & ~(size_t)15;
 	CFMutableDictionaryRef props;
 	IOSurfaceRef surface;
 	CGColorSpaceRef space;
 	CGContextRef context;
 	uint32_t seed = 0;
+	int values[5];
+	const char *keys[5] = { "IOSurfaceWidth", "IOSurfaceHeight",
+	    "IOSurfaceBytesPerElement", "IOSurfaceBytesPerRow",
+	    "IOSurfacePixelFormat" };
+	unsigned i;
 
-	if (width < 8 || height < 8 || row * height > 64u * 1024 * 1024) {
+	if (width < 4 || height < 4 || row * height > 64u * 1024 * 1024) {
 		return NULL;
 	}
 	props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
@@ -15580,31 +17197,27 @@ mondrian_image_surface(CGImageRef image)
 	if (props == NULL) {
 		return NULL;
 	}
-	{
-		CFNumberRef n;
-		int values[5] = { (int)width, (int)height, 4, (int)row, 'BGRA' };
-		const char *keys[5] = { "IOSurfaceWidth", "IOSurfaceHeight",
-		    "IOSurfaceBytesPerElement", "IOSurfaceBytesPerRow",
-		    "IOSurfacePixelFormat" };
-		unsigned i;
+	values[0] = (int)width;
+	values[1] = (int)height;
+	values[2] = 4;
+	values[3] = (int)row;
+	values[4] = 'BGRA';
+	for (i = 0; i < 5; i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i],
+		    kCFStringEncodingUTF8);
+		CFNumberRef number = CFNumberCreate(NULL, kCFNumberIntType,
+		    &values[i]);
 
-		for (i = 0; i < 5; i++) {
-			CFStringRef key = CFStringCreateWithCString(NULL, keys[i],
-			    kCFStringEncodingUTF8);
-
-			n = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
-			CFDictionarySetValue(props, key, n);
-			CFRelease(n);
-			CFRelease(key);
-		}
+		CFDictionarySetValue(props, key, number);
+		CFRelease(number);
+		CFRelease(key);
 	}
 	surface = IOSurfaceCreate(props);
 	CFRelease(props);
-	if (surface == NULL) {
-		return NULL;
-	}
-	if (IOSurfaceLock(surface, 0, &seed) != 0) {
-		CFRelease(surface);
+	if (surface == NULL || IOSurfaceLock(surface, 0, &seed) != 0) {
+		if (surface != NULL) {
+			CFRelease(surface);
+		}
 		return NULL;
 	}
 	space = CGColorSpaceCreateDeviceRGB();
@@ -15617,7 +17230,7 @@ mondrian_image_surface(CGImageRef image)
 		CFRelease(surface);
 		return NULL;
 	}
-	CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+	CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
 	CGContextFlush(context);
 	CGContextRelease(context);
 	IOSurfaceUnlock(surface, 0, &seed);
@@ -15635,7 +17248,17 @@ mondrian_layer_contents(id self, SEL cmd, id contents)
 		CGImageRef image = (CGImageRef)contents;
 		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
 
-		if (w >= 300 && h >= 200 && w % 4 == 0) {
+		/*
+		 * Every picture, not just the ones of screen size. Measured
+		 * 2026-11-20 on the Settings list: the Airplane Mode row's
+		 * switch drew its track (a plain colour layer) and no knob, and
+		 * the knob is a 129x129 CGImage on a 43x43 layer -- under the
+		 * old 300x200 floor, so it kept the CGImage path and the window
+		 * server created a 129x129 surface for it and left it zero. The
+		 * floor was there to keep the ring legible, not because small
+		 * pictures take a different road; the road is the same one.
+		 */
+		if (w >= 4 && h >= 4) {
 			surface = mondrian_image_surface(image);
 			if (surface != NULL) {
 				contents = (id)surface;
@@ -15687,14 +17310,23 @@ mondrian_layer_contents(id self, SEL cmd, id contents)
 static void
 mondrian_layer_probe_install(void)
 {
+	static int installed;
 	Class layer = objc_getClass("CALayer");
 	Method m = layer != NULL
 	    ? class_getInstanceMethod(layer, sel_registerName("setContents:")) : NULL;
 
-	if (m != NULL) {
-		mondrian_layer_contents_orig = (void (*)(id, SEL, id))
-		    method_setImplementation(m, (IMP)mondrian_layer_contents);
+	if (installed || m == NULL) {
+		return;
 	}
+	/*
+	 * Twice would make the "original" this function itself and every
+	 * picture would be converted again inside its own call. The bridge is
+	 * installed from the constructor and again by Photos' probe, so the
+	 * guard is what keeps that one installation.
+	 */
+	mondrian_layer_contents_orig = (void (*)(id, SEL, id))
+	    method_setImplementation(m, (IMP)mondrian_layer_contents);
+	installed = 1;
 }
 
 static void
@@ -15773,6 +17405,15 @@ mondrian_install_ui_hooks(void)
 	if (getprogname() != NULL && strcmp(getprogname(), "ReportCrash") == 0 &&
 	    !boot_arg_set("mondrianreportcrash=1")) {
 		_exit(0);
+	}
+	/*
+	 * A picture crosses to the window server as a surface on this port and not
+	 * as a CGImage (see mondrian_layer_contents), so every process that draws
+	 * one needs the bridge whatever else it is here for. backboardd is the
+	 * renderer and receives render nodes, not a client's layers.
+	 */
+	if (getprogname() == NULL || strcmp(getprogname(), "backboardd") != 0) {
+		mondrian_layer_probe_install();
 	}
 	if (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0) {
 		pthread_t opener;

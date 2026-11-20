@@ -1,18 +1,23 @@
-xnu 0399: com.apple.uart.sk.bluetooth, the HCI transport bluetoothd uses
+xnu 0399: the HCI control bluetoothd's POSIX driver opens
 
 0386 put the HCI transport behind /dev/cu.bluetooth on the strength of the
 access() pair and the termios imports in bluetoothd. The disassembly of
-/usr/sbin/bluetoothd (16.7.16) says otherwise: BT_HCI_TRANSPORT=H4:POSIX
-parses to the H4 transport and the POSIX driver, and that driver creates a
-PF_SYSTEM socket, resolves "com.apple.uart.sk.bluetooth" with CTLIOCGINFO at
-0x100066d34, connects, and asks the control for a termios (0x40487413) and a
-16-byte UUID (0x40105412). The UUID is fed to os_channel_create(); with no
-Skywalk nexus behind it that call returns NULL, and the same driver falls back
-to write(2) at 0x1000676a4 and read(2) at 0x100067a9c on the control socket.
-The tty is never opened by the transport: the access() check only decides that
-FindLocalMacAddress should not look for an IORegistry node.
+/usr/sbin/bluetoothd (16.7.16) says otherwise: BT_HCI_TRANSPORT parses as
+"transport:driver[:parameter]", and the POSIX driver takes the parameter as
+the kernel control name it resolves with CTLIOCGINFO at 0x100066d34.
 
-This adds the control the POSIX driver connects to. It forwards write(2) to
+That name selects the data path. With exactly "com.apple.uart.sk.bluetooth"
+the driver asks for a 16-byte UUID (0x40105412) and feeds it to
+os_channel_create(); this kernel has no Skywalk (SKYWALK_BASE is not built), so
+the call returns NULL and the driver closes the socket. It does not fall back -
+measured 2026-11-20, errno ENOENT and "Failed to initialize driver POSIX". With
+any other control name the same driver takes the plain path at 0x100066e50: it
+sets the termios and the 12-byte UART option, leaves its channel pointer NULL,
+and writes and reads the control socket directly (0x1000676a4, 0x100067a9c).
+
+This registers the control as com.mondrian.btuart; the shim passes that name as
+the third token, BT_HCI_TRANSPORT=H4:POSIX:com.mondrian.btuart. It forwards
+write(2) to
 the existing QUP wrapper 2 engine and polls the engine every 10 ms into
 ctl_enqueuedata(), the same rate the tty used: 115 bytes at 115200 fit the
 128-byte RX FIFO. The termios and UART options the daemon sets are accepted
@@ -76,21 +81,17 @@ new file mode 100644
 index 0000000..9c9d16c
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,314 @@
 +/*
-+ * com.apple.uart.sk.bluetooth: the HCI transport bluetoothd opens on this
-+ * phone.
++ * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
-+ * Measured in /usr/sbin/bluetoothd (16.7.16): with BT_HCI_TRANSPORT=H4:POSIX
-+ * the daemon does not open /dev/cu.bluetooth. The POSIX driver creates a
-+ * PF_SYSTEM socket, asks the kernel control named "com.apple.uart.sk.bluetooth"
-+ * for its id (CTLIOCGINFO at 0x100066d34), connects to it, and asks for two
-+ * private options: a 72-byte termios (0x40487413) and a 16-byte channel UUID
-+ * (0x40105412), which it feeds to os_channel_create. When that channel cannot
-+ * be created - there is no Skywalk nexus behind it here - the same driver
-+ * falls back to write(2) and read(2) on the control socket (0x1000676a4 and
-+ * 0x100067a9c). This control is that socket: the bytes go to the QUP wrapper 2
-+ * engine in bsd/dev/mondrian_btuart.c, the same engine the tty used.
++ * The driver takes the third token of BT_HCI_TRANSPORT as the control name
++ * (0x100156264). The name decides the data path: the literal
++ * "com.apple.uart.sk.bluetooth" makes the driver ask for a Skywalk channel
++ * UUID and abort when os_channel_create() returns NULL, while any other name
++ * takes the termios path at 0x100066e50 and then writes and reads this socket
++ * directly. Skywalk is not built into this kernel, so the control uses a name
++ * of its own and the shim tells the daemon to use it.
 + *
 + * The node /dev/cu.bluetooth still exists: FindLocalMacAddress in the same
 + * binary access()es it to decide that a serial port is present, before it
@@ -118,7 +119,7 @@ index 0000000..9c9d16c
 +extern int mondrian_btuart_tty_write(const void *buf, size_t len);
 +extern int mondrian_btuart_tty_read(void *buf, size_t cap);
 +
-+#define MONDRIAN_BTCTL_NAME     "com.apple.uart.sk.bluetooth"
++#define MONDRIAN_BTCTL_NAME     "com.mondrian.btuart"
 +
 +#define MONDRIAN_BTCTL_GET_TERMIOS      0x40487413      /* _IOR('t', 0x13, struct termios) */
 +#define MONDRIAN_BTCTL_GET_UUID         0x40105412      /* _IOR('t', 0x12, uuid_t) */
@@ -367,6 +368,13 @@ index 0000000..9c9d16c
 +
 +	bzero(&reg, sizeof(reg));
 +	strlcpy(reg.ctl_name, MONDRIAN_BTCTL_NAME, sizeof(reg.ctl_name));
++	/*
++	 * The daemon builds its socket as PF_SYSTEM/SOCK_STREAM/SYSPROTO_CONTROL
++	 * and kern_control refuses that with EPROTOTYPE unless the control
++	 * registered itself as a sock-stream control (measured 2026-11-20:
++	 * connect returned errno 41 and the H4 driver gave up).
++	 */
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
 +	reg.ctl_sendsize = 64 * 1024;
 +	reg.ctl_recvsize = 64 * 1024;
 +	reg.ctl_connect = mondrian_btctl_connect;

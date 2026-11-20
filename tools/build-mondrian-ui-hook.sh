@@ -21,7 +21,7 @@ if command -v xcrun >/dev/null 2>&1 &&
 	xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -isysroot "$sdk" \
 		-dynamiclib -Os -fno-common -fvisibility=hidden \
 		-install_name /usr/libexec/mondrian-ui-hook.dylib \
-		-o "$out" "$root/tools/mondrian-ui-hook.m" -lobjc -Wl,-undefined,dynamic_lookup -framework CoreFoundation -framework Foundation -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework IOSurface -framework IOKit
+		-o "$out" "$root/tools/mondrian-ui-hook.m" -lobjc -Wl,-undefined,dynamic_lookup -framework CoreFoundation -framework Foundation -framework QuartzCore -framework CoreGraphics -framework ImageIO -framework IOSurface -framework IOKit -framework Security
 	codesign --force --sign - --timestamp=none "$out"
 	codesign --verify --strict "$out"
 else
@@ -34,6 +34,7 @@ else
 		-syslibroot "$sdk" -F"$sdk/System/Library/Frameworks" \
 		-framework CoreFoundation -framework Foundation -framework QuartzCore \
 		-framework CoreGraphics -framework IOSurface -framework IOKit \
+		-framework Security \
 		-L"$sdk/usr/lib" -lobjc -undefined dynamic_lookup \
 		-o "$out" "$out.o"
 	rm -f "$out.o"
