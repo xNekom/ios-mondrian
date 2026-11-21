@@ -1224,16 +1224,17 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   included. `tools/wsl/verify-second-app.sh NAME X Y` opens an icon at a
   coordinate taken from the same boot's capture and reports the load line, the
   callers, the server's zero-format copies, present and crashes.
-- **Control Center's backdrop can tear when the sheet is reopened.** Measured
-  2026-11-21 on a clean boot: the sheet before the Bluetooth tile and right
-  after tapping it renders clean in both captures, and the capture taken after
-  dismissing and reopening it shows a hard horizontal seam across the wallpaper
-  (the lower third brighter and cyan). One earlier reopen on the same image
-  showed a cyan noise-filled block over the orientation-lock and
-  screen-mirroring tiles that survived further reopens. The app bridge is not
-  injected into SpringBoard and `mondrianwallpaper=1` was absent, so the tear is
-  in the compositor's backdrop/wallpaper path, not in the bridge or the paint
-  hooks. OPEN.
+- **Control Center shows a home-screen strip across its lower quarter.** Measured
+  2026-11-21 on a live boot, reproducible on every open: the sheet draws its
+  tiles correctly, but the bottom ~760 of 3200 rows show the home wallpaper and
+  icons at full brightness (no dim), with a hard seam at the boundary. It is the
+  same over the home screen and over an app, and identical in captures four
+  seconds apart, so it is a composited image, not a transition frame. The
+  compositor names its own copies of the display surface (`MONDRIAN FB: layer 0
+  surface 2/3 1440x3200`) and the seam survives both, which puts it in the GL
+  picture/backdrop draw (`tools/gpu/eagl.c`), where CoreAnimation draws only the
+  changed box and our renderer keeps the rest of the surface. The bridge does not
+  run in SpringBoard and `mondrianwallpaper=1` is absent. OPEN.
 - **locationd crash-loops and forks ReportCrash each time.** Measured
   2026-11-21: `CRASH locationd ... sig 11 code 0x100000001`, 5 crashes by the
   third minute of the boot and 8 by the fifth, `Process[229] crashed: locationd.
