@@ -239,6 +239,36 @@ bt_ring_dump(const char *what, const struct bt_ring_entry *ring, unsigned pos)
 	}
 }
 
+/*
+ * The power path is the one that ends in a crash, and the main log is
+ * truncated by the next start (launchd restarts within a second), so these
+ * lines go to their own append-only file: it survives the crash and the
+ * restart, which is the only way to read what the daemon received.
+ */
+static void
+bt_power_append(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	int n;
+	int fd;
+
+	n = snprintf(line, sizeof(line), "mondrian-bt[%d]: ", getpid());
+	if (n < 0 || n >= (int)sizeof(line)) {
+		return;
+	}
+	va_start(ap, fmt);
+	vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+	va_end(ap);
+	fd = open("/private/var/mobile/Library/Preferences/mondrian-bt-power.log",
+	    O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0) {
+		return;
+	}
+	(void)syscall(SYS_write, fd, line, strlen(line));
+	close(fd);
+}
+
 static const char *const interesting[] = {
 	"Bluetooth", "bluetooth", "transport", "Transport", "HCI", "restart",
 	"Switch", "switch", "failed", "Failed", "error", "Error", "driver",
@@ -1662,14 +1692,19 @@ my_xpc_received(id self, SEL _cmd, xpc_object_t message)
 
 			bt_log("power.hook: id %llu\n",
 			    (unsigned long long)msgid);
+			bt_power_append("id %llu\n",
+			    (unsigned long long)msgid);
 			mark = xpc_dictionary_get_string(message, "mondrian");
 			if (mark != NULL) {
 				bt_log("power.hook: mark %s\n", mark);
 			}
 		}
-		if (description != NULL && xpc_description_budget > 0) {
-			xpc_description_budget--;
-			bt_log("power.hook: msg %.600s\n", description);
+		if (description != NULL) {
+			bt_power_append("msg %.300s\n", description);
+			if (xpc_description_budget > 0) {
+				xpc_description_budget--;
+				bt_log("power.hook: msg %.600s\n", description);
+			}
 		}
 		free(description);
 	}
@@ -1701,6 +1736,7 @@ my_entitled(id self, SEL _cmd, id *error)
 		result = original_entitled(self, _cmd, error);
 	}
 	bt_log("power.hook: entitled %d self %p\n", result, self);
+	bt_power_append("entitled %d self %p\n", result, self);
 	return result;
 }
 
