@@ -1161,6 +1161,37 @@ log_name_reply(xpc_object_t message)
 	free(description);
 }
 
+/*
+ * The pane's rows are built from what the daemon forwards to the client; the
+ * generic XPC budget is spent during the init burst, so device events are
+ * logged here on their own. Any dictionary that names a device or carries a
+ * name is captured whole (900 bytes) for the next run.
+ */
+static void
+log_device_message(const char *what, xpc_object_t message)
+{
+	static unsigned logged;
+	char *description;
+
+	if (message == NULL || logged >= 12) {
+		return;
+	}
+	description = xpc_copy_description(message);
+	if (description == NULL) {
+		return;
+	}
+	if (strstr(description, "kCBMsgArgDevice") != NULL ||
+	    strstr(description, "kCBMsgArgName") != NULL ||
+	    strstr(description, "DeviceFound") != NULL ||
+	    strstr(description, "deviceFound") != NULL ||
+	    strstr(description, "kCBMsgArgUUID") != NULL) {
+		logged++;
+		bt_power_append("xpc.dev[%d] %s %.900s\n", getpid(), what,
+		    description);
+	}
+	free(description);
+}
+
 static void
 my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 {
@@ -1174,6 +1205,7 @@ my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 	log_message("oneway", message, "kMsgId");
 	log_description("out", message);
 	log_name_reply(message);
+	log_device_message("oneway", message);
 	if (original != NULL) {
 		original(connection, message);
 	} else {
@@ -1234,6 +1266,7 @@ my_xpc_send_with_reply_sync(xpc_connection_t connection, xpc_object_t message)
 	}
 	log_connection("sync", connection);
 	log_message("sync", message, "kMsgId");
+	log_device_message("sync", message);
 	identifier = xpc_dictionary_get_string(message, "kMsgId");
 	if (identifier != NULL && strcmp(identifier, "RunBuiltinScript") == 0) {
 		static unsigned long fakes;
@@ -2274,7 +2307,15 @@ hook_device_found(void)
 			    strstr(name, "Found") == NULL &&
 			    strstr(name, "found") == NULL &&
 			    strstr(name, "Scan") == NULL &&
-			    strstr(name, "scan") == NULL) {
+			    strstr(name, "scan") == NULL &&
+			    strstr(name, "Notif") == NULL &&
+			    strstr(name, "notif") == NULL &&
+			    strstr(name, "Event") == NULL &&
+			    strstr(name, "event") == NULL &&
+			    strstr(name, "Client") == NULL &&
+			    strstr(name, "client") == NULL &&
+			    strstr(name, "UUID") == NULL &&
+			    strstr(name, "uuid") == NULL) {
 				continue;
 			}
 			bt_power_append("dev.sel %s\n", name);
