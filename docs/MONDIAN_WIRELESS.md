@@ -902,60 +902,67 @@ The daemon does not use any of them. `kCBMsgIdDeviceGetNameMsg` answers
 fresh daemon and a fresh Settings client (measured 2026-11-21), so the pane
 draws the address. The daemon sends no Remote Name Request during discovery
 (`name req 0`), so the padding the control applies to 0x0419 is only exercised
-when it does. The control bridges the gap for LE devices: it keeps the classic
-EIR name and appends it as a Complete Local Name to the LE report for the same
-address, translated 0x0d or the legacy 0x02 the controller also sends, when
-the advertisement carries none. A shortened name (0x08) in a report is
+when it does. The control bridges the gap for LE devices: it searches the inquiry response
+for a name structure (0x08 or 0x09, after the firmware's junk prefix) and
+appends it as a Complete Local Name to the LE report for the same address,
+translated 0x0d or the legacy 0x02 the controller also sends, when the
+advertisement carries none. A shortened name (0x08) in a report is
 promoted to the complete type (0x09), because the daemon reads only 0x09 and
 the controller's scan responses carry 0x08. A classic-only device has no LE
 report to carry the name; `B0:AC` stays on its address until the daemon uses
 the EIR.
 
 The name is on the stream the daemon reads, so the loss is inside it. Measured
-2026-11-21: the pane's own scan is active (`scan params type 1 own 1 filter 0`;
-a background scan asks type 0), the controller answers with scan responses
-(`ext report ... type 0x001b data 17`), and the control's legacy conversion
-promotes their 0x08 name. A framer in the shim's `read` path logs every name it
-sees in that stream (`adv name` in `mondrian-bt-power.log`): `ASUS-TUF-GAMING`,
-`[AV] Samsung Soundbar MS650`, `RGB smart bulb`, `Dryer`, `[TV] Samsung 5
-Series (49)`, `LUH-D301S-WEU`, `X2+ Connect_D54EABA568E6`.
+2026-11-21: the pane's own scan is active when it asks (`scan params type 1 own
+1 filter 0`; a background scan asks type 0), the controller answers with scan
+responses (`ext report ... type 0x001b data 17`), and the control's legacy
+conversion promotes their 0x08 name. A framer in the shim's `read` path logs
+every name it sees in that stream (`adv name` in `mondrian-bt-power.log`):
+`ASUS-TUF-GAMING`, `[AV] Samsung Soundbar MS650`, `RGB smart bulb`, `Dryer`,
+`[TV] Samsung 5 Series (49)`, `LUH-D301S-WEU`, `X2+ Connect_D54EABA568E6`.
 
-The daemon builds no device from them. On a fresh boot, with no daemon restart
-and 24 named reports read, its reply to the client is
-`kCBMsgArgDeviceArray count = 0` with `kCBMsgArgResult 0`, so the pane shows an
-empty list and no row exists to tap. A pane scan calls none of the daemon's
-device hooks (`_reportDeviceFound:`, `_stackClassicScannerDeviceFound:`,
-`_stackBLEScannerDeviceFound:`, `_stackDeviceMonitorDeviceFound:`,
-`_whbDiscoveryDeviceFound:`), all installed and silent. The daemon's outgoing XPC
-messages are logged (`xpc.dev` in the power log), which is where the empty
-array is visible.
+The daemon's discovery depends on the controller's own address. The WCN7850
+ships unprovisioned and answers Read BD_ADDR (0x1009) with QCA's default
+`00:00:00:00:5A:AD`, the value in NVM tag 0x0002 and the one Linux's btqca
+calls `QCA_BDADDR_DEFAULT`. With it, Create Connection (0x0405) is rejected
+with Command Status 0x11 "unsupported feature or parameter value" (measured
+with a DM1-only packet type mask, 0x0001) and the pane's rows stay bare
+addresses. The shim provisions the controller in `qca_boot`: it reads 0x1009,
+and when the value is the default it writes `02:00:00:00:5A:AD` with
+`EDL_WRITE_BD_ADDR` 0xFC14 and reads it back. The command takes the address in
+**display order** (the stock HAL swaps `GetLocalAddress` into that order;
+sending HCI order stored the reverse) and refuses a second write with status
+0x02, so a provisioned controller is left alone. The value survives a reboot.
 
-The empty list is the classic scanner being off, not a broken report path.
-`_stackClassicScannerShouldRun` and `_stackBLEScannerShouldRun` both answer 0
-while the pane is open; the LE scan the control sees (`scan params type 1`) is
-the client-driven one and does not fill the daemon's device map. Forcing
-`_stackClassicScannerShouldRun` to 1 makes the daemon send HCI Inquiry
-(`hci req 0401 len 9`), but the controller never answers it: no Command
-Complete (`hci cc 0401`) and no Inquiry Result (`0x2f`) appears, and the
-daemon retries the command about once a second. A classic row
-(`B0:AC:82:15:22:3C`) can appear while this runs, but it leaves on the next
-cycle, draws the address although the probe decoded `DIGI R2A` from its EIR,
-and a tap on it (`MONDRIAN HID: touch 0 down at 7200,8020`) changes nothing and
-queues no Create Connection. The daemon's outgoing `kCBMsgArgDevices` and
-`kCBMsgArgDeviceArray` messages both carry `count = 0` throughout
-(`xpc.dev` in the power log), so the row is not coming from the daemon's
-device map either. The classic failure is at the controller's answer to
-Inquiry, upstream of the daemon, the name and pairing; the EIR bridge above is
-a separate source and no longer the blocker.
+With a valid address the pane's own path discovers devices: it still answers
+`_stackClassicScannerShouldRun` 0, but its scan sends Inquiry
+(`hci req 0401 len 9`) and the controller accepts it. The answer is a
+**Command Status** (`hci cs 0401 status 0`, event 0x0f), followed by Inquiry
+Complete (`inquiry complete status 0`), not a Command Complete; an earlier
+framer reset on every event code but 0x3e and the probe looked for 0x0e, which
+is why the controller looked silent. The pane then lists the PC
+`A8:41:F4:2C:C2:35` and the Digi `B0:AC:82:15:22:3C` without any forced
+scanner.
 
-Pairing has never been exercised. Measured 2026-11-21: a tap on the discovered
-row of a real peer (`C8:A6:EF:12:00:9F`, a TV) reaches SpringBoard
-(`MONDRIAN HID: touch 0 down at 2500,4440`) and produces no HCI connection
-attempt, no pairing dialog, and the pane does not change. `0x0401` is HCI
-Inquiry, not pairing; Create Connection is `0x0405`, and no such command was
-seen either. The row's action is part of what the daemon's device entry needs,
-together with the name, and the discovery handshake above has to be stable
-before the tap can be exercised.
+The row is still drawn on the address. The PC's Inquiry Result carries no EIR
+at all, and the daemon sends no Remote Name Request while discovering
+(`name req 0`), so `kCBMsgIdDeviceGetNameMsg` still answers
+`kCBMsgArgResult 212` with a zero-length `kCBMsgArgName`. A tap on the row
+reaches SpringBoard (`MONDRIAN HID: touch 0 down at 7200,8000`) but queues no
+0x0405, so the row's action is missing together with the name. `0x0401` is
+Inquiry, not pairing; Create Connection is 0x0405, and with the standard packet
+type mask 0xCC18 it returns Command Status 0 (measured with the shim's `poke`
+debug command, which sends one command from a marker file and can leave the
+daemon waiting for a completion it never sent -- restart it afterwards).
+
+The controller's Inquiry Result is malformed at the source: `plen` is 0xff
+(258 bytes) and the bytes between the 13 fixed fields and the EIR are not
+cleared (`e4 c0` repeats for the PC; one or three junk bytes precede
+`09 09 DIGI R2A` and `10 09 ASUS-TUF-GAMING`). Rebuilding the event into the
+fixed fields plus the EIR chain made the daemon stop creating devices, so the
+control forwards it unchanged; the name search only feeds the LE bridge. A
+classic-only peer therefore stays on its address until the daemon itself asks
+for the name, which is the next gap.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
