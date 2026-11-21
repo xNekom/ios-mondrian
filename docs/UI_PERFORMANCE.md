@@ -1103,6 +1103,16 @@ uses `LSApplicationWorkspace openURL:withOptions:`; the `UIApplication openURL:`
 variant aborted SpringBoard in a loop (sig 6, libc++abi terminate) because the
 `mondrian-open` thread is not the main thread.
 
+Measured 2026-11-21: with the UI up, the Control Center (swipe from the top-right)
+draws its modules, but the connectivity module's backdrop is a cyan corrupted
+block that changes shape between opens, and the media module's next button shows
+a smaller blue blob in one open. SpringBoard creates 1440 x 3200
+`0x77333072` (`w30r`) surfaces with bpr 5888 while the Center is open, next to
+the BGRA ones at bpr 5760. The home screen and Settings (BGRA) draw clean, so
+the defect is in the pass that *samples* a wide-color surface as the module
+material, not in drawing it as the wallpaper. Next: the GL shim's
+material/backdrop pass and its texture format for `w30r`.
+
 The idle path had a second cause and it was ours. Until `0342` the driver
 painted the framebuffer black when the blank fired, and the wake lived inside
 `present()`: by then iOS has dimmed and stopped its own display link, so a tap
