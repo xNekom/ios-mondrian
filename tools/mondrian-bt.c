@@ -2184,6 +2184,7 @@ static void (*original_ble_found)(id, SEL, id);
 static void (*original_monitor_found)(id, SEL, id);
 static void (*original_whb_found)(id, SEL, id);
 static void (*original_classic_start)(id, SEL);
+static void (*original_classic_stop)(id, SEL);
 static void (*original_ble_start)(id, SEL);
 static BOOL (*original_classic_should)(id, SEL);
 static BOOL (*original_ble_should)(id, SEL);
@@ -2295,6 +2296,18 @@ my_classic_start(id self, SEL _cmd)
 	}
 }
 
+/*
+ * The daemon stops the classic scanner from its own state machine even while
+ * shouldRun is forced to 1, and each stop removes the row the pane had. With
+ * discovery forced, the stop is suppressed so a scan session survives long
+ * enough to read the EIR name and tap the row.
+ */
+static void
+my_classic_stop(id self, SEL _cmd)
+{
+	bt_power_append("scan classic ensureStopped suppressed\n");
+}
+
 static void
 my_ble_start(id self, SEL _cmd)
 {
@@ -2373,6 +2386,12 @@ hook_device_found(void)
 	if (method != NULL) {
 		original_classic_start = (void (*)(id, SEL))
 		    method_setImplementation(method, (IMP)my_classic_start);
+	}
+	method = own_method(cls, "_stackClassicScannerEnsureStopped");
+	if (method != NULL) {
+		original_classic_stop = (void (*)(id, SEL))
+		    method_getImplementation(method);
+		method_setImplementation(method, (IMP)my_classic_stop);
 	}
 	method = own_method(cls, "_stackBLEScannerEnsureStarted");
 	if (method != NULL) {
