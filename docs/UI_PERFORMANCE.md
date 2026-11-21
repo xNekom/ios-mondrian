@@ -1224,6 +1224,15 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   included. `tools/wsl/verify-second-app.sh NAME X Y` opens an icon at a
   coordinate taken from the same boot's capture and reports the load line, the
   callers, the server's zero-format copies, present and crashes.
+- **Control Center can keep a corrupted tile block after its Bluetooth
+  button.** Measured 2026-11-21: tapping the Bluetooth tile, then closing and
+  reopening Control Center, leaves a cyan noise-filled block over the
+  orientation-lock and screen-mirroring tiles (and a patch at the top-left); it
+  survives dismissal and the reopen, while the Settings pane underneath draws
+  normally. The block is identical in captures four seconds apart, so it is a
+  composited surface, not a frame caught mid-transition. The app bridge is not
+  injected into SpringBoard, so the source is the GPU/panel path, not the
+  bridge. OPEN.
 - **locationd crash-loops and forks ReportCrash each time.** Measured
   2026-11-21: `CRASH locationd ... sig 11 code 0x100000001`, 5 crashes by the
   third minute of the boot and 8 by the fifth, `Process[229] crashed: locationd.

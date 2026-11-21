@@ -862,6 +862,17 @@ disable` counted in the ring, and the pane listing `B0:AC:82:15:22:3C` in the
 first capture and `C8:A6:EF:12:00:9F` a minute later -- the list refreshes in
 place instead of being wiped by a restart.
 
+The switch itself is wired and the daemon side is not: a drag on the Bluetooth
+switch reaches UIControl (the bridge probe logs `switch action controlChanged:
+-> PSSwitchTableCell`) and `bluetoothd` then dies with `sig 11 ... pc 0x0 lr
+bluetoothd + 0xf3b50`, leaving no XPC message in the shim's power log -- only
+`CtrA`/`GCtI`/`UpId` and connection invalidations arrive. launchd restarts it
+and the pane recovers with its list, so the cost is the recovery, not a stuck
+radio. Control Center's Bluetooth button does not reproduce it: on iOS 16 that
+button only stops new connections ("New Bluetooth connections have been turned
+off from Control Center") and the daemon keeps its pid, which puts the fault in
+the Settings client path rather than in the power state machine. OPEN.
+
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
 `mondrian-bt-exit.log` instead, truncated on every exit so it always holds the
