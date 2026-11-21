@@ -675,11 +675,20 @@ boot each, so the three columns differ only in what changed:
   is not the source: SpringBoard's `UIKeyboardWillChangeFrameNotification`
   reports `0,765.7 480x301`, the keyboard scene layer is 480x1066.7 at 0,0 and
   the safe area is `59,0,34,0`. The offset fits a 512 pt scene whose 480 pt plane
-  keeps its 3 pt margin and lands at 35 (expected, not measured): the number to
-  read next is the scene size in the keyboard's own process. Rewriting
-  `/private/var/vm/mondrian-kbd` makes every hooked process print its screen, its
-  windows, the keyboard's view chain with safe areas and its layer host
-  (`keyboard_probe_once`), and that is where those numbers come from.
+  keeps its 3 pt margin and lands at 35 (expected, not measured). The plane is
+  laid out in the **Spotlight** process, not in SpringBoard and not in kbd:
+  SpringBoard registers the whole keyboard class family (`UIKeyboardLayoutStar`,
+  `UIKeyboardLayout`, `TUIKeyplaneView`, `UIKBKeyplaneView`) and instantiates
+  none of it for the presented keyboard, kbd has no layout class at all, and the
+  keyboard's surfaces are `MONDRIAN SURF: Spotlight ... 1440x729`. `0403` gives
+  the UI hook to kbd and Spotlight behind bit 11, so a boot with
+  `EXTRA_ARGS='mondrian_ui_hook=3334'` runs `MONDRIAN KL:` in those processes:
+  it lists the layout classes each one registers and prints the frame, superview
+  chain, window and screen of every `layoutSubviews` pass. Rewriting
+  `/private/var/vm/mondrian-kbd` still dumps the SpringBoard side (screen,
+  windows, keyboard chain with safe areas, layer host) and was where the host
+  numbers above came from; kbd's sandbox cannot read that file, which is why the
+  mask, not a file, gates the layout probe.
 - **Aim with points, not pixels.** `tap`/`swipe` take panel pixels (1440x3200) and
   `screen` returns half of that, so multiply a runtime frame by three: the hook
   prints `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points and
