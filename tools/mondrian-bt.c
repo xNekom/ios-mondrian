@@ -978,6 +978,62 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		    pkt[7], pkt[6], pkt[12]);
 		return;
 	}
+	if (len >= 10 && pkt[1] == 0x07) {
+		size_t at;
+		char text[80];
+		int used = 0;
+
+		for (at = 10; at < len && used >= 0 &&
+		    (size_t)used < sizeof(text) - 1; at++) {
+			unsigned char c = pkt[at];
+
+			text[used++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+		}
+		text[used < 0 ? 0 : used] = '\0';
+		bt_power_append("rnr complete status %#x "
+		    "%02x:%02x:%02x:%02x:%02x:%02x \"%s\"\n", pkt[3],
+		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], text);
+		return;
+	}
+	if (len >= 10 && pkt[1] == 0x17) {
+		bt_power_append("link key request "
+		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4]);
+		return;
+	}
+	if (len >= 13 && pkt[1] == 0x18) {
+		bt_power_append("link key notify "
+		    "%02x:%02x:%02x:%02x:%02x:%02x type %u\n",
+		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[10]);
+		return;
+	}
+	if (len >= 10 && pkt[1] == 0x16) {
+		bt_power_append("pin request "
+		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
+		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4]);
+		return;
+	}
+	if (len >= 8 && (pkt[1] == 0x2b || pkt[1] == 0x2c ||
+	    pkt[1] == 0x2d || pkt[1] == 0x2e || pkt[1] == 0x30 ||
+	    pkt[1] == 0x33 || pkt[1] == 0x34)) {
+		size_t at;
+		char line[120];
+		int used = snprintf(line, sizeof(line), "pair evt %02x plen %u:",
+		    pkt[1], pkt[2]);
+
+		for (at = 3; at < len && used > 0 &&
+		    (size_t)used < sizeof(line) - 4; at++) {
+			used += snprintf(line + used,
+			    sizeof(line) - (size_t)used, " %02x", pkt[at]);
+		}
+		bt_power_append("%s\n", line);
+		return;
+	}
+	if (len >= 7 && pkt[1] == 0x05) {
+		bt_power_append("disconnect status %#x handle %u reason %#x\n",
+		    pkt[3], pkt[4] | (pkt[5] << 8), pkt[6]);
+		return;
+	}
 	if (len >= 7 && pkt[1] == 0x0f) {
 		uint16_t opcode = (uint16_t)(pkt[5] | (pkt[6] << 8));
 
@@ -1135,6 +1191,22 @@ bt_poke_parse(const char *text, enum bt_poke_kind *kind, uint8_t addr[6],
 	return 0;
 }
 
+/*
+ * `wfile` creates the marker as root and the daemon is mobile, so unlink()
+ * fails with EPERM and the same marker is read every 500 ms. Truncating the
+ * 0666 file works, and a marker that starts with "none" matches no command.
+ */
+static void
+bt_poke_clear(const char *marker)
+{
+	int fd = open(marker, O_WRONLY | O_TRUNC);
+
+	if (fd >= 0) {
+		(void)syscall(SYS_write, fd, "none", 4);
+		close(fd);
+	}
+}
+
 static void *
 bt_poke_thread(void *argument)
 {
@@ -1241,7 +1313,7 @@ bt_poke_thread(void *argument)
 			    addr[3], addr[2], addr[1], addr[0], packet_type,
 			    written);
 		}
-		unlink(marker);
+		bt_poke_clear(marker);
 	}
 	return NULL;
 }
@@ -1335,6 +1407,18 @@ my_write(int fd, const void *buf, size_t len)
 		if (len >= 4 && p[0] == 0x01) {
 			uint16_t opcode = (uint16_t)(p[1] | (p[2] << 8));
 
+			/*
+			 * The daemon answers the controller's IO Capability
+			 * Request (event 0x2b) with 0x042b. Its capability byte
+			 * is 0x01 (DisplayYesNo), which is why the controller
+			 * raises User Passkey Notification (0x33) instead of
+			 * Just Works. Rewriting it to 0x03 was tried and made no
+			 * difference (measured 2026-11-21: still 0x33), so the
+			 * byte is only logged.
+			 */
+			if (opcode == 0x042b && len >= 11) {
+				bt_power_append("io cap %02x\n", p[10]);
+			}
 			if (opcode == 0x0401 || opcode == 0x0402 ||
 			    opcode == 0x0405 || opcode == 0x0409 ||
 			    opcode == 0x0419) {
@@ -1344,11 +1428,25 @@ my_write(int fd, const void *buf, size_t len)
 				 * completes at once with no results, which is what a
 				 * retry about once a second looks like.
 				 */
-				bt_power_append("hci req %04x len %zu:"
-				    " %02x %02x %02x %02x %02x\n", opcode, len,
-				    len > 4 ? p[4] : 0, len > 5 ? p[5] : 0,
-				    len > 6 ? p[6] : 0, len > 7 ? p[7] : 0,
-				    len > 8 ? p[8] : 0);
+				{
+					char params[160];
+					size_t at;
+					int used = 0;
+
+					params[0] = '\0';
+					for (at = 4; at < len && at < 28 &&
+					    used >= 0 &&
+					    (size_t)used < sizeof(params) - 4;
+					    at++) {
+						used += snprintf(
+						    params + used,
+						    sizeof(params) - (size_t)used,
+						    " %02x", p[at]);
+					}
+					bt_power_append(
+					    "hci req %04x len %zu:%s\n",
+					    opcode, len, params);
+				}
 			}
 		}
 		log_hci_write("hci write", buf, len);
@@ -1537,6 +1635,8 @@ log_device_message(const char *what, xpc_object_t message)
 	free(description);
 }
 
+static void log_xpc_payload(const char *what, id message);
+
 static void
 my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 {
@@ -1547,6 +1647,7 @@ my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 		    interposed_real((const void *)my_xpc_send);
 	}
 	log_connection("oneway", connection);
+	log_xpc_payload("oneway", (id)message);
 	log_message("oneway", message, "kMsgId");
 	log_description("out", message);
 	log_name_reply(message);
@@ -2675,7 +2776,7 @@ log_xpc_in(const char *what, xpc_object_t message)
 	static unsigned count;
 	char *description;
 
-	if (message == NULL || count >= 40) {
+	if (message == NULL || count >= 60) {
 		return;
 	}
 	description = xpc_copy_description(message);
@@ -2686,12 +2787,9 @@ log_xpc_in(const char *what, xpc_object_t message)
 	 * The pane's tap becomes a request on this side; the outgoing reply is
 	 * already logged, and the missing half is what the client asked for.
 	 */
-	if (strstr(description, "MsgId") != NULL ||
-	    strstr(description, "kCBMsgArg") != NULL) {
-		count++;
-		bt_power_append("xpc.in[%d] %s %.900s\n", getpid(), what,
-		    description);
-	}
+	count++;
+	bt_power_append("xpc.in[%d] %s %.900s\n", getpid(), what,
+	    description);
 	free(description);
 }
 
@@ -2710,6 +2808,340 @@ my_remote_event(id self, SEL _cmd, id event, id options)
 	log_xpc_in("remote", (xpc_object_t)event);
 	if (original_remote_event != NULL) {
 		original_remote_event(self, _cmd, event, options);
+	}
+}
+
+/*
+ * The pane's client talks to a CBDaemonXPCConnection, not to the server, so a
+ * row tap is one of its xpcReceived* methods before any _xpc handler. Log the
+ * message there: the earlier listener hooks never fired because the server
+ * only sees the connection at accept time.
+ */
+static void (*original_xpc_message)(id, SEL, id);
+static void (*original_xpc_request)(id, SEL, id, id);
+
+static void
+my_xpc_message(id self, SEL _cmd, id message)
+{
+	static unsigned hits;
+
+	if (hits < 8) {
+		hits++;
+		bt_power_append("xpc.hit[%d] message %p class %s\n", getpid(),
+		    message, message != NULL ?
+		    class_getName(object_getClass(message)) : "null");
+	}
+	log_xpc_in("message", (xpc_object_t)message);
+	if (original_xpc_message != NULL) {
+		original_xpc_message(self, _cmd, message);
+	}
+}
+
+static void
+my_xpc_request(id self, SEL _cmd, id message, id handler)
+{
+	static unsigned hits;
+
+	if (hits < 8) {
+		hits++;
+		bt_power_append("xpc.hit[%d] request %p class %s\n", getpid(),
+		    message, message != NULL ?
+		    class_getName(object_getClass(message)) : "null");
+	}
+	log_xpc_in("request", (xpc_object_t)message);
+	if (original_xpc_request != NULL) {
+		original_xpc_request(self, _cmd, message, handler);
+	}
+}
+
+/*
+ * Device flow on both sides of the connection. The pane's row comes from a
+ * device array the daemon builds from BTDevice objects; a tap becomes a
+ * device request. Log both payloads in full (the wire keys are four-letter
+ * tokens, not kCBMsg*, so a name-based filter cannot see them).
+ */
+static void (*original_xpc_perform)(id, SEL, id);
+static void (*original_xpc_getdevices)(id, SEL, id);
+static void (*original_xpc_reply)(id, SEL, id);
+
+static void
+log_xpc_payload(const char *what, id message)
+{
+	static unsigned count;
+	char *description;
+
+	if (message == NULL || count >= 40) {
+		return;
+	}
+	description = xpc_copy_description((xpc_object_t)message);
+	if (description == NULL) {
+		return;
+	}
+	count++;
+	bt_power_append("xpc.pay[%d] %s %.1200s\n", getpid(), what, description);
+	free(description);
+}
+
+static void
+my_xpc_perform(id self, SEL _cmd, id message)
+{
+	log_xpc_payload("perform", message);
+	if (original_xpc_perform != NULL) {
+		original_xpc_perform(self, _cmd, message);
+	}
+}
+
+static void
+my_xpc_getdevices(id self, SEL _cmd, id message)
+{
+	log_xpc_payload("getdevices", message);
+	if (original_xpc_getdevices != NULL) {
+		original_xpc_getdevices(self, _cmd, message);
+	}
+}
+
+static void
+my_xpc_reply(id self, SEL _cmd, id message)
+{
+	log_xpc_payload("reply", message);
+	if (original_xpc_reply != NULL) {
+		original_xpc_reply(self, _cmd, message);
+	}
+}
+
+/*
+ * Pairing prompt. A tap now connects and the controller raises SSP events
+ * (0x33 User Passkey Notification), but the pane draws no dialog. These two
+ * methods are the path: the stack controller asks its delegate to prompt, and
+ * the daemon connection forwards the prompt to the client (SpringBoard).
+ */
+static void (*original_pairing_prompt)(id, SEL, id, unsigned long, id,
+    unsigned long);
+static void (*original_xpc_pair_prompt)(id, SEL, id, id);
+static void (*original_pairing_completed)(id, SEL, id, long);
+
+static void
+my_pairing_prompt(id self, SEL _cmd, id device, unsigned long type,
+    id pin, unsigned long flags)
+{
+	const char *pin_text = "(nil)";
+	id description = nil;
+	const char *text = "(nil)";
+
+	if (pin != nil && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(pin,
+	    sel_registerName("respondsToSelector:"),
+	    sel_registerName("UTF8String"))) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(pin,
+		    sel_registerName("UTF8String"));
+		if (text != NULL) {
+			pin_text = text;
+		}
+	}
+	if (device != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(device,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("pair.prompt[%d] type %lu pin %s flags %lu "
+	    "device %.400s\n", getpid(), type, pin_text, flags,
+	    text != NULL ? text : "(nil)");
+	if (original_pairing_prompt != NULL) {
+		original_pairing_prompt(self, _cmd, device, type, pin, flags);
+	}
+}
+
+static void
+my_xpc_pair_prompt(id self, SEL _cmd, id connection, id info)
+{
+	id description = nil;
+	const char *text = "(nil)";
+
+	if (info != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(info,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("pair.xpc[%d] info %.600s\n", getpid(),
+	    text != NULL ? text : "(nil)");
+	if (original_xpc_pair_prompt != NULL) {
+		original_xpc_pair_prompt(self, _cmd, connection, info);
+	}
+}
+
+static void
+my_pairing_completed(id self, SEL _cmd, id device, long result)
+{
+	bt_power_append("pair.done[%d] result %ld device %s\n", getpid(),
+	    result, device != nil ?
+	    class_getName(object_getClass(device)) : "(nil)");
+	if (original_pairing_completed != NULL) {
+		original_pairing_completed(self, _cmd, device, result);
+	}
+}
+
+static id (*original_get_devices)(id, SEL, unsigned long, id *);
+static void (*original_perform_request)(id, SEL, id, id, id);
+
+static id
+my_get_devices(id self, SEL _cmd, unsigned long flags, id *error)
+{
+	static unsigned logged;
+	id result = nil;
+
+	if (original_get_devices != NULL) {
+		result = original_get_devices(self, _cmd, flags, error);
+	}
+	if (result != nil && logged < 12) {
+		id description = ((id (*)(id, SEL))objc_msgSend)(result,
+		    sel_registerName("description"));
+		const char *text = NULL;
+
+		logged++;
+		if (description != nil) {
+			text = ((const char *(*)(id, SEL))objc_msgSend)(
+			    description, sel_registerName("UTF8String"));
+		}
+		bt_power_append("ctl.dev[%d] flags %lu count %lu %.800s\n",
+		    getpid(), flags,
+		    (unsigned long)((unsigned long (*)(id, SEL))objc_msgSend)(
+		    result, sel_registerName("count")),
+		    text != NULL ? text : "(nil)");
+	}
+	return result;
+}
+
+static void
+my_perform_request(id self, SEL _cmd, id request, id device, id handler)
+{
+	id description = nil;
+	const char *text = NULL;
+	id request_text = nil;
+
+	if (request != nil) {
+		request_text = ((id (*)(id, SEL))objc_msgSend)(request,
+		    sel_registerName("description"));
+	}
+
+	if (device != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(device,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("ctl.req[%d] request %.200s device %s: %.500s\n",
+	    getpid(), request_text != nil ?
+	    ((const char *(*)(id, SEL))objc_msgSend)(request_text,
+	    sel_registerName("UTF8String")) : "(nil)",
+	    device != nil ? class_getName(object_getClass(device)) : "(nil)",
+	    text != NULL ? text : "(nil)");
+	if (original_perform_request != NULL) {
+		original_perform_request(self, _cmd, request, device, handler);
+	}
+}
+
+static void
+hook_controller_requests(void)
+{
+	Class cls = objc_getClass("CBStackControllerBTStack");
+	Method method;
+
+	if (cls == Nil) {
+		return;
+	}
+	method = own_method(cls, "getDevicesWithFlags:error:");
+	if (method != NULL) {
+		original_get_devices = (id (*)(id, SEL, unsigned long, id *))
+		    method_setImplementation(method, (IMP)my_get_devices);
+		bt_log("ctl.hook: getDevicesWithFlags:error: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "_pairingPromptWithBTDevice:pairingType:"
+	    "pinString:flags:");
+	if (method != NULL) {
+		original_pairing_prompt = (void (*)(id, SEL, id, unsigned long,
+		    id, unsigned long))method_setImplementation(method,
+		    (IMP)my_pairing_prompt);
+		bt_log("ctl.hook: _pairingPromptWithBTDevice: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "_pairingCompletedWithBTDevice:result:");
+	if (method != NULL) {
+		original_pairing_completed = (void (*)(id, SEL, id, long))
+		    method_setImplementation(method,
+		    (IMP)my_pairing_completed);
+		bt_log("ctl.hook: _pairingCompletedWithBTDevice: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "performDeviceRequest:device:completionHandler:");
+	if (method != NULL) {
+		original_perform_request = (void (*)(id, SEL, id, id, id))
+		    method_setImplementation(method, (IMP)my_perform_request);
+		bt_log("ctl.hook: performDeviceRequest: %s\n",
+		    method_getTypeEncoding(method));
+	}
+}
+
+static void
+hook_xpc_connection(void)
+{
+	Class cls = objc_getClass("CBDaemonXPCConnection");
+	Method method;
+
+	if (cls == Nil) {
+		bt_log("xpc.hook: no CBDaemonXPCConnection\n");
+		return;
+	}
+	method = own_method(cls, "xpcReceivedMessage:");
+	if (method != NULL) {
+		original_xpc_message = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_xpc_message);
+		bt_log("xpc.hook: xpcReceivedMessage: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "xpcReceivedRequest:");
+	if (method != NULL) {
+		original_xpc_request = (void (*)(id, SEL, id, id))
+		    method_setImplementation(method, (IMP)my_xpc_request);
+		bt_log("xpc.hook: xpcReceivedRequest: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "_xpcPerformDeviceRequest:");
+	if (method != NULL) {
+		original_xpc_perform = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_xpc_perform);
+		bt_log("xpc.hook: _xpcPerformDeviceRequest: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "_xpcGetDevices:");
+	if (method != NULL) {
+		original_xpc_getdevices = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_xpc_getdevices);
+		bt_log("xpc.hook: _xpcGetDevices: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls,
+	    "_xpcCBConnection:pairingPromptWithPairingInfo:");
+	if (method != NULL) {
+		original_xpc_pair_prompt = (void (*)(id, SEL, id, id))
+		    method_setImplementation(method,
+		    (IMP)my_xpc_pair_prompt);
+		bt_log("xpc.hook: pairingPromptWithPairingInfo: %s\n",
+		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "_xpcSendReply:");
+	if (method != NULL) {
+		original_xpc_reply = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_xpc_reply);
+		bt_log("xpc.hook: _xpcSendReply: %s\n",
+		    method_getTypeEncoding(method));
 	}
 }
 
@@ -3013,6 +3445,16 @@ runtime_dump(void *context)
 		 * point that should turn an advertising report into a device is.
 		 */
 		{	Class cls = objc_getClass("CBStackControllerBTStack");
+			if (cls != Nil) {
+				dump_all_methods(cls);
+			}
+		}
+		/*
+		 * The client's requests (a scan start, a row tap) arrive on the
+		 * connection object, not on the server: its methods are where the
+		 * incoming message and the reply are paired.
+		 */
+		{	Class cls = objc_getClass("CBDaemonXPCConnection");
 			if (cls != Nil) {
 				dump_all_methods(cls);
 			}
@@ -4054,6 +4496,8 @@ mondrian_bt_init(void)
 		 */
 		hook_server_entry();
 		hook_device_found();
+		hook_xpc_connection();
+		hook_controller_requests();
 		{
 			pthread_t thread;
 
