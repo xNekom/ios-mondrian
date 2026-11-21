@@ -862,16 +862,33 @@ disable` counted in the ring, and the pane listing `B0:AC:82:15:22:3C` in the
 first capture and `C8:A6:EF:12:00:9F` a minute later -- the list refreshes in
 place instead of being wiped by a restart.
 
-The switch itself is wired and the daemon side is not: a drag on the Bluetooth
-switch reaches UIControl (the bridge probe logs `switch action controlChanged:
--> PSSwitchTableCell`) and `bluetoothd` then dies with `sig 11 ... pc 0x0 lr
-bluetoothd + 0xf3b50`, leaving no XPC message in the shim's power log -- only
-`CtrA`/`GCtI`/`UpId` and connection invalidations arrive. launchd restarts it
-and the pane recovers with its list, so the cost is the recovery, not a stuck
-radio. Control Center's Bluetooth button does not reproduce it: on iOS 16 that
-button only stops new connections ("New Bluetooth connections have been turned
-off from Control Center") and the daemon keeps its pid, which puts the fault in
-the Settings client path rather than in the power state machine. OPEN.
+The Settings switch is fixed. The drag reaches UIControl (the bridge probe logs
+`switch action controlChanged: -> PSSwitchTableCell`), and the teardown that
+follows calls the transport's notify slot at `+0x60` with a bare `br x0`
+(bluetoothd `0xf3b4c` calls `0xe6aac`, which loads `[transport + 0x60]`).
+Apple's H4 table leaves that slot NULL -- the APPLEBT and H4BC tables fill it
+with a stub that sets a state byte, and H4 has no such byte -- so the call
+landed on address 0: `sig 11 pc 0x0 far 0x0 lr bluetoothd + 0xf3b50`. The shim
+now puts a no-op in the empty slot at startup (`h4: notify slot +0x60 was NULL,
+no-op installed` in the power log). Measured 2026-11-21 on a live pane: a drag
+off shows the powered-off text ("AirDrop, AirPlay, Find My, and Location
+Services use Bluetooth"), a drag on brings back the discoverable text and the
+device list, `pid 205` serves both, and `exit bluetoothd` stays at the one
+SIGKILL the test itself sent. Control Center's Bluetooth button is separate: on
+iOS 16 it only stops new connections ("New Bluetooth connections have been
+turned off from Control Center") and keeps the pid.
+
+The list shows the address, not the device name. Measured 2026-11-21: a
+connection carries five `0x2f` events (Inquiry Result with RSSI, the EIR form,
+so `Write_Inquiry_Mode` 2 is in effect), and no `0x0419` (Remote Name Request)
+appears among the 64 packets the control can log. The LE reports are outside
+that window too, and LE Set Scan Parameters (0x200b) is the command the
+controller refuses with 0x0c while it is scanning, while the extended form
+(0x202f/0x2031) is accepted. The control therefore counts, for the whole
+connection, LE meta events, advertising and scan-response reports, inquiry
+results, name requests and both scan-enable forms, and prints the first bytes
+of the first reports: that separates a name the daemon never receives from one
+it receives and drops.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
