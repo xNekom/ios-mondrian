@@ -1130,22 +1130,22 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		bt_rnr_store(pkt, len);
 		return;
 	}
-	if (len >= 10 && pkt[1] == 0x17) {
+	if (len >= 9 && pkt[1] == 0x17) {
 		bt_power_append("link key request "
 		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
-		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4]);
+		    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3]);
 		return;
 	}
-	if (len >= 13 && pkt[1] == 0x18) {
+	if (len >= 26 && pkt[1] == 0x18) {
 		bt_power_append("link key notify "
 		    "%02x:%02x:%02x:%02x:%02x:%02x type %u\n",
-		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[10]);
+		    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3], pkt[25]);
 		return;
 	}
-	if (len >= 10 && pkt[1] == 0x16) {
+	if (len >= 9 && pkt[1] == 0x16) {
 		bt_power_append("pin request "
 		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
-		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4]);
+		    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3]);
 		return;
 	}
 	/*
@@ -1179,7 +1179,8 @@ bt_event_report(const uint8_t *pkt, size_t len)
 	}
 	if (len >= 8 && (pkt[1] == 0x2b || pkt[1] == 0x2c ||
 	    pkt[1] == 0x2d || pkt[1] == 0x2e || pkt[1] == 0x30 ||
-	    pkt[1] == 0x34)) {
+	    pkt[1] == 0x31 || pkt[1] == 0x32 || pkt[1] == 0x34 ||
+	    pkt[1] == 0x36)) {
 		size_t at;
 		char line[120];
 		int used = snprintf(line, sizeof(line), "pair evt %02x plen %u:",
