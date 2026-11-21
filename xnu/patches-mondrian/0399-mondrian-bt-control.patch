@@ -180,10 +180,10 @@ index 3c4165b..aa4607b 100755
   * ring is not reachable from its sandbox), so the driver prints the first
 diff --git a/bsd/dev/mondrian_btctl.c b/bsd/dev/mondrian_btctl.c
 new file mode 100644
-index 0000000..c86e73d
+index 0000000..1585ae1
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,1381 @@
+@@ -0,0 +1,1353 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -267,7 +267,6 @@ index 0000000..c86e73d
 +	unsigned rx_dropped;
 +	unsigned rx_filler;
 +	unsigned rx_acks;
-+	unsigned name_padded;
 +	unsigned names_added;
 +	unsigned names_noted;
 +	unsigned ext_params_pending;
@@ -681,7 +680,6 @@ index 0000000..c86e73d
 +	mondrian_btctl.rx_dropped = 0;
 +	mondrian_btctl.rx_filler = 0;
 +	mondrian_btctl.rx_acks = 0;
-+	mondrian_btctl.name_padded = 0;
 +	mondrian_btctl.names_added = 0;
 +	mondrian_btctl.names_noted = 0;
 +	mondrian_btctl.ext_params_pending = 0;
@@ -744,7 +742,7 @@ index 0000000..c86e73d
 +	unsigned legacy_enable, legacy_disable, ext_enable, ext_disable;
 +	unsigned scan_refused, scan_translated, ext_reports, rx_dropped;
 +	unsigned rx_filler, rx_acks;
-+	unsigned name_padded, names_added;
++	unsigned names_added;
 +
 +	clock_get_uptime(&now);
 +	lck_mtx_lock(&mondrian_btctl_lock);
@@ -768,7 +766,6 @@ index 0000000..c86e73d
 +	rx_dropped = mondrian_btctl.rx_dropped;
 +	rx_filler = mondrian_btctl.rx_filler;
 +	rx_acks = mondrian_btctl.rx_acks;
-+	name_padded = mondrian_btctl.name_padded;
 +	names_added = mondrian_btctl.names_added;
 +	last = mondrian_btctl.last_tx > mondrian_btctl.last_rx ?
 +	    mondrian_btctl.last_tx : mondrian_btctl.last_rx;
@@ -791,11 +788,11 @@ index 0000000..c86e73d
 +	printf("MONDRIAN BTCTL: scan le meta %u adv %u rsp %u "
 +	    "inquiry eir %u name req %u legacy %u/%u ext %u/%u "
 +	    "xlate %u ext rsp %u refused %u drop %u filler %u ack %u "
-+	    "namepad %u names %u\n",
++	    "names %u\n",
 +	    le_meta, le_adv, le_scan_rsp, inquiry_results, name_reqs,
 +	    legacy_enable, legacy_disable, ext_enable, ext_disable,
 +	    scan_translated, ext_reports, scan_refused, rx_dropped,
-+	    rx_filler, rx_acks, name_padded, names_added);
++	    rx_filler, rx_acks, names_added);
 +	return 0;
 +}
 +
@@ -893,39 +890,14 @@ index 0000000..c86e73d
 +			return 0;
 +		}
 +		/*
-+		 * Remote Name Request (0x0419) is 11 parameter bytes: BD_ADDR,
-+		 * packet type, clock offset and the page-scan repetition mode.
-+		 * bluetoothd sends 10 and the controller rejects the command,
-+		 * so no name arrives for a classic device (measured 2026-11-21,
-+		 * `name request 14 01 19 04 0a ...`). The missing byte is the
-+		 * repetition mode; R0 is what the legacy command assumes.
++		 * Remote Name Request (0x0419) takes 10 parameter bytes: BD_ADDR,
++		 * page-scan repetition mode, reserved and clock offset. The daemon
++		 * sends exactly that (`01 19 04 0a <addr> 01 00 0b fd`), so the
++		 * command is forwarded unchanged. An earlier revision appended an
++		 * eleventh byte, which the WCN7850 answered with Command Status
++		 * 0x12 (Invalid HCI Command Parameters): the name request never
++		 * left the controller while a 15-byte packet was written.
 +		 */
-+		if (len == 14 && data[0] == 0x01 && data[1] == 0x19 &&
-+		    data[2] == 0x04 && data[3] == 10) {
-+			uint8_t fixed[15];
-+			int written;
-+
-+			bcopy(data, fixed, 14);
-+			fixed[3] = 11;
-+			fixed[14] = 0x00;
-+			if (mondrian_btctl.name_padded < 4) {
-+				printf("MONDRIAN BTCTL: name request padded"
-+				    " to 11\n");
-+			}
-+			mondrian_btctl.name_padded++;
-+			lck_mtx_lock(&mondrian_btctl_tx_lock);
-+			written = mondrian_btuart_tty_write(fixed,
-+			    sizeof(fixed));
-+			lck_mtx_unlock(&mondrian_btctl_tx_lock);
-+			if (written < 0) {
-+				mondrian_btctl.tx_fails++;
-+				return EIO;
-+			}
-+			mondrian_btctl.tx_packets++;
-+			clock_get_uptime(&mondrian_btctl.last_tx);
-+			*total += (int)len;
-+			return 0;
-+		}
 +	}
 +	/*
 +	 * Everything else goes to the controller whole: the daemon's H4
