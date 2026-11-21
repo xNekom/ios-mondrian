@@ -661,6 +661,15 @@ boot each, so the three columns differ only in what changed:
   compare a second open and a frame captured mid-drag before reading that as a
   missing layer: the module materials are the ones the 0402 submission-order
   bug used to corrupt.
+- **The Settings row icons and the Wi-Fi switch draw (2026-11-22).** The
+  Settings root draws every full-colour row tile (Airplane, Wi-Fi, Bluetooth,
+  Notifications, General, Accessibility, ...), the Airplane switch draws track
+  and knob, and the Wi-Fi pane's switch draws the same way. The Wi-Fi switch is
+  the first control found that draws but does not react: neither
+  `tools/wsl/ui-switch-audit.sh 1240 480` nor a plain tap at the same point
+  changes its state, so its row is "not wired yet" rather than a drawing fault.
+  The home screen draws its icons, labels, the Messages badge, the Search pill
+  and the dock; the Photos widget shows iOS's own "No content available".
 - **The missing knob is not reproduced on the Settings switches (2026-11-21).**
   `tools/wsl/ui-switch-audit.sh 1240 848` on Airplane Mode and `1240 480` on
   the Bluetooth pane both draw the white knob in the off and the on state, and
