@@ -3513,6 +3513,140 @@ static unsigned mondrian_kl_nhooks;
 static unsigned mondrian_kl_dumps;
 static int mondrian_kl_installed;
 
+/*
+ * The panel is 480 pt wide; UIKit sizes `UIKeyboardAutomatic` for a 414 pt
+ * phone keyboard and centres it, so the automatic sits at x 33 and the 480 pt
+ * `UIKeyboardImpl` inside it is clipped at the right edge (measured 2026-11-21
+ * in the Spotlight process: UIInputSetHostView 480 -> _UIKBCompatInputView 480
+ * -> UIKeyboardAutomatic 414 at x 33 -> UIKeyboardImpl 480 ->
+ * UIKeyboardLayoutStar 480).
+ *
+ * The class clamps both `setFrame:` and `setBounds:` back to its 414 pt
+ * keyboard, so the frame is corrected through UIView's own setters after the
+ * class has seen it: bounds 480 wide with the centre at 240 leaves the
+ * automatic at x 0 and the impl where the keys are drawn. The correction runs
+ * only when the incoming frame is narrower than the window, so a settled
+ * keyboard costs nothing; correcting after the layout pass instead was
+ * measured to loop at about a hundred passes a second.
+ */
+static int mondrian_kl_defines(Class cls, const char *want);
+
+static void (*mondrian_kbf_orig_setframe)(id, SEL, CGRect);
+static void (*mondrian_uiview_setbounds)(id, SEL, CGRect);
+static void (*mondrian_uiview_setcenter)(id, SEL, CGPoint);
+static unsigned mondrian_kbf_writes;
+
+static void
+mondrian_kbf_setframe(id self, SEL cmd, CGRect frame)
+{
+	CGRect bounds;
+	CGPoint centre;
+	id window;
+	CGFloat width = 0.0;
+
+	if (mondrian_kbf_orig_setframe != NULL) {
+		mondrian_kbf_orig_setframe(self, cmd, frame);
+	}
+	window = ((id (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("window"));
+	if (window != nil) {
+		width = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("bounds")).size.width;
+	}
+	if (width < 1.0) {
+		Class screen_cls = objc_getClass("UIScreen");
+		id screen = screen_cls != Nil ?
+		    ((id (*)(id, SEL))objc_msgSend)((id)screen_cls,
+		    sel_registerName("mainScreen")) : nil;
+
+		if (screen != nil) {
+			width = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+			    sel_registerName("bounds")).size.width;
+		}
+	}
+	if (width < 1.0 || frame.size.width + 0.5 >= width ||
+	    mondrian_uiview_setbounds == NULL ||
+	    mondrian_uiview_setcenter == NULL) {
+		return;
+	}
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("bounds"));
+	centre = ((CGPoint (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("center"));
+	bounds.origin.x = 0.0;
+	bounds.size.width = width;
+	mondrian_uiview_setbounds(self, sel_registerName("setBounds:"), bounds);
+	centre.x = width / 2.0;
+	mondrian_uiview_setcenter(self, sel_registerName("setCenter:"), centre);
+	if (mondrian_kbf_writes < 8) {
+		char line[96];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KBF: keyboard widened to %.1f (%u)\n",
+		    width, mondrian_kbf_writes + 1);
+		say(line);
+	}
+	mondrian_kbf_writes++;
+}
+
+/*
+ * Installed in whichever process instantiates the class. `setFrame:` is
+ * UIView's unless the subclass overrides it, and replacing UIView's would
+ * change every view in the process, so the override is added to the subclass
+ * when it does not define one. The class's `setBounds:`/`setCenter:` clamp,
+ * so UIView's implementations are saved and called directly.
+ */
+static void
+mondrian_kbf_hook_frame(void)
+{
+	Class cls = objc_getClass("UIKeyboardAutomatic");
+	Class uiview;
+	Method method;
+	IMP imp;
+
+	if (cls == Nil) {
+		return;
+	}
+	if (mondrian_uiview_setbounds == NULL) {
+		uiview = objc_getClass("UIView");
+		if (uiview != Nil) {
+			method = class_getInstanceMethod(uiview,
+			    sel_registerName("setBounds:"));
+			mondrian_uiview_setbounds = method != NULL ?
+			    (void (*)(id, SEL, CGRect))
+			    method_getImplementation(method) : NULL;
+			method = class_getInstanceMethod(uiview,
+			    sel_registerName("setCenter:"));
+			mondrian_uiview_setcenter = method != NULL ?
+			    (void (*)(id, SEL, CGPoint))
+			    method_getImplementation(method) : NULL;
+		}
+	}
+	if (mondrian_kbf_orig_setframe != NULL) {
+		return;
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("setFrame:"));
+	if (method == NULL) {
+		return;
+	}
+	imp = method_getImplementation(method);
+	mondrian_kbf_orig_setframe = (void (*)(id, SEL, CGRect))imp;
+	if (mondrian_kl_defines(cls, "setFrame:")) {
+		method_setImplementation(method, (IMP)mondrian_kbf_setframe);
+	} else {
+		class_addMethod(cls, sel_registerName("setFrame:"),
+		    (IMP)mondrian_kbf_setframe, method_getTypeEncoding(method));
+	}
+	{
+		char line[96];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KBF: keyboard frame hooked in %s\n",
+		    getprogname());
+		say(line);
+	}
+}
+
 static void
 mondrian_kl_layout(id self, SEL cmd)
 {
@@ -3563,10 +3697,38 @@ mondrian_kl_layout(id self, SEL cmd)
 	screen_bounds = screen != nil ?
 	    ((CGRect (*)(id, SEL))objc_msgSend)(screen,
 	    sel_registerName("bounds")) : CGRectZero;
+	/*
+	 * The ancestors, up to the window: the layout itself is 480 wide at x 0
+	 * and only its conversion to the window says 33, so the offset is added
+	 * by one of these frames, not by the layout.
+	 */
+	{
+		id at = self;
+		unsigned up;
+
+		for (up = 0; up < 6 && at != nil; up++) {
+			CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(at,
+			    sel_registerName("bounds"));
+			CGRect in_win = ((CGRect (*)(id, SEL, CGRect, id))
+			    objc_msgSend)(at, sel_registerName("convertRect:toView:"),
+			    r, nil);
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN KLC[%s %d]: %u %s win %.1f,%.1f %.1fx%.1f\n",
+			    getprogname(), getpid(), up,
+			    object_getClassName(at), in_win.origin.x,
+			    in_win.origin.y, in_win.size.width,
+			    in_win.size.height);
+			say(line);
+			at = ((id (*)(id, SEL))objc_msgSend)(at,
+			    sel_registerName("superview"));
+		}
+	}
 	snprintf(line, sizeof(line),
-	    "MONDRIAN KL: %s f %.1f,%.1f %.1fx%.1f b %.1fx%.1f win %.1f,%.1f"
+	    "MONDRIAN KL[%s %d]: %s f %.1f,%.1f %.1fx%.1f b %.1fx%.1f win %.1f,%.1f"
 	    " super %s %.1f,%.1f %.1fx%.1f window %s %.1fx%.1f screen %.1fx%.1f\n",
-	    object_getClassName(self), frame.origin.x, frame.origin.y,
+	    getprogname(), getpid(), object_getClassName(self),
+	    frame.origin.x, frame.origin.y,
 	    frame.size.width, frame.size.height, bounds.size.width,
 	    bounds.size.height, in_window.origin.x, in_window.origin.y,
 	    superview != nil ? object_getClassName(superview) : "-",
@@ -3703,6 +3865,15 @@ mondrian_kl_install(void)
 	int total, i;
 	static int said, listed, ticks;
 
+	if (mondrian_kbd_mask() == 0) {
+		return;
+	}
+	/*
+	 * The frame hook runs before the layout scan's cap: the keyboard's frame
+	 * is set once, when it is presented, so it must be installed even when
+	 * every layout slot is already used.
+	 */
+	mondrian_kbf_hook_frame();
 	/*
 	 * Keep scanning until every slot is used: the classes do not all exist at
 	 * the same moment (UIKit's layout and TextUI's keyplane appear with the
@@ -3718,9 +3889,6 @@ mondrian_kl_install(void)
 		    "MONDRIAN KL: enter prog %s pid %d mask 0x%x\n",
 		    getprogname(), getpid(), mondrian_kbd_mask());
 		say(line);
-	}
-	if (mondrian_kbd_mask() == 0) {
-		return;
 	}
 	ticks++;
 	/*
@@ -3807,12 +3975,18 @@ run_watcher(void *unused)
 {
 	(void)unused;
 	for (;;) {
+		/*
+		 * The keyboard frame hooks have to exist before the first
+		 * presentation, which happens well inside the first two seconds
+		 * of a process that was just started to show a keyboard. The
+		 * probe itself only touches marker files, so it can wait.
+		 */
+		mondrian_kl_install();
 		sleep(2);
 		mondrian_run_once();
 		bluetooth_power_once();
 		bluetooth_open_pane();
 		keyboard_probe_once();
-		mondrian_kl_install();
 		proc_probe_once();
 	}
 	return NULL;

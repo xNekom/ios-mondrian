@@ -1,48 +1,48 @@
-xnu 0403: the UI hook can be injected into kbd and Spotlight, the keyboard's processes
+xnu 0403: the UI hook reaches kbd and Spotlight, the keyboard's processes
 
 The software keyboard draws correctly-sized keys (42 pt on a 48 pt pitch, the
 480 pt layout) but on its first presentation puts the ten-key row at x 37.3 pt
-instead of 3, so `p`, delete and `search` are clipped by the right edge. A later
-layout pass corrects it in place. The host is not the source: SpringBoard's
-UIKeyboardWillChangeFrameNotification reports 0,765.7 480x301, the keyboard's
-scene layer is 480x1066.7 at 0,0 and the safe area is 59,0,34,0; the offset fits
-a 512 pt scene whose 480 pt plane keeps its 3 pt margin (expected).
+instead of 3, so `p`, delete and `search` are clipped by the right edge. The
+cause is UIKit's phone keyboard width, not the host: measured 2026-11-21 in the
+Spotlight process, the chain is UIInputSetHostView 480 -> _UIKBCompatInputView
+480 -> UIKeyboardAutomatic 414 at x 33 -> UIKeyboardImpl 480 ->
+UIKeyboardLayoutStar 480, and 414 pt is the widest iPhone keyboard centred in
+the 480 pt window.
 
 Which process lays that plane out was the open question. SpringBoard registers
 the whole keyboard family (UIKeyboardLayoutStar, UIKeyboardLayout,
 TUIKeyplaneView, UIKBKeyplaneView) and instantiates none of them for the
 presented keyboard; kbd carries the input managers (TIKeyboard*) and no layout
-class at all, even after the keyboard is up; the keyboard's surfaces are created
-by the Spotlight process (`MONDRIAN SURF: Spotlight ... 1440x729`), which hosts
-the search UI and its keyboard. Bit 11 therefore gives the hook to both kbd and
-Spotlight. The bit is off in the default command line; a boot that reads the
-keyboard's own geometry adds `mondrian_ui_hook=3334` (6 | 0x100 | 0x400 | 0x800)
-with EXTRA_ARGS, and the last key wins.
+class at all, even after the keyboard is up; the keyboard is laid out in the
+Spotlight process (`MONDRIAN SURF: Spotlight ... 1440x729`), which hosts the
+search UI and its keyboard. Bit 11 therefore gives the hook to both kbd and
+Spotlight, and it is part of the default mask: mondrian_ui_hook=3334
+(6 | 0x100 | 0x400 | 0x800). The hook, not the kernel, corrects the automatic's
+frame (docs/UI_PERFORMANCE.md).
 
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 3dc87f4..3e1fdf0 100755
+index 3dc87f4..6bfe386 100755
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5679,6 +5679,18 @@ bad:
+@@ -5679,6 +5679,17 @@ bad:
   */
  #define MONDRIAN_HOOK_APP               0x400
  
 +/*
 + * kbd and Spotlight (0x800): the two processes involved in the software
-+ * keyboard. On the first presentation its ten-key row is laid out about 33 pt
-+ * right of a 480 pt screen and the last column is clipped; the host is not the
-+ * source -- SpringBoard's frame notification is 480x301 at x 0, the scene
-+ * layer is 480 wide and the safe area has no horizontal inset (measured
-+ * 2026-11-21). SpringBoard registers the layout classes and instantiates none
-+ * of them, kbd has no layout class at all, and the keyboard's surfaces are
-+ * created by the Spotlight process, so the probe has to reach both.
++ * keyboard. The keyboard is laid out in Spotlight; UIKit gives its
++ * UIKeyboardAutomatic a 414 pt phone keyboard and centres it on this 480 pt
++ * panel, which shifts the 480 pt impl to x 33 and clips the last column.
++ * SpringBoard registers the keyboard family and instantiates none of it, and
++ * kbd has no layout class, so both names carry the bit; the hook corrects the
++ * automatic's frame through UIView's setters (docs/UI_PERFORMANCE.md).
 + */
 +#define MONDRIAN_HOOK_KBD               0x800
 +
  /*
   * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
   * them there once the root turns writable, so before that, or with glblob=0,
-@@ -6110,6 +6122,12 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -6110,6 +6121,12 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("xpcproxy") - 1 &&
  	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_XPCPROXY;

@@ -361,7 +361,12 @@ MONDRIAN = Board(
              # probe file. Bit 10 (0x400) is every app in /Applications, which
              # carries the same bridge and nothing else (0402): a CGImage does
              # not cross to the window server on this port, so Settings' switch
-             # drew its track and no knob without it. 6 | 0x100 | 0x400 = 1286.
+             # drew its track and no knob without it. Bit 11 (0x800) is
+             # kbd and Spotlight, and it belongs here too: the software
+             # keyboard is laid out in Spotlight and UIKit gives its
+             # automatic 414 pt on this 480 pt panel, which clips `p`,
+             # delete and `search` on the first presentation (measured
+             # 2026-11-21). 6 | 0x100 | 0x400 | 0x800 = 3334.
              # `mondriankeepawake=0` takes both idle-timer holds off for a boot;
              # the idle timer still never fires, so the holds are the default
              # (docs/MONDIAN_PORT.md). `mondrianautolock=N` writes the root's
@@ -374,7 +379,7 @@ MONDRIAN = Board(
              # minute. The sampler (`mondriansample=`) is a diagnostic and is
              # added per experiment, not carried here: with it the line is
              # 608 bytes and the kernel refuses every reader.
-             'mondrian_ui_hook=1286 mondrian_gpu_hook=1 mondriankeepawake=1 '
+             'mondrian_ui_hook=3334 mondrian_gpu_hook=1 mondriankeepawake=1 '
              'mondrianunlock=1 '
              # bluetoothd only evaluates a serial transport when it has a local
              # Bluetooth address, and the address comes from the preference it
