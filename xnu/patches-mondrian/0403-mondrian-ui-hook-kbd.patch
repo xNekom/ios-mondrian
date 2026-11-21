@@ -1,4 +1,4 @@
-xnu 0403: the UI hook can be injected into kbd, the process that draws the keyboard
+xnu 0403: the UI hook can be injected into kbd and Spotlight, the keyboard's processes
 
 The software keyboard draws correctly-sized keys (42 pt on a 48 pt pitch, the
 480 pt layout) but on its first presentation puts the ten-key row at x 37.3 pt
@@ -6,40 +6,52 @@ instead of 3, so `p`, delete and `search` are clipped by the right edge. A later
 layout pass corrects it in place. The host is not the source: SpringBoard's
 UIKeyboardWillChangeFrameNotification reports 0,765.7 480x301, the keyboard's
 scene layer is 480x1066.7 at 0,0 and the safe area is 59,0,34,0; the offset fits
-a 512 pt scene whose 480 pt plane keeps its 3 pt margin (expected). The scene
-size is decided in kbd, which the mask does not reach, so this adds bit 11 and
-the name match for it. Bit 11 is off in the default command line; a boot that
-reads the keyboard's own geometry adds `mondrian_ui_hook=3334` (6 | 0x100 |
-0x400 | 0x800) with EXTRA_ARGS, and the last key wins.
+a 512 pt scene whose 480 pt plane keeps its 3 pt margin (expected).
+
+Which process lays that plane out was the open question. SpringBoard registers
+the whole keyboard family (UIKeyboardLayoutStar, UIKeyboardLayout,
+TUIKeyplaneView, UIKBKeyplaneView) and instantiates none of them for the
+presented keyboard; kbd carries the input managers (TIKeyboard*) and no layout
+class at all, even after the keyboard is up; the keyboard's surfaces are created
+by the Spotlight process (`MONDRIAN SURF: Spotlight ... 1440x729`), which hosts
+the search UI and its keyboard. Bit 11 therefore gives the hook to both kbd and
+Spotlight. The bit is off in the default command line; a boot that reads the
+keyboard's own geometry adds `mondrian_ui_hook=3334` (6 | 0x100 | 0x400 | 0x800)
+with EXTRA_ARGS, and the last key wins.
 
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 3dc87f4..3e1fdf0 100755
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5680,6 +5680,16 @@
+@@ -5679,6 +5679,18 @@ bad:
+  */
  #define MONDRIAN_HOOK_APP               0x400
  
- /*
-+ * kbd (0x800): the process that draws the software keyboard. On the first
-+ * presentation its ten-key row is laid out about 33 pt right of a 480 pt
-+ * screen and the last column is clipped; the host is not the source --
-+ * SpringBoard's frame notification is 480x301 at x 0, the scene layer is 480
-+ * wide and the safe area has no horizontal inset (measured 2026-11-21). The
-+ * scene the keyboard lays out in is the number to read, and it lives here.
++/*
++ * kbd and Spotlight (0x800): the two processes involved in the software
++ * keyboard. On the first presentation its ten-key row is laid out about 33 pt
++ * right of a 480 pt screen and the last column is clipped; the host is not the
++ * source -- SpringBoard's frame notification is 480x301 at x 0, the scene
++ * layer is 480 wide and the safe area has no horizontal inset (measured
++ * 2026-11-21). SpringBoard registers the layout classes and instantiates none
++ * of them, kbd has no layout class at all, and the keyboard's surfaces are
++ * created by the Spotlight process, so the probe has to reach both.
 + */
 +#define MONDRIAN_HOOK_KBD               0x800
 +
-+/*
+ /*
   * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
   * them there once the root turns writable, so before that, or with glblob=0,
-  * the path handed to a process would name a file dyld cannot open.
-@@ -6112,6 +6122,10 @@
+@@ -6110,6 +6122,12 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	} else if (imgp->ip_ndp->ni_cnd.cn_namelen == sizeof("xpcproxy") - 1 &&
+ 	    strncmp(name, "xpcproxy", sizeof("xpcproxy") - 1) == 0) {
  		wanted = MONDRIAN_HOOK_XPCPROXY;
++	} else if (wanted == 0 &&
++	    (mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "kbd") ||
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "Spotlight"))) {
++		wanted = MONDRIAN_HOOK_KBD;
  	} else if (wanted == 0 &&
  	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
-+	    "kbd")) {
-+		wanted = MONDRIAN_HOOK_KBD;
-+	} else if (wanted == 0 &&
-+	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
  	    "MobileSlideShow")) {
- 		wanted = MONDRIAN_HOOK_PHOTOS;
- 	} else if (wanted == 0 &&
