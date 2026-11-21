@@ -128,7 +128,7 @@ index 0000000..9c9d16c
 +
 +#define MONDRIAN_BTCTL_POLL_MS          10
 +#define MONDRIAN_BTCTL_RX_MAX           128
-+#define MONDRIAN_BTCTL_LOG_PACKETS      8
++#define MONDRIAN_BTCTL_LOG_PACKETS      64
 +
 +static LCK_GRP_DECLARE(mondrian_btctl_grp, "mondrian_btctl");
 +static LCK_MTX_DECLARE(mondrian_btctl_lock, &mondrian_btctl_grp);
@@ -153,7 +153,7 @@ index 0000000..9c9d16c
 +	int m;
 +
 +	m = snprintf(line, sizeof(line), "MONDRIAN BTCTL: %s %d", what, n);
-+	for (int i = 0; i < n && i < 24 && m < (int)sizeof(line) - 4; i++) {
++	for (int i = 0; i < n && i < 32 && m < (int)sizeof(line) - 4; i++) {
 +		m += snprintf(line + m, sizeof(line) - (size_t)m, " %02x",
 +		    buf[i]);
 +	}

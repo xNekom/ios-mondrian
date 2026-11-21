@@ -1,0 +1,51 @@
+xnu 0400: trace the kernel-control lookups the Bluetooth transport makes
+
+Diagnostic only. bluetoothd registers no log the host can read without the
+shim, and the shim has not been loading reliably since the transport work
+started. These three prints land in the console ring and say whether the
+daemon reaches the PF_SYSTEM path at all:
+
+- CTLIOCGINFO, with the name it asks for and the id it gets back;
+- the client's pid, control id and unit at connect, before the driver runs;
+- the driver's connect return value.
+
+`com.apple.uart.sk.bluetooth` is the name 0399 registers. A missing
+CTLIOCGINFO line means the transport was never created; an id of 0 means the
+name did not resolve; a driver connect other than 0 is the error 0399's
+callback returned. Remove this patch once the path is proven.
+
+diff --git a/bsd/kern/kern_control.c b/bsd/kern/kern_control.c
+index 539730e..fa95b48 100755
+--- a/bsd/kern/kern_control.c
++++ b/bsd/kern/kern_control.c
+@@ -563,6 +563,12 @@ ctl_bind(struct socket *so, struct sockaddr *nam, struct proc *p)
+ 	ctl_kcb_require_clearing(kcb, mtx_held);
+ 
+ 	error = ctl_setup_kctl(so, nam, p);
++	if (p != NULL) {
++		struct sockaddr_ctl *sac = (struct sockaddr_ctl *)nam;
++
++		printf("MONDRIAN KCTL: connect pid %d id %u unit %u -> %d\n",
++		    proc_pid(p), sac->sc_id, sac->sc_unit, error);
++	}
+ 	if (error) {
+ 		goto out;
+ 	}
+@@ -620,6 +626,8 @@ ctl_connect(struct socket *so, struct sockaddr *nam, struct proc *p)
+ 	socket_unlock(so, 0);
+ 	error = (*kcb->kctl->connect)(kcb->kctl->kctlref, &kcb->sac, &kcb->userdata);
+ 	socket_lock(so, 0);
++	printf("MONDRIAN KCTL: driver connect unit %u -> %d\n",
++	    kcb->sac.sc_unit, error);
+ 	if (error) {
+ 		goto end;
+ 	}
+@@ -1462,6 +1470,8 @@ ctl_ioctl(struct socket *so, u_long cmd, caddr_t data,
+ 		ctl_info.ctl_id = kctl->id;
+ 		bcopy(&ctl_info, data, sizeof(ctl_info));
+ 		error = 0;
++		printf("MONDRIAN KCTL: CTLIOCGINFO \"%s\" -> %d id %u\n",
++		    ctl_info.ctl_name, error, ctl_info.ctl_id);
+ 		break;
+ 	}
+ 
