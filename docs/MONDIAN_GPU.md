@@ -1199,6 +1199,23 @@ them has Metal. That is the path this port follows.
   check-in only for the GL extensions. The hook's static wallpaper is that still
   image and draws on the lock and home screens (measured 2026-11-19); the live
   poster remains the open part.
+- **The IOVA arena leaked the ranges it freed, and a long boot paid for it.**
+  Measured 2026-11-20 on a boot left running for three hours: 9 479
+  `MondrianGPU: gem_new 0x1400000 refused`, the first at 10 614 s of uptime,
+  with 6 GiB of RAM free and 282 GPU buffers live. Only the large requests were
+  refused (20, 10, 7, 5 MiB) -- the arena's bump pointer had reached the end of
+  the 1.75 GiB window while the 128 remembered holes still held room for the
+  small ones -- so surfaces and textures stopped being mappable and the
+  compositor fell to 1-2 frames a second with the panel showing its last frame.
+  The hole list was a bump allocator with 128 free ranges and no coalescing
+  past one neighbour: the range it could not record was dropped, so the bump
+  only moved forward. `0401` keeps the list sorted and coalesced with both
+  neighbours (1 024 entries, one per boundary between live buffers), counts
+  what it has to drop, and prints the arena's state and the refusing step with
+  every `gem_new` refusal. Read a refusal as `arena` (the window is spent),
+  `map` (the CP's table region), `memory` (the descriptor) -- the size alone
+  says nothing, and it cost an afternoon as "out of memory" while 6 GiB were
+  free.
 - **One ring, one lock.** Every `MondrianGPU` client (backboardd,
   SpringBoard, the poster extensions, mediaserverd) submits to the same CP
   ring, whose cursor, fence sequence and memptr slots are file-static in
