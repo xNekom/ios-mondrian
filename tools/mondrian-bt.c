@@ -2784,6 +2784,7 @@ qca_probe_scan(struct qca_reader *r)
 	static const uint8_t enable[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t disable[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	int status;
+	int reports = 0;
 	int waited;
 
 	status = qca_command(r, 0x2041, params, sizeof(params), 3000, NULL, 0,
@@ -2793,14 +2794,65 @@ qca_probe_scan(struct qca_reader *r)
 	    NULL);
 	bt_power_append("ext: 0x2042 enable status %d\n", status);
 	if (status == 0) {
-		for (waited = 0; waited < 1000 && r->len < 3; waited += 20) {
-			if (qca_read_more(r, 20) <= 0) {
-				break;
+		for (waited = 0; waited < 3000 && reports < 4; waited += 20) {
+			size_t total;
+			uint8_t *p;
+			char name[40];
+			size_t n;
+
+			if (r->len < 3) {
+				if (qca_read_more(r, 20) <= 0) {
+					break;
+				}
+				continue;
 			}
-		}
-		if (r->len >= 3) {
-			bt_power_append("ext: first event %02x %02x %02x\n",
-			    r->buf[0], r->buf[1], r->buf[2]);
+			if (r->buf[0] == 0x04 && r->buf[1] == 0x3e &&
+			    r->buf[2] >= 2 && r->buf[3] == 0x0d) {
+				total = 3 + (size_t)r->buf[2];
+				if (r->len < total) {
+					if (qca_read_more(r, 20) <= 0) {
+						break;
+					}
+					continue;
+				}
+				reports++;
+				p = r->buf + 4;   /* num, event type, address... */
+				name[0] = '\0';
+				if (p[0] >= 1 && total >= 4 + 26) {
+					const uint8_t *data = p + 25;
+					size_t dlen = p[24];
+					size_t at = 0;
+
+					while (at + 1 < dlen) {
+						size_t len = data[at];
+						uint8_t type;
+
+						if (len == 0 || at + 1 + len > dlen) {
+							break;
+						}
+						type = data[at + 1];
+						if ((type == 0x08 || type == 0x09) &&
+						    len > 1) {
+							n = len - 1;
+							if (n > sizeof(name) - 1) {
+								n = sizeof(name) - 1;
+							}
+							memcpy(name, data + at + 2, n);
+							name[n] = '\0';
+							break;
+						}
+						at += 1 + len;
+					}
+					bt_power_append(
+					    "ext: report %02x:%02x:%02x:%02x:%02x:%02x name \"%s\"\n",
+					    p[9], p[8], p[7], p[6], p[5], p[4],
+					    name);
+				}
+				qca_drop(r, total);
+			} else {
+				/* not an extended report: drop one byte and resync */
+				qca_drop(r, 1);
+			}
 		}
 	}
 	status = qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
