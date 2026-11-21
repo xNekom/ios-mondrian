@@ -1199,9 +1199,11 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   the reverse drag turned it back, and the state survived a Preferences
   relaunch. Control Center's own controls take a plain tap -- its Bluetooth
   toggle put up the iOS 16 "Disconnecting Bluetooth Accessories Until Tomorrow"
-  alert. The Settings > Bluetooth switch does not follow the same drag while
-  the manager keeps the radio up; that is a Bluetooth finding, not a drawing
-  one. `tools/wsl/verify-local-switch.sh` runs the tap/drag comparison.
+  alert. The Settings > Bluetooth switch takes the same drag and raises iOS
+  16's "Turn off Bluetooth?" alert, but confirming it leaves the Inquiry
+  cadence unbroken (`docs/MONDIAN_WIRELESS.md`): the gesture path is not the
+  fault, and the pane's dimmed title or spinner is the manager's state, not the
+  radio's. `tools/wsl/verify-local-switch.sh` runs the tap/drag comparison.
 - **Settings rows are 108 px tall and the list shifts when the large title
   collapses.** Measured 2026-11-21: a tap 3 px into the General/Control Center
   boundary opened General, and after a pane was dismissed the same y landed on

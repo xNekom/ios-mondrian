@@ -823,6 +823,31 @@ launchd refuses the spawn, and its own error does reach the ring as
 place to look when a job silently does not run. The redirection therefore has
 to be a job key (`StandardErrorPath`) rather than a wrapper.
 
+### The switch, the scan and the 16 s cycle (measured)
+
+The Settings switch reaches the app, not the controller. Measured 2026-11-21
+with the pane open: a 120 ms drag on the switch raises iOS 16's "Turn off
+Bluetooth?" alert, so the action does run; confirming **Turn Off** leaves the
+title dimmed and a spinner where the switch was, but the HCI Inquiry keeps its
+cadence without a gap (… 2389, 2405, 2422, 2438, 2454 s, one every ~16 s), and
+the pane is back to On within a minute. The model changes; the radio does not.
+
+The 16 s cycle is the daemon's, not the control's: `mondrian_btctl_connect`
+refuses a second client with `EBUSY` (no "connect refused" appears in the log)
+and the poll only re-arms itself, so nothing in the driver closes the socket.
+Each reopen starts with an HCI Reset and a full init burst (Write Scan Enable 0,
+class of device, local name, IAC, Inquiry), which is why a device the pane
+listed once (`B0:AC:82:15:22:3C`, 4:35) is gone in the next cycle. The pane
+swaps the switch for a spinner during those transitions, so a drag that lands
+in the window logs nothing; repeat it.
+
+Reproduce: `tools/wsl/verify-bt-power-cycle.sh` drags the switch, confirms Turn
+Off and prints the Inquiry seconds around it; `tools/wsl/trace-bt-power.sh`
+prints the transport and init events after the drag marker; and
+`tools/wsl/probe-switch-actions.sh` logs UIControl actions through the bridge
+probe at `/private/var/vm/bridge-switch-probe` (the action line can precede the
+kernel's touch marker, so do not read the two as ordered).
+
 ## What other ports teach
 
 | Project | What it does | Lesson for mondrian |
