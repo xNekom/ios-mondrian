@@ -1148,9 +1148,38 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4]);
 		return;
 	}
+	/*
+	 * User Confirmation Request (0x33): the numeric comparison value both
+	 * sides display, which the host answers with 0x042c once the user
+	 * presses Pair. bluetoothd has no pairing client, so nothing answers,
+	 * the controller repeats the event and then drops the link with
+	 * disconnect 0x16. The shim is the only party here that can act as that
+	 * client, so it logs the six-digit value and sends the reply on the
+	 * same control socket the daemon uses; 0x042c with no parameters beyond
+	 * the address is the accept path, the same result as the tap.
+	 */
+	if (len >= 13 && pkt[1] == 0x33) {
+		uint8_t reply[10];
+		uint32_t value = (uint32_t)pkt[9] | ((uint32_t)pkt[10] << 8) |
+		    ((uint32_t)pkt[11] << 16) | ((uint32_t)pkt[12] << 24);
+		ssize_t written;
+
+		if (control_socket_fd < 0) {
+			bt_power_append("pair confirm: no control socket\n");
+			return;
+		}
+		memcpy(reply, "\x01\x2c\x04\x06", 4);
+		memcpy(reply + 4, pkt + 3, 6);
+		written = (ssize_t)syscall(SYS_write, control_socket_fd, reply,
+		    sizeof(reply));
+		bt_power_append("pair confirm %02x:%02x:%02x:%02x:%02x:%02x "
+		    "value %u -> %zd\n", pkt[8], pkt[7], pkt[6], pkt[5], pkt[4],
+		    pkt[3], value, written);
+		return;
+	}
 	if (len >= 8 && (pkt[1] == 0x2b || pkt[1] == 0x2c ||
 	    pkt[1] == 0x2d || pkt[1] == 0x2e || pkt[1] == 0x30 ||
-	    pkt[1] == 0x33 || pkt[1] == 0x34)) {
+	    pkt[1] == 0x34)) {
 		size_t at;
 		char line[120];
 		int used = snprintf(line, sizeof(line), "pair evt %02x plen %u:",
@@ -1544,15 +1573,32 @@ my_write(int fd, const void *buf, size_t len)
 
 			/*
 			 * The daemon answers the controller's IO Capability
-			 * Request (event 0x2b) with 0x042b. Its capability byte
-			 * is 0x01 (DisplayYesNo), which is why the controller
-			 * raises User Passkey Notification (0x33) instead of
-			 * Just Works. Rewriting it to 0x03 was tried and made no
-			 * difference (measured 2026-11-21: still 0x33), so the
-			 * byte is only logged.
+			 * Request with 0x042b, capability 0x01 (DisplayYesNo),
+			 * so the controller runs numeric comparison and raises
+			 * User Confirmation Request (0x33) three times. Neither
+			 * the app nor this port has a pairing alert to press
+			 * Pair on, so the controller gives up and bluetoothd
+			 * drops the link (disconnect 0x16). iOS shows that alert;
+			 * without it the only association model that needs no
+			 * user on either side is Just Works, which the remote
+			 * also accepts with no prompt. Rewrite the capability to
+			 * 0x03 (NoInputNoOutput) and clear the MITM bit in the
+			 * authentication requirements; the controller then
+			 * completes the pairing on its own.
 			 */
-			if (opcode == 0x042b && len >= 11) {
-				bt_power_append("io cap %02x\n", p[10]);
+			if (opcode == 0x042b && len >= 13) {
+				uint8_t fixed[13];
+
+				memcpy(fixed, p, sizeof(fixed));
+				bt_power_append("io cap %02x oob %02x auth %02x\n",
+				    p[10], p[11], p[12]);
+				fixed[10] = 0x03;
+				fixed[12] = (uint8_t)(p[12] & ~0x01);
+				bt_power_append("io cap rewritten to %02x auth %02x\n",
+				    fixed[10], fixed[12]);
+				log_hci_write("hci write", fixed, sizeof(fixed));
+				return (ssize_t)syscall(SYS_write, fd, fixed,
+				    sizeof(fixed));
 			}
 			if (opcode == 0x0401 || opcode == 0x0402 ||
 			    opcode == 0x0405 || opcode == 0x0409 ||
