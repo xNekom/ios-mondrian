@@ -2232,6 +2232,7 @@ static void
 trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices, GLint first, GLsizei count)
 {
 	float low[2] = { 1e9f, 1e9f }, high[2] = { -1e9f, -1e9f }, colour[4] = { 0, 0, 0, 0 }, where[2] = { 0, 0 };
+	float where_last[2] = { 0, 0 }, where_low[2] = { 1e9f, 1e9f }, where_high[2] = { -1e9f, -1e9f };
 	GLint blend[2] = { 0, 0 }, scissor[4] = { 0, 0, 0, 0 };
 	char textures[256] = "";
 	size_t used = 0;
@@ -2251,17 +2252,29 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 			low[axis] = place[axis] < low[axis] ? place[axis] : low[axis];
 			high[axis] = place[axis] > high[axis] ? place[axis] : high[axis];
 		}
-		if (i == 0) {
-			if (e->arrays[1].pointer != NULL && e->arrays[1].type == GL_HALF_FLOAT) {
-				uint16_t halves[4];
+		if (i == 0 && e->arrays[1].pointer != NULL && e->arrays[1].type == GL_HALF_FLOAT) {
+			uint16_t halves[4];
 
-				memcpy(halves, (const uint8_t *)e->arrays[1].pointer + (size_t)vertex * (size_t)e->arrays[1].stride, 8);
-				for (unsigned part = 0; part < 4; part++) {
-					colour[part] = half_float(halves[part]);
-				}
+			memcpy(halves, (const uint8_t *)e->arrays[1].pointer + (size_t)vertex * (size_t)e->arrays[1].stride, 8);
+			for (unsigned part = 0; part < 4; part++) {
+				colour[part] = half_float(halves[part]);
 			}
-			if (e->arrays[2].pointer != NULL && e->arrays[2].type == GL_FLOAT) {
-				memcpy(where, (const uint8_t *)e->arrays[2].pointer + (size_t)vertex * (size_t)e->arrays[2].stride, 8);
+		}
+		if (e->arrays[2].pointer != NULL && e->arrays[2].type == GL_FLOAT) {
+			float tc[2];
+
+			memcpy(tc, (const uint8_t *)e->arrays[2].pointer + (size_t)vertex * (size_t)e->arrays[2].stride, 8);
+			for (unsigned axis = 0; axis < 2; axis++) {
+				where_low[axis] = tc[axis] < where_low[axis] ? tc[axis] : where_low[axis];
+				where_high[axis] = tc[axis] > where_high[axis] ? tc[axis] : where_high[axis];
+			}
+			if (i == 0) {
+				where[0] = tc[0];
+				where[1] = tc[1];
+			}
+			if (i == count - 1 || i == 95) {
+				where_last[0] = tc[0];
+				where_last[1] = tc[1];
 			}
 		}
 	}
@@ -2315,6 +2328,37 @@ trace_placed_draw(struct eagl *e, GLenum mode, GLenum type, const void *indices,
 	    (double)high[0], (double)high[1], e->program, textures, (double)colour[0], (double)colour[1], (double)colour[2],
 	    (double)colour[3], (double)where[0], (double)where[1], glIsEnabled(GL_BLEND) ? "on" : "off", blend[0], blend[1],
 	    glIsEnabled(GL_SCISSOR_TEST) ? "on" : "off", scissor[0], scissor[1], scissor[2], scissor[3]);
+	/*
+	 * The capture's own numbers: CoreAnimation's texmat0 is the scale and
+	 * offset it applies to the vertex texture coordinates, and the corners'
+	 * range says whether those arrive normalized or counted in pixels.
+	 * Between them they say which space the capture is sampled in.
+	 */
+	if (e->program != 0) {
+		GLfloat texmat[4] = { 0, 0, 0, 0 };
+		GLint location = glGetUniformLocation(e->program, "texmat0");
+
+		if (location >= 0) {
+			glGetUniformfv(e->program, location, texmat);
+			say("gl-at:     texcoords %g,%g to %g,%g; texmat0 %g %g %g %g\n",
+			    (double)where_low[0], (double)where_low[1], (double)where_high[0], (double)where_high[1],
+			    (double)texmat[0], (double)texmat[1], (double)texmat[2], (double)texmat[3]);
+		}
+	} else {
+		GLfloat size[2] = { 0, 0 }, textured = -1;
+		GLint ls = e->plain != 0 ? glGetUniformLocation(e->plain, "texture_size") : -1;
+		GLint lt = e->plain != 0 ? glGetUniformLocation(e->plain, "textured") : -1;
+
+		if (ls >= 0) {
+			glGetUniformfv(e->plain, ls, size);
+		}
+		if (lt >= 0) {
+			glGetUniformfv(e->plain, lt, &textured);
+		}
+		say("gl-at:     plain texcoords %g,%g to %g,%g; texture_size %g,%g; textured %g\n",
+		    (double)where_low[0], (double)where_low[1], (double)where_high[0], (double)where_high[1],
+		    (double)size[0], (double)size[1], (double)textured);
+	}
 }
 
 /* gltrace_look: the pixel a listed draw has left in the middle of itself (the matrix is CoreAnimation's, the last it gave). */
@@ -2340,6 +2384,32 @@ trace_placed_look(struct eagl *e)
 	glReadPixels(px, py, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
 	say("gl-at:     it left %u %u %u %u (red green blue alpha) at %d,%d of the framebuffer%s\n", pixel[0], pixel[1], pixel[2],
 	    pixel[3], px, py, glGetError() ? " (not readable)" : "");
+	/*
+	 * The place's own centre, after every listed draw, when it changes: the
+	 * module backdrop glitch is painted once and then only copied, so the
+	 * draw that paints it is found by watching one point of it.
+	 */
+	{
+		static uint8_t last[4];
+		float fx = (trace_place[0] + trace_place[2]) / 2;
+		float fy = (trace_place[1] + trace_place[3]) / 2;
+		float cx = m[0] * fx + m[4] * fy + m[12];
+		float cy = m[1] * fx + m[5] * fy + m[13];
+		float cw = m[3] * fx + m[7] * fy + m[15];
+		uint8_t at[4] = { 0, 0, 0, 0 };
+
+		if (cw != 0) {
+			int qx = view[0] + (int)((cx / cw + 1) / 2 * (float)view[2]);
+			int qy = view[1] + (int)((cy / cw + 1) / 2 * (float)view[3]);
+
+			glReadPixels(qx, qy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, at);
+			if (memcmp(at, last, sizeof(at)) != 0) {
+				memcpy(last, at, sizeof(last));
+				say("gl-at:     the place at %d,%d holds %u %u %u %u after draw %u\n", qx, qy, at[0], at[1],
+				    at[2], at[3], e->draws);
+			}
+		}
+	}
 	/*
 	 * Eight pixels in a row, of the framebuffer and of the first texture the draw
 	 * sampled: a picture that comes out in fine vertical stripes either holds them
@@ -3774,15 +3844,17 @@ static int fetch_flush_on = 1;
 static unsigned fetch_flushes_told;
 
 /*
- * glflushdraws=0 (the default): nothing.
+ * glflushdraws=0: nothing (what the port shipped until 2026-11-21).
  * glflushdraws=1: end the submission before every draw, which is the valve for a frame whose
  *   pieces read pixels another draw wrote and see the old ones (a black band where the lock
  *   screen's clock was, a blurred strip built of pieces of an older frame).
- * glflushdraws=2: only before a draw that samples the texture it draws into, which is what
- *   CoreAnimation does when it takes the picture it has just made (the strip it blurs, the
- *   group it flattens) -- one submit for those, not for every draw.
+ * glflushdraws=2 (the default): only before a draw that samples a texture written since the last
+ *   submit, or whose shader reads the picture it draws into. Measured 2026-11-21: with 0 the
+ *   Control Center's module backdrop captured the frame before it -- the wallpaper where the
+ *   Bluetooth pane should be, a sheared cyan block -- and the media module's next glyph was a blue
+ *   blob. With 2 both are drawn correctly and the Control Center's frames stay at 12-17 ms.
  */
-static int flush_draws;
+static int flush_draws = 2;
 
 static void
 flush_before_draw(struct eagl *e)
@@ -4746,6 +4818,111 @@ my_glCopyTexSubImage2D(void *context, GLenum target, GLint level, GLint x0, GLin
 	}
 	glCopyTexSubImage2D(target, level, x0, y0, x, y, width, height);
 	EAGL_LEAVE(e, MONDIAN_GL_COPY_TEX_SUB_IMAGE_2D);
+}
+
+/*
+ * CoreAnimation's own renderer reaches some of its full-screen quads through the
+ * instanced entry points. They were left as generated forwarders, so those
+ * draws never met plain_draw_begin()/group_draw_begin(), never appeared in a
+ * trace, and drew with whatever program was current: a material whose backdrop
+ * is one of them samples a picture nobody set up. Measured 2026-11-21: the
+ * Control Center's module backdrop is such a quad, and this is the path it
+ * takes. One instance is what CoreAnimation uses; more are passed through.
+ */
+static void
+my_glDrawArraysInstancedEXT(void *context, GLenum mode, GLint first, GLsizei count, GLsizei instances)
+{
+	struct eagl *e = eagl_resolve(context);
+	GLint enabled[4] = { 1, 1, 1, 1 };
+	bool plain;
+
+	EAGL_ENTER(e, MONDIAN_GL_DRAW_ARRAYS_INSTANCED);
+	bind_nothing(e);
+	draw_reads_icon(e);
+	drawing(e);
+	count_spans(e, mode, count);
+	e->draws++;
+	e->triangles += triangles_of(mode, count) * (unsigned)(instances > 0 ? instances : 1);
+	if (eagl_tracing) {
+		eagl_trace("glDrawArraysInstancedEXT(%#x, %d, %d, %d)\n", mode, first, count, instances);
+		trace_draw(e, 0, NULL, first, count);
+	}
+	if (trace_placing) {
+		trace_placed_draw(e, mode, 0, NULL, first, count);
+	}
+	flush_before_draw(e);
+	if (group_draw_begin(e, enabled)) {
+		glDrawArraysInstancedEXT(mode, first, count, instances);
+		group_draw_end(e, enabled);
+	} else {
+		plain = plain_draw_begin(e, enabled);
+		if (plain && e->reads_picture) {
+			fetch_flush(e);
+		}
+		glDrawArraysInstancedEXT(mode, first, count, instances);
+		if (plain) {
+			plain_draw_end(e, enabled);
+		}
+		if (!(plain && e->reads_picture)) {
+			e->picture_read = false;
+		}
+	}
+	if (trace_listed) {
+		trace_placed_look(e);
+	}
+	EAGL_LEAVE(e, MONDIAN_GL_DRAW_ARRAYS_INSTANCED);
+	if (eagl_tracing) {
+		trace_pixels(e);
+	}
+}
+
+static void
+my_glDrawElementsInstancedEXT(void *context, GLenum mode, GLsizei count, GLenum type, const void *indices,
+    GLsizei instances)
+{
+	struct eagl *e = eagl_resolve(context);
+	GLint enabled[4] = { 1, 1, 1, 1 };
+	bool plain;
+
+	EAGL_ENTER(e, MONDIAN_GL_DRAW_ELEMENTS_INSTANCED);
+	bind_nothing(e);
+	draw_reads_icon(e);
+	dump_draw_state();
+	drawing(e);
+	count_spans(e, mode, count);
+	e->draws++;
+	e->triangles += triangles_of(mode, count) * (unsigned)(instances > 0 ? instances : 1);
+	if (eagl_tracing) {
+		eagl_trace("glDrawElementsInstancedEXT(%#x, %d, %#x, %p, %d)\n", mode, count, type, indices, instances);
+		trace_draw(e, type, indices, 0, count);
+	}
+	if (trace_placing) {
+		trace_placed_draw(e, mode, type, indices, 0, count);
+	}
+	flush_before_draw(e);
+	if (group_draw_begin(e, enabled)) {
+		glDrawElementsInstancedEXT(mode, count, type, indices, instances);
+		group_draw_end(e, enabled);
+	} else {
+		plain = plain_draw_begin(e, enabled);
+		if (plain && e->reads_picture) {
+			fetch_flush(e);
+		}
+		glDrawElementsInstancedEXT(mode, count, type, indices, instances);
+		if (plain) {
+			plain_draw_end(e, enabled);
+		}
+		if (!(plain && e->reads_picture)) {
+			e->picture_read = false;
+		}
+	}
+	if (trace_listed) {
+		trace_placed_look(e);
+	}
+	EAGL_LEAVE(e, MONDIAN_GL_DRAW_ELEMENTS_INSTANCED);
+	if (eagl_tracing) {
+		trace_pixels(e);
+	}
 }
 
 static void

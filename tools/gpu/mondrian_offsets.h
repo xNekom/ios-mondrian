@@ -86,6 +86,8 @@
 #define MONDIAN_GL_DELETE_TEXTURES              0x1e0
 #define MONDIAN_GL_DRAW_ARRAYS                  0x210
 #define MONDIAN_GL_DRAW_ELEMENTS                0x220
+#define MONDIAN_GL_DRAW_ARRAYS_INSTANCED        0x17d8
+#define MONDIAN_GL_DRAW_ELEMENTS_INSTANCED      0x17e0
 #define MONDIAN_GL_FINISH                       0x2d0
 #define MONDIAN_GL_FLUSH                        0x2d8
 #define MONDIAN_GL_GET_INTEGERV                 0x348

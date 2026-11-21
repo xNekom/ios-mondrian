@@ -266,8 +266,8 @@
 0x17a0  glBlitFramebuffer
 0x17a8  glRenderbufferStorageMultisample
 0x17c0  glGetAttachedShaders
-0x17d8  glDrawArraysInstancedEXT
-0x17e0  glDrawElementsInstancedEXT
+0x17d8  glDrawArraysInstancedEXT               hand  MONDIAN_GL_DRAW_ARRAYS_INSTANCED
+0x17e0  glDrawElementsInstancedEXT             hand  MONDIAN_GL_DRAW_ELEMENTS_INSTANCED
 0x1808  glBindVertexArray
 0x1810  glDeleteVertexArrays
 0x1818  glGenVertexArrays
