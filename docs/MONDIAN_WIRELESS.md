@@ -823,30 +823,65 @@ launchd refuses the spawn, and its own error does reach the ring as
 place to look when a job silently does not run. The redirection therefore has
 to be a job key (`StandardErrorPath`) rather than a wrapper.
 
-### The switch, the scan and the 16 s cycle (measured)
+### The switch, the scan and the daemon's exit chain (measured)
 
 The Settings switch reaches the app, not the controller. Measured 2026-11-21
 with the pane open: a 120 ms drag on the switch raises iOS 16's "Turn off
-Bluetooth?" alert, so the action does run; confirming **Turn Off** leaves the
-title dimmed and a spinner where the switch was, but the HCI Inquiry keeps its
-cadence without a gap (… 2389, 2405, 2422, 2438, 2454 s, one every ~16 s), and
-the pane is back to On within a minute. The model changes; the radio does not.
+Bluetooth?" alert, so the action does run. While the daemon was still exiting
+every 16 s, confirming **Turn Off** left the title dimmed and a spinner where
+the switch was, while the HCI Inquiry kept its cadence without a gap (… 2389,
+2405, 2422, 2438, 2454 s); the model changed and the radio did not. That
+symptom was the restart cycle below, not the switch.
 
-The 16 s cycle is the daemon's, not the control's: `mondrian_btctl_connect`
-refuses a second client with `EBUSY` (no "connect refused" appears in the log)
-and the poll only re-arms itself, so nothing in the driver closes the socket.
-Each reopen starts with an HCI Reset and a full init burst (Write Scan Enable 0,
-class of device, local name, IAC, Inquiry), which is why a device the pane
-listed once (`B0:AC:82:15:22:3C`, 4:35) is gone in the next cycle. The pane
-swaps the switch for a spinner during those transitions, so a drag that lands
-in the window logs nothing; repeat it.
+`bluetoothd` exited with status 1 about every 16 s because it treats each
+refused HCI command as fatal. Its plist carries `KeepAlive.SuccessfulExit=false`,
+so launchd restarted it, and every restart began with an HCI Reset and the full
+init burst (Write Scan Enable 0, class of device, local name, IAC, Inquiry),
+which is why a device the pane listed once (`B0:AC:82:15:22:3C`, 4:35) was gone
+in the next cycle.
 
-Reproduce: `tools/wsl/verify-bt-power-cycle.sh` drags the switch, confirms Turn
-Off and prints the Inquiry seconds around it; `tools/wsl/trace-bt-power.sh`
-prints the transport and init events after the drag marker; and
+The vendor commands are answered in the kernel control, not in the user-space
+shim. The shim's injected completion sits in its own buffer until the daemon
+calls `read()` again, and the daemon waits on a dispatch source that only fires
+when the socket is readable, so the command times out anyway (measured
+2026-11-21: the shim answered 0xfce9 and the daemon still exited 15 s later).
+`mondrian_btctl_send` (`0399`) recognises these commands and replies with
+`ctl_enqueuedata`, which makes the socket readable: 0xfce9 and 0xfce2 get a
+success (0xfce2 carries two zero bytes, the smallest payload the Broadcom
+parser accepts, as the 0x15 case in `tools/mondrian-bt.c` showed). 0x200b is
+answered with success every time and never reaches the controller: the
+controller keeps whatever scan parameters it already has, and BR/EDR inquiry --
+what discovery uses -- does not depend on the command. 0x200c is answered for
+both values: the controller refuses the enable and the disable alike in this
+state, so the LE scan control the daemon sees is virtual and the controller
+keeps its own.
+
+Measured 2026-11-21 after that: one `bluetoothd` pid for the whole minute,
+zero `exit bluetoothd`, `0x200b answered` and `0x200c enable` and `0x200c
+disable` counted in the ring, and the pane listing `B0:AC:82:15:22:3C` in the
+first capture and `C8:A6:EF:12:00:9F` a minute later -- the list refreshes in
+place instead of being wiped by a restart.
+
+The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
+(truncated on each start). The `_exit` interposer writes
+`mondrian-bt-exit.log` instead, truncated on every exit so it always holds the
+newest one: status, x19/x20 resolved as text, a backtrace, and the last 16 HCI
+writes and reads with their bytes. That ring is what identified 0x200b -- the
+kernel's own packet log keeps only the first 64 packets of a connection
+(`MONDRIAN_BTCTL_LOG_PACKETS`), so it had shown the start of a run, not its
+end.
+
+Reproduce: `tools/wsl/verify-bt-stable.sh` opens the pane and compares two
+dumps a minute apart (one pid, no new exits, the three answers counted);
+`tools/wsl/verify-bt-power-cycle.sh` drags the switch, confirms Turn Off and
+prints the Inquiry seconds around it; `tools/wsl/trace-bt-power.sh` prints the
+transport and init events after the drag marker;
 `tools/wsl/probe-switch-actions.sh` logs UIControl actions through the bridge
 probe at `/private/var/vm/bridge-switch-probe` (the action line can precede the
-kernel's touch marker, so do not read the two as ordered).
+kernel's touch marker, so do not read the two as ordered);
+`tools/wsl/bt-job-info.sh` prints the plist keys, `tools/wsl/bt-exit-reason.sh`
+rebuilds the shim, deploys it and prints the newest exit report, and
+`tools/wsl/bt-last-hci.sh` shows the last HCI exchange before an exit.
 
 ## What other ports teach
 
