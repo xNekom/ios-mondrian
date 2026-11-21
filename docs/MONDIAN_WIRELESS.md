@@ -928,16 +928,28 @@ device hooks (`_reportDeviceFound:`, `_stackClassicScannerDeviceFound:`,
 `_stackBLEScannerDeviceFound:`, `_stackDeviceMonitorDeviceFound:`,
 `_whbDiscoveryDeviceFound:`), all installed and silent. The daemon's outgoing XPC
 messages are logged (`xpc.dev` in the power log), which is where the empty
-array is visible. The loss is therefore between the report read and the device map,
-upstream of both the name reply and pairing; the EIR bridge above is a separate
-source and no longer the blocker.
+array is visible.
+
+The empty list is the classic scanner being off, not a broken report path.
+`_stackClassicScannerShouldRun` and `_stackBLEScannerShouldRun` both answer 0
+while the pane is open; the LE scan the control sees (`scan params type 1`) is
+the client-driven one and does not fill the daemon's device map. Forcing
+`_stackClassicScannerShouldRun` to 1 makes the daemon send HCI Inquiry
+(`hci req 0401 len 9`) and a classic row appears in the pane on its address,
+`B0:AC:82:15:22:3C`. The row leaves when the forced scan cycles, and it still
+draws the address although the probe decoded `DIGI R2A` from its EIR, so the
+name and the client/daemon discovery handshake remain open. This is upstream
+of both the name reply and pairing; the EIR bridge above is a separate source
+and no longer the blocker.
 
 Pairing has never been exercised. Measured 2026-11-21: a tap on the discovered
 row of a real peer (`C8:A6:EF:12:00:9F`, a TV) reaches SpringBoard
 (`MONDRIAN HID: touch 0 down at 2500,4440`) and produces no HCI connection
-attempt — no `0x0401`, no pairing dialog, and the pane does not change — so the
-daemon does not act on the row as it stands. The row's action is part of what
-the daemon's device entry needs, together with the name.
+attempt, no pairing dialog, and the pane does not change. `0x0401` is HCI
+Inquiry, not pairing; Create Connection is `0x0405`, and no such command was
+seen either. The row's action is part of what the daemon's device entry needs,
+together with the name, and the discovery handshake above has to be stable
+before the tap can be exercised.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
