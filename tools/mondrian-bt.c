@@ -943,6 +943,71 @@ struct bt_rnr_name {
 static struct bt_rnr_name bt_rnr_names[BT_RNR_NAMES];
 static unsigned bt_rnr_count;
 
+/*
+ * The resolved name has to outlive bluetoothd: the daemon restarts on every
+ * stack error, and without the cache the pane falls back to the address
+ * (`A8:41:F4:2C:C2:35`) until a row tap runs a fresh Remote Name Request. The
+ * file keeps the addresses and names the controller reported.
+ */
+static int bt_rnr_loaded;
+
+static void
+bt_rnr_load(void)
+{
+	FILE *fp;
+	char line[128];
+	unsigned slot = 0;
+
+	if (bt_rnr_loaded) {
+		return;
+	}
+	bt_rnr_loaded = 1;
+	fp = fopen("/private/var/mobile/Library/Preferences/mondrian-bt-names",
+	    "r");
+	if (fp == NULL) {
+		return;
+	}
+	while (slot < BT_RNR_NAMES && fgets(line, sizeof(line), fp) != NULL) {
+		unsigned b[6];
+		char name[sizeof(bt_rnr_names[0].name)];
+		int i;
+
+		if (sscanf(line, "%x:%x:%x:%x:%x:%x %63[^\n]", &b[0], &b[1],
+		    &b[2], &b[3], &b[4], &b[5], name) != 7) {
+			continue;
+		}
+		for (i = 0; i < 6; i++) {
+			bt_rnr_names[slot].addr[i] = (uint8_t)b[i];
+		}
+		snprintf(bt_rnr_names[slot].name,
+		    sizeof(bt_rnr_names[slot].name), "%s", name);
+		slot++;
+	}
+	bt_rnr_count = (unsigned)slot;
+	fclose(fp);
+}
+
+static void
+bt_rnr_save(void)
+{
+	FILE *fp;
+	unsigned slot;
+
+	fp = fopen("/private/var/mobile/Library/Preferences/mondrian-bt-names",
+	    "w");
+	if (fp == NULL) {
+		return;
+	}
+	for (slot = 0; slot < BT_RNR_NAMES && slot < bt_rnr_count; slot++) {
+		fprintf(fp, "%02x:%02x:%02x:%02x:%02x:%02x %s\n",
+		    bt_rnr_names[slot].addr[0], bt_rnr_names[slot].addr[1],
+		    bt_rnr_names[slot].addr[2], bt_rnr_names[slot].addr[3],
+		    bt_rnr_names[slot].addr[4], bt_rnr_names[slot].addr[5],
+		    bt_rnr_names[slot].name);
+	}
+	fclose(fp);
+}
+
 static void
 bt_rnr_store(const uint8_t *pkt, size_t len)
 {
@@ -965,11 +1030,13 @@ bt_rnr_store(const uint8_t *pkt, size_t len)
 	if (used == 0) {
 		return;
 	}
+	bt_rnr_load();
 	slot = bt_rnr_count % BT_RNR_NAMES;
 	memcpy(bt_rnr_names[slot].addr, pkt + 4, 6);
 	snprintf(bt_rnr_names[slot].name, sizeof(bt_rnr_names[slot].name),
 	    "%s", text);
 	bt_rnr_count++;
+	bt_rnr_save();
 	bt_power_append("rnr.name[%d] %02x:%02x:%02x:%02x:%02x:%02x %s\n",
 	    getpid(), pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], text);
 }
@@ -986,6 +1053,7 @@ bt_rnr_lookup(const char *addr)
 	    &b[4], &b[5]) != 6) {
 		return NULL;
 	}
+	bt_rnr_load();
 	for (slot = 0; slot < BT_RNR_NAMES && slot < bt_rnr_count; slot++) {
 		for (i = 0; i < 6; i++) {
 			if (bt_rnr_names[slot].addr[i] != (uint8_t)b[5 - i]) {
