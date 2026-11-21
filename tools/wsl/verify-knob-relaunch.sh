@@ -1,8 +1,8 @@
 #!/bin/bash
-# Test a rebuilt app bridge without a respring: the bridge is read when the
-# app execs, so pushing it, killing Preferences and tapping its icon is enough.
-# A respring is not usable here: SpringBoard stays at its spinner and the
-# poster extensions crash with check-in timeouts (measured 2026-11-21).
+# Test a rebuilt app bridge without touching SpringBoard: the bridge is read
+# when the app execs, so pushing it, killing Preferences and tapping its icon
+# is enough. A respring restarts backboardd and presents, but lands on the
+# lock screen; relaunching the app keeps the measured home screen in place.
 #
 # Usage: tools/wsl/verify-knob-relaunch.sh [--no-push]
 set -u
