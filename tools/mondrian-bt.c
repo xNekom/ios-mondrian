@@ -37,6 +37,7 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <mach/arm/thread_status.h>
 #include <mach/thread_act.h>
@@ -1740,6 +1741,78 @@ my_entitled(id self, SEL _cmd, id *error)
 	return result;
 }
 
+/*
+ * The teardown that a power change runs calls the transport's notify slot at
+ * +0x60 through a bare `br x0` (bluetoothd `0xf3b4c` calls `0xe6aac`, whose
+ * body loads `[transport + 0x60]` and branches). Apple's H4 table leaves that
+ * slot NULL: the APPLEBT and H4BC tables fill it with a stub that sets a state
+ * byte, and H4 has no such byte. The tail call therefore lands on address 0,
+ * which is the Settings switch crash: `sig 11 pc 0x0 far 0x0 lr
+ * bluetoothd + 0xf3b50`. A no-op in the empty slot is what H4 already does
+ * with the other one: no H4 code reads that state.
+ *
+ * The table is in __DATA of the main image (vmaddr 0x100844228, first word 1
+ * and name "H4"), so it is writable at constructor time.
+ */
+#define H4_TRANSPORT_TABLE 0x844228UL
+#define H4_TRANSPORT_NAME 0x08UL
+#define H4_TRANSPORT_NOTIFY 0x60UL
+
+static void
+mondrian_bt_transport_notify(void)
+{
+}
+
+static uintptr_t
+main_image_base(void)
+{
+	uint32_t i;
+	uint32_t count = _dyld_image_count();
+
+	for (i = 0; i < count; i++) {
+		const struct mach_header_64 *header =
+		    (const struct mach_header_64 *)_dyld_get_image_header(i);
+
+		if (header != NULL && header->filetype == MH_EXECUTE) {
+			return (uintptr_t)header;
+		}
+	}
+	return 0;
+}
+
+static void
+fix_h4_transport(void)
+{
+	uintptr_t base = main_image_base();
+	uint32_t *table;
+	void **slot;
+	const char *name;
+
+	if (base == 0) {
+		bt_log("h4: no executable image\n");
+		bt_power_append("h4: no executable image\n");
+		return;
+	}
+	table = (uint32_t *)(base + H4_TRANSPORT_TABLE);
+	slot = (void **)((uintptr_t)table + H4_TRANSPORT_NOTIFY);
+	name = *(const char **)((uintptr_t)table + H4_TRANSPORT_NAME);
+	if (table[0] != 1 || name == NULL || strcmp(name, "H4") != 0) {
+		bt_log("h4: base %p id %u name \"%s\", slot untouched\n",
+		    (void *)base, table[0], name != NULL ? name : "(null)");
+		bt_power_append("h4: base %p id %u name \"%s\", slot untouched\n",
+		    (void *)base, table[0], name != NULL ? name : "(null)");
+		return;
+	}
+	if (*slot != NULL) {
+		bt_log("h4: notify slot already %p\n", *slot);
+		bt_power_append("h4: notify slot already %p\n", *slot);
+		return;
+	}
+	*slot = (void *)&mondrian_bt_transport_notify;
+	bt_log("h4: notify slot +0x60 was NULL, no-op installed\n");
+	bt_power_append("h4: notify slot +0x60 was NULL, no-op installed\n");
+}
+
 static void
 hook_power_method(void)
 {
@@ -2779,6 +2852,7 @@ mondrian_bt_init(void)
 	    access(PORT, F_OK));
 	if (strstr(executable, btd) != NULL) {
 		qca_boot();
+		fix_h4_transport();
 		hook_power_method();
 		/*
 		 * main() allocates the server, so the init hook has to be in

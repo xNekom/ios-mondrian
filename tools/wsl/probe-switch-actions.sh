@@ -26,7 +26,7 @@ if [ -n "$pid" ]; then
 	$RING kill "$pid"
 	$RING wait 2
 fi
-$RING tap 200 810
+$RING tap 205 780
 $RING wait 6
 $RING tap 720 1112
 $RING wait 4

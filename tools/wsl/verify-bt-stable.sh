@@ -12,8 +12,8 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 RING="python3 tools/usb-ring.py"
-ICON_X=${1:-200}
-ICON_Y=${2:-810}
+ICON_X=${1:-205}
+ICON_Y=${2:-780}
 ROW_X=${3:-720}
 ROW_Y=${4:-1112}
 

@@ -17,7 +17,7 @@ $RING bl 1024
 $RING wait 20
 
 echo "== open Settings > Bluetooth"
-$RING tap 200 810
+$RING tap 205 780
 $RING wait 8
 $RING tap 720 1112
 $RING wait 8
