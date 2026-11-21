@@ -936,10 +936,14 @@ while the pane is open; the LE scan the control sees (`scan params type 1`) is
 the client-driven one and does not fill the daemon's device map. Forcing
 `_stackClassicScannerShouldRun` to 1 makes the daemon send HCI Inquiry
 (`hci req 0401 len 9`) and a classic row appears in the pane on its address,
-`B0:AC:82:15:22:3C`. The row leaves when the forced scan cycles, and it still
-draws the address although the probe decoded `DIGI R2A` from its EIR, so the
-name and the client/daemon discovery handshake remain open. This is upstream
-of both the name reply and pairing; the EIR bridge above is a separate source
+`B0:AC:82:15:22:3C`. The row leaves when the forced scan cycles, it still
+draws the address although the probe decoded `DIGI R2A` from its EIR, and a
+tap on it (`MONDRIAN HID: touch 0 down at 7200,8020`) changes nothing and
+queues no Create Connection. The daemon's `kCBMsgArgDeviceArray` replies stay
+`count = 0` even while that row is drawn, so the pane's discovered rows come
+from a path other than the paired-device array, and the name and the row
+action remain in the daemon's private discovery state. This is upstream of
+both the name reply and pairing; the EIR bridge above is a separate source
 and no longer the blocker.
 
 Pairing has never been exercised. Measured 2026-11-21: a tap on the discovered
