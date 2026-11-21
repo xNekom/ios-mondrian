@@ -833,47 +833,34 @@ the switch was, while the HCI Inquiry kept its cadence without a gap (… 2389,
 2405, 2422, 2438, 2454 s); the model changed and the radio did not. That
 symptom was the restart cycle below, not the switch.
 
-`bluetoothd` exited with status 1 about every 16 s because it treats each
-refused HCI command as fatal. Its plist carries `KeepAlive.SuccessfulExit=false`,
-so launchd restarted it, and every restart began with an HCI Reset and the full
-init burst (Write Scan Enable 0, class of device, local name, IAC, Inquiry),
-which is why a device the pane listed once (`B0:AC:82:15:22:3C`, 4:35) was gone
-in the next cycle.
+`bluetoothd` used to exit with status 1 about every 16 s; each refused HCI
+command is fatal to it, and its plist (`KeepAlive.SuccessfulExit=false`) makes
+launchd restart it, so every restart ran the full HCI init and wiped the device
+list. Three separate chains fed that loop, all measured 2026-11-21:
 
-The vendor commands are answered in the kernel control, not in the user-space
-shim. The shim's injected completion sits in its own buffer until the daemon
-calls `read()` again, and the daemon waits on a dispatch source that only fires
-when the socket is readable, so the command times out anyway (measured
-2026-11-21: the shim answered 0xfce9 and the daemon still exited 15 s later).
-`mondrian_btctl_send` (`0399`) recognises these commands and replies with
-`ctl_enqueuedata`, which makes the socket readable: 0xfce9 and 0xfce2 get a
-success (0xfce2 carries two zero bytes, the smallest payload the Broadcom
-parser accepts, as the 0x15 case in `tools/mondrian-bt.c` showed).
+- The Olympian vendor commands 0xfce9/0xfce2 are answered in the kernel control
+  (`mondrian_btctl_send`, `0399`), not in the user-space shim: a shim reply
+  waits in its own buffer until the daemon reads again, and the daemon waits
+  for the socket to become readable, so the command timed out anyway.
+  `ctl_enqueuedata` makes the socket readable; 0xfce2 carries two zero bytes,
+  the smallest payload the Broadcom parser accepts.
+- The controller's FIFO carried a reset completion the previous daemon never
+  read, and the next daemon took it as the answer to its own reset: the stack
+  exits on a completion it did not ask for and leaves its own behind, so the
+  chain never ended (the exit report named `OI_DHCI_RESET_OPCODE`, and one read
+  held two identical completions). The connect path drains the FIFO, and the
+  poll resynchronises on the H4 packet type: the controller emits 0xFD/0xFE
+  wake filler between packets and answers the shim's 0xFD wake with a bare
+  0xFC, so only the filler is dropped.
+- With the FIFO clean, the reset still went unanswered: the part was in HCI-IBS
+  sleep, repeating 0xFD every 100 ms and taking no command until the host
+  answers 0xFC (`hci_qca.c`). The shim answered during `qca_boot` and nobody
+  did afterwards. The poll answers now, under a write lock shared with the
+  daemon's commands.
 
-`LE Set Scan Parameters` (0x200b) and `LE Set Scan Enable` (0x200c) are
-forwarded to the controller and its refusal is rewritten to success on the way
-back. The WCN7850 answers both with 0x0c "command disallowed" in every state
-measured 2026-11-21 (four enables, three disables and the parameter command, 11
-refusals over 79 s), and the stack treats the refusal as fatal, which is why
-they used to be answered in the kernel. Forwarding keeps the real status in the
-log (`0x200b refused 0xc, reported success`) and lets the daemon continue; the
-legacy pair still does not scan, so `scan le meta` stays 0 and no LE report
-reaches the device list.
-
-The extended pair works. A probe in `qca_boot`
-(`/private/var/vm/bt-ext-probe`) sends 0x2041 and 0x2042 and both complete with
-status 0, and the controller then delivers an LE meta event (`04 3e 47`). Its
-LE features carry bit 12 (extended advertising), so the hardware scans; the
-daemon uses the legacy pair because `enableExtendedScanHCI` is 0 in its
-init-time report (`enableBTSpecAdvertisingSets=... enableExtendedScanHCI=%d`).
-That is the remaining bridge: translate the daemon's legacy scan commands and
-the extended reports in the control, or make the daemon take the extended path.
-
-Measured 2026-11-21 after that: one `bluetoothd` pid for the whole minute,
-zero `exit bluetoothd`, `0x200b answered` and `0x200c enable` and `0x200c
-disable` counted in the ring, and the pane listing `B0:AC:82:15:22:3C` in the
-first capture and `C8:A6:EF:12:00:9F` a minute later -- the list refreshes in
-place instead of being wiped by a restart.
+Measured after those: one `bluetoothd` pid for minutes, zero `exit
+bluetoothd`, `ibs ack` counted in the ring, and the Settings row showing
+Bluetooth **On** with the switch drawn.
 
 The Settings switch is fixed. The drag reaches UIControl (the bridge probe logs
 `switch action controlChanged: -> PSSwitchTableCell`), and the teardown that
@@ -886,20 +873,36 @@ now puts a no-op in the empty slot at startup (`h4: notify slot +0x60 was NULL,
 no-op installed` in the power log). Measured 2026-11-21 on a live pane: a drag
 off shows the powered-off text ("AirDrop, AirPlay, Find My, and Location
 Services use Bluetooth"), a drag on brings back the discoverable text and the
-device list, `pid 205` serves both, and `exit bluetoothd` stays at the one
-SIGKILL the test itself sent. Control Center's Bluetooth button is separate: on
-iOS 16 it only stops new connections ("New Bluetooth connections have been
-turned off from Control Center") and keeps the pid.
+device list, and one pid serves both. Control Center's Bluetooth button is
+separate: on iOS 16 it only stops new connections ("New Bluetooth connections
+have been turned off from Control Center") and keeps the pid.
 
-The list shows the address, not the device name. Measured 2026-11-21: the
-controller returns `0x2f` (Inquiry Result with RSSI) events whose EIR carries
-names (`0d 09 45 63 68 6f ...` = "Echo Dot-8PD"), the pane still draws the
-address, and the daemon asks the client for nothing extra; in another
-connection it sends one Remote Name Request (`name req 1`) with 10 parameter
-bytes for a command whose layout is 11, and no completion arrives. The client
-does ask for the name (`kCBMsgIdDeviceGetNameMsg`, six times), so the loss is
-between the HCI event and the device object, not in the row. LE is the path
-that would fill names for modern devices, which is why the scan above matters.
+The LE scan is the control's translation. bluetoothd asks for the legacy pair
+because its init-time report says `enableExtendedScanHCI=0`, and the WCN7850
+refuses 0x200b/0x200c with 0x0c in every state. `0399` rewrites them to
+0x2041/0x2042, answers the daemon with the completion for the opcode it sent,
+keeps one pending completion per translated command (a flag let a back-to-back
+enable/disable completion reach the daemon, which exits on an opcode it never
+sent), and turns every extended advertising report (subevent 0x0d) into the
+legacy report (0x02) the daemon parses. The own address type is forced to
+public: bluetoothd asks for random, and the controller answers the extended
+enable with 0x12 when no random address is set (probe: own=1 -> 18, own=0 -> 0,
+same interval, window and filter).
+
+Measured on the live pane: extended reports arrive (`ext report
+c8:a6:ef:12:00:9f type 0x0013 data 31`), the translated legacy events reach
+the daemon, the pane lists `C8:A6:EF:12:00:9F`, and active scanning returns
+scan responses: the probe decoded `51:69:9b:35:ed:46 type 0x04 name
+"ASUS-TUF-GAMING"` from one. A device that advertises no name still shows its
+address by design; `C8:A6:EF` carries no name in its 31-byte advertisement or
+its 6-byte scan response.
+
+What is left on names: a named device in range to confirm the row draws the
+name, and the classic path. The daemon sends one Remote Name Request (0x0419)
+with 10 parameter bytes for a command whose layout is 11, and no completion
+arrives; padding the command in the control is the candidate fix. The inquiry
+EIR does carry names (`0d 09 ...` = "Echo Dot-8PD"), and the pane drew the
+address for that device too.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
@@ -919,8 +922,11 @@ transport and init events after the drag marker;
 probe at `/private/var/vm/bridge-switch-probe` (the action line can precede the
 kernel's touch marker, so do not read the two as ordered);
 `tools/wsl/bt-job-info.sh` prints the plist keys, `tools/wsl/bt-exit-reason.sh`
-rebuilds the shim, deploys it and prints the newest exit report, and
-`tools/wsl/bt-last-hci.sh` shows the last HCI exchange before an exit.
+rebuilds the shim, deploys it and prints the newest exit report,
+`tools/wsl/bt-last-hci.sh` shows the last HCI exchange before an exit,
+`tools/wsl/bt-ext-probe.sh` runs the extended-scan matrix and decodes the names
+in the reports it receives, and `tools/wsl/bt-read-log.sh PHONE-PATH` pulls any
+of the append-only logs (`bt-power.log`, `bt-exit.log`).
 
 ## What other ports teach
 
