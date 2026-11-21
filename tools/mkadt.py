@@ -219,7 +219,28 @@ def build(board, seed=None, qemu=False, altmem=False):
         # 1:1 and does not scale. QEMU's virt machine has no MDP, so the node
         # is left out there: a driver attached to it aborts on the first
         # register read and QEMU restarts the instruction forever.
-    ] + ([] if qemu else [node('disp0', [
+    ] + ([] if qemu else [node('bluetooth', [
+        ph(),
+        # The client attaches only when this node exists (without it
+        # BTSessionAttachWithQueue returns 9 before any IPC). The properties
+        # mirror the real D22AP node, /arm-io/uart1/bluetooth in
+        # research/ipsw-x/d22ap.adt: a node carrying only the address let the
+        # attach through and then crashed SpringBoard inside MobileBluetooth
+        # (SIGSEGV, far 0xc0), which is what the ids and the profile mask are
+        # here for. local-mac-address replaces iBoot's
+        # macaddr/btaddr,syscfg/BMac placeholder with the address the shim
+        # publishes, and transport-speed is the port's own 115200, not the
+        # 3 Mbit the BCM part uses.
+        ('device_type', cstr('bluetooth')),
+        ('compatible', cstr('bluetooth,n88')),
+        ('transport-speed', u32(115200)),
+        ('transport-encoding', u32(3)),
+        ('vendor-id', u32(0x5ac)),
+        ('product-id', u32(0x12a0)),
+        ('supported-profiles', u32(0x2ffb)),
+        ('coex', u32(2)),
+        ('local-mac-address', bytes([0xb1, 0x80, 0xed, 0x2e, 0xed, 0x13])),
+    ]), node('disp0', [
         ph(),
         ('device_type', cstr('display-subsystem')),
         ('compatible', cstr(board.dt_prefix + ',display')),
