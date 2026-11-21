@@ -979,7 +979,12 @@ and `setPairingPromptHandler:`. The daemon has exactly four classes of its own
 (`CBDaemonServer`, `CBDaemonXPCConnection`, `CBStackControllerBTStack`,
 `CBConnection`), so there is no second connection class to hook. Pairing from
 the PC side does not help either: `DeviceInformation.Pairing.PairAsync()`
-returns `Failed` with `protection=None` for the phone's Bluetooth address. The phone shows no passkey dialog and the PC shows no
+returns `Failed` with `protection=None` for the phone's Bluetooth address.
+Creating a `CBConnection` with `alloc`/`init` and registering that with
+`addPairingClient:error:` was tried and restart-loops bluetoothd (the pid
+climbed 1646 -> 1650 -> 1658 within a minute); the object only exists through
+`initWithXPCObject:error:` from the app's activation message. The fix has to
+produce that activation, not synthesize the agent. The phone shows no passkey dialog and the PC shows no
 prompt either; after the third notification the controller disconnects with
 reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
 phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
