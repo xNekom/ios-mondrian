@@ -44,6 +44,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <os/log.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -937,13 +938,100 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		}
 		return;
 	}
-	if (len >= 10 && pkt[1] == 0x2f) {
-		results++;
-		if (results <= 8) {
-			bt_power_append("inquiry result %u %02x:%02x:%02x:"
-			    "%02x:%02x:%02x\n", results, pkt[9], pkt[8],
-			    pkt[7], pkt[6], pkt[5], pkt[4]);
+	if (len >= 3 && pkt[1] == 0xff) {
+		size_t at;
+		char line[160];
+		int used = snprintf(line, sizeof(line), "vendor evt:");
+
+		for (at = 2; at < len && used > 0 &&
+		    (size_t)used < sizeof(line) - 4; at++) {
+			used += snprintf(line + used,
+			    sizeof(line) - (size_t)used, " %02x", pkt[at]);
 		}
+		bt_power_append("%s\n", line);
+		return;
+	}
+	if (len >= 7 && pkt[1] == 0x0e) {
+		uint16_t op = (uint16_t)(pkt[4] | (pkt[5] << 8));
+
+		if (op == 0x1002 || op == 0x1003 || op == 0x1009 ||
+		    op == 0xfc14) {
+			size_t at;
+			char line[160];
+			int used = snprintf(line, sizeof(line), "local %04x "
+			    "status %#x:", op, pkt[6]);
+
+			for (at = 7; at < len && used > 0 &&
+			    (size_t)used < sizeof(line) - 4; at++) {
+				used += snprintf(line + used,
+				    sizeof(line) - (size_t)used, " %02x",
+				    pkt[at]);
+			}
+			bt_power_append("%s\n", line);
+			return;
+		}
+	}
+	if (len >= 13 && pkt[1] == 0x03) {
+		bt_power_append("conn complete status %#x handle %u "
+		    "%02x:%02x:%02x:%02x:%02x:%02x link %u\n", pkt[3],
+		    pkt[4] | (pkt[5] << 8), pkt[11], pkt[10], pkt[9], pkt[8],
+		    pkt[7], pkt[6], pkt[12]);
+		return;
+	}
+	if (len >= 7 && pkt[1] == 0x0f) {
+		uint16_t opcode = (uint16_t)(pkt[5] | (pkt[6] << 8));
+
+		if (opcode == 0x0401 || opcode == 0x0402 ||
+		    opcode == 0x0405 || opcode == 0x0419) {
+			bt_power_append("hci cs %04x status %#x\n", opcode,
+			    pkt[3]);
+		}
+		return;
+	}
+	if (len >= 4 && pkt[1] == 0x01) {
+		bt_power_append("inquiry complete status %#x\n", pkt[3]);
+		return;
+	}
+	if (len >= 10 && pkt[1] == 0x2f) {
+		static unsigned dumps;
+
+		/*
+		 * The controller answers Inquiry with a 0xff-length event and
+		 * bytes of variable junk between the fixed 14-byte response and
+		 * the EIR, so the daemon cannot find the name at a fixed offset.
+		 * Dump the whole packet once to see what the trailing bytes are.
+		 */
+		if (dumps++ < 2) {
+			size_t at;
+			char line[160];
+			int used;
+
+			bt_power_append("inquiry len %zu plen %u num %u\n", len,
+			    pkt[2], pkt[3]);
+			for (at = 0; at < len; at += 40) {
+				size_t k;
+				size_t n = len - at < 40 ? len - at : 40;
+
+				used = snprintf(line, sizeof(line), "inq[%zu]:", at);
+				for (k = 0; k < n && used > 0 &&
+				    (size_t)used < sizeof(line) - 4; k++) {
+					used += snprintf(line + used,
+					    sizeof(line) - (size_t)used, " %02x",
+					    pkt[at + k]);
+				}
+				bt_power_append("%s\n", line);
+			}
+		}
+		/*
+		 * Now that the framer keeps every event this is the measurement
+		 * that says whether the Inquiry returned peers: its absence with
+		 * a status 0 completion means the air was empty, not that the
+		 * command failed.
+		 */
+		results++;
+		bt_power_append("inquiry result %u %02x:%02x:%02x:"
+		    "%02x:%02x:%02x\n", results, pkt[9], pkt[8],
+		    pkt[7], pkt[6], pkt[5], pkt[4]);
 	}
 }
 
@@ -969,10 +1057,13 @@ bt_name_feed(const uint8_t *buf, size_t len)
 			continue;
 		}
 		name_pkt[name_pkt_len++] = b;
-		if (name_pkt_state == 1 && name_pkt_len == 2 &&
-		    name_pkt[1] != 0x3e) {
-			name_pkt_state = 0;
-		} else if (name_pkt_state == 1 && name_pkt_len == 3) {
+		/*
+		 * Every 0x04 event has to be assembled: the Inquiry answer is a
+		 * Command Status (0x0f), and an earlier version reset the framer
+		 * on any code but 0x3e here, so bt_event_report never saw one and
+		 * the classic path looked silent.
+		 */
+		if (name_pkt_state == 1 && name_pkt_len == 3) {
 			name_pkt_need = 3 + (size_t)name_pkt[2];
 			name_pkt_state = name_pkt_need >= 4 ? 2 : 0;
 		} else if (name_pkt_state == 2 &&
@@ -985,6 +1076,174 @@ bt_name_feed(const uint8_t *buf, size_t len)
 			name_pkt_state = 0;
 		}
 	}
+}
+
+/*
+ * Pairing has never been exercised because no discovered row could be tapped.
+ * This debug path sends one HCI command the daemon would send on its own:
+ * `/private/var/vm/bt-poke` holds `connect AA:BB:CC:DD:EE:FF`, and the thread
+ * writes Create Connection (0x0405) to the same control socket bluetoothd
+ * uses, then removes the marker. The command's Command Status and Connection
+ * Complete events flow back through the daemon's read path and are logged.
+ */
+enum bt_poke_kind {
+	BT_POKE_CONNECT,
+	BT_POKE_COMMANDS,
+	BT_POKE_FEATURES,
+	BT_POKE_BDADDR,
+	BT_POKE_SET_BDADDR
+};
+
+static int
+bt_poke_parse(const char *text, enum bt_poke_kind *kind, uint8_t addr[6],
+    unsigned *packet_type)
+{
+	unsigned int b[6];
+	unsigned int ptype = 0x0001;
+	int i, matched;
+
+	if (strncmp(text, "commands", 8) == 0) {
+		*kind = BT_POKE_COMMANDS;
+		return 0;
+	}
+	if (strncmp(text, "features", 8) == 0) {
+		*kind = BT_POKE_FEATURES;
+		return 0;
+	}
+	if (strncmp(text, "bdaddr", 6) == 0) {
+		*kind = BT_POKE_BDADDR;
+		return 0;
+	}
+	if (sscanf(text, "setbdaddr %x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2],
+	    &b[3], &b[4], &b[5]) == 6) {
+		for (i = 0; i < 6; i++) {
+			addr[i] = (uint8_t)b[5 - i];
+		}
+		*kind = BT_POKE_SET_BDADDR;
+		return 0;
+	}
+	matched = sscanf(text, "connect %x:%x:%x:%x:%x:%x %x", &b[0], &b[1],
+	    &b[2], &b[3], &b[4], &b[5], &ptype);
+	if (matched < 6) {
+		return -1;
+	}
+	for (i = 0; i < 6; i++) {
+		addr[i] = (uint8_t)b[5 - i];
+	}
+	*kind = BT_POKE_CONNECT;
+	*packet_type = ptype;
+	return 0;
+}
+
+static void *
+bt_poke_thread(void *argument)
+{
+	const char *marker = "/private/var/vm/bt-poke";
+	uint8_t last[6] = { 0 };
+	int logged_wait = 0;
+
+	(void)argument;
+	for (;;) {
+		char text[128];
+		uint8_t addr[6];
+		enum bt_poke_kind kind;
+		unsigned packet_type = 0x0001;
+		int fd;
+		ssize_t got;
+
+		usleep(500000);
+		fd = open(marker, O_RDONLY);
+		if (fd < 0) {
+			logged_wait = 0;
+			continue;
+		}
+		bzero(text, sizeof(text));
+		got = read(fd, text, sizeof(text) - 1);
+		close(fd);
+		if (got <= 0 ||
+		    bt_poke_parse(text, &kind, addr, &packet_type) != 0) {
+			continue;
+		}
+		/*
+		 * The connect marker is consumed by address; the read commands
+		 * are consumed by name and carry a different last buffer, so a
+		 * second request is simply the same text after the marker returns.
+		 */
+		if (kind == BT_POKE_CONNECT &&
+		    memcmp(addr, last, sizeof(last)) == 0) {
+			continue;
+		}
+		if (kind == BT_POKE_CONNECT) {
+			memcpy(last, addr, sizeof(last));
+		}
+		if (control_socket_fd < 0) {
+			if (!logged_wait) {
+				bt_power_append("poke: no control socket yet\n");
+				logged_wait = 1;
+			}
+			continue;
+		}
+		{
+			uint8_t cmd[17];
+			size_t cmd_len;
+			ssize_t written;
+
+			cmd[0] = 0x01;
+			cmd[3] = 0x00;
+			switch (kind) {
+			case BT_POKE_CONNECT:
+				cmd[1] = 0x05;
+				cmd[2] = 0x04;
+				cmd[3] = 0x0d;
+				memcpy(cmd + 4, addr, 6);
+				cmd[10] = (uint8_t)(packet_type & 0xff);
+				cmd[11] = (uint8_t)(packet_type >> 8);
+				cmd[12] = 0x01;   /* page scan repetition: R1 */
+				cmd[13] = 0x00;   /* reserved */
+				cmd[14] = 0x00;   /* clock offset */
+				cmd[15] = 0x00;
+				cmd[16] = 0x01;   /* allow role switch */
+				cmd_len = sizeof(cmd);
+				break;
+			case BT_POKE_COMMANDS:
+				cmd[1] = 0x02;
+				cmd[2] = 0x10;
+				cmd_len = 4;
+				break;
+			case BT_POKE_FEATURES:
+				cmd[1] = 0x03;
+				cmd[2] = 0x10;
+				cmd_len = 4;
+				break;
+			case BT_POKE_SET_BDADDR:
+				/*
+				 * QCA EDL_WRITE_BD_ADDR (0xFC14, WCN3990 and later):
+				 * the six address bytes in HCI order. The Linux driver
+				 * waits for a vendor event for this one, so the poke
+				 * also sends Read BD_ADDR afterwards to prove it stuck.
+				 */
+				cmd[1] = 0x14;
+				cmd[2] = 0xfc;
+				cmd[3] = 0x06;
+				memcpy(cmd + 4, addr, 6);
+				cmd_len = 10;
+				break;
+			default:
+				cmd[1] = 0x09;
+				cmd[2] = 0x10;
+				cmd_len = 4;
+				break;
+			}
+			written = (ssize_t)syscall(SYS_write, control_socket_fd,
+			    cmd, cmd_len);
+			bt_power_append("poke: kind %d to %02x:%02x:%02x:%02x:%02x:"
+			    "%02x ptype %#x -> %zd\n", (int)kind, addr[5], addr[4],
+			    addr[3], addr[2], addr[1], addr[0], packet_type,
+			    written);
+		}
+		unlink(marker);
+	}
+	return NULL;
 }
 
 static void
@@ -1079,8 +1338,17 @@ my_write(int fd, const void *buf, size_t len)
 			if (opcode == 0x0401 || opcode == 0x0402 ||
 			    opcode == 0x0405 || opcode == 0x0409 ||
 			    opcode == 0x0419) {
-				bt_power_append("hci req %04x len %zu\n", opcode,
-				    len);
+				/*
+				 * Inquiry (0x0401) is 5 parameters: LAP 3, length in
+				 * 1.28 s units, and the response limit. Length 0
+				 * completes at once with no results, which is what a
+				 * retry about once a second looks like.
+				 */
+				bt_power_append("hci req %04x len %zu:"
+				    " %02x %02x %02x %02x %02x\n", opcode, len,
+				    len > 4 ? p[4] : 0, len > 5 ? p[5] : 0,
+				    len > 6 ? p[6] : 0, len > 7 ? p[7] : 0,
+				    len > 8 ? p[8] : 0);
 			}
 		}
 		log_hci_write("hci write", buf, len);
@@ -2350,15 +2618,18 @@ my_classic_start(id self, SEL _cmd)
 }
 
 /*
- * The daemon stops the classic scanner from its own state machine even while
- * shouldRun is forced to 1, and each stop removes the row the pane had. With
- * discovery forced, the stop is suppressed so a scan session survives long
- * enough to read the EIR name and tap the row.
+ * The scanner's stop is logged and passed through now that the controller has
+ * a valid address and the pane's own path drives discovery. While the address
+ * was the unprovisioned default this stop was suppressed to keep a forced scan
+ * row on screen; that workaround is gone.
  */
 static void
 my_classic_stop(id self, SEL _cmd)
 {
-	bt_power_append("scan classic ensureStopped suppressed\n");
+	bt_power_append("scan classic ensureStopped\n");
+	if (original_classic_stop != NULL) {
+		original_classic_stop(self, _cmd);
+	}
 }
 
 static void
@@ -2377,13 +2648,12 @@ my_classic_should(id self, SEL _cmd)
 	    original_classic_should(self, _cmd) : NO;
 
 	/*
-	 * The pane opens with both stack scanners off (shouldRun 0), so the
-	 * daemon never sends the Inquiry that would give it the classic
-	 * devices the pane used to list. Force classic discovery on and log
-	 * what the daemon asked for.
+	 * Pass the daemon's own answer through now that the controller has a
+	 * valid address: forcing it on was what made the pane show rows while
+	 * the controller still carried the unprovisioned 00:00:00:00:5A:AD.
 	 */
-	bt_power_append("scan classic shouldRun %d -> 1\n", (int)result);
-	return YES;
+	bt_power_append("scan classic shouldRun %d\n", (int)result);
+	return result;
 }
 
 static BOOL
@@ -2394,6 +2664,53 @@ my_ble_should(id self, SEL _cmd)
 
 	bt_power_append("scan ble shouldRun %d\n", (int)result);
 	return result;
+}
+
+static void (*original_xpc_listener)(id, SEL, id);
+static void (*original_remote_event)(id, SEL, id, id);
+
+static void
+log_xpc_in(const char *what, xpc_object_t message)
+{
+	static unsigned count;
+	char *description;
+
+	if (message == NULL || count >= 40) {
+		return;
+	}
+	description = xpc_copy_description(message);
+	if (description == NULL) {
+		return;
+	}
+	/*
+	 * The pane's tap becomes a request on this side; the outgoing reply is
+	 * already logged, and the missing half is what the client asked for.
+	 */
+	if (strstr(description, "MsgId") != NULL ||
+	    strstr(description, "kCBMsgArg") != NULL) {
+		count++;
+		bt_power_append("xpc.in[%d] %s %.900s\n", getpid(), what,
+		    description);
+	}
+	free(description);
+}
+
+static void
+my_xpc_listener(id self, SEL _cmd, id message)
+{
+	log_xpc_in("listener", (xpc_object_t)message);
+	if (original_xpc_listener != NULL) {
+		original_xpc_listener(self, _cmd, message);
+	}
+}
+
+static void
+my_remote_event(id self, SEL _cmd, id event, id options)
+{
+	log_xpc_in("remote", (xpc_object_t)event);
+	if (original_remote_event != NULL) {
+		original_remote_event(self, _cmd, event, options);
+	}
 }
 
 static void
@@ -2460,6 +2777,18 @@ hook_device_found(void)
 	if (method != NULL) {
 		original_ble_should = (BOOL (*)(id, SEL))
 		    method_setImplementation(method, (IMP)my_ble_should);
+	}
+	method = own_method(cls, "_xpcListenerEvent:");
+	if (method != NULL) {
+		original_xpc_listener = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_xpc_listener);
+		bt_log("dev.hook: _xpcListenerEvent: replaced\n");
+	}
+	method = own_method(cls, "_remoteReceivedEvent:options:");
+	if (method != NULL) {
+		original_remote_event = (void (*)(id, SEL, id, id))
+		    method_setImplementation(method, (IMP)my_remote_event);
+		bt_log("dev.hook: _remoteReceivedEvent:options: replaced\n");
 	}
 	{
 		unsigned int count = 0, i;
@@ -2677,6 +3006,16 @@ runtime_dump(void *context)
 		}
 		if (server_class != Nil) {
 			dump_all_methods(server_class);
+		}
+		/*
+		 * The HCI event parser and the discovery objects live on the stack
+		 * controller, not on the server: its method list is where the entry
+		 * point that should turn an advertising report into a device is.
+		 */
+		{	Class cls = objc_getClass("CBStackControllerBTStack");
+			if (cls != Nil) {
+				dump_all_methods(cls);
+			}
 		}
 	}
 	bt_log("rt: server %p\n", daemon_server);
@@ -3215,6 +3554,161 @@ qca_stream(struct qca_reader *r, const char *name, const uint8_t *blob,
  * first event's bytes, which is what decides whether a kernel-level
  * translation of the daemon's legacy scan commands is worth writing.
  */
+/*
+ * The WCN7850 ships unprovisioned and answers Read BD_ADDR with the QCA
+ * default 00:00:00:00:5A:AD (the value in NVM tag 2, and the one Linux's
+ * btqca names QCA_BDADDR_DEFAULT). Classic needs a valid address: with the
+ * default, Create Connection completes with status 0x11 "unsupported feature
+ * or parameter value", and Apple's bluetoothd exits during init. QCA's
+ * EDL_WRITE_BD_ADDR (0xFC14) sets it; Linux waits for a vendor event, not a
+ * Command Complete. The first byte gets the locally-administered bit so the
+ * address is a valid unicast one that cannot collide with a vendor block.
+ */
+/*
+ * The stock HAL passes the address to 0xFC14 in display order: it reads the
+ * six bytes with BluetoothAddress::GetLocalAddress (little-endian) and swaps
+ * them into the command. Writing it in HCI order instead stored the reverse
+ * (AD:5A:00:00:00:02 for 02:00:00:00:5A:AD, measured 2026-11-21).
+ */
+static const uint8_t qca_bdaddr[6] = { 0x02, 0x00, 0x00, 0x00, 0x5a, 0xad };
+
+static int
+qca_wait_vendor(struct qca_reader *r, uint16_t opcode, int timeout_ms,
+    uint8_t *event, size_t cap, size_t *event_len)
+{
+	int waited = 0;
+
+	for (;;) {
+		if (r->len >= 3) {
+			size_t total;
+
+			if (r->buf[0] != 0x04) {
+				qca_drop(r, 1);
+				continue;
+			}
+			total = 3 + (size_t)r->buf[2];
+			if (r->len >= total) {
+				int done = 0;
+
+				if (r->buf[1] == 0xff) {
+					done = 1;
+				} else if (r->buf[1] == 0x0e &&
+				    total >= 7 &&
+				    (uint16_t)(r->buf[4] |
+				    (r->buf[5] << 8)) == opcode) {
+					/*
+					 * The stock HAL waits on sendCommandWait, so the
+					 * completion may be an ordinary Command Complete
+					 * rather than the WCN3990 vendor event Linux
+					 * expects.
+					 */
+					done = 1;
+				}
+				if (done) {
+					size_t n = total < cap ? total : cap;
+
+					if (event != NULL) {
+						memcpy(event, r->buf, n);
+					}
+					if (event_len != NULL) {
+						*event_len = n;
+					}
+					qca_drop(r, total);
+					return 0;
+				}
+				qca_drop(r, total);
+				continue;
+			}
+		}
+		if (qca_read_more(r, 20) < 0) {
+			return -1;
+		}
+		waited += 20;
+		if (waited >= timeout_ms) {
+			return -1;
+		}
+	}
+}
+
+static int
+qca_set_bdaddr(struct qca_reader *r)
+{
+	uint8_t packet[10];
+	uint8_t event[32];
+	size_t event_len = 0;
+	char text[160];
+	int used;
+	size_t i;
+
+	packet[0] = 0x01;
+	packet[1] = 0x14;
+	packet[2] = 0xfc;
+	packet[3] = 0x06;
+	memcpy(packet + 4, qca_bdaddr, 6);
+	if (qca_write_all(r->fd, packet, sizeof(packet)) != 0) {
+		return -1;
+	}
+	if (qca_wait_vendor(r, 0xfc14, 3000, event, sizeof(event),
+	    &event_len) != 0) {
+		bt_log("qca: bdaddr write got no completion\n");
+		return -1;
+	}
+	used = snprintf(text, sizeof(text), "qca: bdaddr write event");
+	for (i = 0; i < event_len && used > 0 &&
+	    (size_t)used < sizeof(text) - 4; i++) {
+		used += snprintf(text + used, sizeof(text) - (size_t)used,
+		    " %02x", event[i]);
+	}
+	bt_log("%s\n", text);
+	if (event_len >= 7 && event[1] == 0x0e) {
+		return event[6];
+	}
+	return 0;
+}
+
+/*
+ * Provision the address once: a controller that already carries anything but
+ * the QCA default is left alone, because 0xFC14 refuses a second write with
+ * status 0x02 and the value is already in NVM (measured 2026-11-21: the
+ * address written by an earlier poke survived a boot).
+ */
+static void
+qca_provision_bdaddr(struct qca_reader *r)
+{
+	uint8_t bd[8];
+	size_t bd_len = 0;
+	int status;
+	int is_default;
+
+	status = qca_command(r, 0x1009, NULL, 0, 3000, bd, sizeof(bd),
+	    &bd_len);
+	if (status != 0 || bd_len < 7) {
+		bt_log("qca: bdaddr read failed status %d len %zu\n", status,
+		    bd_len);
+		return;
+	}
+	bt_log("qca: bdaddr %02x:%02x:%02x:%02x:%02x:%02x\n",
+	    bd[6], bd[5], bd[4], bd[3], bd[2], bd[1]);
+	is_default = bd[1] == 0xad && bd[2] == 0x5a && bd[3] == 0x00 &&
+	    bd[4] == 0x00 && bd[5] == 0x00 && bd[6] == 0x00;
+	if (!is_default) {
+		bt_log("qca: bdaddr already provisioned\n");
+		return;
+	}
+	status = qca_set_bdaddr(r);
+	bt_log("qca: bdaddr write status %d\n", status);
+	if (status != 0) {
+		return;
+	}
+	bd_len = 0;
+	status = qca_command(r, 0x1009, NULL, 0, 3000, bd, sizeof(bd),
+	    &bd_len);
+	bt_log("qca: bdaddr readback status %d %02x:%02x:%02x:%02x:%02x:%02x\n",
+	    status, bd_len > 6 ? bd[6] : 0, bd_len > 5 ? bd[5] : 0,
+	    bd_len > 4 ? bd[4] : 0, bd_len > 3 ? bd[3] : 0,
+	    bd_len > 2 ? bd[2] : 0, bd_len > 1 ? bd[1] : 0);
+}
+
 static void
 qca_probe_scan(struct qca_reader *r)
 {
@@ -3410,6 +3904,7 @@ qca_boot(void)
 			 * handled in the H4 filter below.
 			 */
 			bt_log("qca: already patched, leaving the NVM alone\n");
+			qca_provision_bdaddr(&reader);
 			if (access("/private/var/vm/bt-ext-probe",
 			    F_OK) == 0) {
 				qca_probe_scan(&reader);
@@ -3451,6 +3946,11 @@ nvm:
 	bt_log("qca: disable logging status %d\n", status);
 	status = qca_command(&reader, 0x0c03, NULL, 0, 5000, NULL, 0, NULL);
 	bt_log("qca: reset status %d\n", status);
+	/*
+	 * Unprovisioned, the controller's address is 00:00:00:00:5A:AD and
+	 * classic cannot page, so it is set before bluetoothd runs.
+	 */
+	qca_provision_bdaddr(&reader);
 	if (qca_version(&reader, &product, &patch, &rom, &soc)) {
 		bt_log("qca: booted patch 0x%04x rom 0x%04x\n", patch, rom);
 	}
@@ -3554,6 +4054,14 @@ mondrian_bt_init(void)
 		 */
 		hook_server_entry();
 		hook_device_found();
+		{
+			pthread_t thread;
+
+			if (pthread_create(&thread, NULL, bt_poke_thread,
+			    NULL) == 0) {
+				pthread_detach(thread);
+			}
+		}
 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 4000000000LL),
 		    dispatch_get_global_queue(0, 0), NULL, runtime_dump);
 	}
