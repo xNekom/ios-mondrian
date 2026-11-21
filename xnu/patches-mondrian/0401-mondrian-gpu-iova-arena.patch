@@ -1,0 +1,344 @@
+xnu 0401: the IOVA arena keeps every freed range, and a refusal names its step
+
+A boot left running for three hours measured 9 479
+`MondrianGPU: gem_new 0x1400000 refused` (0xa00000, 0x700000 and 0x500000
+behind it), the first one at 10 614 s of uptime, while 6 GiB of RAM were free
+and 282 GPU buffers were live. Only large buffers were refused: the arena's
+bump pointer had reached the end of the 1.75 GiB window and the 128 remembered
+holes still had room for small allocations, so surfaces and textures stopped
+being mappable and the compositor fell to 1-2 frames a second. Nothing in the
+ring said which step had refused, so the size read as "out of memory".
+
+The hole list now stays sorted and coalesces with both neighbours, so it holds
+one range per boundary between live buffers instead of one per free() ever
+seen; 1 024 entries, and a range it cannot record is counted in `dropped`
+instead of disappearing. `mondrian_gpu_uc_iova_state()` prints the bump, the
+hole count, the largest hole and the dropped bytes with every refusal, and the
+user client names the step (`no memory`, `arena`, `map`, `no page`,
+`descriptor`, `buffer count`, `too big`).
+
+diff --git a/bsd/dev/mondrian_gpu.c b/bsd/dev/mondrian_gpu.c
+index 1c079ab..2c04e2b 100644
+--- a/bsd/dev/mondrian_gpu.c
++++ b/bsd/dev/mondrian_gpu.c
+@@ -4123,46 +4123,94 @@ mondrian_gpu_uc_param(uint32_t param, uint64_t *value)
+ }
+ 
+ /*
+- * The arena used to be a pure bump allocator: a buffer freed by gem_close
+- * left its IOVA behind, and the UI allocates and frees tens of megabytes per
+- * frame (measured: `gem_new 0x1400000 refused` after about twenty frames).
+- * Every new IOVA also needs a new L2/L3 table, so the exhaustion showed up
+- * twice. Keep the freed ranges and first-fit from them.
++ * The arena is one contiguous window (MONDRIAN_UC_IOVA_BASE.._END) and every
++ * GEM buffer takes a range in it. It started as a bump pointer, then kept 128
++ * freed ranges and first-fit from them, which is enough for a bring-up boot and
++ * not for a day of frames: the list gives up the range it cannot record, so the
++ * bump keeps moving and the tail of the window is eventually all a large
++ * allocation has left. Measured 2026-11-20 on a boot 3 h old: 9 479
++ * `MondrianGPU: gem_new 0x1400000 refused` (and 0xa00000, 0x700000, 0x500000,
++ * all of them large) with 6 GiB of RAM free and 282 buffers live -- large
++ * surfaces and textures stopped being mappable while small ones still found a
++ * hole, and the compositor fell to 1-2 frames a second.
++ *
++ * Keep them sorted and coalesced with both neighbours, so the list holds one
++ * range per boundary between live buffers, not one per free() ever seen; a full
++ * list now says so with the number of bytes it had to drop instead of losing
++ * them silently.
+  */
+-#define MONDRIAN_UC_IOVA_HOLES	128
++#define MONDRIAN_UC_IOVA_HOLES	1024
+ static struct {
+ 	uint64_t start;
+ 	uint64_t bytes;
+ } mondrian_uc_holes[MONDRIAN_UC_IOVA_HOLES];
+ static uint32_t mondrian_uc_hole_count;
++static uint64_t mondrian_uc_iova_dropped;
+ 
+ void
+ mondrian_gpu_uc_iova_free(uint64_t iova, uint64_t bytes)
+ {
+-	uint32_t i;
++	uint32_t at, i;
++	uint64_t end;
+ 
+ 	bytes = (bytes + 0xfffull) & ~0xfffull;
+-	if (bytes == 0) {
++	if (bytes == 0 || iova < MONDRIAN_UC_IOVA_BASE ||
++	    iova + bytes > MONDRIAN_UC_IOVA_END) {
+ 		return;
+ 	}
+-	for (i = 0; i < mondrian_uc_hole_count; i++) {
+-		uint64_t end = iova + bytes;
+-
+-		if (mondrian_uc_holes[i].start + mondrian_uc_holes[i].bytes ==
+-		    iova) {
+-			mondrian_uc_holes[i].bytes += bytes;
+-			return;
++	end = iova + bytes;
++	/* The list is sorted by start; find the first hole above this range. */
++	for (at = 0; at < mondrian_uc_hole_count; at++) {
++		if (mondrian_uc_holes[at].start > iova) {
++			break;
+ 		}
+-		if (end == mondrian_uc_holes[i].start) {
+-			mondrian_uc_holes[i].start = iova;
+-			mondrian_uc_holes[i].bytes += bytes;
++	}
++	/*
++	 * A range that overlaps a hole was already given back (or is not ours).
++	 * Dropping the second report keeps the list sane; nothing legitimate
++	 * frees part of a live buffer.
++	 */
++	if (at > 0 && mondrian_uc_holes[at - 1].start +
++	    mondrian_uc_holes[at - 1].bytes > iova) {
++		return;
++	}
++	if (at < mondrian_uc_hole_count && end > mondrian_uc_holes[at].start) {
++		return;
++	}
++	if (at > 0 && mondrian_uc_holes[at - 1].start +
++	    mondrian_uc_holes[at - 1].bytes == iova) {
++		/* Joins the hole below it. */
++		mondrian_uc_holes[at - 1].bytes = end -
++		    mondrian_uc_holes[at - 1].start;
++		i = at - 1;
++	} else if (at < mondrian_uc_hole_count &&
++	    end == mondrian_uc_holes[at].start) {
++		/* Joins the hole above it. */
++		mondrian_uc_holes[at].start = iova;
++		mondrian_uc_holes[at].bytes += bytes;
++		i = at;
++	} else {
++		if (mondrian_uc_hole_count >= MONDRIAN_UC_IOVA_HOLES) {
++			mondrian_uc_iova_dropped += bytes;
+ 			return;
+ 		}
+-	}
+-	if (mondrian_uc_hole_count < MONDRIAN_UC_IOVA_HOLES) {
+-		mondrian_uc_holes[mondrian_uc_hole_count].start = iova;
+-		mondrian_uc_holes[mondrian_uc_hole_count].bytes = bytes;
++		for (i = mondrian_uc_hole_count; i > at; i--) {
++			mondrian_uc_holes[i] = mondrian_uc_holes[i - 1];
++		}
++		mondrian_uc_holes[at].start = iova;
++		mondrian_uc_holes[at].bytes = bytes;
+ 		mondrian_uc_hole_count++;
++		i = at;
++	}
++	if (i + 1 < mondrian_uc_hole_count &&
++	    mondrian_uc_holes[i].start + mondrian_uc_holes[i].bytes ==
++	    mondrian_uc_holes[i + 1].start) {
++		/* The two neighbours touch: one hole again. */
++		mondrian_uc_holes[i].bytes += mondrian_uc_holes[i + 1].bytes;
++		for (; i + 1 < mondrian_uc_hole_count; i++) {
++			mondrian_uc_holes[i + 1] = mondrian_uc_holes[i + 2];
++		}
++		mondrian_uc_hole_count--;
+ 	}
+ }
+ 
+@@ -4184,8 +4232,10 @@ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ 		mondrian_uc_holes[i].start += bytes;
+ 		mondrian_uc_holes[i].bytes -= bytes;
+ 		if (mondrian_uc_holes[i].bytes == 0) {
+-			mondrian_uc_holes[i] =
+-			    mondrian_uc_holes[--mondrian_uc_hole_count];
++			for (; i + 1 < mondrian_uc_hole_count; i++) {
++				mondrian_uc_holes[i] = mondrian_uc_holes[i + 1];
++			}
++			mondrian_uc_hole_count--;
+ 		}
+ 		return iova;
+ 	}
+@@ -4197,6 +4247,34 @@ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ 	return iova;
+ }
+ 
++/* What the arena has left, for a refusal that has to name its reason. */
++void
++mondrian_gpu_uc_iova_state(uint64_t *bump, uint32_t *holes, uint64_t *largest,
++    uint64_t *dropped)
++{
++	uint32_t i;
++
++	if (bump != NULL) {
++		*bump = mondrian_uc_iova;
++	}
++	if (holes != NULL) {
++		*holes = mondrian_uc_hole_count;
++	}
++	if (largest != NULL) {
++		uint64_t best = 0;
++
++		for (i = 0; i < mondrian_uc_hole_count; i++) {
++			if (mondrian_uc_holes[i].bytes > best) {
++				best = mondrian_uc_holes[i].bytes;
++			}
++		}
++		*largest = best;
++	}
++	if (dropped != NULL) {
++		*dropped = mondrian_uc_iova_dropped;
++	}
++}
++
+ int
+ mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions)
+ {
+@@ -5862,6 +5940,24 @@ mondrian_gpu_uc_iova_alloc(uint64_t bytes)
+ 	return 0;
+ }
+ 
++void
++mondrian_gpu_uc_iova_state(uint64_t *bump, uint32_t *holes, uint64_t *largest,
++    uint64_t *dropped)
++{
++	if (bump != NULL) {
++		*bump = 0;
++	}
++	if (holes != NULL) {
++		*holes = 0;
++	}
++	if (largest != NULL) {
++		*largest = 0;
++	}
++	if (dropped != NULL) {
++		*dropped = 0;
++	}
++}
++
+ int
+ mondrian_gpu_uc_map_page(uint64_t iova, uint64_t pa, uint32_t permissions)
+ {
+diff --git a/bsd/dev/mondrian_gpu_api.h b/bsd/dev/mondrian_gpu_api.h
+index 4e9bf03..4e1763b 100644
+--- a/bsd/dev/mondrian_gpu_api.h
++++ b/bsd/dev/mondrian_gpu_api.h
+@@ -24,6 +24,14 @@ int mondrian_gpu_uc_param(uint32_t param, uint64_t *value);
+ uint64_t mondrian_gpu_uc_iova_alloc(uint64_t bytes);
+ void mondrian_gpu_uc_iova_free(uint64_t iova, uint64_t bytes);
+ 
++/*
++ * What the arena looks like, for a refusal that has to name its reason: the
++ * bump pointer, how many freed ranges are remembered, the largest of them and
++ * how many bytes a full list had to drop (which must stay zero).
++ */
++void mondrian_gpu_uc_iova_state(uint64_t *bump, uint32_t *holes,
++    uint64_t *largest, uint64_t *dropped);
++
+ /*
+  * Stage-1 map/unmap of one 4 KiB page. Buffers a submission touches must be
+  * user accessible (permissions 3 or 7): packets executed from an indirect
+diff --git a/iokit/Kernel/arm/MondrianGPU.cpp b/iokit/Kernel/arm/MondrianGPU.cpp
+index 3403ff4..d6c6098 100644
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -621,6 +621,21 @@ mondrian_gpu_buffer_count_total(void)
+ 	return mondrian_gpu_buffer_count;
+ }
+ 
++/*
++ * Why the last buffer was refused. A size on its own is not a diagnosis: the
++ * arena, the memory descriptor, a missing physical page and a full page-table
++ * region all read as the same line, and on 2026-11-20 a ring with 9 479
++ * refusals of large buffers and 6 GiB of free RAM was read as "out of memory"
++ * for three hours when the allocator had lost the ranges it freed.
++ */
++static const char *mondrian_refuse_why = "?";
++
++static void
++mondrian_refuse(const char *why)
++{
++	mondrian_refuse_why = why;
++}
++
+ mondrian_buffer *
+ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ {
+@@ -631,6 +646,8 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 	size = (size + 0xfffu) & ~0xfffull;
+ 	if (memory == NULL || size == 0 || size > kMondrianBufferMax ||
+ 	    fBufferCount >= kMondrianBuffers) {
++		mondrian_refuse(memory == NULL ? "no memory" :
++		    size > kMondrianBufferMax ? "too big" : "buffer count");
+ 		return NULL;
+ 	}
+ 	/*
+@@ -657,6 +674,7 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 	}
+ 	iova = mondrian_gpu_uc_iova_alloc(size);
+ 	if (iova == 0) {
++		mondrian_refuse("arena");
+ 		return NULL;
+ 	}
+ 	for (off = 0; off < size; off += 0x1000) {
+@@ -667,6 +685,7 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 			for (i = 0; i < off; i += 0x1000) {
+ 				(void)mondrian_gpu_uc_unmap_page(iova + i);
+ 			}
++			mondrian_refuse("no page");
+ 			return NULL;
+ 		}
+ 		if (mondrian_gpu_uc_map_page(iova + off, pa,
+@@ -674,12 +693,14 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 			for (i = 0; i <= off; i += 0x1000) {
+ 				(void)mondrian_gpu_uc_unmap_page(iova + i);
+ 			}
++			mondrian_refuse("map");
+ 			return NULL;
+ 		}
+ 	}
+ 	(void)mondrian_gpu_uc_tables_sync();
+ 	buffer = (mondrian_buffer *)IOMalloc(sizeof(mondrian_buffer));
+ 	if (buffer == NULL) {
++		mondrian_refuse("descriptor");
+ 		return NULL;
+ 	}
+ 	memory->retain();
+@@ -724,6 +745,7 @@ MondrianGPUUserClient::bufferNew(uint64_t size)
+ 
+ 	if (size == 0 || size > kMondrianBufferMax || fBufferCount >=
+ 	    kMondrianBuffers) {
++		mondrian_refuse(size > kMondrianBufferMax ? "too big" : "buffer count");
+ 		return NULL;
+ 	}
+ 	/*
+@@ -747,6 +769,7 @@ MondrianGPUUserClient::bufferNew(uint64_t size)
+ 		    kernel_task, kIODirectionInOut, (size + 0xfffu) & ~0xfffull,
+ 		    0x00000000fffff000ull);
+ 		if (memory == NULL) {
++			mondrian_refuse("memory");
+ 			return NULL;
+ 		}
+ 	}
+@@ -801,9 +824,27 @@ MondrianGPUUserClient::gemNew(struct msm_gem_new *request)
+ 	IOLockLock(fLock);
+ 	buffer = bufferNew(request->size);
+ 	if (buffer == NULL) {
++		static unsigned said;
++		uint64_t bump = 0, largest = 0, dropped = 0;
++		uint32_t holes = 0;
++
++		mondrian_gpu_uc_iova_state(&bump, &holes, &largest, &dropped);
++		/*
++		 * The size alone sent 2026-11-20's 9 479 refusals to the wrong
++		 * pool: 6 GiB were free, 282 buffers were live and the arena's
++		 * state was the one number nobody printed. Every refusal names
++		 * its step now, and the arena's numbers come with it.
++		 */
++		if (said < 8 || (said % 512) == 0) {
++			IOLog("MondrianGPU: gem_new 0x%llx refused (%s) iova 0x%llx"
++			    " holes %u largest 0x%llx dropped 0x%llx bufs %u\n",
++			    (unsigned long long)request->size, mondrian_refuse_why,
++			    (unsigned long long)bump, holes,
++			    (unsigned long long)largest, (unsigned long long)dropped,
++			    fBufferCount);
++		}
++		said++;
+ 		IOLockUnlock(fLock);
+-		IOLog("MondrianGPU: gem_new 0x%llx refused\n",
+-		    (unsigned long long)request->size);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	request->handle = buffer->handle;
