@@ -10,10 +10,10 @@ RING="python3 tools/usb-ring.py"
 
 bash tools/wsl/attach.sh || exit 1
 for p in \
-	/private/var/mobile/Library/Preferences/mondrian-bt.log \
-	/private/var/mobile/Library/Logs/mondrian-bt.log \
-	/private/var/log/mondrian-bt.log \
-	/private/var/tmp/mondrian-bt.log \
+	/private/var/mobile/Library/Preferences/mondrian-btd.log \
+	/private/var/mobile/Library/Logs/mondrian-btd.log \
+	/private/var/log/mondrian-btd.log \
+	/private/var/tmp/mondrian-btd.log \
 	/private/var/mobile/Library/Preferences/mondrian-bt-power.log; do
 	printf '%s -> ' "$p"
 	$RING rf "$p" 0 120 2>&1 | head -2 | tr '\n' ' '

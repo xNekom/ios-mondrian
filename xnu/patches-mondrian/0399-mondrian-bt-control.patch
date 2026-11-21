@@ -81,7 +81,7 @@ new file mode 100644
 index 0000000..9c9d16c
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,481 @@
+@@ -0,0 +1,576 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -145,6 +145,17 @@ index 0000000..9c9d16c
 +	unsigned tx_packets;
 +	unsigned tx_fails;
 +	unsigned rx_packets;
++	unsigned le_meta;
++	unsigned le_adv;
++	unsigned le_scan_rsp;
++	unsigned inquiry_results;
++	unsigned inquiry_cmds;
++	unsigned name_reqs;
++	unsigned legacy_enable;
++	unsigned legacy_disable;
++	unsigned ext_enable;
++	unsigned ext_disable;
++	unsigned scan_refused;
 +	uint64_t opened;
 +	uint64_t last_tx;
 +	uint64_t last_rx;
@@ -164,6 +175,86 @@ index 0000000..9c9d16c
 +		    buf[i]);
 +	}
 +	printf("%s\n", line);
++}
++
++/*
++ * The connection summary is the only place that can say what happened after
++ * the first 64 packets, which the ring cannot show: whether LE reports ever
++ * arrive, whether an advertisement carries a name, and whether the daemon asks
++ * for one with Remote Name Request (0x0419). A device list of bare addresses
++ * cannot be told from an unparsed one without these numbers.
++ */
++static void
++mondrian_btctl_count_command(const uint8_t *buf, size_t len)
++{
++	uint16_t opcode;
++
++	if (len < 3 || buf[0] != 0x01) {
++		return;
++	}
++	opcode = (uint16_t)(buf[1] | (buf[2] << 8));
++	switch (opcode) {
++	case 0x0401:
++		mondrian_btctl.inquiry_cmds++;
++		break;
++	case 0x0419:
++		mondrian_btctl.name_reqs++;
++		if (mondrian_btctl.name_reqs <= 4) {
++			mondrian_btctl_dump("name request", buf,
++			    (int)MIN(len, (size_t)16));
++		}
++		break;
++	case 0x200c:
++		if (len >= 5 && buf[4] != 0) {
++			mondrian_btctl.legacy_enable++;
++		} else {
++			mondrian_btctl.legacy_disable++;
++		}
++		break;
++	case 0x2031:
++		if (len >= 5 && buf[4] != 0) {
++			mondrian_btctl.ext_enable++;
++		} else {
++			mondrian_btctl.ext_disable++;
++		}
++		break;
++	}
++}
++
++static void
++mondrian_btctl_count_event(const uint8_t *buf, size_t len)
++{
++	unsigned sub;
++
++	if (len < 3 || buf[0] != 0x04) {
++		return;
++	}
++	if (buf[1] == 0x2f) {
++		mondrian_btctl.inquiry_results++;
++		if (mondrian_btctl.inquiry_results <= 4) {
++			mondrian_btctl_dump("inquiry eir", buf,
++			    (int)MIN(len, (size_t)32));
++		}
++		return;
++	}
++	if (buf[1] != 0x3e || len < 4) {
++		return;
++	}
++	sub = buf[3];
++	mondrian_btctl.le_meta++;
++	if (sub == 0x02) {
++		mondrian_btctl.le_adv++;
++		if (mondrian_btctl.le_adv <= 4) {
++			mondrian_btctl_dump("le adv", buf,
++			    (int)MIN(len, (size_t)48));
++		}
++	} else if (sub == 0x04) {
++		mondrian_btctl.le_scan_rsp++;
++		if (mondrian_btctl.le_scan_rsp <= 4) {
++			mondrian_btctl_dump("le scan rsp", buf,
++			    (int)MIN(len, (size_t)48));
++		}
++	}
 +}
 +
 +static errno_t
@@ -187,6 +278,17 @@ index 0000000..9c9d16c
 +	mondrian_btctl.tx_packets = 0;
 +	mondrian_btctl.tx_fails = 0;
 +	mondrian_btctl.rx_packets = 0;
++	mondrian_btctl.le_meta = 0;
++	mondrian_btctl.le_adv = 0;
++	mondrian_btctl.le_scan_rsp = 0;
++	mondrian_btctl.inquiry_results = 0;
++	mondrian_btctl.inquiry_cmds = 0;
++	mondrian_btctl.name_reqs = 0;
++	mondrian_btctl.legacy_enable = 0;
++	mondrian_btctl.legacy_disable = 0;
++	mondrian_btctl.ext_enable = 0;
++	mondrian_btctl.ext_disable = 0;
++	mondrian_btctl.scan_refused = 0;
 +	mondrian_btctl.last_tx = 0;
 +	mondrian_btctl.last_rx = 0;
 +	clock_get_uptime(&mondrian_btctl.opened);
@@ -214,6 +316,9 @@ index 0000000..9c9d16c
 +{
 +	uint64_t now = 0, opened = 0, last = 0, age_ns = 0, idle_ns = 0;
 +	unsigned tx, fails, rx;
++	unsigned le_meta, le_adv, le_scan_rsp, inquiry_results, name_reqs;
++	unsigned legacy_enable, legacy_disable, ext_enable, ext_disable;
++	unsigned scan_refused;
 +
 +	clock_get_uptime(&now);
 +	lck_mtx_lock(&mondrian_btctl_lock);
@@ -222,6 +327,16 @@ index 0000000..9c9d16c
 +	tx = mondrian_btctl.tx_packets;
 +	fails = mondrian_btctl.tx_fails;
 +	rx = mondrian_btctl.rx_packets;
++	le_meta = mondrian_btctl.le_meta;
++	le_adv = mondrian_btctl.le_adv;
++	le_scan_rsp = mondrian_btctl.le_scan_rsp;
++	inquiry_results = mondrian_btctl.inquiry_results;
++	name_reqs = mondrian_btctl.name_reqs;
++	legacy_enable = mondrian_btctl.legacy_enable;
++	legacy_disable = mondrian_btctl.legacy_disable;
++	ext_enable = mondrian_btctl.ext_enable;
++	ext_disable = mondrian_btctl.ext_disable;
++	scan_refused = mondrian_btctl.scan_refused;
 +	last = mondrian_btctl.last_tx > mondrian_btctl.last_rx ?
 +	    mondrian_btctl.last_tx : mondrian_btctl.last_rx;
 +	lck_mtx_unlock(&mondrian_btctl_lock);
@@ -240,11 +355,16 @@ index 0000000..9c9d16c
 +	    "age %llu ms idle %llu ms\n", tx, fails, rx,
 +	    (unsigned long long)(age_ns / 1000000ull),
 +	    (unsigned long long)(idle_ns / 1000000ull));
++	printf("MONDRIAN BTCTL: scan le meta %u adv %u rsp %u "
++	    "inquiry eir %u name req %u legacy %u/%u ext %u/%u refused %u\n",
++	    le_meta, le_adv, le_scan_rsp, inquiry_results, name_reqs,
++	    legacy_enable, legacy_disable, ext_enable, ext_disable,
++	    scan_refused);
 +	return 0;
 +}
 +
 +static errno_t
-+mondrian_btctl_send(kern_ctl_ref kref, uint32_t unit,
++mondrian_btctl_send(__unused kern_ctl_ref kref, __unused uint32_t unit,
 +    __unused void *unitinfo, mbuf_t m, __unused int flags)
 +{
 +	mbuf_t head = m;
@@ -257,6 +377,7 @@ index 0000000..9c9d16c
 +		if (len == 0) {
 +			continue;
 +		}
++		mondrian_btctl_count_command(data, len);
 +		/*
 +		 * BD_VSC_OLYMPIC_*: the WCN7850 has no Olympian vendor
 +		 * commands and answers "unknown command" (status 1), and the
@@ -307,70 +428,19 @@ index 0000000..9c9d16c
 +			continue;
 +		}
 +		/*
-+		 * 0x200b (LE Set Scan Parameters) is refused with "command
-+		 * disallowed" (0x0c) while the controller is scanning, and the
-+		 * stack treats that refusal as fatal: the last write before
-+		 * `_exit(1)` is this command and its completion carries 0x0c
-+		 * (measured 2026-11-21 with the shim's packet ring). The refusal
-+		 * is not only a reconfiguration: it is also the first 0x200b of
-+		 * a fresh daemon, so the controller's scan state outlives the
-+		 * daemon's HCI Reset. Apple's Broadcom firmware accepts the
-+		 * command while scanning; the WCN7850 does not. Answer it here
-+		 * with success and leave the controller's parameters in place
-+		 * instead of ending the daemon. BR/EDR inquiry -- what
-+		 * discovery uses -- does not depend on this command.
++		 * 0x200b (LE Set Scan Parameters) and 0x200c (LE Set Scan
++		 * Enable) are forwarded. The controller refuses at least one of
++		 * them with "command disallowed" (0x0c) in the state it boots
++		 * in, and the stack treats a refusal as fatal, which is why they
++		 * used to be answered here. Answering them also kept the
++		 * controller from ever receiving a scan enable: no LE advertising
++		 * report reached the daemon and the device list showed addresses
++		 * only (measured 2026-11-21: `scan le meta 0` over 79 s). They go
++		 * to the controller now, and the refusal is rewritten to success
++		 * on the way back (mondrian_btctl_mask_scan_status): a chip that
++		 * accepts the command scans for real, a chip that refuses it does
++		 * not end the daemon.
 +		 */
-+		if (len >= 4 && data[0] == 0x01 && data[1] == 0x0b &&
-+		    data[2] == 0x20) {
-+			static const uint8_t complete[] = {
-+				0x04, 0x0e, 0x04, 0x01, 0x0b, 0x20, 0x00
-+			};
-+
-+			if (mondrian_btctl.tx_logged <
-+			    MONDRIAN_BTCTL_LOG_PACKETS) {
-+				mondrian_btctl.tx_logged++;
-+				mondrian_btctl_dump("tx", data,
-+				    (int)MIN(len, (size_t)24));
-+			}
-+			printf("MONDRIAN BTCTL: 0x200b answered\n");
-+			(void) ctl_enqueuedata(kref, unit, complete,
-+			    sizeof(complete), 0);
-+			mondrian_btctl.tx_packets++;
-+			clock_get_uptime(&mondrian_btctl.last_tx);
-+			total += (int)len;
-+			continue;
-+		}
-+		/*
-+		 * 0x200c (LE Set Scan Enable): the controller refuses both
-+		 * values with "command disallowed" (0x0c) -- the enable right
-+		 * after 0x200b, and the disable at the end of the discovery
-+		 * cycle (measured 2026-11-21: each run's last write is one of
-+		 * them and the completion carries 0x0c). The LE scan control is
-+		 * therefore virtual: the daemon is told each request succeeded
-+		 * and the controller keeps whatever state it has. BR/EDR inquiry
-+		 * is untouched and that is what fills the device list.
-+		 */
-+		if (len >= 5 && data[0] == 0x01 && data[1] == 0x0c &&
-+		    data[2] == 0x20) {
-+			static const uint8_t complete[] = {
-+				0x04, 0x0e, 0x04, 0x01, 0x0c, 0x20, 0x00
-+			};
-+
-+			if (mondrian_btctl.tx_logged <
-+			    MONDRIAN_BTCTL_LOG_PACKETS) {
-+				mondrian_btctl.tx_logged++;
-+				mondrian_btctl_dump("tx", data,
-+				    (int)MIN(len, (size_t)24));
-+			}
-+			printf("MONDRIAN BTCTL: 0x200c %s answered\n",
-+			    data[4] ? "enable" : "disable");
-+			(void) ctl_enqueuedata(kref, unit, complete,
-+			    sizeof(complete), 0);
-+			mondrian_btctl.tx_packets++;
-+			clock_get_uptime(&mondrian_btctl.last_tx);
-+			total += (int)len;
-+			continue;
-+		}
 +		if (mondrian_btctl.tx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {
 +			mondrian_btctl.tx_logged++;
 +			mondrian_btctl_dump("tx", data,
@@ -480,6 +550,29 @@ index 0000000..9c9d16c
 +}
 +
 +static void
++mondrian_btctl_mask_scan_status(uint8_t *buf, size_t len)
++{
++	uint8_t status;
++
++	if (len < 7 || buf[0] != 0x04 || buf[1] != 0x0e || buf[3] != 0x01) {
++		return;
++	}
++	if (!((buf[4] == 0x0b || buf[4] == 0x0c) && buf[5] == 0x20)) {
++		return;
++	}
++	status = buf[6];
++	if (status == 0) {
++		return;
++	}
++	if (mondrian_btctl.scan_refused < 4) {
++		printf("MONDRIAN BTCTL: 0x20%02x refused %#x, reported success\n",
++		    buf[4], status);
++	}
++	mondrian_btctl.scan_refused++;
++	buf[6] = 0;
++}
++
++static void
 +mondrian_btctl_poll(thread_call_param_t p0, thread_call_param_t p1)
 +{
 +	uint8_t buf[MONDRIAN_BTCTL_RX_MAX];
@@ -505,6 +598,8 @@ index 0000000..9c9d16c
 +
 +		n = mondrian_btuart_tty_read(buf, cap);
 +		if (n > 0) {
++			mondrian_btctl_mask_scan_status(buf, (size_t)n);
++			mondrian_btctl_count_event(buf, (size_t)n);
 +			mondrian_btctl.rx_packets++;
 +			clock_get_uptime(&mondrian_btctl.last_rx);
 +			if (mondrian_btctl.rx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {

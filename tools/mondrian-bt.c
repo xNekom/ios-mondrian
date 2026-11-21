@@ -1962,6 +1962,100 @@ own_method(Class cls, const char *name)
 	return found;
 }
 
+/*
+ * What the daemon knows about a discovered device. Its name comes from the
+ * classic EIR, a Remote Name Request completion or an LE report, and the
+ * Settings pane shows the address instead. These two selectors are the stack
+ * reporting a device upward, so reading `name` off the object says whether the
+ * loss is here or in the client that draws the row. The strings go to the
+ * append-only power log because the main log is truncated on every start.
+ */
+static void (*original_device_found)(id, SEL, id);
+static void (*original_classic_found)(id, SEL, id);
+static unsigned devices_logged;
+
+static BOOL
+has_selector(id object, const char *name)
+{
+	return object != nil && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(object,
+	    sel_registerName("respondsToSelector:"), sel_registerName(name));
+}
+
+static const char *
+object_text(id object, const char *selector)
+{
+	id value;
+	const char *text;
+
+	if (!has_selector(object, selector)) {
+		return NULL;
+	}
+	value = ((id (*)(id, SEL))objc_msgSend)(object,
+	    sel_registerName(selector));
+	if (value == nil || !has_selector(value, "UTF8String")) {
+		return NULL;
+	}
+	text = ((const char *(*)(id, SEL))objc_msgSend)(value,
+	    sel_registerName("UTF8String"));
+	return text;
+}
+
+static void
+log_device_found(const char *what, id device)
+{
+	const char *name, *address;
+
+	if (device == nil || devices_logged >= 8) {
+		return;
+	}
+	devices_logged++;
+	name = object_text(device, "name");
+	address = object_text(device, "addressString");
+	bt_power_append("%s name \"%s\" addr \"%s\"\n", what,
+	    name != NULL ? name : "(nil)", address != NULL ? address : "(nil)");
+}
+
+static void
+my_device_found(id self, SEL _cmd, id device)
+{
+	log_device_found("reportDeviceFound", device);
+	if (original_device_found != NULL) {
+		original_device_found(self, _cmd, device);
+	}
+}
+
+static void
+my_classic_found(id self, SEL _cmd, id device)
+{
+	log_device_found("classicDeviceFound", device);
+	if (original_classic_found != NULL) {
+		original_classic_found(self, _cmd, device);
+	}
+}
+
+static void
+hook_device_found(void)
+{
+	Class cls = objc_getClass("CBDaemonServer");
+	Method method;
+
+	if (cls == Nil) {
+		return;
+	}
+	method = own_method(cls, "_reportDeviceFound:");
+	if (method != NULL) {
+		original_device_found = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_device_found);
+		bt_log("dev.hook: _reportDeviceFound: replaced\n");
+	}
+	method = own_method(cls, "_stackClassicScannerDeviceFound:");
+	if (method != NULL) {
+		original_classic_found = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_classic_found);
+		bt_log("dev.hook: _stackClassicScannerDeviceFound: replaced\n");
+	}
+}
+
 static void
 hook_server_entry(void)
 {
@@ -2671,6 +2765,49 @@ qca_stream(struct qca_reader *r, const char *name, const uint8_t *blob,
 	return 0;
 }
 
+/*
+ * Will the controller scan with the extended commands? The daemon drives the
+ * legacy pair (0x200b/0x200c), which the WCN7850 answers with 0x0c "command
+ * disallowed", so no LE advertising report reaches the daemon and the device
+ * list stays on addresses. Its LE features carry bit 12 (extended
+ * advertising), so the extended pair is the other way in. The probe runs only
+ * when /private/var/vm/bt-ext-probe exists: it reports the statuses and the
+ * first event's bytes, which is what decides whether a kernel-level
+ * translation of the daemon's legacy scan commands is worth writing.
+ */
+static void
+qca_probe_scan(struct qca_reader *r)
+{
+	static const uint8_t params[] = {
+		0x00, 0x00, 0x01, 0x01, 0x30, 0x00, 0x30, 0x00
+	};
+	static const uint8_t enable[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t disable[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	int status;
+	int waited;
+
+	status = qca_command(r, 0x2041, params, sizeof(params), 3000, NULL, 0,
+	    NULL);
+	bt_power_append("ext: 0x2041 params status %d\n", status);
+	status = qca_command(r, 0x2042, enable, sizeof(enable), 3000, NULL, 0,
+	    NULL);
+	bt_power_append("ext: 0x2042 enable status %d\n", status);
+	if (status == 0) {
+		for (waited = 0; waited < 1000 && r->len < 3; waited += 20) {
+			if (qca_read_more(r, 20) <= 0) {
+				break;
+			}
+		}
+		if (r->len >= 3) {
+			bt_power_append("ext: first event %02x %02x %02x\n",
+			    r->buf[0], r->buf[1], r->buf[2]);
+		}
+	}
+	status = qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
+	    NULL);
+	bt_power_append("ext: 0x2042 disable status %d\n", status);
+}
+
 static void
 qca_boot(void)
 {
@@ -2723,6 +2860,10 @@ qca_boot(void)
 			 * handled in the H4 filter below.
 			 */
 			bt_log("qca: already patched, leaving the NVM alone\n");
+			if (access("/private/var/vm/bt-ext-probe",
+			    F_OK) == 0) {
+				qca_probe_scan(&reader);
+			}
 			syscall(SYS_close, fd);
 			free(fw);
 			free(nvm);
@@ -2762,6 +2903,9 @@ nvm:
 	bt_log("qca: reset status %d\n", status);
 	if (qca_version(&reader, &product, &patch, &rom, &soc)) {
 		bt_log("qca: booted patch 0x%04x rom 0x%04x\n", patch, rom);
+	}
+	if (access("/private/var/vm/bt-ext-probe", F_OK) == 0) {
+		qca_probe_scan(&reader);
 	}
 	/* Nothing the burst left behind may reach the daemon's H4 parser. */
 	for (i = 0; i < 50 && reader.len > 0; i++) {
@@ -2859,6 +3003,7 @@ mondrian_bt_init(void)
 		 * place before it runs.
 		 */
 		hook_server_entry();
+		hook_device_found();
 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 4000000000LL),
 		    dispatch_get_global_queue(0, 0), NULL, runtime_dump);
 	}
