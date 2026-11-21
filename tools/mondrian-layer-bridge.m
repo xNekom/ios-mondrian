@@ -112,6 +112,29 @@ bridge_say(const char *line)
 }
 
 /*
+ * The Settings > Bluetooth switch does not follow a drag that toggles every
+ * other UISwitch in the same app (docs/UI_PERFORMANCE.md). The ring cannot say
+ * whether the gesture reaches UIControl's action dispatch, so this logs the
+ * action and its target. It runs in every app the bridge enters, so it is armed
+ * by a marker file: echo > /private/var/vm/bridge-switch-probe, relaunch the
+ * app, then drag the switch.
+ */
+static BOOL (*bridge_switch_orig)(id, SEL, SEL, id, id);
+
+static BOOL
+bridge_switch_send(id self, SEL cmd, SEL action, id target, id event)
+{
+	char line[200];
+
+	snprintf(line, sizeof(line),
+	    "MONDRIAN BRIDGE[%d]: switch action %s -> %s\n", getpid(),
+	    action != NULL ? sel_getName(action) : "(null)",
+	    target != NULL ? object_getClassName(target) : "(nil)");
+	bridge_say(line);
+	return bridge_switch_orig(self, cmd, action, target, event);
+}
+
+/*
  * The picture under a label that does not describe it: four real bytes a pixel
  * declared as one component. Only the label changes, and only when there are
  * four bytes a pixel to keep -- a true 8-bit grey picture has `bytesPerRow`
@@ -715,15 +738,26 @@ bridge_install(void)
 		bridge_contents_orig = (id (*)(id, SEL))
 		    method_setImplementation(method, (IMP)bridge_get_contents);
 	}
+	if (bridge_file_on("/private/var/vm/bridge-switch-probe")) {
+		Class sw = objc_getClass("UISwitch");
+		Method sm = sw != NULL ? class_getInstanceMethod(sw,
+		    sel_registerName("sendAction:to:forEvent:")) : NULL;
+
+		if (sm != NULL) {
+			bridge_switch_orig = (BOOL (*)(id, SEL, SEL, id, id))
+			    method_setImplementation(sm, (IMP)bridge_switch_send);
+		}
+	}
 	/*
 	 * A load line, because "the dylib is missing", "the dylib is loaded and
 	 * the app never set a picture" and "the bridge ran and made a surface"
 	 * are three different findings and no other line separates them.
 	 */
 	snprintf(line, sizeof(line),
-	    "MONDRIAN BRIDGE[%d]: loaded in %s, setContents %s%s\n", getpid(),
+	    "MONDRIAN BRIDGE[%d]: loaded in %s, setContents %s%s%s\n", getpid(),
 	    getprogname() != NULL ? getprogname() : "?",
 	    bridge_original != NULL ? "hooked" : "NOT hooked",
-	    bridge_off() ? ", marker on (CGImages kept)" : "");
+	    bridge_off() ? ", marker on (CGImages kept)" : "",
+	    bridge_switch_orig != NULL ? ", switch probe on" : "");
 	bridge_say(line);
 }
