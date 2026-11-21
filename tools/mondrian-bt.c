@@ -1057,6 +1057,148 @@ bt_name_bridge(xpc_object_t message)
 	bt_last_valid = 0;
 }
 
+/*
+ * Link keys. The controller asks the host for the key of a device it has no
+ * key for (Link Key Request, 0x17), and bluetoothd never answers, so every
+ * connect falls back to a fresh pairing: `link key request` followed by 0x31,
+ * the host's 0x042b, 0x32 and 0x33. Keeping the key the controller hands over
+ * (Link Key Notification, 0x18) and answering 0x040b is the host's own job; the
+ * file makes the key survive a daemon restart, which the controller does not.
+ */
+#define BT_KEY_SLOTS 8
+#define BT_KEY_BYTES 23          /* address 6, key 16, type 1 */
+
+struct bt_key {
+	uint8_t bytes[BT_KEY_BYTES];
+};
+
+static struct bt_key bt_keys[BT_KEY_SLOTS];
+static int bt_keys_used;
+static int bt_keys_loaded;
+
+static void
+bt_keys_load(void)
+{
+	FILE *fp;
+	char line[96];
+
+	if (bt_keys_loaded) {
+		return;
+	}
+	bt_keys_loaded = 1;
+	fp = fopen("/private/var/mobile/Library/Preferences/mondrian-bt-keys",
+	    "r");
+	if (fp == NULL) {
+		return;
+	}
+	while (bt_keys_used < BT_KEY_SLOTS &&
+	    fgets(line, sizeof(line), fp) != NULL) {
+		unsigned int v;
+		int i;
+		int ok = 1;
+
+		for (i = 0; i < BT_KEY_BYTES; i++) {
+			if (sscanf(line + i * 2, "%2x", &v) != 1) {
+				ok = 0;
+				break;
+			}
+			bt_keys[bt_keys_used].bytes[i] = (uint8_t)v;
+		}
+		if (ok) {
+			bt_keys_used++;
+		}
+	}
+	fclose(fp);
+}
+
+static void
+bt_keys_save(void)
+{
+	int fd;
+	int i, k;
+	char line[BT_KEY_BYTES * 2 + 2];
+	int used = 0;
+
+	for (i = 0; i < bt_keys_used; i++) {
+		for (k = 0; k < BT_KEY_BYTES; k++) {
+			used += snprintf(line + used, sizeof(line) - (size_t)used,
+			    "%02x", bt_keys[i].bytes[k]);
+		}
+		line[used++] = '\n';
+		line[used] = '\0';
+	}
+	fd = open("/private/var/mobile/Library/Preferences/mondrian-bt-keys",
+	    O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0) {
+		return;
+	}
+	(void)syscall(SYS_write, fd, line, (size_t)used);
+	close(fd);
+}
+
+static void
+bt_key_store(const uint8_t *pkt, size_t len)
+{
+	int slot;
+
+	if (len < 26) {
+		return;
+	}
+	bt_keys_load();
+	for (slot = 0; slot < bt_keys_used; slot++) {
+		if (memcmp(bt_keys[slot].bytes, pkt + 3, 6) == 0) {
+			break;
+		}
+	}
+	if (slot == BT_KEY_SLOTS) {
+		return;
+	}
+	if (slot == bt_keys_used) {
+		bt_keys_used++;
+	}
+	memcpy(bt_keys[slot].bytes, pkt + 3, 6);
+	memcpy(bt_keys[slot].bytes + 6, pkt + 9, 16);
+	bt_keys[slot].bytes[22] = pkt[25];
+	bt_keys_save();
+	bt_power_append("link key stored %02x:%02x:%02x:%02x:%02x:%02x "
+	    "type %u slot %d\n", pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3],
+	    pkt[25], slot);
+}
+
+static void
+bt_key_reply(const uint8_t *pkt, size_t len)
+{
+	uint8_t cmd[26];
+	ssize_t written;
+	int slot;
+
+	if (len < 9) {
+		return;
+	}
+	bt_power_append("link key request %02x:%02x:%02x:%02x:%02x:%02x\n",
+	    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3]);
+	bt_keys_load();
+	for (slot = 0; slot < bt_keys_used; slot++) {
+		if (memcmp(bt_keys[slot].bytes, pkt + 3, 6) == 0) {
+			break;
+		}
+	}
+	if (slot == bt_keys_used || control_socket_fd < 0) {
+		bt_power_append("link key reply: no key for it\n");
+		return;
+	}
+	cmd[0] = 0x01;
+	cmd[1] = 0x0b;
+	cmd[2] = 0x04;
+	cmd[3] = 0x16;
+	memcpy(cmd + 4, bt_keys[slot].bytes, 6);
+	memcpy(cmd + 10, bt_keys[slot].bytes + 6, 16);
+	written = (ssize_t)syscall(SYS_write, control_socket_fd, cmd,
+	    sizeof(cmd));
+	bt_power_append("link key reply %02x:%02x:%02x:%02x:%02x:%02x -> %zd\n",
+	    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3], written);
+}
+
 static void
 bt_event_report(const uint8_t *pkt, size_t len)
 {
@@ -1131,15 +1273,14 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		return;
 	}
 	if (len >= 9 && pkt[1] == 0x17) {
-		bt_power_append("link key request "
-		    "%02x:%02x:%02x:%02x:%02x:%02x\n",
-		    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3]);
+		bt_key_reply(pkt, len);
 		return;
 	}
 	if (len >= 26 && pkt[1] == 0x18) {
 		bt_power_append("link key notify "
 		    "%02x:%02x:%02x:%02x:%02x:%02x type %u\n",
 		    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3], pkt[25]);
+		bt_key_store(pkt, len);
 		return;
 	}
 	if (len >= 9 && pkt[1] == 0x16) {
@@ -1601,9 +1742,7 @@ my_write(int fd, const void *buf, size_t len)
 				return (ssize_t)syscall(SYS_write, fd, fixed,
 				    sizeof(fixed));
 			}
-			if (opcode == 0x0401 || opcode == 0x0402 ||
-			    opcode == 0x0405 || opcode == 0x0409 ||
-			    opcode == 0x0419) {
+			if (opcode >= 0x0400 && opcode < 0x0500) {
 				/*
 				 * Inquiry (0x0401) is 5 parameters: LAP 3, length in
 				 * 1.28 s units, and the response limit. Length 0
