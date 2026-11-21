@@ -1,0 +1,182 @@
+xnu 0402: an app in /Applications gets the picture bridge, and only it
+
+A layer's `contents` is a CGImage for every image UIKit and an app draw, and on
+this port a CGImage does not cross to the window server: the server creates a
+surface of the picture's size and leaves it all zero (measured 2026-11-19 on a
+640x480 picture and again 2026-11-20 on the 129x129 knob of Settings' Airplane
+Mode switch, whose row draws its track and no knob). What draws is a client
+surface, so tools/mondrian-ui-hook.m bridges every CGImage to one -- but only in
+the processes the kernel injects the hook into, and Settings is not one of
+them.
+
+Bit 10 (0x400) matches every exec whose path starts with /Applications/ and
+gives it a dylib of its own, tools/mondrian-layer-bridge.m: `setContents:` and a
+surface, no interposers. The hook is not what an app receives -- it carries the
+services' sixteen dyld interposers (IORegistry, sandbox, TCC, the Objective-C
+throw path, libc++'s filesystem), and loading those into every app is a change
+no app agreed to. A boot without the dylib in /private/var/vm leaves apps clean
+and says so once. The boot mask becomes 6 | 0x100 | 0x400 = 1286, in
+tools/boards.py.
+
+The match is on the *whole* path, and that is what took a boot to find:
+`ni_cnd.cn_nameptr` has been advanced past every directory by namei, so the
+first version compared the last component ("Preferences") against
+"/Applications/" and could never match. No app ever received the bridge and the
+ring said nothing, because a `wanted == 0` exec is silent. Every other mask
+check in this function compares that component, which is why they work;
+`cn_pnbuf`, the caller's NUL-terminated copy of the path (`cn_pnlen` bytes), is
+the one that still holds all of it. The branch prints the path it compared now,
+so a boot that still misses names the string.
+
+The app's copy of the dylib also answers `-contents` with the picture while the
+layer keeps the surface, because UIKit reads a converted layer back and asserts
+(`-[_UIImageCGImageContent _initWithCGImageSource:CGImage:scale:]`, "imageRef
+passed is not a CGImageRef", measured 2026-11-21: SpringBoard aborted `sig 6`
+right after `exec Preferences`). CoreAnimation builds its render tree from its
+own stored contents, so the frame path still gets the surface.
+
+/test: open Settings and read the Airplane Mode row -- the knob must draw next
+to the track, in both states, and the ring must show
+`MONDRIAN HOOK: /Applications/Preferences.app/Preferences gets the picture
+bridge` and `MONDRIAN BRIDGE[<pid>]: 129x129 as surface ...` from the
+Preferences pid, with no `MONDRIAN SURF: backboardd create ... 129x129 fmt 0x0`
+after the app's first frame, and no assertion or `CRASH SpringBoard`.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index e707df8..3dc87f4 100755
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5667,6 +5667,18 @@ bad:
+  */
+ #define MONDRIAN_HOOK_METAL             0x200
+ 
++/*
++ * Every app in /Applications (0x400): the one thing an app needs is the
++ * CGImage-to-surface bridge, because a picture does not cross to the window
++ * server as a CGImage on this port (measured 2026-11-20: Settings' Airplane
++ * Mode switch drew its track and no knob, its 129x129 knob image under the
++ * bridge's old screen-size floor). It is a dylib of its own, not the hook: the
++ * hook carries the services' sixteen dyld interposers (IORegistry, sandbox,
++ * TCC, the throw path), and none of that belongs in an app. An app receives
++ * tools/mondrian-layer-bridge.m and nothing else.
++ */
++#define MONDRIAN_HOOK_APP               0x400
++
+ /*
+  * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
+  * them there once the root turns writable, so before that, or with glblob=0,
+@@ -5952,6 +5964,53 @@ mondrian_securityd_env(struct image_params *imgp, char *env, size_t size)
+ 	return true;
+ }
+ 
++/*
++ * The exec's path, and its length.
++ *
++ * `ni_cnd.cn_nameptr` has been advanced past every directory by namei, so it
++ * holds the last component ("Preferences") and `cn_namelen` its length -- which
++ * is exactly what every mask check above compares, and why those work. A test
++ * for a directory prefix needs the whole path: `cn_pnbuf` is the caller's
++ * NUL-terminated copy of it, `cn_pnlen` bytes long (PATHBUFLEN inline, else
++ * MAXPATHLEN). Measured 2026-11-21: `/Applications/Preferences.app/Preferences`
++ * reaches this function as `name` == "Preferences", so 0402's
++ * `strncmp(name, "/Applications/")` could never match and no app received the
++ * picture bridge.
++ */
++static const char *
++mondrian_exec_path(struct image_params *imgp, size_t *length)
++{
++	const char *path;
++	size_t size, at;
++
++	*length = 0;
++	if (imgp->ip_ndp == NULL || imgp->ip_ndp->ni_cnd.cn_pnbuf == NULL ||
++	    imgp->ip_ndp->ni_cnd.cn_pnlen <= 0) {
++		return NULL;
++	}
++	path = imgp->ip_ndp->ni_cnd.cn_pnbuf;
++	size = (size_t)imgp->ip_ndp->ni_cnd.cn_pnlen;
++	at = 0;
++	while (at < size && path[at] != '\0') {
++		at++;
++	}
++	*length = at;
++	return path;
++}
++
++/* Is this exec inside /Applications? (the whole path, see mondrian_exec_path) */
++static bool
++mondrian_exec_in_applications(struct image_params *imgp)
++{
++	const char prefix[] = "/Applications/";
++	const char *path;
++	size_t length;
++
++	path = mondrian_exec_path(imgp, &length);
++	return path != NULL && length > sizeof(prefix) - 1 &&
++	    strncmp(path, prefix, sizeof(prefix) - 1) == 0;
++}
++
+ static bool
+ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -5985,6 +6044,13 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	 */
+ 	const char metal[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/libmondrianmetal.dylib";
+ 	const char metal_path[] = "/private/var/vm/libmondrianmetal.dylib";
++	/*
++	 * The picture bridge an app receives by itself (0402). It is not the hook:
++	 * that dylib carries the services' interposers and a layer walk, and an app
++	 * that only needs setContents: is not the place for either.
++	 */
++	const char bridge[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-layer-bridge.dylib";
++	const char bridge_path[] = "/private/var/vm/mondrian-layer-bridge.dylib";
+ 
+ 	/*
+ 	 * A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster
+@@ -6052,6 +6118,8 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
+ 	    "com.apple.WebKit.GPU")) {
+ 		wanted = MONDRIAN_HOOK_METAL;
++	} else if (wanted == 0 && mondrian_exec_in_applications(imgp)) {
++		wanted = MONDRIAN_HOOK_APP;
+ 	}
+ 	/* The probe names its own processes; everything else needs its mask bit. */
+ 	if (wanted == 0 ||
+@@ -6103,6 +6171,37 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+ 		strlcpy(env, injector, size);
+ 		return true;
+ 	}
++	if (wanted == MONDRIAN_HOOK_APP) {
++		static unsigned app_told;
++		size_t pathlen = 0;
++		const char *path = mondrian_exec_path(imgp, &pathlen);
++
++		if (path == NULL) {
++			path = name;
++			pathlen = (size_t)imgp->ip_ndp->ni_cnd.cn_namelen;
++		}
++		/*
++		 * An app that gets this dylib must get one that draws: without the
++		 * bridge the app still runs, so a missing file is not an error, but
++		 * it is the difference between a switch with a knob and one without.
++		 * The whole path is printed, so a boot that still misses says which
++		 * string it compared.
++		 */
++		if (!mondrian_dylib_in_vm(bridge_path)) {
++			if (app_told++ < 4) {
++				printf("MONDRIAN HOOK: %.*s stays clean, no "
++				    "bridge in /private/var/vm\n",
++				    (int)pathlen, path);
++			}
++			return false;
++		}
++		if (app_told++ < 4) {
++			printf("MONDRIAN HOOK: %.*s gets the picture bridge\n",
++			    (int)pathlen, path);
++		}
++		strlcpy(env, bridge, size);
++		return true;
++	}
+ 	{
+ 		static unsigned vm_told;
+ 		bool in_vm = mondrian_dylib_in_vm(

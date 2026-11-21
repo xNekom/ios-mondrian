@@ -2844,6 +2844,26 @@ bluetooth_dump_cstrings(void)
 	}
 }
 
+/*
+ * `_session` and `_localDevice` are the two pointers the framework walks when
+ * it is told to power the controller. Both are NULL until BluetoothManager's
+ * own session setup runs, which needs a live bluetoothd; a direct
+ * BTSessionAttachWithQueue returning 0 is not enough. Measured 2026-11-20:
+ * forcing `available` and calling setPowered: with session 0x0 makes
+ * MobileBluetooth jump through a NULL BTLocalDeviceSetPowerState and SpringBoard
+ * dies with SIGBUS (pc == far) before its first commit.
+ */
+static void *
+bluetooth_manager_pointer(id instance, const char *name)
+{
+	Ivar ivar = class_getInstanceVariable(object_getClass(instance), name);
+
+	if (ivar == NULL) {
+		return NULL;
+	}
+	return *(void **)((char *)instance + ivar_getOffset(ivar));
+}
+
 static void
 bluetooth_power_once(void)
 {
@@ -2861,7 +2881,7 @@ bluetooth_power_once(void)
 	BOOL (*is_powered)(id, SEL);
 	void (*set_powered_fn)(id, SEL, BOOL);
 
-	if (attempts >= 40 || __builtin_strcmp(getprogname(), "SpringBoard") != 0) {
+	if (attempts >= 300 || __builtin_strcmp(getprogname(), "SpringBoard") != 0) {
 		return;
 	}
 	if (!mondrian_file_on("/private/var/vm/bt-power")) {
@@ -2934,7 +2954,10 @@ bluetooth_power_once(void)
 		 * there is no controller. KVC reaches the ivar behind the readonly
 		 * property, so set it and let the regular path send the request.
 		 */
-		if (responds_to(manager_instance, responds_sel,
+		if (mondrian_file_on("/private/var/vm/bt-force") &&
+		    bluetooth_manager_pointer(manager_instance, "_session") != NULL &&
+		    bluetooth_manager_pointer(manager_instance, "_localDevice") != NULL &&
+		    responds_to(manager_instance, responds_sel,
 		    sel_registerName("setValue:forKey:")) &&
 		    bluetooth_has_ivar(object_getClass(manager_instance),
 		    "vailable")) {
@@ -2942,29 +2965,59 @@ bluetooth_power_once(void)
 			    set_value_sel, (id)kCFBooleanTrue, (id)CFSTR("available"));
 			mondrian_probe_fmt("MONDRIAN BTPOWER: available forced\n");
 		} else {
-			mondrian_probe_fmt("MONDRIAN BTPOWER: no available ivar\n");
+			mondrian_probe_fmt("MONDRIAN BTPOWER: available held, session %p"
+			    " device %p\n",
+			    bluetooth_manager_pointer(manager_instance, "_session"),
+			    bluetooth_manager_pointer(manager_instance, "_localDevice"));
 		}
 	}
 	if (attempts % 5 == 0) {
-		mondrian_probe_fmt("MONDRIAN BTPOWER: try %d available %d powered %d\n",
-		    attempts,
+		mondrian_probe_fmt("MONDRIAN BTPOWER: try %d available %d powered %d"
+		    " session %p device %p\n", attempts,
 		    responds_to(manager_instance, responds_sel, available_sel) ?
 		    is_powered(manager_instance, available_sel) : -1,
-		    is_powered(manager_instance, powered_sel));
+		    is_powered(manager_instance, powered_sel),
+		    bluetooth_manager_pointer(manager_instance, "_session"),
+		    bluetooth_manager_pointer(manager_instance, "_localDevice"));
 	}
 	if (is_powered(manager_instance, powered_sel)) {
-		mondrian_probe_fmt("MONDRIAN BTPOWER: powered after %d tries\n",
-		    attempts);
+		mondrian_probe_fmt("MONDRIAN BTPOWER: powered after %d tries"
+		    " available %d session %p device %p\n", attempts,
+		    responds_to(manager_instance, responds_sel, available_sel) ?
+		    is_powered(manager_instance, available_sel) : -1,
+		    bluetooth_manager_pointer(manager_instance, "_session"),
+		    bluetooth_manager_pointer(manager_instance, "_localDevice"));
 		bluetooth_scan_once(manager_instance);
-		attempts = 40;
+		attempts = 300;
 		return;
 	}
 	if (!responds_to(manager_instance, responds_sel, set_powered_sel)) {
 		mondrian_probe_fmt("MONDRIAN BTPOWER: no setPowered:\n");
-		attempts = 40;
+		attempts = 300;
 		return;
 	}
 	set_powered_fn = (void (*)(id, SEL, BOOL))objc_msgSend;
+	/*
+	 * Writing the ivar and calling the setter are behind their own marker.
+	 * Measured 2026-11-21: with bt-client and bt-power armed, every
+	 * SpringBoard start crashes inside MobileBluetooth about two seconds
+	 * after its session appears (SIGBUS, pc == far); with the markers off
+	 * the same boot has no SpringBoard crash at all. The framework's own
+	 * setup is not to be poked until this is understood.
+	 */
+	if (!mondrian_file_on("/private/var/vm/bt-force")) {
+		return;
+	}
+	if (bluetooth_manager_pointer(manager_instance, "_session") == NULL ||
+	    bluetooth_manager_pointer(manager_instance, "_localDevice") == NULL) {
+		if (attempts <= 3 || attempts % 10 == 0) {
+			mondrian_probe_fmt("MONDRIAN BTPOWER: setPowered held (try %d)"
+			    " session %p device %p\n", attempts,
+			    bluetooth_manager_pointer(manager_instance, "_session"),
+			    bluetooth_manager_pointer(manager_instance, "_localDevice"));
+		}
+		return;
+	}
 	if (attempts <= 3 || attempts % 10 == 0) {
 		mondrian_probe_fmt("MONDRIAN BTPOWER: setPowered YES (try %d)\n",
 		    attempts);
@@ -9505,10 +9558,16 @@ mondrian_switch_surface(CGImageRef image)
 	}
 	surface = IOSurfaceCreate(props);
 	CFRelease(props);
-	if (surface == NULL || IOSurfaceLock(surface, 0, &seed) != 0) {
-		if (surface != NULL) {
-			CFRelease(surface);
-		}
+	if (surface == NULL) {
+		return NULL;
+	}
+	/*
+	 * A copied layer holds this surface without the box `-setContents:`
+	 * leaves on the original; the readback rebuilds a CGImage for a box-less
+	 * layer from the surface's own pixels (mondrian_surface_picture).
+	 */
+	if (IOSurfaceLock(surface, 0, &seed) != 0) {
+		CFRelease(surface);
 		return NULL;
 	}
 	space = CGColorSpaceCreateDeviceRGB();
@@ -9633,6 +9692,17 @@ mondrian_switch_probe(id app)
 	unsigned count, i, printed = 0;
 	char line[128];
 
+	/*
+	 * Disarmed for good. Measured 2026-11-20: with /private/var/vm/mondrian-switch
+	 * holding 1, every dump shows `MONDRIAN SW: V0 UISwitch` and thirty lines
+	 * later `CRASH SpringBoard`, and a boot with the marker at 0 has none. The
+	 * probe builds its view inside the window server's client and that view is
+	 * what kills it, so a diagnostic must not be one file write away from a
+	 * crash loop at the logo. The knob is drawn by the picture bridge now, and
+	 * the tree below stays as the record of what the dump measured.
+	 */
+	(void)app;
+	return;
 	file = fopen("/private/var/vm/mondrian-switch", "r");
 	if (file == NULL) {
 		return;
@@ -17173,15 +17243,440 @@ static unsigned mondrian_layer_made;
  * why only widths divisible by four are converted; the rest keep their CGImage so
  * a bad stride cannot be mistaken for a bad idea.
  */
+/*
+ * The picture under a label that does not describe it.
+ *
+ * Measured 2026-11-20: the Airplane Mode knob is a 129x129 CGImage, 8 bits a
+ * component, 32 bits a pixel, 544 a row, colour model 1 -- four real bytes a
+ * pixel under a label that says one component. CoreGraphics draws the bytes
+ * through the label, which is why the same picture drawn into a BGRA context
+ * came out at 8 of 25 sampled points while the 1530x3 track next to it came
+ * out with its colour. Only the label changes, and only when there are four
+ * bytes a pixel to keep: a true 8-bit grey picture has a row below
+ * `width * 4` and is left alone. `mondrian_wall_relabel` is the same repair for
+ * the wallpaper, with an extra guard that refuses a picture whose channels are
+ * equal -- the knob is white, so that guard refuses exactly the picture that
+ * needs the repair.
+ */
+static CGImageRef
+mondrian_image_drawable(CGImageRef image)
+{
+	CGColorSpaceRef space = CGImageGetColorSpace(image);
+	CGDataProviderRef source;
+	CFDataRef data;
+	CGDataProviderRef provider;
+	CGColorSpaceRef rgb;
+	CGImageRef copy = NULL;
+	CGColorSpaceModel model;
+
+	if (space == NULL || CGImageGetBitsPerComponent(image) != 8 ||
+	    CGImageGetBitsPerPixel(image) < 24 ||
+	    CGImageGetBytesPerRow(image) < CGImageGetWidth(image) * 4) {
+		return NULL;
+	}
+	model = CGColorSpaceGetModel(space);
+	if (model == kCGColorSpaceModelRGB || model == kCGColorSpaceModelCMYK) {
+		return NULL;
+	}
+	/*
+	 * Rebuilt, not CGImageCreateCopyWithColorSpace: that one requires the
+	 * new colour space to have the same number of components as the old
+	 * one, and one (grey) to three (RGB) is exactly the change wanted here.
+	 * The bytes, the alpha and the byte order are the source's own.
+	 */
+	source = CGImageGetDataProvider(image);
+	data = source != NULL ? CGDataProviderCopyData(source) : NULL;
+	if (data == NULL) {
+		return NULL;
+	}
+	provider = CGDataProviderCreateWithCFData(data);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	if (provider != NULL && rgb != NULL) {
+		copy = CGImageCreate(CGImageGetWidth(image),
+		    CGImageGetHeight(image), 8, 32, CGImageGetBytesPerRow(image),
+		    rgb, CGImageGetBitmapInfo(image), provider, NULL, false,
+		    kCGRenderingIntentDefault);
+	}
+	if (rgb != NULL) {
+		CGColorSpaceRelease(rgb);
+	}
+	if (provider != NULL) {
+		CGDataProviderRelease(provider);
+	}
+	CFRelease(data);
+	return copy;
+}
+
+/* How many of a 7x7 grid of the surface's own memory is not zero. */
+static unsigned
+mondrian_surface_coverage(IOSurfaceRef surface)
+{
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	size_t row = IOSurfaceGetBytesPerRow(surface);
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface);
+	unsigned found = 0, x, y;
+
+	if (base == NULL || width == 0 || height == 0) {
+		return 0;
+	}
+	for (y = 0; y < 7; y++) {
+		for (x = 0; x < 7; x++) {
+			size_t at = ((height - 1) * y / 6) * row +
+			    ((width - 1) * x / 6) * 4;
+			const uint8_t *p = base + at;
+
+			if (p[0] | p[1] | p[2] | p[3]) {
+				found++;
+			}
+		}
+	}
+	return found;
+}
+
+static int
+mondrian_image_draw(IOSurfaceRef surface, CGImageRef image)
+{
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface);
+	size_t row = IOSurfaceGetBytesPerRow(surface);
+	CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+	CGContextRef context = space != NULL ? CGBitmapContextCreate(
+	    IOSurfaceGetBaseAddress(surface), width, height, 8, row, space,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little) : NULL;
+
+	if (space != NULL) {
+		CGColorSpaceRelease(space);
+	}
+	if (context == NULL) {
+		return 0;
+	}
+	CGContextDrawImage(context,
+	    CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
+	CGContextFlush(context);
+	CGContextRelease(context);
+	return 1;
+}
+
+/*
+ * One surface per picture, kept while the picture is alive.
+ *
+ * CoreAnimation asks for the same image on every layout and state change:
+ * measured 2026-11-20, one boot made 1011 surfaces and the 129x129 knob was a
+ * new one ten times a second. Each conversion is a CoreGraphics draw plus a GPU
+ * buffer that has to find an IOVA in backboardd, and that boot's ring carried
+ * `MondrianGPU: gem_new 0x700000 refused` right beside the switch. The entry
+ * holds the CGImage itself, so a recycled address cannot hand back another
+ * picture's surface.
+ */
+#define MONDRIAN_LAYER_CACHE	8
+#define MONDRIAN_LAYER_CACHE_MAX (1024u * 1024u)
+static struct {
+	CGImageRef image;
+	IOSurfaceRef surface;
+} mondrian_layer_cache[MONDRIAN_LAYER_CACHE];
+static unsigned mondrian_layer_cache_next;
+static unsigned mondrian_layer_hits;
+
+/*
+ * The A/B is a file and -setContents: runs thousands of times a boot, so the
+ * answer is remembered for a second instead of an open() per picture. A file's
+ * *existence* is the switch here, as docs/COREANIMATION_GLES.md states it, so
+ * `touch` and `1` mean the same and `0` does not quietly turn the bridge on.
+ */
+static int
+mondrian_layer_bridge_off(void)
+{
+	static double looked;
+	static int off;
+	double now = CFAbsoluteTimeGetCurrent();
+
+	if (looked == 0.0 || now - looked > 1.0 || now < looked) {
+		int fd = open("/private/var/vm/mondrian-layercsurf-off", O_RDONLY);
+
+		looked = now;
+		off = fd >= 0;
+		if (fd >= 0) {
+			(void)close(fd);
+		}
+	}
+	return off;
+}
+
 static IOSurfaceRef
-mondrian_image_surface(CGImageRef image)
+mondrian_image_cached(CGImageRef image)
+{
+	unsigned i;
+
+	for (i = 0; i < MONDRIAN_LAYER_CACHE; i++) {
+		if (mondrian_layer_cache[i].image == image &&
+		    mondrian_layer_cache[i].surface != NULL) {
+			return (IOSurfaceRef)CFRetain(mondrian_layer_cache[i].surface);
+		}
+	}
+	return NULL;
+}
+
+static void
+mondrian_image_remember(CGImageRef image, IOSurfaceRef surface)
+{
+	unsigned slot = mondrian_layer_cache_next;
+
+	mondrian_layer_cache_next = (mondrian_layer_cache_next + 1) %
+	    MONDRIAN_LAYER_CACHE;
+	if (mondrian_layer_cache[slot].surface != NULL) {
+		CFRelease(mondrian_layer_cache[slot].surface);
+	}
+	if (mondrian_layer_cache[slot].image != NULL) {
+		CGImageRelease(mondrian_layer_cache[slot].image);
+	}
+	mondrian_layer_cache[slot].image = (CGImageRef)CFRetain(image);
+	mondrian_layer_cache[slot].surface = (IOSurfaceRef)CFRetain(surface);
+}
+
+/*
+ * UIKit reads a layer's contents back and expects the picture it put there.
+ *
+ * Measured 2026-11-21: opening Settings asserted in
+ * -[_UIImageCGImageContent _initWithCGImageSource:CGImage:scale:]
+ * (`_UIImageContent.m:533`, "imageRef passed is not a CGImageRef") and
+ * SpringBoard aborted `sig 6` after `exec Preferences`. The render server needs
+ * the surface, so the surface stays what the layer holds; `-contents` answers
+ * the picture instead.
+ *
+ * A fixed table is the wrong home for that: SpringBoard converts hundreds of
+ * layers (icons, badges, widgets), the first version kept sixteen, and an
+ * evicted layer answered with its surface and asserted again. The picture now
+ * hangs off the layer for as long as the layer lives, with the surface ID it
+ * was made for beside it, so a layer that has moved on cannot answer with an
+ * older picture. The box is a CFDictionary: its value callbacks hold the
+ * CGImage, so the association only has to retain the box.
+ *
+ * A copied layer never went through -setContents: and has no box of its own;
+ * for it the surface is rebuilt into a CGImage over its own pixels
+ * (`mondrian_surface_picture`), so a copy does not answer with the surface
+ * either. There is no marker to put on a surface: this port's IOSurface kernel
+ * accepts `IOSurfaceSetValue` in its default selector and stores nothing, so
+ * the fallback tests the 32-bit row geometry instead. CoreAnimation reads its
+ * stored contents when it builds the render tree, not this accessor, so the
+ * frame path keeps the surface.
+ */
+static char mondrian_layer_box_key;
+static unsigned mondrian_layer_reads;
+static unsigned mondrian_layer_copies;
+static unsigned mondrian_layer_foreign;
+static unsigned mondrian_picture_nolock;
+static id (*mondrian_layer_contents_get_orig)(id, SEL);
+
+static void
+mondrian_layer_side_set(id layer, IOSurfaceRef surface, CGImageRef image)
+{
+	CFMutableDictionaryRef box;
+	CFNumberRef identity;
+	int32_t value = (int32_t)IOSurfaceGetID(surface);
+
+	box = CFDictionaryCreateMutable(NULL, 2,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (box == NULL) {
+		return;
+	}
+	CFDictionarySetValue(box, CFSTR("picture"), image);
+	identity = CFNumberCreate(NULL, kCFNumberSInt32Type, &value);
+	if (identity != NULL) {
+		CFDictionarySetValue(box, CFSTR("surface"), identity);
+		CFRelease(identity);
+	}
+	objc_setAssociatedObject(layer, &mondrian_layer_box_key, (id)box,
+	    OBJC_ASSOCIATION_RETAIN);
+	CFRelease(box);
+}
+
+/* The picture this layer was given for this surface, or NULL. */
+static CGImageRef
+mondrian_layer_side_get(id layer, IOSurfaceRef surface)
+{
+	CFDictionaryRef box = (CFDictionaryRef)objc_getAssociatedObject(layer,
+	    &mondrian_layer_box_key);
+	CFNumberRef identity;
+	int32_t value = 0;
+
+	if (box == NULL) {
+		return NULL;
+	}
+	identity = (CFNumberRef)CFDictionaryGetValue(box, CFSTR("surface"));
+	if (identity == NULL || !CFNumberGetValue(identity, kCFNumberSInt32Type,
+	    &value) || (uint32_t)value != IOSurfaceGetID(surface)) {
+		return NULL;
+	}
+	return (CGImageRef)CFDictionaryGetValue(box, CFSTR("picture"));
+}
+
+#define MONDRIAN_PICTURE_CACHE	8
+#define MONDRIAN_PICTURE_CACHE_MAX (4u * 1024u * 1024u)
+static struct {
+	IOSurfaceRef surface;
+	uint32_t id;
+	CGImageRef picture;
+} mondrian_picture_cache[MONDRIAN_PICTURE_CACHE];
+static unsigned mondrian_picture_cache_next;
+static pthread_mutex_t mondrian_picture_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+mondrian_picture_release(void *info, const void *data, size_t size)
+{
+	(void)data;
+	(void)size;
+	CFRelease((CFTypeRef)info);
+}
+
+/*
+ * A CGImage over the pixels a 32-bit surface already holds. The data provider
+ * holds the surface so the mapping cannot go away under the image; a layer
+ * that holds a surface has no other picture to offer.
+ */
+static CGImageRef
+mondrian_surface_picture(IOSurfaceRef surface)
+{
+	CGDataProviderRef provider;
+	CGColorSpaceRef space;
+	CGImageRef picture;
+	const uint8_t *base;
+	size_t width, height, row, size;
+	uint32_t seed = 0, id = IOSurfaceGetID(surface);
+	unsigned i;
+	bool locked = false;
+
+	pthread_mutex_lock(&mondrian_picture_lock);
+	for (i = 0; i < MONDRIAN_PICTURE_CACHE; i++) {
+		if (mondrian_picture_cache[i].surface == surface &&
+		    mondrian_picture_cache[i].id == id &&
+		    mondrian_picture_cache[i].picture != NULL) {
+			picture = (CGImageRef)CFRetain(
+			    mondrian_picture_cache[i].picture);
+			pthread_mutex_unlock(&mondrian_picture_lock);
+			return picture;
+		}
+	}
+	pthread_mutex_unlock(&mondrian_picture_lock);
+
+	/*
+	 * The picture is a view over the surface's mapped pixels, so the lock is
+	 * only there to keep a writer from moving them, never to wait for the
+	 * render server. Measured 2026-11-21: this code from a main-thread reader
+	 * (UIKit's image-content path) with a plain read lock left presentation
+	 * frozen at `ca begin 0 commit 0` and no crash -- the lock waited for the
+	 * server's hold and the commit never ran. AvoidSync never blocks, and a
+	 * readback that gets a torn frame is harmless.
+	 */
+	if (IOSurfaceLock(surface,
+	    kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, &seed) == 0) {
+		locked = true;
+	} else if (mondrian_picture_nolock++ < 4) {
+		mondrian_probe_fmt("MONDRIAN LAYER[%d]: surface %u picture "
+		    "read without the lock\n", getpid(), id);
+	}
+	base = IOSurfaceGetBaseAddress(surface);
+	width = IOSurfaceGetWidth(surface);
+	height = IOSurfaceGetHeight(surface);
+	row = IOSurfaceGetBytesPerRow(surface);
+	if (locked) {
+		IOSurfaceUnlock(surface,
+		    kIOSurfaceLockReadOnly | kIOSurfaceLockAvoidSync, &seed);
+	}
+	if (base == NULL || width == 0 || height == 0 || row < width * 4) {
+		return NULL;
+	}
+	size = row * height;
+	CFRetain(surface);
+	provider = CGDataProviderCreateWithData((void *)surface, base, size,
+	    mondrian_picture_release);
+	if (provider == NULL) {
+		CFRelease(surface);
+		return NULL;
+	}
+	space = CGColorSpaceCreateDeviceRGB();
+	picture = space != NULL ? CGImageCreate(width, height, 8, 32, row,
+	    space, kCGImageAlphaPremultipliedFirst |
+	    kCGBitmapByteOrder32Little, provider, NULL, false,
+	    kCGRenderingIntentDefault) : NULL;
+	if (space != NULL) {
+		CGColorSpaceRelease(space);
+	}
+	CGDataProviderRelease(provider);
+	if (picture == NULL) {
+		return NULL;
+	}
+	if (size > MONDRIAN_PICTURE_CACHE_MAX) {
+		return picture;
+	}
+	pthread_mutex_lock(&mondrian_picture_lock);
+	i = mondrian_picture_cache_next++ % MONDRIAN_PICTURE_CACHE;
+	if (mondrian_picture_cache[i].picture != NULL) {
+		CGImageRelease(mondrian_picture_cache[i].picture);
+	}
+	mondrian_picture_cache[i].surface = surface;
+	mondrian_picture_cache[i].id = id;
+	mondrian_picture_cache[i].picture = (CGImageRef)CFRetain(picture);
+	pthread_mutex_unlock(&mondrian_picture_lock);
+	return picture;
+}
+
+static id
+mondrian_layer_contents_get(id self, SEL cmd)
+{
+	id real = mondrian_layer_contents_get_orig != NULL
+	    ? mondrian_layer_contents_get_orig(self, cmd) : nil;
+	CGImageRef picture = NULL;
+	bool rebuilt = false;
+
+	if (real != nil && CFGetTypeID((CFTypeRef)real) == IOSurfaceGetTypeID()) {
+		IOSurfaceRef surface = (IOSurfaceRef)real;
+
+		picture = mondrian_layer_side_get(self, surface);
+		if (picture != NULL) {
+			picture = (CGImageRef)CFRetain(picture);
+		} else {
+			picture = mondrian_surface_picture(surface);
+			rebuilt = picture != NULL;
+		}
+		if (picture == NULL && mondrian_layer_foreign++ < 4) {
+			mondrian_probe_fmt("MONDRIAN LAYER[%d]: contents %zux%zu "
+			    "fmt %08x is not a 32-bit picture, left a "
+			    "surface\n", getpid(),
+			    IOSurfaceGetWidth(surface),
+			    IOSurfaceGetHeight(surface),
+			    (unsigned)IOSurfaceGetPixelFormat(surface));
+		}
+	}
+	if (picture != NULL) {
+		if (rebuilt) {
+			if (mondrian_layer_copies++ == 0) {
+				mondrian_probe_fmt("MONDRIAN LAYER[%d]: contents "
+				    "read back from a surface with no picture "
+				    "on the layer, rebuilt\n", getpid());
+			}
+		} else if (mondrian_layer_reads++ == 0) {
+			mondrian_probe_fmt("MONDRIAN LAYER[%d]: contents read "
+			    "back as the picture, surface kept for the "
+			    "renderer\n", getpid());
+		}
+		return (id)CFAutorelease(picture);
+	}
+	return real;
+}
+
+/*
+ * `*used` is the picture that was actually drawn (the relabelled copy when one
+ * was made) and `*coverage` how much of a 7x7 grid of the surface came out
+ * non-zero, so the ring says whether the bridge made a picture and not only
+ * whether it made a surface.
+ */
+static IOSurfaceRef
+mondrian_image_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 {
 	size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
 	size_t row = (width * 4 + 15) & ~(size_t)15;
 	CFMutableDictionaryRef props;
 	IOSurfaceRef surface;
-	CGColorSpaceRef space;
-	CGContextRef context;
+	CGImageRef drawable;
 	uint32_t seed = 0;
 	int values[5];
 	const char *keys[5] = { "IOSurfaceWidth", "IOSurfaceHeight",
@@ -17189,6 +17684,8 @@ mondrian_image_surface(CGImageRef image)
 	    "IOSurfacePixelFormat" };
 	unsigned i;
 
+	*used = image;
+	*coverage = 0;
 	if (width < 4 || height < 4 || row * height > 64u * 1024 * 1024) {
 		return NULL;
 	}
@@ -17214,25 +17711,40 @@ mondrian_image_surface(CGImageRef image)
 	}
 	surface = IOSurfaceCreate(props);
 	CFRelease(props);
-	if (surface == NULL || IOSurfaceLock(surface, 0, &seed) != 0) {
-		if (surface != NULL) {
-			CFRelease(surface);
-		}
+	if (surface == NULL) {
 		return NULL;
 	}
-	space = CGColorSpaceCreateDeviceRGB();
-	context = CGBitmapContextCreate(IOSurfaceGetBaseAddress(surface), width,
-	    height, 8, row, space,
-	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-	CGColorSpaceRelease(space);
-	if (context == NULL) {
-		IOSurfaceUnlock(surface, 0, &seed);
+	/*
+	 * A copied layer holds this surface without the box `-setContents:`
+	 * leaves on the original; the readback rebuilds a CGImage for a box-less
+	 * layer from the surface's own pixels (mondrian_surface_picture).
+	 */
+	if (IOSurfaceLock(surface, 0, &seed) != 0) {
 		CFRelease(surface);
 		return NULL;
 	}
-	CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height), image);
-	CGContextFlush(context);
-	CGContextRelease(context);
+	/*
+	 * The repaired label first, the picture as it arrived second: a picture
+	 * CoreGraphics cannot draw under the repaired label still gets its own
+	 * attempt instead of a surface nothing was drawn into.
+	 */
+	drawable = mondrian_image_drawable(image);
+	if (drawable != NULL) {
+		*used = drawable;
+		(void)mondrian_image_draw(surface, drawable);
+		*coverage = mondrian_surface_coverage(surface);
+	}
+	if (*coverage == 0 && drawable != NULL) {
+		*used = image;
+		(void)mondrian_image_draw(surface, image);
+		*coverage = mondrian_surface_coverage(surface);
+	} else if (drawable == NULL) {
+		(void)mondrian_image_draw(surface, image);
+		*coverage = mondrian_surface_coverage(surface);
+	}
+	if (drawable != NULL) {
+		CGImageRelease(drawable);
+	}
 	IOSurfaceUnlock(surface, 0, &seed);
 	return surface;
 }
@@ -17243,7 +17755,7 @@ mondrian_layer_contents(id self, SEL cmd, id contents)
 	IOSurfaceRef surface = NULL;
 
 	if (contents != NULL &&
-	    !mondrian_file_on("/private/var/vm/mondrian-layercsurf-off") &&
+	    !mondrian_layer_bridge_off() &&
 	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
 		CGImageRef image = (CGImageRef)contents;
 		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
@@ -17259,14 +17771,48 @@ mondrian_layer_contents(id self, SEL cmd, id contents)
 		 * pictures take a different road; the road is the same one.
 		 */
 		if (w >= 4 && h >= 4) {
-			surface = mondrian_image_surface(image);
+			surface = mondrian_image_cached(image);
 			if (surface != NULL) {
-				contents = (id)surface;
-				if (mondrian_layer_made++ < 8) {
+				if (mondrian_layer_hits++ < 4) {
 					mondrian_probe_fmt("MONDRIAN LAYER[%d]: "
-					    "%zux%zu as surface %u\n", getpid(), w,
-					    h, IOSurfaceGetID(surface));
+					    "%zux%zu as cached surface %u\n",
+					    getpid(), w, h,
+					    IOSurfaceGetID(surface));
 				}
+			} else {
+				CGImageRef used = image;
+				unsigned coverage = 0;
+
+				surface = mondrian_image_surface(image, &used,
+				    &coverage);
+				if (surface != NULL) {
+					if (IOSurfaceGetAllocSize(surface) <=
+					    MONDRIAN_LAYER_CACHE_MAX) {
+						mondrian_image_remember(image,
+						    surface);
+					}
+					if (mondrian_layer_made++ < 8) {
+						/*
+						 * `drew N/49` is the half that
+						 * was missing: a surface with
+						 * no pixels and a picture with
+						 * no surface drew the same.
+						 */
+						mondrian_probe_fmt("MONDRIAN "
+						    "LAYER[%d]: %zux%zu as surface "
+						    "%u bpr %zu drew %u/49%s%s\n",
+						    getpid(), w, h,
+						    IOSurfaceGetID(surface),
+						    IOSurfaceGetBytesPerRow(surface),
+						    coverage,
+						    used != image ? " relabelled" : "",
+						    coverage == 0 ? " empty" : "");
+					}
+				}
+			}
+			if (surface != NULL) {
+				mondrian_layer_side_set(self, surface, image);
+				contents = (id)surface;
 			}
 		}
 	}
@@ -17326,6 +17872,21 @@ mondrian_layer_probe_install(void)
 	 */
 	mondrian_layer_contents_orig = (void (*)(id, SEL, id))
 	    method_setImplementation(m, (IMP)mondrian_layer_contents);
+	/*
+	 * And the read side: UIKit asks a layer for its contents and expects the
+	 * picture (see mondrian_layer_contents_get). Installed in the same
+	 * guarded place so a second call cannot chain either hook into itself.
+	 */
+	{
+		Method get = class_getInstanceMethod(layer,
+		    sel_registerName("contents"));
+
+		if (get != NULL) {
+			mondrian_layer_contents_get_orig = (id (*)(id, SEL))
+			    method_setImplementation(get,
+			    (IMP)mondrian_layer_contents_get);
+		}
+	}
 	installed = 1;
 }
 
@@ -17381,11 +17942,63 @@ mondrian_app_probe(void)
 	}
 }
 
+/*
+ * The image list with each range, so a crash pc printed by the kernel in a
+ * later boot can be matched to the image that produced it. The shared cache is
+ * slid per boot, which is why the ranges have to come from the same boot as
+ * the crash.
+ */
+static void
+mondrian_dump_images(void)
+{
+	uint32_t count = _dyld_image_count();
+	uint32_t index;
+
+	for (index = 0; index < count; index++) {
+		const struct mach_header_64 *header =
+		    (const struct mach_header_64 *)_dyld_get_image_header(index);
+		const char *path = _dyld_get_image_name(index);
+		uint64_t text_vmaddr = 0;
+		uint64_t end = 0;
+		const struct load_command *command;
+		uint32_t at;
+
+		if (header == NULL || header->magic != MH_MAGIC_64) {
+			continue;
+		}
+		command = (const struct load_command *)(header + 1);
+		for (at = 0; at < header->ncmds; at++) {
+			if (command->cmd == LC_SEGMENT_64) {
+				const struct segment_command_64 *segment =
+				    (const struct segment_command_64 *)command;
+
+				if (strcmp(segment->segname, "__TEXT") == 0) {
+					text_vmaddr = segment->vmaddr;
+				}
+				if (segment->vmaddr + segment->vmsize > end) {
+					end = segment->vmaddr + segment->vmsize;
+				}
+			}
+			command = (const struct load_command *)
+			    ((uintptr_t)command + command->cmdsize);
+		}
+		if (text_vmaddr == 0) {
+			continue;
+		}
+		mondrian_probe_fmt("MONDRIAN MAP: %p-%p %s\n", header,
+		    (void *)(uintptr_t)header + (end - text_vmaddr),
+		    path != NULL ? path : "?");
+	}
+}
+
 __attribute__((constructor))
 static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (mondrian_file_on("/private/var/vm/bt-maps")) {
+		mondrian_dump_images();
+	}
 	mondrian_throw_original = (void (*)(id))mondrian_throw_interpose.replacee;
 	/*
 	 * ReportCrash faults inside libc++'s filesystem path code

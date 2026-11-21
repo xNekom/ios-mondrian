@@ -358,7 +358,10 @@ MONDRIAN = Board(
              # Bit 8 (0x100) is MobileSlideShow: the CGImage-to-surface bridge
              # is what makes Photos' Library tiles and viewer draw (measured
              # 2026-11-19), so it belongs to the default mask and not to a
-             # probe file. 6 | 0x100 = 262.
+             # probe file. Bit 10 (0x400) is every app in /Applications, which
+             # carries the same bridge and nothing else (0402): a CGImage does
+             # not cross to the window server on this port, so Settings' switch
+             # drew its track and no knob without it. 6 | 0x100 | 0x400 = 1286.
              # `mondriankeepawake=0` takes both idle-timer holds off for a boot;
              # the idle timer still never fires, so the holds are the default
              # (docs/MONDIAN_PORT.md). `mondrianautolock=N` writes the root's
@@ -371,7 +374,7 @@ MONDRIAN = Board(
              # minute. The sampler (`mondriansample=`) is a diagnostic and is
              # added per experiment, not carried here: with it the line is
              # 608 bytes and the kernel refuses every reader.
-             'mondrian_ui_hook=262 mondrian_gpu_hook=1 mondriankeepawake=1 '
+             'mondrian_ui_hook=1286 mondrian_gpu_hook=1 mondriankeepawake=1 '
              'mondrianunlock=1 '
              # bluetoothd only evaluates a serial transport when it has a local
              # Bluetooth address, and the address comes from the preference it
