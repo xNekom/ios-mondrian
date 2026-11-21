@@ -62,10 +62,14 @@ the order they were paid for:
   does not see the colour cache. `FLUSH_PER_OVERLAP` orders those primitives among themselves but
   not against the draws before the mode was on, so the first triangle of each such quad took
   whatever the tile held: pieces of other icons, a vibrant box black, the wallpaper in bands.
-  Flushing from the shim (`glflushdraws`, `glfbflush`) only moved the window and cost a submission
-  per frame; the fix belongs in the driver, and `tools/mesa/mondrian-darwin.patch` has it: a
+  Flushing from the shim (`glflushdraws`, `glfbflush`) only moved the window for that
+  framebuffer-fetch case and cost a submission per frame; its fix belongs in the driver, and
+  `tools/mesa/mondrian-darwin.patch` has it: a
   `FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE` barrier before the first draw that reads the
   framebuffer after one that did not (`fd6_draw.cc`, `prev_draw_read_fb` in `freedreno_batch.h`).
+  A different read — a draw sampling a texture written earlier in the same submission — is the
+  shim's: `flush_draws = 2` (the default) submits before it, which fixed the Control Center's
+  module backdrop (`docs/UI_PERFORMANCE.md`).
 - **The eight-times downsample that starts a backdrop's blur is not tinted by the layer that asked
   for it.** CoreAnimation's own four- and six-sample downsamples multiply the picture by nothing;
   the colour of the corners is the layer's opacity, which it applies where the layer is laid on

@@ -1116,13 +1116,17 @@ dump names the platters' shared capture: each `MTMaterialView` is an
 the sheet background is `...modulesBackground` and draws correctly. The place
 trace (`/private/var/vm/mondrian-gl-place`) shows what the platter samples: the
 module capture is a 218 x 267 target that CoreAnimation's own programs 3 and 46
-fill from the whole 1440 x 3200 screen, not from the platter's rectangle, so the
-block is a sheared, magnified piece of the pane. Clearing the group name is not
-the fix: it cleans most of the live sheet but a reopened one is corrupted again,
-and MaterialKit never calls `setGroupName:` after the first build, so the name is
-not the lever. The next probe is the capture texture and the texture-size
-uniform CoreAnimation's filters receive from the shim (`set_texture_size()` in
-`tools/gpu/eagl.c`), not the layer tree. Do not walk the raw layer tree from the
+fill from the whole 1440 x 3200 screen. The group name is not the cause: with a
+fresh SpringBoard, the first sheet over Settings > Bluetooth carries
+`ControlCenterModuleBackground.modules` on its module materials (11 layers) and
+the block is there, and `glgroup=0` leaves it there too. The cause is the
+submission order: a draw that samples a texture written earlier in the same
+submission reads the pixels from before the write, so the module backdrop
+captured the frame before it (the wallpaper where the pane should be) and the
+media module's next glyph was a blue blob. `glflushdraws=2` draws both correctly
+and is the default now (`flush_draws` in `tools/gpu/eagl.c`); the Control
+Center's frames stay at 12-17 ms. `glflushdraws=0` returns to the old behaviour
+for an A/B. Do not walk the raw layer tree from the
 Control Center pass: it runs on the main thread and a full `sublayers` walk there
 froze the sheet at its blurred background on a second open (measured the same
 day, main thread idle in `CFRunLoopRunSpecific` afterwards). The media module's
