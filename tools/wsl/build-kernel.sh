@@ -271,6 +271,14 @@ say "building $KERNEL_CONFIG $MACHINE on $XNU_TAG (log: $LOG)"
 		) || say \
 			"warning: the UI hook did not rebuild; the kernel keeps the old copy"
 	fi
+	# A GL library older than its source is the trap that cost a boot on
+	# 2026-11-21: the kernel embedded the 16:26 copy while the flush fix was in
+	# eagl.c, and the boot looked like the fix did nothing. Rebuild it here.
+	if [ ! -f out/gpu/mondrian-gl.dylib ] || [ tools/gpu/eagl.c -nt out/gpu/mondrian-gl.dylib ]; then
+		say "building the GL library (its source is newer)"
+		( source tools/wsl/env-ios.sh >/dev/null 2>&1 && bash tools/gpu/build.sh out/gpu ) ||
+			say "warning: the GL library did not rebuild; the kernel keeps the old copy"
+	fi
 	if [ -f out/gpu/mondrian-gl.dylib ] && [ -f out/gpu/mondrian-inject.dylib ]; then
 		probe=()
 		[ -f out/gpu/mondrian-probe.dylib ] &&
