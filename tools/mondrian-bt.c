@@ -915,6 +915,38 @@ bt_name_report(const uint8_t *pkt, size_t len)
 	}
 }
 
+/*
+ * Command Complete and Inquiry Result are read from the assembled packet, not
+ * from the byte-at-a-time state machine: the offsets there depend on how the
+ * header was counted, and that hid the Inquiry's status. A Command Complete is
+ * 04 0e <len> <num> <opcode lo> <opcode hi> <status>; an Inquiry Result is
+ * 04 2f <len> <num> <addr> <page scan> ... and carries the EIR name.
+ */
+static void
+bt_event_report(const uint8_t *pkt, size_t len)
+{
+	static unsigned results;
+
+	if (len >= 7 && pkt[1] == 0x0e) {
+		uint16_t opcode = (uint16_t)(pkt[4] | (pkt[5] << 8));
+
+		if (opcode == 0x0401 || opcode == 0x0402 ||
+		    opcode == 0x0405 || opcode == 0x0419) {
+			bt_power_append("hci cc %04x status %#x\n", opcode,
+			    pkt[6]);
+		}
+		return;
+	}
+	if (len >= 10 && pkt[1] == 0x2f) {
+		results++;
+		if (results <= 8) {
+			bt_power_append("inquiry result %u %02x:%02x:%02x:"
+			    "%02x:%02x:%02x\n", results, pkt[9], pkt[8],
+			    pkt[7], pkt[6], pkt[5], pkt[4]);
+		}
+	}
+}
+
 static void
 bt_name_feed(const uint8_t *buf, size_t len)
 {
@@ -945,7 +977,11 @@ bt_name_feed(const uint8_t *buf, size_t len)
 			name_pkt_state = name_pkt_need >= 4 ? 2 : 0;
 		} else if (name_pkt_state == 2 &&
 		    name_pkt_len >= name_pkt_need) {
-			bt_name_report(name_pkt, name_pkt_len);
+			if (name_pkt[1] == 0x3e) {
+				bt_name_report(name_pkt, name_pkt_len);
+			} else {
+				bt_event_report(name_pkt, name_pkt_len);
+			}
 			name_pkt_state = 0;
 		}
 	}
@@ -1197,18 +1233,35 @@ log_device_message(const char *what, xpc_object_t message)
 	static unsigned logged;
 	char *description;
 
-	if (message == NULL || logged >= 12) {
+	if (message == NULL || logged >= 40) {
 		return;
 	}
 	description = xpc_copy_description(message);
 	if (description == NULL) {
 		return;
 	}
+	/*
+	 * The startup burst is a dozen empty paired-device arrays; they are
+	 * not what draws a discovered row. Keep only a payload that names or
+	 * addresses a device, and let a scan event through even when its keys
+	 * are none of the ones guessed here (an address is enough).
+	 */
+	if (strstr(description, "kCBMsgArgDeviceArray") != NULL &&
+	    strstr(description, "count = 0") != NULL) {
+		free(description);
+		return;
+	}
 	if (strstr(description, "kCBMsgArgDevice") != NULL ||
 	    strstr(description, "kCBMsgArgName") != NULL ||
+	    strstr(description, "kCBMsgArgAddress") != NULL ||
+	    strstr(description, "kCBMsgArgAdv") != NULL ||
+	    strstr(description, "kCBMsgArgScan") != NULL ||
+	    strstr(description, "kCBMsgArgRSSI") != NULL ||
 	    strstr(description, "DeviceFound") != NULL ||
 	    strstr(description, "deviceFound") != NULL ||
-	    strstr(description, "kCBMsgArgUUID") != NULL) {
+	    strstr(description, "kCBMsgArgUUID") != NULL ||
+	    strstr(description, "b0:ac:82") != NULL ||
+	    strstr(description, "B0:AC:82") != NULL) {
 		logged++;
 		bt_power_append("xpc.dev[%d] %s %.900s\n", getpid(), what,
 		    description);
