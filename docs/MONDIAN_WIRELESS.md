@@ -911,6 +911,13 @@ the controller's scan responses carry 0x08. A classic-only device has no LE
 report to carry the name; `B0:AC` stays on its address until the daemon uses
 the EIR.
 
+Pairing has never been exercised. Measured 2026-11-21: a tap on the discovered
+row of a real peer (`C8:A6:EF:12:00:9F`, a TV) reaches SpringBoard
+(`MONDRIAN HID: touch 0 down at 2500,4440`) and produces no HCI connection
+attempt — no `0x0401`, no pairing dialog, and the pane does not change — so the
+daemon does not act on the row as it stands. The row's action is part of what
+the daemon's device entry needs, together with the name.
+
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
 `mondrian-bt-exit.log` instead, truncated on every exit so it always holds the
