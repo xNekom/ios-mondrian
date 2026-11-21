@@ -13,6 +13,7 @@ import re
 import sys
 
 pattern = re.compile(r'MONDRIAN BTCTL: (?:rx \d+ 04 3e|le adv|le scan rsp|le meta) (.*)')
+inquiry = re.compile(r'MONDRIAN BTCTL: inquiry eir \d+ (.*)')
 
 
 def ad_name(data):
@@ -42,6 +43,20 @@ def report(payload, kind):
 
 
 for line in open(sys.argv[1], 'r', errors='replace'):
+    match = inquiry.search(line)
+    if match:
+        try:
+            buf = [int(b, 16) for b in match.group(1).split()]
+        except ValueError:
+            continue
+        if len(buf) >= 18 and buf[0] == 0x04 and buf[1] == 0x2f:
+            buf = buf[3:]
+        if len(buf) < 16:
+            continue
+        addr = ':'.join('%02x' % b for b in reversed(buf[1:7]))
+        name = ad_name(buf[15:])
+        print('classic %s %s' % (addr, name if name else '(no name)'))
+        continue
     match = pattern.search(line)
     if not match:
         continue

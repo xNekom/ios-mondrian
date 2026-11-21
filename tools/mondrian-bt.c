@@ -1011,6 +1011,31 @@ log_description(const char *what, xpc_object_t message)
 	free(description);
 }
 
+/*
+ * The reply to a name request is what the client draws. The generic
+ * description budget is spent during the init burst, so the replies are
+ * logged here on their own, filtered to the dictionaries that carry a name.
+ */
+static void
+log_name_reply(xpc_object_t message)
+{
+	static unsigned count;
+	char *description;
+
+	if (message == NULL || count >= 20) {
+		return;
+	}
+	description = xpc_copy_description(message);
+	if (description == NULL) {
+		return;
+	}
+	if (strstr(description, "ame") != NULL) {
+		count++;
+		bt_power_append("xpc.name[%d] %.900s\n", getpid(), description);
+	}
+	free(description);
+}
+
 static void
 my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 {
@@ -1023,6 +1048,7 @@ my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 	log_connection("oneway", connection);
 	log_message("oneway", message, "kMsgId");
 	log_description("out", message);
+	log_name_reply(message);
 	if (original != NULL) {
 		original(connection, message);
 	} else {
@@ -2003,15 +2029,20 @@ object_text(id object, const char *selector)
 static void
 log_device_found(const char *what, id device)
 {
-	const char *name, *address;
+	const char *name, *address, *cls = "?";
+	Class c;
 
-	if (device == nil || devices_logged >= 8) {
+	if (device == nil || devices_logged >= 24) {
 		return;
 	}
 	devices_logged++;
+	c = object_getClass(device);
+	if (c != Nil && class_getName(c) != NULL) {
+		cls = class_getName(c);
+	}
 	name = object_text(device, "name");
 	address = object_text(device, "addressString");
-	bt_power_append("%s name \"%s\" addr \"%s\"\n", what,
+	bt_power_append("%s %s name \"%s\" addr \"%s\"\n", what, cls,
 	    name != NULL ? name : "(nil)", address != NULL ? address : "(nil)");
 }
 
