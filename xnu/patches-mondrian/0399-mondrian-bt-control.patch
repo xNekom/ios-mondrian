@@ -180,10 +180,10 @@ index 3c4165b..aa4607b 100755
   * ring is not reachable from its sandbox), so the driver prints the first
 diff --git a/bsd/dev/mondrian_btctl.c b/bsd/dev/mondrian_btctl.c
 new file mode 100644
-index 0000000..9fe39d4
+index 0000000..7ee0f6a
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,1350 @@
+@@ -0,0 +1,1359 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -545,6 +545,14 @@ index 0000000..9fe39d4
 +		out[4] = 0x00;
 +		out[5] = data[10];
 +		out[6] = 0x01;
++		/*
++		 * The daemon uses both kinds: the background scan asks for passive,
++		 * the Settings pane for active. The type is kept as asked; the log
++		 * is what tells the two apart in a ring (measured 2026-11-21: the
++		 * pane's scan is type 1 and its scan responses carry the names).
++		 */
++		printf("MONDRIAN BTCTL: scan params type %u own %u filter %u\n",
++		    data[4], data[9], data[10]);
 +		out[7] = data[4];
 +		out[8] = data[5];
 +		out[9] = data[6];
@@ -1206,7 +1214,7 @@ index 0000000..9fe39d4
 +    size_t cap)
 +{
 +	const uint8_t *p = pkt + 5;
-+	size_t num, i, used = 4;
++	size_t num, i, used = 5;
 +
 +	if (total < 6) {
 +		return 0;
@@ -1214,7 +1222,8 @@ index 0000000..9fe39d4
 +	num = pkt[4];
 +	out[0] = 0x04;
 +	out[1] = 0x3e;
-+	out[3] = pkt[4];
++	out[3] = 0x02;
++	out[4] = pkt[4];
 +	for (i = 0; i < num; i++) {
 +		size_t dlen, adlen = 0;
 +		uint8_t ad[31];
