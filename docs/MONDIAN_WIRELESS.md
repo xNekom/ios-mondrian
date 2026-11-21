@@ -986,12 +986,16 @@ climbed 1646 -> 1650 -> 1658 within a minute); the object only exists through
 `initWithXPCObject:error:` from the app's activation message. The fix has to
 produce that activation, not synthesize the agent.
 
-A clean test (SpringBoard restarted, no "Pairing Unsuccessful" dialog, one tap
-on the row) still shows no client message before the connect: with the
-Get Controller Info and Update Identities polls filtered out of the incoming
-log, the last packets before `hci req 0405` are the scan's Inquiry Result and
-the daemon's own device events. The connect follows discovery, so the
-pairing request does not come from the tap. The phone shows no passkey dialog and the PC shows no
+A clean test (SpringBoard restarted, no "Pairing Unsuccessful" dialog) shows
+the connect is tap-driven: with the pane open and the PC in the list, no
+`hci req 0405` appears until the row is tapped, and then it follows within
+seconds. The ObjC controller is not the path: both
+`connectDevice:connectionFlags:serviceFlags:error:` and
+`connectWithCBConnection:completionHandler:` are replaced with logging
+implementations and neither is called for that connect
+(`ctl.hook: connectDevice: B40@0:8@16I24I28^@32`,
+`ctl.hook: connectWithCBConnection: v32@0:8@16@?24`), so the request goes
+through the BTStack object below the controller. The phone shows no passkey dialog and the PC shows no
 prompt either; after the third notification the controller disconnects with
 reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
 phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
