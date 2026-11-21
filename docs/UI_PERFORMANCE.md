@@ -664,31 +664,35 @@ boot each, so the three columns differ only in what changed:
   a RAM boot is the fallback when the panel does not change; a hook change is
   also testable by rebuilding only the app bridge, which is read when an app
   execs (kill the app and tap its icon).
-- **The keyboard is reachable, and its first presentation is the clipped one.**
-  Measured 2026-11-21: the Search pill under the dock opens Spotlight and puts the
-  keyboard on the glass, and a tap on `q` types `q`, so the hit areas follow the
-  glyphs -- the injector is enough for this field. The keys of the first
-  presentation sit about 33 pt right: the ten-key row spans x 37.3..517.3 pt on a
-  480 pt screen, so `p`, delete and `search` are cut at the right edge. Any later
-  layout pass corrects it in place (a tap in the `123` row centres the same plane
-  at x 4.7 pt), so the keyboard keeps a stale layout, not a wrong size. The host
-  is not the source: SpringBoard's `UIKeyboardWillChangeFrameNotification`
-  reports `0,765.7 480x301`, the keyboard scene layer is 480x1066.7 at 0,0 and
-  the safe area is `59,0,34,0`. The offset fits a 512 pt scene whose 480 pt plane
-  keeps its 3 pt margin and lands at 35 (expected, not measured). The plane is
-  laid out in the **Spotlight** process, not in SpringBoard and not in kbd:
-  SpringBoard registers the whole keyboard class family (`UIKeyboardLayoutStar`,
-  `UIKeyboardLayout`, `TUIKeyplaneView`, `UIKBKeyplaneView`) and instantiates
-  none of it for the presented keyboard, kbd has no layout class at all, and the
-  keyboard's surfaces are `MONDRIAN SURF: Spotlight ... 1440x729`. `0403` gives
-  the UI hook to kbd and Spotlight behind bit 11, so a boot with
-  `EXTRA_ARGS='mondrian_ui_hook=3334'` runs `MONDRIAN KL:` in those processes:
-  it lists the layout classes each one registers and prints the frame, superview
-  chain, window and screen of every `layoutSubviews` pass. Rewriting
+- **The keyboard is full width and its first presentation is the one that was
+  clipped.** Measured 2026-11-21: the Search pill under the dock opens Spotlight
+  and puts the keyboard on the glass; before the fix the ten-key row sat at
+  x 37.3..517.3 pt on a 480 pt screen, so `p`, delete and `search` were cut at
+  the right edge. The cause is UIKit's phone keyboard width, not the host:
+  SpringBoard's `UIKeyboardWillChangeFrameNotification` reports
+  `0,765.7 480x301`, the keyboard scene layer is 480x1066.7 at 0,0 and the safe
+  area is `59,0,34,0`, while in the Spotlight process the chain is
+  `UIInputSetHostView 480 -> _UIKBCompatInputView 480 -> UIKeyboardAutomatic
+  414 at x 33 -> UIKeyboardImpl 480 -> UIKeyboardLayoutStar 480`. 414 pt is the
+  widest iPhone keyboard, and the automatic is centred in the 480 pt window. The
+  plane is laid out in **Spotlight**, not in SpringBoard and not in kbd:
+  SpringBoard registers the whole keyboard class family
+  (`UIKeyboardLayoutStar`, `UIKeyboardLayout`, `TUIKeyplaneView`,
+  `UIKBKeyplaneView`) and instantiates none of it, and kbd has no layout class
+  at all. `-[UIKeyboardAutomatic setFrame:]` and `setBounds:` clamp back to 414,
+  so the hook replaces `setFrame:` and, when the incoming frame is narrower than
+  the window, writes bounds 480 wide and centre 240 through UIView's own
+  setters: the automatic goes to x 0 and the impl stops shifting. It runs twice
+  on the first presentation and not again (measured: the counter stayed at 2
+  for ten seconds and across a second presentation, and a tap on `v` typed
+  `v`). Bit 11 (`0x800`, kbd and Spotlight) is part of the default mask for
+  this reason, so a normal boot carries the fix.
+- **The layout probe is the diagnostic on top.** With bit 11 set, `MONDRIAN KL:`
+  lists the layout classes a process registers and prints the frame, superview
+  chain, window and screen of each `layoutSubviews` pass; rewriting
   `/private/var/vm/mondrian-kbd` still dumps the SpringBoard side (screen,
-  windows, keyboard chain with safe areas, layer host) and was where the host
-  numbers above came from; kbd's sandbox cannot read that file, which is why the
-  mask, not a file, gates the layout probe.
+  windows, keyboard chain with safe areas, layer host). kbd's sandbox cannot
+  read that file, which is why the boot mask, not a file, gates the probe.
 - **Aim with points, not pixels.** `tap`/`swipe` take panel pixels (1440x3200) and
   `screen` returns half of that, so multiply a runtime frame by three: the hook
   prints `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points and
