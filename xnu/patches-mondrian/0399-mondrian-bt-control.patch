@@ -180,10 +180,10 @@ index 3c4165b..aa4607b 100755
   * ring is not reachable from its sandbox), so the driver prints the first
 diff --git a/bsd/dev/mondrian_btctl.c b/bsd/dev/mondrian_btctl.c
 new file mode 100644
-index 0000000..7ee0f6a
+index 0000000..c86e73d
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,1359 @@
+@@ -0,0 +1,1381 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -429,6 +429,34 @@ index 0000000..7ee0f6a
 +	return 0;
 +}
 +
++/*
++ * One Inquiry Result response, fixed fields only: number at 3, then 13
++ * bytes (BD_ADDR, page-scan repetition, reserved, class of device, clock
++ * offset) and the EIR. The controller's plen is always 0xff and the bytes
++ * between offset 17 and the real EIR are not cleared, so the name structure
++ * is found by walking the possible starts rather than read at a fixed one.
++ */
++static int
++mondrian_btctl_inquiry_name(const uint8_t *pkt, size_t total, size_t *at)
++{
++	size_t pos;
++
++	if (total < 18 || pkt[3] != 0x01) {
++		return 0;
++	}
++	for (pos = 17; pos + 2 <= total && pos <= 72; pos++) {
++		uint8_t elen = pkt[pos];
++
++		if (elen >= 2 && elen <= 30 &&
++		    (pkt[pos + 1] == 0x08 || pkt[pos + 1] == 0x09) &&
++		    pos + 1 + elen <= total) {
++			*at = pos;
++			return 1;
++		}
++	}
++	return 0;
++}
++
 +static void
 +mondrian_btctl_count_event(const uint8_t *buf, size_t len)
 +{
@@ -444,25 +472,19 @@ index 0000000..7ee0f6a
 +			    (int)MIN(len, (size_t)32));
 +		}
 +		/*
-+		 * One response: 14 fixed bytes after the address and then the
-+		 * EIR. Keep the name for the LE report of the same address.
++		 * The fixed response is 13 bytes after the number (address,
++		 * page-scan mode, reserved, class and clock), so a standard EIR
++		 * starts at 17. The WCN7850 firmware instead sends plen 0xff and
++		 * leaves uninitialised bytes before the EIR (measured 2026-11-21:
++		 * e4 c0 repeated for the PC, one junk byte before DIGI R2A), so
++		 * the name structure is searched for instead of assumed.
 +		 */
-+		if (len > 18 && buf[3] == 0x01) {
-+			size_t pos = 18;
++		{
++			size_t at;
 +
-+			while (pos + 1 < len) {
-+				size_t elen = buf[pos];
-+
-+				if (elen == 0 || pos + 1 + elen > len) {
-+					break;
-+				}
-+				if ((buf[pos + 1] == 0x08 ||
-+				    buf[pos + 1] == 0x09) && elen > 1) {
-+					mondrian_btctl_note_name(buf + 4,
-+					    buf + pos + 2, elen - 1);
-+					break;
-+				}
-+				pos += 1 + elen;
++			if (mondrian_btctl_inquiry_name(buf, len, &at)) {
++				mondrian_btctl_note_name(buf + 4, buf + at + 2,
++				    buf[at] - 1);
 +			}
 +		}
 +		return;
