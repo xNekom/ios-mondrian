@@ -730,12 +730,26 @@ my_read(int fd, void *buf, size_t len)
 
 			if (h4_state == 2) {
 				if (h4_type == 0x04 && h4_hdr[0] == 0x0e) {
+					static uint16_t complete_opcode;
+
 					if (h4_pos == 1) {
 						h4_supported_mask = byte == 0x02;
+						complete_opcode = byte;
 					} else if (h4_pos == 2) {
+						complete_opcode |= (uint16_t)
+						    (byte << 8);
 						if (byte != 0x10) {
 							h4_supported_mask = 0;
 						}
+					} else if (h4_pos == 3 &&
+					    (complete_opcode == 0x0401 ||
+					    complete_opcode == 0x0402 ||
+					    complete_opcode == 0x0405 ||
+					    complete_opcode == 0x0409 ||
+					    complete_opcode == 0x0419)) {
+						bt_power_append("hci complete"
+						    " %04x status %#x\n",
+						    complete_opcode, byte);
 					} else if (h4_supported_mask && h4_pos == 22) {
 						byte |= 0x08;
 					}
@@ -1022,6 +1036,16 @@ my_write(int fd, const void *buf, size_t len)
 			bt_log("hci 0xfd1b: emulated factory cal\n");
 			inject_event(complete, sizeof(complete));
 			return (ssize_t)len;
+		}
+		if (len >= 4 && p[0] == 0x01) {
+			uint16_t opcode = (uint16_t)(p[1] | (p[2] << 8));
+
+			if (opcode == 0x0401 || opcode == 0x0402 ||
+			    opcode == 0x0405 || opcode == 0x0409 ||
+			    opcode == 0x0419) {
+				bt_power_append("hci req %04x len %zu\n", opcode,
+				    len);
+			}
 		}
 		log_hci_write("hci write", buf, len);
 	}
@@ -2159,6 +2183,10 @@ static void (*original_classic_found)(id, SEL, id);
 static void (*original_ble_found)(id, SEL, id);
 static void (*original_monitor_found)(id, SEL, id);
 static void (*original_whb_found)(id, SEL, id);
+static void (*original_classic_start)(id, SEL);
+static void (*original_ble_start)(id, SEL);
+static BOOL (*original_classic_should)(id, SEL);
+static BOOL (*original_ble_should)(id, SEL);
 static unsigned devices_logged;
 
 static BOOL
@@ -2252,6 +2280,56 @@ my_whb_found(id self, SEL _cmd, id device)
 	}
 }
 
+/*
+ * Which scanner the pane starts is the next question: classic discovery is an
+ * HCI Inquiry (0x0401), and 0x0401 was being read as the pairing command in
+ * the documents. Create Connection is 0x0405. These four selectors say
+ * whether the daemon starts classic, LE, both or neither.
+ */
+static void
+my_classic_start(id self, SEL _cmd)
+{
+	bt_power_append("scan classic ensureStarted\n");
+	if (original_classic_start != NULL) {
+		original_classic_start(self, _cmd);
+	}
+}
+
+static void
+my_ble_start(id self, SEL _cmd)
+{
+	bt_power_append("scan ble ensureStarted\n");
+	if (original_ble_start != NULL) {
+		original_ble_start(self, _cmd);
+	}
+}
+
+static BOOL
+my_classic_should(id self, SEL _cmd)
+{
+	BOOL result = original_classic_should != NULL ?
+	    original_classic_should(self, _cmd) : NO;
+
+	/*
+	 * The pane opens with both stack scanners off (shouldRun 0), so the
+	 * daemon never sends the Inquiry that would give it the classic
+	 * devices the pane used to list. Force classic discovery on and log
+	 * what the daemon asked for.
+	 */
+	bt_power_append("scan classic shouldRun %d -> 1\n", (int)result);
+	return YES;
+}
+
+static BOOL
+my_ble_should(id self, SEL _cmd)
+{
+	BOOL result = original_ble_should != NULL ?
+	    original_ble_should(self, _cmd) : NO;
+
+	bt_power_append("scan ble shouldRun %d\n", (int)result);
+	return result;
+}
+
 static void
 hook_device_found(void)
 {
@@ -2291,6 +2369,26 @@ hook_device_found(void)
 		    method_setImplementation(method, (IMP)my_whb_found);
 		bt_log("dev.hook: _whbDiscoveryDeviceFound: replaced\n");
 	}
+	method = own_method(cls, "_stackClassicScannerEnsureStarted");
+	if (method != NULL) {
+		original_classic_start = (void (*)(id, SEL))
+		    method_setImplementation(method, (IMP)my_classic_start);
+	}
+	method = own_method(cls, "_stackBLEScannerEnsureStarted");
+	if (method != NULL) {
+		original_ble_start = (void (*)(id, SEL))
+		    method_setImplementation(method, (IMP)my_ble_start);
+	}
+	method = own_method(cls, "_stackClassicScannerShouldRun");
+	if (method != NULL) {
+		original_classic_should = (BOOL (*)(id, SEL))
+		    method_setImplementation(method, (IMP)my_classic_should);
+	}
+	method = own_method(cls, "_stackBLEScannerShouldRun");
+	if (method != NULL) {
+		original_ble_should = (BOOL (*)(id, SEL))
+		    method_setImplementation(method, (IMP)my_ble_should);
+	}
 	{
 		unsigned int count = 0, i;
 		Method *list = class_copyMethodList(cls, &count);
@@ -2318,7 +2416,9 @@ hook_device_found(void)
 			    strstr(name, "uuid") == NULL) {
 				continue;
 			}
-			bt_power_append("dev.sel %s\n", name);
+			bt_power_append("dev.sel %s %s\n", name,
+			    method_getTypeEncoding(list[i]) != NULL ?
+			    method_getTypeEncoding(list[i]) : "?");
 		}
 		free(list);
 	}
