@@ -3425,6 +3425,72 @@ hook_xpc_connection(void)
 	}
 }
 
+/*
+ * The pane's requests may not arrive on the class the hooks replace. Print
+ * every daemon/XPC class the process has so a second connection class (or a
+ * subclass) is visible.
+ */
+static void
+dump_xpc_classes(void)
+{
+	Class bases[4];
+	int count = objc_getClassList(NULL, 0);
+	Class *classes;
+	int i, logged = 0;
+
+	/*
+	 * A class in the daemon image is not in objc_getClassList until it is
+	 * realized: objc_getClass is what realizes it, which is why the first
+	 * dump showed only CoreBluetooth classes.
+	 */
+	bases[0] = objc_getClass("CBDaemonServer");
+	bases[1] = objc_getClass("CBDaemonXPCConnection");
+	bases[2] = objc_getClass("CBStackControllerBTStack");
+	bases[3] = objc_getClass("CBConnection");
+	if (count <= 0) {
+		return;
+	}
+	classes = malloc(sizeof(Class) * (size_t)count);
+	if (classes == NULL) {
+		return;
+	}
+	count = objc_getClassList(classes, count);
+	for (i = 0; i < count && logged < 80; i++) {
+		const char *name = class_getName(classes[i]);
+
+		if (name != NULL && (strstr(name, "CBDaemon") != NULL ||
+		    strncmp(name, "CBXPC", 5) == 0 ||
+		    strncmp(name, "CBConnection", 12) == 0 ||
+		    strncmp(name, "CBStackController", 17) == 0)) {
+			bt_log("cls: %s\n", name);
+			logged++;
+		}
+		{
+			Class s = class_getSuperclass(classes[i]);
+
+			while (s != Nil) {
+				int b;
+
+				for (b = 0; b < 4; b++) {
+					if (s == bases[b] && logged < 100) {
+						bt_log("cls.sub: %s < %s\n",
+						    name != NULL ? name : "?",
+						    class_getName(s));
+						logged++;
+						s = Nil;
+						break;
+					}
+				}
+				if (s == Nil) {
+					break;
+				}
+				s = class_getSuperclass(s);
+			}
+		}
+	}
+	free(classes);
+}
+
 static void
 hook_device_found(void)
 {
@@ -3745,6 +3811,7 @@ runtime_dump(void *context)
 		}
 	}
 	bt_log("rt: server %p\n", daemon_server);
+	dump_xpc_classes();
 	sample_main_thread();
 	if (daemon_server == nil && retries++ < 15) {
 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 2000000000LL),
