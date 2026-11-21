@@ -2778,86 +2778,144 @@ qca_stream(struct qca_reader *r, const char *name, const uint8_t *blob,
 static void
 qca_probe_scan(struct qca_reader *r)
 {
-	static const uint8_t params[] = {
-		0x00, 0x00, 0x01, 0x01, 0x30, 0x00, 0x30, 0x00
+	static const uint8_t params_rand[] = {
+		0x01, 0x00, 0x01, 0x01, 0x40, 0x00, 0x30, 0x00
 	};
+	static const uint8_t params_pub[] = {
+		0x00, 0x00, 0x01, 0x01, 0x40, 0x00, 0x30, 0x00
+	};
+	static const uint8_t enable_dup[] = { 0x01, 0x01, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t enable[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t disable[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	int status;
-	int reports = 0;
-	int waited;
 
-	status = qca_command(r, 0x2041, params, sizeof(params), 3000, NULL, 0,
+	(void) qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
 	    NULL);
-	bt_power_append("ext: 0x2041 params status %d\n", status);
-	status = qca_command(r, 0x2042, enable, sizeof(enable), 3000, NULL, 0,
+	status = qca_command(r, 0x2041, params_rand, sizeof(params_rand),
+	    3000, NULL, 0, NULL);
+	bt_power_append("ext: params own=1 status %d\n", status);
+	status = qca_command(r, 0x2042, enable_dup, sizeof(enable_dup),
+	    3000, NULL, 0, NULL);
+	bt_power_append("ext: enable own=1 dup=1 status %d\n", status);
+	(void) qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
 	    NULL);
-	bt_power_append("ext: 0x2042 enable status %d\n", status);
+
+	status = qca_command(r, 0x2041, params_pub, sizeof(params_pub),
+	    3000, NULL, 0, NULL);
+	bt_power_append("ext: params own=0 status %d\n", status);
+	status = qca_command(r, 0x2042, enable_dup, sizeof(enable_dup),
+	    3000, NULL, 0, NULL);
+	bt_power_append("ext: enable own=0 dup=1 status %d\n", status);
 	if (status == 0) {
-		for (waited = 0; waited < 3000 && reports < 4; waited += 20) {
+		int reports = 0;
+		int waited;
+
+		for (waited = 0; waited < 12000 && reports < 6; waited += 20) {
 			size_t total;
 			uint8_t *p;
 			char name[40];
-			size_t n;
+			size_t at, dlen, n;
+			unsigned sub;
 
 			if (r->len < 3) {
-				if (qca_read_more(r, 20) <= 0) {
+				if (qca_read_more(r, 20) < 0) {
 					break;
 				}
 				continue;
 			}
-			if (r->buf[0] == 0x04 && r->buf[1] == 0x3e &&
-			    r->buf[2] >= 2 && r->buf[3] == 0x0d) {
-				total = 3 + (size_t)r->buf[2];
-				if (r->len < total) {
-					if (qca_read_more(r, 20) <= 0) {
-						break;
-					}
-					continue;
+			if (r->buf[0] != 0x04 || r->buf[1] != 0x3e ||
+			    r->buf[2] < 2) {
+				qca_drop(r, 1);
+				continue;
+			}
+			total = 3 + (size_t)r->buf[2];
+			if (r->len < total) {
+				if (qca_read_more(r, 20) < 0) {
+					break;
 				}
-				reports++;
-				p = r->buf + 4;   /* num, event type, address... */
-				name[0] = '\0';
-				if (p[0] >= 1 && total >= 4 + 26) {
-					const uint8_t *data = p + 25;
-					size_t dlen = p[24];
-					size_t at = 0;
+				continue;
+			}
+			sub = r->buf[3];
+			p = r->buf + 4;
+			name[0] = '\0';
+			if (sub == 0x02 && total >= 3 + 12) {
+				uint8_t type = p[1];
 
-					while (at + 1 < dlen) {
-						size_t len = data[at];
-						uint8_t type;
+				dlen = p[9];
+				at = 10;
+				n = 0;
+				if (at + dlen <= total - 3) {
+					size_t k = 0;
 
-						if (len == 0 || at + 1 + len > dlen) {
+					while (k + 1 < dlen) {
+						size_t l = p[at + k];
+						uint8_t t;
+
+						if (l == 0 || k + 1 + l > dlen) {
 							break;
 						}
-						type = data[at + 1];
-						if ((type == 0x08 || type == 0x09) &&
-						    len > 1) {
-							n = len - 1;
+						t = p[at + k + 1];
+						if ((t == 0x08 || t == 0x09) && l > 1) {
+							n = l - 1;
 							if (n > sizeof(name) - 1) {
 								n = sizeof(name) - 1;
 							}
-							memcpy(name, data + at + 2, n);
+							memcpy(name, p + at + k + 2, n);
 							name[n] = '\0';
 							break;
 						}
-						at += 1 + len;
+						k += 1 + l;
 					}
-					bt_power_append(
-					    "ext: report %02x:%02x:%02x:%02x:%02x:%02x name \"%s\"\n",
-					    p[9], p[8], p[7], p[6], p[5], p[4],
-					    name);
 				}
-				qca_drop(r, total);
-			} else {
-				/* not an extended report: drop one byte and resync */
-				qca_drop(r, 1);
+				bt_power_append("ext: adv %02x:%02x:%02x:%02x:%02x:%02x "
+				    "type 0x%02x len %u name \"%s\"\n",
+				    p[8], p[7], p[6], p[5], p[4], p[3], type,
+				    (unsigned)dlen, name);
+				reports++;
+			} else if (sub == 0x0d && total >= 5 + 24) {
+				p = r->buf + 5;
+				dlen = p[23];
+				at = 24;
+				n = 0;
+				if (at + dlen <= (size_t)r->buf[2] - 2) {
+					size_t k = 0;
+
+					while (k + 1 < dlen) {
+						size_t l = p[at + k];
+						uint8_t t;
+
+						if (l == 0 || k + 1 + l > dlen) {
+							break;
+						}
+						t = p[at + k + 1];
+						if ((t == 0x08 || t == 0x09) && l > 1) {
+							n = l - 1;
+							if (n > sizeof(name) - 1) {
+								n = sizeof(name) - 1;
+							}
+							memcpy(name, p + at + k + 2, n);
+							name[n] = '\0';
+							break;
+						}
+						k += 1 + l;
+					}
+				}
+				bt_power_append("ext: adv %02x:%02x:%02x:%02x:%02x:%02x "
+				    "type 0x%04x len %u name \"%s\"\n",
+				    p[8], p[7], p[6], p[5], p[4], p[3],
+				    (unsigned)(p[0] | (p[1] << 8)), (unsigned)dlen,
+				    name);
+				reports++;
 			}
+			qca_drop(r, total);
 		}
+		bt_power_append("ext: %d reports decoded\n", reports);
 	}
-	status = qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
+	status = qca_command(r, 0x2042, enable, sizeof(enable), 3000, NULL, 0,
 	    NULL);
-	bt_power_append("ext: 0x2042 disable status %d\n", status);
+	bt_power_append("ext: enable own=0 dup=0 status %d\n", status);
+	(void) qca_command(r, 0x2042, disable, sizeof(disable), 3000, NULL, 0,
+	    NULL);
 }
 
 static void

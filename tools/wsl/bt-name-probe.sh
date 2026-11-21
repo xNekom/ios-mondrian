@@ -38,7 +38,7 @@ echo "== connection summary"
 grep -a 'BTCTL: disconnected' out/bt-name-dump.txt | tail -2
 grep -a 'BTCTL: scan le meta' out/bt-name-dump.txt | tail -2
 echo "== first reports"
-grep -a 'BTCTL: name request\|BTCTL: inquiry eir\|BTCTL: le adv\|BTCTL: le scan rsp' out/bt-name-dump.txt | tail -8
+grep -a 'BTCTL: name request\|BTCTL: inquiry eir\|BTCTL: le adv\|BTCTL: le scan rsp\|BTCTL: ext report\|BTCTL: ext scan' out/bt-name-dump.txt | tail -12
 echo "== names decoded"
 bash tools/wsl/bt-le-names.sh out/bt-name-dump.txt | tail -12
 echo "== pane: out/bt-name-pane.png out/bt-name-pane-late.png"
