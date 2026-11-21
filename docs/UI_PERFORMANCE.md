@@ -432,6 +432,15 @@ boot each, so the three columns differ only in what changed:
   `sig 6`, now in an uncaught C++ exception (the trace ends in `libc++abi`
   `terminate`); a boot without `mondrian-probe` shows the same crash at the same
   pc, so the hook is not the cause.
+- **A TCC preflight in the hook's constructor can hang a daemon and the whole
+  UI.** Measured 2026-11-21: `iconservicesagent`'s constructor sat in the real
+  `TCCAccessPreflight` (the status probe's `mondrian_tcc_ask`) -> synchronous
+  XPC to `tccd`, which never answered for that process. The daemon never
+  reached its own main, `lsd`'s only worker waited forever on the IconServices
+  call, and SpringBoard's main thread waited on the `_LSDatabase` lock -- the
+  panel never drew. Killing `tccd` does not clear it (the TCC client retries
+  the synchronous call); the probe is now behind
+  `/private/var/vm/mondrian-tccs`, so no boot pays for it.
 - **A hook change is only in the kernel when the kernel build rebuilds it.**
   `tools/wsl/build-kernel.sh` embeds `out/gpu/mondrian-ui-hook.dylib` when the
   file exists and never rebuilt it from `tools/mondrian-ui-hook.m`, so a kernel
@@ -703,6 +712,46 @@ boot each, so the three columns differ only in what changed:
   to `/private/var/vm/mondrian-open` and the hook in SpringBoard calls
   `-[LSApplicationWorkspace openApplicationWithBundleID:]`, which answers 1 only
   while the device is unlocked, and every rewrite of the file is a new request.
+- **A marker left by an earlier boot is a request at every start.** Measured
+  2026-11-21: `/private/var/vm/mondrian-open` held `com.apple.Preferences`, so
+  every SpringBoard start called `-[LSApplicationWorkspace
+  openApplicationWithBundleID:]`; one thread sat in that synchronous
+  LaunchServices call while the main thread waited on the same `_LSDatabase`
+  lock. The thread now primes from the file at start and acts only on a later
+  change, so a request must differ from the value the file already held.
+  Deleting a stale marker does not clear that wait (measured: the main thread
+  stayed in `__ulock_wait`), so the open is a defect of its own, not the whole
+  hang.
+- **`mondrianprobe=1` kills SpringBoard on this port.** Measured 2026-11-21:
+  the probe's launch thread calls the application workspace, which creates
+  `SBLockScreenManager` before `UIApplication` exists; SpringBoard raises
+  `NSInternalInconsistencyException` with that exact reason, aborts `sig 6`
+  and launchd relaunches it -- twice in one boot, the abort stack ending in
+  `mondrian_launch_thread`. Give the process table its own boot; mixing it
+  with a UI test makes the panel look like the thing under test crashed.
+- **The LaunchServices wait is an IconServices round trip.** Measured
+  2026-11-21: SpringBoard's main thread waits on the `_LSDatabase` lock, the
+  holder sits in a synchronous CoreServices call, and `lsd`'s only worker is in
+  a synchronous IconServices call that `iconservicesagent` never answers.
+  Denying the agent's exec makes SpringBoard exit `status 0x1` around the time
+  the boot reaches the UI, before the hook's thread samples (100 s), so the
+  deny proves the agent is required but not that the wait disappears. A
+  boot-arg deny matches `p->p_name` (33 bytes), not the 16-character `p_comm`,
+  so a name longer than 16 characters must be written in full
+  (`iconservicesagent`); the USB `execdeny` command replaces the list at run
+  time. A boot that reaches the shell has `/private/var/vm/mondrian-xpc`
+  present: its probe at about four seconds starts the named services and keeps
+  the icons agent ahead of lsd's icon request (boot 33/34); without it the boot
+  stayed in the cycle (boot 31), and killing lsd once at run time also breaks it
+  (boot 32, the home screen then drew).
+- **`mondrian_probe=1` cannot reach a process the UI hook already takes.**
+  `exec_extract_strings` tries the hook environment first and the probe only in
+  the `else` branch, so `iconservicesagent` (a service mask target) never sees
+  the thread probe even with the exact name: the ring says
+  `MONDRIAN HOOK: iconservicesagent uses the /private/var/vm copy` and no
+  `injected probe`. Instrument those processes from the hook itself; an
+  on-demand dump keyed on `/private/var/vm/mondrian-thrprobe` is what answers
+  "where is this daemon waiting" without a second injection slot.
 - **A private selector called unguarded in a constructor is a SpringBoard crash
   loop.** Measured 2026-11-18: a probe that called `-[PLPrivacy _TCCForScope:]`
   without `respondsToSelector:` raised inside the hook's constructor, and

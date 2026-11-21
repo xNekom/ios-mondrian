@@ -58,9 +58,9 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
-- **Display and UI.** The home screen draws on its own 1440x3200 canvas (480x1066
-  pt at scale 3; `docs/UI_PERFORMANCE.md` has the frame meter) and
-  `mondrian_ui_hook=1286 mondrian_gpu_hook=1` brings up the shell and Settings.
+- **Display and UI.** The home screen and Settings draw on the 1440x3200 canvas
+  (`docs/UI_PERFORMANCE.md` has the frame meter and the boot traps);
+  `mondrian_ui_hook=1286` plus `/private/var/vm/mondrian-xpc` brings up the shell.
 
 Current blockers, in order:
 
