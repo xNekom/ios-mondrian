@@ -1192,6 +1192,42 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   driver (`MONDRIAN HID: touch 0 down`), so it is SpringBoard that ignores
   them: a UI test must not assume it can unlock the device, and a transition has
   to be produced by the port (`mondriananim=2`) or by a boot.
+- **A synthetic tap does not move a UISwitch; a short drag does.** Measured
+  2026-11-21 on Settings > Control Center > "Access Within Apps", a local
+  preference with no daemon behind it: `usb-ring.py tap 1256 626` left it On;
+  `swipe 1330 626 1200 626 150` turned it Off and the knob drew on the left;
+  the reverse drag turned it back, and the state survived a Preferences
+  relaunch. Control Center's own controls take a plain tap -- its Bluetooth
+  toggle put up the iOS 16 "Disconnecting Bluetooth Accessories Until Tomorrow"
+  alert. The Settings > Bluetooth switch does not follow the same drag while
+  the manager keeps the radio up; that is a Bluetooth finding, not a drawing
+  one. `tools/wsl/verify-local-switch.sh` runs the tap/drag comparison.
+- **Settings rows are 108 px tall and the list shifts when the large title
+  collapses.** Measured 2026-11-21: a tap 3 px into the General/Control Center
+  boundary opened General, and after a pane was dismissed the same y landed on
+  a different row. Capture the list, aim at the row centre (General 1984,
+  Control Center 2078 on the expanded layout), and capture again to confirm
+  before the next tap.
+- **An app that is not installed still shows a home-screen icon.** Measured
+  2026-11-21: `rf /Applications/Photos.app/Info.plist` answers `-2` while
+  Preferences, Safari and App Store return `bplist00`; the Photos icon sits on
+  the home screen, its widget reads "No content available", and a tap on the
+  icon does nothing. Read `rf` before calling a missing launch a SpringBoard
+  fault.
+- **`0402` reaches every app in `/Applications`, not only Preferences.**
+  Measured 2026-11-21: Safari logs `loaded in MobileSafari` and hands 27x39 and
+  49x50 surfaces to QuartzCore with its toolbar drawn; App Store logs
+  `loaded in AppStore` and hands 60x60 surfaces (its content stays at LOADING
+  without a network); Control Center draws its whole grid, brightness slider
+  included. `tools/wsl/verify-second-app.sh NAME X Y` opens an icon at a
+  coordinate taken from the same boot's capture and reports the load line, the
+  callers, the server's zero-format copies, present and crashes.
+- **locationd crash-loops about once a second and forks ReportCrash each time.**
+  Measured 2026-11-21: `CRASH locationd ... sig 11 code 0x100000001`, 8 crashes
+  in the first five minutes, `Process[229] crashed: locationd. Too many corpses
+  being created.` The UI still presents (48/s during a launch animation) but
+  the churn costs CPU; `grep -c 'CRASH locationd'` before blaming the renderer
+  for a low frame rate.
 - **A blanked panel keeps its last image.** `0342` switches the panel off and
   leaves its RAM alone, so a capture taken while it is off shows the frame from
   before the blank: an old clock, not a frozen compositor. A capture that reads
