@@ -69,7 +69,10 @@ the order they were paid for:
   framebuffer after one that did not (`fd6_draw.cc`, `prev_draw_read_fb` in `freedreno_batch.h`).
   A different read — a draw sampling a texture written earlier in the same submission — is the
   shim's: `flush_draws = 2` (the default) submits before it, which fixed the Control Center's
-  module backdrop (`docs/UI_PERFORMANCE.md`).
+  module backdrop (`docs/UI_PERFORMANCE.md`). `build-kernel.sh` embeds
+  `out/gpu/mondrian-gl.dylib` as it finds it; it now rebuilds the library when
+  `tools/gpu/eagl.c` is newer, because a boot that carried an older copy read as "the flush did
+  nothing" (measured 2026-11-21).
 - **The eight-times downsample that starts a backdrop's blur is not tinted by the layer that asked
   for it.** CoreAnimation's own four- and six-sample downsamples multiply the picture by nothing;
   the colour of the corners is the layer's opacity, which it applies where the layer is laid on
