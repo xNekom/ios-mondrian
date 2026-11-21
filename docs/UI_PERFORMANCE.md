@@ -644,13 +644,17 @@ boot each, so the three columns differ only in what changed:
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
   `0402` injects it into every app in `/Applications`, so Settings gets the
   bridge without the hook's interposers.
-- **A respring does not bring the shell back on this port.** Measured
-  2026-11-21: after `kill SpringBoard`, the new SpringBoard stays at its boot
-  spinner (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster`
-  crash-loops with `extension check-in timeout`; the same kernel presents on a
-  RAM boot (`ca begin 1 commit 1`). Test a hook change by booting with it
-  embedded, or rebuild only the app bridge, which is read when an app execs
-  (kill the app and tap its icon).
+- **A respring must restart backboardd, not only SpringBoard.** Measured
+  2026-11-21: `kill SpringBoard` alone leaves the new one at its boot spinner
+  (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster` crash-loops
+  with `extension check-in timeout`; killing backboardd restarts the window
+  server and SpringBoard together and the new SpringBoard presents (a
+  `present 27/s`, `ca begin 9 commit 9` burst, then the lock screen).
+  `usb-ring.py respring` signals backboardd and lets SpringBoard follow. A
+  second restart in a row can still leave the previous frame on the glass, so
+  a RAM boot is the fallback when the panel does not change; a hook change is
+  also testable by rebuilding only the app bridge, which is read when an app
+  execs (kill the app and tap its icon).
 - **The keyboard is not reachable with the synthetic touch.** Measured
   2026-11-19: the Messages search field and Safari's address field do not focus
   on a tap or a hold, and no keyboard window appears; the hook's own note says
