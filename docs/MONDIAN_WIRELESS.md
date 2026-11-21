@@ -988,10 +988,16 @@ and the controller still runs numeric comparison because the remote asked for
 MITM. An earlier note that the rewrite "made no difference" was reading a log
 line: `my_write` sent the original buffer.
 
-The pairing is not durable and the app never learns about it. The next connect
-runs the whole sequence again (`pair evt 31`, `io cap`, `pair evt 32`,
-`pair confirm`) and no `link key request` appears, so the controller does not
-offer a stored key back, and the pane still draws "Pairing Unsuccessful"
+The pairing is not durable and the app never learns about it. The controller
+keeps no key of its own: on the next connect it asks the host
+(`link key request a8:41:f4:2c:c2:35`), bluetoothd never answers, and the link
+falls back to a fresh pairing in the same daemon session (`pair evt 31`,
+`io cap`, `pair evt 32`, `pair confirm`). `tools/mondrian-bt.c` now keeps the
+key the controller reports (`link key notify`) in
+`/private/var/mobile/Library/Preferences/mondrian-bt-keys` and answers the
+request with 0x040b (`link key reply ... -> 26`); the reply path is in place,
+but a key only exists after a pairing Windows completed, which it only does
+from its own Add-a-device window. The pane still draws "Pairing Unsuccessful"
 because no pairing client exists to call. That client is `CBConnection`, which
 only exists through `initWithXPCObject:error:` from its activation message:
 `alloc`/`init` plus `addPairingClient:error:` restart-loops bluetoothd (the pid
