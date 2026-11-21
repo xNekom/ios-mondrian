@@ -963,51 +963,50 @@ event that names that address (`name.inject`), then answers the client's
 follow-up 212 with the same name and result 0 (`name.reply`). The pane draws
 `ASUS-TUF-GAMING` instead of `A8:41:F4:2C:C2:35` (measured 2026-11-21).
 
-Pairing gets past the phone side now. With the link up the controller raises
-`pair evt 33 plen 10: <addr> <4-byte value>`. That is User Confirmation Request
-(SSP numeric comparison, parameters bdaddr plus a six-digit value such as
-507960), not a passkey notification: the host is expected to answer 0x042c when
-the user presses Pair. Nothing answered, so the controller repeated it up to
-three times with a fresh value and bluetoothd dropped the link with disconnect
-0x16. `tools/mondrian-bt.c` sends that 0x042c on the control socket the daemon
-uses (`pair confirm <addr> value 507960 -> 10`); the repeats stop and the link
-stays up, waiting for the remote's own confirmation.
+Pairing completes when the PC starts it. Measured 2026-11-22: in Windows,
+Settings > Bluetooth y dispositivos > Agregar un dispositivo > Bluetooth and
+then a click on the device item ends with "Conectado", and
+`DeviceInformation.Pairing.IsPaired` reads true while the controller logs
+`link key notify`. Windows refuses the phone's own attempt: `BTHUSB` event 16
+("Error en la autenticacion mutua") and 37 ("Se rechazo una solicitud de
+autenticacion entrante") appear when the pairing starts from the row tap, so a
+row tap alone cannot pair.
 
-The phone has no alert to press Pair on, and the daemon has no pairing client to
-build one from: `addPairingClient:error:` and
-`pairingContinueWithPairingInfo:error:` are never called, neither
-`_xpcCBConnectionActivate:` nor the `_xpc*` device handlers fire, and no
-outgoing XPC carries a prompt. The daemon owns four classes
-(`CBDaemonServer`, `CBDaemonXPCConnection`, `CBStackControllerBTStack`,
-`CBConnection`); `CBConnection` is the pairing client and only exists through
-`initWithXPCObject:error:` from the app's activation message, so
+The controller runs Secure Simple Pairing with numeric comparison either way:
+`pair evt 31` (IO Capability Request), the host's 0x042b reply, `pair evt 32`
+carrying the remote's `01 00 05` (DisplayYesNo, MITM required), then `pair evt
+33` with a six-digit value. 0x33 is User Confirmation Request, not a passkey
+notification, and the host must answer 0x042c; the shim does
+(`pair confirm <addr> value 507960 -> 10`), the same result as pressing Pair.
+Without it the controller repeated the event up to three times with a fresh
+value and bluetoothd dropped the link with reason 0x16.
+
+Just Works is not reachable from the host. The daemon's 0x042b carries 0x01
+(DisplayYesNo); the shim rewrites it to 0x03 (NoInputNoOutput) and clears the
+MITM bit (`io cap 01 oob 00 auth 04`, then `io cap rewritten to 03 auth 04`),
+and the controller still runs numeric comparison because the remote asked for
+MITM. An earlier note that the rewrite "made no difference" was reading a log
+line: `my_write` sent the original buffer.
+
+The pairing is not durable and the app never learns about it. The next connect
+runs the whole sequence again (`pair evt 31`, `io cap`, `pair evt 32`,
+`pair confirm`) and no `link key request` appears, so the controller does not
+offer a stored key back, and the pane still draws "Pairing Unsuccessful"
+because no pairing client exists to call. That client is `CBConnection`, which
+only exists through `initWithXPCObject:error:` from its activation message:
 `alloc`/`init` plus `addPairingClient:error:` restart-loops bluetoothd (the pid
 climbed 1646 -> 1650 -> 1658 within a minute) and must not be repeated.
-
-The other way to need no prompt is Just Works, which needs the host's IO
-capability to be NoInputNoOutput. Rewriting the 0x042b reply from 0x01
-(DisplayYesNo) to 0x03 does reach the controller (`io cap 01 oob 00 auth 04`,
-then `io cap rewritten to 03 auth 04`) and the controller still raises 0x33: its
-association model follows the remote's DisplayYesNo capability, not the host's.
-An earlier note that the rewrite "made no difference" was measuring a log line
-only, because `my_write` sent the original buffer.
+`addPairingClient:error:` and `pairingContinueWithPairingInfo:error:` are never
+called, neither `_xpcCBConnectionActivate:` nor the `_xpc*` device handlers
+fire, and no outgoing XPC carries a prompt.
 
 The connect is tap-driven: with the pane open and the PC in the list, no
 `hci req 0405` appears until the row is tapped, and then it follows within
 seconds. The ObjC controller is not the path: both
 `connectDevice:connectionFlags:serviceFlags:error:` and
 `connectWithCBConnection:completionHandler:` are replaced with logging
-implementations and neither is called for that connect
-(`ctl.hook: connectDevice: B40@0:8@16I24I28^@32`,
-`ctl.hook: connectWithCBConnection: v32@0:8@16@?24`), so the request goes
+implementations and neither is called for that connect, so the request goes
 through the BTStack object below the controller.
-
-The PC's half of the numeric comparison is what is left: `PairAsync()` returns
-`Failed` with `protection=None`, and custom pairing
-(`DeviceInformationCustomPairing.PairAsync` with ConfirmOnly, ConfirmPinMatch,
-ProvidePin and DisplayPin) returns `RejectedByHandler` without ever raising
-`PairingRequested`, so the Windows side neither shows nor answers a prompt from
-a script.
 
 The controller's Inquiry Result is malformed at the source: `plen` is 0xff
 (258 bytes) and the bytes between the 13 fixed fields and the EIR are not
