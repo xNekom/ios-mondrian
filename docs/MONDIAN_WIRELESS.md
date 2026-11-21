@@ -963,31 +963,36 @@ event that names that address (`name.inject`), then answers the client's
 follow-up 212 with the same name and result 0 (`name.reply`). The pane draws
 `ASUS-TUF-GAMING` instead of `A8:41:F4:2C:C2:35` (measured 2026-11-21).
 
-Pairing gets as far as Secure Simple Pairing and then stalls on a prompt that
-never reaches the screen. With the link up, the controller raises
-`pair evt 33 plen 10: <addr> <passkey>` (User Passkey Notification, up to three
-different passkeys per attempt), and bluetoothd sends nothing to its client
-between the connection and the event: no `pairingPromptWithPairingInfo:`, no
-outgoing XPC message. `addPairingClient:error:` and
-`pairingContinueWithPairingInfo:error:` are never called either, and neither
-`_xpcCBConnectionActivate:` nor the `_xpc*` device handlers fire, so the app's
-request does not take the CBConnection path the daemon would register a
-pairing client from. `CBConnection` is that client: it implements
-`pairingAgent:peerDidRequestPairing:type:passkey:`,
-`pairingAgent:peerDidCompletePairing:` and `pairingAgent:peerDidFailToCompletePairing:error:`,
-and `setPairingPromptHandler:`. The daemon has exactly four classes of its own
-(`CBDaemonServer`, `CBDaemonXPCConnection`, `CBStackControllerBTStack`,
-`CBConnection`), so there is no second connection class to hook. Pairing from
-the PC side does not help either: `DeviceInformation.Pairing.PairAsync()`
-returns `Failed` with `protection=None` for the phone's Bluetooth address.
-Creating a `CBConnection` with `alloc`/`init` and registering that with
-`addPairingClient:error:` was tried and restart-loops bluetoothd (the pid
-climbed 1646 -> 1650 -> 1658 within a minute); the object only exists through
-`initWithXPCObject:error:` from the app's activation message. The fix has to
-produce that activation, not synthesize the agent.
+Pairing gets past the phone side now. With the link up the controller raises
+`pair evt 33 plen 10: <addr> <4-byte value>`. That is User Confirmation Request
+(SSP numeric comparison, parameters bdaddr plus a six-digit value such as
+507960), not a passkey notification: the host is expected to answer 0x042c when
+the user presses Pair. Nothing answered, so the controller repeated it up to
+three times with a fresh value and bluetoothd dropped the link with disconnect
+0x16. `tools/mondrian-bt.c` sends that 0x042c on the control socket the daemon
+uses (`pair confirm <addr> value 507960 -> 10`); the repeats stop and the link
+stays up, waiting for the remote's own confirmation.
 
-A clean test (SpringBoard restarted, no "Pairing Unsuccessful" dialog) shows
-the connect is tap-driven: with the pane open and the PC in the list, no
+The phone has no alert to press Pair on, and the daemon has no pairing client to
+build one from: `addPairingClient:error:` and
+`pairingContinueWithPairingInfo:error:` are never called, neither
+`_xpcCBConnectionActivate:` nor the `_xpc*` device handlers fire, and no
+outgoing XPC carries a prompt. The daemon owns four classes
+(`CBDaemonServer`, `CBDaemonXPCConnection`, `CBStackControllerBTStack`,
+`CBConnection`); `CBConnection` is the pairing client and only exists through
+`initWithXPCObject:error:` from the app's activation message, so
+`alloc`/`init` plus `addPairingClient:error:` restart-loops bluetoothd (the pid
+climbed 1646 -> 1650 -> 1658 within a minute) and must not be repeated.
+
+The other way to need no prompt is Just Works, which needs the host's IO
+capability to be NoInputNoOutput. Rewriting the 0x042b reply from 0x01
+(DisplayYesNo) to 0x03 does reach the controller (`io cap 01 oob 00 auth 04`,
+then `io cap rewritten to 03 auth 04`) and the controller still raises 0x33: its
+association model follows the remote's DisplayYesNo capability, not the host's.
+An earlier note that the rewrite "made no difference" was measuring a log line
+only, because `my_write` sent the original buffer.
+
+The connect is tap-driven: with the pane open and the PC in the list, no
 `hci req 0405` appears until the row is tapped, and then it follows within
 seconds. The ObjC controller is not the path: both
 `connectDevice:connectionFlags:serviceFlags:error:` and
@@ -995,13 +1000,14 @@ seconds. The ObjC controller is not the path: both
 implementations and neither is called for that connect
 (`ctl.hook: connectDevice: B40@0:8@16I24I28^@32`,
 `ctl.hook: connectWithCBConnection: v32@0:8@16@?24`), so the request goes
-through the BTStack object below the controller. The phone shows no passkey dialog and the PC shows no
-prompt either; after the third notification the controller disconnects with
-reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
-phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
-daemon's IO Capability Request Reply (0x042b) carries 0x01 (DisplayYesNo);
-rewriting it to 0x03 (NoInputNoOutput, Just Works) made no difference, the
-controller still raises 0x33.
+through the BTStack object below the controller.
+
+The PC's half of the numeric comparison is what is left: `PairAsync()` returns
+`Failed` with `protection=None`, and custom pairing
+(`DeviceInformationCustomPairing.PairAsync` with ConfirmOnly, ConfirmPinMatch,
+ProvidePin and DisplayPin) returns `RejectedByHandler` without ever raising
+`PairingRequested`, so the Windows side neither shows nor answers a prompt from
+a script.
 
 The controller's Inquiry Result is malformed at the source: `plen` is 0xff
 (258 bytes) and the bytes between the 13 fixed fields and the EIR are not
