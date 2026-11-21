@@ -519,15 +519,25 @@ the result. The refusal is inside `MobileBluetooth`'s
 neither exists. The shim answers those two lookups inside `bluetoothd` only, so
 every other process saw an empty registry.
 
-Adding `/arm-io/bluetooth` to the ADT (`tools/mkadt.py`) with
-`local-mac-address` (the address the shim publishes), `transport-encoding`,
-`transport-speed` and `compatible = "marconi-bt"` makes the attach return 0,
-and is the only change that has done so. It also makes SpringBoard crash at
-boot (`SIGSEGV`, `far 0xc0`, pc in a shared-cache framework, four SpringBoard
-frames under it) while the same kernel without the node boots; the node is
-therefore not in the default ADT until that crash is understood. Userspace
-interposition of `IOServiceGetMatchingService` is not a substitute: the client
-looks the service up through paths the hook does not see.
+Adding `/arm-io/bluetooth` to the ADT (`tools/mkadt.py`) makes the attach
+return 0, and is the only change that has done so. The node carries what the
+real D22AP node has -- `device_type`, `compatible = "bluetooth,n88"`,
+`vendor-id`, `product-id`, `supported-profiles`, `coex`, `transport-encoding`,
+`transport-speed` and `local-mac-address` (the address the shim publishes) --
+because a node with only the address cleared the gate and left `_setup:`
+reading absent properties. Userspace interposition of
+`IOServiceGetMatchingService` is not a substitute: the client looks the service
+up through paths the hook does not see.
+
+The gate is necessary, not sufficient. With `bluetoothd` alive, the manager's
+XPC reaches `kCBMsgIdLocalDeviceGetDefaultMsg` and gets a device id, and the
+manager then powers the controller on its own: measured `powered after 4 tries`
+with every forcible path disabled. Forcing the `available` ivar and calling
+`setPowered:` before that -- while `_session` and `_localDevice` are still
+NULL -- makes MobileBluetooth jump through a NULL
+`BTLocalDeviceSetPowerState` and kills SpringBoard with SIGBUS (`pc == far`)
+before its first commit. The probe is read-only by default; a
+`/private/var/vm/bt-force` marker gates both writes.
 
 ### The control bluetoothd opens
 
