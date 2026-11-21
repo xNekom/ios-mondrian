@@ -918,13 +918,19 @@ a background scan asks type 0), the controller answers with scan responses
 promotes their 0x08 name. A framer in the shim's `read` path logs every name it
 sees in that stream (`adv name` in `mondrian-bt-power.log`): `ASUS-TUF-GAMING`,
 `[AV] Samsung Soundbar MS650`, `RGB smart bulb`, `Dryer`, `[TV] Samsung 5
-Series (49)`, `LUH-D301S-WEU`, `X2+ Connect_D54EABA568E6`. The reply is still
-empty, and a pane scan calls none of the daemon's device hooks
-(`_reportDeviceFound:`, `_stackClassicScannerDeviceFound:`,
+Series (49)`, `LUH-D301S-WEU`, `X2+ Connect_D54EABA568E6`.
+
+The daemon builds no device from them. On a fresh boot, with no daemon restart
+and 24 named reports read, its reply to the client is
+`kCBMsgArgDeviceArray count = 0` with `kCBMsgArgResult 0`, so the pane shows an
+empty list and no row exists to tap. A pane scan calls none of the daemon's
+device hooks (`_reportDeviceFound:`, `_stackClassicScannerDeviceFound:`,
 `_stackBLEScannerDeviceFound:`, `_stackDeviceMonitorDeviceFound:`,
-`_whbDiscoveryDeviceFound:`), so the path that builds the device entries the
-pane lists is still unidentified. The EIR bridge above is a separate source;
-the pane's devices already carry names in their own scan responses.
+`_whbDiscoveryDeviceFound:`), all installed and silent. The daemon's outgoing XPC
+messages are logged (`xpc.dev` in the power log), which is where the empty
+array is visible. The loss is therefore between the report read and the device map,
+upstream of both the name reply and pairing; the EIR bridge above is a separate
+source and no longer the blocker.
 
 Pairing has never been exercised. Measured 2026-11-21: a tap on the discovered
 row of a real peer (`C8:A6:EF:12:00:9F`, a TV) reaches SpringBoard
