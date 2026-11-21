@@ -276,8 +276,26 @@ def springboard_pid(text):
     return pid
 
 
+def backboardd_pid(text):
+    """The backboardd PID from the kernel's `SMP t=...` line, or None.
+
+    Killing SpringBoard alone leaves the new one on its boot spinner with no
+    commit; the render server is the one that has to restart (measured
+    2026-11-21). Only the SMP line is trusted, for the same reason.
+    """
+    pid = None
+    for line in text.splitlines():
+        if "SMP t=" not in line or "backboardd(" not in line:
+            continue
+        at = line.rfind("backboardd(")
+        end = line.find(")", at)
+        if end > at:
+            pid = line[at + len("backboardd("):end]
+    return pid
+
+
 def respring():
-    """Restart SpringBoard.
+    """Restart the render server and SpringBoard.
 
     `kill` takes a PID. `kill SpringBoard` is `kill 0` -- measured 2026-11-18: it
     answers `kill 0 -> 3` and nothing restarts, so a rebuilt hook is never mapped
@@ -293,13 +311,27 @@ def respring():
             text = f.read()
     finally:
         os.remove(path)
-    pid = springboard_pid(text)
-    if pid is None:
-        print("no SpringBoard pid in the ring", file=sys.stderr)
+    spid = springboard_pid(text)
+    bpid = backboardd_pid(text)
+    if spid is None and bpid is None:
+        print("no SpringBoard or backboardd pid in the ring", file=sys.stderr)
         return 1
-    print(f"SpringBoard pid {pid}")
-    answer = simple("kill " + pid, 5.0)
-    print(answer.decode(errors="replace").strip() if answer else "no answer")
+    # Only the render server is signalled. Killing SpringBoard alone leaves
+    # the new one on its boot spinner with no commit and a poster extension
+    # timing out; killing backboardd brings the window server and SpringBoard
+    # back together and the new SpringBoard presents (measured 2026-11-21:
+    # present 27/s, ca begin 9 commit 9). Signalling SpringBoard as well raced
+    # the replacement into a second restart and left the panel on the old
+    # frame, so the SpringBoard pid is only the fallback for a kernel that
+    # does not print backboardd.
+    if bpid is not None:
+        print(f"backboardd pid {bpid}")
+        answer = simple("kill " + bpid, 5.0)
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
+    elif spid is not None:
+        print(f"SpringBoard pid {spid}")
+        answer = simple("kill " + spid, 5.0)
+        print(answer.decode(errors="replace").strip() if answer else "no answer")
     return 0
 
 
