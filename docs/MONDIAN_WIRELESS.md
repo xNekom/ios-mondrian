@@ -531,13 +531,13 @@ up through paths the hook does not see.
 
 The gate is necessary, not sufficient. With `bluetoothd` alive, the manager's
 XPC reaches `kCBMsgIdLocalDeviceGetDefaultMsg` and gets a device id, and the
-manager then powers the controller on its own: measured `powered after 4 tries`
-with every forcible path disabled. Forcing the `available` ivar and calling
-`setPowered:` before that -- while `_session` and `_localDevice` are still
-NULL -- makes MobileBluetooth jump through a NULL
-`BTLocalDeviceSetPowerState` and kills SpringBoard with SIGBUS (`pc == far`)
-before its first commit. The probe is read-only by default; a
-`/private/var/vm/bt-force` marker gates both writes.
+manager then powers the controller on its own: measured `powered after 13
+tries available 1 session 0x283ffc240 device 0x702f0001` with every forcible
+path disabled. Forcing the `available` ivar and calling `setPowered:` before
+that -- while `_session` and `_localDevice` are still NULL -- makes
+MobileBluetooth jump through a NULL `BTLocalDeviceSetPowerState` and kills
+SpringBoard with SIGBUS (`pc == far`) before its first commit. The probe is
+read-only by default; a `/private/var/vm/bt-force` marker gates both writes.
 
 ### The control bluetoothd opens
 
@@ -560,11 +560,18 @@ under the engine's 128-byte RX FIFO, and RFR asserts before it fills. The
 termios and the 12-byte UART option are accepted; the UUID names no nexus,
 which is what selects the read/write fallback.
 
-Nothing in `bluetoothd` can log, so both the control and the tty print the
-first eight packets in each direction (`MONDRIAN BTCTL:` and `MONDRIAN BTTTY:`).
-Those lines are the measurement: a `01 03 0c 00` from the daemon and an answer
-from the part is the transport working. What comes after is the stack's opinion
-of a ROM-only chip, which is where the firmware load enters.
+Nothing in `bluetoothd` can log, so the control and the tty print the first
+packets in each direction (`MONDRIAN BTCTL:` and `MONDRIAN BTTTY:`). The tty
+keeps eight; the control logs 64, because the daemon's init burst alone fills
+an eight-packet budget and the scan traffic that follows never reaches the
+ring. Those lines are the measurement: a `01 03 0c 00` from the daemon and an
+answer from the part is the transport working. What comes after is the stack's
+opinion of a ROM-only chip, which is where the firmware load enters.
+
+With the Settings pane open, the daemon issues the classic inquiry
+(`01 01 04 05 33 8b 9e 04 40`) and turns inquiry/page scan on (`01 1a 0c 01
+01`); that is the scan the DEVICES spinner shows. A chip that answers the init
+but never this command leaves the pane spinning with an empty list.
 
 Before any transport, though, `bluetoothd` refuses to run without a local
 Bluetooth address: every boot until now logged `exec bluetoothd` and
