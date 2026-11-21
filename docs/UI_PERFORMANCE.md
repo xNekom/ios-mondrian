@@ -1222,12 +1222,12 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   included. `tools/wsl/verify-second-app.sh NAME X Y` opens an icon at a
   coordinate taken from the same boot's capture and reports the load line, the
   callers, the server's zero-format copies, present and crashes.
-- **locationd crash-loops about once a second and forks ReportCrash each time.**
-  Measured 2026-11-21: `CRASH locationd ... sig 11 code 0x100000001`, 8 crashes
-  in the first five minutes, `Process[229] crashed: locationd. Too many corpses
-  being created.` The UI still presents (48/s during a launch animation) but
-  the churn costs CPU; `grep -c 'CRASH locationd'` before blaming the renderer
-  for a low frame rate.
+- **locationd crash-loops and forks ReportCrash each time.** Measured
+  2026-11-21: `CRASH locationd ... sig 11 code 0x100000001`, 5 crashes by the
+  third minute of the boot and 8 by the fifth, `Process[229] crashed: locationd.
+  Too many corpses being created.` The UI still presents (48/s during a launch
+  animation) but the churn costs CPU; `grep -c 'CRASH locationd'` before blaming
+  the renderer for a low frame rate.
 - **A blanked panel keeps its last image.** `0342` switches the panel off and
   leaves its RAM alone, so a capture taken while it is off shows the frame from
   before the blank: an old clock, not a frozen compositor. A capture that reads
