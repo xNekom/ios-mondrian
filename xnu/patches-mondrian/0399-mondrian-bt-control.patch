@@ -65,6 +65,70 @@ download got 2 KB of 0xFD/0xFE and no packet (measured 2026-11-21). The poll
 answers the indication now, under a write lock shared with the daemon's
 commands so the ACK cannot interleave with a command.
 
+On top of the transport, the control translates the LE scan the daemon asks
+for. bluetoothd's init-time report sets enableExtendedScanHCI=0, so it drives
+LE Set Scan Parameters and LE Set Scan Enable (0x200b/0x200c); the WCN7850
+refuses that pair with 0x0c "command disallowed" in every state measured
+2026-11-21 and delivers no report, which is why the device list stayed on
+addresses. The extended pair (0x2041/0x2042) completes with status 0 and
+produces LE meta events. The control rewrites the two commands, answers the
+daemon with the completion for the opcode it sent, swallows the controller's
+completion, and turns each extended advertising report (subevent 0x0d) into
+the legacy report (subevent 0x02) bluetoothd parses.
+
+Two details of the translation are measured. The own address type goes out as
+public: bluetoothd asks for the random type, and the controller answers the
+extended enable with 0x12 "invalid parameters" when no random address is set
+(the shim probe: own=1 -> 18, own=0 -> 0, same interval, window and filter).
+Each translated command gets its own pending count, not a flag: bluetoothd
+sends an enable and a disable back to back, and one flag let the second
+completion through to the daemon, which exits on an opcode it never sent
+(measured 2026-11-21, the exit report named "Unknown" at hcievents.c).
+
+A legacy report carries at most 31 data bytes, and an extended advertisement
+can be longer. Cutting the payload at 31 bytes left the last AD structure
+promising more bytes than the event carried, and the daemon rejected the whole
+report (`Invalid advertising response data size (1 + 66)`, measured 2026-11-21
+on a 67-byte advertisement). The translation copies whole AD structures only
+and drops the incomplete tail, so a report with a long service-data field
+keeps its flags and name instead of disappearing.
+
+The name in the classic inquiry EIR is not used by this bluetoothd for a
+dual-mode device: it answers kCBMsgIdDeviceGetNameMsg with an empty name
+(measured 2026-11-21, result 212, name length 0) while the EIR for the same
+address says "55...", so the pane draws the address. The controller's scan
+responses carry the shortened name type (0x08), and this daemon does not use
+it either (`55" Crys` for C8:A6:EF, still an empty reply), so the copy
+promotes it to Complete Local Name (0x09). The control also keeps the EIR name
+and appends it as a Complete Local Name when the advertisement carries neither
+form; trailing structures are dropped when the 31-byte legacy payload needs
+the room. The controller sends legacy reports as well, so both paths share the
+bridge.
+
+The classic name request is one byte short. Remote Name Request (0x0419) takes
+BD_ADDR, packet type, clock offset and the page-scan repetition mode, 11 bytes
+in all; bluetoothd sends 10 and the controller rejects the command, so no
+completion and no name arrive. The control appends the repetition mode (R0)
+and forwards 11.
+
+The controller's byte stream needs the same care as its reports: it emits
+0xFD/0xFE wake filler between packets, it answers the shim's 0xFD wake with a
+bare 0xFC, and a completion the previous daemon never read stays in the FIFO
+and reaches the next one as the answer to its own reset. The stack exits on an
+unexpected completion and leaves its own behind, so that chain never ends by
+itself (measured 2026-11-21: every run died processing OI_DHCI_RESET_OPCODE,
+and one read carried two identical reset completions). The poll path skips the
+filler, keeps the bare handshake byte, and reassembles whole packets; the
+connect path drains the FIFO first.
+
+HCI-IBS is the other half of that stream: 0xFD is the controller's WAKE_IND and
+needs a 0xFC from the host, or the part repeats it every 100 ms and takes no
+command (hci_qca.c). The shim answers while it boots the firmware; after it
+closes the control nobody did, and a daemon whose reset followed a fresh NVM
+download got 2 KB of 0xFD/0xFE and no packet (measured 2026-11-21). The poll
+answers the indication now, under a write lock shared with the daemon's
+commands so the ACK cannot interleave with a command.
+
 diff --git a/bsd/conf/files b/bsd/conf/files
 index c34682e..d579bb6 100755
 --- a/bsd/conf/files
@@ -116,10 +180,10 @@ index 3c4165b..aa4607b 100755
   * ring is not reachable from its sandbox), so the driver prints the first
 diff --git a/bsd/dev/mondrian_btctl.c b/bsd/dev/mondrian_btctl.c
 new file mode 100644
-index 0000000..963247f
+index 0000000..9fe39d4
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,1003 @@
+@@ -0,0 +1,1350 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -203,6 +267,9 @@ index 0000000..963247f
 +	unsigned rx_dropped;
 +	unsigned rx_filler;
 +	unsigned rx_acks;
++	unsigned name_padded;
++	unsigned names_added;
++	unsigned names_noted;
 +	unsigned ext_params_pending;
 +	unsigned ext_enable_pending;
 +	uint8_t pending[MONDRIAN_BTCTL_PENDING];
@@ -272,6 +339,96 @@ index 0000000..963247f
 +	}
 +}
 +
++/*
++ * The daemon ignores the name in the classic inquiry EIR: for a dual-mode
++ * device whose LE advertisement carries no name it answers
++ * kCBMsgIdDeviceGetNameMsg with an empty string (measured 2026-11-21:
++ * kCBMsgArgResult 212, name length 0), while the EIR for the same address
++ * says `55...`. The control sees both streams, so it keeps the EIR name and
++ * appends it to the LE report for that address when the advertisement has no
++ * name of its own.
++ */
++#define MONDRIAN_BTCTL_NAMES 8
++#define MONDRIAN_BTCTL_NAME_LEN 30
++
++struct mondrian_btctl_name {
++	uint8_t addr[6];
++	char name[MONDRIAN_BTCTL_NAME_LEN];
++};
++
++static struct mondrian_btctl_name
++    mondrian_btctl_names[MONDRIAN_BTCTL_NAMES];
++static unsigned mondrian_btctl_names_next;
++
++static void
++mondrian_btctl_note_name(const uint8_t *addr, const uint8_t *data, size_t len)
++{
++	struct mondrian_btctl_name *slot = NULL;
++	unsigned i;
++	int fresh = 0;
++
++	if (len == 0) {
++		return;
++	}
++	if (len >= MONDRIAN_BTCTL_NAME_LEN) {
++		len = MONDRIAN_BTCTL_NAME_LEN - 1;
++	}
++	for (i = 0; i < MONDRIAN_BTCTL_NAMES; i++) {
++		if (bcmp(mondrian_btctl_names[i].addr, addr, 6) == 0) {
++			slot = &mondrian_btctl_names[i];
++			break;
++		}
++	}
++	if (slot == NULL) {
++		slot = &mondrian_btctl_names[
++		    mondrian_btctl_names_next++ % MONDRIAN_BTCTL_NAMES];
++		bcopy(addr, slot->addr, 6);
++		fresh = 1;
++	}
++	bcopy(data, slot->name, len);
++	slot->name[len] = '\0';
++	if (fresh && mondrian_btctl.names_noted < 8) {
++		mondrian_btctl.names_noted++;
++		printf("MONDRIAN BTCTL: name note"
++		    " %02x:%02x:%02x:%02x:%02x:%02x \"%s\"\n",
++		    addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
++		    slot->name);
++	}
++}
++
++static const char *
++mondrian_btctl_find_name(const uint8_t *addr)
++{
++	unsigned i;
++
++	for (i = 0; i < MONDRIAN_BTCTL_NAMES; i++) {
++		if (mondrian_btctl_names[i].name[0] != '\0' &&
++		    bcmp(mondrian_btctl_names[i].addr, addr, 6) == 0) {
++			return mondrian_btctl_names[i].name;
++		}
++	}
++	return NULL;
++}
++
++static int
++mondrian_btctl_ad_has_name(const uint8_t *data, size_t len)
++{
++	size_t pos = 0;
++
++	while (pos + 1 < len) {
++		size_t elen = data[pos];
++
++		if (elen == 0 || pos + 1 + elen > len) {
++			break;
++		}
++		if (data[pos + 1] == 0x08 || data[pos + 1] == 0x09) {
++			return 1;
++		}
++		pos += 1 + elen;
++	}
++	return 0;
++}
++
 +static void
 +mondrian_btctl_count_event(const uint8_t *buf, size_t len)
 +{
@@ -285,6 +442,28 @@ index 0000000..963247f
 +		if (mondrian_btctl.inquiry_results <= 4) {
 +			mondrian_btctl_dump("inquiry eir", buf,
 +			    (int)MIN(len, (size_t)32));
++		}
++		/*
++		 * One response: 14 fixed bytes after the address and then the
++		 * EIR. Keep the name for the LE report of the same address.
++		 */
++		if (len > 18 && buf[3] == 0x01) {
++			size_t pos = 18;
++
++			while (pos + 1 < len) {
++				size_t elen = buf[pos];
++
++				if (elen == 0 || pos + 1 + elen > len) {
++					break;
++				}
++				if ((buf[pos + 1] == 0x08 ||
++				    buf[pos + 1] == 0x09) && elen > 1) {
++					mondrian_btctl_note_name(buf + 4,
++					    buf + pos + 2, elen - 1);
++					break;
++				}
++				pos += 1 + elen;
++			}
 +		}
 +		return;
 +	}
@@ -472,6 +651,9 @@ index 0000000..963247f
 +	mondrian_btctl.rx_dropped = 0;
 +	mondrian_btctl.rx_filler = 0;
 +	mondrian_btctl.rx_acks = 0;
++	mondrian_btctl.name_padded = 0;
++	mondrian_btctl.names_added = 0;
++	mondrian_btctl.names_noted = 0;
 +	mondrian_btctl.ext_params_pending = 0;
 +	mondrian_btctl.ext_enable_pending = 0;
 +	mondrian_btctl.pending_len = 0;
@@ -532,6 +714,7 @@ index 0000000..963247f
 +	unsigned legacy_enable, legacy_disable, ext_enable, ext_disable;
 +	unsigned scan_refused, scan_translated, ext_reports, rx_dropped;
 +	unsigned rx_filler, rx_acks;
++	unsigned name_padded, names_added;
 +
 +	clock_get_uptime(&now);
 +	lck_mtx_lock(&mondrian_btctl_lock);
@@ -555,6 +738,8 @@ index 0000000..963247f
 +	rx_dropped = mondrian_btctl.rx_dropped;
 +	rx_filler = mondrian_btctl.rx_filler;
 +	rx_acks = mondrian_btctl.rx_acks;
++	name_padded = mondrian_btctl.name_padded;
++	names_added = mondrian_btctl.names_added;
 +	last = mondrian_btctl.last_tx > mondrian_btctl.last_rx ?
 +	    mondrian_btctl.last_tx : mondrian_btctl.last_rx;
 +	lck_mtx_unlock(&mondrian_btctl_lock);
@@ -575,11 +760,12 @@ index 0000000..963247f
 +	    (unsigned long long)(idle_ns / 1000000ull));
 +	printf("MONDRIAN BTCTL: scan le meta %u adv %u rsp %u "
 +	    "inquiry eir %u name req %u legacy %u/%u ext %u/%u "
-+	    "xlate %u ext rsp %u refused %u drop %u filler %u ack %u\n",
++	    "xlate %u ext rsp %u refused %u drop %u filler %u ack %u "
++	    "namepad %u names %u\n",
 +	    le_meta, le_adv, le_scan_rsp, inquiry_results, name_reqs,
 +	    legacy_enable, legacy_disable, ext_enable, ext_disable,
 +	    scan_translated, ext_reports, scan_refused, rx_dropped,
-+	    rx_filler, rx_acks);
++	    rx_filler, rx_acks, name_padded, names_added);
 +	return 0;
 +}
 +
@@ -671,6 +857,40 @@ index 0000000..963247f
 +			}
 +			mondrian_btctl.scan_translated++;
 +			mondrian_btctl_complete_scan(kref, unit, opcode);
++			mondrian_btctl.tx_packets++;
++			clock_get_uptime(&mondrian_btctl.last_tx);
++			*total += (int)len;
++			return 0;
++		}
++		/*
++		 * Remote Name Request (0x0419) is 11 parameter bytes: BD_ADDR,
++		 * packet type, clock offset and the page-scan repetition mode.
++		 * bluetoothd sends 10 and the controller rejects the command,
++		 * so no name arrives for a classic device (measured 2026-11-21,
++		 * `name request 14 01 19 04 0a ...`). The missing byte is the
++		 * repetition mode; R0 is what the legacy command assumes.
++		 */
++		if (len == 14 && data[0] == 0x01 && data[1] == 0x19 &&
++		    data[2] == 0x04 && data[3] == 10) {
++			uint8_t fixed[15];
++			int written;
++
++			bcopy(data, fixed, 14);
++			fixed[3] = 11;
++			fixed[14] = 0x00;
++			if (mondrian_btctl.name_padded < 4) {
++				printf("MONDRIAN BTCTL: name request padded"
++				    " to 11\n");
++			}
++			mondrian_btctl.name_padded++;
++			lck_mtx_lock(&mondrian_btctl_tx_lock);
++			written = mondrian_btuart_tty_write(fixed,
++			    sizeof(fixed));
++			lck_mtx_unlock(&mondrian_btctl_tx_lock);
++			if (written < 0) {
++				mondrian_btctl.tx_fails++;
++				return EIO;
++			}
 +			mondrian_btctl.tx_packets++;
 +			clock_get_uptime(&mondrian_btctl.last_tx);
 +			*total += (int)len;
@@ -850,8 +1070,10 @@ index 0000000..963247f
 +	}
 +	num = pkt[4];
 +	for (i = 0; i < num; i++) {
-+		size_t dlen, room;
++		size_t adlen = 0, dlen, room;
++		uint8_t ad[31];
 +		uint8_t type, legacy;
++		const char *name;
 +
 +		if ((size_t)(p - pkt) + 24 > len) {
 +			break;
@@ -860,6 +1082,84 @@ index 0000000..963247f
 +		if ((size_t)(p - pkt) + 24 + dlen > len) {
 +			break;
 +		}
++		/*
++		 * A legacy report carries at most 31 data bytes, and an
++		 * extended advertisement can be longer. Cut at whole AD
++		 * structures only: a length byte that promises bytes the event
++		 * does not carry makes the daemon reject the report
++		 * (`Invalid advertising response data size (1 + 66)`,
++		 * measured 2026-11-21 on a 67-byte advertisement).
++		 */
++		while (adlen < dlen) {
++			size_t elen = p[24 + adlen];
++
++			if (elen == 0) {
++				if (adlen + 1 <= sizeof(ad)) {
++					ad[adlen++] = 0;
++				}
++				break;
++			}
++			if (adlen + 1 + elen > sizeof(ad)) {
++				break;
++			}
++			bcopy(p + 24 + adlen, ad + adlen, 1 + elen);
++			/*
++			 * The daemon keeps the device name from a Complete
++			 * Local Name (0x09) and not from the shortened one
++			 * (0x08) this controller's scan responses carry
++			 * (measured 2026-11-21: the scan response for
++			 * C8:A6:EF says 0x08 "55...", the pane still draws
++			 * the address). Promote it.
++			 */
++			if (ad[adlen + 1] == 0x08) {
++				ad[adlen + 1] = 0x09;
++			}
++			adlen += 1 + elen;
++		}
++		/*
++		 * The daemon ignores the classic EIR name for a dual-mode
++		 * device (see mondrian_btctl_note_name). When this
++		 * advertisement has no name of its own, add the one the
++		 * inquiry carried, dropping trailing AD structures if the
++		 * 31-byte legacy payload needs the room.
++		 */
++		name = mondrian_btctl_find_name(p + 3);
++		if (name != NULL && !mondrian_btctl_ad_has_name(ad, adlen)) {
++			size_t nlen = strlen(name);
++
++			if (nlen > sizeof(ad) - 2) {
++				nlen = sizeof(ad) - 2;
++			}
++			while (adlen + 2 + nlen > sizeof(ad) && adlen > 0) {
++				size_t start = 0, pos = 0;
++
++				while (pos < adlen) {
++					size_t elen = ad[pos];
++
++					if (elen == 0 ||
++					    pos + 1 + elen > adlen) {
++						break;
++					}
++					start = pos;
++					pos += 1 + elen;
++				}
++				adlen = start;
++			}
++			if (adlen + 2 + nlen <= sizeof(ad)) {
++				ad[adlen++] = (uint8_t)(nlen + 1);
++				ad[adlen++] = 0x09;
++				bcopy(name, ad + adlen, nlen);
++				adlen += nlen;
++				if (mondrian_btctl.names_added < 8) {
++					mondrian_btctl.names_added++;
++					printf("MONDRIAN BTCTL: ext name"
++					    " %02x:%02x:%02x:%02x:%02x:%02x"
++					    " \"%s\"\n", p[8], p[7], p[6],
++					    p[5], p[4], p[3], name);
++				}
++			}
++		}
++		dlen = adlen;
 +		legacy = 0x00;
 +		if (p[0] & 0x08) {
 +			legacy = 0x04;
@@ -869,9 +1169,6 @@ index 0000000..963247f
 +			legacy = 0x03;
 +		} else if ((p[0] & 0x01) == 0) {
 +			legacy = 0x02;
-+		}
-+		if (dlen > 31) {
-+			dlen = 31;
 +		}
 +		room = 12 + dlen;
 +		if (used + 3 + room > cap) {
@@ -890,11 +1187,114 @@ index 0000000..963247f
 +		out[used + 6] = type;
 +		bcopy(p + 3, out + used + 7, 6);
 +		out[used + 13] = (uint8_t)dlen;
-+		bcopy(p + 24, out + used + 14, dlen);
++		bcopy(ad, out + used + 14, dlen);
 +		out[used + 14 + dlen] = p[13];
 +		used += 3 + room;
 +		p += 24 + p[23];
 +	}
++	return used;
++}
++
++/*
++ * Legacy advertising reports (subevent 0x02) come straight from the
++ * controller when the daemon asks for the legacy scan, and they carry the
++ * same AD structures. Apply the name bridge and rebuild the packet: adding
++ * the name changes the event length, which the poll path cannot do in place.
++ */
++static size_t
++mondrian_btctl_legacy_rewrite(const uint8_t *pkt, size_t total, uint8_t *out,
++    size_t cap)
++{
++	const uint8_t *p = pkt + 5;
++	size_t num, i, used = 4;
++
++	if (total < 6) {
++		return 0;
++	}
++	num = pkt[4];
++	out[0] = 0x04;
++	out[1] = 0x3e;
++	out[3] = pkt[4];
++	for (i = 0; i < num; i++) {
++		size_t dlen, adlen = 0;
++		uint8_t ad[31];
++		const char *name;
++
++		if ((size_t)(p - pkt) + 9 > total) {
++			return 0;
++		}
++		dlen = p[8];
++		if ((size_t)(p - pkt) + 9 + dlen + 1 > total) {
++			return 0;
++		}
++		while (adlen < dlen) {
++			size_t elen = p[9 + adlen];
++
++			if (elen == 0) {
++				if (adlen + 1 <= sizeof(ad)) {
++					ad[adlen++] = 0;
++				}
++				break;
++			}
++			if (adlen + 1 + elen > sizeof(ad)) {
++				break;
++			}
++			bcopy(p + 9 + adlen, ad + adlen, 1 + elen);
++			if (ad[adlen + 1] == 0x08) {
++				ad[adlen + 1] = 0x09;
++			}
++			adlen += 1 + elen;
++		}
++		name = mondrian_btctl_find_name(p + 2);
++		if (name != NULL && !mondrian_btctl_ad_has_name(ad, adlen)) {
++			size_t nlen = strlen(name);
++
++			if (nlen > sizeof(ad) - 2) {
++				nlen = sizeof(ad) - 2;
++			}
++			while (adlen + 2 + nlen > sizeof(ad) && adlen > 0) {
++				size_t start = 0, pos = 0;
++
++				while (pos < adlen) {
++					size_t elen = ad[pos];
++
++					if (elen == 0 ||
++					    pos + 1 + elen > adlen) {
++						break;
++					}
++					start = pos;
++					pos += 1 + elen;
++				}
++				adlen = start;
++			}
++			if (adlen + 2 + nlen <= sizeof(ad)) {
++				ad[adlen++] = (uint8_t)(nlen + 1);
++				ad[adlen++] = 0x09;
++				bcopy(name, ad + adlen, nlen);
++				adlen += nlen;
++				if (mondrian_btctl.names_added < 8) {
++					mondrian_btctl.names_added++;
++					printf("MONDRIAN BTCTL: ext name"
++					    " %02x:%02x:%02x:%02x:%02x:%02x"
++					    " \"%s\"\n", p[7], p[6], p[5],
++					    p[4], p[3], p[2], name);
++				}
++			}
++		}
++		if (used + 9 + adlen + 1 > cap) {
++			return 0;
++		}
++		out[used++] = p[0];
++		out[used++] = p[1];
++		bcopy(p + 2, out + used, 6);
++		used += 6;
++		out[used++] = (uint8_t)adlen;
++		bcopy(ad, out + used, adlen);
++		used += adlen;
++		out[used++] = p[9 + dlen];
++		p += 9 + dlen + 1;
++	}
++	out[2] = (uint8_t)(used - 3);
 +	return used;
 +}
 +
@@ -1052,6 +1452,17 @@ index 0000000..963247f
 +			    out + out_len, sizeof(out) - out_len);
 +			if (used == 0) {
 +				mondrian_btctl.rx_dropped++;
++			}
++		} else if (pkt[0] == 0x04 && pkt[1] == 0x3e && total >= 7 &&
++		    pkt[3] == 0x02) {
++			used = mondrian_btctl_legacy_rewrite(pkt, total,
++			    out + out_len, sizeof(out) - out_len);
++			if (used == 0) {
++				if (out_len + total > sizeof(out)) {
++					break;
++				}
++				bcopy(pkt, out + out_len, total);
++				used = total;
 +			}
 +		} else {
 +			if (out_len + total > sizeof(out)) {

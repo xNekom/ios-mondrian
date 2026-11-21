@@ -4,7 +4,14 @@
 # injected names, the daemon's name replies (kCBMsgArgName) and the decoded
 # LE/classic names.
 #
+# The pane is opened through LaunchServices (bt-pane-open.sh), not by tapping
+# the Settings icon: the icon's position moves between boots and a tap on the
+# wrong pixel is indistinguishable from a pane that never opened.
+#
 # Usage: bt-name-check.sh [WAIT]
+#   WAIT      seconds to let the pane scan (default 30)
+#   BT_ROW=1  also tap the Bluetooth row at 720,1118 after opening (use when
+#             the URL lands on Settings' root instead of the pane)
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 RING="python3 tools/usb-ring.py"
@@ -14,9 +21,12 @@ bash tools/wsl/attach.sh || exit 1
 $RING bl 1024 >/dev/null 2>&1
 $RING swipe 720 2800 720 1000 250 >/dev/null
 $RING wait 4 >/dev/null
-$RING tap 206 754 >/dev/null
-$RING wait 6 >/dev/null
-$RING tap 720 1118 >/dev/null
+bash tools/wsl/bt-pane-open.sh 10 >/dev/null 2>&1
+$RING screen out/bt-name-settings.png >/dev/null
+if [ "${BT_ROW:-0}" = 1 ]; then
+	$RING tap 720 1118 >/dev/null
+	$RING wait 4 >/dev/null
+fi
 $RING wait "$WAIT" >/dev/null
 $RING screen out/bt-name-check.png >/dev/null
 $RING dump out/bt-name-check.txt >/dev/null
