@@ -1104,14 +1104,30 @@ variant aborted SpringBoard in a loop (sig 6, libc++abi terminate) because the
 `mondrian-open` thread is not the main thread.
 
 Measured 2026-11-21: with the UI up, the Control Center (swipe from the top-right)
-draws its modules, but the connectivity module's backdrop is a cyan corrupted
-block that changes shape between opens, and the media module's next button shows
-a smaller blue blob in one open. SpringBoard creates 1440 x 3200
-`0x77333072` (`w30r`) surfaces with bpr 5888 while the Center is open, next to
-the BGRA ones at bpr 5760. The home screen and Settings (BGRA) draw clean, so
-the defect is in the pass that *samples* a wide-color surface as the module
-material, not in drawing it as the wallpaper. Next: the GL shim's
-material/backdrop pass and its texture format for `w30r`.
+draws its modules, and one state corrupts the left column — the connectivity
+platter and the two below it — with a sheared blue/cyan block that survives new
+frames. The trigger is the backdrop: opened over the home screen or over
+Settings' root the sheet is clean on every open; opened over Settings > Bluetooth
+the block is there every time. It is not the wallpaper (turning
+`/private/var/vm/mondrian-nowallpaper` off leaves it) and not the sheet's own
+blur (the background around the block is the correct blurred pane). The tree
+dump names the platters' shared capture: each `MTMaterialView` is an
+`MTMaterialLayer` with `groupName ControlCenterModuleBackground.modules`, while
+the sheet background is `...modulesBackground` and draws correctly. The place
+trace (`/private/var/vm/mondrian-gl-place`) shows what the platter samples: the
+module capture is a 218 x 267 target that CoreAnimation's own programs 3 and 46
+fill from the whole 1440 x 3200 screen, not from the platter's rectangle, so the
+block is a sheared, magnified piece of the pane. Clearing the group name is not
+the fix: it cleans most of the live sheet but a reopened one is corrupted again,
+and MaterialKit never calls `setGroupName:` after the first build, so the name is
+not the lever. The next probe is the capture texture and the texture-size
+uniform CoreAnimation's filters receive from the shim (`set_texture_size()` in
+`tools/gpu/eagl.c`), not the layer tree. Do not walk the raw layer tree from the
+Control Center pass: it runs on the main thread and a full `sublayers` walk there
+froze the sheet at its blurred background on a second open (measured the same
+day, main thread idle in `CFRunLoopRunSpecific` afterwards). The media module's
+next button also shows a blue blob in some opens and the correct double arrow in
+others.
 
 The idle path had a second cause and it was ours. Until `0342` the driver
 painted the framebuffer black when the blank fired, and the wake lived inside

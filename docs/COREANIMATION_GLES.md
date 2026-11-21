@@ -81,10 +81,13 @@ the order they were paid for:
   own window and, dimmed, under the App Library's cards, which is what the empty capture group
   was supposed to show. The library's backdrop and the wrong-label half of this are in
   `docs/UI_PERFORMANCE.md`.
-- **The Control Center shows that poster through its sheet.** The sheet's `MTMaterialView`
-  spans the whole window (480x1067 pt, measured from the view tree), so the bright bokeh in its
-  lower third is the poster's content, not a band in the material, and the home screen behind it
-  is a different, plain gradient. Fixing that look means fixing the wallpaper, not the backdrop.
+- **The Control Center's module platters share a backdrop capture.** The sheet's
+  own background (`...modulesBackground`) draws the blurred screen correctly;
+  the module platters' shared capture (`ControlCenterModuleBackground.modules`)
+  comes out as a sheared fragment of the pane when the sheet opens over
+  Settings > Bluetooth, and is clean over the home screen. The capture trace and
+  the levers already ruled out are in `docs/UI_PERFORMANCE.md`; it is not the
+  poster.
 
 The rest of this file is the design. CoreAnimation draws through Mesa into the display's IOSurface
 with no copy; the no-copy path below is what does it.
