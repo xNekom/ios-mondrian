@@ -653,6 +653,14 @@ boot each, so the three columns differ only in what changed:
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
   `0402` injects it into every app in `/Applications`, so Settings gets the
   bridge without the hook's interposers.
+- **Control Center draws, and its sliders show no thumb (2026-11-22).** A swipe
+  from the top-right corner over the home screen draws every module, the
+  brightness capsule's white fill included, and the volume capsule at about
+  half opacity with no fill -- the look iOS gives a volume control with no audio
+  route, which is this port's state. Neither capsule shows a round knob, so
+  compare a second open and a frame captured mid-drag before reading that as a
+  missing layer: the module materials are the ones the 0402 submission-order
+  bug used to corrupt.
 - **The missing knob is not reproduced on the Settings switches (2026-11-21).**
   `tools/wsl/ui-switch-audit.sh 1240 848` on Airplane Mode and `1240 480` on
   the Bluetooth pane both draw the white knob in the off and the on state, and
