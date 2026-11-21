@@ -11411,12 +11411,31 @@ mondrian_cc_dump(id view, unsigned depth)
 		    sel_registerName("alpha"));
 		CGRect f = ((CGRect (*)(id, SEL))objc_msgSend)(view,
 		    sel_registerName("frame"));
-		char line[192];
+		id layer = mondrian_send(view, "layer");
+		const char *lname = layer != nil ? object_getClassName(layer) : "-";
+		const char *group = "-";
+		char line[256];
 
+		/*
+		 * The module platters that draw garbage capture a named group
+		 * instead of the screen behind them: the group is the handle the
+		 * repair below needs, so the dump names it.
+		 */
+		if (layer != nil &&
+		    [layer respondsToSelector:sel_registerName("groupName")]) {
+			id g = mondrian_send(layer, "groupName");
+
+			if (g != nil && [g isKindOfClass:objc_getClass("NSString")]) {
+				group = [(NSString *)g UTF8String];
+				if (group == NULL) {
+					group = "-";
+				}
+			}
+		}
 		snprintf(line, sizeof(line),
-		    "MONDRIAN CC %u %s %.0f,%.0f %.0fx%.0f h%d a%.2f\n",
+		    "MONDRIAN CC %u %s %.0f,%.0f %.0fx%.0f h%d a%.2f layer %s group %s\n",
 		    depth, name != NULL ? name : "?", f.origin.x, f.origin.y,
-		    f.size.width, f.size.height, hidden ? 1 : 0, alpha);
+		    f.size.width, f.size.height, hidden ? 1 : 0, alpha, lname, group);
 		say(line);
 		mondrian_cc_dump_lines++;
 	}
@@ -11427,6 +11446,19 @@ mondrian_cc_dump(id view, unsigned depth)
 	}
 }
 
+/*
+ * The sheet's module platters share one backdrop capture, named
+ * `ControlCenterModuleBackground.modules` (from the dump above; the sheet's own
+ * background is `...modulesBackground` and it draws its blur correctly). Over
+ * the Bluetooth pane that shared capture comes out as a sheared, magnified
+ * fragment of the pane -- the cyan block the panel shows -- while the media
+ * column beside it stays clean (measured 2026-11-21; the sheet opens clean over
+ * the home screen and Settings' root, so the capture is there and its content
+ * is what goes wrong). Clearing the name is not the fix: the live clear cleans
+ * most of the sheet, a reopened one is corrupted again, and MaterialKit never
+ * calls `setGroupName:` after the fact. See docs/UI_PERFORMANCE.md for the
+ * capture trace; the next lever is the capture texture, not the group.
+ */
 static void
 mondrian_cc_main_pass(void)
 {
