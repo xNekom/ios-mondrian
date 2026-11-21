@@ -3045,6 +3045,329 @@ bluetooth_power_once(void)
 }
 
 /*
+ * The software keyboard's geometry, on demand.
+ *
+ * The panel is 480x1066 pt, and the keyboard lays its ten-key row out for 480
+ * pt correctly: the keys measure 42 pt wide on a 48 pt pitch (measured
+ * 2026-11-21 on Spotlight's keyboard). The row is nevertheless drawn about 35
+ * pt too far right, so its last column is clipped by the screen. That number
+ * is the whole question: a 480-pt plane inside a wider window, a plane offset
+ * inside a 480-pt window, or a window offset in a scene that is not the
+ * screen. `mondrianwin=1` cannot answer it -- it dumps 100 s into every
+ * process, and it cannot be aimed at the moment the keyboard is up -- so this
+ * one is asked for with a file. Rewrite /private/var/vm/mondrian-kbd and each
+ * hooked process prints its screen, its window list, and the view tree of any
+ * window whose class says keyboard with every frame in window coordinates.
+ *
+ * The print is on the main queue: UIKit's screen and window accessors belong to
+ * the main thread and raise from another one (the same reason the screen
+ * report is queued).
+ */
+static void
+mondrian_kbd_walk(id view, unsigned depth, unsigned *lines)
+{
+	char line[256];
+	CGRect rect;
+	const char *name;
+	NSArray *kids;
+	unsigned count, i;
+	BOOL hidden;
+	CGFloat alpha;
+
+	if (view == nil || depth > 8 || *lines >= 80) {
+		return;
+	}
+	rect = ((CGRect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+	rect = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(view,
+	    sel_registerName("convertRect:toView:"), rect, nil);
+	name = object_getClassName(view);
+	hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view, sel_registerName("isHidden"));
+	alpha = ((CGFloat (*)(id, SEL))objc_msgSend)(view, sel_registerName("alpha"));
+	snprintf(line, sizeof(line),
+	    "MONDRIAN KBD: %*s%s %.1f,%.1f %.1fx%.1f hid %d a %.2f\n",
+	    (int)(depth * 2), "", name != NULL ? name : "?", rect.origin.x,
+	    rect.origin.y, rect.size.width, rect.size.height, hidden, alpha);
+	say(line);
+	(*lines)++;
+	kids = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	if (kids == nil) {
+		return;
+	}
+	count = (unsigned)[(NSArray *)kids count];
+	for (i = 0; i < count; i++) {
+		mondrian_kbd_walk([(NSArray *)kids objectAtIndex:i], depth + 1, lines);
+	}
+}
+
+/*
+ * The rendered side. The keyboard is a scene another process owns, so the
+ * frames inside it are not in this process's UIKit tree; what is here is the
+ * layer host and the layer it presents. Its bounds say which point space the
+ * keyboard was drawn for, and a host wider than the screen with the content
+ * centred in it is the clipped column's cause.
+ */
+typedef struct {
+	CGFloat top;
+	CGFloat left;
+	CGFloat bottom;
+	CGFloat right;
+} mondrian_kbd_insets;
+
+static void
+mondrian_kbd_layers(id view)
+{
+	char line[224];
+	id layer;
+	NSArray *sublayers;
+	CGRect bounds, frame;
+	unsigned count, i;
+
+	layer = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("layer"));
+	if (layer == nil) {
+		return;
+	}
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("bounds"));
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("frame"));
+	snprintf(line, sizeof(line),
+	    "MONDRIAN KBD: layer %s b %.1fx%.1f f %.1f,%.1f %.1fx%.1f\n",
+	    object_getClassName(layer), bounds.size.width, bounds.size.height,
+	    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height);
+	say(line);
+	sublayers = ((id (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("sublayers"));
+	if (sublayers == nil) {
+		return;
+	}
+	count = (unsigned)[(NSArray *)sublayers count];
+	snprintf(line, sizeof(line), "MONDRIAN KBD: sublayers %u\n", count);
+	say(line);
+	for (i = 0; i < count && i < 8; i++) {
+		id sub = [(NSArray *)sublayers objectAtIndex:i];
+
+		bounds = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+		    sel_registerName("bounds"));
+		frame = ((CGRect (*)(id, SEL))objc_msgSend)(sub,
+		    sel_registerName("frame"));
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KBD: sub %u %s b %.1fx%.1f f %.1f,%.1f"
+		    " %.1fx%.1f\n", i, object_getClassName(sub),
+		    bounds.size.width, bounds.size.height, frame.origin.x,
+		    frame.origin.y, frame.size.width, frame.size.height);
+		say(line);
+	}
+}
+
+static void
+mondrian_kbd_find(id view, unsigned depth, id *best, CGFloat *best_area)
+{
+	const char *name;
+	NSArray *kids;
+	unsigned count, i;
+
+	if (view == nil || depth > 14) {
+		return;
+	}
+	name = object_getClassName(view);
+	if (name != NULL && strstr(name, "Keyboard") != NULL) {
+		CGRect rect = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("bounds"));
+
+		rect = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(view,
+		    sel_registerName("convertRect:toView:"), rect, nil);
+		if (rect.size.width * rect.size.height > *best_area) {
+			*best_area = rect.size.width * rect.size.height;
+			*best = view;
+		}
+	}
+	kids = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	if (kids == nil) {
+		return;
+	}
+	count = (unsigned)[(NSArray *)kids count];
+	for (i = 0; i < count; i++) {
+		mondrian_kbd_find([(NSArray *)kids objectAtIndex:i], depth + 1,
+		    best, best_area);
+	}
+}
+
+/*
+ * The window list is not where the keyboard's layout lives: the visible one is
+ * a subtree of a text-effects window in the process that owns the field, and
+ * the only window that names itself keyboard is a hidden Medusa leftover. Find
+ * the view and print the chain from its window down, then its own tree; the
+ * offset is in that chain and nowhere else.
+ */
+static void
+mondrian_keyboard_dump(void)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	Class screen_cls = objc_getClass("UIScreen");
+	id screen, app, windows, found, chain[20];
+	CGRect bounds, native, rect;
+	double scale;
+	unsigned count, i, n, lines = 0;
+	char line[256];
+
+	if (!mondrian_file_on("/private/var/vm/mondrian-kbd")) {
+		return;
+	}
+	@try {
+		screen = screen_cls != Nil ?
+		    ((id (*)(id, SEL))objc_msgSend)((id)screen_cls,
+		    sel_registerName("mainScreen")) : nil;
+		if (screen != nil) {
+			bounds = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+			    sel_registerName("bounds"));
+			native = ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+			    sel_registerName("nativeBounds"));
+			scale = ((double (*)(id, SEL))objc_msgSend)(screen,
+			    sel_registerName("scale"));
+			snprintf(line, sizeof(line),
+			    "MONDRIAN KBD: screen %.1fx%.1f native %.0fx%.0f"
+			    " scale %.2f\n", bounds.size.width,
+			    bounds.size.height, native.size.width,
+			    native.size.height, scale);
+			say(line);
+		}
+		app = app_cls != Nil ?
+		    ((id (*)(id, SEL))objc_msgSend)((id)app_cls,
+		    sel_registerName("sharedApplication")) : nil;
+		windows = app != nil ? ((id (*)(id, SEL))objc_msgSend)(app,
+		    sel_registerName("windows")) : nil;
+		if (windows == nil) {
+			return;
+		}
+		count = (unsigned)[(NSArray *)windows count];
+		snprintf(line, sizeof(line), "MONDRIAN KBD: windows %u\n", count);
+		say(line);
+		for (i = 0; i < count && i < 20; i++) {
+			id window = [(NSArray *)windows objectAtIndex:i];
+			const char *name = object_getClassName(window);
+
+			bounds = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+			    sel_registerName("bounds"));
+			snprintf(line, sizeof(line),
+			    "MONDRIAN KBD: win %u %s %.1fx%.1f b %.1fx%.1f\n",
+			    i, name != NULL ? name : "?", bounds.size.width,
+			    bounds.size.height, bounds.size.width,
+			    bounds.size.height);
+			say(line);
+			{
+				CGFloat best_area = 0.0;
+
+				found = nil;
+				mondrian_kbd_find(window, 0, &found, &best_area);
+			}
+			if (found == nil) {
+				continue;
+			}
+			n = 0;
+			for (; found != nil && n < 20; found = ((id (*)(id, SEL))
+			    objc_msgSend)(found, sel_registerName("superview"))) {
+				chain[n++] = found;
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN KBD: chain %u in win %u\n", n, i);
+			say(line);
+			for (; n > 0; n--) {
+				id view = chain[n - 1];
+				mondrian_kbd_insets inset =
+				    ((mondrian_kbd_insets (*)(id, SEL))
+				    objc_msgSend)(view,
+				    sel_registerName("safeAreaInsets"));
+
+				rect = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+				    sel_registerName("bounds"));
+				rect = ((CGRect (*)(id, SEL, CGRect, id))
+				    objc_msgSend)(view,
+				    sel_registerName("convertRect:toView:"),
+				    rect, nil);
+				snprintf(line, sizeof(line),
+				    "MONDRIAN KBD: %*s%s %.1f,%.1f"
+				    " %.1fx%.1f sa %.1f,%.1f,%.1f,%.1f\n",
+				    (int)((20 - n) * 2), "",
+				    object_getClassName(view), rect.origin.x,
+				    rect.origin.y, rect.size.width,
+				    rect.size.height, inset.top, inset.left,
+				    inset.bottom, inset.right);
+				say(line);
+			}
+			mondrian_kbd_layers(chain[0]);
+			mondrian_kbd_walk(chain[0], 0, &lines);
+			break;
+		}
+	} @catch (NSException *e) {
+		say("MONDRIAN KBD: skipped (exception)\n");
+	}
+}
+
+/*
+ * The frame UIKit tells the host the keyboard will take. A host whose layer is
+ * 480 wide but whose notification says 550, or one whose plane draws 35 pt in
+ * from the edge of a frame it was given at 0, are two different bugs and this
+ * one line separates them. Registered only when the marker is present, so an
+ * ordinary boot logs nothing new.
+ */
+static void
+mondrian_kbd_observe(void)
+{
+	static int registered;
+
+	if (registered) {
+		return;
+	}
+	registered = 1;
+	[[NSNotificationCenter defaultCenter] addObserverForName:
+	    @"UIKeyboardWillChangeFrameNotification" object:nil
+	    queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+		NSDictionary *info = [note userInfo];
+		NSValue *begin = [info objectForKey:
+		    @"UIKeyboardFrameBeginUserInfoKey"];
+		NSValue *end = [info objectForKey:@"UIKeyboardFrameEndUserInfoKey"];
+		CGRect b = CGRectZero, e = CGRectZero;
+		char line[224];
+
+		if (begin != nil) {
+			[begin getValue:&b];
+		}
+		if (end != nil) {
+			[end getValue:&e];
+		}
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KBD: note begin %.1f,%.1f %.1fx%.1f end"
+		    " %.1f,%.1f %.1fx%.1f\n", b.origin.x, b.origin.y,
+		    b.size.width, b.size.height, e.origin.x, e.origin.y,
+		    e.size.width, e.size.height);
+		say(line);
+	}];
+}
+
+static void
+keyboard_probe_once(void)
+{
+	static long long seen;
+	struct stat st;
+	long long now;
+
+	if (stat("/private/var/vm/mondrian-kbd", &st) != 0) {
+		return;
+	}
+	now = (long long)st.st_mtimespec.tv_sec * 1000000000LL +
+	    (long long)st.st_mtimespec.tv_nsec;
+	if (now == seen) {
+		return;
+	}
+	seen = now;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		mondrian_kbd_observe();
+		mondrian_keyboard_dump();
+	});
+}
+
+/*
  * The heartbeat stops after a minute; a test can be uploaded at any time, so
  * the run file gets a watcher of its own that never stops asking. It costs one
  * open() every two seconds and says nothing unless it has something to run.
@@ -3058,6 +3381,7 @@ run_watcher(void *unused)
 		mondrian_run_once();
 		bluetooth_power_once();
 		bluetooth_open_pane();
+		keyboard_probe_once();
 	}
 	return NULL;
 }
@@ -16923,10 +17247,10 @@ mondrian_sec_probe(void)
 
 /*
  * Opening an app from the host. A synthetic touch is delivered (the kernel logs
- * it) but the home screen's icon view does not act on it, and the keyboard's hit
- * areas are not where its glyphs are drawn, so neither can be scripted into
- * opening Photos. This watches a switch and asks SpringBoard's own workspace,
- * which is the entry an icon press ends in.
+ * it) but the home screen's icon view does not act on it, so an icon cannot be
+ * scripted into opening Photos -- Spotlight's field can be, and a tapped key
+ * types its key (measured 2026-11-21). This watches a switch and asks
+ * SpringBoard's own workspace, which is the entry an icon press ends in.
  * Switch: /private/var/vm/mondrian-open, holding the bundle id. Every rewrite
  * of the file -- even with the same identifier -- is a new request, so the host
  * unlocks first and then asks, and the same boot can open several apps.
