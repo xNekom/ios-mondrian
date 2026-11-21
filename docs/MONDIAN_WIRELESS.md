@@ -848,13 +848,26 @@ when the socket is readable, so the command times out anyway (measured
 `mondrian_btctl_send` (`0399`) recognises these commands and replies with
 `ctl_enqueuedata`, which makes the socket readable: 0xfce9 and 0xfce2 get a
 success (0xfce2 carries two zero bytes, the smallest payload the Broadcom
-parser accepts, as the 0x15 case in `tools/mondrian-bt.c` showed). 0x200b is
-answered with success every time and never reaches the controller: the
-controller keeps whatever scan parameters it already has, and BR/EDR inquiry --
-what discovery uses -- does not depend on the command. 0x200c is answered for
-both values: the controller refuses the enable and the disable alike in this
-state, so the LE scan control the daemon sees is virtual and the controller
-keeps its own.
+parser accepts, as the 0x15 case in `tools/mondrian-bt.c` showed).
+
+`LE Set Scan Parameters` (0x200b) and `LE Set Scan Enable` (0x200c) are
+forwarded to the controller and its refusal is rewritten to success on the way
+back. The WCN7850 answers both with 0x0c "command disallowed" in every state
+measured 2026-11-21 (four enables, three disables and the parameter command, 11
+refusals over 79 s), and the stack treats the refusal as fatal, which is why
+they used to be answered in the kernel. Forwarding keeps the real status in the
+log (`0x200b refused 0xc, reported success`) and lets the daemon continue; the
+legacy pair still does not scan, so `scan le meta` stays 0 and no LE report
+reaches the device list.
+
+The extended pair works. A probe in `qca_boot`
+(`/private/var/vm/bt-ext-probe`) sends 0x2041 and 0x2042 and both complete with
+status 0, and the controller then delivers an LE meta event (`04 3e 47`). Its
+LE features carry bit 12 (extended advertising), so the hardware scans; the
+daemon uses the legacy pair because `enableExtendedScanHCI` is 0 in its
+init-time report (`enableBTSpecAdvertisingSets=... enableExtendedScanHCI=%d`).
+That is the remaining bridge: translate the daemon's legacy scan commands and
+the extended reports in the control, or make the daemon take the extended path.
 
 Measured 2026-11-21 after that: one `bluetoothd` pid for the whole minute,
 zero `exit bluetoothd`, `0x200b answered` and `0x200c enable` and `0x200c
@@ -878,17 +891,15 @@ SIGKILL the test itself sent. Control Center's Bluetooth button is separate: on
 iOS 16 it only stops new connections ("New Bluetooth connections have been
 turned off from Control Center") and keeps the pid.
 
-The list shows the address, not the device name. Measured 2026-11-21: a
-connection carries five `0x2f` events (Inquiry Result with RSSI, the EIR form,
-so `Write_Inquiry_Mode` 2 is in effect), and no `0x0419` (Remote Name Request)
-appears among the 64 packets the control can log. The LE reports are outside
-that window too, and LE Set Scan Parameters (0x200b) is the command the
-controller refuses with 0x0c while it is scanning, while the extended form
-(0x202f/0x2031) is accepted. The control therefore counts, for the whole
-connection, LE meta events, advertising and scan-response reports, inquiry
-results, name requests and both scan-enable forms, and prints the first bytes
-of the first reports: that separates a name the daemon never receives from one
-it receives and drops.
+The list shows the address, not the device name. Measured 2026-11-21: the
+controller returns `0x2f` (Inquiry Result with RSSI) events whose EIR carries
+names (`0d 09 45 63 68 6f ...` = "Echo Dot-8PD"), the pane still draws the
+address, and the daemon asks the client for nothing extra; in another
+connection it sends one Remote Name Request (`name req 1`) with 10 parameter
+bytes for a command whose layout is 11, and no completion arrives. The client
+does ask for the name (`kCBMsgIdDeviceGetNameMsg`, six times), so the loss is
+between the HCI event and the device object, not in the row. LE is the path
+that would fill names for modern devices, which is why the scan above matters.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
