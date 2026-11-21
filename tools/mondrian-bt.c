@@ -83,6 +83,8 @@ extern CFPropertyListRef _CFPreferencesCopyAppValue(CFStringRef key,
 
 extern const char *xpc_dictionary_get_string(xpc_object_t dictionary,
     const char *key);
+extern uint64_t xpc_dictionary_get_uint64(xpc_object_t dictionary,
+    const char *key);
 extern xpc_object_t xpc_dictionary_create(const char *const *keys,
     xpc_object_t *values, size_t count);
 extern void xpc_dictionary_set_int64(xpc_object_t dictionary, const char *key,
@@ -923,6 +925,138 @@ bt_name_report(const uint8_t *pkt, size_t len)
  * 04 0e <len> <num> <opcode lo> <opcode hi> <status>; an Inquiry Result is
  * 04 2f <len> <num> <addr> <page scan> ... and carries the EIR name.
  */
+/*
+ * Remote names, bridged onto the daemon's device events. The controller
+ * answers Remote Name Request with the peer's name, but bluetoothd keeps it
+ * in its own stack object: the device event it sends the client carries the
+ * address and an empty name, so the pane draws the address. Remember every
+ * successful 0x07 and add the name to any outgoing dictionary that names that
+ * address, which is the same bridge the control uses for EIR names.
+ */
+#define BT_RNR_NAMES 8
+
+struct bt_rnr_name {
+	uint8_t addr[6];
+	char name[48];
+};
+
+static struct bt_rnr_name bt_rnr_names[BT_RNR_NAMES];
+static unsigned bt_rnr_count;
+
+static void
+bt_rnr_store(const uint8_t *pkt, size_t len)
+{
+	char text[48];
+	size_t at, used = 0;
+	unsigned slot;
+
+	if (len < 11 || pkt[3] != 0) {
+		return;
+	}
+	for (at = 10; at < len && used < sizeof(text) - 1; at++) {
+		unsigned char c = pkt[at];
+
+		if (c == 0) {
+			break;
+		}
+		text[used++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+	}
+	text[used] = '\0';
+	if (used == 0) {
+		return;
+	}
+	slot = bt_rnr_count % BT_RNR_NAMES;
+	memcpy(bt_rnr_names[slot].addr, pkt + 4, 6);
+	snprintf(bt_rnr_names[slot].name, sizeof(bt_rnr_names[slot].name),
+	    "%s", text);
+	bt_rnr_count++;
+	bt_power_append("rnr.name[%d] %02x:%02x:%02x:%02x:%02x:%02x %s\n",
+	    getpid(), pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], text);
+}
+
+static const char *
+bt_rnr_lookup(const char *addr)
+{
+	unsigned b[6], i, slot;
+
+	if (addr == NULL) {
+		return NULL;
+	}
+	if (sscanf(addr, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3],
+	    &b[4], &b[5]) != 6) {
+		return NULL;
+	}
+	for (slot = 0; slot < BT_RNR_NAMES && slot < bt_rnr_count; slot++) {
+		for (i = 0; i < 6; i++) {
+			if (bt_rnr_names[slot].addr[i] != (uint8_t)b[5 - i]) {
+				break;
+			}
+		}
+		if (i == 6) {
+			return bt_rnr_names[slot].name;
+		}
+	}
+	return NULL;
+}
+
+static char bt_last_name[48];
+static int bt_last_valid;
+
+static void
+bt_name_bridge(xpc_object_t message)
+{
+	const char *addr, *name;
+	uint64_t result;
+
+	if (message == NULL) {
+		return;
+	}
+	{
+		char *description = xpc_copy_description(message);
+
+		if (description == NULL) {
+			return;
+		}
+		if (strstr(description, "<dictionary:") == NULL) {
+			free(description);
+			return;
+		}
+		free(description);
+	}
+	addr = xpc_dictionary_get_string(message, "kCBMsgArgAddressString");
+	if (addr != NULL) {
+		name = bt_rnr_lookup(addr);
+		if (name == NULL) {
+			return;
+		}
+		xpc_dictionary_set_string(message, "kCBMsgArgName", name);
+		snprintf(bt_last_name, sizeof(bt_last_name), "%s", name);
+		bt_last_valid = 1;
+		bt_power_append("name.inject[%d] %s %s\n", getpid(), addr,
+		    name);
+		return;
+	}
+	/*
+	 * The client then asks for the name by itself and the daemon answers
+	 * result 212 with an empty string, which is what leaves the row on the
+	 * address even after the device event carried the name. That reply has
+	 * no address; it follows the resolved device, so fill it from the last
+	 * name and turn the result into success.
+	 */
+	name = xpc_dictionary_get_string(message, "kCBMsgArgName");
+	if (name == NULL || name[0] != '\0' || !bt_last_valid) {
+		return;
+	}
+	result = xpc_dictionary_get_uint64(message, "kCBMsgArgResult");
+	if (result != 212) {
+		return;
+	}
+	xpc_dictionary_set_string(message, "kCBMsgArgName", bt_last_name);
+	xpc_dictionary_set_int64(message, "kCBMsgArgResult", 0);
+	bt_power_append("name.reply[%d] %s\n", getpid(), bt_last_name);
+	bt_last_valid = 0;
+}
+
 static void
 bt_event_report(const uint8_t *pkt, size_t len)
 {
@@ -993,6 +1127,7 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		bt_power_append("rnr complete status %#x "
 		    "%02x:%02x:%02x:%02x:%02x:%02x \"%s\"\n", pkt[3],
 		    pkt[9], pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], text);
+		bt_rnr_store(pkt, len);
 		return;
 	}
 	if (len >= 10 && pkt[1] == 0x17) {
@@ -1647,6 +1782,7 @@ my_xpc_send(xpc_connection_t connection, xpc_object_t message)
 		    interposed_real((const void *)my_xpc_send);
 	}
 	log_connection("oneway", connection);
+	bt_name_bridge(message);
 	log_xpc_payload("oneway", (id)message);
 	log_message("oneway", message, "kMsgId");
 	log_description("out", message);
@@ -2767,6 +2903,8 @@ my_ble_should(id self, SEL _cmd)
 	return result;
 }
 
+static id stack_controller;
+
 static void (*original_xpc_listener)(id, SEL, id);
 static void (*original_remote_event)(id, SEL, id, id);
 
@@ -2776,17 +2914,13 @@ log_xpc_in(const char *what, xpc_object_t message)
 	static unsigned count;
 	char *description;
 
-	if (message == NULL || count >= 60) {
+	if (message == NULL || count >= 200) {
 		return;
 	}
 	description = xpc_copy_description(message);
 	if (description == NULL) {
 		return;
 	}
-	/*
-	 * The pane's tap becomes a request on this side; the outgoing reply is
-	 * already logged, and the missing half is what the client asked for.
-	 */
 	count++;
 	bt_power_append("xpc.in[%d] %s %.900s\n", getpid(), what,
 	    description);
@@ -2825,7 +2959,7 @@ my_xpc_message(id self, SEL _cmd, id message)
 {
 	static unsigned hits;
 
-	if (hits < 8) {
+	if (hits < 200) {
 		hits++;
 		bt_power_append("xpc.hit[%d] message %p class %s\n", getpid(),
 		    message, message != NULL ?
@@ -2842,7 +2976,7 @@ my_xpc_request(id self, SEL _cmd, id message, id handler)
 {
 	static unsigned hits;
 
-	if (hits < 8) {
+	if (hits < 200) {
 		hits++;
 		bt_power_append("xpc.hit[%d] request %p class %s\n", getpid(),
 		    message, message != NULL ?
@@ -2985,6 +3119,121 @@ my_pairing_completed(id self, SEL _cmd, id device, long result)
 	}
 }
 
+/*
+ * Pairing client registration. The controller raises 0x33 but no prompt
+ * reaches the client, so the question is whether SpringBoard's connection is
+ * registered with this controller at all: addPairingClient:error: is where a
+ * client that can answer prompts enters, and pairingContinueWithPairingInfo:
+ * is where the answer comes back.
+ */
+/*
+ * Pairing client registration. The controller raises 0x33 but
+ * addPairingClient:error: is never called, so no client can receive the
+ * prompt. The daemon keeps the activated CBConnection for the app in
+ * -activatedConnection; register that object with the stack controller after
+ * the activation goes through, and let the controller's own prompt path run.
+ */
+/*
+ * The daemon's message dispatcher. xpcReceivedMessage: and
+ * xpcReceivedRequest: never fire for the pane's requests, so the entry the
+ * daemon actually uses has to be this one: it is the only method that pairs a
+ * message with the remote device. Log the tag and payload here.
+ */
+static void (*original_xpc_remote_recv)(id, SEL, id, id);
+
+static void
+my_xpc_remote_recv(id self, SEL _cmd, id message, id device)
+{
+	log_xpc_payload("recv", message);
+	if (original_xpc_remote_recv != NULL) {
+		original_xpc_remote_recv(self, _cmd, message, device);
+	}
+}
+
+static void (*original_xpc_conn_activate)(id, SEL, id);
+
+static void
+my_xpc_conn_activate(id self, SEL _cmd, id message)
+{
+	id connection = nil;
+
+	if (original_xpc_conn_activate != NULL) {
+		original_xpc_conn_activate(self, _cmd, message);
+	}
+	connection = ((id (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("activatedConnection"));
+	if (connection == nil) {
+		bt_power_append("pair.reg[%d] no activatedConnection\n", getpid());
+		return;
+	}
+	if (stack_controller == nil) {
+		bt_power_append("pair.reg[%d] no stack controller\n", getpid());
+		return;
+	}
+	{
+		id error = nil;
+		BOOL ok = ((BOOL (*)(id, SEL, id, id *))objc_msgSend)(
+		    stack_controller, sel_registerName("addPairingClient:error:"),
+		    connection, &error);
+
+		bt_power_append("pair.reg[%d] %s -> %d err %p\n", getpid(),
+		    class_getName(object_getClass(connection)), (int)ok, error);
+	}
+}
+
+static BOOL (*original_add_pairing_client)(id, SEL, id, id *);
+static BOOL (*original_pairing_continue)(id, SEL, id, id *);
+
+static BOOL
+my_add_pairing_client(id self, SEL _cmd, id client, id *error)
+{
+	BOOL result = NO;
+	id description = nil;
+	const char *text = "(nil)";
+
+	if (client != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(client,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("pair.client[%d] add %s: %.400s\n", getpid(),
+	    client != nil ? class_getName(object_getClass(client)) : "(nil)",
+	    text != NULL ? text : "(nil)");
+	if (original_add_pairing_client != NULL) {
+		result = original_add_pairing_client(self, _cmd, client, error);
+	}
+	bt_power_append("pair.client[%d] add result %d\n", getpid(),
+	    (int)result);
+	return result;
+}
+
+static BOOL
+my_pairing_continue(id self, SEL _cmd, id info, id *error)
+{
+	BOOL result = NO;
+	id description = nil;
+	const char *text = "(nil)";
+
+	if (info != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(info,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("pair.cont[%d] %.600s\n", getpid(),
+	    text != NULL ? text : "(nil)");
+	if (original_pairing_continue != NULL) {
+		result = original_pairing_continue(self, _cmd, info, error);
+	}
+	bt_power_append("pair.cont[%d] result %d\n", getpid(), (int)result);
+	return result;
+}
+
 static id (*original_get_devices)(id, SEL, unsigned long, id *);
 static void (*original_perform_request)(id, SEL, id, id, id);
 
@@ -3072,6 +3321,22 @@ hook_controller_requests(void)
 		bt_log("ctl.hook: _pairingPromptWithBTDevice: %s\n",
 		    method_getTypeEncoding(method));
 	}
+	method = own_method(cls, "addPairingClient:error:");
+	if (method != NULL) {
+		bt_log("ctl.hook: addPairingClient:error: %s\n",
+		    method_getTypeEncoding(method));
+		original_add_pairing_client = (BOOL (*)(id, SEL, id, id *))
+		    method_setImplementation(method,
+		    (IMP)my_add_pairing_client);
+	}
+	method = own_method(cls, "pairingContinueWithPairingInfo:error:");
+	if (method != NULL) {
+		bt_log("ctl.hook: pairingContinueWithPairingInfo:error: %s\n",
+		    method_getTypeEncoding(method));
+		original_pairing_continue = (BOOL (*)(id, SEL, id, id *))
+		    method_setImplementation(method,
+		    (IMP)my_pairing_continue);
+	}
 	method = own_method(cls, "_pairingCompletedWithBTDevice:result:");
 	if (method != NULL) {
 		original_pairing_completed = (void (*)(id, SEL, id, long))
@@ -3098,6 +3363,21 @@ hook_xpc_connection(void)
 	if (cls == Nil) {
 		bt_log("xpc.hook: no CBDaemonXPCConnection\n");
 		return;
+	}
+	method = own_method(cls, "_xpcReceivedMessage:remoteDevice:");
+	if (method != NULL) {
+		bt_log("xpc.hook: _xpcReceivedMessage:remoteDevice: %s\n",
+		    method_getTypeEncoding(method));
+		original_xpc_remote_recv = (void (*)(id, SEL, id, id))
+		    method_setImplementation(method, (IMP)my_xpc_remote_recv);
+	}
+	method = own_method(cls, "_xpcCBConnectionActivate:");
+	if (method != NULL) {
+		bt_log("xpc.hook: _xpcCBConnectionActivate: %s\n",
+		    method_getTypeEncoding(method));
+		original_xpc_conn_activate = (void (*)(id, SEL, id))
+		    method_setImplementation(method,
+		    (IMP)my_xpc_conn_activate);
 	}
 	method = own_method(cls, "xpcReceivedMessage:");
 	if (method != NULL) {
@@ -3289,7 +3569,6 @@ hook_server_entry(void)
 	}
 }
 
-static id stack_controller;
 
 static long
 controller_power_state(void)
@@ -3454,6 +3733,11 @@ runtime_dump(void *context)
 		 * connection object, not on the server: its methods are where the
 		 * incoming message and the reply are paired.
 		 */
+		{	Class cls = objc_getClass("CBConnection");
+			if (cls != Nil) {
+				dump_all_methods(cls);
+			}
+		}
 		{	Class cls = objc_getClass("CBDaemonXPCConnection");
 			if (cls != Nil) {
 				dump_all_methods(cls);
