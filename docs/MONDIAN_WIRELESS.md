@@ -984,7 +984,14 @@ Creating a `CBConnection` with `alloc`/`init` and registering that with
 `addPairingClient:error:` was tried and restart-loops bluetoothd (the pid
 climbed 1646 -> 1650 -> 1658 within a minute); the object only exists through
 `initWithXPCObject:error:` from the app's activation message. The fix has to
-produce that activation, not synthesize the agent. The phone shows no passkey dialog and the PC shows no
+produce that activation, not synthesize the agent.
+
+A clean test (SpringBoard restarted, no "Pairing Unsuccessful" dialog, one tap
+on the row) still shows no client message before the connect: with the
+Get Controller Info and Update Identities polls filtered out of the incoming
+log, the last packets before `hci req 0405` are the scan's Inquiry Result and
+the daemon's own device events. The connect follows discovery, so the
+pairing request does not come from the tap. The phone shows no passkey dialog and the PC shows no
 prompt either; after the third notification the controller disconnects with
 reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
 phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
