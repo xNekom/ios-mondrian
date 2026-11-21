@@ -3191,6 +3191,69 @@ my_xpc_conn_activate(id self, SEL _cmd, id message)
 	}
 }
 
+/*
+ * Auto-connect gate. The daemon connects to the PC right after the Inquiry
+ * Result, without any client message, and the SSP prompt then has no client.
+ * Log every connect and, when the bt-noconnect marker exists, refuse it so a
+ * manual tap can be observed on its own.
+ */
+/*
+ * The real CBConnection. connectDevice: never fires, so the pane's connect
+ * takes connectWithCBConnection:completionHandler: with the object the app
+ * created. That object is initialized from the XPC message, so registering it
+ * as the pairing client is the step the daemon is missing; it cannot crash
+ * the way a synthesized CBConnection did.
+ */
+static void (*original_connect_cb)(id, SEL, id, id);
+
+static void
+my_connect_cb(id self, SEL _cmd, id connection, id handler)
+{
+	id error = nil;
+
+	bt_power_append("ctl.cb[%d] connect %s %p\n", getpid(),
+	    connection != nil ?
+	    class_getName(object_getClass(connection)) : "(nil)", connection);
+	if (connection != nil && stack_controller != nil) {
+		BOOL ok = ((BOOL (*)(id, SEL, id, id *))objc_msgSend)(
+		    stack_controller, sel_registerName("addPairingClient:error:"),
+		    connection, &error);
+
+		bt_power_append("ctl.cb[%d] register %d err %p\n", getpid(),
+		    (int)ok, error);
+	}
+	if (original_connect_cb != NULL) {
+		original_connect_cb(self, _cmd, connection, handler);
+	}
+}
+
+static BOOL (*original_connect_device)(id, SEL, id, unsigned long,
+    unsigned long, id *);
+
+static BOOL
+my_connect_device(id self, SEL _cmd, id device, unsigned long connection_flags,
+    unsigned long service_flags, id *error)
+{
+	id description = nil;
+	const char *text = "(nil)";
+
+	if (device != nil) {
+		description = ((id (*)(id, SEL))objc_msgSend)(device,
+		    sel_registerName("description"));
+	}
+	if (description != nil) {
+		text = ((const char *(*)(id, SEL))objc_msgSend)(description,
+		    sel_registerName("UTF8String"));
+	}
+	bt_power_append("ctl.connect[%d] flags %lu/%lu %.300s\n", getpid(),
+	    connection_flags, service_flags, text != NULL ? text : "(nil)");
+	if (original_connect_device != NULL) {
+		return original_connect_device(self, _cmd, device,
+		    connection_flags, service_flags, error);
+	}
+	return NO;
+}
+
 static BOOL (*original_add_pairing_client)(id, SEL, id, id *);
 static BOOL (*original_pairing_continue)(id, SEL, id, id *);
 
@@ -3330,6 +3393,22 @@ hook_controller_requests(void)
 		    (IMP)my_pairing_prompt);
 		bt_log("ctl.hook: _pairingPromptWithBTDevice: %s\n",
 		    method_getTypeEncoding(method));
+	}
+	method = own_method(cls, "connectWithCBConnection:completionHandler:");
+	if (method != NULL) {
+		bt_log("ctl.hook: connectWithCBConnection: %s\n",
+		    method_getTypeEncoding(method));
+		original_connect_cb = (void (*)(id, SEL, id, id))
+		    method_setImplementation(method, (IMP)my_connect_cb);
+	}
+	method = own_method(cls, "connectDevice:connectionFlags:serviceFlags:"
+	    "error:");
+	if (method != NULL) {
+		bt_log("ctl.hook: connectDevice: %s\n",
+		    method_getTypeEncoding(method));
+		original_connect_device = (BOOL (*)(id, SEL, id, unsigned long,
+		    unsigned long, id *))method_setImplementation(method,
+		    (IMP)my_connect_device);
 	}
 	method = own_method(cls, "addPairingClient:error:");
 	if (method != NULL) {
