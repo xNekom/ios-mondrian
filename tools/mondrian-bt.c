@@ -180,6 +180,65 @@ bt_log(const char *fmt, ...)
 	write(STDERR_FILENO, line, len);
 }
 
+/*
+ * Why a run ends is invisible in the main log: `logged_lines` stops the
+ * diagnostics and the daemon restarts every ~16 s, so only the first packets
+ * of a run survive. Keep the last few HCI writes and reads instead and print
+ * them inside the exit report, which is written by the `_exit` interposer
+ * before the process goes away. The packet that ends a run is then always in
+ * that report, which is the one file that outlives the restart.
+ */
+#define BT_RING_DEPTH 16
+
+struct bt_ring_entry {
+	uint8_t data[32];
+	size_t len;
+};
+
+static struct bt_ring_entry bt_tx_ring[BT_RING_DEPTH];
+static struct bt_ring_entry bt_rx_ring[BT_RING_DEPTH];
+static unsigned bt_tx_ring_pos;
+static unsigned bt_rx_ring_pos;
+
+static void
+bt_ring_record(struct bt_ring_entry *ring, unsigned *pos, const void *buf,
+    size_t len)
+{
+	struct bt_ring_entry *entry = &ring[*pos % BT_RING_DEPTH];
+
+	memset(entry, 0, sizeof(*entry));
+	entry->len = len < sizeof(entry->data) ? len : sizeof(entry->data);
+	memcpy(entry->data, buf, entry->len);
+	(*pos)++;
+}
+
+static void
+bt_ring_dump(const char *what, const struct bt_ring_entry *ring, unsigned pos)
+{
+	unsigned count = pos < BT_RING_DEPTH ? pos : BT_RING_DEPTH;
+	unsigned first = pos < BT_RING_DEPTH ? 0 : pos % BT_RING_DEPTH;
+	unsigned i;
+	unsigned k;
+	char line[200];
+	int n;
+
+	for (i = 0; i < count; i++) {
+		const struct bt_ring_entry *entry =
+		    &ring[(first + i) % BT_RING_DEPTH];
+
+		n = snprintf(line, sizeof(line), "%s %zu:", what, entry->len);
+		for (k = 0; k < entry->len && n > 0 &&
+		    n < (int)sizeof(line) - 4; k++) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n,
+			    " %02x", entry->data[k]);
+		}
+		if (n > 0 && n < (int)sizeof(line) - 1) {
+			snprintf(line + n, sizeof(line) - (size_t)n, "\n");
+			bt_log("%s", line);
+		}
+	}
+}
+
 static const char *const interesting[] = {
 	"Bluetooth", "bluetooth", "transport", "Transport", "HCI", "restart",
 	"Switch", "switch", "failed", "Failed", "error", "Error", "driver",
@@ -716,6 +775,9 @@ my_read(int fd, void *buf, size_t len)
 		}
 		bt_log("hci read %zu of %zu:%s\n", produced, len, text);
 	}
+	if (produced > 0) {
+		bt_ring_record(bt_rx_ring, &bt_rx_ring_pos, buf, produced);
+	}
 	return (ssize_t)produced;
 }
 
@@ -749,6 +811,7 @@ my_write(int fd, const void *buf, size_t len)
 	const uint8_t *p = buf;
 
 	if (fd == control_socket_fd && control_socket_fd >= 0) {
+		bt_ring_record(bt_tx_ring, &bt_tx_ring_pos, buf, len);
 		if (len >= 4 && p[0] == 0x01 && p[1] == 0x5b &&
 		    p[2] == 0x0c) {
 			static const uint8_t complete[] = {
@@ -1111,15 +1174,39 @@ bt_std_string(const char *what, uintptr_t value)
 void
 bt_report_exit(int status, uintptr_t r19, uintptr_t r20)
 {
+	int fd;
+
 	if (status == 0) {
 		return;
 	}
+	/*
+	 * The main log is truncated on every start, so a run's report is gone
+	 * before it can be read: the daemon leaves about every 16 s. Append the
+	 * exit report to its own file instead; this runs once, at exit, so it
+	 * does not disturb the run's log.
+	 */
+	fd = open("/private/var/mobile/Library/Preferences/mondrian-bt-exit.log",
+	    O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd >= 0) {
+		dup2(fd, STDOUT_FILENO);
+		dup2(fd, STDERR_FILENO);
+		if (fd > STDERR_FILENO) {
+			close(fd);
+		}
+	}
+	/*
+	 * The logger stops after `logged_lines`; the report is what has to be
+	 * written late in a run, when that counter is exhausted.
+	 */
+	logged_lines = 0;
 	bt_log("_exit(%d) x19=0x%lx x20=0x%lx\n", status,
 	    (unsigned long)r19, (unsigned long)r20);
 	bt_string("x19", r19);
 	bt_std_string("x19", r19);
 	bt_string("x20", r20);
 	bt_backtrace("exit");
+	bt_ring_dump("last tx", bt_tx_ring, bt_tx_ring_pos);
+	bt_ring_dump("last rx", bt_rx_ring, bt_rx_ring_pos);
 }
 
 /*
@@ -2644,7 +2731,7 @@ mondrian_bt_init(void)
 	if (sysctlbyname("kern.boottime", &boot, &boot_len, NULL, 0) != 0) {
 		boot.tv_sec = 0;
 	}
-	bt_log("init v62 %s uid %d log \"%s\" boot %ld inherited \"%s\" "
+	bt_log("init v63 %s uid %d log \"%s\" boot %ld inherited \"%s\" "
 	    "transport \"%s\" baud \"%s\" port %d\n",
 	    executable,
 	    getuid(),

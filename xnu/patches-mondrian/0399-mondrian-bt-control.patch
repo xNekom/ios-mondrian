@@ -81,7 +81,7 @@ new file mode 100644
 index 0000000..9c9d16c
 --- /dev/null
 +++ b/bsd/dev/mondrian_btctl.c
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,481 @@
 +/*
 + * com.mondrian.btuart: the HCI control bluetoothd's POSIX driver opens.
 + *
@@ -142,6 +142,12 @@ index 0000000..9c9d16c
 +	int active;
 +	int tx_logged;
 +	int rx_logged;
++	unsigned tx_packets;
++	unsigned tx_fails;
++	unsigned rx_packets;
++	uint64_t opened;
++	uint64_t last_tx;
++	uint64_t last_rx;
 +} mondrian_btctl;
 +
 +static void mondrian_btctl_poll(thread_call_param_t, thread_call_param_t);
@@ -165,7 +171,9 @@ index 0000000..9c9d16c
 +    void **unitinfo)
 +{
 +	int error;
++	char name[64];
 +
++	proc_name(proc_pid(current_proc()), name, sizeof(name));
 +	lck_mtx_lock(&mondrian_btctl_lock);
 +	if (mondrian_btctl.active) {
 +		lck_mtx_unlock(&mondrian_btctl_lock);
@@ -176,6 +184,12 @@ index 0000000..9c9d16c
 +	mondrian_btctl.unit = sac->sc_unit;
 +	mondrian_btctl.tx_logged = 0;
 +	mondrian_btctl.rx_logged = 0;
++	mondrian_btctl.tx_packets = 0;
++	mondrian_btctl.tx_fails = 0;
++	mondrian_btctl.rx_packets = 0;
++	mondrian_btctl.last_tx = 0;
++	mondrian_btctl.last_rx = 0;
++	clock_get_uptime(&mondrian_btctl.opened);
 +	mondrian_btctl.active = 1;
 +	lck_mtx_unlock(&mondrian_btctl_lock);
 +
@@ -187,7 +201,8 @@ index 0000000..9c9d16c
 +		printf("MONDRIAN BTCTL: engine open failed %d\n", error);
 +		return error;
 +	}
-+	printf("MONDRIAN BTCTL: connected unit %u\n", mondrian_btctl.unit);
++	printf("MONDRIAN BTCTL: connected unit %u from %s pid %d\n",
++	    mondrian_btctl.unit, name, proc_pid(current_proc()));
 +	*unitinfo = &mondrian_btctl;
 +	mondrian_btctl_poll(NULL, NULL);
 +	return 0;
@@ -197,15 +212,39 @@ index 0000000..9c9d16c
 +mondrian_btctl_disconnect(__unused kern_ctl_ref kref, __unused uint32_t unit,
 +    __unused void *unitinfo)
 +{
++	uint64_t now = 0, opened = 0, last = 0, age_ns = 0, idle_ns = 0;
++	unsigned tx, fails, rx;
++
++	clock_get_uptime(&now);
 +	lck_mtx_lock(&mondrian_btctl_lock);
 +	mondrian_btctl.active = 0;
++	opened = mondrian_btctl.opened;
++	tx = mondrian_btctl.tx_packets;
++	fails = mondrian_btctl.tx_fails;
++	rx = mondrian_btctl.rx_packets;
++	last = mondrian_btctl.last_tx > mondrian_btctl.last_rx ?
++	    mondrian_btctl.last_tx : mondrian_btctl.last_rx;
 +	lck_mtx_unlock(&mondrian_btctl_lock);
-+	printf("MONDRIAN BTCTL: disconnected\n");
++	if (now > opened) {
++		absolutetime_to_nanoseconds(now - opened, &age_ns);
++	}
++	if (last != 0 && now > last) {
++		absolutetime_to_nanoseconds(now - last, &idle_ns);
++	}
++	/*
++	 * One line per connection: the daemon leaves and reopens the control
++	 * about every 16 s (docs/MONDIAN_WIRELESS.md), and whether the close
++	 * follows a failed write or an idle socket decides the fix.
++	 */
++	printf("MONDRIAN BTCTL: disconnected tx %u fail %u rx %u "
++	    "age %llu ms idle %llu ms\n", tx, fails, rx,
++	    (unsigned long long)(age_ns / 1000000ull),
++	    (unsigned long long)(idle_ns / 1000000ull));
 +	return 0;
 +}
 +
 +static errno_t
-+mondrian_btctl_send(__unused kern_ctl_ref kref, __unused uint32_t unit,
++mondrian_btctl_send(kern_ctl_ref kref, uint32_t unit,
 +    __unused void *unitinfo, mbuf_t m, __unused int flags)
 +{
 +	mbuf_t head = m;
@@ -218,15 +257,141 @@ index 0000000..9c9d16c
 +		if (len == 0) {
 +			continue;
 +		}
++		/*
++		 * BD_VSC_OLYMPIC_*: the WCN7850 has no Olympian vendor
++		 * commands and answers "unknown command" (status 1), and the
++		 * stack treats the failed
++		 * BT_VSC_OLYMPIC_SET_RETAIN_LE_SCAN_DUPLICATES_ON_START as
++		 * fatal: bluetoothd calls _exit(1) about 16 s into every run
++		 * and launchd restarts it, which re-initialises the controller
++		 * and drops the discovered-device list (measured 2026-11-21,
++		 * the exit report names the command).
++		 *
++		 * The user-space shim cannot answer these: its injected reply
++		 * sits in its own buffer until the daemon calls read() again,
++		 * and the daemon is waiting on a dispatch source that only
++		 * fires when the socket is readable -- so the command times out
++		 * anyway. ctl_enqueuedata makes the socket readable, which is
++		 * why the completion is made here. The Olympics only tune
++		 * Broadcom firmware behaviour, so a successful completion
++		 * leaves the controller's own defaults in place; the 0xfce2
++		 * family carries two zero bytes, the smallest payload the
++		 * Broadcom parser accepts (the 0x15 case in
++		 * tools/mondrian-bt.c measured it).
++		 */
++		if (len >= 3 && data[0] == 0x01 && data[2] == 0xfc &&
++		    (data[1] == 0xe9 || data[1] == 0xe2)) {
++			static const uint8_t olympic[] = {
++				0x04, 0x0e, 0x04, 0x01, 0xe9, 0xfc, 0x00
++			};
++			static const uint8_t apple[] = {
++				0x04, 0x0e, 0x06, 0x01, 0xe2, 0xfc, 0x00, 0x00,
++				0x00
++			};
++
++			if (mondrian_btctl.tx_logged <
++			    MONDRIAN_BTCTL_LOG_PACKETS) {
++				mondrian_btctl.tx_logged++;
++				mondrian_btctl_dump("tx", data,
++				    (int)MIN(len, (size_t)24));
++			}
++			printf("MONDRIAN BTCTL: vsc %02x/%02x answered\n",
++			    data[1], len > 4 ? data[4] : 0);
++			(void) ctl_enqueuedata(kref, unit,
++			    data[1] == 0xe9 ? olympic : apple,
++			    data[1] == 0xe9 ? sizeof(olympic) : sizeof(apple),
++			    0);
++			mondrian_btctl.tx_packets++;
++			clock_get_uptime(&mondrian_btctl.last_tx);
++			total += (int)len;
++			continue;
++		}
++		/*
++		 * 0x200b (LE Set Scan Parameters) is refused with "command
++		 * disallowed" (0x0c) while the controller is scanning, and the
++		 * stack treats that refusal as fatal: the last write before
++		 * `_exit(1)` is this command and its completion carries 0x0c
++		 * (measured 2026-11-21 with the shim's packet ring). The refusal
++		 * is not only a reconfiguration: it is also the first 0x200b of
++		 * a fresh daemon, so the controller's scan state outlives the
++		 * daemon's HCI Reset. Apple's Broadcom firmware accepts the
++		 * command while scanning; the WCN7850 does not. Answer it here
++		 * with success and leave the controller's parameters in place
++		 * instead of ending the daemon. BR/EDR inquiry -- what
++		 * discovery uses -- does not depend on this command.
++		 */
++		if (len >= 4 && data[0] == 0x01 && data[1] == 0x0b &&
++		    data[2] == 0x20) {
++			static const uint8_t complete[] = {
++				0x04, 0x0e, 0x04, 0x01, 0x0b, 0x20, 0x00
++			};
++
++			if (mondrian_btctl.tx_logged <
++			    MONDRIAN_BTCTL_LOG_PACKETS) {
++				mondrian_btctl.tx_logged++;
++				mondrian_btctl_dump("tx", data,
++				    (int)MIN(len, (size_t)24));
++			}
++			printf("MONDRIAN BTCTL: 0x200b answered\n");
++			(void) ctl_enqueuedata(kref, unit, complete,
++			    sizeof(complete), 0);
++			mondrian_btctl.tx_packets++;
++			clock_get_uptime(&mondrian_btctl.last_tx);
++			total += (int)len;
++			continue;
++		}
++		/*
++		 * 0x200c (LE Set Scan Enable): the controller refuses both
++		 * values with "command disallowed" (0x0c) -- the enable right
++		 * after 0x200b, and the disable at the end of the discovery
++		 * cycle (measured 2026-11-21: each run's last write is one of
++		 * them and the completion carries 0x0c). The LE scan control is
++		 * therefore virtual: the daemon is told each request succeeded
++		 * and the controller keeps whatever state it has. BR/EDR inquiry
++		 * is untouched and that is what fills the device list.
++		 */
++		if (len >= 5 && data[0] == 0x01 && data[1] == 0x0c &&
++		    data[2] == 0x20) {
++			static const uint8_t complete[] = {
++				0x04, 0x0e, 0x04, 0x01, 0x0c, 0x20, 0x00
++			};
++
++			if (mondrian_btctl.tx_logged <
++			    MONDRIAN_BTCTL_LOG_PACKETS) {
++				mondrian_btctl.tx_logged++;
++				mondrian_btctl_dump("tx", data,
++				    (int)MIN(len, (size_t)24));
++			}
++			printf("MONDRIAN BTCTL: 0x200c %s answered\n",
++			    data[4] ? "enable" : "disable");
++			(void) ctl_enqueuedata(kref, unit, complete,
++			    sizeof(complete), 0);
++			mondrian_btctl.tx_packets++;
++			clock_get_uptime(&mondrian_btctl.last_tx);
++			total += (int)len;
++			continue;
++		}
 +		if (mondrian_btctl.tx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {
 +			mondrian_btctl.tx_logged++;
 +			mondrian_btctl_dump("tx", data,
 +			    (int)MIN(len, (size_t)24));
 +		}
-+		if (mondrian_btuart_tty_write(data, len) < 0) {
-+			m_freem(head);
-+			return EIO;
++		{
++			int written = mondrian_btuart_tty_write(data, len);
++
++			if (written < 0) {
++				mondrian_btctl.tx_fails++;
++				if (mondrian_btctl.tx_fails <= 4) {
++					printf("MONDRIAN BTCTL: write failed %d"
++					    " after %lu bytes\n", written,
++					    (unsigned long)len);
++				}
++				m_freem(head);
++				return EIO;
++			}
 +		}
++		mondrian_btctl.tx_packets++;
++		clock_get_uptime(&mondrian_btctl.last_tx);
 +		total += (int)len;
 +	}
 +	m_freem(head);
@@ -340,6 +505,8 @@ index 0000000..9c9d16c
 +
 +		n = mondrian_btuart_tty_read(buf, cap);
 +		if (n > 0) {
++			mondrian_btctl.rx_packets++;
++			clock_get_uptime(&mondrian_btctl.last_rx);
 +			if (mondrian_btctl.rx_logged < MONDRIAN_BTCTL_LOG_PACKETS) {
 +				mondrian_btctl.rx_logged++;
 +				mondrian_btctl_dump("rx", buf,
