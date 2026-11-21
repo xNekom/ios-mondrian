@@ -645,6 +645,8 @@ inject_event(const uint8_t *event, size_t len)
 	inject_len = len;
 }
 
+static void bt_name_feed(const uint8_t *buf, size_t len);
+
 static ssize_t
 my_read(int fd, void *buf, size_t len)
 {
@@ -808,8 +810,131 @@ my_read(int fd, void *buf, size_t len)
 	}
 	if (produced > 0) {
 		bt_ring_record(bt_rx_ring, &bt_rx_ring_pos, buf, produced);
+		bt_name_feed(buf, produced);
 	}
 	return (ssize_t)produced;
+}
+
+/*
+ * What reaches the daemon is the control's legacy report stream; the name it
+ * carries is the whole question behind the empty kCBMsgArgName reply. Walk
+ * the same H4 stream the daemon reads and log every advertising name in it,
+ * so the next probe can say whether the name is missing from the wire or is
+ * being dropped by the daemon's cache.
+ */
+static uint8_t name_pkt[300];
+static size_t name_pkt_len, name_pkt_need;
+static int name_pkt_state;
+
+static void
+bt_name_report(const uint8_t *pkt, size_t len)
+{
+	const uint8_t *p = pkt + 5;
+	size_t num, i;
+
+	if (len < 7 || pkt[1] != 0x3e || pkt[3] != 0x02) {
+		return;
+	}
+	num = pkt[4];
+	for (i = 0; i < num; i++) {
+		size_t dlen, ad;
+		const uint8_t *addr;
+		char name[32];
+		size_t nlen = 0;
+
+		if ((size_t)(p - pkt) + 10 > len) {
+			return;
+		}
+		dlen = p[8];
+		if ((size_t)(p - pkt) + 10 + dlen > len) {
+			return;
+		}
+		addr = p + 2;
+		for (ad = 0; ad < dlen && nlen == 0; ) {
+			size_t elen = p[9 + ad];
+
+			if (elen == 0 || ad + 1 + elen > dlen) {
+				break;
+			}
+			if ((p[10 + ad] == 0x08 || p[10 + ad] == 0x09) &&
+			    elen > 1) {
+				nlen = elen - 1;
+				if (nlen > sizeof(name) - 1) {
+					nlen = sizeof(name) - 1;
+				}
+				memcpy(name, p + 11 + ad, nlen);
+				name[nlen] = 0;
+			}
+			ad += 1 + elen;
+		}
+		if (nlen > 0) {
+			bt_power_append("adv name %02x:%02x:%02x:%02x:%02x:%02x"
+			    " \"%s\"\n", addr[5], addr[4], addr[3], addr[2],
+			    addr[1], addr[0], name);
+		}
+		{
+			static unsigned seen;
+			char hex[64];
+			size_t k, used = 0;
+
+			if (seen < 10) {
+				seen++;
+				hex[0] = 0;
+				for (k = 0; k < dlen && k < 8; k++) {
+					int w = snprintf(hex + used,
+					    sizeof(hex) - used, " %02x",
+					    p[9 + k]);
+
+					if (w <= 0 ||
+					    (size_t)w >= sizeof(hex) - used) {
+						break;
+					}
+					used += (size_t)w;
+				}
+				bt_power_append("le report #%u type 0x%02x"
+				    " %02x:%02x:%02x:%02x:%02x:%02x dlen %zu:%s\n",
+				    seen - 1, p[0], addr[5], addr[4], addr[3],
+				    addr[2], addr[1], addr[0], dlen, hex);
+			}
+		}
+		p += 10 + dlen;
+	}
+}
+
+static void
+bt_name_feed(const uint8_t *buf, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		uint8_t b = buf[i];
+
+		if (name_pkt_state == 0) {
+			if (b == 0x04) {
+				name_pkt[0] = b;
+				name_pkt_len = 1;
+				name_pkt_need = 0;
+				name_pkt_state = 1;
+			}
+			continue;
+		}
+		if (name_pkt_len >= sizeof(name_pkt)) {
+			name_pkt_state = 0;
+			continue;
+		}
+		name_pkt[name_pkt_len++] = b;
+		if (name_pkt_state == 1 && name_pkt_len == 2 &&
+		    name_pkt[1] != 0x3e) {
+			name_pkt_state = 0;
+		} else if (name_pkt_state == 1 && name_pkt_len == 3) {
+			name_pkt_need = 3 + (size_t)name_pkt[2];
+			name_pkt_state = name_pkt_need >= 4 ? 2 : 0;
+		} else if (name_pkt_state == 2 &&
+		    name_pkt_len >= name_pkt_need) {
+			bt_name_report(name_pkt, name_pkt_len);
+			name_pkt_state = 0;
+		}
+	}
 }
 
 static void
@@ -1998,6 +2123,9 @@ own_method(Class cls, const char *name)
  */
 static void (*original_device_found)(id, SEL, id);
 static void (*original_classic_found)(id, SEL, id);
+static void (*original_ble_found)(id, SEL, id);
+static void (*original_monitor_found)(id, SEL, id);
+static void (*original_whb_found)(id, SEL, id);
 static unsigned devices_logged;
 
 static BOOL
@@ -2065,6 +2193,33 @@ my_classic_found(id self, SEL _cmd, id device)
 }
 
 static void
+my_ble_found(id self, SEL _cmd, id device)
+{
+	log_device_found("bleDeviceFound", device);
+	if (original_ble_found != NULL) {
+		original_ble_found(self, _cmd, device);
+	}
+}
+
+static void
+my_monitor_found(id self, SEL _cmd, id device)
+{
+	log_device_found("monitorDeviceFound", device);
+	if (original_monitor_found != NULL) {
+		original_monitor_found(self, _cmd, device);
+	}
+}
+
+static void
+my_whb_found(id self, SEL _cmd, id device)
+{
+	log_device_found("whbDiscoveryDeviceFound", device);
+	if (original_whb_found != NULL) {
+		original_whb_found(self, _cmd, device);
+	}
+}
+
+static void
 hook_device_found(void)
 {
 	Class cls = objc_getClass("CBDaemonServer");
@@ -2084,6 +2239,47 @@ hook_device_found(void)
 		original_classic_found = (void (*)(id, SEL, id))
 		    method_setImplementation(method, (IMP)my_classic_found);
 		bt_log("dev.hook: _stackClassicScannerDeviceFound: replaced\n");
+	}
+	method = own_method(cls, "_stackBLEScannerDeviceFound:");
+	if (method != NULL) {
+		original_ble_found = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_ble_found);
+		bt_log("dev.hook: _stackBLEScannerDeviceFound: replaced\n");
+	}
+	method = own_method(cls, "_stackDeviceMonitorDeviceFound:");
+	if (method != NULL) {
+		original_monitor_found = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_monitor_found);
+		bt_log("dev.hook: _stackDeviceMonitorDeviceFound: replaced\n");
+	}
+	method = own_method(cls, "_whbDiscoveryDeviceFound:");
+	if (method != NULL) {
+		original_whb_found = (void (*)(id, SEL, id))
+		    method_setImplementation(method, (IMP)my_whb_found);
+		bt_log("dev.hook: _whbDiscoveryDeviceFound: replaced\n");
+	}
+	{
+		unsigned int count = 0, i;
+		Method *list = class_copyMethodList(cls, &count);
+
+		for (i = 0; i < count; i++) {
+			const char *name =
+			    sel_getName(method_getName(list[i]));
+
+			if (name == NULL) {
+				continue;
+			}
+			if (strstr(name, "Device") == NULL &&
+			    strstr(name, "device") == NULL &&
+			    strstr(name, "Found") == NULL &&
+			    strstr(name, "found") == NULL &&
+			    strstr(name, "Scan") == NULL &&
+			    strstr(name, "scan") == NULL) {
+				continue;
+			}
+			bt_power_append("dev.sel %s\n", name);
+		}
+		free(list);
 	}
 }
 
