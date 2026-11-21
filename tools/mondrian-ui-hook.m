@@ -2065,6 +2065,7 @@ static void
 mondrian_run_once(void)
 {
 	static char done[512];
+	static int primed;
 	char text[512], command[512];
 	char *argv[17];
 	posix_spawn_file_actions_t actions;
@@ -2078,6 +2079,11 @@ mondrian_run_once(void)
 	}
 	fd = open("/private/var/vm/mondrian-run", O_RDONLY);
 	if (fd < 0) {
+		/*
+		 * Nothing to prime: if the file was absent at first sight, the next
+		 * content is a request from the host, not a leftover.
+		 */
+		primed = 1;
 		return;
 	}
 	n = read(fd, text, sizeof(text) - 1);
@@ -2091,6 +2097,19 @@ mondrian_run_once(void)
 		text[--n] = '\0';
 	}
 	if (n == 0 || __builtin_strcmp(text, done) == 0) {
+		return;
+	}
+	/*
+	 * A marker left by an earlier boot is not a request. Measured 2026-11-21:
+	 * /private/var/vm/mondrian-run still held /private/var/vm/bt-power, which
+	 * no longer exists, and every SpringBoard start tried to spawn it (errno
+	 * 2). Prime from whatever the file holds at first sight, exactly like the
+	 * open marker; the host writes after the ring is up, so a real request
+	 * always differs.
+	 */
+	if (!primed) {
+		primed = 1;
+		(void)strlcpy(done, text, sizeof(done));
 		return;
 	}
 	(void)strlcpy(done, text, sizeof(done));
@@ -12110,6 +12129,33 @@ mondrian_threads_watch(void *unused)
 	return NULL;
 }
 
+/*
+ * The same dump, asked for from the host. The fixed sample times are a guess
+ * about when a wait forms, and a daemon whose first frame never arrives has no
+ * moment to guess: /private/var/vm/mondrian-thrprobe is written by the host and
+ * every new write is one dump. Used in the processes the fixed watch does not
+ * cover, `iconservicesagent` first (measured 2026-11-21: lsd waits on it
+ * forever while SpringBoard's main thread waits on lsd).
+ */
+static void *
+mondrian_threads_demand(void *unused)
+{
+	struct stat st;
+	struct timespec seen = { 0, 0 };
+
+	(void)unused;
+	for (;;) {
+		if (stat("/private/var/vm/mondrian-thrprobe", &st) == 0 &&
+		    (st.st_mtimespec.tv_sec != seen.tv_sec ||
+		    st.st_mtimespec.tv_nsec != seen.tv_nsec)) {
+			seen = st.st_mtimespec;
+			mondrian_dump_threads("demand");
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
 static void *
 mondrian_link_run(void *unused)
 {
@@ -14028,6 +14074,13 @@ mondrian_probe_launch(void)
  * One boot, two passes: the passive half at boot (file, launchd log, direct
  * spawn, workspace) and the process set every 15 s for five minutes, so a tap
  * made at any point is caught with the processes it created.
+ *
+ * Do not leave this on for a boot whose UI matters. Measured 2026-11-21:
+ * this thread's workspace call created SBLockScreenManager before UIApplication
+ * existed, SpringBoard raised "Unexpectedly created SBLockScreenManager before
+ * UIApplication instance was created", aborted (sig 6) and was relaunched --
+ * twice in one boot, with the abort stack ending in mondrian_launch_thread.
+ * The process table it prints is worth a dedicated boot, never a mixed one.
  */
 static void *
 mondrian_launch_thread(void *unused)
@@ -16853,6 +16906,34 @@ mondrian_open_thread(void *unused)
 	char last[160] = { 0 };
 
 	(void)unused;
+	/*
+	 * A marker left by an earlier boot is not a request. Measured 2026-11-21:
+	 * a stale /private/var/vm/mondrian-open made every SpringBoard start call
+	 * -[LSApplicationWorkspace openApplicationWithBundleID:], whose
+	 * synchronous LaunchServices call holds the _LSDatabase lock while
+	 * Control Center reads the same database on the main thread -- the panel
+	 * never drew and the main thread sat in __ulock_wait. Prime from whatever
+	 * the file holds now and let only a later change count. A repeated
+	 * identical request therefore needs a new value (a URL with a fresh
+	 * query, see below), which is the protocol the host already follows.
+	 */
+	{
+		struct stat st;
+		FILE *file;
+		char stale[160];
+
+		if (stat("/private/var/vm/mondrian-open", &st) == 0) {
+			seen = st.st_mtimespec;
+			file = fopen("/private/var/vm/mondrian-open", "r");
+			if (file != NULL) {
+				if (fgets(stale, sizeof(stale), file) != NULL) {
+					stale[strcspn(stale, "\r\n")] = '\0';
+					strlcpy(last, stale, sizeof(last));
+				}
+				fclose(file);
+			}
+		}
+	}
 	for (;;) {
 		struct stat st;
 		FILE *file;
@@ -17996,6 +18077,21 @@ static void
 mondrian_install_ui_hooks(void)
 {
 	console_fd = open("/dev/console", O_WRONLY | O_NOCTTY);
+	/*
+	 * The icons daemon is the one process whose own wait is invisible to the
+	 * fixed watch: it has no window yet, and lsd's only worker never returns
+	 * while it waits for this process to answer. The probe injection cannot
+	 * reach it (the hook takes the env slot first), so the dump lives here.
+	 */
+	if (getprogname() != NULL &&
+	    strcmp(getprogname(), "iconservicesagent") == 0) {
+		pthread_t demand;
+
+		if (pthread_create(&demand, NULL, mondrian_threads_demand,
+		    NULL) == 0) {
+			(void)pthread_detach(demand);
+		}
+	}
 	if (mondrian_file_on("/private/var/vm/bt-maps")) {
 		mondrian_dump_images();
 	}
@@ -18063,7 +18159,18 @@ mondrian_install_ui_hooks(void)
 	    (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0)) {
 		mondrian_install_privacy_hook();
 		mondrian_install_library_hook();
-		mondrian_tcc_status_probe();
+		/*
+		 * The status probe asks tccd for the real verdict, and on this port a
+		 * process tccd will not answer for waits forever: measured
+		 * 2026-11-21, iconservicesagent's constructor sat in
+		 * TCCAccessPreflight -> synchronous XPC to tccd, so the daemon never
+		 * reached its own main, lsd waited on it and SpringBoard's main
+		 * thread waited on lsd. It is a diagnostic; a marker keeps it out of
+		 * every boot.
+		 */
+		if (mondrian_file_on("/private/var/vm/mondrian-tccs")) {
+			mondrian_tcc_status_probe();
+		}
 		int fd = open("/private/var/vm/mondrian-ent", O_RDONLY);
 
 		if (fd < 0) {
