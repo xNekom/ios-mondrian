@@ -972,7 +972,14 @@ outgoing XPC message. `addPairingClient:error:` and
 `pairingContinueWithPairingInfo:error:` are never called either, and neither
 `_xpcCBConnectionActivate:` nor the `_xpc*` device handlers fire, so the app's
 request does not take the CBConnection path the daemon would register a
-pairing client from. The phone shows no passkey dialog and the PC shows no
+pairing client from. `CBConnection` is that client: it implements
+`pairingAgent:peerDidRequestPairing:type:passkey:`,
+`pairingAgent:peerDidCompletePairing:` and `pairingAgent:peerDidFailToCompletePairing:error:`,
+and `setPairingPromptHandler:`. The daemon has exactly four classes of its own
+(`CBDaemonServer`, `CBDaemonXPCConnection`, `CBStackControllerBTStack`,
+`CBConnection`), so there is no second connection class to hook. Pairing from
+the PC side does not help either: `DeviceInformation.Pairing.PairAsync()`
+returns `Failed` with `protection=None` for the phone's Bluetooth address. The phone shows no passkey dialog and the PC shows no
 prompt either; after the third notification the controller disconnects with
 reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
 phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
