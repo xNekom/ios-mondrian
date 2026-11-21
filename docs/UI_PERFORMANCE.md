@@ -653,6 +653,12 @@ boot each, so the three columns differ only in what changed:
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
   `0402` injects it into every app in `/Applications`, so Settings gets the
   bridge without the hook's interposers.
+- **The missing knob is not reproduced on the Settings switches (2026-11-21).**
+  `tools/wsl/ui-switch-audit.sh 1240 848` on Airplane Mode and `1240 480` on
+  the Bluetooth pane both draw the white knob in the off and the on state, and
+  the Bluetooth pane's switch keeps its knob after a full off/on cycle. The
+  0402 layer bridge is in effect in this boot; run the audit on the control a
+  report names before treating it as the same image-transfer failure.
 - **A respring must restart backboardd, not only SpringBoard.** Measured
   2026-11-21: `kill SpringBoard` alone leaves the new one at its boot spinner
   (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster` crash-loops
