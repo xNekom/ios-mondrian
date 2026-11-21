@@ -203,10 +203,45 @@ lock and leaves it all zero; the app never looks the surface up or locks it. The
 `CA::Render::Image::copy_cgimage()` (`+0x140bec`) only wraps in a bitmap context. That pointer is
 zero, so the loss is the image data the render server received, before any surface is involved.
 A layer whose `contents` is a filled IOSurface draws the picture, so `tools/mondrian-ui-hook.m`
-hands every CGImage of picture size to the layer as a surface (default; `mondrian-layercsurf-off`
-keeps the CGImage path for an A/B). A local WebKit page loads -- the
-host's HTTP server logs its icon GETs -- and still draws black, so the same server-side surface
-path keeps both the picture and the page off the glass.
+bridges a CGImage to a surface (default; `mondrian-layercsurf-off` keeps the CGImage path for an
+A/B). The bridge is not only for pictures: every element UIKit draws as an image travels that same
+road, and the floor it used to have (300x200 pixels) cost the small ones. Measured 2026-11-20 on the
+Settings list: the Airplane Mode row's switch drew its track (a plain colour layer, `bg 78788052`
+`corner 15.5`) and no knob, and the knob is a `UIImageView` of 43x43 pt whose layer holds a 129x129
+CGImage -- under the floor, so the CGImage kept the broken road and the ring shows
+`MONDRIAN SURF: backboardd create ... 129x129 fmt 0x0 ... size 81920` right after the app built it.
+The bridge now converts every CGImage of 4x4 or more, pads the surface row to 16 bytes so any width
+works, and is built as a dylib of its own (`tools/mondrian-layer-bridge.m`) because the hook carries
+the services' sixteen dyld interposers; `0402` injects that dylib into every process whose exec path
+starts with `/Applications/`, so Settings carries the bridge and none of the hook
+(`mondrian_ui_hook=1286`). The app match has to use the whole path
+(`cn_pnbuf`): by the time the environment is copied, `cn_nameptr` points at the
+last component, so a `strncmp(name, "/Applications/")` never matches an app --
+which is why the first 0402 boot injected nothing and said nothing.
+
+Substituting the surface for the picture has a second edge: UIKit reads a layer's `contents`
+back and expects the CGImage it put there. Measured 2026-11-21, opening Settings
+asserted in `-[_UIImageCGImageContent _initWithCGImageSource:CGImage:scale:]`
+(`_UIImageContent.m:533`, "imageRef passed is not a CGImageRef") and SpringBoard
+aborted `sig 6`. The hook keeps the picture on the layer itself (an associated CFDictionary holding the image
+and the surface ID it was made for), so no fixed table can evict the layer UIKit is about to
+read; a copied layer that never went through `-setContents:` has no box, and for it the surface
+is rebuilt into a CGImage over its own pixels (the port's IOSurface kernel ignores properties,
+so the test is a 32-bit row). The app bridge answers `-contents` by caller: the picture for
+UIKitCore, and the surface the layer holds for QuartzCore's commit, so CoreAnimation's
+transaction carries the surface and no server-side copy is made. Measured 2026-11-21: the
+Airplane Mode and Bluetooth toggles draw their knobs (`129x129`, `fmt 0x42475241`, `bpr 528`)
+with no `backboardd create ... 129x129 fmt 0x0` after the app's surface. Answering `-contents`
+with the surface for every caller, with the picture rebuilt at that UIKit initializer, froze
+presentation with no commit and no crash (measured 2026-11-21); the picture-returning default
+is the resting state.
+The rebuild path itself must never wait on the server: a read lock on a surface the render server
+holds (`IOSurfaceLock(..., kIOSurfaceLockReadOnly)`) is exactly the shape of that freeze, so
+`mondrian_surface_picture` asks for `kIOSurfaceLockAvoidSync` and reads the mapping even when the
+lock is refused, with a ring line the first four times. A local WebKit page loads -- the host's HTTP server logs its icon GETs --
+and still draws black, so the same server-side surface path keeps both the picture and the page off
+the glass; that one is not bridged because WebKit's pictures arrive as layer contents in the
+network process, and it stays open.
 
 `tools/gpu/gl_osmesa.c` documents the request and the three things the kernel does for it: find
 the surface by ID, make a wired GPU buffer of it, map it into the CP's stage-1 context.

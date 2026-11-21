@@ -59,9 +59,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen draws on its own 1440x3200 canvas (480x1066
-  pt at scale 3); `docs/UI_PERFORMANCE.md` has the frame meter, `0282` the
-  two-record tick. `mondrian_ui_hook=6 mondrian_gpu_hook=1` brings up the lock
-  screen, the home screen, the Control Center and `exec Preferences` on a tap.
+  pt at scale 3; `docs/UI_PERFORMANCE.md` has the frame meter) and
+  `mondrian_ui_hook=1286 mondrian_gpu_hook=1` brings up the shell and Settings.
 
 Current blockers, in order:
 
@@ -70,16 +69,17 @@ Current blockers, in order:
    injector in `backboardd`, `docs/MONDIAN_GPU.md`) without a present switches the
    panel off with DCS `0x28`; a key or touch switches it back on (`0x29`) from the
    tick, never from a frame -- iOS has stopped its display link, so a tap presents
-   nothing (`0342`). The holds stay on (`mondriankeepawake=1`), and
-   `mondrianunlock=1` opens the lock screen: with the holds off the phone locked
-   itself mid-experiment (measured 2026-11-19).
-2. **Charge level.** Charging works by itself (the charger sits behind the ADSP
-   and holds +1.27 A, measured through `ichg_fb`), but the coulomb counter is
-   out of reach: the level is a voltage table (`0304`), anchored to the Android
-   sample with `battfix=mv:pct,...` (the vendor tree has no profile to copy).
+   nothing (`0342`). The holds stay on (`mondriankeepawake=1`); with them off the
+   phone locked itself mid-experiment (measured 2026-11-19).
+2. **Charge level.** Charging works by itself (the charger sits behind the ADSP,
+   +1.27 A through `ichg_fb`), but the coulomb counter is out of reach: the level
+   is a voltage table (`0304`) anchored to the Android sample with `battfix=mv:pct,...`.
 3. **Control Center and the rest.** The CC grid is 430 pt wide whatever the
-   screen is and the brightness module never calls its setter; GPU glitches,
-   audio, modem and cameras remain (`docs/MONDIAN_GPU.md`).
+   screen is and the brightness module never calls its setter. A picture does
+   not cross to the window server as a CGImage, so a bridge-only dylib converts
+   every image element in every app in `/Applications` (`0402`); what it never
+   sees stays blank (WebKit's page content). Audio, modem and cameras remain
+   (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 

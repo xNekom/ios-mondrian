@@ -623,6 +623,34 @@ boot each, so the three columns differ only in what changed:
   and the **App Store** stops at `LOADING` because it needs the network. So a
   black screen after a tap is not one failure: read the ring's `exec` line to
   tell "never launched" from "launched and had nothing to draw".
+- **A switch draws its track and not its knob, and the knob is an image.**
+  Measured 2026-11-20 on the Settings list (its Airplane Mode row is the first
+  one on screen): the track is a plain colour layer (`bg 78788052`,
+  `cornerRadius 15.5`) and the knob is a 43x43 pt `UIImageView` whose layer
+  holds a 129x129 CGImage, `model 1` (grayscale), 32 bits a pixel, 544 a row.
+  Nothing of it reaches the glass, and the ring says why: the app builds the
+  image and the window server answers with `MONDRIAN SURF: backboardd create ...
+  129x129 ... size 81920`, a surface it then leaves at zero -- the CGImage
+  transfer of `docs/COREANIMATION_GLES.md`. The same switch built inside
+  SpringBoard draws the same way and its layer tree reads
+  `MONDRIAN SW: L3 CALayer -6,-3 43x43 ... contents CGImage 129x129`
+  (`/private/var/vm/mondrian-switch`, probe `mondrian_switch_probe`), so the
+  row is not a Settings problem. The probe is disarmed in the source now:
+  armed, it puts SpringBoard in a crash loop thirty lines after
+  `MONDRIAN SW: V0 UISwitch` (measured 2026-11-20), and the marker at 0
+  crashes none. The app bridge (`tools/mondrian-layer-bridge.m`) is what draws
+  it: it converts a layer's CGImage to a client surface, covers every size (the
+  old 300x200 floor is why the knob was left out), and answers `-contents` with
+  the surface only to QuartzCore's commit, so the picture still reaches UIKit.
+  `0402` injects it into every app in `/Applications`, so Settings gets the
+  bridge without the hook's interposers.
+- **A respring does not bring the shell back on this port.** Measured
+  2026-11-21: after `kill SpringBoard`, the new SpringBoard stays at its boot
+  spinner (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster`
+  crash-loops with `extension check-in timeout`; the same kernel presents on a
+  RAM boot (`ca begin 1 commit 1`). Test a hook change by booting with it
+  embedded, or rebuild only the app bridge, which is read when an app execs
+  (kill the app and tap its icon).
 - **The keyboard is not reachable with the synthetic touch.** Measured
   2026-11-19: the Messages search field and Safari's address field do not focus
   on a tap or a hold, and no keyboard window appears; the hook's own note says
