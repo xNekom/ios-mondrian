@@ -383,9 +383,8 @@ no sudo is needed.
   enable in bit 9 (`pinctrl-sm8450.c`'s `PINGROUP`). Inside `IN_OUT`, bit 0 is
   the pin level and bit 1 is the output value, so driving a pad and reading it
   back is `write 2`, then `read & 1`.
-- **The software keyboard's hit areas are not where its glyphs are drawn.**
-  Measured 2026-11-19 with the USB injector: a tap or a hold on the Messages
-  search field or Safari's address field does not focus it and no keyboard
-  window appears, while buttons in the same window react. The hook's own note
-  says the keyboard's hit areas are offset; a real finger on the panel is the
-  next test, because the injector is not the touchscreen.
+- **A tapped key types the key, but the first keyboard layout is shifted.**
+  Measured 2026-11-21: Spotlight's field takes a synthetic tap and `q` produces
+  `q`, so the hit areas follow the glyphs; the first presentation draws the key
+  plane about 33 pt right and clips its last column, and a later layout pass
+  corrects it. The frames and the measurement are in `docs/UI_PERFORMANCE.md`.

@@ -664,17 +664,26 @@ boot each, so the three columns differ only in what changed:
   a RAM boot is the fallback when the panel does not change; a hook change is
   also testable by rebuilding only the app bridge, which is read when an app
   execs (kill the app and tap its icon).
-- **The keyboard is not reachable with the synthetic touch.** Measured
-  2026-11-19: the Messages search field and Safari's address field do not focus
-  on a tap or a hold, and no keyboard window appears; the hook's own note says
-  the keyboard's hit areas are not where its glyphs are drawn. A real finger on
-  the panel is the next test -- the USB injector is not the touchscreen.
-  `tap`/`swipe` take panel pixels (1440x3200) and `screen` returns half of that,
-  so aim with the runtime's frames, not with the picture: the hook prints
-  `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points, and three
-  times that is the panel box whose centre is `201,798`; the grid is 3 columns, so
-  the Photos icon above it is `201,420` and the dock row sits at `y 2990`
-  (`420`, `720`, `1020` for Phone, Safari, Messages). One gesture at a time --
+- **The keyboard is reachable, and its first presentation is the clipped one.**
+  Measured 2026-11-21: the Search pill under the dock opens Spotlight and puts the
+  keyboard on the glass, and a tap on `q` types `q`, so the hit areas follow the
+  glyphs -- the injector is enough for this field. The keys of the first
+  presentation sit about 33 pt right: the ten-key row spans x 37.3..517.3 pt on a
+  480 pt screen, so `p`, delete and `search` are cut at the right edge. Any later
+  layout pass corrects it in place (a tap in the `123` row centres the same plane
+  at x 4.7 pt), so the keyboard keeps a stale layout, not a wrong size. The host
+  is not the source: SpringBoard's `UIKeyboardWillChangeFrameNotification`
+  reports `0,765.7 480x301`, the keyboard scene layer is 480x1066.7 at 0,0 and
+  the safe area is `59,0,34,0`. The offset fits a 512 pt scene whose 480 pt plane
+  keeps its 3 pt margin and lands at 35 (expected, not measured): the number to
+  read next is the scene size in the keyboard's own process. Rewriting
+  `/private/var/vm/mondrian-kbd` makes every hooked process print its screen, its
+  windows, the keyboard's view chain with safe areas and its layer host
+  (`keyboard_probe_once`), and that is where those numbers come from.
+- **Aim with points, not pixels.** `tap`/`swipe` take panel pixels (1440x3200) and
+  `screen` returns half of that, so multiply a runtime frame by three: the hook
+  prints `MONDRIAN UI: icon Settings live <base> frame 35,227 64x78` in points and
+  the icon's centre is `201,798` in the ring's pixels. One gesture at a time --
   the gadget's command thread is busy until the swipe finishes.
 - **Photos runs on a default boot.** Measured 2026-11-19: the app calls
   `+[PHPhotoLibrary enableMultiLibraryMode]` at launch and then opens
