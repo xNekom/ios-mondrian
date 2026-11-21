@@ -1,0 +1,45 @@
+xnu 0403: the UI hook can be injected into kbd, the process that draws the keyboard
+
+The software keyboard draws correctly-sized keys (42 pt on a 48 pt pitch, the
+480 pt layout) but on its first presentation puts the ten-key row at x 37.3 pt
+instead of 3, so `p`, delete and `search` are clipped by the right edge. A later
+layout pass corrects it in place. The host is not the source: SpringBoard's
+UIKeyboardWillChangeFrameNotification reports 0,765.7 480x301, the keyboard's
+scene layer is 480x1066.7 at 0,0 and the safe area is 59,0,34,0; the offset fits
+a 512 pt scene whose 480 pt plane keeps its 3 pt margin (expected). The scene
+size is decided in kbd, which the mask does not reach, so this adds bit 11 and
+the name match for it. Bit 11 is off in the default command line; a boot that
+reads the keyboard's own geometry adds `mondrian_ui_hook=3334` (6 | 0x100 |
+0x400 | 0x800) with EXTRA_ARGS, and the last key wins.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5680,6 +5680,16 @@
+ #define MONDRIAN_HOOK_APP               0x400
+ 
+ /*
++ * kbd (0x800): the process that draws the software keyboard. On the first
++ * presentation its ten-key row is laid out about 33 pt right of a 480 pt
++ * screen and the last column is clipped; the host is not the source --
++ * SpringBoard's frame notification is 480x301 at x 0, the scene layer is 480
++ * wide and the safe area has no horizontal inset (measured 2026-11-21). The
++ * scene the keyboard lays out in is the number to read, and it lives here.
++ */
++#define MONDRIAN_HOOK_KBD               0x800
++
++/*
+  * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
+  * them there once the root turns writable, so before that, or with glblob=0,
+  * the path handed to a process would name a file dyld cannot open.
+@@ -6112,6 +6122,10 @@
+ 		wanted = MONDRIAN_HOOK_XPCPROXY;
+ 	} else if (wanted == 0 &&
+ 	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "kbd")) {
++		wanted = MONDRIAN_HOOK_KBD;
++	} else if (wanted == 0 &&
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
+ 	    "MobileSlideShow")) {
+ 		wanted = MONDRIAN_HOOK_PHOTOS;
+ 	} else if (wanted == 0 &&
