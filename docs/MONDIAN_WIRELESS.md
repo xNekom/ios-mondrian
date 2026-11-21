@@ -889,20 +889,27 @@ public: bluetoothd asks for random, and the controller answers the extended
 enable with 0x12 when no random address is set (probe: own=1 -> 18, own=0 -> 0,
 same interval, window and filter).
 
-Measured on the live pane: extended reports arrive (`ext report
-c8:a6:ef:12:00:9f type 0x0013 data 31`), the translated legacy events reach
-the daemon, the pane lists `C8:A6:EF:12:00:9F`, and active scanning returns
-scan responses: the probe decoded `51:69:9b:35:ed:46 type 0x04 name
-"ASUS-TUF-GAMING"` from one. A device that advertises no name still shows its
-address by design; `C8:A6:EF` carries no name in its 31-byte advertisement or
-its 6-byte scan response.
+Measured on the live pane: reports arrive (`ext report
+c8:a6:ef:12:00:9f type 0x0013 data 31`), the pane lists
+`C8:A6:EF:12:00:9F` and `B0:AC:82:15:22:3C`, and the air carries names: the
+probe decoded `51:69:9b:35:ed:46 name "ASUS-TUF-GAMING"` from a scan response,
+`C8:A6:EF`'s scan response carries the shortened `55" Crys` and its classic
+EIR a complete `10 09 35 35 ...`, and `B0:AC` is classic-only with
+`09 09 44 49 47 49 20 52 32 41` = "DIGI R2A".
 
-What is left on names: a named device in range to confirm the row draws the
-name, and the classic path. The daemon sends one Remote Name Request (0x0419)
-with 10 parameter bytes for a command whose layout is 11, and no completion
-arrives; padding the command in the control is the candidate fix. The inquiry
-EIR does carry names (`0d 09 ...` = "Echo Dot-8PD"), and the pane drew the
-address for that device too.
+The daemon does not use any of them. `kCBMsgIdDeviceGetNameMsg` answers
+`kCBMsgArgResult 212` and a zero-length `kCBMsgArgName` for every row, with a
+fresh daemon and a fresh Settings client (measured 2026-11-21), so the pane
+draws the address. The daemon sends no Remote Name Request during discovery
+(`name req 0`), so the padding the control applies to 0x0419 is only exercised
+when it does. The control bridges the gap for LE devices: it keeps the classic
+EIR name and appends it as a Complete Local Name to the LE report for the same
+address, translated 0x0d or the legacy 0x02 the controller also sends, when
+the advertisement carries none. A shortened name (0x08) in a report is
+promoted to the complete type (0x09), because the daemon reads only 0x09 and
+the controller's scan responses carry 0x08. A classic-only device has no LE
+report to carry the name; `B0:AC` stays on its address until the daemon uses
+the EIR.
 
 The shim's log is `/private/var/mobile/Library/Preferences/mondrian-btd.log`
 (truncated on each start). The `_exit` interposer writes
@@ -925,8 +932,12 @@ kernel's touch marker, so do not read the two as ordered);
 rebuilds the shim, deploys it and prints the newest exit report,
 `tools/wsl/bt-last-hci.sh` shows the last HCI exchange before an exit,
 `tools/wsl/bt-ext-probe.sh` runs the extended-scan matrix and decodes the names
-in the reports it receives, and `tools/wsl/bt-read-log.sh PHONE-PATH` pulls any
-of the append-only logs (`bt-power.log`, `bt-exit.log`).
+in the reports it receives, `tools/wsl/bt-name-check.sh` opens Settings >
+Bluetooth and prints the scan counters, the names the control injected, the
+daemon's `kCBMsgArgName` replies and the decoded LE/classic names,
+`tools/wsl/bt-name-reply.sh` restarts bluetoothd and SpringBoard and prints the
+name replies with a fresh client, and `tools/wsl/bt-read-log.sh PHONE-PATH`
+pulls any of the append-only logs (`bt-power.log`, `bt-exit.log`).
 
 ## What other ports teach
 
