@@ -963,6 +963,13 @@ event that names that address (`name.inject`), then answers the client's
 follow-up 212 with the same name and result 0 (`name.reply`). The pane draws
 `ASUS-TUF-GAMING` instead of `A8:41:F4:2C:C2:35` (measured 2026-11-21).
 
+The resolved name is persisted in
+`/private/var/mobile/Library/Preferences/mondrian-bt-names`, because bluetoothd
+restarts on stack errors and the RAM-only cache left the pane on the bare
+address (`A8:41:F4:2C:C2:35`) until the row was tapped again. Measured
+2026-11-22: restart the daemon, reopen the pane without touching the row, and
+the row draws `ASUS-TUF-GAMING` from the file.
+
 Pairing completes when the PC starts it. Measured 2026-11-22: in Windows,
 Settings > Bluetooth y dispositivos > Agregar un dispositivo > Bluetooth and
 then a click on the device item ends with "Conectado", and
@@ -971,6 +978,13 @@ then a click on the device item ends with "Conectado", and
 ("Error en la autenticacion mutua") and 37 ("Se rechazo una solicitud de
 autenticacion entrante") appear when the pairing starts from the row tap, so a
 row tap alone cannot pair.
+
+The pairing that counts is the one Windows answers. With its "Emparejar
+dispositivo" prompt open, clicking Permitir completes it and the controller
+reports the whole handover: `pair evt 36 plen 7: 00 <addr>` (Simple Pairing
+Complete, status 0), `link key notify <addr> type 4` and, from the shim,
+`link key stored <addr> type 4 slot 0`. Without that click the controller never
+reports 0x36 and no key exists anywhere.
 
 The controller runs Secure Simple Pairing with numeric comparison either way:
 `pair evt 31` (IO Capability Request), the host's 0x042b reply, `pair evt 32`
@@ -989,10 +1003,12 @@ MITM. An earlier note that the rewrite "made no difference" was reading a log
 line: `my_write` sent the original buffer.
 
 The pairing is not durable and the app never learns about it. The controller
-keeps no key of its own: on the next connect it asks the host
+keeps no key of its own: before a completed pairing exists it asks the host
 (`link key request a8:41:f4:2c:c2:35`), bluetoothd never answers, and the link
 falls back to a fresh pairing in the same daemon session (`pair evt 31`,
-`io cap`, `pair evt 32`, `pair confirm`). `tools/mondrian-bt.c` now keeps the
+`io cap`, `pair evt 32`, `pair confirm`). After a completed pairing the next
+connect starts 0x31 again with no request at all, so the reply path below has
+still not been exercised. `tools/mondrian-bt.c` now keeps the
 key the controller reports (`link key notify`) in
 `/private/var/mobile/Library/Preferences/mondrian-bt-keys` and answers the
 request with 0x040b (`link key reply ... -> 26`); the reply path is in place,
