@@ -3345,6 +3345,61 @@ mondrian_kbd_observe(void)
 	}];
 }
 
+/*
+ * The process table, on demand. The keyboard is drawn by a process the hook
+ * does not enter, and the first question is its name: the kernel injects by
+ * image name, so a bit for it cannot be written until the name is known.
+ * `/private/var/vm/mondrian-ps` rewritten in SpringBoard prints every process
+ * the kernel reports, pid, ppid and comm, to the ring.
+ */
+static void
+proc_probe_once(void)
+{
+	static long long seen;
+	struct stat st;
+	long long now;
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	size_t len = 0, i, count;
+	char *buf;
+	char line[160];
+
+	if (__builtin_strcmp(getprogname(), "SpringBoard") != 0 ||
+	    stat("/private/var/vm/mondrian-ps", &st) != 0) {
+		return;
+	}
+	now = (long long)st.st_mtimespec.tv_sec * 1000000000LL +
+	    (long long)st.st_mtimespec.tv_nsec;
+	if (now == seen) {
+		return;
+	}
+	seen = now;
+	if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) {
+		say("MONDRIAN PS: sysctl size failed\n");
+		return;
+	}
+	buf = malloc(len);
+	if (buf == NULL) {
+		return;
+	}
+	if (sysctl(mib, 4, buf, &len, NULL, 0) != 0) {
+		free(buf);
+		say("MONDRIAN PS: sysctl read failed\n");
+		return;
+	}
+	count = len / sizeof(struct kinfo_proc);
+	snprintf(line, sizeof(line), "MONDRIAN PS: %zu procs\n", count);
+	say(line);
+	for (i = 0; i < count; i++) {
+		struct kinfo_proc *kp = &((struct kinfo_proc *)buf)[i];
+
+		snprintf(line, sizeof(line), "MONDRIAN PS: %d %d %s\n",
+		    kp->kp_proc.p_pid, kp->kp_eproc.e_ppid,
+		    kp->kp_proc.p_comm);
+		say(line);
+	}
+	free(buf);
+}
+
 static void
 keyboard_probe_once(void)
 {
@@ -3382,6 +3437,7 @@ run_watcher(void *unused)
 		bluetooth_power_once();
 		bluetooth_open_pane();
 		keyboard_probe_once();
+		proc_probe_once();
 	}
 	return NULL;
 }
