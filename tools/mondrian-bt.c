@@ -2914,11 +2914,21 @@ log_xpc_in(const char *what, xpc_object_t message)
 	static unsigned count;
 	char *description;
 
-	if (message == NULL || count >= 200) {
+	if (message == NULL || count >= 400) {
 		return;
 	}
 	description = xpc_copy_description(message);
 	if (description == NULL) {
+		return;
+	}
+	/*
+	 * The pane polls Get Controller Info (GCtI) and Update Identities
+	 * (UpId) often enough to spend the cap before a row tap; skip those
+	 * tags so the tap's request is never the one that gets dropped.
+	 */
+	if (strstr(description, "GCtI") != NULL ||
+	    strstr(description, "UpId") != NULL) {
+		free(description);
 		return;
 	}
 	count++;
