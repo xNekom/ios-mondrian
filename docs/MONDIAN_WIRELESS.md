@@ -942,8 +942,7 @@ is why the controller looked silent. The pane then lists the PC
 `A8:41:F4:2C:C2:35` and the Digi `B0:AC:82:15:22:3C` without any forced
 scanner.
 
-The row is still drawn on the address, but its action works now. A tap on the
-row queues Create Connection (`hci req 0405 len 17` with packet-type mask
+The row's action works now. A tap on the row queues Create Connection (`hci req 0405 len 17` with packet-type mask
 `18 cc`, Command Status 0) and the controller answers
 `conn complete status 0 handle N ... link 1`: the link to the PC comes up.
 The tap is at the row's centre (panel `720 880` on this layout); a tap above it
@@ -956,16 +955,24 @@ eleventh byte, and the WCN7850 answered every request with Command Status
 0x12 (Invalid HCI Command Parameters): the name never arrived. The command is
 now forwarded unchanged and the controller answers
 `rnr complete status 0 a8:41:f4:2c:c2:35 "ASUS-TUF-GAMING"`. The name arrives
-after the pane has already built the row, and the daemon's
-`kCBMsgArgName` reply stays empty (`kCBMsgArgResult 212`), so the row keeps the
-address; the next gap is the daemon applying that name to the device object.
+after the pane has already built the row, and the daemon's own name reply
+stays empty (`kCBMsgArgResult 212`), so bluetoothd does not apply it to the
+device object. The shim bridges it the same way the control bridges EIR names:
+it remembers every successful 0x07 and writes `kCBMsgArgName` into the outgoing
+event that names that address (`name.inject`), then answers the client's
+follow-up 212 with the same name and result 0 (`name.reply`). The pane draws
+`ASUS-TUF-GAMING` instead of `A8:41:F4:2C:C2:35` (measured 2026-11-21).
 
 Pairing gets as far as Secure Simple Pairing and then stalls on a prompt that
 never reaches the screen. With the link up, the controller raises
 `pair evt 33 plen 10: <addr> <passkey>` (User Passkey Notification, up to three
 different passkeys per attempt), and bluetoothd sends nothing to its client
 between the connection and the event: no `pairingPromptWithPairingInfo:`, no
-outgoing XPC message. The phone shows no passkey dialog and the PC shows no
+outgoing XPC message. `addPairingClient:error:` and
+`pairingContinueWithPairingInfo:error:` are never called either, and neither
+`_xpcCBConnectionActivate:` nor the `_xpc*` device handlers fire, so the app's
+request does not take the CBConnection path the daemon would register a
+pairing client from. The phone shows no passkey dialog and the PC shows no
 prompt either; after the third notification the controller disconnects with
 reason 0x16 and the pane draws "Pairing Unsuccessful". The PC reports the
 phone as `iPhone` with `ConnectionStatus Connected` and `paired=False`. The
