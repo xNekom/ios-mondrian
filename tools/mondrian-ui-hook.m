@@ -3063,6 +3063,57 @@ bluetooth_power_once(void)
  * the main thread and raise from another one (the same reason the screen
  * report is queued).
  */
+/*
+ * The layout and the keyplane, wherever they are in this process's tree: their
+ * frames are the number the whole keyboard question turns on. A visible
+ * keyboard drawn from a hidden plane (a snapshot or a remote layer) shows the
+ * offset here as well, which is why this does not filter by hidden.
+ */
+static void
+mondrian_kbd_plane_walk(id view, unsigned depth, unsigned *lines)
+{
+	char line[200];
+	const char *name;
+	NSArray *kids;
+	unsigned count, i;
+	CGRect rect;
+	BOOL hidden;
+	CGFloat alpha;
+
+	if (view == nil || depth > 16 || *lines >= 40) {
+		return;
+	}
+	name = object_getClassName(view);
+	if (name != NULL &&
+	    (strstr(name, "KeyboardLayout") != NULL ||
+	    strstr(name, "Keyplane") != NULL ||
+	    strstr(name, "KeyPlane") != NULL)) {
+		rect = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("bounds"));
+		rect = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(view,
+		    sel_registerName("convertRect:toView:"), rect, nil);
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("isHidden"));
+		alpha = ((CGFloat (*)(id, SEL))objc_msgSend)(view,
+		    sel_registerName("alpha"));
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KBP: d%u %s %.1f,%.1f %.1fx%.1f hid %d a %.2f\n",
+		    depth, name, rect.origin.x, rect.origin.y, rect.size.width,
+		    rect.size.height, hidden, alpha);
+		say(line);
+		(*lines)++;
+	}
+	kids = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	if (kids == nil) {
+		return;
+	}
+	count = (unsigned)[(NSArray *)kids count];
+	for (i = 0; i < count; i++) {
+		mondrian_kbd_plane_walk([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, lines);
+	}
+}
+
 static void
 mondrian_kbd_walk(id view, unsigned depth, unsigned *lines)
 {
@@ -3112,6 +3163,9 @@ typedef struct {
 	CGFloat bottom;
 	CGFloat right;
 } mondrian_kbd_insets;
+
+/* Defined with the layout probe below; the marker dump lists what is here. */
+static void mondrian_kl_list(void);
 
 static void
 mondrian_kbd_layers(id view)
@@ -3207,12 +3261,13 @@ mondrian_keyboard_dump(void)
 	id screen, app, windows, found, chain[20];
 	CGRect bounds, native, rect;
 	double scale;
-	unsigned count, i, n, lines = 0;
+	unsigned count, i, n, lines = 0, planelines = 0;
 	char line[256];
 
 	if (!mondrian_file_on("/private/var/vm/mondrian-kbd")) {
 		return;
 	}
+	mondrian_kl_list();
 	@try {
 		screen = screen_cls != Nil ?
 		    ((id (*)(id, SEL))objc_msgSend)((id)screen_cls,
@@ -3254,6 +3309,7 @@ mondrian_keyboard_dump(void)
 			    bounds.size.height, bounds.size.width,
 			    bounds.size.height);
 			say(line);
+			mondrian_kbd_plane_walk(window, 0, &planelines);
 			{
 				CGFloat best_area = 0.0;
 
@@ -3400,6 +3456,325 @@ proc_probe_once(void)
 	free(buf);
 }
 
+/*
+ * The keyboard's own layout pass. kbd's sandbox cannot read
+ * /private/var/vm, so the marker file above never reaches it; the boot mask
+ * can, because kern.bootargs is a sysctl. Bit 11 (0x800) of mondrian_ui_hook is
+ * the diagnostic boot, and the last key on the line wins (a duplicate is how
+ * the mask is widened without changing the default command line).
+ *
+ * The layout is where the 33 pt is chosen: `-[UIKeyboardLayout layoutSubviews]`
+ * is handed the frame it lays the keys out in, so it prints its own frame, its
+ * bounds, the superview chain's frames, the window and the screen the first
+ * few times it runs. A second, correct pass (the one a tap triggers) shows the
+ * same print with the centred plane, which is what tells a stale frame from a
+ * bad constant.
+ */
+#define MONDRIAN_UI_HOOK_KBD	0x800
+
+static int
+mondrian_kbd_mask(void)
+{
+	char args[2048];
+	size_t size = sizeof(args);
+	const char *at, *last = NULL;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 ||
+	    size == 0) {
+		return 0;
+	}
+	args[sizeof(args) - 1] = 0;
+	at = strstr(args, "mondrian_ui_hook=");
+	while (at != NULL) {
+		last = at;
+		at = strstr(at + 1, "mondrian_ui_hook=");
+	}
+	if (last == NULL) {
+		return 0;
+	}
+	return (int)strtol(last + sizeof("mondrian_ui_hook=") - 1, NULL, 0) &
+	    MONDRIAN_UI_HOOK_KBD;
+}
+
+/*
+ * More than one class can carry the layout in a single build (UIKeyboardLayout
+ * and its Star subclass, and TextUI's TUI variants), and an instance may be of
+ * a private subclass, so each hooked class keeps its own original and the
+ * trampoline finds it by walking self's superclass chain. A single original
+ * would either lose a class or, worse, skip the original layout for it.
+ */
+#define MONDRIAN_KL_MAX	4
+
+static struct {
+	char name[48];
+	void (*orig)(id, SEL);
+} mondrian_kl_hooks[MONDRIAN_KL_MAX];
+static unsigned mondrian_kl_nhooks;
+static unsigned mondrian_kl_dumps;
+static int mondrian_kl_installed;
+
+static void
+mondrian_kl_layout(id self, SEL cmd)
+{
+	char line[224];
+	CGRect frame, bounds, in_window;
+	id superview, window;
+	Class screen_cls, cls;
+	id screen;
+	CGRect screen_bounds;
+	void (*orig)(id, SEL) = NULL;
+	unsigned i;
+
+	for (cls = object_getClass(self); cls != Nil;
+	    cls = class_getSuperclass(cls)) {
+		const char *name = class_getName(cls);
+
+		for (i = 0; i < mondrian_kl_nhooks; i++) {
+			if (name != NULL &&
+			    strcmp(mondrian_kl_hooks[i].name, name) == 0) {
+				orig = mondrian_kl_hooks[i].orig;
+			}
+		}
+		if (orig != NULL) {
+			break;
+		}
+	}
+	if (orig != NULL) {
+		orig(self, cmd);
+	}
+	if (mondrian_kl_dumps >= 10) {
+		return;
+	}
+	mondrian_kl_dumps++;
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("frame"));
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("bounds"));
+	in_window = ((CGRect (*)(id, SEL, CGRect, id))objc_msgSend)(self,
+	    sel_registerName("convertRect:toView:"), bounds, nil);
+	superview = ((id (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("superview"));
+	window = ((id (*)(id, SEL))objc_msgSend)(self,
+	    sel_registerName("window"));
+	screen_cls = objc_getClass("UIScreen");
+	screen = screen_cls != Nil ?
+	    ((id (*)(id, SEL))objc_msgSend)((id)screen_cls,
+	    sel_registerName("mainScreen")) : nil;
+	screen_bounds = screen != nil ?
+	    ((CGRect (*)(id, SEL))objc_msgSend)(screen,
+	    sel_registerName("bounds")) : CGRectZero;
+	snprintf(line, sizeof(line),
+	    "MONDRIAN KL: %s f %.1f,%.1f %.1fx%.1f b %.1fx%.1f win %.1f,%.1f"
+	    " super %s %.1f,%.1f %.1fx%.1f window %s %.1fx%.1f screen %.1fx%.1f\n",
+	    object_getClassName(self), frame.origin.x, frame.origin.y,
+	    frame.size.width, frame.size.height, bounds.size.width,
+	    bounds.size.height, in_window.origin.x, in_window.origin.y,
+	    superview != nil ? object_getClassName(superview) : "-",
+	    superview != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(superview,
+	    sel_registerName("frame")).origin.x : 0.0,
+	    superview != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(superview,
+	    sel_registerName("frame")).origin.y : 0.0,
+	    superview != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(superview,
+	    sel_registerName("frame")).size.width : 0.0,
+	    superview != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(superview,
+	    sel_registerName("frame")).size.height : 0.0,
+	    window != nil ? object_getClassName(window) : "-",
+	    window != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(window,
+	    sel_registerName("bounds")).size.width : 0.0,
+	    window != nil ? ((CGRect (*)(id, SEL))objc_msgSend)(window,
+	    sel_registerName("bounds")).size.height : 0.0,
+	    screen_bounds.size.width, screen_bounds.size.height);
+	say(line);
+}
+
+/*
+ * The layout class is private and its name has moved between releases
+ * (UIKeyboardLayoutStar, TUIKeyboardLayoutStar, and a keyplane class under
+ * TextUI), so ask the runtime what this build actually registers instead of
+ * guessing: every class whose name mentions Keyboard, capped.
+ */
+static void
+mondrian_kl_list(void)
+{
+	char line[160];
+	Class *classes;
+	int total, i, shown = 0;
+
+	total = objc_getClassList(NULL, 0);
+	if (total <= 0) {
+		return;
+	}
+	classes = malloc((size_t)total * sizeof(Class));
+	if (classes == NULL) {
+		return;
+	}
+	total = objc_getClassList(classes, total);
+	snprintf(line, sizeof(line), "MONDRIAN KL: %d classes\n", total);
+	say(line);
+	for (i = 0; i < total && shown < 40; i++) {
+		const char *name = class_getName(classes[i]);
+
+		if (name == NULL ||
+		    (strstr(name, "KeyboardLayout") == NULL &&
+		    strstr(name, "Keyplane") == NULL &&
+		    strstr(name, "KeyPlane") == NULL)) {
+			continue;
+		}
+		snprintf(line, sizeof(line), "MONDRIAN KL: has %s\n", name);
+		say(line);
+		shown++;
+	}
+	free(classes);
+}
+
+/* Does this class implement the selector itself (not only inherit it)? */
+static int
+mondrian_kl_defines(Class cls, const char *want)
+{
+	Method *list;
+	unsigned count = 0, i;
+	int found = 0;
+
+	list = class_copyMethodList(cls, &count);
+	if (list == NULL) {
+		return 0;
+	}
+	for (i = 0; i < count && !found; i++) {
+		const char *name = sel_getName(method_getName(list[i]));
+
+		if (name != NULL && strcmp(name, want) == 0) {
+			found = 1;
+		}
+	}
+	free(list);
+	return found;
+}
+
+/*
+ * The keyboard exists only after the first presentation, and its layout class
+ * is private, so the install scans every tick until one appears: a class whose
+ * name says keyboard layout and that implements `layoutSubviews` itself. A
+ * class that only inherits it would send the swizzle to UIView and print the
+ * first ten layout passes of the whole process instead of the keyboard's.
+ */
+static void
+mondrian_kl_hook(const char *name, Class cls)
+{
+	Method method;
+	void (*orig)(id, SEL);
+	unsigned i;
+
+	if (cls == Nil || mondrian_kl_nhooks >= MONDRIAN_KL_MAX) {
+		return;
+	}
+	for (i = 0; i < mondrian_kl_nhooks; i++) {
+		if (strcmp(mondrian_kl_hooks[i].name, name) == 0) {
+			return;
+		}
+	}
+	if (!mondrian_kl_defines(cls, "layoutSubviews")) {
+		return;
+	}
+	method = class_getInstanceMethod(cls, sel_registerName("layoutSubviews"));
+	if (method == NULL ||
+	    method_getImplementation(method) == (IMP)mondrian_kl_layout) {
+		return;
+	}
+	orig = (void (*)(id, SEL))
+	    method_setImplementation(method, (IMP)mondrian_kl_layout);
+	strlcpy(mondrian_kl_hooks[mondrian_kl_nhooks].name, name,
+	    sizeof(mondrian_kl_hooks[0].name));
+	mondrian_kl_hooks[mondrian_kl_nhooks].orig = orig;
+	mondrian_kl_nhooks++;
+	mondrian_kl_installed = 1;
+	{
+		char line[96];
+
+		snprintf(line, sizeof(line), "MONDRIAN KL: hooked %s\n", name);
+		say(line);
+	}
+}
+
+static void
+mondrian_kl_install(void)
+{
+	char line[160];
+	Class *classes;
+	int total, i;
+	static int said, listed, ticks;
+
+	/*
+	 * Keep scanning until every slot is used: the classes do not all exist at
+	 * the same moment (UIKit's layout and TextUI's keyplane appear with the
+	 * first presentation), and one tick that finds only the first must not end
+	 * the search for the others.
+	 */
+	if (mondrian_kl_nhooks >= MONDRIAN_KL_MAX) {
+		return;
+	}
+	if (!said) {
+		said = 1;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN KL: enter prog %s pid %d mask 0x%x\n",
+		    getprogname(), getpid(), mondrian_kbd_mask());
+		say(line);
+	}
+	if (mondrian_kbd_mask() == 0) {
+		return;
+	}
+	ticks++;
+	/*
+	 * Measured 2026-11-21: the layout is not SpringBoard's and not kbd's.
+	 * SpringBoard registers the whole keyboard class family and instantiates
+	 * none of it for the presented keyboard; kbd carries the input managers
+	 * (TIKeyboard*) and no layout class at all, even after the keyboard is up.
+	 * The surfaces of that keyboard are created by the Spotlight process
+	 * (`MONDRIAN SURF: Spotlight ... 1440x729`), which hosts the search UI and
+	 * its keyboard, so the scan runs in whatever process the mask bit reaches
+	 * and prints where the class actually is.
+	 */
+	{
+		static const char *const preferred[] = {
+			"UIKeyboardLayoutStar", "TUIKeyboardLayoutStar",
+			"UIKeyboardLayout", "TUIKeyboardLayout",
+		};
+		unsigned p;
+
+		for (p = 0; p < sizeof(preferred) / sizeof(preferred[0]); p++) {
+			mondrian_kl_hook(preferred[p],
+			    objc_getClass(preferred[p]));
+		}
+	}
+	total = objc_getClassList(NULL, 0);
+	if (total <= 0) {
+		return;
+	}
+	classes = malloc((size_t)total * sizeof(Class));
+	if (classes == NULL) {
+		return;
+	}
+	total = objc_getClassList(classes, total);
+	for (i = 0; i < total; i++) {
+		const char *name = class_getName(classes[i]);
+
+		if (name == NULL ||
+		    (strstr(name, "KeyboardLayout") == NULL &&
+		    strstr(name, "Keyplane") == NULL &&
+		    strstr(name, "KeyPlane") == NULL)) {
+			continue;
+		}
+		mondrian_kl_hook(name, classes[i]);
+	}
+	free(classes);
+	if (!mondrian_kl_installed && !listed) {
+		listed = 1;
+		mondrian_kl_list();
+	}
+	if (!mondrian_kl_installed && ticks == 20) {
+		say("MONDRIAN KL: still no keyboard layout class\n");
+	}
+}
+
 static void
 keyboard_probe_once(void)
 {
@@ -3437,6 +3812,7 @@ run_watcher(void *unused)
 		bluetooth_power_once();
 		bluetooth_open_pane();
 		keyboard_probe_once();
+		mondrian_kl_install();
 		proc_probe_once();
 	}
 	return NULL;
