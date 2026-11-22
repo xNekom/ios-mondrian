@@ -671,6 +671,21 @@ boot each, so the three columns differ only in what changed:
   missing element is a CGImage (bridge), a vibrancy portal (no CA filter or
   portal support) or Metal (no renderer): name which one before touching the
   app.
+- **The lock screen's clock is painted by the hook (2026-11-22).** The date and
+  time live in `BSUIVibrancyEffectView` (32,96 416x234 in the app-side dump),
+  the time view at 0,21 416x129 and the date at 0,0 416x36, behind a
+  `BSUIVibrancyAnimatingPortalView` (`CAPortalLayer`) and a `CABackdropLayer`;
+  that group draws nothing here, so the glass showed the wallpaper alone.
+  `mondrian_lockscreen_clock_step` puts two `UILabel`s on the cover sheet window
+  -- the date view sits below the wallpaper replica, which covers a label added
+  there (measured: the log printed and the glass stayed wallpaper) -- with those
+  frames, updated when the minute changes. Armed by
+  `/private/var/vm/mondrian-lockscreen-clock`; the ring answers
+  `MONDRIAN CLOCK: '7:51' 'Sunday, November 22' host SBCoverSheetWindow`, and a
+  power-wake capture shows the date over the clock. The phone boots at the
+  epoch, and the PMK8350 RTC is owned by processor 4, so `rtc set` moves the
+  running clock only: `tools/wsl/cycle.sh` sets it from the host after every
+  proven boot, or the date reads 1970.
 - **The Control Center capsules draw and take a drag, not a tap (2026-11-22).**
   The brightness capsule's fill is its own thumb: a light band from the bottom
   whose rounded top edge is the level, and it moves with the panel brightness
