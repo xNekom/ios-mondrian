@@ -220,6 +220,9 @@ boot each, so the three columns differ only in what changed:
   forcing them, and the nested `CABackdropLayer`'s own `scale`, to 3.00 at run
   time left the artifact exactly as it was, and the layer classes, frames and
   transforms are all as expected. Do not spend another boot on the scale.
+  Re-measured 2026-11-22 on the image with `0351`/`0352`: the App Library's
+  backdrop is a smooth blue gradient, no sawtooth and no black blocks, with the
+  finger held still (`out/glitch-library-a.png`, `out/glitch-library-b.png`).
   `mondriangeom=1` runs the walker (`mondrian_effect_walk`): every visible
   window, each effect/backdrop view with frame, bounds, layer bounds,
   contentsScale, rasterizationScale and whether its transform is identity.
@@ -719,6 +722,9 @@ boot each, so the three columns differ only in what changed:
   a faded blue with its speaker glyph and no fill, the look iOS gives a volume
   control with no audio route, which is this port's state. There is no general
   picture failure here: read a capsule's fill edge before calling one missing.
+  Three opens in a row on the 2026-11-22 image (`out/glitch-cc-1.png` to
+  `-3.png`) are identical and clean: the media module reads "Not Playing" with
+  white glyphs and no blue blob, the platter and both capsules draw.
 - **Control Center draws every module over the home screen (2026-11-22).** A
   swipe from the top-right corner draws the connectivity platter, the media
   module, Focus, the toggles and both capsules. The sheared blue block the
@@ -811,10 +817,19 @@ boot each, so the three columns differ only in what changed:
   `contents no` -- the snapshot image never reaches it. What shows instead is
   the card's `PBUISnapshotReplicaView` (the wallpaper) and, on one capture, the
   app's own canvas. The card titles are `UILabel alpha 0.00`, so a title is only
-  visible where the blurred backdrop behind it is bright. Who fills the
-  720x1600 BGRA surfaces SpringBoard creates at the switcher is the open
-  question; the magenta test in the hook would catch that colour
-  (`B > 150`, `G < 90`, `R > 150`) if it were a layer's contents.
+  visible where the blurred backdrop behind it is bright.
+  The setContents watch (`/private/var/vm/mondrian-switch-watch`, `MONDRIAN SW2`
+  and `SW3` in the ring) closes the picture question: the card layers
+  (`CALayer 480x1067` and `336x747`) do receive CGImages -- 720x1600, 1080x2400,
+  1007x2240 -- and the bridge turns each into a surface with `drew 49/49`, so
+  the picture is not lost on the way in. One card layer receives an **IOSurface**
+  instead and the bridge passes it through untouched (`no surface made (contents
+  IOSurface, off 0)`); that one can still be uninitialised, and the magenta
+  `(255,4,198)` is the poison colour of a surface nothing drew into, not a
+  colour an app asked for. The next instrument is a dump of that surface's own
+  bytes (`mondrian-dump-picture` writes the bridge's surfaces to
+  `/private/var/mobile/Library/Preferences/*.bgra`; a pass-through surface is
+  not the bridge's to dump).
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
