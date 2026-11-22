@@ -1016,6 +1016,11 @@ my_read(int fd, void *buf, size_t len)
 static uint8_t name_pkt[300];
 static size_t name_pkt_len, name_pkt_need;
 static int name_pkt_state;
+/* H4 framing for the non-event packets: their payload is not an event stream. */
+static uint8_t name_type;
+static uint8_t name_hdr[4];
+static size_t name_hdr_need, name_hdr_got;
+static size_t name_skip;
 
 static void
 bt_name_report(const uint8_t *pkt, size_t len)
@@ -1664,6 +1669,15 @@ bt_event_report(const uint8_t *pkt, size_t len)
 	}
 }
 
+/*
+ * The delivered bytes are an H4 stream: event, ACL and SCO packets are
+ * interleaved. Scanning for 0x04 anywhere turned an ACL payload that
+ * happened to contain it into a fake event, and the shim answered the fake
+ * User Confirmation Request with 0x042C -> status 0x02 (measured 2026-11-22,
+ * right after a Settings pairing attempt). Follow the framing instead: only
+ * a 0x04 at a packet boundary is an event, and an ACL/SCO payload is skipped
+ * whole.
+ */
 static void
 bt_name_feed(const uint8_t *buf, size_t len)
 {
@@ -1672,12 +1686,39 @@ bt_name_feed(const uint8_t *buf, size_t len)
 	for (i = 0; i < len; i++) {
 		uint8_t b = buf[i];
 
+		if (name_pkt_state == 3) {
+			if (name_hdr_got < name_hdr_need) {
+				name_hdr[name_hdr_got++] = b;
+			}
+			if (name_hdr_got == name_hdr_need) {
+				name_skip = name_type == 0x02 ?
+				    ((size_t)name_hdr[2] |
+				    ((size_t)name_hdr[3] << 8)) :
+				    (size_t)name_hdr[2];
+				name_pkt_state = name_skip > 0 ? 4 : 0;
+			}
+			continue;
+		}
+		if (name_pkt_state == 4) {
+			if (name_skip > 0) {
+				name_skip--;
+				if (name_skip == 0) {
+					name_pkt_state = 0;
+				}
+			}
+			continue;
+		}
 		if (name_pkt_state == 0) {
 			if (b == 0x04) {
 				name_pkt[0] = b;
 				name_pkt_len = 1;
 				name_pkt_need = 0;
 				name_pkt_state = 1;
+			} else if (b == 0x02 || b == 0x03) {
+				name_type = b;
+				name_hdr_got = 0;
+				name_hdr_need = b == 0x02 ? 4 : 3;
+				name_pkt_state = 3;
 			}
 			continue;
 		}
