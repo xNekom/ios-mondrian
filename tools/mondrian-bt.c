@@ -1688,6 +1688,15 @@ bt_poke_thread(void *argument)
 	int logged_wait = 0;
 
 	(void)argument;
+	/*
+	 * A request left over from an earlier boot must not fire. `kill NAME`
+	 * persisted in /private/var/vm across boots, and on the next boot this
+	 * daemon killed the app that request named within a second of its launch
+	 * (measured 2026-11-22: MONDRIAN KILL: Preferences[240] by bluetoothd[85],
+	 * and every Settings launch reaped the same way). The marker is a one-shot
+	 * command, so a stale one is dropped at startup.
+	 */
+	bt_poke_clear(marker);
 	for (;;) {
 		char text[128];
 		uint8_t addr[6];

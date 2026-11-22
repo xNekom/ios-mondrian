@@ -27,6 +27,10 @@ fi
 printf 'kill %s\n' "$NAME" > "$MARKER"
 $RING wfile /private/var/vm/bt-poke "$MARKER" >/dev/null || exit 1
 $RING wait 3
+# A one-shot request must not outlive the call: left in the image it fired again
+# on the next boot and killed that app on every launch (2026-11-22).
+printf 'none\n' > "$MARKER"
+$RING wfile /private/var/vm/bt-poke "$MARKER" >/dev/null 2>&1 || true
 
 # The shim only appends to its own log, so read it the windowed way.
 bash tools/wsl/bt-read-log.sh \
