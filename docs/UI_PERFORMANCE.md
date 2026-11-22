@@ -177,6 +177,12 @@ boot each, so the three columns differ only in what changed:
   that is a drawing fault before it is a frame-rate question. The board's
   cmdline is 599 bytes, so the 22-byte override does not fit under the 607-byte
   ceiling: the A/B is a build with the default flipped, not an `EXTRA_ARGS`.
+  Measured that way on 2026-11-22, with the same fourteen swipes in one boot
+  each: 43-50 fps with the fence and `gpuwait avg 0.7-1.3 ms`, 41-51 fps with
+  the default flipped and `gpuwait avg 0` -- the difference is the boot, not
+  the wait, so the fence costs no frame rate. What limits the page swipe is the
+  compositor's own frame time (9.3-18.9 ms, 400-830 GL calls, 75-139 draws),
+  not the present path.
 - **Corruption in the image is one layer's content, not the path to the glass.**
   Measured 2026-11-17 on the App Library, finger held still on the glass: the
   blurred backdrop is drawn sheared -- a sawtooth of black blocks and a blue
@@ -838,12 +844,16 @@ boot each, so the three columns differ only in what changed:
   `isEnabled` before treating the silence as a UI bug.
   The home screen draws its icons, labels, the Messages badge, the Search pill
   and the dock; the Photos widget shows iOS's own "No content available".
-- **The missing knob is not reproduced on the Settings switches (2026-11-21).**
-  `tools/wsl/ui-switch-audit.sh 1240 848` on Airplane Mode and `1240 480` on
-  the Bluetooth pane both draw the white knob in the off and the on state, and
-  the Bluetooth pane's switch keeps its knob after a full off/on cycle. The
-  0402 layer bridge is in effect in this boot; run the audit on the control a
-  report names before treating it as the same image-transfer failure.
+- **A UISwitch draws in Settings and in another app, in both states
+  (2026-11-22).** The bridge's switch test (`/private/var/vm/mondrian-switch-test`,
+  armed with `tools/wsl/switch-apps.sh`) adds an off and an on `UISwitch` to the first
+  visible window of whichever app it enters. Messages draws both: a light grey
+  track with the white thumb on the left for off, a green track and the thumb on
+  the right for on; Settings draws the on switch the same way. The off track is
+  Apple's faint grey on white and reads as "almost missing" at a glance, which is
+  the control's own look, not a picture failure. `tools/wsl/ui-switch-audit.sh`
+  still flips the Settings switches, and a switch that draws but ignores a tap is
+  a control with no controller behind it (Wi-Fi), not a drawing fault.
 - **A respring must restart backboardd, not only SpringBoard.** Measured
   2026-11-21: `kill SpringBoard` alone leaves the new one at its boot spinner
   (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster` crash-loops
