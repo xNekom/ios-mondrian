@@ -8184,11 +8184,14 @@ mondrian_window_watch(void *unused)
  */
 
 /*
- * `mondriantouch=1`: where the events SpringBoard receives end up.
- * -[UIApplication sendEvent:] is called once per event, not once per view, so
- * wrapping it is cheap where wrapping hitTest was not. One line per touch: its
- * phase, the point, the window UIKit gives it to, and the view it lands on --
- * `nil` for the view is what a sheet that swallows touches looks like.
+ * `mondriantouch=1`, or /private/var/vm/mondrian-touch: where the events an app
+ * receives end up. The boot argument costs a reboot and the 607-byte command
+ * line has no room for it; the marker file arms the same probe on the next
+ * launch, which is what a dead button needs. -[UIApplication sendEvent:] is
+ * called once per event, not once per view, so wrapping it is cheap where
+ * wrapping hitTest was not. One line per touch: its phase, the point, the
+ * window UIKit gives it to, and the view it lands on -- `nil` for the view is
+ * what a sheet that swallows touches looks like.
  */
 static void (*mondrian_send_event_orig)(id, SEL, id);
 static unsigned mondrian_touch_logs;
@@ -8257,7 +8260,8 @@ install_touch_probe(void)
 	Class cls = objc_getClass("UIApplication");
 	Method m;
 
-	if (!boot_arg_set("mondriantouch=1") || cls == Nil) {
+	if ((!boot_arg_set("mondriantouch=1") &&
+	    !mondrian_file_on("/private/var/vm/mondrian-touch")) || cls == Nil) {
 		return;
 	}
 	m = class_getInstanceMethod(cls, sel_registerName("sendEvent:"));
@@ -12677,6 +12681,25 @@ load_gpu_test(void)
 {
 	void *handle;
 
+	/*
+	 * SpringBoard draws the status bar and the lock screen itself, and it is
+	 * the one injected image that receives the hook *instead of* the app
+	 * bridge: 0402's branch only runs for a process the mask does not already
+	 * claim, and SpringBoard is bit 4. Every CGImage SpringBoard sets -- the
+	 * battery outline, the lock screen's legibility pictures -- therefore
+	 * takes the broken CGImage road while the same picture inside an app
+	 * draws. Load the bridge here as well; its constructor defers until
+	 * CALayer is up, and QTMovie/CA are up before any status bar exists.
+	 */
+	if (strcmp(getprogname(), "SpringBoard") == 0 &&
+	    access("/private/var/vm/mondrian-layer-bridge.dylib", R_OK) == 0) {
+		void *bridge = dlopen("/private/var/vm/mondrian-layer-bridge.dylib",
+		    RTLD_NOW);
+
+		say(bridge != NULL ?
+		    "MONDRIAN UI: picture bridge in SpringBoard\n" :
+		    "MONDRIAN UI: picture bridge dlopen failed\n");
+	}
 	/*
 	 * The CoreAnimation-on-GLES path (docs/COREANIMATION_GLES.md). The
 	 * injector's constructor does nothing outside backboardd, so loading it
