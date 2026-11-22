@@ -653,6 +653,14 @@ boot each, so the three columns differ only in what changed:
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
   `0402` injects it into every app in `/Applications`, so Settings gets the
   bridge without the hook's interposers.
+- **The Control Center capsules answer no touch either (2026-11-22).** On the
+  current boot the brightness capsule draws its fill as a thin band at the
+  bottom while the panel reports 25% (`MONDR USB: brightness 1024 of 4095`), and
+  a tap in the middle of the capsule (`tap 860 1200`) changes neither the fill
+  nor anything else on the sheet; the volume capsule stays a faded blue with its
+  speaker glyph. With no thumb in any state and no reference frame from this
+  build, the capsule is open, not a confirmed drawing fault: the next step is a
+  mid-drag frame or a layer dump of the sheet, not a code change.
 - **Control Center draws, and its sliders show no thumb (2026-11-22).** A swipe
   from the top-right corner over the home screen draws every module, the
   brightness capsule's white fill included, and the volume capsule at about
@@ -691,7 +699,10 @@ boot each, so the three columns differ only in what changed:
   and knob, and the Wi-Fi pane's switch draws the same way. The Wi-Fi switch is
   the first control found that draws but does not react: neither
   `tools/wsl/ui-switch-audit.sh 1240 480` nor a plain tap at the same point
-  changes its state, so its row is "not wired yet" rather than a drawing fault.
+  changes its state, and the root row keeps reading "Off" afterwards, so its row
+  is "not wired yet" rather than a drawing fault; a control is disabled on iOS
+  when its controller is absent, and this port has no Wi-Fi driver, so read
+  `isEnabled` before treating the silence as a UI bug.
   The home screen draws its icons, labels, the Messages badge, the Search pill
   and the dock; the Photos widget shows iOS's own "No content available".
 - **The missing knob is not reproduced on the Settings switches (2026-11-21).**
