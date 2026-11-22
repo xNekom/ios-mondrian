@@ -168,12 +168,13 @@ boot each, so the three columns differ only in what changed:
 - **Nothing waited for the submission that named the surface.** The GL
   interposer skips its `glFinish` (a full sync drops the display to about twenty
   swaps a second) and the driver never looked at the fence, so `swap()` could
-  copy a canvas the GPU was still drawing. `mondrianfb_gpuwait=1` (`0350`)
+  copy a canvas the GPU was still drawing. `mondrianfb_gpuwait` (`0350`)
   waits, bounded at 100 ms, on the fence the submission path already handed out;
   measured on the lock screen it costs `gpuwait avg 155-447 us` a frame -- the
   GPU had retired the frame in most of them -- and the swap rate is 59-61 with
-  `late max` 4.0-4.4 ms. It is off by default: what it buys is ordering, not
-  frames.
+  `late max` 4.0-4.4 ms. It is on by default (`mondrianfb_gpuwait=0` is the
+  A/B): the panel copy must not read a surface the GPU is still drawing, and
+  that is a drawing fault before it is a frame-rate question.
 - **Corruption in the image is one layer's content, not the path to the glass.**
   Measured 2026-11-17 on the App Library, finger held still on the glass: the
   blurred backdrop is drawn sheared -- a sawtooth of black blocks and a blue
@@ -749,22 +750,29 @@ boot each, so the three columns differ only in what changed:
   drops the marker at startup. The lesson generalises: a request a script
   leaves on the phone is replayed after a reboot, so clear it in the same
   script, and read `MONDRIAN KILL:` before blaming a launch path.
-- **The app launch animation drew the poster replica; it now paints the wallpaper (2026-11-22).**
-  A burst capture of a Settings launch caught a full-width band of `ff04c6`
-  (94% of the band, `tools/png-crop.py` and a colour census) with rows of white
-  memory stripes and the app's rounded corners over it; on another boot the same
-  band was black. The band is `PBUIPosterFloatingLayerReplica` (and
-  `PBUISnapshotReplicaView`) in `_SBWallpaperSecureWindow`, whose layer holds the
-  poster's uninitialised surface, so the animation had nothing to show behind
+- **The launch animation showed magenta twice, from two different layers (2026-11-22).**
+  The backdrop behind the zoom is `PBUIPosterFloatingLayerReplica` (and
+  `PBUISnapshotReplicaView`) in `_SBWallpaperSecureWindow`, whose layers hold the
+  poster's uninitialised surface, so the animation has nothing to show behind
   the zoom. `mondrian_replica_paint_step` in `tools/mondrian-ui-hook.m` paints
   every `Replica` and `Poster` view and its full-screen sublayers with
   `mondrian_wallpaper_image()`, the gradient the wallpaper window carries, and
   `-[CALayer setContents:]` replaces the picture when the animation sets it
   later. The `Poster` match is what removes the last strip: the animation also
   uses `PBUIPosterFloatingView`, which is not named `Replica`. Armed by
-  `/private/var/vm/mondrian-replica-paint`; verified on one boot, the same
-  launch that showed the magenta band now shows the home wallpaper and icons
-  while Settings zooms in.
+  `/private/var/vm/mondrian-replica-paint`.
+  The other one is the cold-launch snapshot itself: a full-screen `UIImageView`
+  whose `contents` is a 1440x3200 IOSurface with every pixel magenta, shown for
+  about 450 ms until the white launch screen fades in (measured with the panel's
+  row sampler: 81-95% magenta at 2.4-2.5 s after the tap, on every cold launch
+  after a respring). A solid magenta full-screen picture is not a drawing the
+  system meant to show, so `mondrian_layer_set_contents` replaces it, surface or
+  CGImage, with the system background before it reaches the glass. On by
+  default; `mondrian-launch-fix-off` is the A/B. Cold Settings and cold Messages
+  now report zero magenta samples. A warm launch still shows about 100 ms of
+  pink while the launch screen fades over the animated backdrop (32 of 1406 row
+  samples); that one is the presentation layer of the running animation, not the
+  picture.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
