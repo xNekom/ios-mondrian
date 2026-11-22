@@ -1,0 +1,35 @@
+xnu 0404: name the sender of a SIGKILL
+
+A process that dies with `status 0x9` in the ring names no sender. On this port
+that is how an app ends: `exec Preferences` is followed about two seconds later
+by `exit Preferences[<pid>] status 0x9`, with the app's view tree built and its
+pictures converted, and no crash report line. The kernel knows who called
+psignal; one line per SIGKILL names both ends, so the ring answers the question
+the exit line cannot.
+
+--- a/bsd/kern/kern_sig.c	2026-11-22 10:40:14.660737382 +0100
++++ b/bsd/kern/kern_sig.c	2026-11-22 10:40:14.660876408 +0100
+@@ -2049,6 +2049,23 @@
+ 		panic("psignal: bad signal number %d", signum);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_MONDRIAN)
++	/*
++	 * A process that dies with `status 0x9` in the ring names no sender, and
++	 * "the app was reaped" is not a diagnosis. One line per SIGKILL names both
++	 * ends: what is killed and who sent it.
++	 */
++	if (signum == SIGKILL) {
++		proc_t from = current_proc();
++
++		printf("MONDRIAN KILL: %s[%d] by %s[%d]\n",
++		    p != PROC_NULL ? p->p_comm : "?", 
++		    p != PROC_NULL ? proc_getpid(p) : -1,
++		    from != PROC_NULL ? from->p_comm : "?",
++		    from != PROC_NULL ? proc_getpid(from) : -1);
++	}
++#endif
++
+ 	mask = sigmask(signum);
+ 	prop = sigprop[signum];
+ 
