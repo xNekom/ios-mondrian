@@ -750,6 +750,21 @@ inject_event(const uint8_t *event, size_t len)
 
 static void bt_name_feed(const uint8_t *buf, size_t len);
 
+/*
+ * The controller's Command Complete for the User Confirmation Request reply
+ * (0x042C) is an orphan in bluetoothd's eyes when the shim sends that reply:
+ * the daemon exits 1 naming `OI_DHCI_USER_CONFIRM_REQ_REPLY_OPCODE` (measured
+ * 2026-11-22 from mondrian-bt-exit.log, right after the Echo
+ * 86:dc:7e:21:e6:a8 paired). Hold each H4 event whole so that one can be
+ * dropped before any byte of it reaches the daemon.
+ */
+static unsigned bt_pair_own;
+static uint8_t bt_ev_buf[300];
+static size_t bt_ev_len;
+static uint8_t bt_pend_buf[300];
+static size_t bt_pend_len;
+static size_t bt_pend_off;
+
 static ssize_t
 my_read(int fd, void *buf, size_t len)
 {
@@ -760,6 +775,17 @@ my_read(int fd, void *buf, size_t len)
 
 	if (fd != control_socket_fd || control_socket_fd < 0 || len == 0) {
 		return (ssize_t)syscall(SYS_read, fd, buf, len);
+	}
+	/* Finish delivering an event that did not fit in the last call. */
+	while (bt_pend_off < bt_pend_len && produced < len) {
+		out[produced++] = bt_pend_buf[bt_pend_off++];
+	}
+	if (bt_pend_off == bt_pend_len) {
+		bt_pend_off = 0;
+		bt_pend_len = 0;
+	}
+	if (produced == len) {
+		return (ssize_t)produced;
 	}
 	while (produced < len) {
 		size_t want;
@@ -857,16 +883,58 @@ my_read(int fd, void *buf, size_t len)
 						byte |= 0x08;
 					}
 				}
-				out[produced++] = byte;
+				if (h4_type == 0x04) {
+					if (bt_ev_len < sizeof(bt_ev_buf)) {
+						bt_ev_buf[bt_ev_len++] = byte;
+					}
+				} else {
+					out[produced++] = byte;
+				}
 				h4_pos++;
 				if (--h4_left == 0) {
+					size_t k;
+
 					h4_state = 0;
 					h4_left = 0;
+					if (h4_type != 0x04) {
+						continue;
+					}
+					if (bt_pair_own > 0 && bt_ev_len >= 6 &&
+					    bt_ev_buf[0] == 0x04 &&
+					    bt_ev_buf[1] == 0x0e &&
+					    (uint16_t)(bt_ev_buf[4] |
+					    (bt_ev_buf[5] << 8)) == 0x042c) {
+						unsigned status = bt_ev_len > 6 ?
+						    bt_ev_buf[6] : 0xff;
+
+						bt_pair_own--;
+						bt_ev_len = 0;
+						bt_event_append("pair complete dropped"
+						    " status %#x\n", status);
+						continue;
+					}
+					for (k = 0; k < bt_ev_len; k++) {
+						if (produced < len) {
+							out[produced++] =
+							    bt_ev_buf[k];
+						} else if (bt_pend_len <
+						    sizeof(bt_pend_buf)) {
+							bt_pend_buf[bt_pend_len++] =
+							    bt_ev_buf[k];
+						}
+					}
+					bt_ev_len = 0;
 				}
 				continue;
 			}
 			if (h4_state == 1) {
-				out[produced++] = byte;
+				if (h4_type == 0x04) {
+					if (bt_ev_len < sizeof(bt_ev_buf)) {
+						bt_ev_buf[bt_ev_len++] = byte;
+					}
+				} else {
+					out[produced++] = byte;
+				}
 				h4_hdr[h4_hdr_got++] = byte;
 				if (h4_hdr_got == h4_hdr_need) {
 					if (h4_type == 0x04) {
@@ -898,7 +966,12 @@ my_read(int fd, void *buf, size_t len)
 				h4_pos = 0;
 				h4_supported_mask = 0;
 				h4_state = 1;
-				out[produced++] = byte;
+				if (byte == 0x04) {
+					bt_ev_len = 0;
+					bt_ev_buf[bt_ev_len++] = byte;
+				} else {
+					out[produced++] = byte;
+				}
 				continue;
 			}
 			/* Noise at a packet boundary: not an H4 type. */
@@ -1496,6 +1569,7 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		}
 		memcpy(reply, "\x01\x2c\x04\x06", 4);
 		memcpy(reply + 4, pkt + 3, 6);
+		bt_pair_own++;
 		written = bt_tx_write(reply, sizeof(reply));
 		bt_power_append("pair confirm %02x:%02x:%02x:%02x:%02x:%02x "
 		    "value %u -> %zd\n", pkt[8], pkt[7], pkt[6], pkt[5], pkt[4],
