@@ -156,6 +156,25 @@ bridge_file_on(const char *path)
 	return 1;
 }
 
+/* The first byte of a marker, or -1. The snapshot marker doubles as a mode:
+ * "1" arms the cache hooks, "2" also asks the layer dump. A separate file for
+ * the mode was not visible to SpringBoard (measured 2026-11-22), while the
+ * marker this dylib already reads was. */
+static int
+bridge_file_byte(const char *path)
+{
+	char c;
+	int fd = open(path, O_RDONLY);
+	ssize_t n;
+
+	if (fd < 0) {
+		return -1;
+	}
+	n = read(fd, &c, 1);
+	(void)close(fd);
+	return n == 1 ? (unsigned char)c : -1;
+}
+
 /*
  * The A/B is a file, and setContents: runs thousands of times a boot, so the
  * answer is remembered for a second: the marker is not expected to change
@@ -1807,7 +1826,8 @@ bridge_fbs_init(id self, SEL cmd, id context)
 	 * means nothing to draw, a layer with a picture and a blank result puts
 	 * the fault in the render.
 	 */
-	if (layers != nil && bridge_file_on("/private/var/vm/mondrian-snap-layers") &&
+	if (layers != nil &&
+	    bridge_file_byte("/private/var/vm/mondrian-snap-probe") == '2' &&
 	    [layers respondsToSelector:sel_registerName("count")]) {
 		unsigned i;
 
