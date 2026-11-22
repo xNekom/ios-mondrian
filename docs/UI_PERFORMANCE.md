@@ -671,18 +671,32 @@ boot each, so the three columns differ only in what changed:
 - **The Today view's suggestion cards are not a lost CGImage (2026-11-22).**
   Pulling down on the home screen gives a "Siri Suggestions" card whose content
   is a blur with no app icon, and the ring names both halves: Spotlight creates
-  its own `192x192 fmt 0x42475241` surfaces (keys 6, the bridge's) and the render
-  server creates `192x192 fmt 0x0` surfaces (keys 8) beside them, so the
-  server-side zeros are backing stores, not a picture that failed to cross.
-  The layers answer `contents picture for QuartzCore` with nothing to convert
-  (their contents are nil at commit), so the picture bridge has nothing to fix
-  here and the missing icon is upstream of it, in the suggestion provider.
-  Do not reload Spotlight to test a dylib: killing it wedges the view (blurred
-  blobs, a stray rule, the search bar half slid in) until a respring, even when
-  it is killed from the home screen. `tools/wsl/ui-kill-by-name.sh NAME` is the
-  way to reload a service that survives a respring -- the daemon sends
-  `kill NAME` through `/private/var/vm/bt-poke` and the shim signals it -- but
-  the Today view is the one place it costs the shell.
+  its own `192x192 fmt 0x42475241` surfaces (keys 6) and the render server
+  creates `192x192 fmt 0x0` (keys 8) beside them, so the server-side zeros are
+  backing stores, not a picture that failed to cross. The layers answer
+  `contents picture for QuartzCore` with nothing to convert (their contents are
+  nil at commit), so the picture bridge has nothing to fix here.
+  The card is not a SpringBoard view either: the hook's deep dump
+  (`tools/wsl/ui-deep-today.sh 7`) walks the open view and finds only
+  `SBSearchBackdropView`, `SBHSearchPillView` and a `_UIPortalView` whose layer
+  is a `CAPortalLayer` -- the content is a portal into another process.
+  That process cannot stay up: `exec Spotlight` is followed every time by
+  `exit Spotlight[<pid>] status 0x9`, and the A/B with the bridge removed
+  (`tools/wsl/ui-spotlight-ab.sh without`, which 0402 reads as "no bridge in
+  /private/var/vm") shows the same loop, so the bridge is not what kills it and
+  the view has no live provider. What the Today view shows is SpringBoard's
+  backdrop over a portal with no source. Name the kill reason next (a crash
+  report or the job's check-in), not the picture path.
+- **An app's console output does not reach the ring (2026-11-22).** The bridge
+  logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
+  never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
+  dylib runs and its console text is dropped. The bridge therefore writes a
+  view dump to `/private/var/mobile/Library/Preferences/mondrian-appdeep-<pid>.log`
+  (armed by `/private/var/vm/mondrian-deep-app`, four dumps per process, written
+  from a main-queue timer) and one `...-alive.log` line per load. Apps can write
+  that directory on this port (measured: `Preferences pid 1940: loaded`), so a
+  missing file means the process never ran the dylib, not that the write failed.
+  Read one with `tools/wsl/ui-deep-app-pull.sh PID NUMBER`.
 - **Two presses wake, and the unlock swipe starts at the screen's bottom edge
   (2026-11-22).** The power button is a toggle: one press on a lit screen puts
   the phone to sleep, and the swipe afterwards lands on a dark panel, which
