@@ -668,6 +668,27 @@ boot each, so the three columns differ only in what changed:
   module, Focus, the toggles and both capsules. The sheared blue block the
   module materials used to show is the 0402 submission-order bug (see the
   backdrop entry below), not a drawing gap.
+- **The Today view's suggestion cards are not a lost CGImage (2026-11-22).**
+  Pulling down on the home screen gives a "Siri Suggestions" card whose content
+  is a blur with no app icon, and the ring names both halves: Spotlight creates
+  its own `192x192 fmt 0x42475241` surfaces (keys 6, the bridge's) and the render
+  server creates `192x192 fmt 0x0` surfaces (keys 8) beside them, so the
+  server-side zeros are backing stores, not a picture that failed to cross.
+  The layers answer `contents picture for QuartzCore` with nothing to convert
+  (their contents are nil at commit), so the picture bridge has nothing to fix
+  here and the missing icon is upstream of it, in the suggestion provider.
+  Do not reload Spotlight to test a dylib: killing it wedges the view (blurred
+  blobs, a stray rule, the search bar half slid in) until a respring, even when
+  it is killed from the home screen. `tools/wsl/ui-kill-by-name.sh NAME` is the
+  way to reload a service that survives a respring -- the daemon sends
+  `kill NAME` through `/private/var/vm/bt-poke` and the shim signals it -- but
+  the Today view is the one place it costs the shell.
+- **Two presses wake, and the unlock swipe starts at the screen's bottom edge
+  (2026-11-22).** The power button is a toggle: one press on a lit screen puts
+  the phone to sleep, and the swipe afterwards lands on a dark panel, which
+  reads as a wedged lock screen. Two presses a second apart end on, and the
+  swipe up must start at the home indicator (panel y=3120); one starting at
+  mid-screen is ignored. `tools/wsl/ui-unlock.sh` does both.
 - **A switch without its knob can be a kernel without the app bridge
   (2026-11-22).** After a power cycle the phone booted the flashed image from
   2026-11-17, which predates 0402: Settings drew the Airplane Mode track in
