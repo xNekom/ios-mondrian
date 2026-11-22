@@ -40,6 +40,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -383,7 +384,58 @@ static unsigned bridge_foreign;
 static unsigned bridge_picture_nolock;
 static unsigned bridge_contents_reads;
 static unsigned bridge_commit_reads;
+static unsigned bridge_late;
 static id (*bridge_contents_orig)(id, SEL);
+
+/*
+ * A layer whose contents are still a CGImage when CoreAnimation reads them.
+ *
+ * The setter hook only reaches a layer whose `setContents:` is CALayer's own.
+ * A subclass that overrides it, or a layer filled by something other than
+ * -setContents:, keeps the picture, and the commit then hands it to the server,
+ * which builds its own format-less surface and leaves it zero. Measured
+ * 2026-11-22 on the Today view: four 192x192 suggestion cards, each answered by
+ * `backboardd create ... 192x192 fmt 0x0` right after Spotlight had already
+ * made its own `fmt 0x42475241` surface for a sibling card.
+ *
+ * The commit is the last place the picture is still in the process, so the
+ * conversion belongs there as a fallback: a picture read at commit becomes a
+ * surface, kept on the layer beside the picture it came from. The box is
+ * separate from the setter's so neither path can steal the other's entry.
+ */
+static char bridge_commit_box_key;
+
+static IOSurfaceRef
+bridge_commit_surface(id layer, CGImageRef image)
+{
+	CFDictionaryRef box = (CFDictionaryRef)objc_getAssociatedObject(layer,
+	    &bridge_commit_box_key);
+	CGImageRef kept;
+	IOSurfaceRef surface;
+
+	if (box == NULL) {
+		return NULL;
+	}
+	kept = (CGImageRef)CFDictionaryGetValue(box, CFSTR("image"));
+	surface = (IOSurfaceRef)CFDictionaryGetValue(box, CFSTR("surface"));
+	return kept == image ? surface : NULL;
+}
+
+static void
+bridge_commit_remember(id layer, CGImageRef image, IOSurfaceRef surface)
+{
+	CFMutableDictionaryRef box = CFDictionaryCreateMutable(NULL, 2,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+	if (box == NULL) {
+		return;
+	}
+	CFDictionarySetValue(box, CFSTR("image"), image);
+	CFDictionarySetValue(box, CFSTR("surface"), surface);
+	objc_setAssociatedObject(layer, &bridge_commit_box_key, (id)box,
+	    OBJC_ASSOCIATION_RETAIN);
+	CFRelease(box);
+}
 
 /* The image and nearest symbol behind a return address, for the ring. */
 static const char *
@@ -588,6 +640,52 @@ bridge_get_contents(id self, SEL cmd)
 	char name[96];
 
 	/*
+	 * A picture that reached the commit without going through the setter (a
+	 * subclass's own setContents:, a layer filled some other way) is
+	 * converted here: the server cannot take a CGImage on this port, and
+	 * this is the last point where its pixels are still in the process.
+	 */
+	if (commit && real != nil && !bridge_off() &&
+	    CFGetTypeID((CFTypeRef)real) == CGImageGetTypeID()) {
+		CGImageRef image = (CGImageRef)real;
+		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+
+		if (w >= 4 && h >= 4) {
+			IOSurfaceRef surface = bridge_commit_surface(self, image);
+			bool made = false;
+
+			if (surface == NULL) {
+				CGImageRef used = image;
+				unsigned coverage = 0;
+
+				surface = bridge_surface(image, &used,
+				    &coverage);
+				if (surface != NULL) {
+					bridge_commit_remember(self, image,
+					    surface);
+					made = true;
+					if (bridge_late++ < 4) {
+						snprintf(line, sizeof(line),
+						    "MONDRIAN BRIDGE[%d]: %zux%zu "
+						    "as surface %u at commit on "
+						    "%s drew %u/49\n", getpid(),
+						    w, h, IOSurfaceGetID(surface),
+						    object_getClassName(self),
+						    coverage);
+						bridge_say(line);
+					}
+				}
+			}
+			if (surface != NULL) {
+				real = (id)surface;
+				if (made) {
+					CFRelease(surface); /* the box holds it */
+				}
+			}
+		}
+	}
+
+	/*
 	 * The commit keeps the surface the layer was given; building a picture
 	 * for it is what hid the app's surface and left the knob zero. Every
 	 * other reader gets the picture, which is what UIKitCore asserts on.
@@ -714,15 +812,45 @@ bridge_set_contents(id self, SEL cmd, id contents)
 	}
 }
 
-__attribute__((constructor))
+static bool bridge_console_open;
+static bool bridge_installed;
+static bool bridge_told;
+
+/*
+ * Install when CoreAnimation is there.
+ *
+ * A process that receives this dylib before it has loaded QuartzCore has no
+ * CALayer to hook, and returning silently made that state indistinguishable
+ * from "the dylib was never injected": measured 2026-11-22, Spotlight created
+ * its suggestion images (`MONDRIAN SURF: Spotlight create ... 192x192 fmt
+ * 0x42475241`) and the server then made its own zero surfaces for them, while
+ * no `loaded in Spotlight` line existed anywhere. The install is retried from
+ * the dyld add-image callback, which fires again for every image QuartzCore is
+ * in.
+ */
 static void
 bridge_install(void)
 {
-	Class layer = objc_getClass("CALayer");
+	Class layer;
 	Method method;
 	char line[200];
 
-	bridge_console = open("/dev/console", O_WRONLY | O_NOCTTY);
+	if (bridge_installed) {
+		return;
+	}
+	if (!bridge_console_open) {
+		bridge_console = open("/dev/console", O_WRONLY | O_NOCTTY);
+		bridge_console_open = true;
+	}
+	layer = objc_getClass("CALayer");
+	if (!bridge_told) {
+		bridge_told = true;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN BRIDGE[%d]: in %s, CALayer %s\n", getpid(),
+		    getprogname() != NULL ? getprogname() : "?",
+		    layer != NULL ? "up" : "not up yet");
+		bridge_say(line);
+	}
 	if (layer == NULL) {
 		return;
 	}
@@ -730,6 +858,7 @@ bridge_install(void)
 	if (method == NULL) {
 		return;
 	}
+	bridge_installed = true;
 	bridge_original = (void (*)(id, SEL, id))
 	    method_setImplementation(method, (IMP)bridge_set_contents);
 	/* And the read side, so UIKit still sees the picture (bridge_get_contents). */
@@ -760,4 +889,22 @@ bridge_install(void)
 	    bridge_off() ? ", marker on (CGImages kept)" : "",
 	    bridge_switch_orig != NULL ? ", switch probe on" : "");
 	bridge_say(line);
+}
+
+static void
+bridge_image_added(const struct mach_header *header, intptr_t slide)
+{
+	(void)header;
+	(void)slide;
+	if (!bridge_installed) {
+		bridge_install();
+	}
+}
+
+__attribute__((constructor))
+static void
+bridge_load(void)
+{
+	bridge_install();
+	_dyld_register_func_for_add_image(bridge_image_added);
 }

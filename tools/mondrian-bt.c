@@ -58,6 +58,8 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/param.h>
 
 /* The iPhoneOS SDK used on Linux ships dispatch but not the XPC headers. */
 typedef void *xpc_object_t;
@@ -1627,6 +1629,57 @@ bt_poke_clear(const char *marker)
 	}
 }
 
+/*
+ * "kill NAME": signal every process whose command name is NAME.
+ *
+ * A rebuilt dylib is only read at exec, and a view service such as Spotlight
+ * outlives a respring, so without this the only way to load a new bridge into
+ * it is a reboot -- which also rewrites /private/var/vm from the boot image and
+ * throws the pushed dylib away. The daemon runs as root with no sandbox, so it
+ * can name and signal what the ring's `kill` cannot: that one takes a pid.
+ */
+static int
+bt_kill_by_name(const char *text)
+{
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+	struct kinfo_proc *list;
+	char name[32];
+	size_t size = 0;
+	size_t at = 0;
+	int count = 0;
+	int n, i;
+
+	while (text[at] != 0 && at < sizeof(name) - 1 && text[at] != ' ' &&
+	    text[at] != '\t' && text[at] != '\n' && text[at] != '\r') {
+		name[at] = text[at];
+		at++;
+	}
+	name[at] = 0;
+	if (at == 0) {
+		return -1;
+	}
+	if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) {
+		return -1;
+	}
+	list = malloc(size);
+	if (list == NULL) {
+		return -1;
+	}
+	if (sysctl(mib, 4, list, &size, NULL, 0) != 0) {
+		free(list);
+		return -1;
+	}
+	n = (int)(size / sizeof(list[0]));
+	for (i = 0; i < n; i++) {
+		if (strcmp(list[i].kp_proc.p_comm, name) == 0 &&
+		    kill(list[i].kp_proc.p_pid, SIGKILL) == 0) {
+			count++;
+		}
+	}
+	free(list);
+	return count;
+}
+
 static void *
 bt_poke_thread(void *argument)
 {
@@ -1652,8 +1705,18 @@ bt_poke_thread(void *argument)
 		bzero(text, sizeof(text));
 		got = read(fd, text, sizeof(text) - 1);
 		close(fd);
-		if (got <= 0 ||
-		    bt_poke_parse(text, &kind, addr, &packet_type) != 0) {
+		if (got <= 0) {
+			continue;
+		}
+		if (strncmp(text, "kill ", 5) == 0) {
+			int killed = bt_kill_by_name(text + 5);
+
+			bt_power_append("poke: kill %s -> %d\n",
+			    text + 5, killed);
+			bt_poke_clear(marker);
+			continue;
+		}
+		if (bt_poke_parse(text, &kind, addr, &packet_type) != 0) {
 			continue;
 		}
 		/*
