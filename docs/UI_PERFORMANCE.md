@@ -806,35 +806,37 @@ boot each, so the three columns differ only in what changed:
   calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
-- **The app switcher's snapshot is a blank magenta picture (2026-11-22).** The
-  cards show three different failures (a blank white card, a black card with a
-  few readable rows, a card filled with `(255,4,198)`), and the `setContents`
-  watch is how the picture's road was named. Two details cost a wrong
-  conclusion. The card and the wallpaper replica are both a plain
-  `CALayer 480x1067` for `-[CALayer setContents:]`, so a watch keyed on the
-  layer class and bounds prints the replica once and hides the card behind it.
-  Keyed on the owning view, every line is a replica or poster view
-  (`PBUISnapshotReplicaView`, `PBUIPosterFloatingView`, `UIImageView`).
+- **The app switcher's snapshot is unwritten memory (2026-11-22).** The cards
+  show a blank white card, a black card with a few readable rows, or a card
+  filled with a flat colour, and the `setContents` watch is how the picture's
+  road was named. Two details cost a wrong conclusion. The card and the
+  wallpaper replica are both a plain `CALayer 480x1067` for `-[CALayer
+  setContents:]`, so a watch keyed on the layer class and bounds prints the
+  replica once and hides the card behind it. Keyed on the owning view, every
+  line is a replica or poster view (`PBUISnapshotReplicaView`,
+  `PBUIPosterFloatingView`, `UIImageView`).
   The picture is not missing at the cache: hooking
   `SBAppSwitcherSnapshotImageCache` prints `create for SBDisplayItem full 0`,
   `load`, `finished, XBApplicationSnapshotImage 336x746` and
-  `cached XBApplicationSnapshotImage`, so the request completes and an image
-  arrives. Its pixels are the failure: the bridge's conversion of that image
-  (`336x747` -> 1008x2240) is **100 % pure magenta `(255,0,255)`**. The snapshot
-  renderer returns a blank placeholder, and the rows visible on the card come
-  from the live scene layer drawn over it -- the focused card's
-  `SBAppSwitcherReusableSnapshotView` sits at `opacity 0.00` for that reason.
-  The live content also goes through a colour matrix that lifts dark pixels to
-  red, which is why the card's black title reads red.
-  A separate 1440x3200 IOSurface handed to a card layer is 99.8 % magenta with
-  a sliver of glyphs (`tools/card-surface-map.py`), and another open has it
-  black: allocator memory, not a drawing. Instrumenting `glClear` for a magenta
-  colour records **zero** clears, so the shim does not paint it.
-  The next target is `-[_FBSSnapshot CGImage]` in the app (`_FBSSnapshot`,
-  `_FBSSnapshotContext`, `_FBSSnapshotLayer`, `FBSSceneSnapshotRequest` are the
-  classes the runtime lists) and the render that produces the blank picture;
-  `mondrian-dump-picture` writes a quarter-scale copy of a picture too large for
-  the ring.
+  `cached XBApplicationSnapshotImage`, so the request completes. The pixels are
+  the failure. `_FBSSnapshot` runs in SpringBoard (`init 480x1067 scale 3.00
+  layers 1` or `4`, `capture ok`), and the picture it returns is **one flat
+  colour**: the 1440x3200 image is 16 bits a channel DisplayP3 with its first
+  pixels `ff ff 00 00` (red), the 1008x2240 cache image is 8 bits a channel with
+  `ff 00 00 ff` (red) in one run and `ff 00 b7 ff` (magenta) in another.
+  Drawing the image into a zeroed bitmap (`bridge_bitmap_probe`) gives 100 % of
+  one colour every time -- `(255,0,0)` in one boot, `(255,0,188)` in the next --
+  so the source really is uniform; the colour is the allocator's, not a drawing.
+  The card follows that colour (white, red or magenta), and the rows that
+  sometimes show over it come from the live scene layer, not the snapshot.
+  Instrumenting `glClear` for a magenta colour records **zero** clears, so the
+  shim does not paint it either.
+  The render that is supposed to fill the destination is the target:
+  `/private/var/vm/mondrian-snap-layers` arms a dump of the `_FBSSnapshot`
+  context's layers (class and `contents`), and
+  `/private/var/vm/mondrian-dump-picture` writes a quarter-scale copy of a
+  picture too large for the ring. `tools/card-surface-map.py` measures the
+  picture's box and colours.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
