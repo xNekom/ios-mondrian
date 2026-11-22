@@ -1007,14 +1007,19 @@ keeps no key of its own: before a completed pairing exists it asks the host
 (`link key request a8:41:f4:2c:c2:35`), bluetoothd never answers, and the link
 falls back to a fresh pairing in the same daemon session (`pair evt 31`,
 `io cap`, `pair evt 32`, `pair confirm`). After a completed pairing the next
-connect starts 0x31 again with no request at all, so the reply path below has
-still not been exercised. `tools/mondrian-bt.c` now keeps the
-key the controller reports (`link key notify`) in
+connect starts 0x31 again with no request at all, so the request only appears
+once the controller has forgotten the key. `tools/mondrian-bt.c` keeps the key
+the controller reports (`link key notify`) in
 `/private/var/mobile/Library/Preferences/mondrian-bt-keys` and answers the
-request with 0x040b (`link key reply ... -> 26`); the reply path is in place,
-but a key only exists after a pairing Windows completed, which it only does
-from its own Add-a-device window. The pane still draws "Pairing Unsuccessful"
-because no pairing client exists to call. That client is `CBConnection`, which
+request with 0x040b (`link key reply ... -> 26`).
+
+Measured 2026-11-22, after the Windows device record was deleted and the PC
+paired again: the tap produced `link key request` and the shim's stored key
+(`link key reply a8:41:f4:2c:c2:35 -> 26`), and the next lines from bluetoothd
+carry a *new pid* - the daemon restarted instead of carrying the link, and
+Windows reported the connection failed while `IsPaired` stayed true. A key at
+the controller is therefore not enough: the daemon needs a device record of its
+own, and only its pairing client creates one. That client is `CBConnection`,
 only exists through `initWithXPCObject:error:` from its activation message:
 `alloc`/`init` plus `addPairingClient:error:` restart-loops bluetoothd (the pid
 climbed 1646 -> 1650 -> 1658 within a minute) and must not be repeated.
@@ -1065,6 +1070,19 @@ writes and reads with their bytes. That ring is what identified 0x200b -- the
 kernel's own packet log keeps only the first 64 packets of a connection
 (`MONDRIAN_BTCTL_LOG_PACKETS`), so it had shown the start of a run, not its
 end.
+
+The power log is different and is capped: it is append-only and took one line
+per Inquiry Result, so by 2026-11-22 it had reached 5.4 MB in a day. Nothing
+reads it wrong; the cost is that a pull is one 1000-byte request per block, and
+an offset past the end answers zero bytes, which reads as an empty log instead
+of as the end of one. The shim now caps the file at 1 MiB (`BT_POWER_MAX`,
+truncated with a `log rotated` marker), logs the first four results of a scan
+and the total on Inquiry Complete, and `tools/wsl/bt-read-log.sh` pulls from
+offset 0 and stops at the first short answer.
+
+`usb-ring.py pos` is **not** a file size: it prints the ring's byte count and
+ignores a path argument. Reading `pos` as the log's length makes a pull start
+past the end and come back empty; the length comes from the pull itself.
 
 Reproduce: `tools/wsl/verify-bt-stable.sh` opens the pane and compares two
 dumps a minute apart (one pid, no new exits, the three answers counted);

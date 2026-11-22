@@ -653,22 +653,21 @@ boot each, so the three columns differ only in what changed:
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
   `0402` injects it into every app in `/Applications`, so Settings gets the
   bridge without the hook's interposers.
-- **The Control Center capsules answer no touch either (2026-11-22).** On the
-  current boot the brightness capsule draws its fill as a thin band at the
-  bottom while the panel reports 25% (`MONDR USB: brightness 1024 of 4095`), and
-  a tap in the middle of the capsule (`tap 860 1200`) changes neither the fill
-  nor anything else on the sheet; the volume capsule stays a faded blue with its
-  speaker glyph. With no thumb in any state and no reference frame from this
-  build, the capsule is open, not a confirmed drawing fault: the next step is a
-  mid-drag frame or a layer dump of the sheet, not a code change.
-- **Control Center draws, and its sliders show no thumb (2026-11-22).** A swipe
-  from the top-right corner over the home screen draws every module, the
-  brightness capsule's white fill included, and the volume capsule at about
-  half opacity with no fill -- the look iOS gives a volume control with no audio
-  route, which is this port's state. Neither capsule shows a round knob, so
-  compare a second open and a frame captured mid-drag before reading that as a
-  missing layer: the module materials are the ones the 0402 submission-order
-  bug used to corrupt.
+- **The Control Center capsules draw and take a drag, not a tap (2026-11-22).**
+  The brightness capsule's fill is its own thumb: a light band from the bottom
+  whose rounded top edge is the level, and it moves with the panel brightness
+  (`MONDR USB: brightness 1024 of 4095`). A 0 ms tap inside it changes nothing,
+  exactly as with a UISwitch; a 150 ms drag upwards moves the edge
+  (`tools/wsl/ui-cc-capsule.sh drag 860 1000` then
+  `tools/png-capsule-fill.py`: row 718 -> 690 of 1600). The volume capsule stays
+  a faded blue with its speaker glyph and no fill, the look iOS gives a volume
+  control with no audio route, which is this port's state. There is no general
+  picture failure here: read a capsule's fill edge before calling one missing.
+- **Control Center draws every module over the home screen (2026-11-22).** A
+  swipe from the top-right corner draws the connectivity platter, the media
+  module, Focus, the toggles and both capsules. The sheared blue block the
+  module materials used to show is the 0402 submission-order bug (see the
+  backdrop entry below), not a drawing gap.
 - **A switch without its knob can be a kernel without the app bridge
   (2026-11-22).** After a power cycle the phone booted the flashed image from
   2026-11-17, which predates 0402: Settings drew the Airplane Mode track in

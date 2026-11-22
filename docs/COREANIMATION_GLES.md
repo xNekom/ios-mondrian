@@ -222,9 +222,14 @@ CGImage -- under the floor, so the CGImage kept the broken road and the ring sho
 `MONDRIAN SURF: backboardd create ... 129x129 fmt 0x0 ... size 81920` right after the app built it.
 The bridge now converts every CGImage of 4x4 or more, pads the surface row to 16 bytes so any width
 works, and is built as a dylib of its own (`tools/mondrian-layer-bridge.m`) because the hook carries
-the services' sixteen dyld interposers; `0402` injects that dylib into every process whose exec path
-starts with `/Applications/`, so Settings carries the bridge and none of the hook
-(`mondrian_ui_hook=1286`). The app match has to use the whole path
+the services' sixteen dyld interposers; `0402` injects that dylib into every exec whose path contains
+`.app/` or `/WebKit.framework/`, so Settings carries the bridge and none of the hook
+(`mondrian_ui_hook` in `tools/boards.py`). That is every app bundle the system can launch - the system
+apps under `/Applications/`, an App Store app under
+`/private/var/containers/Bundle/Application/<uuid>/Name.app/Name`, its extensions under
+`.app/PlugIns/` - plus the WebKit services. Matching `/Applications/` alone reached the system apps
+and nothing else: measured 2026-11-22, the bridge ran only in Preferences, SpringBoard and Spotlight,
+so a third-party app and a web page still lost every picture. The app match has to use the whole path
 (`cn_pnbuf`): by the time the environment is copied, `cn_nameptr` points at the
 last component, so a `strncmp(name, "/Applications/")` never matches an app --
 which is why the first 0402 boot injected nothing and said nothing.

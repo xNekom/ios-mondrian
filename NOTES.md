@@ -60,7 +60,8 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `DKIOCISWRITABLE` must agree or HFS disables writes.
 - **Display and UI.** The home screen and Settings draw on the 1440x3200 canvas
   (`docs/UI_PERFORMANCE.md` has the frame meter and the boot traps);
-  `mondrian_ui_hook=1286` plus `/private/var/vm/mondrian-xpc` brings up the shell.
+  `mondrian_ui_hook` (the mask in `tools/boards.py`) plus
+  `/private/var/vm/mondrian-xpc` brings up the shell.
 
 Current blockers, in order:
 
@@ -69,17 +70,16 @@ Current blockers, in order:
    injector in `backboardd`, `docs/MONDIAN_GPU.md`) without a present switches the
    panel off with DCS `0x28`; a key or touch switches it back on (`0x29`) from the
    tick, never from a frame -- iOS has stopped its display link, so a tap presents
-   nothing (`0342`). The holds stay on (`mondriankeepawake=1`); with them off the
-   phone locked itself mid-experiment (measured 2026-11-19).
+   nothing (`0342`) -- and the holds stay on (`mondriankeepawake=1`).
 2. **Charge level.** Charging works by itself (the charger sits behind the ADSP,
    +1.27 A through `ichg_fb`), but the coulomb counter is out of reach: the level
    is a voltage table (`0304`) anchored to the Android sample with `battfix=mv:pct,...`.
 3. **Control Center and the rest.** The CC grid is 430 pt wide whatever the
-   screen is and the brightness module never calls its setter. A picture does
-   not cross to the window server as a CGImage, so a bridge-only dylib converts
-   every image element in every app in `/Applications` (`0402`); what it never
-   sees stays blank (WebKit's page content). Audio, modem and cameras remain
-   (`docs/MONDIAN_GPU.md`).
+   screen is. A picture does not cross to the window server as a CGImage, so a
+   bridge-only dylib converts every image element in every `.app` bundle and in
+   the WebKit services (`0402`); a web page still draws black because its
+   renderer runs through Metal, which this port has no driver for. Audio, modem
+   and cameras remain (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 
