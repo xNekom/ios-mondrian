@@ -831,9 +831,9 @@ boot each, so the three columns differ only in what changed:
   sometimes show over it come from the live scene layer, not the snapshot.
   Instrumenting `glClear` for a magenta colour records **zero** clears, so the
   shim does not paint it either.
-  The render that is supposed to fill the destination is the target:
-  `/private/var/vm/mondrian-snap-layers` arms a dump of the `_FBSSnapshot`
-  context's layers (class and `contents`), and
+  The render that is supposed to fill the destination is the target: writing
+  `2` (instead of `1`) to `/private/var/vm/mondrian-snap-probe` arms a dump of
+  the `_FBSSnapshot` context's layers (class and `contents`), and
   `/private/var/vm/mondrian-dump-picture` writes a quarter-scale copy of a
   picture too large for the ring. `tools/card-surface-map.py` measures the
   picture's box and colours.
