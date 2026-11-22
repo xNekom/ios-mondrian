@@ -1946,7 +1946,7 @@ my_write(int fd, const void *buf, size_t len)
 				return bt_tx_write(fixed, sizeof(fixed));
 			}
 			if ((opcode >= 0x0400 && opcode < 0x0500) ||
-			    opcode == 0x0c1a) {
+			    opcode == 0x0c1a || opcode == 0x0c13) {
 				/*
 				 * Inquiry (0x0401) is 5 parameters: LAP 3, length in
 				 * 1.28 s units, and the response limit. Length 0
