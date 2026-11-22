@@ -706,8 +706,16 @@ boot each, so the three columns differ only in what changed:
   launch itself (`tools/wsl/ui-catch-launch.sh`): it lasts about a second. A
   second RAM boot of the same image reproduces it (`exec Preferences` and `exit
   Preferences[240]/[241] status 0x9`), with the bridge loaded in both, so it is
-  not a per-session leak either. The next probe is the killer's identity, not the
-  drawing path.
+  not a per-session leak either. `0404` names the sender, and it is our own
+  shim: `MONDRIAN KILL: Preferences[240] by bluetoothd[85]`. The request was a
+  `kill Preferences` left in `/private/var/vm/bt-poke` by an earlier session;
+  the poke thread is one-shot and clears the marker, but the file outlives the
+  boot in the image, so every boot replayed it once. Writing `none` into the
+  marker brings the app back within one launch (`tools/wsl/ui-switch-shot.sh`
+  then draws the Airplane switch and the Bluetooth pane stays up), and the shim
+  drops the marker at startup. The lesson generalises: a request a script
+  leaves on the phone is replayed after a reboot, so clear it in the same
+  script, and read `MONDRIAN KILL:` before blaming a launch path.
 - **The app launch animation draws the magenta poster replica (2026-11-22).**
   A burst capture of a Settings launch catches a full-width band of `ff04c6`
   (94% of the band, `tools/png-crop.py` and a colour census) with rounded top
