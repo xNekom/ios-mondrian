@@ -831,12 +831,21 @@ boot each, so the three columns differ only in what changed:
   sometimes show over it come from the live scene layer, not the snapshot.
   Instrumenting `glClear` for a magenta colour records **zero** clears, so the
   shim does not paint it either.
-  The render that is supposed to fill the destination is the target: writing
-  `2` (instead of `1`) to `/private/var/vm/mondrian-snap-probe` arms a dump of
-  the `_FBSSnapshot` context's layers (class and `contents`), and
-  `/private/var/vm/mondrian-dump-picture` writes a quarter-scale copy of a
-  picture too large for the ring. `tools/card-surface-map.py` measures the
-  picture's box and colours.
+  The magic is the layer: `_FBSSnapshotLayer` only has `baseTransform`,
+  `initWithContextID:baseTransform:` and `contextID`; `contents` is nil because
+  the picture lives in the render server, not in the wrapper. The snapshot's
+  own IOSurface is `w30r` (30-bit wide gamut), 1440x3200, row 5888, and its ID
+  **never appears in backboardd's GL log** -- the render server never attaches
+  or draws into it. The 1440x3200 surface the shim does attach at that moment
+  is the panel. So the destination is created, handed to a renderer that does
+  nothing, and read back as allocator poison.
+  The next target is the render itself: either `_FBSSnapshot capture` never
+  reaches the render server for these context IDs, or the server's offscreen
+  path skips a surface in this format. `mondrian-snap-probe` mode `2` prints
+  the layer class, `contextID` and the snapshot surface; mode `1` only arms the
+  cache hooks. `/private/var/vm/mondrian-dump-picture` writes a quarter-scale
+  copy of a picture too large for the ring, and `tools/card-surface-map.py`
+  measures its box and colours.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
