@@ -386,11 +386,29 @@ log_arg_string(const uint8_t *buf, unsigned size, const char *format)
 	}
 	memcpy(&pointer, buf + 4, sizeof(pointer));
 	if (pointer < 0x1000) {
+		/*
+		 * The daemon exits 0x100 on the power path and its last line is an
+		 * oslog.error whose string argument never came out; a pointer that
+		 * cannot be read is why. Name it instead of dropping it silently.
+		 */
+		if (wanted(format)) {
+			bt_log("oslog.text? %s ptr %#lx low\n", format,
+			    (unsigned long)pointer);
+		}
 		return;
 	}
-	if (vm_read_overwrite(mach_task_self(), (vm_address_t)pointer,
-	    sizeof(text) - 1, (vm_address_t)(uintptr_t)text, &got) != KERN_SUCCESS) {
-		return;
+	{
+		kern_return_t kr = vm_read_overwrite(mach_task_self(),
+		    (vm_address_t)pointer, sizeof(text) - 1,
+		    (vm_address_t)(uintptr_t)text, &got);
+
+		if (kr != KERN_SUCCESS) {
+			if (wanted(format)) {
+				bt_log("oslog.text? %s ptr %#lx failed %d\n",
+				    format, (unsigned long)pointer, (int)kr);
+			}
+			return;
+		}
 	}
 	text[sizeof(text) - 1] = 0;
 	for (i = 0; i < sizeof(text) - 1; i++) {
@@ -815,7 +833,15 @@ my_read(int fd, void *buf, size_t len)
 				if (--h4_left == 0) {
 					h4_state = 0;
 					h4_left = 0;
-					if (bt_scan_own && bt_pkt_track &&
+					/*
+					 * Off: the daemon still reported `orphan event,
+					 * opcode 0x0C1A` with the frame already gated
+					 * off, so this rewind was not removing our own
+					 * complete -- it was cutting a packet the daemon
+					 * did ask for and leaving the next one orphaned.
+					 * Framing correctness beats the optimisation.
+					 */
+					if (0 && bt_scan_own && bt_pkt_track &&
 					    produced >= bt_pkt_mark + 6 &&
 					    out[bt_pkt_mark] == 0x04 &&
 					    out[bt_pkt_mark + 1] == 0x0e &&
