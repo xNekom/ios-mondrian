@@ -844,10 +844,84 @@ bridge_get_contents(id self, SEL cmd)
 	return result;
 }
 
+static int bridge_watch_on = -1;
+
+/*
+ * What the switcher hands its cards. Armed by
+ * /private/var/vm/mondrian-switch-watch: the card views are created by
+ * SpringBoard and the deep dump says their content view has no contents, so the
+ * only way to name the picture's road is to stand in setContents() while the
+ * switcher opens and print each distinct layer shape with what it was given.
+ */
+static int
+bridge_watch_contents(id layer, id contents)
+{
+	Class cls;
+	const char *name;
+	CGRect bounds;
+	static struct {
+		const char *name;
+		int w, h;
+	} seen[16];
+	static unsigned n;
+	unsigned i;
+	const char *kind = "nil";
+	char line[220];
+
+	if (bridge_watch_on < 0) {
+		bridge_watch_on = bridge_file_on(
+		    "/private/var/vm/mondrian-switch-watch") ? 1 : 0;
+	}
+	if (bridge_watch_on == 0 || getprogname() == NULL ||
+	    strcmp(getprogname(), "SpringBoard") != 0) {
+		return 0;
+	}
+	cls = object_getClass(layer);
+	name = cls != NULL ? class_getName(cls) : NULL;
+	if (name == NULL) {
+		return 0;
+	}
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("bounds"));
+	if (!(bounds.size.width >= 300 && bounds.size.height >= 500) &&
+	    strstr(name, "Snapshot") == NULL &&
+	    strstr(name, "Switcher") == NULL) {
+		return 0;
+	}
+	for (i = 0; i < n; i++) {
+		if (seen[i].name == name && seen[i].w == (int)bounds.size.width &&
+		    seen[i].h == (int)bounds.size.height) {
+			return 0;
+		}
+	}
+	if (n < 16) {
+		seen[n].name = name;
+		seen[n].w = (int)bounds.size.width;
+		seen[n].h = (int)bounds.size.height;
+		n++;
+	}
+	if (contents != NULL) {
+		CFTypeID type = CFGetTypeID((CFTypeRef)contents);
+
+		if (type == CGImageGetTypeID()) {
+			kind = "CGImage";
+		} else if (type == IOSurfaceGetTypeID()) {
+			kind = "IOSurface";
+		} else {
+			kind = object_getClassName(contents);
+		}
+	}
+	snprintf(line, sizeof(line), "MONDRIAN SW2: %s %.0fx%.0f contents %s\n",
+	    name, (double)bounds.size.width, (double)bounds.size.height, kind);
+	bridge_say(line);
+	return 1;
+}
+
 static void
 bridge_set_contents(id self, SEL cmd, id contents)
 {
 	IOSurfaceRef surface = NULL;
+	int watched = bridge_watch_contents(self, contents);
 
 	if (contents != NULL && !bridge_off() &&
 	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
@@ -857,6 +931,19 @@ bridge_set_contents(id self, SEL cmd, id contents)
 		if (w >= 4 && h >= 4) {
 			surface = bridge_cached(image);
 			if (surface != NULL) {
+				if (watched) {
+					char line[240];
+					CGRect lb = ((CGRect (*)(id, SEL))objc_msgSend)(
+					    self, sel_registerName("bounds"));
+
+					snprintf(line, sizeof(line),
+					    "MONDRIAN SW3: %s %.0fx%.0f image %zux%zu "
+					    "cached surface %u\n",
+					    object_getClassName(self),
+					    (double)lb.size.width, (double)lb.size.height,
+					    w, h, IOSurfaceGetID(surface));
+					bridge_say(line);
+				}
 				if (bridge_hits++ < 4) {
 					char line[160];
 
@@ -871,18 +958,19 @@ bridge_set_contents(id self, SEL cmd, id contents)
 				unsigned coverage = 0;
 
 				surface = bridge_surface(image, &used, &coverage);
-				if (surface != NULL && bridge_made++ < 8) {
-					char line[220];
+				if (watched) {
+					char line[280];
+					CGRect lb = ((CGRect (*)(id, SEL))objc_msgSend)(
+					    self, sel_registerName("bounds"));
 
 					snprintf(line, sizeof(line),
-					    "MONDRIAN BRIDGE[%d]: %zux%zu as "
-					    "surface %u bpr %zu drew %u/49%s%s\n",
-					    getpid(), w, h,
-					    IOSurfaceGetID(surface),
-					    IOSurfaceGetBytesPerRow(surface),
+					    "MONDRIAN SW3: %s %.0fx%.0f image %zux%zu "
+					    "surface %s drew %u/49%s\n",
+					    object_getClassName(self),
+					    (double)lb.size.width, (double)lb.size.height,
+					    w, h, surface != NULL ? "made" : "none",
 					    coverage,
-					    used != image ? " relabelled" : "",
-					    coverage == 0 ? " empty" : "");
+					    used != image ? " relabelled" : "");
 					bridge_say(line);
 				}
 				if (surface != NULL &&
@@ -895,6 +983,15 @@ bridge_set_contents(id self, SEL cmd, id contents)
 				contents = (id)surface;
 			}
 		}
+	}
+	if (watched && surface == NULL) {
+		char line[200];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN SW3: no surface made (contents %s, off %d)\n",
+		    contents != NULL ? object_getClassName(contents) : "nil",
+		    bridge_off() ? 1 : 0);
+		bridge_say(line);
 	}
 	if (bridge_original != NULL) {
 		bridge_original(self, cmd, contents);
