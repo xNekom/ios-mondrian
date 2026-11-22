@@ -5261,6 +5261,23 @@ mondrian_bt_init(void)
 		truncate = 0;
 	}
 	for (i = 0; i < path_count; i++) {
+		if (truncate) {
+			char previous[256];
+			struct stat st;
+
+			/*
+			 * Keep the previous instance's tail. The daemon exits 0x100
+			 * on this port and its last lines are the only record of why
+			 * (measured 2026-11-22: bluetoothd[816] and [954] exited
+			 * 0x100 with an ACL link up, and truncating here erased the
+			 * reason). One rotation is enough to read it.
+			 */
+			if (snprintf(previous, sizeof(previous), "%s-prev",
+			    paths[i]) < (int)sizeof(previous) &&
+			    stat(paths[i], &st) == 0 && st.st_size > 0) {
+				(void)rename(paths[i], previous);
+			}
+		}
 		fd = open(paths[i], O_WRONLY | O_CREAT | (truncate ? O_TRUNC : O_APPEND),
 		    0666);
 		if (fd >= 0) {
