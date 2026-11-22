@@ -661,6 +661,22 @@ boot each, so the three columns differ only in what changed:
   compare a second open and a frame captured mid-drag before reading that as a
   missing layer: the module materials are the ones the 0402 submission-order
   bug used to corrupt.
+- **A plain UISlider keeps its thumb; the Control Center capsules do not
+  (2026-11-22).** Settings > Sounds draws three switches (Change with Buttons,
+  Keyboard Clicks, Lock Sound) and the ringtone volume slider with its round
+  white thumb, and `tools/wsl/ui-switch-audit.sh 1240 1126` flips Change with
+  Buttons and rewrites its footer. So the thumb a UISlider gets through the same
+  0402 bridge is drawn; the Control Center's missing thumb is that control's own
+  drawing, not a general picture failure.
+- **Interposing XPC in the layer bridge paints apps red (2026-11-22).** The
+  bridge loads in every app, so it looked like the place to log what Settings
+  sends to bluetoothd. Adding interposers for
+  `xpc_connection_send_message`, `..._with_reply` and `..._with_reply_sync`
+  built and installed cleanly, and after the respring Settings painted a solid
+  red window while other apps kept drawing; reverting to the committed source
+  and respringing brought it back. The trap is the bridge: it is the app's only
+  injected code and a wrong XPC shim there breaks the app's own UI. Log the
+  message from the daemon side, or from a separate dylib.
 - **The Settings row icons and the Wi-Fi switch draw (2026-11-22).** The
   Settings root draws every full-colour row tile (Airplane, Wi-Fi, Bluetooth,
   Notifications, General, Accessibility, ...), the Airplane switch draws track
