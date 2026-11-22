@@ -40,6 +40,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -55,6 +56,71 @@ static int bridge_console = -1;
 static unsigned bridge_made;
 static unsigned bridge_hits;
 static unsigned bridge_empty;
+static bool bridge_log_started;
+
+/*
+ * A second channel for the dump.
+ *
+ * Console writes from an app do not reach the kernel ring on this port: the
+ * bridge's own `loaded in ...` line never appears for Spotlight, yet Spotlight
+ * creates its surfaces (`MONDRIAN SURF: Spotlight create ... keys 6`), so the
+ * dylib runs and its console output is dropped. A dump therefore goes to a file
+ * the host can pull with `rf`, and -- until an app proves it can write there --
+ * to the console as well.
+ */
+static void
+bridge_dump_write(const char *line)
+{
+	int fd;
+	int32_t pid = (int32_t)getpid();
+	char path[160];
+
+	snprintf(path, sizeof(path),
+	    "/private/var/mobile/Library/Preferences/mondrian-appdeep-%d.log",
+	    (int)pid);
+	if (!bridge_log_started) {
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd >= 0) {
+			close(fd);
+			bridge_log_started = true;
+		}
+	}
+	if (!bridge_log_started) {
+		return;
+	}
+	fd = open(path, O_WRONLY | O_APPEND, 0666);
+	if (fd < 0) {
+		return;
+	}
+	(void)write(fd, line, strlen(line));
+	close(fd);
+}
+
+/*
+ * One line per load, appended to a file shared by every process: the only way
+ * to tell "the dylib is not in Spotlight" from "it is, and its console output
+ * is dropped" and from "its sandbox refuses the write". The dump below uses a
+ * file per pid, so a process that never writes one is invisible without this.
+ */
+static void
+bridge_alive(const char *what)
+{
+	static bool wrote;
+	char line[160];
+	int fd;
+
+	snprintf(line, sizeof(line), "%s pid %d: %s\n",
+	    getprogname() != NULL ? getprogname() : "?", (int)getpid(), what);
+	fd = open("/private/var/mobile/Library/Preferences/"
+	    "mondrian-bridge-alive.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0) {
+		return;
+	}
+	(void)write(fd, line, strlen(line));
+	close(fd);
+	wrote = true;
+	(void)wrote;
+}
 
 static void (*bridge_original)(id, SEL, id);
 
@@ -817,6 +883,149 @@ static bool bridge_installed;
 static bool bridge_told;
 
 /*
+ * The view tree of the process that carries this dylib, for the screens no
+ * other dump can reach. The hook's deep dump walks SpringBoard's windows, and
+ * on the Today view that names only the backdrop and the search pill: the four
+ * 192x192 suggestion cards live in the Spotlight process, behind a
+ * `_UIPortalView`/`CAPortalLayer`, so the only way to read their class and
+ * whether they hold contents is from inside Spotlight -- and Spotlight gets
+ * this dylib, not the hook.
+ *
+ * Armed by /private/var/vm/mondrian-deep-app holding a new number, four dumps
+ * per process, like the hook's. The lines go to /dev/console and to a file;
+ * the console is dropped for an app on this port, which is why the file exists.
+ */
+#define BRIDGE_DEEP_MAX 220
+
+static unsigned bridge_deep_prints;
+
+static void
+bridge_deep_view(id view, unsigned depth)
+{
+	id layer, kids;
+	const char *name;
+	char line[300];
+	CGRect frame;
+	const char *lname = "-";
+	bool has_contents = false;
+	unsigned n, i;
+
+	if (view == nil || depth > 12 || bridge_deep_prints >= BRIDGE_DEEP_MAX) {
+		return;
+	}
+	name = object_getClassName(view);
+	frame = ((CGRect (*)(id, SEL))objc_msgSend)(view,
+	    sel_registerName("frame"));
+	layer = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("layer"));
+	if (layer != nil) {
+		lname = object_getClassName(layer);
+		has_contents = ((id (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("contents")) != nil;
+	}
+	bridge_deep_prints++;
+	snprintf(line, sizeof(line),
+	    "MONDRIAN APPDEEP: %*s%s %.0f,%.0f %.0fx%.0f layer %s contents %s\n",
+	    (int)(depth * 2), "", name != NULL ? name : "?",
+	    (double)frame.origin.x, (double)frame.origin.y,
+	    (double)frame.size.width, (double)frame.size.height, lname,
+	    has_contents ? "yes" : "no");
+	bridge_say(line);
+	bridge_dump_write(line);
+
+	kids = ((id (*)(id, SEL))objc_msgSend)(view, sel_registerName("subviews"));
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		bridge_deep_view([(NSArray *)kids objectAtIndex:i], depth + 1);
+	}
+}
+
+static void
+bridge_deep_dump(void)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	id app, windows;
+	char line[160];
+	unsigned count, i;
+
+	if (app_cls == NULL) {
+		return;
+	}
+	app = ((id (*)(id, SEL))objc_msgSend)(app_cls,
+	    sel_registerName("sharedApplication"));
+	if (app == nil) {
+		return;
+	}
+	windows = ((id (*)(id, SEL))objc_msgSend)(app,
+	    sel_registerName("windows"));
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	snprintf(line, sizeof(line), "MONDRIAN APPDEEP: %s pid %d, %u windows\n",
+	    getprogname() != NULL ? getprogname() : "?", getpid(), count);
+	bridge_say(line);
+	bridge_dump_write(line);
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+
+		snprintf(line, sizeof(line), "MONDRIAN APPDEEP: window %s\n",
+		    object_getClassName(window));
+		bridge_say(line);
+		bridge_dump_write(line);
+		bridge_deep_view(window, 1);
+	}
+}
+
+static void
+bridge_deep_probe(void)
+{
+	static unsigned long asked;
+	static unsigned dumps;
+	FILE *file;
+	unsigned long wanted = 0;
+
+	file = fopen("/private/var/vm/mondrian-deep-app", "r");
+	if (file == NULL) {
+		return;
+	}
+	if (fscanf(file, "%lu", &wanted) != 1) {
+		(void)fclose(file);
+		return;
+	}
+	(void)fclose(file);
+	if (dumps >= 4 || wanted == asked) {
+		return;
+	}
+	asked = wanted;
+	dumps++;
+	bridge_deep_dump();
+}
+
+/*
+ * The dump needs the main thread (UIKit), and the dylib has no run loop of its
+ * own: one main-queue timer per process, which reads a marker file every two
+ * seconds and does nothing else while the file is absent.
+ */
+static dispatch_source_t bridge_timer;
+
+static void
+bridge_deep_start(void)
+{
+	if (bridge_timer != NULL) {
+		return;
+	}
+	bridge_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+	    dispatch_get_main_queue());
+	if (bridge_timer == NULL) {
+		return;
+	}
+	dispatch_source_set_timer(bridge_timer,
+	    dispatch_time(DISPATCH_TIME_NOW, 0), 2ull * NSEC_PER_SEC,
+	    500ull * NSEC_PER_MSEC);
+	dispatch_source_set_event_handler(bridge_timer, ^{
+		bridge_deep_probe();
+	});
+	dispatch_resume(bridge_timer);
+}
+
+/*
  * Install when CoreAnimation is there.
  *
  * A process that receives this dylib before it has loaded QuartzCore has no
@@ -889,6 +1098,8 @@ bridge_install(void)
 	    bridge_off() ? ", marker on (CGImages kept)" : "",
 	    bridge_switch_orig != NULL ? ", switch probe on" : "");
 	bridge_say(line);
+	bridge_alive("loaded");
+	bridge_deep_start();
 }
 
 static void
