@@ -687,6 +687,21 @@ boot each, so the three columns differ only in what changed:
   the view has no live provider. What the Today view shows is SpringBoard's
   backdrop over a portal with no source. Name the kill reason next (a crash
   report or the job's check-in), not the picture path.
+- **An app can launch, draw, and still be killed before its first frame
+  (2026-11-22).** After a RAM boot of the 08:21 kernel, tapping Settings gives
+  `exec Preferences` followed by `exit Preferences[<pid>] status 0x9`, and the
+  capture stays on the home screen while the ring shows the app's own surfaces
+  (`MONDRIAN BRIDGE[<pid>]: loaded in Preferences`, `129x129` conversions), so
+  the process ran and rendered. It reproduces with the picture bridge deleted
+  (`del /private/var/vm/mondrian-layer-bridge.dylib`, which 0402 reads as "no
+  bridge"), so the bridge is not the killer, and a sleep/wake plus unlock
+  (`tools/wsl/ui-wake-cycle.sh`) does not restore the launch. `0x9` is the
+  signal number in this kernel's exit report, so the app is being killed, not
+  exiting. Read `exec`/`exit` pairs before blaming an icon: a tap that produces
+  no `exec` at all is SpringBoard's launch path, and one that produces an
+  `exec` plus an `exit 0x9` is the app being reaped. The next probe is
+  RunningBoard's reason (a crash report or the launch watchdog), not the
+  drawing path.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
