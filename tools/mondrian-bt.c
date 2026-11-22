@@ -691,6 +691,17 @@ inject_event(const uint8_t *event, size_t len)
 
 static void bt_name_feed(const uint8_t *buf, size_t len);
 
+/*
+ * Our own `Write Scan Enable` (0x0C1A) is answered by a Command Complete that
+ * the daemon never asked for, and three of those in a row made bluetoothd exit
+ * 0x100 (measured 2026-11-22). Drop it from the stream the daemon reads: the
+ * bytes are already in its buffer, so rewinding the produced count removes the
+ * whole event.
+ */
+static int bt_scan_own;
+static int bt_pkt_track;
+static size_t bt_pkt_mark;
+
 static ssize_t
 my_read(int fd, void *buf, size_t len)
 {
@@ -702,6 +713,7 @@ my_read(int fd, void *buf, size_t len)
 	if (fd != control_socket_fd || control_socket_fd < 0 || len == 0) {
 		return (ssize_t)syscall(SYS_read, fd, buf, len);
 	}
+	bt_pkt_track = 0;
 	while (produced < len) {
 		size_t want;
 		ssize_t got;
@@ -802,6 +814,16 @@ my_read(int fd, void *buf, size_t len)
 				h4_pos++;
 				if (--h4_left == 0) {
 					h4_state = 0;
+					h4_left = 0;
+					if (bt_scan_own && bt_pkt_track &&
+					    produced >= bt_pkt_mark + 6 &&
+					    out[bt_pkt_mark] == 0x04 &&
+					    out[bt_pkt_mark + 1] == 0x0e &&
+					    (uint16_t)(out[bt_pkt_mark + 4] |
+					    (out[bt_pkt_mark + 5] << 8)) == 0x0c1a) {
+						produced = bt_pkt_mark;
+						bt_scan_own = 0;
+					}
 				}
 				continue;
 			}
@@ -838,6 +860,8 @@ my_read(int fd, void *buf, size_t len)
 				h4_pos = 0;
 				h4_supported_mask = 0;
 				h4_state = 1;
+				bt_pkt_mark = produced;
+				bt_pkt_track = 1;
 				out[produced++] = byte;
 				continue;
 			}
@@ -1726,6 +1750,7 @@ bt_poke_thread(void *argument)
 		 */
 		if (access("/private/var/vm/bt-scan-on", F_OK) == 0 &&
 		    ++scan_ticks % 8 == 0) {
+			bt_scan_own = 1;
 			(void)bt_tx_write(scan_frame, sizeof(scan_frame));
 			if (scan_ticks == 8) {
 				bt_power_append(
