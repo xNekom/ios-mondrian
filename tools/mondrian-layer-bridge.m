@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BRIDGE_CACHE	8
@@ -56,6 +57,7 @@ static int bridge_console = -1;
 static unsigned bridge_made;
 static unsigned bridge_hits;
 static unsigned bridge_empty;
+static unsigned bridge_pic_dumps;
 static bool bridge_log_started;
 
 /*
@@ -383,6 +385,30 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 		CGImageRelease(drawable);
 	}
 	IOSurfaceUnlock(surface, 0, &seed);
+	/*
+	 * A raw copy of what the layer will hand the server. The ring can say a
+	 * 129x129 picture was converted and how much of it is not zero, but not
+	 * whether it is the knob or a transparent square; this writes the bytes a
+	 * host can look at. Armed by /private/var/vm/mondrian-dump-picture.
+	 */
+	if (bridge_pic_dumps < 8 && row * height <= 8u * 1024u * 1024u &&
+	    access("/private/var/vm/mondrian-dump-picture", F_OK) == 0) {
+		char path[160];
+		const void *base = IOSurfaceGetBaseAddress(surface);
+		int fd;
+
+		snprintf(path, sizeof(path),
+		    "/private/var/mobile/Library/Preferences/"
+		    "mondrian-pic-%zux%zu-%zu-%u.bgra", width, height, row,
+		    bridge_pic_dumps);
+		fd = base != NULL ? open(path,
+		    O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+		if (fd >= 0) {
+			(void)write(fd, base, row * height);
+			close(fd);
+			bridge_pic_dumps++;
+		}
+	}
 	if (*coverage == 0) {
 		bridge_empty++;
 	}
@@ -946,7 +972,6 @@ bridge_deep_dump(void)
 	id app, windows, scenes;
 	char line[160];
 	unsigned count, i;
-
 	if (app_cls == NULL) {
 		return;
 	}
@@ -1023,10 +1048,20 @@ bridge_deep_probe(void)
 		return;
 	}
 	(void)fclose(file);
-	if (dumps >= 4 || wanted == asked) {
+	/*
+	 * A new number restarts the series. The first dump lands before the app
+	 * has a window, so one dump per arm is useless here: an app can be
+	 * killed about two seconds after exec (measured 2026-11-22, `exit
+	 * Preferences[pid] status 0x9`), which leaves only the dumps that the
+	 * half-second timer fits in that life.
+	 */
+	if (wanted != asked) {
+		asked = wanted;
+		dumps = 0;
+	}
+	if (dumps >= 8) {
 		return;
 	}
-	asked = wanted;
 	dumps++;
 	bridge_deep_dump();
 }
@@ -1050,8 +1085,8 @@ bridge_deep_start(void)
 		return;
 	}
 	dispatch_source_set_timer(bridge_timer,
-	    dispatch_time(DISPATCH_TIME_NOW, 0), 2ull * NSEC_PER_SEC,
-	    500ull * NSEC_PER_MSEC);
+	    dispatch_time(DISPATCH_TIME_NOW, 0), 500ull * NSEC_PER_MSEC,
+	    100ull * NSEC_PER_MSEC);
 	dispatch_source_set_event_handler(bridge_timer, ^{
 		bridge_deep_probe();
 	});
