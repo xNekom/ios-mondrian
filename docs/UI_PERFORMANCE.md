@@ -716,18 +716,20 @@ boot each, so the three columns differ only in what changed:
   drops the marker at startup. The lesson generalises: a request a script
   leaves on the phone is replayed after a reboot, so clear it in the same
   script, and read `MONDRIAN KILL:` before blaming a launch path.
-- **The app launch animation draws the magenta poster replica (2026-11-22).**
-  A burst capture of a Settings launch catches a full-width band of `ff04c6`
-  (94% of the band, `tools/png-crop.py` and a colour census) with rounded top
-  corners rising from the icon, and the row icons drawn over it. That colour is
-  the wallpaper poster's own replica (the hook's note at
-  `mondrian_display_picture` records every byte of the 1440x3200 CGImage as
-  `ff 00 ff ff`): the home screen's wallpaper is a display render, but the
-  launch animation's backdrop still takes the replica. On the next boot the same
-  band is black instead of magenta, so the animation's backdrop layer holds
-  whatever the poster handed it and nothing fills it. So a flash while an app
-  opens is the poster, not the app's own drawing, and the fix is to give the
-  animation the same display picture the wallpaper gets.
+- **The app launch animation drew the poster replica; it now paints the wallpaper (2026-11-22).**
+  A burst capture of a Settings launch caught a full-width band of `ff04c6`
+  (94% of the band, `tools/png-crop.py` and a colour census) with rows of white
+  memory stripes and the app's rounded corners over it; on another boot the same
+  band was black. The band is `PBUIPosterFloatingLayerReplica` (and
+  `PBUISnapshotReplicaView`) in `_SBWallpaperSecureWindow`, whose layer holds the
+  poster's uninitialised surface, so the animation had nothing to show behind
+  the zoom. `mondrian_replica_paint_step` in `tools/mondrian-ui-hook.m` paints
+  every `Replica` view and its full-screen sublayers with
+  `mondrian_wallpaper_image()`, the gradient the wallpaper window carries, and
+  `-[CALayer setContents:]` replaces the picture when the animation sets it
+  later. Armed by `/private/var/vm/mondrian-replica-paint`; verified on one
+  boot, the same launch that showed the magenta band now shows the home
+  wallpaper and icons while Settings zooms in.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the

@@ -9856,16 +9856,38 @@ mondrian_relabel_on(void)
 	return on;
 }
 
+static CGImageRef mondrian_wallpaper_image(void);
+
 static void
 mondrian_layer_set_contents(id self, SEL _cmd, id contents)
 {
 	CGImageRef fixed = NULL;
+	int owns = 0;
 
-	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
+	/*
+	 * The launch animation shows the wallpaper's poster replica behind the
+	 * zooming app, and on this port the replica is the poster's own
+	 * uninitialised surface: magenta on one boot, black on the next
+	 * (measured 2026-11-22, a burst capture of a Settings launch). The home
+	 * wallpaper is the gradient this hook writes, so paint the replica with
+	 * the same picture or every app opens through a coloured flash.
+	 */
+	if (mondrian_file_on("/private/var/vm/mondrian-replica-paint")) {
+		id delegate = mondrian_send(self, "delegate");
+		const char *owner = delegate != nil ?
+		    object_getClassName(delegate) : NULL;
+
+		if (owner != NULL && strstr(owner, "Replica") != NULL) {
+			fixed = mondrian_wallpaper_image();
+		}
+	}
+	if (fixed == NULL && contents != nil &&
+	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
 	    mondrian_relabel_on()) {
 		fixed = mondrian_wall_relabel((CGImageRef)contents);
+		owns = fixed != NULL;
 	}
-	if (fixed != NULL) {
+	if (fixed != NULL && owns) {
 		static unsigned said;
 
 		if (said < 8) {
@@ -9880,7 +9902,7 @@ mondrian_layer_set_contents(id self, SEL _cmd, id contents)
 		}
 	}
 	mondrian_set_contents(self, _cmd, fixed != NULL ? (id)fixed : contents);
-	if (fixed != NULL) {
+	if (owns) {
 		CGImageRelease(fixed);
 	}
 }
@@ -10035,6 +10057,109 @@ mondrian_wallpaper_step(void)
 			continue;
 		}
 		(void)mondrian_wallpaper_paste(window, 0, &printed);
+	}
+}
+
+static unsigned
+mondrian_replica_paint_layer(id layer, unsigned depth, unsigned *printed)
+{
+	id contents, kids;
+	unsigned n, i, hits = 0;
+
+	if (layer == nil || depth > 8) {
+		return 0;
+	}
+	contents = mondrian_send(layer, "contents");
+	if (contents != nil && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
+	    CGImageGetWidth((CGImageRef)contents) >= 640 &&
+	    CGImageGetHeight((CGImageRef)contents) >= 1000) {
+		((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"),
+		    (id)mondrian_wallpaper_image());
+		if (*printed < 4) {
+			(*printed)++;
+			say("MONDRIAN REPLICA: the full-screen picture is the wallpaper now\n");
+		}
+		hits++;
+	}
+	kids = mondrian_send(layer, "sublayers");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_replica_paint_layer([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, printed);
+	}
+	return hits;
+}
+
+static unsigned
+mondrian_replica_paint_view(id view, unsigned depth, unsigned *printed)
+{
+	id kids, layer;
+	unsigned n, i, hits = 0;
+	const char *name = view != nil ? object_getClassName(view) : NULL;
+
+	if (view == nil || depth > 10) {
+		return 0;
+	}
+	if (name != NULL && strstr(name, "Replica") != NULL) {
+		layer = mondrian_send(view, "layer");
+		if (layer != nil) {
+			((void (*)(id, SEL, id))objc_msgSend)(layer,
+			    sel_registerName("setContents:"),
+			    (id)mondrian_wallpaper_image());
+			if (*printed < 4) {
+				char line[160];
+
+				(*printed)++;
+				snprintf(line, sizeof(line),
+				    "MONDRIAN REPLICA: %s painted\n", name);
+				say(line);
+			}
+			hits++;
+			hits += mondrian_replica_paint_layer(layer, 0, printed);
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		hits += mondrian_replica_paint_view([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, printed);
+	}
+	return hits;
+}
+
+/*
+ * The replica can already hold its picture when the hook is installed, so a
+ * tick repaints it. Armed by /private/var/vm/mondrian-replica-paint.
+ */
+static void
+mondrian_replica_paint_step(void)
+{
+	static unsigned said;
+	Class app_cls = objc_getClass("UIApplication");
+	Method method;
+	id app, windows;
+	unsigned count, i, hits = 0, printed = 0;
+
+	if (!mondrian_file_on("/private/var/vm/mondrian-replica-paint") ||
+	    mondrian_wallpaper_image() == NULL || app_cls == Nil ||
+	    (method = class_getClassMethod(app_cls,
+	    sel_registerName("sharedApplication"))) == NULL) {
+		return;
+	}
+	app = ((id (*)(id, SEL))method_getImplementation(method))((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		hits += mondrian_replica_paint_view([(NSArray *)windows objectAtIndex:i],
+		    0, &printed);
+	}
+	if (hits > 0 && said++ < 6) {
+		char line[128];
+
+		snprintf(line, sizeof(line),
+		    "MONDRIAN REPLICA: %u painted in %u window(s)\n", hits, count);
+		say(line);
 	}
 }
 
@@ -10836,6 +10961,7 @@ mondrian_lock_step(void *context)
 		}
 		mondrian_hide_step();
 		mondrian_wallpaper_step();
+		mondrian_replica_paint_step();
 		mondrian_library_step();
 		mondrian_layer_report();
 		mondrian_relabel_arm();
