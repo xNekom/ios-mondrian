@@ -1581,4 +1581,7 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    the first `present` before optimizing draws.
 4. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
    screen something is actually animating. `glwait=0` is off the table (see the
-   traps).
+   traps). The wait itself is 2.4-6.2 ms of a frame (`waiting` on the
+   `mondrian-gl: frame` line), so the open question is how many frames the
+   submission path can hold in flight: a third one would let the CPU run a frame
+   ahead without skipping the wait. TODO, not measured.
