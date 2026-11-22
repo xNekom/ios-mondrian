@@ -314,6 +314,47 @@ bt_power_append(const char *fmt, ...)
 	close(fd);
 }
 
+/*
+ * Pairing and connection events, one line each, in a file of their own.
+ * The power log is capped at 1 MiB and an inquiry flood grows it past that
+ * within minutes, so the pairing lines of a test were gone by the time the
+ * test was read (measured 2026-11-22: the Windows pairing completed and the
+ * log had already rotated). This file holds only low-volume events.
+ */
+#define BT_EVENTS_MAX (64 * 1024)
+
+static void
+bt_event_append(const char *fmt, ...)
+{
+	char line[512];
+	va_list ap;
+	int n;
+	int fd;
+	struct stat st;
+
+	n = snprintf(line, sizeof(line), "mondrian-bt[%d]: ", getpid());
+	if (n < 0 || n >= (int)sizeof(line)) {
+		return;
+	}
+	va_start(ap, fmt);
+	vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+	va_end(ap);
+	fd = open("/private/var/mobile/Library/Preferences/mondrian-bt-events.log",
+	    O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0) {
+		return;
+	}
+	if (fstat(fd, &st) == 0 && st.st_size > BT_EVENTS_MAX &&
+	    ftruncate(fd, 0) == 0) {
+		static const char rotated[] =
+		    "mondrian-bt[0]: log rotated\n";
+
+		(void)syscall(SYS_write, fd, rotated, sizeof(rotated) - 1);
+	}
+	(void)syscall(SYS_write, fd, line, strlen(line));
+	close(fd);
+}
+
 static const char *const interesting[] = {
 	"Bluetooth", "bluetooth", "transport", "Transport", "HCI", "restart",
 	"Switch", "switch", "failed", "Failed", "error", "Error", "driver",
@@ -1331,6 +1372,21 @@ bt_event_report(const uint8_t *pkt, size_t len)
 {
 	static unsigned results;
 
+	if (len >= 2 && (pkt[1] == 0x03 || pkt[1] == 0x05 ||
+	    pkt[1] == 0x06 || pkt[1] == 0x16 || pkt[1] == 0x17 ||
+	    pkt[1] == 0x18 || (pkt[1] >= 0x2b && pkt[1] <= 0x36))) {
+		size_t at;
+		char line[320];
+		int used = snprintf(line, sizeof(line), "evt %02x:",
+		    pkt[1]);
+
+		for (at = 2; at < len && used > 0 &&
+		    (size_t)used < sizeof(line) - 4; at++) {
+			used += snprintf(line + used,
+			    sizeof(line) - (size_t)used, " %02x", pkt[at]);
+		}
+		bt_event_append("%s\n", line);
+	}
 	if (len >= 7 && pkt[1] == 0x0e) {
 		uint16_t opcode = (uint16_t)(pkt[4] | (pkt[5] << 8));
 
@@ -5329,6 +5385,7 @@ mondrian_bt_init(void)
 	if (sysctlbyname("kern.boottime", &boot, &boot_len, NULL, 0) != 0) {
 		boot.tv_sec = 0;
 	}
+	bt_event_append("shim up\n");
 	bt_log("init v63 %s uid %d log \"%s\" boot %ld inherited \"%s\" "
 	    "transport \"%s\" baud \"%s\" port %d\n",
 	    executable,
