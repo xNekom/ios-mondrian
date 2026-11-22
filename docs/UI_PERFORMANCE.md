@@ -800,6 +800,21 @@ boot each, so the three columns differ only in what changed:
   calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
+- **The app switcher does not show a snapshot of the app (2026-11-22).** Three
+  captures of the same gesture (`out/switcher-a.png`, `out/switcher-hook.png`,
+  `out/switcher-idle.png`) show three different failures: a Messages card that
+  is blank white, a Settings card that is black bands with a few readable rows,
+  and a Settings card filled with `(255,4,198)`, the same uninitialised canvas
+  colour the launch fix calls magenta, with the pane's text over it. The view
+  tree names the cards: `SBAppSwitcherReusableSnapshotView` over
+  `_SBOrientationTransformedContentView`, and that content view reports
+  `contents no` -- the snapshot image never reaches it. What shows instead is
+  the card's `PBUISnapshotReplicaView` (the wallpaper) and, on one capture, the
+  app's own canvas. The card titles are `UILabel alpha 0.00`, so a title is only
+  visible where the blurred backdrop behind it is bright. Who fills the
+  720x1600 BGRA surfaces SpringBoard creates at the switcher is the open
+  question; the magenta test in the hook would catch that colour
+  (`B > 150`, `G < 90`, `R > 150`) if it were a layer's contents.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
