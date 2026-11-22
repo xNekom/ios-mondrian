@@ -777,10 +777,10 @@ boot each, so the three columns differ only in what changed:
   system meant to show, so `mondrian_layer_set_contents` replaces it, surface or
   CGImage, with the system background before it reaches the glass. On by
   default; `mondrian-launch-fix-off` is the A/B. Cold Settings and cold Messages
-  now report zero magenta samples. A warm launch still shows about 100 ms of
-  pink while the launch screen fades over the animated backdrop (32 of 1406 row
-  samples); that one is the presentation layer of the running animation, not the
-  picture. The hook the kernel loads is written from the image at mount
+  now report zero magenta samples. A warm launch still shows a flash of
+  pink while the launch screen fades over the animated backdrop (10 of about
+  1400 row samples on 2026-11-22, down from 32); that one is the presentation
+  layer of the running animation, not the picture. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
