@@ -806,7 +806,7 @@ boot each, so the three columns differ only in what changed:
   calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
-- **The app switcher does not show a snapshot of the app (2026-11-22).** The
+- **The app switcher's snapshot is a blank magenta picture (2026-11-22).** The
   cards show three different failures (a blank white card, a black card with a
   few readable rows, a card filled with `(255,4,198)`), and the `setContents`
   watch is how the picture's road was named. Two details cost a wrong
@@ -814,23 +814,27 @@ boot each, so the three columns differ only in what changed:
   `CALayer 480x1067` for `-[CALayer setContents:]`, so a watch keyed on the
   layer class and bounds prints the replica once and hides the card behind it.
   Keyed on the owning view, every line is a replica or poster view
-  (`PBUISnapshotReplicaView`, `PBUIPosterFloatingView`, `UIImageView`) and
-  `SBAppSwitcherReusableSnapshotView` never receives a picture at all. The view
-  tree says the same: that view and `_SBOrientationTransformedContentView`
-  report `contents no`. The launch fix cannot catch the magenta, because at
-  `setContents:` time the card's surface is still blank; whatever fills it does
-  so afterwards.
-  The card's own surface is the measurement: a 1440x3200 IOSurface, **99.8 % of
-  it pure magenta `(255,0,255)`** (`tools/card-surface-stats.py` on the
-  quarter-scale dump), with a sliver of the app's rows over the rest; another
-  open has the same surface black. Both are what the allocator left there, not
-  a colour an app asked for: instrumenting `glClear` for a magenta colour
-  records **zero** clears, so the fill is not the shim's. The card titles are
-  `UILabel alpha 0.00`, so a title is only visible where the backdrop behind it
-  is bright. The next target is the window server's snapshot render (what fills
-  the destination surface, and why only a sliver of the app is drawn), not the
-  bridge. `mondrian-dump-picture` writes a quarter-scale copy of a picture too
-  large for the ring, which is how the 18 MB card surface is read.
+  (`PBUISnapshotReplicaView`, `PBUIPosterFloatingView`, `UIImageView`).
+  The picture is not missing at the cache: hooking
+  `SBAppSwitcherSnapshotImageCache` prints `create for SBDisplayItem full 0`,
+  `load`, `finished, XBApplicationSnapshotImage 336x746` and
+  `cached XBApplicationSnapshotImage`, so the request completes and an image
+  arrives. Its pixels are the failure: the bridge's conversion of that image
+  (`336x747` -> 1008x2240) is **100 % pure magenta `(255,0,255)`**. The snapshot
+  renderer returns a blank placeholder, and the rows visible on the card come
+  from the live scene layer drawn over it -- the focused card's
+  `SBAppSwitcherReusableSnapshotView` sits at `opacity 0.00` for that reason.
+  The live content also goes through a colour matrix that lifts dark pixels to
+  red, which is why the card's black title reads red.
+  A separate 1440x3200 IOSurface handed to a card layer is 99.8 % magenta with
+  a sliver of glyphs (`tools/card-surface-map.py`), and another open has it
+  black: allocator memory, not a drawing. Instrumenting `glClear` for a magenta
+  colour records **zero** clears, so the shim does not paint it.
+  The next target is `-[_FBSSnapshot CGImage]` in the app (`_FBSSnapshot`,
+  `_FBSSnapshotContext`, `_FBSSnapshotLayer`, `FBSSceneSnapshotRequest` are the
+  classes the runtime lists) and the render that produces the blank picture;
+  `mondrian-dump-picture` writes a quarter-scale copy of a picture too large for
+  the ring.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
