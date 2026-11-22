@@ -391,21 +391,59 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 	 * whether it is the knob or a transparent square; this writes the bytes a
 	 * host can look at. Armed by /private/var/vm/mondrian-dump-picture.
 	 */
-	if (bridge_pic_dumps < 8 && row * height <= 8u * 1024u * 1024u &&
+	if (bridge_pic_dumps < 8 && width >= 300 && height >= 500 &&
 	    access("/private/var/vm/mondrian-dump-picture", F_OK) == 0) {
 		char path[160];
 		const void *base = IOSurfaceGetBaseAddress(surface);
-		int fd;
+		int fd = -1;
 
-		snprintf(path, sizeof(path),
-		    "/private/var/mobile/Library/Preferences/"
-		    "mondrian-pic-%zux%zu-%zu-%u.bgra", width, height, row,
-		    bridge_pic_dumps);
-		fd = base != NULL ? open(path,
-		    O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+		if (row * height <= 16u * 1024u * 1024u) {
+			snprintf(path, sizeof(path),
+			    "/private/var/mobile/Library/Preferences/"
+			    "mondrian-pic-%zux%zu-%zu-%u.bgra", width, height,
+			    row, bridge_pic_dumps);
+			fd = base != NULL ? open(path,
+			    O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+			if (fd >= 0) {
+				(void)write(fd, base, row * height);
+				close(fd);
+			}
+		} else if (base != NULL) {
+			/*
+			 * A full-screen card is 1440x3200, 18 MB: too big to pull
+			 * over the ring just to see its background. A quarter-scale
+			 * copy keeps every fourth row and column, which is enough to
+			 * tell a magenta placeholder from a drawn card.
+			 */
+			size_t sw = width / 4, sh = height / 4, srow = sw * 4;
+			uint8_t *small = malloc(srow * sh);
+
+			if (small != NULL) {
+				size_t x, y;
+
+				for (y = 0; y < sh; y++) {
+					const uint8_t *src =
+					    (const uint8_t *)base + (y * 4) * row;
+
+					for (x = 0; x < sw; x++) {
+						memcpy(small + y * srow + x * 4,
+						    src + (x * 4) * 4, 4);
+					}
+				}
+				snprintf(path, sizeof(path),
+				    "/private/var/mobile/Library/Preferences/"
+				    "mondrian-pic-%zux%zu-%zu-%u.bgra", sw, sh,
+				    srow, bridge_pic_dumps);
+				fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
+				    0666);
+				if (fd >= 0) {
+					(void)write(fd, small, srow * sh);
+					close(fd);
+				}
+				free(small);
+			}
+		}
 		if (fd >= 0) {
-			(void)write(fd, base, row * height);
-			close(fd);
 			bridge_pic_dumps++;
 		}
 	}
@@ -859,14 +897,17 @@ bridge_watch_contents(id layer, id contents)
 	Class cls;
 	const char *name;
 	CGRect bounds;
+	id delegate;
+	const char *owner;
 	static struct {
 		const char *name;
+		const char *owner;
 		int w, h;
 	} seen[16];
 	static unsigned n;
 	unsigned i;
 	const char *kind = "nil";
-	char line[220];
+	char line[260];
 
 	if (bridge_watch_on < 0) {
 		bridge_watch_on = bridge_file_on(
@@ -888,14 +929,25 @@ bridge_watch_contents(id layer, id contents)
 	    strstr(name, "Switcher") == NULL) {
 		return 0;
 	}
+	/*
+	 * The card and the wallpaper replica are both a plain `CALayer 480x1067`
+	 * to -[CALayer setContents:], and keying only on the layer class and size
+	 * folded them into one line -- which is how the replica's wallpaper read
+	 * as "the cards get their picture". The owning view is the difference.
+	 */
+	delegate = ((id (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("delegate"));
+	owner = delegate != nil ? object_getClassName(delegate) : "-";
 	for (i = 0; i < n; i++) {
-		if (seen[i].name == name && seen[i].w == (int)bounds.size.width &&
+		if (seen[i].name == name && seen[i].owner == owner &&
+		    seen[i].w == (int)bounds.size.width &&
 		    seen[i].h == (int)bounds.size.height) {
 			return 0;
 		}
 	}
 	if (n < 16) {
 		seen[n].name = name;
+		seen[n].owner = owner;
 		seen[n].w = (int)bounds.size.width;
 		seen[n].h = (int)bounds.size.height;
 		n++;
@@ -911,8 +963,10 @@ bridge_watch_contents(id layer, id contents)
 			kind = object_getClassName(contents);
 		}
 	}
-	snprintf(line, sizeof(line), "MONDRIAN SW2: %s %.0fx%.0f contents %s\n",
-	    name, (double)bounds.size.width, (double)bounds.size.height, kind);
+	snprintf(line, sizeof(line),
+	    "MONDRIAN SW2: %s %.0fx%.0f view %s contents %s\n",
+	    name, (double)bounds.size.width, (double)bounds.size.height, owner,
+	    kind);
 	bridge_say(line);
 	return 1;
 }
@@ -992,6 +1046,65 @@ bridge_set_contents(id self, SEL cmd, id contents)
 		    contents != NULL ? object_getClassName(contents) : "nil",
 		    bridge_off() ? 1 : 0);
 		bridge_say(line);
+	}
+	if (surface == NULL && contents != NULL &&
+	    CFGetTypeID((CFTypeRef)contents) == IOSurfaceGetTypeID()) {
+		/*
+		 * The card layer that gets an IOSurface and not a picture: the
+		 * bridge passes it through, so its bytes are the only way to say
+		 * whether the window server filled it or left it poisoned. Read
+		 * only; two dumps a process, 8 MiB at most.
+		 */
+		static unsigned dumped;
+		IOSurfaceRef shared = (IOSurfaceRef)contents;
+		size_t w = IOSurfaceGetWidth(shared);
+		size_t h = IOSurfaceGetHeight(shared);
+		size_t row = IOSurfaceGetBytesPerRow(shared);
+		uint32_t seed = 0;
+		char line[240];
+
+		if (bridge_watch_on <= 0) {
+			bridge_watch_on = bridge_file_on(
+			    "/private/var/vm/mondrian-switch-watch") ? 1 : 0;
+		}
+		if (bridge_watch_on > 0 && getprogname() != NULL &&
+		    strcmp(getprogname(), "SpringBoard") == 0) {
+			kern_return_t lock = IOSurfaceLock(shared,
+			    kIOSurfaceLockReadOnly, &seed);
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN SW4: surface %zux%zu row %zu lock %d\n",
+			    w, h, row, (int)lock);
+			bridge_say(line);
+			if (lock == 0) {
+				const void *base =
+				    IOSurfaceGetBaseAddress(shared);
+				char path[160];
+				int fd = -1;
+
+				if (dumped < 2 && w >= 300 && h >= 500 &&
+				    row * h <= 8u * 1024u * 1024u &&
+				    base != NULL) {
+					snprintf(path, sizeof(path),
+					    "/private/var/mobile/Library/"
+					    "Preferences/mondrian-card-%zux%zu-"
+					    "%zu-%u.bgra", w, h, row, dumped);
+					fd = open(path, O_WRONLY | O_CREAT |
+					    O_TRUNC, 0666);
+					if (fd >= 0) {
+						(void)write(fd, base, row * h);
+						close(fd);
+						dumped++;
+					}
+				}
+				IOSurfaceUnlock(shared,
+				    kIOSurfaceLockReadOnly, &seed);
+				snprintf(line, sizeof(line),
+				    "MONDRIAN SW4: %zux%zu row %zu dumped %s\n",
+				    w, h, row, fd >= 0 ? "yes" : "no");
+				bridge_say(line);
+			}
+		}
 	}
 	if (bridge_original != NULL) {
 		bridge_original(self, cmd, contents);

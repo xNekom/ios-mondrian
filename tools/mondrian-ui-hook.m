@@ -9436,13 +9436,29 @@ mondrian_deep_view(id view, unsigned depth, unsigned *printed)
 		}
 		(*printed)++;
 		hits++;
-		snprintf(line, sizeof(line),
-		    "MONDRIAN DEEP: %*s%s %.0f,%.0f %.0fx%.0f hidden %d alpha %.2f layer %s"
-		    " opacity %.2f contents %s\n", (int)(depth * 2), "", name != NULL ? name : "?",
-		    (double)frame.origin.x, (double)frame.origin.y, (double)frame.size.width,
-		    (double)frame.size.height, (int)hidden, (double)alpha, lname, (double)layer_alpha,
-		    contents != nil ? "yes" : "no");
-		say(line);
+		{
+			const char *kind = "no";
+
+			if (contents != nil) {
+				CFTypeID type =
+				    CFGetTypeID((CFTypeRef)contents);
+
+				if (type == IOSurfaceGetTypeID()) {
+					kind = "surface";
+				} else if (type == CGImageGetTypeID()) {
+					kind = "image";
+				} else {
+					kind = object_getClassName(contents);
+				}
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN DEEP: %*s%s %.0f,%.0f %.0fx%.0f hidden %d alpha %.2f layer %s"
+			    " opacity %.2f contents %s\n", (int)(depth * 2), "", name != NULL ? name : "?",
+			    (double)frame.origin.x, (double)frame.origin.y, (double)frame.size.width,
+			    (double)frame.size.height, (int)hidden, (double)alpha, lname, (double)layer_alpha,
+			    kind);
+			say(line);
+		}
 	}
 	kids = mondrian_send(view, "subviews");
 	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
@@ -9450,6 +9466,88 @@ mondrian_deep_view(id view, unsigned depth, unsigned *printed)
 		hits += mondrian_deep_view([(NSArray *)kids objectAtIndex:i], depth + 1, printed);
 	}
 	return hits;
+}
+
+static void
+mondrian_deep_layers(id layer, unsigned depth, unsigned *printed)
+{
+	id kids;
+	const char *name;
+	CGRect bounds;
+	id contents, delegate;
+	const char *kind = "no";
+	BOOL hidden = NO;
+	float opacity = -1.0f;
+	char bg[40] = "bg -";
+	unsigned n, i;
+
+	if (layer == nil || depth > 12 || *printed >= 200) {
+		return;
+	}
+	name = object_getClassName(layer);
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("bounds"));
+	contents = mondrian_send(layer, "contents");
+	if (contents != nil) {
+		CFTypeID type = CFGetTypeID((CFTypeRef)contents);
+
+		if (type == IOSurfaceGetTypeID()) {
+			kind = "surface";
+		} else if (type == CGImageGetTypeID()) {
+			kind = "image";
+		} else {
+			kind = object_getClassName(contents);
+		}
+	}
+	if ([layer respondsToSelector:sel_registerName("isHidden")]) {
+		hidden = ((BOOL (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("isHidden"));
+	}
+	if ([layer respondsToSelector:sel_registerName("opacity")]) {
+		opacity = ((float (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("opacity"));
+	}
+	{
+		id colour = mondrian_send(layer, "backgroundColor");
+
+		if (colour != nil && CFGetTypeID((CFTypeRef)colour) ==
+		    CGColorGetTypeID()) {
+			size_t parts = CGColorGetNumberOfComponents(
+			    (CGColorRef)colour);
+			const CGFloat *c = CGColorGetComponents(
+			    (CGColorRef)colour);
+
+			if (parts >= 4) {
+				snprintf(bg, sizeof(bg),
+				    "bg %.2f/%.2f/%.2f/%.2f", (double)c[0],
+				    (double)c[1], (double)c[2], (double)c[3]);
+			} else if (parts >= 1) {
+				snprintf(bg, sizeof(bg), "bg %.2f",
+				    (double)c[0]);
+			}
+		}
+	}
+	delegate = mondrian_send(layer, "delegate");
+	if (contents != nil ||
+	    (bounds.size.width >= 300 && bounds.size.height >= 500)) {
+		char line[320];
+
+		(*printed)++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN DEEP L: %*s%s %.0fx%.0f contents %s %s "
+		    "hidden %d opacity %.2f view %s\n",
+		    (int)(depth * 2), "", name != NULL ? name : "?",
+		    (double)bounds.size.width, (double)bounds.size.height, kind,
+		    bg, (int)hidden, (double)opacity,
+		    delegate != nil ? object_getClassName(delegate) : "-");
+		say(line);
+	}
+	kids = mondrian_send(layer, "sublayers");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		mondrian_deep_layers([(NSArray *)kids objectAtIndex:i],
+		    depth + 1, printed);
+	}
 }
 
 static void
@@ -9509,6 +9607,19 @@ mondrian_deep_probe(void)
 		snprintf(line, sizeof(line), "MONDRIAN DEEP: %s, dump %u\n", name, dumps);
 		say(line);
 		(void)mondrian_deep_view(window, 0, &printed);
+		if (strstr(name, "Switcher") != NULL) {
+			unsigned layers = 0;
+			id window_layer = mondrian_send(window, "layer");
+			unsigned told = 0;
+
+			if (window_layer != nil) {
+				snprintf(line, sizeof(line),
+				    "MONDRIAN DEEP L: %s\n", name);
+				say(line);
+				(void)told;
+				mondrian_deep_layers(window_layer, 0, &layers);
+			}
+		}
 	}
 }
 
@@ -10404,6 +10515,76 @@ mondrian_clock_label(CGRect frame, double size, double weight, id colour)
 	((void (*)(id, SEL, double))objc_msgSend)(label,
 	    sel_registerName("setMinimumScaleFactor:"), 0.4);
 	return label;
+}
+
+/*
+ * The lock screen is the one state a host script cannot read through the glass:
+ * a panel capture keeps the last frame after the backlight goes off, so "locked"
+ * and "awake" look alike, and the same swipe unlocks or scrolls depending on the
+ * state it started in. This prints the state whenever it changes, and asks
+ * SpringBoard to unlock while /private/var/vm/mondrian-unlock exists (the test
+ * rig's "open the phone", so a script does not have to guess the gesture).
+ */
+static void
+mondrian_lock_state_step(id app)
+{
+	static int last = -1;
+	static unsigned unlock_tries;
+	Class mgr_cls = objc_getClass("SBLockScreenManager");
+	id mgr, windows;
+	int ui = -1, pass = -1, out = -1, wallpaper_hidden = -1;
+	unsigned count, i;
+
+	if (mgr_cls == Nil) {
+		return;
+	}
+	mgr = ((id (*)(id, SEL))objc_msgSend)((id)mgr_cls,
+	    sel_registerName("sharedInstance"));
+	if (mgr == nil) {
+		return;
+	}
+	if ([mgr respondsToSelector:sel_registerName("isUILocked")]) {
+		ui = ((BOOL (*)(id, SEL))objc_msgSend)(mgr,
+		    sel_registerName("isUILocked"));
+	}
+	if ([mgr respondsToSelector:sel_registerName("isPasscodeLocked")]) {
+		pass = ((BOOL (*)(id, SEL))objc_msgSend)(mgr,
+		    sel_registerName("isPasscodeLocked"));
+	}
+	if ([mgr respondsToSelector:sel_registerName("isLockedOut")]) {
+		out = ((BOOL (*)(id, SEL))objc_msgSend)(mgr,
+		    sel_registerName("isLockedOut"));
+	}
+	windows = app != nil ? mondrian_send(app, "windows") : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		id window = [(NSArray *)windows objectAtIndex:i];
+		const char *name = object_getClassName(window);
+
+		if (name != NULL && strstr(name, "Wallpaper") != NULL &&
+		    [window respondsToSelector:sel_registerName("isHidden")]) {
+			wallpaper_hidden = ((BOOL (*)(id, SEL))objc_msgSend)(
+			    window, sel_registerName("isHidden"));
+			break;
+		}
+	}
+	if (ui * 4 + pass * 2 + out != last) {
+		char line[160];
+
+		last = ui * 4 + pass * 2 + out;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN LOCK: ui %d passcode %d lockedout %d wallpaper hidden %d\n",
+		    ui, pass, out, wallpaper_hidden);
+		say(line);
+	}
+	if (ui == 1 && mondrian_file_on("/private/var/vm/mondrian-unlock") &&
+	    [mgr respondsToSelector:sel_registerName("unlockUIFromSource:withOptions:")]) {
+		((void (*)(id, SEL, long, id))objc_msgSend)(mgr,
+		    sel_registerName("unlockUIFromSource:withOptions:"), 1L, nil);
+		if (unlock_tries++ < 4) {
+			say("MONDRIAN LOCK: asked for an unlock\n");
+		}
+	}
 }
 
 static void
@@ -11385,6 +11566,7 @@ mondrian_lock_step(void *context)
 		mondrian_wallpaper_step();
 		mondrian_replica_paint_step();
 		mondrian_lockscreen_clock_step(app);
+		mondrian_lock_state_step(app);
 		mondrian_library_step();
 		mondrian_layer_report();
 		mondrian_relabel_arm();
