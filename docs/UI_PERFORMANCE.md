@@ -841,7 +841,11 @@ boot each, so the three columns differ only in what changed:
   nothing, and read back as allocator poison.
   The next target is the render itself: either `_FBSSnapshot capture` never
   reaches the render server for these context IDs, or the server's offscreen
-  path skips a surface in this format. `mondrian-snap-probe` mode `2` prints
+  path skips a surface in this format. The display is not a substitute:
+  `CARenderServerRenderDisplay` from the bridge returns black both at the
+  snapshot request and while an app is on screen (marker
+  `/private/var/vm/mondrian-capture-now`), so the picture has to come from the
+  render server or from the app itself. `mondrian-snap-probe` mode `2` prints
   the layer class, `contextID` and the snapshot surface; mode `1` only arms the
   cache hooks. `/private/var/vm/mondrian-dump-picture` writes a quarter-scale
   copy of a picture too large for the ring, and `tools/card-surface-map.py`
