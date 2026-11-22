@@ -1698,6 +1698,18 @@ bt_poke_thread(void *argument)
 	 */
 	bt_poke_clear(marker);
 	for (;;) {
+		/*
+		 * Keep inquiry and page scan on. bluetoothd never sends
+		 * Write Scan Enable (0x0C1A) on this port: measured
+		 * 2026-11-22, its own state machine says `scan classic
+		 * shouldRun 0` while the pane promises discoverability, so
+		 * Windows cannot find the phone and an incoming connection
+		 * (Alexa) is never page-scanned and dies in about six
+		 * seconds.
+		 */
+		static const uint8_t scan_frame[] =
+		    { 0x01, 0x1a, 0x0c, 0x01, 0x03 };
+		static unsigned scan_ticks;
 		char text[128];
 		uint8_t addr[6];
 		enum bt_poke_kind kind;
@@ -1705,6 +1717,21 @@ bt_poke_thread(void *argument)
 		int fd;
 		ssize_t got;
 
+		/*
+		 * Off unless asked: the controller's Command Complete for this
+		 * frame is not ours in bluetoothd's eyes, and three of them
+		 * made it exit 0x100 in a row (measured 2026-11-22). Switch on
+		 * with /private/var/vm/bt-scan-on once the read path swallows
+		 * that event.
+		 */
+		if (access("/private/var/vm/bt-scan-on", F_OK) == 0 &&
+		    ++scan_ticks % 8 == 0) {
+			(void)bt_tx_write(scan_frame, sizeof(scan_frame));
+			if (scan_ticks == 8) {
+				bt_power_append(
+				    "discoverable: wrote scan enable 0x03\n");
+			}
+		}
 		usleep(500000);
 		fd = open(marker, O_RDONLY);
 		if (fd < 0) {
