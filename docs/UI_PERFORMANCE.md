@@ -651,8 +651,26 @@ boot each, so the three columns differ only in what changed:
   it: it converts a layer's CGImage to a client surface, covers every size (the
   old 300x200 floor is why the knob was left out), and answers `-contents` with
   the surface only to QuartzCore's commit, so the picture still reaches UIKit.
-  `0402` injects it into every app in `/Applications`, so Settings gets the
-  bridge without the hook's interposers.
+  `0402` injects it into every process whose path carries `.app/` or
+  `/WebKit.framework/`, so Settings gets the bridge without the hook's
+  interposers.
+- **SpringBoard received the hook instead of the bridge (2026-11-22).** The
+  bridge branch of `0402` runs only for an image the mask does not already
+  claim, and SpringBoard is bit 4, so every CGImage SpringBoard set kept the
+  broken road: the status bar battery drew as a green fill with no outline and
+  the home screen's Search pill had no magnifier, while the same pictures drew
+  inside Settings. `load_gpu_test` in `tools/mondrian-ui-hook.m` now dlopens
+  `/private/var/vm/mondrian-layer-bridge.dylib` when the process is SpringBoard;
+  the ring answers `MONDRIAN UI: picture bridge in SpringBoard` and
+  `MONDRIAN BRIDGE[<pid>]: in SpringBoard, CALayer up`, and the next frame draws
+  both. The lock screen clock is a different gap: `SBFLockScreenDateView` keeps
+  the time and date inside `BSUIVibrancyEffectView`, behind a
+  `BSUIVibrancyAnimatingPortalView` (`CAPortalLayer`) and a `CABackdropLayer`,
+  and that group draws nothing here; the same screen's "Swipe up to open" is an
+  `SBUILegibilityLabel` and does draw once the bridge is in SpringBoard. A
+  missing element is a CGImage (bridge), a vibrancy portal (no CA filter or
+  portal support) or Metal (no renderer): name which one before touching the
+  app.
 - **The Control Center capsules draw and take a drag, not a tap (2026-11-22).**
   The brightness capsule's fill is its own thumb: a light band from the bottom
   whose rounded top edge is the level, and it moves with the panel brightness
