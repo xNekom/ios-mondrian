@@ -62,6 +62,7 @@ static bool bridge_log_started;
 static void bridge_snapshot_hooks(void);
 static void bridge_fbs_hooks(void);
 static void bridge_chain_dump(const char *tag, CGImageRef image);
+static void bridge_capture_check(void);
 
 /* Prefix for a dump made from a named checkpoint, so a picture converted from
  * the cache can be told from one converted on its way to a layer. */
@@ -1036,6 +1037,7 @@ bridge_set_contents(id self, SEL cmd, id contents)
 
 	bridge_snapshot_hooks();
 	bridge_fbs_hooks();
+	bridge_capture_check();
 	watched = bridge_watch_contents(self, contents);
 
 	if (contents != NULL && !bridge_off() &&
@@ -1982,11 +1984,131 @@ bridge_snap_load(id self, SEL cmd, id request, id item, id layout)
 	}
 }
 
+/*
+ * What the display holds when the switcher asks for a snapshot. The render
+ * server's offscreen capture is the broken part; the display itself is drawn
+ * by the same server and is the one picture known to be right. If the centre
+ * still shows the app here, this capture can stand in for the snapshot.
+ */
+static void
+bridge_capture_display(void)
+{	void (*render)(unsigned, CFStringRef, CGContextRef, int, int);
+	size_t width = 1440, height = 3200, row = width * 4;
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+	uint8_t *buffer;
+	const uint8_t *middle;
+	char line[200];
+
+	render = (void (*)(unsigned, CFStringRef, CGContextRef, int, int))
+	    dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+	if (render == NULL) {
+		bridge_chain_line("SNAPDISP no CARenderServerRenderDisplay");
+		return;
+	}
+	buffer = calloc(1, row * height);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	if (buffer == NULL || rgb == NULL) {
+		free(buffer);
+		if (rgb != NULL) {
+			CGColorSpaceRelease(rgb);
+		}
+		return;
+	}
+	ctx = CGBitmapContextCreate(buffer, width, height, 8, row, rgb,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(rgb);
+	if (ctx == NULL) {
+		free(buffer);
+		return;
+	}
+	render(0, CFSTR("mon"), ctx, 0, 0);
+	middle = buffer + (height / 2) * row + (width / 2) * 4;
+	snprintf(line, sizeof(line), "SNAPDISP centre %02x %02x %02x",
+	    middle[0], middle[1], middle[2]);
+	bridge_chain_line(line);
+	/*
+	 * A quarter-scale copy for the host: the same sampling the layer dump
+	 * uses, so a 360x800 `bgra-to-png` can show whether this is the app.
+	 */
+	{
+		size_t sw = width / 4, sh = height / 4, srow = sw * 4;
+		uint8_t *small = malloc(srow * sh);
+
+		if (small != NULL) {
+			size_t x, y;
+
+			for (y = 0; y < sh; y++) {
+				const uint8_t *src = buffer + (y * 4) * row;
+
+				for (x = 0; x < sw; x++) {
+					memcpy(small + y * srow + x * 4,
+					    src + (x * 4) * 4, 4);
+				}
+			}
+			{
+				char path[180];
+				int fd;
+
+				snprintf(path, sizeof(path),
+				    "/private/var/mobile/Library/Preferences/"
+				    "mondrian-pic-SNAPDISP%zux%zu-%zu.bgra",
+				    sw, sh, srow);
+				fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
+				    0666);
+				if (fd >= 0) {
+					(void)write(fd, small, srow * sh);
+					close(fd);
+				}
+			}
+			free(small);
+		}
+	}
+	CGContextRelease(ctx);
+	free(buffer);
+}
+
+/*
+ * A one-shot capture the host can ask for while an app is on screen, before
+ * the switcher covers it: writing a new byte to
+ * /private/var/vm/mondrian-capture-now runs the display capture once. It is
+ * checked from setContents, which is the main thread, because the render
+ * server call is not meaningful from a background queue (measured: black).
+ */
+static void
+bridge_capture_check(void)
+{
+	static int last = -1;
+	static unsigned long long looked;
+	struct timeval now;
+	unsigned long long at;
+	int v;
+
+	(void)gettimeofday(&now, NULL);
+	at = (unsigned long long)now.tv_sec * 1000000ull +
+	    (unsigned)now.tv_usec;
+	if (looked != 0 && at - looked < 1000000ull) {
+		return;
+	}
+	looked = at;
+	v = bridge_file_byte("/private/var/vm/mondrian-capture-now");
+	if (v != -1 && v != last) {
+		last = v;
+		bridge_capture_display();
+	}
+}
+
 static void
 bridge_snap_create(id self, SEL cmd, id item, id layout, BOOL full)
 {
 	static unsigned said;
+	static bool captured;
 
+	if (!captured &&
+	    bridge_file_byte("/private/var/vm/mondrian-snap-probe") == '3') {
+		captured = true;
+		bridge_capture_display();
+	}
 	if (said < 8) {
 		char line[200];
 
