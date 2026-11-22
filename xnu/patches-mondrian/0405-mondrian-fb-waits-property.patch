@@ -1,0 +1,32 @@
+xnu 0405: the framebuffer says it waits, so the client stops waiting twice
+
+0350 made present() wait for the compositor's fence before it copies a
+surface into the panel, but IOMobileFramebuffer never said so. The GL
+interposer asks (display_waits(), tools/gpu/eagl.c); with no
+MondrianWaitsForGPU property it keeps its own glFinish at the end of every
+frame, which puts the CPU 2.4-6.2 ms behind the GPU for a wait the display
+does anyway. Measured with the property absent: 'mondrian-gl: frame' shows
+that wait under 'waiting', 2.4-4.4 ms on a page swipe and 6.2 ms on a
+launch. The interposer then flushes with a fence and does not wait
+(glClientWaitSync with a zero timeout), and the display's copy still
+cannot read a surface the GPU is drawing.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -1031,6 +1031,15 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	/*
++	 * The GL interposer asks this before it decides to glFinish a frame
++	 * (`display_waits()` in tools/gpu/eagl.c). With the fence on, the copy in
++	 * present() is the wait: a client-side glFinish puts the CPU a whole GPU
++	 * time behind every frame and buys nothing the display does not do itself.
++	 */
++	if (mondrian_fb_gpuwait) {
++		setProperty("MondrianWaitsForGPU", kOSBooleanTrue);
++	}
++	/*
+ 	 * IOMobileFramebufferOpen's getEDTProperty() reads these as 4-byte
+ 	 * CFData (getBytes:range:). An OSNumber crashes on -length and an
+ 	 * OSString on -getBytes:range:, so publish raw u32 bytes.
