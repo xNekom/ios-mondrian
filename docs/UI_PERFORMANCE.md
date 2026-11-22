@@ -806,30 +806,31 @@ boot each, so the three columns differ only in what changed:
   calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
-- **The app switcher does not show a snapshot of the app (2026-11-22).** Three
-  captures of the same gesture (`out/switcher-a.png`, `out/switcher-hook.png`,
-  `out/switcher-idle.png`) show three different failures: a Messages card that
-  is blank white, a Settings card that is black bands with a few readable rows,
-  and a Settings card filled with `(255,4,198)`, the same uninitialised canvas
-  colour the launch fix calls magenta, with the pane's text over it. The view
-  tree names the cards: `SBAppSwitcherReusableSnapshotView` over
-  `_SBOrientationTransformedContentView`, and that content view reports
-  `contents no` -- the snapshot image never reaches it. What shows instead is
-  the card's `PBUISnapshotReplicaView` (the wallpaper) and, on one capture, the
-  app's own canvas. The card titles are `UILabel alpha 0.00`, so a title is only
-  visible where the blurred backdrop behind it is bright.
-  The setContents watch (`/private/var/vm/mondrian-switch-watch`, `MONDRIAN SW2`
-  and `SW3` in the ring) closes the picture question: the card layers
-  (`CALayer 480x1067` and `336x747`) do receive CGImages -- 720x1600, 1080x2400,
-  1007x2240 -- and the bridge turns each into a surface with `drew 49/49`, so
-  the picture is not lost on the way in. One card layer receives an **IOSurface**
-  instead and the bridge passes it through untouched (`no surface made (contents
-  IOSurface, off 0)`); that one can still be uninitialised, and the magenta
-  `(255,4,198)` is the poison colour of a surface nothing drew into, not a
-  colour an app asked for. The next instrument is a dump of that surface's own
-  bytes (`mondrian-dump-picture` writes the bridge's surfaces to
-  `/private/var/mobile/Library/Preferences/*.bgra`; a pass-through surface is
-  not the bridge's to dump).
+- **The app switcher does not show a snapshot of the app (2026-11-22).** The
+  cards show three different failures (a blank white card, a black card with a
+  few readable rows, a card filled with `(255,4,198)`), and the `setContents`
+  watch is how the picture's road was named. Two details cost a wrong
+  conclusion. The card and the wallpaper replica are both a plain
+  `CALayer 480x1067` for `-[CALayer setContents:]`, so a watch keyed on the
+  layer class and bounds prints the replica once and hides the card behind it.
+  Keyed on the owning view, every line is a replica or poster view
+  (`PBUISnapshotReplicaView`, `PBUIPosterFloatingView`, `UIImageView`) and
+  `SBAppSwitcherReusableSnapshotView` never receives a picture at all. The view
+  tree says the same: that view and `_SBOrientationTransformedContentView`
+  report `contents no`. The launch fix cannot catch the magenta, because at
+  `setContents:` time the card's surface is still blank; whatever fills it does
+  so afterwards.
+  The card's own surface is the measurement: a 1440x3200 IOSurface, **99.8 % of
+  it pure magenta `(255,0,255)`** (`tools/card-surface-stats.py` on the
+  quarter-scale dump), with a sliver of the app's rows over the rest; another
+  open has the same surface black. Both are what the allocator left there, not
+  a colour an app asked for: instrumenting `glClear` for a magenta colour
+  records **zero** clears, so the fill is not the shim's. The card titles are
+  `UILabel alpha 0.00`, so a title is only visible where the backdrop behind it
+  is bright. The next target is the window server's snapshot render (what fills
+  the destination surface, and why only a sliver of the app is drawn), not the
+  bridge. `mondrian-dump-picture` writes a quarter-scale copy of a picture too
+  large for the ring, which is how the 18 MB card surface is read.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the

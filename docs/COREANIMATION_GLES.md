@@ -73,6 +73,20 @@ the order they were paid for:
   `out/gpu/mondrian-gl.dylib` as it finds it; it now rebuilds the library when
   `tools/gpu/eagl.c` is newer, because a boot that carried an older copy read as "the flush did
   nothing" (measured 2026-11-21).
+- **The shim is built with the SDK in `~/sdks` and a named `ld64.lld`.**
+  `xcrun --show-sdk-path` can answer a path with no
+  `System/Library/Frameworks/OpenGLES.framework/Headers` and no
+  `usr/include/stdlib.h` (measured 2026-11-22), and the distro clang then
+  invokes GNU ld, which answers `unrecognised emulation mode: llvm`. The build
+  falls back to `~/sdks/iPhoneOS*.sdk`, names `ld64.lld` explicitly and passes
+  `-arch arm64 -platform_version ios 16.0 16.0` itself, because clang does not
+  hand those flags to a linker named by absolute path.
+- **A magenta picture is allocator memory, not a clear.** The switcher's card
+  surface is 99.8 % pure `(255,0,255)` and another open has the same surface
+  black; instrumenting `glClear` for a magenta colour records zero clears, so
+  nothing paints it. Do not "fix" it in the shim's clear path: the destination
+  surface is simply never written by the window server's snapshot render
+  (`docs/UI_PERFORMANCE.md` has the measurements).
 - **The eight-times downsample that starts a backdrop's blur is not tinted by the layer that asked
   for it.** CoreAnimation's own four- and six-sample downsamples multiply the picture by nothing;
   the colour of the corners is the layer's opacity, which it applies where the layer is laid on
