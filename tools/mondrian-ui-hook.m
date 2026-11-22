@@ -10170,6 +10170,269 @@ mondrian_replica_paint_step(void)
 }
 
 /*
+ * The lock screen's date and time live inside BSUIVibrancyEffectView, behind a
+ * CAPortalLayer and a CABackdropLayer, and that group draws nothing here: the
+ * views are in the tree with no contents and the glass shows the wallpaper
+ * alone. The wallpaper had the same shape -- a full-screen picture that never
+ * crossed -- and the answer was to paint it ourselves. This does the same with
+ * two labels, added above the portal in SBFLockScreenDateView and updated when
+ * the minute changes; the frames are the ones the app-side dump reported
+ * (`BSUIVibrancyEffectView 32,96 416x234`, time 0,21 416x129, date 0,0 416x36).
+ *
+ * Armed by /private/var/vm/mondrian-lockscreen-clock.
+ */
+static id mondrian_clock_host;
+static id mondrian_clock_time_label;
+static id mondrian_clock_date_label;
+static id mondrian_clock_time_text;
+static id mondrian_clock_date_text;
+static long mondrian_clock_minute = -1;
+
+static id
+mondrian_find_view_named(id view, const char *needle, unsigned depth)
+{
+	id kids;
+	unsigned n, i;
+
+	if (view == nil || depth > 14) {
+		return nil;
+	}
+	{
+		const char *name = object_getClassName(view);
+
+		if (name != NULL && strstr(name, needle) != NULL) {
+			return view;
+		}
+	}
+	kids = mondrian_send(view, "subviews");
+	n = kids != nil ? (unsigned)[(NSArray *)kids count] : 0;
+	for (i = 0; i < n; i++) {
+		id hit = mondrian_find_view_named(
+		    [(NSArray *)kids objectAtIndex:i], needle, depth + 1);
+
+		if (hit != nil) {
+			return hit;
+		}
+	}
+	return nil;
+}
+
+static id
+mondrian_clock_label(CGRect frame, double size, double weight, id colour)
+{
+	Class label_cls = objc_getClass("UILabel");
+	Class font_cls = objc_getClass("UIFont");
+	id label, font;
+
+	if (label_cls == Nil || font_cls == Nil || colour == nil) {
+		return nil;
+	}
+	label = ((id (*)(id, SEL))objc_msgSend)((id)label_cls,
+	    sel_registerName("alloc"));
+	label = ((id (*)(id, SEL, CGRect))objc_msgSend)(label,
+	    sel_registerName("initWithFrame:"), frame);
+	if (label == nil) {
+		return nil;
+	}
+	font = ((id (*)(id, SEL, double, double))objc_msgSend)((id)font_cls,
+	    sel_registerName("systemFontOfSize:weight:"), size, weight);
+	if (font != nil) {
+		((void (*)(id, SEL, id))objc_msgSend)(label,
+		    sel_registerName("setFont:"), font);
+	}
+	((void (*)(id, SEL, id))objc_msgSend)(label,
+	    sel_registerName("setTextColor:"), colour);
+	((void (*)(id, SEL, long))objc_msgSend)(label,
+	    sel_registerName("setTextAlignment:"), 1L);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(label,
+	    sel_registerName("setUserInteractionEnabled:"), NO);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(label,
+	    sel_registerName("setAdjustsFontSizeToFitWidth:"), YES);
+	((void (*)(id, SEL, double))objc_msgSend)(label,
+	    sel_registerName("setMinimumScaleFactor:"), 0.4);
+	return label;
+}
+
+static void
+mondrian_lockscreen_clock_step(id app)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	Class colour_cls = objc_getClass("UIColor");
+	Class fmt_cls = objc_getClass("NSDateFormatter");
+	Class date_cls = objc_getClass("NSDate");
+	Class locale_cls = objc_getClass("NSLocale");
+	id windows, host = nil, now, locale, fmt, pattern;
+	id time_text, date_text, colour, date_colour;
+	CGRect bounds, time_frame, date_frame;
+	double scale;
+	long minute;
+	unsigned count, i;
+
+	if (app == nil || app_cls == Nil || colour_cls == Nil || fmt_cls == Nil ||
+	    date_cls == Nil || locale_cls == Nil ||
+	    !mondrian_file_on("/private/var/vm/mondrian-lockscreen-clock")) {
+		return;
+	}
+	windows = mondrian_send(app, "windows");
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count && host == nil; i++) {
+		host = mondrian_find_view_named([(NSArray *)windows objectAtIndex:i],
+		    "SBFLockScreenDateView", 0);
+	}
+	if (host == nil) {
+		/* A scene-based SpringBoard can answer 0 from -windows. */
+		id scenes = mondrian_send(app, "connectedScenes");
+		unsigned sc = scenes != nil ? (unsigned)[(NSSet *)scenes count] : 0;
+		id each = sc > 0 ? [(NSSet *)scenes allObjects] : nil;
+
+		for (i = 0; i < sc && host == nil; i++) {
+			id wins = mondrian_send([(NSArray *)each objectAtIndex:i],
+			    "windows");
+			unsigned n = wins != nil ?
+			    (unsigned)[(NSArray *)wins count] : 0;
+			unsigned k;
+
+			for (k = 0; k < n && host == nil; k++) {
+				host = mondrian_find_view_named(
+				    [(NSArray *)wins objectAtIndex:k],
+				    "SBFLockScreenDateView", 0);
+			}
+		}
+	}
+	if (host == nil) {
+		return;
+	}
+	/*
+	 * The labels go on the window, not on the date view: the wallpaper replica
+	 * (`PBUIPosterFloatingLayerReplica`, painted by this hook) is a later
+	 * sibling of the date view in the lock screen window and covers a label
+	 * added there (measured: the clock line printed and the glass stayed
+	 * wallpaper). The window's last subview is above the replica, and the date
+	 * view's coordinate space is the window's.
+	 */
+	{
+		id window = mondrian_send(host, "window");
+
+		if (window != nil) {
+			host = window;
+		}
+	}
+	if (host != mondrian_clock_host) {
+		((void (*)(id, SEL))objc_msgSend)(mondrian_clock_time_label,
+		    sel_registerName("release"));
+		((void (*)(id, SEL))objc_msgSend)(mondrian_clock_date_label,
+		    sel_registerName("release"));
+		mondrian_clock_time_label = nil;
+		mondrian_clock_date_label = nil;
+		mondrian_clock_host = host;
+		mondrian_clock_minute = -1;
+	}
+	if (mondrian_clock_time_label == nil) {
+		bounds = ((CGRect (*)(id, SEL))objc_msgSend)(host,
+		    sel_registerName("bounds"));
+		scale = bounds.size.width > 1.0 ? bounds.size.width / 480.0 : 1.0;
+		time_frame = CGRectMake(32.0 * scale, 132.0 * scale,
+		    416.0 * scale, 114.0 * scale);
+		date_frame = CGRectMake(32.0 * scale, 96.0 * scale,
+		    416.0 * scale, 36.0 * scale);
+		colour = ((id (*)(id, SEL))objc_msgSend)((id)colour_cls,
+		    sel_registerName("whiteColor"));
+		date_colour = ((id (*)(id, SEL, double, double))objc_msgSend)(
+		    (id)colour_cls, sel_registerName("colorWithWhite:alpha:"),
+		    1.0, 0.88);
+		mondrian_clock_time_label = mondrian_clock_label(time_frame,
+		    96.0 * scale, 0.23, colour);
+		mondrian_clock_date_label = mondrian_clock_label(date_frame,
+		    22.0 * scale, 0.23, date_colour != nil ? date_colour : colour);
+		if (mondrian_clock_time_label != nil &&
+		    mondrian_clock_date_label != nil) {
+			((void (*)(id, SEL, id))objc_msgSend)(host,
+			    sel_registerName("addSubview:"),
+			    mondrian_clock_date_label);
+			((void (*)(id, SEL, id))objc_msgSend)(host,
+			    sel_registerName("addSubview:"),
+			    mondrian_clock_time_label);
+			say("MONDRIAN CLOCK: date and time painted in "
+			    "SBFLockScreenDateView\n");
+		}
+	}
+	if (mondrian_clock_time_label == nil ||
+	    mondrian_clock_date_label == nil) {
+		return;
+	}
+	now = ((id (*)(id, SEL))objc_msgSend)((id)date_cls,
+	    sel_registerName("date"));
+	minute = (long)(((double (*)(id, SEL))objc_msgSend)(now,
+	    sel_registerName("timeIntervalSince1970")) / 60.0);
+	if (minute == mondrian_clock_minute && mondrian_clock_time_text != nil &&
+	    mondrian_clock_date_text != nil) {
+		return;
+	}
+	locale = ((id (*)(id, SEL))objc_msgSend)((id)locale_cls,
+	    sel_registerName("currentLocale"));
+	fmt = ((id (*)(id, SEL))objc_msgSend)((id)fmt_cls,
+	    sel_registerName("alloc"));
+	fmt = ((id (*)(id, SEL))objc_msgSend)(fmt, sel_registerName("init"));
+	pattern = ((id (*)(id, SEL, id, unsigned long, id))objc_msgSend)(
+	    (id)fmt_cls, sel_registerName("dateFormatFromTemplate:options:locale:"),
+	    @"jm", 0UL, locale);
+	/* The lock clock has no AM/PM even when the locale writes one. */
+	pattern = ((id (*)(id, SEL, id, id))objc_msgSend)(pattern,
+	    sel_registerName("stringByReplacingOccurrencesOfString:withString:"),
+	    @" a", @"");
+	((void (*)(id, SEL, id))objc_msgSend)(fmt,
+	    sel_registerName("setDateFormat:"), pattern);
+	time_text = ((id (*)(id, SEL, id))objc_msgSend)(fmt,
+	    sel_registerName("stringFromDate:"), now);
+	/* iOS writes the weekday and the day, not the year ("Sunday, November 22"). */
+	pattern = ((id (*)(id, SEL, id, unsigned long, id))objc_msgSend)(
+	    (id)fmt_cls, sel_registerName("dateFormatFromTemplate:options:locale:"),
+	    @"EEEEMMMMd", 0UL, locale);
+	((void (*)(id, SEL, id))objc_msgSend)(fmt,
+	    sel_registerName("setDateFormat:"), pattern);
+	date_text = ((id (*)(id, SEL, id))objc_msgSend)(fmt,
+	    sel_registerName("stringFromDate:"), now);
+	if (time_text != nil) {
+		((void (*)(id, SEL, id))objc_msgSend)(mondrian_clock_time_label,
+		    sel_registerName("setText:"), time_text);
+		((void (*)(id, SEL))objc_msgSend)(time_text,
+		    sel_registerName("retain"));
+		((void (*)(id, SEL))objc_msgSend)(mondrian_clock_time_text,
+		    sel_registerName("release"));
+		mondrian_clock_time_text = time_text;
+	}
+	if (date_text != nil) {
+		((void (*)(id, SEL, id))objc_msgSend)(mondrian_clock_date_label,
+		    sel_registerName("setText:"), date_text);
+		((void (*)(id, SEL))objc_msgSend)(date_text,
+		    sel_registerName("retain"));
+		((void (*)(id, SEL))objc_msgSend)(mondrian_clock_date_text,
+		    sel_registerName("release"));
+		mondrian_clock_date_text = date_text;
+	}
+	((void (*)(id, SEL))objc_msgSend)(fmt, sel_registerName("release"));
+	mondrian_clock_minute = minute;
+	{
+		static unsigned told;
+
+		if (told++ < 4) {
+			char line[200];
+			const char *t = time_text != nil ?
+			    ((const char *(*)(id, SEL))objc_msgSend)(time_text,
+			    sel_registerName("UTF8String")) : "nil";
+			const char *d = date_text != nil ?
+			    ((const char *(*)(id, SEL))objc_msgSend)(date_text,
+			    sel_registerName("UTF8String")) : "nil";
+
+			snprintf(line, sizeof(line),
+			    "MONDRIAN CLOCK: '%s' '%s' host %s\n", t, d,
+			    object_getClassName(host));
+			say(line);
+		}
+	}
+}
+
+/*
  * The App Library's own background.
  *
  * Measured 2026-11-17: the library's backdrop asks the window server for a capture of
@@ -10968,6 +11231,7 @@ mondrian_lock_step(void *context)
 		mondrian_hide_step();
 		mondrian_wallpaper_step();
 		mondrian_replica_paint_step();
+		mondrian_lockscreen_clock_step(app);
 		mondrian_library_step();
 		mondrian_layer_report();
 		mondrian_relabel_arm();

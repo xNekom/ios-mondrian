@@ -194,6 +194,13 @@ if [ "$BOOTED" != 1 ]; then
 	exit 2
 fi
 
+# The PMK8350 RTC belongs to another processor, so 0315's write answers "not
+# ours" and the boot starts at the epoch: every clock and screenshot would read
+# 1970. `rtc set` still moves the running clock, so take the host's time once
+# the boot is proven. It is not durable across a power cycle, which is why it
+# lives here and not in the image.
+timeout 30 python3 tools/usb-ring.py rtc set "$(date +%s)" 2>&1 | tail -1
+
 # 4. The commands.
 for c in "${CMDS[@]}"; do
 	echo "-- $c"
