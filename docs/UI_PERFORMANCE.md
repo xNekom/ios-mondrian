@@ -703,17 +703,23 @@ boot each, so the three columns differ only in what changed:
   to its run loop between the first pass and the kill. Read `exec`/`exit` pairs
   before blaming an icon (`tools/wsl/ui-launch-ab.sh`, which counts deltas: a tap
   that never reached SpringBoard otherwise reads as a dead app), and capture the
-  launch itself (`tools/wsl/ui-catch-launch.sh`): it lasts about a second. The
-  next probe is the killer's identity, not the drawing path.
+  launch itself (`tools/wsl/ui-catch-launch.sh`): it lasts about a second. A
+  second RAM boot of the same image reproduces it (`exec Preferences` and `exit
+  Preferences[240]/[241] status 0x9`), with the bridge loaded in both, so it is
+  not a per-session leak either. The next probe is the killer's identity, not the
+  drawing path.
 - **The app launch animation draws the magenta poster replica (2026-11-22).**
-  A burst capture of a Settings launch catches a full-width band of `ff00ffff`
-  with rounded top corners rising from the icon, and the row icons drawn over
-  it. That colour is the wallpaper poster's own replica (the hook's note at
+  A burst capture of a Settings launch catches a full-width band of `ff04c6`
+  (94% of the band, `tools/png-crop.py` and a colour census) with rounded top
+  corners rising from the icon, and the row icons drawn over it. That colour is
+  the wallpaper poster's own replica (the hook's note at
   `mondrian_display_picture` records every byte of the 1440x3200 CGImage as
   `ff 00 ff ff`): the home screen's wallpaper is a display render, but the
-  launch animation's backdrop still takes the replica. So a magenta flash while
-  an app opens is the poster, not the app's own drawing, and the fix is to give
-  the animation the same display picture.
+  launch animation's backdrop still takes the replica. On the next boot the same
+  band is black instead of magenta, so the animation's backdrop layer holds
+  whatever the poster handed it and nothing fills it. So a flash while an app
+  opens is the poster, not the app's own drawing, and the fix is to give the
+  animation the same display picture the wallpaper gets.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
