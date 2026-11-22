@@ -724,12 +724,14 @@ boot each, so the three columns differ only in what changed:
   `PBUISnapshotReplicaView`) in `_SBWallpaperSecureWindow`, whose layer holds the
   poster's uninitialised surface, so the animation had nothing to show behind
   the zoom. `mondrian_replica_paint_step` in `tools/mondrian-ui-hook.m` paints
-  every `Replica` view and its full-screen sublayers with
+  every `Replica` and `Poster` view and its full-screen sublayers with
   `mondrian_wallpaper_image()`, the gradient the wallpaper window carries, and
   `-[CALayer setContents:]` replaces the picture when the animation sets it
-  later. Armed by `/private/var/vm/mondrian-replica-paint`; verified on one
-  boot, the same launch that showed the magenta band now shows the home
-  wallpaper and icons while Settings zooms in.
+  later. The `Poster` match is what removes the last strip: the animation also
+  uses `PBUIPosterFloatingView`, which is not named `Replica`. Armed by
+  `/private/var/vm/mondrian-replica-paint`; verified on one boot, the same
+  launch that showed the magenta band now shows the home wallpaper and icons
+  while Settings zooms in.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the

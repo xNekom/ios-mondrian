@@ -9877,7 +9877,8 @@ mondrian_layer_set_contents(id self, SEL _cmd, id contents)
 		const char *owner = delegate != nil ?
 		    object_getClassName(delegate) : NULL;
 
-		if (owner != NULL && strstr(owner, "Replica") != NULL) {
+		if (owner != NULL && (strstr(owner, "Replica") != NULL ||
+		    strstr(owner, "Poster") != NULL)) {
 			fixed = mondrian_wallpaper_image();
 		}
 	}
@@ -10100,7 +10101,8 @@ mondrian_replica_paint_view(id view, unsigned depth, unsigned *printed)
 	if (view == nil || depth > 10) {
 		return 0;
 	}
-	if (name != NULL && strstr(name, "Replica") != NULL) {
+	if (name != NULL && (strstr(name, "Replica") != NULL ||
+	    strstr(name, "Poster") != NULL)) {
 		layer = mondrian_send(view, "layer");
 		if (layer != nil) {
 			((void (*)(id, SEL, id))objc_msgSend)(layer,
