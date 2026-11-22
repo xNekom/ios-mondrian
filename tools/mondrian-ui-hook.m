@@ -9502,7 +9502,8 @@ mondrian_deep_probe(void)
 		char line[128];
 
 		if (name == NULL || (strstr(name, "HomeScreenWindow") == NULL &&
-		    strstr(name, "Wallpaper") == NULL)) {
+		    strstr(name, "Wallpaper") == NULL &&
+		    strstr(name, "Switcher") == NULL)) {
 			continue;
 		}
 		snprintf(line, sizeof(line), "MONDRIAN DEEP: %s, dump %u\n", name, dumps);
