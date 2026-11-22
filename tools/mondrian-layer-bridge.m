@@ -57,8 +57,9 @@ static int bridge_console = -1;
 static unsigned bridge_made;
 static unsigned bridge_hits;
 static unsigned bridge_empty;
-static unsigned bridge_pic_dumps;
 static bool bridge_log_started;
+
+static void bridge_snapshot_hooks(void);
 
 /*
  * A second channel for the dump.
@@ -391,17 +392,45 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 	 * whether it is the knob or a transparent square; this writes the bytes a
 	 * host can look at. Armed by /private/var/vm/mondrian-dump-picture.
 	 */
-	if (bridge_pic_dumps < 8 && width >= 300 && height >= 500 &&
+	if (width >= 300 && height >= 500 &&
 	    access("/private/var/vm/mondrian-dump-picture", F_OK) == 0) {
+		/*
+		 * A budget per geometry, not per process: the wallpaper replica is
+		 * converted on every change and used to take all eight slots before
+		 * the card's own picture (1080x2400, 360x800 points at 3x) arrived.
+		 */
+		static struct {
+			size_t w, h;
+			unsigned n;
+		} shown[12];
+		static unsigned kinds;
+		unsigned slot = kinds, i;
 		char path[160];
 		const void *base = IOSurfaceGetBaseAddress(surface);
 		int fd = -1;
 
+		for (i = 0; i < kinds; i++) {
+			if (shown[i].w == width && shown[i].h == height) {
+				slot = i;
+				break;
+			}
+		}
+		if (i == kinds) {
+			if (kinds < 12) {
+				shown[kinds].w = width;
+				shown[kinds].h = height;
+				shown[kinds].n = 0;
+				kinds++;
+			} else {
+				slot = 12;
+			}
+		}
+		if (slot < kinds && shown[slot].n < 2) {
 		if (row * height <= 16u * 1024u * 1024u) {
 			snprintf(path, sizeof(path),
 			    "/private/var/mobile/Library/Preferences/"
 			    "mondrian-pic-%zux%zu-%zu-%u.bgra", width, height,
-			    row, bridge_pic_dumps);
+			    row, shown[slot].n);
 			fd = base != NULL ? open(path,
 			    O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
 			if (fd >= 0) {
@@ -433,7 +462,7 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 				snprintf(path, sizeof(path),
 				    "/private/var/mobile/Library/Preferences/"
 				    "mondrian-pic-%zux%zu-%zu-%u.bgra", sw, sh,
-				    srow, bridge_pic_dumps);
+				    srow, shown[slot].n);
 				fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
 				    0666);
 				if (fd >= 0) {
@@ -443,8 +472,9 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 				free(small);
 			}
 		}
-		if (fd >= 0) {
-			bridge_pic_dumps++;
+			if (fd >= 0) {
+				shown[slot].n++;
+			}
 		}
 	}
 	if (*coverage == 0) {
@@ -975,7 +1005,10 @@ static void
 bridge_set_contents(id self, SEL cmd, id contents)
 {
 	IOSurfaceRef surface = NULL;
-	int watched = bridge_watch_contents(self, contents);
+	int watched;
+
+	bridge_snapshot_hooks();
+	watched = bridge_watch_contents(self, contents);
 
 	if (contents != NULL && !bridge_off() &&
 	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID()) {
@@ -1039,10 +1072,17 @@ bridge_set_contents(id self, SEL cmd, id contents)
 		}
 	}
 	if (watched && surface == NULL) {
-		char line[200];
+		char line[300];
+		CGRect lb = ((CGRect (*)(id, SEL))objc_msgSend)(self,
+		    sel_registerName("bounds"));
+		id delegate = ((id (*)(id, SEL))objc_msgSend)(self,
+		    sel_registerName("delegate"));
 
 		snprintf(line, sizeof(line),
-		    "MONDRIAN SW3: no surface made (contents %s, off %d)\n",
+		    "MONDRIAN SW3: %s %.0fx%.0f view %s no surface made "
+		    "(contents %s, off %d)\n", object_getClassName(self),
+		    (double)lb.size.width, (double)lb.size.height,
+		    delegate != nil ? object_getClassName(delegate) : "-",
 		    contents != NULL ? object_getClassName(contents) : "nil",
 		    bridge_off() ? 1 : 0);
 		bridge_say(line);
@@ -1366,6 +1406,259 @@ bridge_deep_start(void)
 	dispatch_resume(bridge_timer);
 }
 
+static void (*bridge_snap_image_original)(id, SEL, id, id);
+static void (*bridge_snap_cache_original)(id, SEL, id, id);
+
+/*
+ * What the switcher's snapshot cache is handed. This is the far end of the
+ * request: the app has rendered (or not) and SpringBoard receives the picture.
+ * A real image here means the loss is downstream; magenta means the render
+ * produced the placeholder; no line at all means the request never completed.
+ */
+static void
+bridge_snap_image(id self, SEL cmd, id image, id request)
+{
+	static unsigned said;
+	char line[220];
+
+	if (said < 8) {
+		said++;
+		if (image == nil) {
+			snprintf(line, sizeof(line),
+			    "MONDRIAN SNAP: finished, image nil\n");
+		} else {
+			const char *cls = object_getClassName(image);
+			size_t w = 0, h = 0;
+
+			if (CFGetTypeID((CFTypeRef)image) == CGImageGetTypeID()) {
+				w = CGImageGetWidth((CGImageRef)image);
+				h = CGImageGetHeight((CGImageRef)image);
+			} else if ([image respondsToSelector:sel_registerName("size")]) {
+				CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(
+				    image, sel_registerName("size"));
+
+				w = (size_t)size.width;
+				h = (size_t)size.height;
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN SNAP: finished, %s %zux%zu\n", cls, w, h);
+		}
+		bridge_say(line);
+	}
+	if (bridge_snap_image_original != NULL) {
+		bridge_snap_image_original(self, cmd, image, request);
+	}
+}
+
+static void
+bridge_snap_cache(id self, SEL cmd, id image, id request)
+{
+	static unsigned said;
+	char line[200];
+
+	if (said < 8) {
+		said++;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN SNAP: cached %s\n",
+		    image != nil ? object_getClassName(image) : "nil");
+		bridge_say(line);
+	}
+	if (bridge_snap_cache_original != NULL) {
+		bridge_snap_cache_original(self, cmd, image, request);
+	}
+}
+
+static void (*bridge_snap_load_original)(id, SEL, id, id, id);
+static void (*bridge_snap_create_original)(id, SEL, id, id, BOOL);
+
+static void
+bridge_snap_load(id self, SEL cmd, id request, id item, id layout)
+{
+	static unsigned said;
+
+	if (said < 8) {
+		char line[200];
+
+		said++;
+		snprintf(line, sizeof(line), "MONDRIAN SNAP: load for %s\n",
+		    item != nil ? object_getClassName(item) : "-");
+		bridge_say(line);
+	}
+	if (bridge_snap_load_original != NULL) {
+		bridge_snap_load_original(self, cmd, request, item, layout);
+	}
+}
+
+static void
+bridge_snap_create(id self, SEL cmd, id item, id layout, BOOL full)
+{
+	static unsigned said;
+
+	if (said < 8) {
+		char line[200];
+
+		said++;
+		snprintf(line, sizeof(line), "MONDRIAN SNAP: create for %s full %d\n",
+		    item != nil ? object_getClassName(item) : "-", (int)full);
+		bridge_say(line);
+	}
+	if (bridge_snap_create_original != NULL) {
+		bridge_snap_create_original(self, cmd, item, layout, full);
+	}
+}
+
+/*
+ * The app's snapshot service, named. The switcher card is a placeholder because
+ * the picture never arrives, and on iOS 16 the request is served in the app, not
+ * in SpringBoard. This writes the class and its methods to a file the host can
+ * pull; armed by /private/var/vm/mondrian-snap-probe, once per process.
+ */
+static void
+bridge_snapshot_probe(void)
+{
+	static const char *const names[] = {
+		"_UISnapshotService", "UISnapshotService",
+		"XBApplicationSnapshotService", "XBSnapshotService",
+		"_UIApplicationSnapshotService", "UISceneSnapshotService",
+		"SBAppSwitcherSnapshotImageCache", "_FBSSnapshot",
+		"_FBSSnapshotContext", "FBSSceneSnapshotRequest",
+	};
+	static bool done;
+	unsigned i;
+	int fd;
+
+	if (done || !bridge_file_on("/private/var/vm/mondrian-snap-probe")) {
+		return;
+	}
+	done = true;
+	fd = open("/private/var/mobile/Library/Preferences/"
+	    "mondrian-snapprobe.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd < 0) {
+		return;
+	}
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		Class cls = objc_getClass(names[i]);
+		char line[220];
+		unsigned count = 0, k;
+
+		if (cls == Nil) {
+			snprintf(line, sizeof(line), "%s %s: no class\n",
+			    getprogname() != NULL ? getprogname() : "?",
+			    names[i]);
+			(void)write(fd, line, strlen(line));
+			continue;
+		}
+		{
+			Method *methods = class_copyMethodList(cls, &count);
+
+			snprintf(line, sizeof(line), "%s %s: %u methods\n",
+			    getprogname() != NULL ? getprogname() : "?",
+			    names[i], count);
+			(void)write(fd, line, strlen(line));
+			for (k = 0; k < count && k < 40; k++) {
+				snprintf(line, sizeof(line), "  %s\n",
+				    sel_getName(method_getName(methods[k])));
+				(void)write(fd, line, strlen(line));
+			}
+			free(methods);
+		}
+	}
+	/*
+	 * The guessed names were all absent (measured 2026-11-22), so list the
+	 * classes that carry "Snapshot" in their name instead: the real service
+	 * is one of them, and the method list says what to hook.
+	 */
+	{
+		int total = objc_getClassList(NULL, 0);
+		Class *all = total > 0 ? malloc((size_t)total * sizeof(Class)) : NULL;
+		unsigned shown = 0;
+
+		if (all != NULL) {
+			total = objc_getClassList(all, total);
+			for (i = 0; i < (unsigned)total && shown < 40; i++) {
+				const char *name = class_getName(all[i]);
+				Method *methods;
+				unsigned count = 0, k;
+				char line[220];
+
+				if (name == NULL || strstr(name, "Snapshot") == NULL) {
+					continue;
+				}
+				shown++;
+				methods = class_copyMethodList(all[i], &count);
+				snprintf(line, sizeof(line), "%s class %s: %u methods\n",
+				    getprogname() != NULL ? getprogname() : "?",
+				    name, count);
+				(void)write(fd, line, strlen(line));
+				for (k = 0; k < count && k < 40; k++) {
+					snprintf(line, sizeof(line), "  %s\n",
+					    sel_getName(method_getName(methods[k])));
+					(void)write(fd, line, strlen(line));
+				}
+				free(methods);
+			}
+			free(all);
+		}
+	}
+	close(fd);
+}
+
+/*
+ * The hook is installed from setContents, not from the class listing: the
+ * cache class is not loaded when the dylib installs (measured 2026-11-22), so
+ * the first attempt would silently find nothing.
+ */
+static void
+bridge_snapshot_hooks(void)
+{
+	static bool hooked;
+	static bool told;
+
+	if (hooked || getprogname() == NULL ||
+	    strcmp(getprogname(), "SpringBoard") != 0 ||
+	    !bridge_file_on("/private/var/vm/mondrian-snap-probe")) {
+		return;
+	}
+	{
+		Class cache = objc_getClass("SBAppSwitcherSnapshotImageCache");
+		Method method;
+
+		if (cache == Nil) {
+			if (!told) {
+				told = true;
+				bridge_say("MONDRIAN SNAP: cache class not up yet\n");
+			}
+			return;
+		}
+		hooked = true;
+		method = class_getInstanceMethod(cache,
+		    sel_registerName("_snapshotImage:finishedLoadingForRequest:"));
+		if (method != NULL) {
+			bridge_snap_image_original = (void (*)(id, SEL, id, id))
+			    method_setImplementation(method, (IMP)bridge_snap_image);
+		}
+		method = class_getInstanceMethod(cache,
+		    sel_registerName("_addCacheEntryForImage:fromRequest:"));
+		if (method != NULL) {
+			bridge_snap_cache_original = (void (*)(id, SEL, id, id))
+			    method_setImplementation(method, (IMP)bridge_snap_cache);
+		}
+		method = class_getInstanceMethod(cache,
+		    sel_registerName("_loadSnapshotForRequest:withDisplayItem:inAppLayout:"));
+		if (method != NULL) {
+			bridge_snap_load_original = (void (*)(id, SEL, id, id, id))
+			    method_setImplementation(method, (IMP)bridge_snap_load);
+		}
+		method = class_getInstanceMethod(cache,
+		    sel_registerName("_createSnapshotRequestWithDisplayItem:inAppLayout:forFullSizeSnapshot:"));
+		if (method != NULL) {
+			bridge_snap_create_original = (void (*)(id, SEL, id, id, BOOL))
+			    method_setImplementation(method, (IMP)bridge_snap_create);
+		}
+		bridge_say("MONDRIAN SNAP: cache hooked\n");
+	}
+}
+
 /*
  * Install when CoreAnimation is there.
  *
@@ -1409,6 +1702,7 @@ bridge_install(void)
 		return;
 	}
 	bridge_installed = true;
+	bridge_snapshot_probe();
 	bridge_original = (void (*)(id, SEL, id))
 	    method_setImplementation(method, (IMP)bridge_set_contents);
 	/* And the read side, so UIKit still sees the picture (bridge_get_contents). */

@@ -324,6 +324,12 @@ def respring():
     # the replacement into a second restart and left the panel on the old
     # frame, so the SpringBoard pid is only the fallback for a kernel that
     # does not print backboardd.
+    #
+    # Measured 2026-11-22: a backboardd-only respring can also leave the new
+    # SpringBoard on its boot spinner for minutes -- both processes are alive
+    # and drawing frames, the panel shows the spinner. When that happens,
+    # signal SpringBoard and backboardd together (both pids from the ring);
+    # the pair then presents. Check the panel before deciding, not the ring.
     if bpid is not None:
         print(f"backboardd pid {bpid}")
         answer = simple("kill " + bpid, 5.0)
