@@ -11,10 +11,14 @@ redraws, because CoreAnimation only draws on change.
 
 `mondrian_gpu_retire()` waits, bounded at 100 ms, for the fence the submission
 path already handed out; the framebuffer calls it once per present, before the
-layer loop, behind `mondrianfb_gpuwait=1` for an A/B. It does not consume the
-fence, so `gpuacct`'s numbers stay the client's, and it is not a glFinish: the
-wait sits in the present thread, on the GPU's own remaining time, instead of
-serialising the renderer's CPU work behind the GPU.
+layer loop. The wait is on by default: a port whose bar is "nothing drawn twice"
+cannot leave the panel copy reading a surface in flight, and the measured cost
+is 155-447 us a frame (`gpuwait avg`), because the GPU has retired the frame by
+the time the present thread asks in most frames. `mondrianfb_gpuwait=0` is the
+A/B that turns it off; it does not consume the fence, so `gpuacct`'s numbers stay
+the client's, and it is not a glFinish: the wait sits in the present thread, on
+the GPU's own remaining time, instead of serialising the renderer's CPU work
+behind the GPU.
 
 The fps line now reports `gpuwait avg`, which is what that wait costs.
 --- a/bsd/dev/mondrian_gpu.c
@@ -92,13 +96,13 @@ The fps line now reports `gpuwait avg`, which is what that wait costs.
   */
  static int mondrian_fb_nocopy;
 +/*
-+ * mondrianfb_gpuwait=1: wait for the compositor's own fence before copying a
-+ * surface into the panel. Without it the copy can read a surface the GPU is
-+ * still drawing, because nothing on this port waits for that submission: the
-+ * GL interposer skips its glFinish (it costs the frame rate), so the panel gets
-+ * a frame with parts of the previous one in it.
++ * Wait for the compositor's own fence before copying a surface into the panel.
++ * Without it the copy can read a surface the GPU is still drawing, because
++ * nothing on this port waits for that submission: the GL interposer skips its
++ * glFinish (it costs the frame rate), so the panel gets a frame with parts of
++ * the previous one in it. On by default; `mondrianfb_gpuwait=0` is the A/B.
 + */
-+static int mondrian_fb_gpuwait;
++static int mondrian_fb_gpuwait = 1;
  
  /*
   * Clean and drop the CPU's lines for a surface's pixels, by physical address.
