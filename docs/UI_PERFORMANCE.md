@@ -174,7 +174,9 @@ boot each, so the three columns differ only in what changed:
   GPU had retired the frame in most of them -- and the swap rate is 59-61 with
   `late max` 4.0-4.4 ms. It is on by default (`mondrianfb_gpuwait=0` is the
   A/B): the panel copy must not read a surface the GPU is still drawing, and
-  that is a drawing fault before it is a frame-rate question.
+  that is a drawing fault before it is a frame-rate question. The board's
+  cmdline is 599 bytes, so the 22-byte override does not fit under the 607-byte
+  ceiling: the A/B is a build with the default flipped, not an `EXTRA_ARGS`.
 - **Corruption in the image is one layer's content, not the path to the glass.**
   Measured 2026-11-17 on the App Library, finger held still on the glass: the
   blurred backdrop is drawn sheared -- a sawtooth of black blocks and a blue
@@ -772,7 +774,9 @@ boot each, so the three columns differ only in what changed:
   now report zero magenta samples. A warm launch still shows about 100 ms of
   pink while the launch screen fades over the animated backdrop (32 of 1406 row
   samples); that one is the presentation layer of the running animation, not the
-  picture.
+  picture. The hook the kernel loads is written from the image at mount
+  (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
+  boot; a fix that must survive a reboot goes into the image.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
