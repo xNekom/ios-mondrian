@@ -691,17 +691,29 @@ boot each, so the three columns differ only in what changed:
   (2026-11-22).** After a RAM boot of the 08:21 kernel, tapping Settings gives
   `exec Preferences` followed by `exit Preferences[<pid>] status 0x9`, and the
   capture stays on the home screen while the ring shows the app's own surfaces
-  (`MONDRIAN BRIDGE[<pid>]: loaded in Preferences`, `129x129` conversions), so
-  the process ran and rendered. It reproduces with the picture bridge deleted
+  (`MONDRIAN BRIDGE[<pid>]: loaded in Preferences`, the 87x87 row icons), so the
+  process ran and rendered. It reproduces with the picture bridge deleted
   (`del /private/var/vm/mondrian-layer-bridge.dylib`, which 0402 reads as "no
-  bridge"), so the bridge is not the killer, and a sleep/wake plus unlock
-  (`tools/wsl/ui-wake-cycle.sh`) does not restore the launch. `0x9` is the
-  signal number in this kernel's exit report, so the app is being killed, not
-  exiting. Read `exec`/`exit` pairs before blaming an icon: a tap that produces
-  no `exec` at all is SpringBoard's launch path, and one that produces an
-  `exec` plus an `exit 0x9` is the app being reaped. The next probe is
-  RunningBoard's reason (a crash report or the launch watchdog), not the
-  drawing path.
+  bridge") and no `MONDRIAN BRIDGE[<pid>]` line for the new pid, so the bridge is
+  not the killer, and a sleep/wake plus unlock (`tools/wsl/ui-wake-cycle.sh`)
+  does not restore the launch. `0x9` is the signal number in this kernel's exit
+  report (`p_xstat`), so the app is being killed, not exiting. The app is also
+  not idle: the bridge's dump timer runs every half second, and one armed launch
+  wrote exactly one header (38 bytes), so the app's main thread never came back
+  to its run loop between the first pass and the kill. Read `exec`/`exit` pairs
+  before blaming an icon (`tools/wsl/ui-launch-ab.sh`, which counts deltas: a tap
+  that never reached SpringBoard otherwise reads as a dead app), and capture the
+  launch itself (`tools/wsl/ui-catch-launch.sh`): it lasts about a second. The
+  next probe is the killer's identity, not the drawing path.
+- **The app launch animation draws the magenta poster replica (2026-11-22).**
+  A burst capture of a Settings launch catches a full-width band of `ff00ffff`
+  with rounded top corners rising from the icon, and the row icons drawn over
+  it. That colour is the wallpaper poster's own replica (the hook's note at
+  `mondrian_display_picture` records every byte of the 1440x3200 CGImage as
+  `ff 00 ff ff`): the home screen's wallpaper is a display render, but the
+  launch animation's backdrop still takes the replica. So a magenta flash while
+  an app opens is the poster, not the app's own drawing, and the fix is to give
+  the animation the same display picture.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
@@ -729,6 +741,12 @@ boot each, so the three columns differ only in what changed:
   Bluetooth row was missing from Settings. Prove the boot before reading a
   drawing or a Bluetooth fault: the ring's `Darwin Kernel Version` must be the
   kernel just built, and `loaded in <app>` must appear for the app being read.
+  When the bridge is loaded and the knob is still missing, read the picture
+  itself instead of guessing: `tools/wsl/ui-pic-dump.sh 202 756 Preferences`
+  writes the raw BGRA the bridge handed over, and `tools/bgra-to-png.py` turns
+  it into a PNG with and without alpha. The Airplane knob measured this way is a
+  white disc with transparent corners, so a blank knob on screen means the
+  surface never reached the server, not that the app drew nothing.
 - **A plain UISlider keeps its thumb; the Control Center capsules do not
   (2026-11-22).** Settings > Sounds draws three switches (Change with Buttons,
   Keyboard Clicks, Lock Sound) and the ringtone volume slider with its round
