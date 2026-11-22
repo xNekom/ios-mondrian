@@ -60,6 +60,12 @@ static unsigned bridge_empty;
 static bool bridge_log_started;
 
 static void bridge_snapshot_hooks(void);
+static void bridge_fbs_hooks(void);
+static void bridge_chain_dump(const char *tag, CGImageRef image);
+
+/* Prefix for a dump made from a named checkpoint, so a picture converted from
+ * the cache can be told from one converted on its way to a layer. */
+static const char *bridge_dump_tag;
 
 /*
  * A second channel for the dump.
@@ -429,8 +435,9 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 		if (row * height <= 16u * 1024u * 1024u) {
 			snprintf(path, sizeof(path),
 			    "/private/var/mobile/Library/Preferences/"
-			    "mondrian-pic-%zux%zu-%zu-%u.bgra", width, height,
-			    row, shown[slot].n);
+			    "mondrian-pic-%s%zux%zu-%zu-%u.bgra",
+			    bridge_dump_tag != NULL ? bridge_dump_tag : "",
+			    width, height, row, shown[slot].n);
 			fd = base != NULL ? open(path,
 			    O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
 			if (fd >= 0) {
@@ -461,8 +468,9 @@ bridge_surface(CGImageRef image, CGImageRef *used, unsigned *coverage)
 				}
 				snprintf(path, sizeof(path),
 				    "/private/var/mobile/Library/Preferences/"
-				    "mondrian-pic-%zux%zu-%zu-%u.bgra", sw, sh,
-				    srow, shown[slot].n);
+				    "mondrian-pic-%s%zux%zu-%zu-%u.bgra",
+				    bridge_dump_tag != NULL ? bridge_dump_tag : "",
+				    sw, sh, srow, shown[slot].n);
 				fd = open(path, O_WRONLY | O_CREAT | O_TRUNC,
 				    0666);
 				if (fd >= 0) {
@@ -1008,6 +1016,7 @@ bridge_set_contents(id self, SEL cmd, id contents)
 	int watched;
 
 	bridge_snapshot_hooks();
+	bridge_fbs_hooks();
 	watched = bridge_watch_contents(self, contents);
 
 	if (contents != NULL && !bridge_off() &&
@@ -1429,10 +1438,12 @@ bridge_snap_image(id self, SEL cmd, id image, id request)
 		} else {
 			const char *cls = object_getClassName(image);
 			size_t w = 0, h = 0;
+			CGImageRef cg = NULL;
 
 			if (CFGetTypeID((CFTypeRef)image) == CGImageGetTypeID()) {
-				w = CGImageGetWidth((CGImageRef)image);
-				h = CGImageGetHeight((CGImageRef)image);
+				cg = (CGImageRef)image;
+				w = CGImageGetWidth(cg);
+				h = CGImageGetHeight(cg);
 			} else if ([image respondsToSelector:sel_registerName("size")]) {
 				CGSize size = ((CGSize (*)(id, SEL))objc_msgSend)(
 				    image, sel_registerName("size"));
@@ -1442,6 +1453,20 @@ bridge_snap_image(id self, SEL cmd, id image, id request)
 			}
 			snprintf(line, sizeof(line),
 			    "MONDRIAN SNAP: finished, %s %zux%zu\n", cls, w, h);
+			/*
+			 * The picture the cache is handed, in pixels: the size alone
+			 * cannot tell a real snapshot from a placeholder. The object
+			 * is not always a CGImage; `XBApplicationSnapshotImage` keeps
+			 * the picture behind a method, so both roads are tried.
+			 */
+			if (cg == NULL &&
+			    [image respondsToSelector:sel_registerName("CGImage")]) {
+				cg = ((CGImageRef (*)(id, SEL))objc_msgSend)(image,
+				    sel_registerName("CGImage"));
+			}
+			if (cg != NULL && said <= 4) {
+				bridge_chain_dump("CACHE", cg);
+			}
 		}
 		bridge_say(line);
 	}
@@ -1470,6 +1495,412 @@ bridge_snap_cache(id self, SEL cmd, id image, id request)
 
 static void (*bridge_snap_load_original)(id, SEL, id, id, id);
 static void (*bridge_snap_create_original)(id, SEL, id, id, BOOL);
+
+/*
+ * The snapshot render, from the inside. `_FBSSnapshot` is what turns a
+ * `_FBSSnapshotContext` into a picture: the context carries the layers to draw
+ * and the size, `capture` renders, `CGImage` hands the result out. The cache
+ * receives a 100 % magenta 336x746 picture, so the question is whether the
+ * context has layers at all, and whether a capture with layers still yields
+ * magenta. The answer goes to one file every process appends to, because the
+ * app's console output is dropped.
+ */
+static void
+bridge_chain_line(const char *what)
+{
+	char line[300];
+	int fd;
+
+	snprintf(line, sizeof(line), "%s[%d]: %s\n",
+	    getprogname() != NULL ? getprogname() : "?", (int)getpid(), what);
+	fd = open("/private/var/mobile/Library/Preferences/"
+	    "mondrian-chain.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+	if (fd >= 0) {
+		(void)write(fd, line, strlen(line));
+		close(fd);
+	}
+	/*
+	 * The file is the channel that survives an app sandbox; the console is
+	 * the channel that survives a file the kernel created as root before
+	 * the process could. Write both (measured 2026-11-22: a log pre-created
+	 * by `wfile` is root-owned and the append fails silently).
+	 */
+	snprintf(line, sizeof(line), "MONDRIAN CHAIN: %s\n", what);
+	bridge_say(line);
+}
+
+static void
+bridge_bitmap_probe(const char *tag, CGImageRef image)
+{
+	size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+	size_t sw = w / 4, sh = h / 4, row, x, y;
+	uint8_t *buf;
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+	char path[200];
+	char line[360];
+	unsigned nonzero = 0;
+
+	if (sw < 2 || sh < 2) {
+		return;
+	}
+	/*
+	 * What the picture is made of, not just how big it is: a solid red result
+	 * can come from red source bytes, from a colour space that maps everything
+	 * to red, or from an image whose provider has nothing to read. The raw
+	 * prefix is the difference between those.
+	 */
+	{
+		CGColorSpaceRef cs = CGImageGetColorSpace(image);
+		CGDataProviderRef dp = CGImageGetDataProvider(image);
+		CFDataRef raw = dp != NULL ? CGDataProviderCopyData(dp) : NULL;
+		const UInt8 *bytes = raw != NULL ? CFDataGetBytePtr(raw) : NULL;
+		CFIndex length = raw != NULL ? CFDataGetLength(raw) : 0;
+		char space[80] = "none";
+		int model = -1;
+
+		if (cs != NULL) {
+			CFStringRef name = CGColorSpaceCopyName(cs);
+
+			model = (int)CGColorSpaceGetModel(cs);
+			if (name != NULL) {
+				CFStringGetCString(name, space, sizeof(space),
+				    kCFStringEncodingUTF8);
+				CFRelease(name);
+			}
+		}
+		snprintf(line, sizeof(line),
+		    "%s image %zux%zu bpc %zu bpp %zu row %zu alpha %u "
+		    "info 0x%x model %d space %s raw %ld first %02x %02x %02x %02x",
+		    tag, w, h, CGImageGetBitsPerComponent(image),
+		    CGImageGetBitsPerPixel(image), CGImageGetBytesPerRow(image),
+		    (unsigned)CGImageGetAlphaInfo(image),
+		    (unsigned)CGImageGetBitmapInfo(image), model, space,
+		    (long)length,
+		    bytes != NULL && length > 0 ? bytes[0] : 0,
+		    bytes != NULL && length > 1 ? bytes[1] : 0,
+		    bytes != NULL && length > 2 ? bytes[2] : 0,
+		    bytes != NULL && length > 3 ? bytes[3] : 0);
+		bridge_chain_line(line);
+		if (raw != NULL) {
+			CFRelease(raw);
+		}
+	}
+	row = sw * 4;
+	buf = calloc(1, row * sh);
+	rgb = CGColorSpaceCreateDeviceRGB();
+	if (buf == NULL || rgb == NULL) {
+		free(buf);
+		if (rgb != NULL) {
+			CGColorSpaceRelease(rgb);
+		}
+		return;
+	}
+	ctx = CGBitmapContextCreate(buf, sw, sh, 8, row, rgb,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	if (ctx == NULL) {
+		CGColorSpaceRelease(rgb);
+		free(buf);
+		return;
+	}
+	CGContextTranslateCTM(ctx, 0, (CGFloat)sh);
+	CGContextScaleCTM(ctx, 1, -1);
+	CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
+	CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)sw, (CGFloat)sh),
+	    image);
+	CGContextRelease(ctx);
+	CGColorSpaceRelease(rgb);
+	for (y = 0; y < sh; y++) {
+		const uint8_t *p = buf + y * row;
+
+		for (x = 0; x < sw; x++) {
+			if (p[x * 4] != 0 || p[x * 4 + 1] != 0 ||
+			    p[x * 4 + 2] != 0) {
+				nonzero++;
+			}
+		}
+	}
+	/*
+	 * Zeroed before the draw, so `nonzero` is what CoreGraphics actually
+	 * painted. A blank picture and a draw that silently did nothing used to
+	 * look the same once the bytes landed in allocator memory.
+	 */
+	snprintf(line, sizeof(line), "%s bitmap %zux%zu drawn %u/%zu", tag,
+	    sw, sh, nonzero, sw * sh);
+	bridge_chain_line(line);
+	if (nonzero > 0) {
+		int fd;
+
+		snprintf(path, sizeof(path),
+		    "/private/var/mobile/Library/Preferences/"
+		    "mondrian-pic-%sbitmap-%zux%zu-%zu.bgra", tag, sw, sh, row);
+		fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+		if (fd >= 0) {
+			(void)write(fd, buf, row * sh);
+			close(fd);
+		}
+	}
+	free(buf);
+}
+
+/*
+ * A picture handed over at a checkpoint, drawn through the same conversion the
+ * layers use so the host can read its pixels. `bridge_surface` already writes
+ * the dump file when /private/var/vm/mondrian-dump-picture is present; this
+ * only reports where it went. The tag says which end of the chain produced it.
+ */
+static void
+bridge_chain_dump(const char *tag, CGImageRef image)
+{
+	CGImageRef used = image;
+	IOSurfaceRef surface;
+	unsigned coverage = 0;
+	char line[200];
+	/* One file per checkpoint and geometry: a checkpoint is read once. */
+	static struct {
+		const char *tag;
+		size_t w, h;
+	} seen[8];
+	static unsigned seen_count;
+
+	if (image == NULL) {
+		return;
+	}
+	{
+		const char *saved = bridge_dump_tag;
+		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+		unsigned i;
+
+		for (i = 0; i < seen_count; i++) {
+			if (seen[i].w == w && seen[i].h == h &&
+			    strcmp(seen[i].tag, tag) == 0) {
+				return;
+			}
+		}
+		bridge_dump_tag = tag != NULL ? tag : "";
+		surface = bridge_surface(image, &used, &coverage);
+		bridge_dump_tag = saved;
+		if (surface != NULL && seen_count < 8) {
+			seen[seen_count].tag = tag;
+			seen[seen_count].w = w;
+			seen[seen_count].h = h;
+			seen_count++;
+			bridge_bitmap_probe(tag, image);
+			/*
+			 * The layer dump has a per-geometry budget, and the card's
+			 * own surface takes the 1440x3200 slots before the snapshot
+			 * checkpoint does (measured 2026-11-22: the CACHE picture was
+			 * written, the FBS one was not). A checkpoint is written by
+			 * its own name instead of competing for those slots.
+			 */
+			{
+				size_t row = (w * 4 + 15) & ~(size_t)15;
+				const void *base;
+				uint32_t seed = 0;
+				char path[200];
+				int fd = -1;
+
+				if (IOSurfaceLock(surface,
+				    kIOSurfaceLockReadOnly, &seed) == 0) {
+					base = IOSurfaceGetBaseAddress(surface);
+					if (base != NULL &&
+					    row * h <= 16u * 1024u * 1024u) {
+						snprintf(path, sizeof(path),
+						    "/private/var/mobile/Library/"
+						    "Preferences/mondrian-pic-%s%zux%zu-"
+						    "%zu.bgra", tag, w, h, row);
+						fd = open(path, O_WRONLY |
+						    O_CREAT | O_TRUNC, 0666);
+						if (fd >= 0) {
+							(void)write(fd, base, row * h);
+							close(fd);
+						}
+					} else if (base != NULL) {
+						size_t sw = w / 4, sh = h / 4;
+						size_t srow = sw * 4;
+						uint8_t *small = malloc(srow * sh);
+
+						if (small != NULL) {
+							size_t x, y;
+
+							for (y = 0; y < sh; y++) {
+								const uint8_t *src =
+								    (const uint8_t *)base +
+								    (y * 4) * row;
+
+								for (x = 0; x < sw; x++) {
+									memcpy(small +
+									    y * srow + x * 4,
+									    src + (x * 4) * 4, 4);
+								}
+							}
+							snprintf(path,
+							    sizeof(path),
+							    "/private/var/mobile/"
+							    "Library/Preferences/"
+							    "mondrian-pic-%s%zux%zu-%zu"
+							    ".bgra", tag, sw, sh,
+							    srow);
+							fd = open(path, O_WRONLY |
+							    O_CREAT | O_TRUNC, 0666);
+							if (fd >= 0) {
+								(void)write(fd, small,
+								    srow * sh);
+								close(fd);
+							}
+							free(small);
+						}
+					}
+					IOSurfaceUnlock(surface, 0, &seed);
+				}
+			}
+		}
+	}
+	snprintf(line, sizeof(line), "%s picture %zux%zu surface %s cov %u",
+	    tag, CGImageGetWidth(image), CGImageGetHeight(image),
+	    surface != NULL ? "made" : "none", coverage);
+	bridge_chain_line(line);
+	if (used != image) {
+		CGImageRelease(used);
+	}
+	if (surface != NULL) {
+		CFRelease(surface);
+	}
+}
+
+static id (*bridge_fbs_init_original)(id, SEL, id);
+static BOOL (*bridge_fbs_capture_original)(id, SEL);
+static CGImageRef (*bridge_fbs_cgimage_original)(id, SEL);
+
+static id
+bridge_fbs_init(id self, SEL cmd, id context)
+{
+	id result, layers = nil;
+	CGSize size = { 0, 0 };
+	double scale = 0;
+	unsigned count = 0;
+	char line[300];
+
+	if (context != nil) {
+		if ([context respondsToSelector:sel_registerName("snapshotSize")]) {
+			size = ((CGSize (*)(id, SEL))objc_msgSend)(context,
+			    sel_registerName("snapshotSize"));
+		}
+		if ([context respondsToSelector:sel_registerName("scale")]) {
+			scale = ((double (*)(id, SEL))objc_msgSend)(context,
+			    sel_registerName("scale"));
+		}
+		layers = ((id (*)(id, SEL))objc_msgSend)(context,
+		    sel_registerName("layers"));
+		count = layers != nil ? (unsigned)[(NSArray *)layers count] : 0;
+	}
+	snprintf(line, sizeof(line),
+	    "_FBSSnapshot init %.0fx%.0f scale %.2f layers %u%s\n",
+	    (double)size.width, (double)size.height, scale, count,
+	    count > 0 ? "" : " (nothing to draw)");
+	bridge_chain_line(line);
+	/*
+	 * What the renderer was given, only when armed after boot: the first
+	 * version ran on every snapshot, including the one SpringBoard takes while
+	 * it starts, and the reach into the layer array there is not worth the
+	 * risk. The contents are the decisive part: a layer with nil contents
+	 * means nothing to draw, a layer with a picture and a blank result puts
+	 * the fault in the render.
+	 */
+	if (layers != nil && bridge_file_on("/private/var/vm/mondrian-snap-layers") &&
+	    [layers respondsToSelector:sel_registerName("count")]) {
+		unsigned i;
+
+		for (i = 0; i < count && i < 4; i++) {
+			id layer = ((id (*)(id, SEL, unsigned))objc_msgSend)(layers,
+			    sel_registerName("objectAtIndex:"), i);
+			char contents[80] = "nil";
+
+			if (layer != nil &&
+			    [layer respondsToSelector:sel_registerName("contents")]) {
+				id c = ((id (*)(id, SEL))objc_msgSend)(layer,
+				    sel_registerName("contents"));
+
+				if (c != nil) {
+					CFTypeID t = CFGetTypeID((CFTypeRef)c);
+
+					if (t == CGImageGetTypeID()) {
+						snprintf(contents, sizeof(contents),
+						    "CGImage %zux%zu",
+						    CGImageGetWidth((CGImageRef)c),
+						    CGImageGetHeight((CGImageRef)c));
+					} else if (t == IOSurfaceGetTypeID()) {
+						snprintf(contents, sizeof(contents),
+						    "IOSurface %u %zux%zu",
+						    IOSurfaceGetID((IOSurfaceRef)c),
+						    IOSurfaceGetWidth((IOSurfaceRef)c),
+						    IOSurfaceGetHeight((IOSurfaceRef)c));
+					} else {
+						snprintf(contents, sizeof(contents),
+						    "%s", object_getClassName(c));
+					}
+				}
+			}
+			snprintf(line, sizeof(line), " layer %u %s contents %s",
+			    i, layer != nil ? object_getClassName(layer) : "nil",
+			    contents);
+			bridge_chain_line(line);
+		}
+	}
+	result = bridge_fbs_init_original != NULL ?
+	    bridge_fbs_init_original(self, cmd, context) : nil;
+	return result;
+}
+
+static BOOL
+bridge_fbs_capture(id self, SEL cmd)
+{
+	BOOL ok = bridge_fbs_capture_original != NULL ?
+	    bridge_fbs_capture_original(self, cmd) : NO;
+
+	bridge_chain_line(ok ? "_FBSSnapshot capture ok" :
+	    "_FBSSnapshot capture failed");
+	return ok;
+}
+
+static CGImageRef
+bridge_fbs_cgimage(id self, SEL cmd)
+{
+	CGImageRef image = bridge_fbs_cgimage_original != NULL ?
+	    bridge_fbs_cgimage_original(self, cmd) : NULL;
+	char line[300];
+
+	if (image == NULL) {
+		snprintf(line, sizeof(line), "_FBSSnapshot CGImage nil");
+	} else {
+		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
+		unsigned char pixel[4] = { 0, 0, 0, 0 };
+		CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+		CGContextRef ctx = rgb != NULL ? CGBitmapContextCreate(pixel,
+		    1, 1, 8, 4, rgb, kCGImageAlphaPremultipliedLast) : NULL;
+
+		if (ctx != NULL) {
+			CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), image);
+			CGContextRelease(ctx);
+		}
+		if (rgb != NULL) {
+			CGColorSpaceRelease(rgb);
+		}
+		snprintf(line, sizeof(line),
+		    "_FBSSnapshot CGImage %zux%zu average %u/%u/%u",
+		    w, h, pixel[0], pixel[1], pixel[2]);
+	}
+	bridge_chain_line(line);
+	if (image != NULL) {
+		static unsigned dumped;
+
+		if (dumped < 4) {
+			dumped++;
+			bridge_chain_dump("FBS", image);
+		}
+	}
+	return image;
+}
 
 static void
 bridge_snap_load(id self, SEL cmd, id request, id item, id layout)
@@ -1603,6 +2034,8 @@ bridge_snapshot_probe(void)
 	close(fd);
 }
 
+static void bridge_fbs_hooks(void);
+
 /*
  * The hook is installed from setContents, not from the class listing: the
  * cache class is not loaded when the dylib installs (measured 2026-11-22), so
@@ -1656,6 +2089,55 @@ bridge_snapshot_hooks(void)
 			    method_setImplementation(method, (IMP)bridge_snap_create);
 		}
 		bridge_say("MONDRIAN SNAP: cache hooked\n");
+	}
+}
+
+/*
+ * The render side, in whatever process asks for it. FrontBoardServices is
+ * loaded in the app as well as in SpringBoard, so the hook is not limited to
+ * one program name; the marker decides. `_FBSSnapshot` is not up when the
+ * dylib installs in a small process, so this retries from every setContents.
+ */
+static void
+bridge_fbs_hooks(void)
+{
+	static bool hooked;
+	static bool told;
+
+	if (hooked || !bridge_file_on("/private/var/vm/mondrian-snap-probe")) {
+		return;
+	}
+	{
+		Class snapshot = objc_getClass("_FBSSnapshot");
+		Method method;
+
+		if (snapshot == Nil) {
+			if (!told) {
+				told = true;
+				bridge_chain_line("_FBSSnapshot class not up yet");
+			}
+			return;
+		}
+		hooked = true;
+		method = class_getInstanceMethod(snapshot,
+		    sel_registerName("initWithSnapshotContext:"));
+		if (method != NULL) {
+			bridge_fbs_init_original = (id (*)(id, SEL, id))
+			    method_setImplementation(method, (IMP)bridge_fbs_init);
+		}
+		method = class_getInstanceMethod(snapshot,
+		    sel_registerName("capture"));
+		if (method != NULL) {
+			bridge_fbs_capture_original = (BOOL (*)(id, SEL))
+			    method_setImplementation(method, (IMP)bridge_fbs_capture);
+		}
+		method = class_getInstanceMethod(snapshot,
+		    sel_registerName("CGImage"));
+		if (method != NULL) {
+			bridge_fbs_cgimage_original = (CGImageRef (*)(id, SEL))
+			    method_setImplementation(method, (IMP)bridge_fbs_cgimage);
+		}
+		bridge_chain_line("_FBSSnapshot hooked");
 	}
 }
 
