@@ -42,7 +42,6 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
@@ -716,127 +715,6 @@ bridge_set_contents(id self, SEL cmd, id contents)
 }
 
 __attribute__((constructor))
-
-/*
- * The Bluetooth API the Settings process carries, and a line every time the
- * connect entry point runs. Both classes are bridged to bluetoothd by XPC, so a
- * tap that logs here but sends nothing to the daemon means the message is
- * dropped below this call, and a tap that logs nothing means the row does not
- * use this API at all.
- */
-static void
-bridge_bt_log(const char *fmt, ...)
-{
-	static unsigned lines;
-	char line[600];
-	va_list ap;
-	int n;
-
-	if (lines >= 160) {
-		return;
-	}
-	lines++;
-	n = snprintf(line, sizeof(line), "MONDRIAN BTAPP[%d]: ", getpid());
-	if (n < 0 || n >= (int)sizeof(line)) {
-		return;
-	}
-	va_start(ap, fmt);
-	vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
-	va_end(ap);
-	bridge_say(line);
-	/* bridge_say writes without a newline of its own. */
-	bridge_say("\n");
-}
-
-static BOOL (*bridge_bt_connect_orig)(id, SEL, id, unsigned long,
-    unsigned long, id *);
-
-static BOOL
-bridge_bt_connect(id self, SEL cmd, id device, unsigned long connection_flags,
-    unsigned long service_flags, id *error)
-{
-	bridge_bt_log("connectDevice %s flags %lu/%lu\n",
-	    self != nil ? class_getName(object_getClass(self)) : "?",
-	    connection_flags, service_flags);
-	if (bridge_bt_connect_orig != NULL) {
-		return bridge_bt_connect_orig(self, cmd, device, connection_flags,
-		    service_flags, error);
-	}
-	return NO;
-}
-
-static BOOL (*bridge_bt_pair_client_orig)(id, SEL, id, id *);
-
-static BOOL
-bridge_bt_pair_client(id self, SEL cmd, id client, id *error)
-{
-	bridge_bt_log("addPairingClient %s %s\n",
-	    self != nil ? class_getName(object_getClass(self)) : "?",
-	    client != nil ? class_getName(object_getClass(client)) : "(nil)");
-	if (bridge_bt_pair_client_orig != NULL) {
-		return bridge_bt_pair_client_orig(self, cmd, client, error);
-	}
-	return NO;
-}
-
-static void
-bridge_bt_probe(void)
-{
-	static const char *names[] = {
-		"CBConnection", "CBManager", "CBStackController",
-		"CBStackControllerBTStack", "CBDevice"
-	};
-	unsigned i;
-
-	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-		Class cls = objc_getClass(names[i]);
-		unsigned m, count;
-		Method *list;
-
-		if (cls == Nil) {
-			bridge_bt_log("class %s: absent\n", names[i]);
-			continue;
-		}
-		list = class_copyMethodList(cls, &count);
-		bridge_bt_log("class %s: %u methods\n", names[i], count);
-		for (m = 0; m < count; m++) {
-			const char *name = sel_getName(method_getName(list[m]));
-
-			if (strstr(name, "connect") != NULL ||
-			    strstr(name, "air") != NULL ||
-			    strstr(name, "ctivate") != NULL) {
-				bridge_bt_log("  -%s %s\n", name,
-				    method_getTypeEncoding(list[m]));
-			}
-		}
-		free(list);
-
-		if (strcmp(names[i], "CBConnection") == 0) {
-			Method method = class_getInstanceMethod(cls,
-			    sel_registerName("connectDevice:connectionFlags:"
-			    "serviceFlags:error:"));
-
-			if (method != NULL && bridge_bt_connect_orig == NULL) {
-				bridge_bt_connect_orig = (BOOL (*)(id, SEL, id,
-				    unsigned long, unsigned long, id *))
-				    method_setImplementation(method,
-				    (IMP)bridge_bt_connect);
-				bridge_bt_log("swizzled connectDevice on %s\n",
-				    names[i]);
-			}
-			method = class_getInstanceMethod(cls,
-			    sel_registerName("addPairingClient:error:"));
-			if (method != NULL && bridge_bt_pair_client_orig == NULL) {
-				bridge_bt_pair_client_orig = (BOOL (*)(id, SEL,
-				    id, id *))method_setImplementation(method,
-				    (IMP)bridge_bt_pair_client);
-				bridge_bt_log("swizzled addPairingClient on %s\n",
-				    names[i]);
-			}
-		}
-	}
-}
-
 static void
 bridge_install(void)
 {
@@ -845,18 +723,6 @@ bridge_install(void)
 	char line[200];
 
 	bridge_console = open("/dev/console", O_WRONLY | O_NOCTTY);
-	/*
-	 * Settings is the only app that has to answer "what does the row tap
-	 * call": bluetoothd receives no client message for the connect, so the
-	 * question is which Bluetooth call the app makes. dump an app dylib
-	 * through dlopen was refused (no AMFI signature), and interposing XPC
-	 * here painted Settings red (both measured 2026-11-22), so this reads
-	 * the classes the app already links and swizzles the connect entry
-	 * points it has.
-	 */
-	if (getprogname() != NULL && strcmp(getprogname(), "Preferences") == 0) {
-		bridge_bt_probe();
-	}
 	if (layer == NULL) {
 		return;
 	}

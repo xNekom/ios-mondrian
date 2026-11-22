@@ -1028,21 +1028,17 @@ all: `bluetoothd` execs and exits with status 0, the shim never writes its
 `Darwin Kernel Version` against the kernel just built before reading anything
 into a missing row or a missing probe line.
 
-The row tap sends bluetoothd nothing. To find out what Settings does instead, the
-only dylib every app receives (`mondrian-layer-bridge.dylib`) now probes the
-Bluetooth classes when the program name is `Preferences`: it logs the
-`CBConnection`/`CBManager`/`CBStackController` methods whose names mention
-connect, pair or activate, and one `MONDRIAN BTAPP` line each time
-`connectDevice:connectionFlags:serviceFlags:error:` or `addPairingClient:error:`
-runs. The probe writes to the console ring because the app sandbox refuses
-`/private/var/mobile/Library/Preferences`, and it is inline because a separate
-dylib is refused by the loader: `dlopen("/private/var/vm/mondrian-bt-app.dylib")`
-returns NULL in Preferences (no AMFI signature on the file, and one installed by
-the kernel is the only kind this port can load). Two dead ends cost a boot each
-and must not be repeated: an XPC interposer in the shared bridge left Settings
-painting a solid red window, and the probe has to be read on a boot where the
-home screen still launches apps, because after a few resprings the icons draw
-and stop opening.
+The row tap sends bluetoothd nothing, and the app side is not reachable with
+the picture bridge. Two attempts, both measured 2026-11-22: an XPC interposer
+compiled into `mondrian-layer-bridge.dylib` (the only dylib every app receives)
+left Settings painting a solid red window, and a probe that walked the
+`CBConnection`/`CBManager`/`CBStackController` method lists and swizzled
+`connectDevice:connectionFlags:serviceFlags:error:` made Settings crash on every
+launch (`CRASH Preferences sig 11`, before its first frame). Both are reverted;
+the bridge is back to the committed build. What the row tap calls inside
+Settings is still unmeasured, so the next attempt needs a mechanism that does
+not touch the shared bridge: a hook the kernel injects into Preferences alone,
+or a breakpoint on the daemon side of the XPC service it should be talking to.
 
 The connect is tap-driven: with the pane open and the PC in the list, no
 `hci req 0405` appears until the row is tapped, and then it follows within
