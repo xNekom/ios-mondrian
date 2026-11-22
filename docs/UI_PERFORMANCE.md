@@ -696,6 +696,9 @@ boot each, so the three columns differ only in what changed:
   from a main-queue timer) and one `...-alive.log` line per load. Apps can write
   that directory on this port (measured: `Preferences pid 1940: loaded`), so a
   missing file means the process never ran the dylib, not that the write failed.
+  `-[UIApplication windows]` is empty for a scene-based app even in the
+  foreground (measured 2026-11-22: `MONDRIAN APPDEEP: Preferences pid 2481` and
+  nothing after it), so the dump walks `connectedScenes`' windows as well.
   Read one with `tools/wsl/ui-deep-app-pull.sh PID NUMBER`.
 - **Two presses wake, and the unlock swipe starts at the screen's bottom edge
   (2026-11-22).** The power button is a toggle: one press on a lit screen puts
