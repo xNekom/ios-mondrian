@@ -661,6 +661,14 @@ boot each, so the three columns differ only in what changed:
   compare a second open and a frame captured mid-drag before reading that as a
   missing layer: the module materials are the ones the 0402 submission-order
   bug used to corrupt.
+- **A switch without its knob can be a kernel without the app bridge
+  (2026-11-22).** After a power cycle the phone booted the flashed image from
+  2026-11-17, which predates 0402: Settings drew the Airplane Mode track in
+  both states and never the knob, the ring had no `MONDRIAN BRIDGE` line at all,
+  and `bluetoothd` exec'd and exited (`exit bluetoothd[299] status 0x0`) so the
+  Bluetooth row was missing from Settings. Prove the boot before reading a
+  drawing or a Bluetooth fault: the ring's `Darwin Kernel Version` must be the
+  kernel just built, and `loaded in <app>` must appear for the app being read.
 - **A plain UISlider keeps its thumb; the Control Center capsules do not
   (2026-11-22).** Settings > Sounds draws three switches (Change with Buttons,
   Keyboard Clicks, Lock Sound) and the ringtone volume slider with its round

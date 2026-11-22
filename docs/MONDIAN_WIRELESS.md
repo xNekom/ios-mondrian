@@ -1022,6 +1022,12 @@ climbed 1646 -> 1650 -> 1658 within a minute) and must not be repeated.
 called, neither `_xpcCBConnectionActivate:` nor the `_xpc*` device handlers
 fire, and no outgoing XPC carries a prompt.
 
+A boot whose kernel is older than the Bluetooth injector has no Bluetooth at
+all: `bluetoothd` execs and exits with status 0, the shim never writes its
+`init v63` line, and Settings hides the Bluetooth row. Check the ring's
+`Darwin Kernel Version` against the kernel just built before reading anything
+into a missing row or a missing probe line.
+
 The row tap sends bluetoothd nothing. To find out what Settings does instead, the
 only dylib every app receives (`mondrian-layer-bridge.dylib`) now probes the
 Bluetooth classes when the program name is `Preferences`: it logs the
