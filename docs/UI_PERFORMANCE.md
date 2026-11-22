@@ -183,6 +183,20 @@ boot each, so the three columns differ only in what changed:
   the wait, so the fence costs no frame rate. What limits the page swipe is the
   compositor's own frame time (9.3-18.9 ms, 400-830 GL calls, 75-139 draws),
   not the present path.
+- **The display waits now, so the client stopped waiting too (`0405`).** The GL
+  interposer decides at install time whether it must `glFinish` a frame
+  (`display_waits()` in `tools/gpu/eagl.c`) by reading `MondrianWaitsForGPU`
+  from `IOMobileFramebuffer`. Nothing published that property, so even with the
+  fence on the client kept its own full sync. `0405` publishes it (an
+  `OSBoolean`, `kOSBooleanTrue`: the kernel has no `kCFBooleanTrue`) while
+  `mondrianfb_gpuwait` is on, and the interposer logs `a frame is waited for by
+  the display's driver, not here`. Measured 2026-11-22, fourteen swipes:
+  `waiting` in the `mondrian-gl: frame` line falls from 2.4-6.2 ms to 0.4-0.6 ms
+  and `gpuwait avg` in the present from 0.7-1.3 ms to 65-211 us; the swap rate
+  is 42-50 before and after, because the frame's 13-16 ms is CPU inside the GL
+  calls, not a wait. The panel copy still cannot read a surface the GPU is
+  drawing: the flush the interposer does with a zero-timeout fence hands the
+  submission to the kernel first.
 - **Corruption in the image is one layer's content, not the path to the glass.**
   Measured 2026-11-17 on the App Library, finger held still on the glass: the
   blurred backdrop is drawn sheared -- a sawtooth of black blocks and a blue
@@ -777,10 +791,13 @@ boot each, so the three columns differ only in what changed:
   system meant to show, so `mondrian_layer_set_contents` replaces it, surface or
   CGImage, with the system background before it reaches the glass. On by
   default; `mondrian-launch-fix-off` is the A/B. Cold Settings and cold Messages
-  now report zero magenta samples. A warm launch still shows a flash of
-  pink while the launch screen fades over the animated backdrop (10 of about
-  1400 row samples on 2026-11-22, down from 32); that one is the presentation
-  layer of the running animation, not the picture. The hook the kernel loads is written from the image at mount
+  now report zero magenta samples, and so does a warm launch: on 2026-11-22 the
+  six sampled rows read no magenta pixel through a warm and a cold Settings
+  launch (the fix's lines are in the ring for both). An earlier "10 samples"
+  was a row count, not a frame count: those rows carried 3-4 % magenta pixels
+  (row mean 102,108,149, the wallpaper) and the sampler calls a frame magenta
+  only above 20 % of a row. Read the percentage, not the line count, before
+  calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
