@@ -1066,6 +1066,68 @@ bridge_deep_probe(void)
 	bridge_deep_dump();
 }
 
+/* Armed by /private/var/vm/mondrian-switch-test, read from the main-queue timer. */
+static int bridge_switch_added;
+
+static void
+bridge_switch_test(void)
+{
+	Class app_cls, switch_cls;
+	id app, windows, window, sw;
+	unsigned count, i;
+	char line[200];
+
+	if (bridge_switch_added ||
+	    !bridge_file_on("/private/var/vm/mondrian-switch-test")) {
+		return;
+	}
+	if (getprogname() != NULL && strcmp(getprogname(), "SpringBoard") == 0) {
+		return;
+	}
+	app_cls = objc_getClass("UIApplication");
+	switch_cls = objc_getClass("UISwitch");
+	if (app_cls == Nil || switch_cls == Nil) {
+		return;
+	}
+	app = ((id (*)(id, SEL))objc_msgSend)((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	windows = app != nil ?
+	    ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("windows")) : nil;
+	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
+	for (i = 0; i < count; i++) {
+		window = [(NSArray *)windows objectAtIndex:i];
+		if (window == nil ||
+		    ((BOOL (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("isHidden"))) {
+			continue;
+		}
+		sw = ((id (*)(id, SEL))objc_msgSend)((id)switch_cls,
+		    sel_registerName("alloc"));
+		sw = ((id (*)(id, SEL, CGRect))objc_msgSend)(sw,
+		    sel_registerName("initWithFrame:"),
+		    CGRectMake(40, 200, 51, 31));
+		((void (*)(id, SEL, BOOL))objc_msgSend)(sw,
+		    sel_registerName("setOn:"), NO);
+		((void (*)(id, SEL, id))objc_msgSend)(window,
+		    sel_registerName("addSubview:"), sw);
+		sw = ((id (*)(id, SEL))objc_msgSend)((id)switch_cls,
+		    sel_registerName("alloc"));
+		sw = ((id (*)(id, SEL, CGRect))objc_msgSend)(sw,
+		    sel_registerName("initWithFrame:"),
+		    CGRectMake(140, 200, 51, 31));
+		((void (*)(id, SEL, BOOL))objc_msgSend)(sw,
+		    sel_registerName("setOn:"), YES);
+		((void (*)(id, SEL, id))objc_msgSend)(window,
+		    sel_registerName("addSubview:"), sw);
+		bridge_switch_added = 1;
+		snprintf(line, sizeof(line),
+		    "MONDRIAN BRIDGE[%d]: switch test added in %s\n", getpid(),
+		    getprogname() != NULL ? getprogname() : "?");
+		bridge_say(line);
+		return;
+	}
+}
+
 /*
  * The dump needs the main thread (UIKit), and the dylib has no run loop of its
  * own: one main-queue timer per process, which reads a marker file every two
@@ -1089,6 +1151,7 @@ bridge_deep_start(void)
 	    100ull * NSEC_PER_MSEC);
 	dispatch_source_set_event_handler(bridge_timer, ^{
 		bridge_deep_probe();
+		bridge_switch_test();
 	});
 	dispatch_resume(bridge_timer);
 }
