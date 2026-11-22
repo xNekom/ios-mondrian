@@ -563,6 +563,14 @@ def main():
     if args.command == "fps":
         return fps(float(args.args[0]) if args.args else 5.0)
     if args.command == "pos":
+        # The ring's byte count, not a file's. A path argument used to be
+        # ignored silently, so `pos LOG` read as the log's size and every pull
+        # started past its end and came back empty (measured 2026-11-22).
+        if args.args:
+            print("pos reports the ring position, not a file size; a file's "
+                  "length comes from reading it (tools/wsl/bt-read-log.sh)",
+                  file=sys.stderr)
+            return 2
         answer = simple("pos")
         if answer is None:
             print("no answer", file=sys.stderr)

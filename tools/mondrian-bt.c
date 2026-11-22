@@ -130,6 +130,27 @@ extern xpc_object_t xpc_connection_send_message_with_reply_sync(
  */
 static int control_socket_fd = -1;
 
+/*
+ * The transport is one H4 byte stream. bluetoothd's commands reach it through
+ * my_write, and the shim adds commands of its own from other threads (the
+ * 0x042c accept, the link key reply, the poke). Two writers at once interleave
+ * their packets and the controller sees a corrupted stream, so every write to
+ * the control socket takes this lock. The read side already serialises the
+ * reverse direction (my_read in the daemon, the poll in the kernel control).
+ */
+static pthread_mutex_t bt_tx_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static ssize_t
+bt_tx_write(const uint8_t *data, size_t len)
+{
+	ssize_t written;
+
+	pthread_mutex_lock(&bt_tx_lock);
+	written = (ssize_t)syscall(SYS_write, control_socket_fd, data, len);
+	pthread_mutex_unlock(&bt_tx_lock);
+	return written;
+}
+
 static const char *const log_paths[] = {
 	"/private/var/mobile/Library/Preferences/mondrian-bt.log",
 	"/private/var/mobile/Library/Logs/mondrian-bt.log",
@@ -248,7 +269,17 @@ bt_ring_dump(const char *what, const struct bt_ring_entry *ring, unsigned pos)
  * truncated by the next start (launchd restarts within a second), so these
  * lines go to their own append-only file: it survives the crash and the
  * restart, which is the only way to read what the daemon received.
+ *
+ * The file is capped: an Inquiry result used to be one line and the daemon
+ * re-inquires about once a second, so by 2026-11-22 this log had reached 5.4 MB
+ * in a day. Reading it back is one 1000-byte request per block, so a pull of
+ * that file is thousands of round trips, and an offset past the end answers
+ * zero bytes -- which reads as an empty log rather than as a rotated one.
+ * Truncating at the cap keeps a pull short and every recent line near the
+ * start.
  */
+#define BT_POWER_MAX	(1024 * 1024)
+
 static void
 bt_power_append(const char *fmt, ...)
 {
@@ -256,6 +287,7 @@ bt_power_append(const char *fmt, ...)
 	va_list ap;
 	int n;
 	int fd;
+	struct stat st;
 
 	n = snprintf(line, sizeof(line), "mondrian-bt[%d]: ", getpid());
 	if (n < 0 || n >= (int)sizeof(line)) {
@@ -268,6 +300,13 @@ bt_power_append(const char *fmt, ...)
 	    O_WRONLY | O_CREAT | O_APPEND, 0666);
 	if (fd < 0) {
 		return;
+	}
+	if (fstat(fd, &st) == 0 && st.st_size > BT_POWER_MAX &&
+	    ftruncate(fd, 0) == 0) {
+		static const char rotated[] =
+		    "mondrian-bt[0]: log rotated\n";
+
+		(void)syscall(SYS_write, fd, rotated, sizeof(rotated) - 1);
 	}
 	(void)syscall(SYS_write, fd, line, strlen(line));
 	close(fd);
@@ -1261,8 +1300,7 @@ bt_key_reply(const uint8_t *pkt, size_t len)
 	cmd[3] = 0x16;
 	memcpy(cmd + 4, bt_keys[slot].bytes, 6);
 	memcpy(cmd + 10, bt_keys[slot].bytes + 6, 16);
-	written = (ssize_t)syscall(SYS_write, control_socket_fd, cmd,
-	    sizeof(cmd));
+	written = bt_tx_write(cmd, sizeof(cmd));
 	bt_power_append("link key reply %02x:%02x:%02x:%02x:%02x:%02x -> %zd\n",
 	    pkt[8], pkt[7], pkt[6], pkt[5], pkt[4], pkt[3], written);
 }
@@ -1379,8 +1417,7 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		}
 		memcpy(reply, "\x01\x2c\x04\x06", 4);
 		memcpy(reply + 4, pkt + 3, 6);
-		written = (ssize_t)syscall(SYS_write, control_socket_fd, reply,
-		    sizeof(reply));
+		written = bt_tx_write(reply, sizeof(reply));
 		bt_power_append("pair confirm %02x:%02x:%02x:%02x:%02x:%02x "
 		    "value %u -> %zd\n", pkt[8], pkt[7], pkt[6], pkt[5], pkt[4],
 		    pkt[3], value, written);
@@ -1419,7 +1456,9 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		return;
 	}
 	if (len >= 4 && pkt[1] == 0x01) {
-		bt_power_append("inquiry complete status %#x\n", pkt[3]);
+		bt_power_append("inquiry complete status %#x results %u\n",
+		    pkt[3], results);
+		results = 0;
 		return;
 	}
 	if (len >= 10 && pkt[1] == 0x2f) {
@@ -1459,9 +1498,16 @@ bt_event_report(const uint8_t *pkt, size_t len)
 		 * command failed.
 		 */
 		results++;
-		bt_power_append("inquiry result %u %02x:%02x:%02x:"
-		    "%02x:%02x:%02x\n", results, pkt[9], pkt[8],
-		    pkt[7], pkt[6], pkt[5], pkt[4]);
+		/*
+		 * Four lines say who answered; the rest only say the daemon is
+		 * scanning again, and they were 53 MB of flash writes in one
+		 * boot. The count on Inquiry Complete carries the total.
+		 */
+		if (results <= 4) {
+			bt_power_append("inquiry result %u %02x:%02x:%02x:"
+			    "%02x:%02x:%02x\n", results, pkt[9], pkt[8],
+			    pkt[7], pkt[6], pkt[5], pkt[4]);
+		}
 	}
 }
 
@@ -1680,8 +1726,7 @@ bt_poke_thread(void *argument)
 				cmd_len = 4;
 				break;
 			}
-			written = (ssize_t)syscall(SYS_write, control_socket_fd,
-			    cmd, cmd_len);
+			written = bt_tx_write(cmd, cmd_len);
 			bt_power_append("poke: kind %d to %02x:%02x:%02x:%02x:%02x:"
 			    "%02x ptype %#x -> %zd\n", (int)kind, addr[5], addr[4],
 			    addr[3], addr[2], addr[1], addr[0], packet_type,
@@ -1807,8 +1852,7 @@ my_write(int fd, const void *buf, size_t len)
 				bt_power_append("io cap rewritten to %02x auth %02x\n",
 				    fixed[10], fixed[12]);
 				log_hci_write("hci write", fixed, sizeof(fixed));
-				return (ssize_t)syscall(SYS_write, fd, fixed,
-				    sizeof(fixed));
+				return bt_tx_write(fixed, sizeof(fixed));
 			}
 			if (opcode >= 0x0400 && opcode < 0x0500) {
 				/*
@@ -1839,6 +1883,7 @@ my_write(int fd, const void *buf, size_t len)
 			}
 		}
 		log_hci_write("hci write", buf, len);
+		return bt_tx_write(buf, len);
 	}
 	return (ssize_t)syscall(SYS_write, fd, buf, len);
 }
