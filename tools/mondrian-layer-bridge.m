@@ -943,7 +943,7 @@ static void
 bridge_deep_dump(void)
 {
 	Class app_cls = objc_getClass("UIApplication");
-	id app, windows;
+	id app, windows, scenes;
 	char line[160];
 	unsigned count, i;
 
@@ -955,13 +955,19 @@ bridge_deep_dump(void)
 	if (app == nil) {
 		return;
 	}
+	snprintf(line, sizeof(line), "MONDRIAN APPDEEP: %s pid %d\n",
+	    getprogname() != NULL ? getprogname() : "?", getpid());
+	bridge_say(line);
+	bridge_dump_write(line);
+
+	/*
+	 * `-[UIApplication windows]` is empty for a scene-based app (measured
+	 * 2026-11-22: Preferences in the foreground answered 0), so the windows
+	 * come from each connected scene as well.
+	 */
 	windows = ((id (*)(id, SEL))objc_msgSend)(app,
 	    sel_registerName("windows"));
 	count = windows != nil ? (unsigned)[(NSArray *)windows count] : 0;
-	snprintf(line, sizeof(line), "MONDRIAN APPDEEP: %s pid %d, %u windows\n",
-	    getprogname() != NULL ? getprogname() : "?", getpid(), count);
-	bridge_say(line);
-	bridge_dump_write(line);
 	for (i = 0; i < count; i++) {
 		id window = [(NSArray *)windows objectAtIndex:i];
 
@@ -970,6 +976,33 @@ bridge_deep_dump(void)
 		bridge_say(line);
 		bridge_dump_write(line);
 		bridge_deep_view(window, 1);
+	}
+	scenes = ((id (*)(id, SEL))objc_msgSend)(app,
+	    sel_registerName("connectedScenes"));
+	count = scenes != nil ? (unsigned)[(NSSet *)scenes count] : 0;
+	if (count > 0) {
+		NSArray *each = [(NSSet *)scenes allObjects];
+
+		for (i = 0; i < count; i++) {
+			id scene = [each objectAtIndex:i];
+			id wins = ((id (*)(id, SEL))objc_msgSend)(scene,
+			    sel_registerName("windows"));
+			unsigned n = wins != nil ?
+			    (unsigned)[(NSArray *)wins count] : 0;
+			unsigned k;
+
+			for (k = 0; k < n; k++) {
+				id window = [(NSArray *)wins objectAtIndex:k];
+
+				snprintf(line, sizeof(line),
+				    "MONDRIAN APPDEEP: scene %s window %s\n",
+				    object_getClassName(scene),
+				    object_getClassName(window));
+				bridge_say(line);
+				bridge_dump_write(line);
+				bridge_deep_view(window, 1);
+			}
+		}
 	}
 }
 
