@@ -1,32 +1,41 @@
-xnu 0402: an app in /Applications gets the picture bridge, and only it
+xnu 0402: every process that draws a picture gets the picture bridge
 
 A layer's `contents` is a CGImage for every image UIKit and an app draw, and on
 this port a CGImage does not cross to the window server: the server creates a
 surface of the picture's size and leaves it all zero (measured 2026-11-19 on a
 640x480 picture and again 2026-11-20 on the 129x129 knob of Settings' Airplane
 Mode switch, whose row draws its track and no knob). What draws is a client
-surface, so tools/mondrian-ui-hook.m bridges every CGImage to one -- but only in
-the processes the kernel injects the hook into, and Settings is not one of
-them.
+surface, so tools/mondrian-layer-bridge.m converts every CGImage to one.
 
-Bit 10 (0x400) matches every exec whose path starts with /Applications/ and
-gives it a dylib of its own, tools/mondrian-layer-bridge.m: `setContents:` and a
-surface, no interposers. The hook is not what an app receives -- it carries the
-services' sixteen dyld interposers (IORegistry, sandbox, TCC, the Objective-C
-throw path, libc++'s filesystem), and loading those into every app is a change
-no app agreed to. A boot without the dylib in /private/var/vm leaves apps clean
-and says so once. The boot mask becomes 6 | 0x100 | 0x400 = 1286, in
-tools/boards.py.
+The first version matched `/Applications/`, which covers the system apps and
+nothing else. An App Store app runs from
+`/private/var/containers/Bundle/Application/<uuid>/Name.app/Name`, an extension
+from `.../Name.app/PlugIns/X.appex/X`, and a page's pictures arrive as layer
+contents in `com.apple.WebKit.Networking`, whose path is inside
+WebKit.framework. None of those is under `/Applications/`, so a third-party app
+and a web page still lost every picture. Measured 2026-11-22: the bridge ran in
+Preferences, SpringBoard and Spotlight only.
+
+The match is now two markers on the whole path, `.app/` and
+`/WebKit.framework/`, which is the coverage the picture path needs: every app
+bundle the system can launch, its extensions, and the WebKit services. Bit 10
+(0x400) still selects the dylib, so the boot mask keeps its value in
+`tools/boards.py` (`mondrian_ui_hook`); nothing else changes.
+
+The dylib is not the hook: it carries `setContents:`, `-contents` and the
+surface cache, and none of the hook's sixteen dyld interposers (IORegistry,
+sandbox, TCC, the Objective-C throw path, libc++'s filesystem). Loading those
+into every app is a change no app agreed to. A boot without the dylib in
+`/private/var/vm` leaves apps clean and says so once.
 
 The match is on the *whole* path, and that is what took a boot to find:
 `ni_cnd.cn_nameptr` has been advanced past every directory by namei, so the
 first version compared the last component ("Preferences") against
 "/Applications/" and could never match. No app ever received the bridge and the
-ring said nothing, because a `wanted == 0` exec is silent. Every other mask
-check in this function compares that component, which is why they work;
-`cn_pnbuf`, the caller's NUL-terminated copy of the path (`cn_pnlen` bytes), is
-the one that still holds all of it. The branch prints the path it compared now,
-so a boot that still misses names the string.
+ring said nothing, because a `wanted == 0` exec is silent. `cn_pnbuf`, the
+caller's NUL-terminated copy of the path (`cn_pnlen` bytes), is the one that
+still holds all of it. The branch prints the path it compared, so a boot that
+still misses names the string.
 
 The app's copy of the dylib also answers `-contents` with the picture while the
 layer keeps the surface, because UIKit reads a converted layer back and asserts
@@ -40,10 +49,13 @@ to the track, in both states, and the ring must show
 `MONDRIAN HOOK: /Applications/Preferences.app/Preferences gets the picture
 bridge` and `MONDRIAN BRIDGE[<pid>]: 129x129 as surface ...` from the
 Preferences pid, with no `MONDRIAN SURF: backboardd create ... 129x129 fmt 0x0`
-after the app's first frame, and no assertion or `CRASH SpringBoard`.
+after the app's first frame, and no assertion or `CRASH SpringBoard`. Then open
+an app installed from the App Store, and Safari with a local page: the ring must
+name that app's container path and `com.apple.WebKit.Networking` as
+bridge-carrying.
 
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index e707df8..3dc87f4 100755
+index e707df8..f99a898 100755
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -5667,6 +5667,18 @@ bad:
@@ -65,7 +77,7 @@ index e707df8..3dc87f4 100755
  /*
   * Does this boot's copy of a dylib exist in /private/var/vm? glblob=1 writes
   * them there once the root turns writable, so before that, or with glblob=0,
-@@ -5952,6 +5964,53 @@ mondrian_securityd_env(struct image_params *imgp, char *env, size_t size)
+@@ -5952,6 +5964,82 @@ mondrian_securityd_env(struct image_params *imgp, char *env, size_t size)
  	return true;
  }
  
@@ -103,23 +115,52 @@ index e707df8..3dc87f4 100755
 +	return path;
 +}
 +
-+/* Is this exec inside /Applications? (the whole path, see mondrian_exec_path) */
++/*
++ * Does this exec draw pictures? (the whole path, see mondrian_exec_path)
++ *
++ * Matching /Applications/ reached the system apps and nothing else. An App
++ * Store app runs from /private/var/containers/Bundle/Application/<uuid>/
++ * Name.app/Name and its extensions from .../Name.app/PlugIns/X.appex/X, so
++ * neither ever received the bridge: every picture such an app set as a layer's
++ * contents took the broken CGImage road and stayed behind. The WebKit services
++ * are the same gap from the other side -- a page's pictures arrive as layer
++ * contents in com.apple.WebKit.Networking, whose path is inside
++ * WebKit.framework and is not an .app bundle.
++ */
 +static bool
-+mondrian_exec_in_applications(struct image_params *imgp)
++mondrian_path_has(const char *path, size_t length, const char *needle)
 +{
-+	const char prefix[] = "/Applications/";
++	size_t nlen = strlen(needle);
++	size_t at;
++
++	if (nlen == 0 || length < nlen) {
++		return false;
++	}
++	for (at = 0; at + nlen <= length; at++) {
++		if (path[at] == needle[0] &&
++		    memcmp(path + at, needle, nlen) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++mondrian_exec_draws_pictures(struct image_params *imgp)
++{
 +	const char *path;
 +	size_t length;
 +
 +	path = mondrian_exec_path(imgp, &length);
-+	return path != NULL && length > sizeof(prefix) - 1 &&
-+	    strncmp(path, prefix, sizeof(prefix) - 1) == 0;
++	return path != NULL &&
++	    (mondrian_path_has(path, length, ".app/") ||
++	    mondrian_path_has(path, length, "/WebKit.framework/"));
 +}
 +
  static bool
  mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  {
-@@ -5985,6 +6044,13 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -5985,6 +6073,13 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	 */
  	const char metal[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/libmondrianmetal.dylib";
  	const char metal_path[] = "/private/var/vm/libmondrianmetal.dylib";
@@ -133,16 +174,16 @@ index e707df8..3dc87f4 100755
  
  	/*
  	 * A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster
-@@ -6052,6 +6118,8 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -6052,6 +6147,8 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
  	    "com.apple.WebKit.GPU")) {
  		wanted = MONDRIAN_HOOK_METAL;
-+	} else if (wanted == 0 && mondrian_exec_in_applications(imgp)) {
++	} else if (wanted == 0 && mondrian_exec_draws_pictures(imgp)) {
 +		wanted = MONDRIAN_HOOK_APP;
  	}
  	/* The probe names its own processes; everything else needs its mask bit. */
  	if (wanted == 0 ||
-@@ -6103,6 +6171,37 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
+@@ -6103,6 +6200,37 @@ mondrian_ui_hook_env(struct image_params *imgp, char *env, size_t size)
  		strlcpy(env, injector, size);
  		return true;
  	}
