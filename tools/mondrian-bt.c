@@ -1374,7 +1374,9 @@ bt_event_report(const uint8_t *pkt, size_t len)
 
 	if (len >= 2 && (pkt[1] == 0x03 || pkt[1] == 0x05 ||
 	    pkt[1] == 0x06 || pkt[1] == 0x16 || pkt[1] == 0x17 ||
-	    pkt[1] == 0x18 || (pkt[1] >= 0x2b && pkt[1] <= 0x36))) {
+	    pkt[1] == 0x18 || pkt[1] == 0x2b || pkt[1] == 0x2c ||
+	    pkt[1] == 0x2d || pkt[1] == 0x2e ||
+	    (pkt[1] >= 0x30 && pkt[1] <= 0x34) || pkt[1] == 0x36)) {
 		size_t at;
 		char line[320];
 		int used = snprintf(line, sizeof(line), "evt %02x:",
