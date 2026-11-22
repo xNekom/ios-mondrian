@@ -1798,6 +1798,7 @@ bridge_fbs_init(id self, SEL cmd, id context)
 	CGSize size = { 0, 0 };
 	double scale = 0;
 	unsigned count = 0;
+	static bool methods_told;
 	char line[300];
 
 	if (context != nil) {
@@ -1865,6 +1866,33 @@ bridge_fbs_init(id self, SEL cmd, id context)
 			    i, layer != nil ? object_getClassName(layer) : "nil",
 			    contents);
 			bridge_chain_line(line);
+			if (layer != nil &&
+			    [layer respondsToSelector:sel_registerName("contextID")]) {
+				unsigned cid = ((unsigned (*)(id, SEL))objc_msgSend)(
+				    layer, sel_registerName("contextID"));
+
+				snprintf(line, sizeof(line),
+				    " layer %u contextID %u", i, cid);
+				bridge_chain_line(line);
+			}
+			/*
+			 * The wrapper is not a CALayer: `contents` on it is nil
+			 * while the renderer may read another property. Its own
+			 * method list names the accessor to ask for next.
+			 */
+			if (i == 0 && layer != nil && !methods_told) {
+				unsigned mcount = 0, k;
+				Method *methods = class_copyMethodList(
+				    object_getClass(layer), &mcount);
+
+				methods_told = true;
+				for (k = 0; k < mcount && k < 40; k++) {
+					snprintf(line, sizeof(line), " method %s",
+					    sel_getName(method_getName(methods[k])));
+					bridge_chain_line(line);
+				}
+				free(methods);
+			}
 		}
 	}
 	result = bridge_fbs_init_original != NULL ?
@@ -1911,6 +1939,20 @@ bridge_fbs_cgimage(id self, SEL cmd)
 		    w, h, pixel[0], pixel[1], pixel[2]);
 	}
 	bridge_chain_line(line);
+	if (image != NULL &&
+	    [self respondsToSelector:sel_registerName("IOSurface")]) {
+		IOSurfaceRef s = (IOSurfaceRef)((id (*)(id, SEL))objc_msgSend)(
+		    self, sel_registerName("IOSurface"));
+
+		if (s != NULL) {
+			snprintf(line, sizeof(line),
+			    "_FBSSnapshot IOSurface %u %zux%zu row %zu fmt 0x%x",
+			    IOSurfaceGetID(s), IOSurfaceGetWidth(s),
+			    IOSurfaceGetHeight(s), IOSurfaceGetBytesPerRow(s),
+			    (unsigned)IOSurfaceGetPixelFormat(s));
+			bridge_chain_line(line);
+		}
+	}
 	if (image != NULL) {
 		static unsigned dumped;
 
