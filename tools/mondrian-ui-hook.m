@@ -9862,6 +9862,77 @@ mondrian_relabel_on(void)
 
 static CGImageRef mondrian_wallpaper_image(void);
 
+/*
+ * The middle pixel of a picture, drawn through CoreGraphics so any colour
+ * space or byte order arrives as RGB. The launch snapshot is a solid magenta
+ * rectangle on this port; a real screen is not one colour at its centre.
+ */
+static int
+mondrian_picture_centre(CGImageRef image, unsigned char out[3])
+{
+	unsigned char pixel[4] = { 0, 0, 0, 0 };
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+
+	if (image == NULL || CGImageGetWidth(image) == 0 ||
+	    CGImageGetHeight(image) == 0) {
+		return 0;
+	}
+	rgb = CGColorSpaceCreateDeviceRGB();
+	if (rgb == NULL) {
+		return 0;
+	}
+	ctx = CGBitmapContextCreate(pixel, 1, 1, 8, 4, rgb,
+	    kCGImageAlphaPremultipliedLast);
+	CGColorSpaceRelease(rgb);
+	if (ctx == NULL) {
+		return 0;
+	}
+	CGContextDrawImage(ctx, CGRectMake(0, 0, 1, 1), image);
+	CGContextRelease(ctx);
+	out[0] = pixel[0];
+	out[1] = pixel[1];
+	out[2] = pixel[2];
+	return 1;
+}
+
+/*
+ * A layer's contents can also be an IOSurface, which is what the window server
+ * hands a snapshot layer. Its bytes are B,G,R,A for the usual 'BGRA' format,
+ * so the middle four bytes are enough: two bright channels and a dark one is
+ * the magenta placeholder again.
+ */
+static int
+mondrian_surface_is_magenta(IOSurfaceRef surface)
+{
+	uint32_t seed = 0;
+	size_t width, height, row;
+	const uint8_t *base, *pixel;
+	int magenta = 0;
+
+	if (surface == NULL) {
+		return 0;
+	}
+	width = IOSurfaceGetWidth(surface);
+	height = IOSurfaceGetHeight(surface);
+	row = IOSurfaceGetBytesPerRow(surface);
+	if (width < 8 || height < 8 || row < width * 4) {
+		return 0;
+	}
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &seed) != 0) {
+		return 0;
+	}
+	base = IOSurfaceGetBaseAddress(surface);
+	if (base != NULL) {
+		pixel = base + (height / 2) * row + (width / 2) * 4;
+		if (pixel[1] < 90 && pixel[0] > 150 && pixel[2] > 150) {
+			magenta = 1;
+		}
+	}
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &seed);
+	return magenta;
+}
+
 static void
 mondrian_layer_set_contents(id self, SEL _cmd, id contents)
 {
@@ -9885,6 +9956,87 @@ mondrian_layer_set_contents(id self, SEL _cmd, id contents)
 		    strstr(owner, "Poster") != NULL)) {
 			fixed = mondrian_wallpaper_image();
 		}
+	}
+	/*
+	 * A cold launch shows a full-screen magenta picture where the app's
+	 * background belongs, for about 450 ms, until the white launch screen
+	 * fades in. Measured 2026-11-22 with the panel's row sampler: 81-95%
+	 * of the pixels at 2.4-2.5 s after the tap, on every cold launch after
+	 * a respring. It arrives as a UIImageView's surface, 1440x3200, so it
+	 * is caught here (CGImage) or in the surface branch below. A
+	 * full-screen solid magenta picture is never a drawing the system meant
+	 * to show: paint the system background and let the launch screen fade
+	 * in over it. On by default; `mondrian-launch-fix-off` is the A/B.
+	 */
+	if (fixed == NULL && contents != nil &&
+	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
+	    CGImageGetWidth((CGImageRef)contents) >= 640 &&
+	    CGImageGetHeight((CGImageRef)contents) >= 1000 &&
+	    !mondrian_file_on("/private/var/vm/mondrian-launch-fix-off")) {
+		unsigned char centre[3] = { 0, 0, 0 };
+
+		if (mondrian_picture_centre((CGImageRef)contents, centre) &&
+		    centre[0] > 150 && centre[1] < 90 && centre[2] > 150) {
+			static unsigned said;
+			id delegate = mondrian_send(self, "delegate");
+			const char *owner = delegate != nil ?
+			    object_getClassName(delegate) : "?";
+			CGColorRef background = CGColorCreateGenericRGB(1, 1, 1, 1);
+
+			if (said < 8) {
+				char line[192];
+
+				said++;
+				snprintf(line, sizeof(line),
+				    "MONDRIAN LAUNCH: %s %zux%zu was solid magenta,"
+				    " background painted\n", owner,
+				    CGImageGetWidth((CGImageRef)contents),
+				    CGImageGetHeight((CGImageRef)contents));
+				say(line);
+			}
+			mondrian_set_contents(self, _cmd, nil);
+			if (background != NULL) {
+				((void (*)(id, SEL, CGColorRef))objc_msgSend)(self,
+				    sel_registerName("setBackgroundColor:"), background);
+				CGColorRelease(background);
+			}
+			return;
+		}
+	}
+	/*
+	 * The same picture arrives as a surface on some launches (the window
+	 * server's snapshot). It goes through the same test and the same paint.
+	 */
+	if (fixed == NULL && contents != nil &&
+	    CFGetTypeID((CFTypeRef)contents) == IOSurfaceGetTypeID() &&
+	    IOSurfaceGetWidth((IOSurfaceRef)contents) >= 640 &&
+	    IOSurfaceGetHeight((IOSurfaceRef)contents) >= 1000 &&
+	    !mondrian_file_on("/private/var/vm/mondrian-launch-fix-off") &&
+	    mondrian_surface_is_magenta((IOSurfaceRef)contents)) {
+		static unsigned said;
+		id delegate = mondrian_send(self, "delegate");
+		const char *owner = delegate != nil ?
+		    object_getClassName(delegate) : "?";
+		CGColorRef background = CGColorCreateGenericRGB(1, 1, 1, 1);
+
+		if (said < 8) {
+			char line[192];
+
+			said++;
+			snprintf(line, sizeof(line),
+			    "MONDRIAN LAUNCH: %s %zux%zu surface was solid"
+			    " magenta, background painted\n", owner,
+			    IOSurfaceGetWidth((IOSurfaceRef)contents),
+			    IOSurfaceGetHeight((IOSurfaceRef)contents));
+			say(line);
+		}
+		mondrian_set_contents(self, _cmd, nil);
+		if (background != NULL) {
+			((void (*)(id, SEL, CGColorRef))objc_msgSend)(self,
+			    sel_registerName("setBackgroundColor:"), background);
+			CGColorRelease(background);
+		}
+		return;
 	}
 	if (fixed == NULL && contents != nil &&
 	    CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() &&
