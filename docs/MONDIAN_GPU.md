@@ -59,22 +59,18 @@ them has Metal. That is the path this port follows.
   interface; the DPU scans the ABL's splash carve-out. The GPU path needs the
   IOSurface/`IOMobileFramebuffer` presentation (topaz's `SweetSurface`), with
   the iPhone X 1125x2436 canvas on the 1440x3200 panel. The tick, the
-  TimingElements rate and the panel's `timing@2` switch run at 120 Hz
-  (`vsync avg 8332 us`), but the glass stays at 60: a frame measured from
-  `CTL_START` to clear is 7.74 ms of DSI stream (the 1.2 GHz time) plus 1.14 ms
-  before the first line leaves, 8.88 ms against the 8.33 ms period, so every
-  second kick is coalesced. Pacing is not the lever: kicking the moment the
-  control block clears starts frames 16.5 ms apart, and when the panel blanks
-  the block never clears at all, so the display freezes on the last frame. The
-  1.14 ms is a fill before the first line leaves and the 7.74 ms is the link
-  time. The scanout fetch is not the limit either: a 24 bpp source (`present()`
-  packs B,G,R, SSPP format `0x2243c`, unpack `0x20001`, stride 4320) leaves the
-  rate at +60 and halves the copy to 1.9 ms, because the interface still emits
-  5760 bytes a line and the panel then repeats every 1080 px. The line format is
-  the knob: a frame fits 8.33 ms when the pipe is 24 bpp end to end (INTF panel
-  format, DSI MDP stream, DDIC COLMOD) or compressed, which is what the live
-  tree configures (DSC 8 bpp, 10 bpc, 1440-px slices;
-  `qcom,mdss-mdp-transfer-time-us` 7300).
+  TimingElements rate, the panel's `timing@2` switch and the interface all run
+  at 120 Hz (`vsync avg 8332 us`, `MONDRIAN FB: intf ... (+120)`), and a frame
+  measured from `CTL_START` to clear takes about 4 ms against the 8.33 ms
+  period. The glass stayed at 60 for a transport bug, not for the frame
+  budget: the timing switch's DCS `0x15` writes went out through the `0xc0`
+  long-packet form, so the panel dropped them and kept its 60 Hz timing
+  (`0408`). A short packet puts the data type and data bytes in the descriptor
+  word, four bytes on the wire, and the engine must be idle (DSI_STATUS bits
+  0-1) between packets; display on/off uses the same form. The 24 bpp source
+  experiment (`present()` packs B,G,R, SSPP `0x2243c`, stride 4320) halves the
+  copy but does not change the rate; the live tree is DSC 8 bpp, 10 bpc,
+  720-px slices, compressed end to end.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).

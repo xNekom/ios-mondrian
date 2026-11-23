@@ -208,10 +208,10 @@ the boot splash. CoreAnimation needs `TimingElements`/`ColorElements` and an
 which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
 `pmap_remove_pv`, `0115`); the dylib forces activation.
 
-Open: 120 Hz. The tick and `timing@2` run at 120, but a frame is 8.88 ms
-against 8.33 (7.74 ms DSI stream + 1.14 ms fill), so the glass stays at 60 and
-pacing is settled (kick-on-clear, reverted): the frame must shrink, so the pipe
-goes 24 bpp end to end or DSC (a 24 bpp scanout alone stays at +60).
+120 Hz is reached: the interface completes +120 frames a second and a frame
+clears in about 4 ms of the 8.33 ms period. The gate was the panel's timing
+switch, not the frame budget: its `0x15` writes went out as long packets and
+the panel kept its 60 Hz timing (`0408`).
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is

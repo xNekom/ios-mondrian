@@ -293,28 +293,28 @@ the free list (`mondrian_page_is_screen()`) or `vm_page_init`'s assert fires
 `/arm-io/disp0`.
 
 **A frozen interface is the bootloader's autorefresh.** It leaves
-`INTF_TEAR_AUTOREFRESH_CONFIG = 0x8000003c` (autorefresh, 60 frames) and
-`INTF_TEAR_CHECK_EN = 1`; clear both **before the first `CTL_START` of the
-session** and the interface runs indefinitely (measured 9,813 frames at 59-61/s);
-clearing them later needs `CTL_SW_RESET` (`0x030` = 1). `CTL_START` (`0x01c`)
-bit 0 self-clears on completion and stays 1 when it never completed.
+`INTF_TEAR_AUTOREFRESH_CONFIG = 0x8000003c` (60 frames) and
+`INTF_TEAR_CHECK_EN = 1`; clear both **before the first `CTL_START`**, or the
+interface stops after 60 frames and only `CTL_SW_RESET` (`0x030` = 1) brings it
+back. `CTL_START` (`0x01c`) bit 0 clears on completion and stays 1 if it never did.
+
+**A short DCS write is four bytes,** `(type << 16) | data0 | data1 << 8`; the
+`0xc0` long form is dropped by the panel and the 120 Hz switch stays at 60 (`0408`).
 
 **The kick is the default.** `MondrianFramebuffer` writes the frame, `dsb sy`,
 `CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`, with Normal Non-cacheable
 stores. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
-`mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test` and `mondrianfb_defer=0`
-are diagnostics (`docs/MONDIAN_GPU.md`).
+Diagnostics: `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test`, `mondrianfb_defer=0`.
 
 **Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
-through `dsi_ctrl_hw_cmn_kickoff_command`'s embedded DMA (a FIFO send wedges the
-engine for the boot: `INT_CTRL` `0x500`, no `DMA_DONE`; reset the FIFO before
-the next send), and `DSI_CTRL.CMD_MODE_EN` on this video-mode controller stops
-it reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window
+through the embedded DMA (a FIFO send wedges the engine: `INT_CTRL` `0x500`,
+no `DMA_DONE`; reset the FIFO first), and `DSI_CTRL.CMD_MODE_EN` stops it
+reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window
 starts at `0x840000000`, so the last page of the splash carve-out, `0xbaaf0000`
 (`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>`
 (0xfff full scale), `bl LEVEL [FMT [CMD]]` and `IOMobileFramebuffer` selector 100
-(`0314`) set the level, `mondrianblfmt` the byte order; `brightness-nits` 0 means
+(`0314`) set the level, `mondrianblfmt` the byte order; `brightness-nits` 0 is
 "display asleep".
 
 **The battery's VADC read: sleep, never poll.** ADC7 has no polling mode, so a
