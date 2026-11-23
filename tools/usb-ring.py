@@ -297,6 +297,11 @@ def backboardd_pid(text):
 def respring():
     """Restart the render server and SpringBoard.
 
+    Not a reliable reload path: measured 2026-11-23, every signal order
+    (SpringBoard alone, backboardd alone, both, and backboardd first) left a
+    black panel and `loop 0 in 1 s`. Reboot and boot the image again instead.
+    A rebuilt hook is only mapped by a new SpringBoard.
+
     `kill` takes a PID. `kill SpringBoard` is `kill 0` -- measured 2026-11-18: it
     answers `kill 0 -> 3` and nothing restarts, so a rebuilt hook is never mapped
     and every new probe reads exactly like "the new code did not run". The PID
@@ -316,20 +321,14 @@ def respring():
     if spid is None and bpid is None:
         print("no SpringBoard or backboardd pid in the ring", file=sys.stderr)
         return 1
-    # Only the render server is signalled. Killing SpringBoard alone leaves
-    # the new one on its boot spinner with no commit and a poster extension
-    # timing out; killing backboardd brings the window server and SpringBoard
-    # back together and the new SpringBoard presents (measured 2026-11-21:
-    # present 27/s, ca begin 9 commit 9). Signalling SpringBoard as well raced
-    # the replacement into a second restart and left the panel on the old
-    # frame, so the SpringBoard pid is only the fallback for a kernel that
-    # does not print backboardd.
-    #
-    # Measured 2026-11-22: a backboardd-only respring can also leave the new
-    # SpringBoard on its boot spinner for minutes -- both processes are alive
-    # and drawing frames, the panel shows the spinner. When that happens,
-    # signal SpringBoard and backboardd together (both pids from the ring);
-    # the pair then presents. Check the panel before deciding, not the ring.
+    # Only the render server is signalled, because a SpringBoard-only kill
+    # leaves the new one at its boot spinner: both processes alive and drawing
+    # frames, the panel shows the spinner. Measured 2026-11-21 backboardd alone
+    # once presented a new SpringBoard (27/s); measured 2026-11-23 it did not --
+    # SpringBoard alone, backboardd alone, both together and the reverse pair
+    # all ended black with `loop 0 in 1 s`, and only a reboot recovered. Check
+    # the panel after the call; the SpringBoard pid is the fallback for a kernel
+    # that does not print backboardd.
     if bpid is not None:
         print(f"backboardd pid {bpid}")
         answer = simple("kill " + bpid, 5.0)
