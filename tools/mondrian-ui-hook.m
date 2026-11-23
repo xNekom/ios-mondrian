@@ -4311,6 +4311,8 @@ static uint64_t mondrian_dl_total2;      /* the late link */
 static double   mondrian_dl_period;      /* link.duration */
 static double   mondrian_dl_target;      /* targetTimestamp - timestamp */
 static double   mondrian_dl_stamp;
+static uint64_t mondrian_dl_last_ns;     /* last primary tick, for the interval bins */
+static uint32_t mondrian_dl_iv[8];       /* <8, 8-8.6, 8.6-9.2, 9.2-10, 10-12, 12-15, 15-18, >18 ms */
 
 @interface MondrianDisplayLinkProbe : NSObject
 {
@@ -4346,7 +4348,12 @@ static double   mondrian_dl_stamp;
 	snprintf(line, sizeof(line), "MONDRIAN DL[%d]: %s created\n", getpid(), what);
 	say(line);
 	if ([link respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
-		link.preferredFramesPerSecond = 60;
+		/*
+		 * The first link asks for the display's own rate (0 is the
+		 * maximum): its tick rate is what the compositor can have. The
+		 * second keeps 60 as the control.
+		 */
+		link.preferredFramesPerSecond = late ? 60 : 0;
 	}
 	[link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 	snprintf(line, sizeof(line), "MONDRIAN DL[%d]: %s armed\n", getpid(), what);
@@ -4358,11 +4365,40 @@ static double   mondrian_dl_stamp;
 	if (late) {
 		mondrian_dl_total2++;
 	} else {
+		struct timespec ts = { 0, 0 };
+		uint64_t ns;
+
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+		if (mondrian_dl_last_ns != 0 && ns > mondrian_dl_last_ns) {
+			uint64_t d = ns - mondrian_dl_last_ns;
+			unsigned bin;
+
+			if (d < 8000000ULL) {
+				bin = 0;
+			} else if (d < 8600000ULL) {
+				bin = 1;        /* one period, on time */
+			} else if (d < 9200000ULL) {
+				bin = 2;        /* one period, a little late */
+			} else if (d < 10000000ULL) {
+				bin = 3;
+			} else if (d < 12000000ULL) {
+				bin = 4;
+			} else if (d < 15000000ULL) {
+				bin = 5;
+			} else if (d < 18000000ULL) {
+				bin = 6;        /* a held frame */
+			} else {
+				bin = 7;
+			}
+			mondrian_dl_iv[bin]++;
+		}
+		mondrian_dl_last_ns = ns;
 		mondrian_dl_total++;
+		mondrian_dl_period = link.duration;
+		mondrian_dl_target = link.targetTimestamp - link.timestamp;
 	}
-	mondrian_dl_period = link.duration;
 	mondrian_dl_stamp = link.timestamp;
-	mondrian_dl_target = link.targetTimestamp - link.timestamp;
 }
 @end
 
@@ -4495,13 +4531,20 @@ dl_report(void *unused)
 		rate2 = mondrian_dl_total2 - last2;
 		ts = dl_now();
 		n = snprintf(buf, sizeof(buf),
-		    "MONDRIAN DL[%d]: early %llu late %llu ticks/%ds total %llu/%llu now %.3f stamp %.3f\n",
+		    "MONDRIAN DL[%d]: early %llu late %llu ticks/%ds total %llu/%llu dur %.4f target %.4f "
+		    "iv %u %u %u %u %u %u %u %u now %.3f stamp %.3f\n",
 		    getpid(), (unsigned long long)rate, (unsigned long long)rate2,
 		    MONDRIAN_DL_SECONDS, (unsigned long long)mondrian_dl_total,
-		    (unsigned long long)mondrian_dl_total2,
+		    (unsigned long long)mondrian_dl_total2, mondrian_dl_period,
+		    mondrian_dl_target, mondrian_dl_iv[0], mondrian_dl_iv[1],
+		    mondrian_dl_iv[2], mondrian_dl_iv[3], mondrian_dl_iv[4],
+		    mondrian_dl_iv[5], mondrian_dl_iv[6], mondrian_dl_iv[7],
 		    (double)ts.tv_sec + ts.tv_nsec / 1e9, mondrian_dl_stamp);
 		if (n > 0) {
 			say(buf);
+		}
+		for (int k = 0; k < 8; k++) {
+			mondrian_dl_iv[k] = 0;
 		}
 		last = mondrian_dl_total;
 		last2 = mondrian_dl_total2;
