@@ -60,11 +60,12 @@ them has Metal. That is the path this port follows.
   IOSurface/`IOMobileFramebuffer` presentation (topaz's `SweetSurface`), with
   the iPhone X 1125x2436 canvas on the 1440x3200 panel. The tick, the
   TimingElements rate and the panel's `timing@2` switch run at 120 Hz
-  (`vsync avg 8332 us`), but the glass stays at 60: a frame takes 8.9-14.6 ms
-  from `CTL_START` to clear against the 8.33 ms period, so every second kick
-  is coalesced. The DSI stream is about 7.7 ms of that; the rest is the fetch
-  and end latency, which the vendor overlaps across frames (ping-pong) and
-  runs with display clocks our driver never programs.
+  (`vsync avg 8332 us`), but the glass stays at 60: a frame measured from
+  `CTL_START` to clear is 7.74 ms of DSI stream (the 1.2 GHz time) plus 1.14 ms
+  of fetch, 8.88 ms against the 8.33 ms period, so every second kick is
+  coalesced (kicks that land mid-frame read 10-14.6 ms). The fetch is the only
+  part over budget: the vendor hides it with a compressed (UBWC) source, while
+  our copy path fetches an uncompressed 18.4 MB BGRA canvas.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
