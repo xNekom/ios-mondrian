@@ -71,8 +71,9 @@ them has Metal. That is the path this port follows.
   word, four bytes on the wire, and the engine must be idle (DSI_STATUS bits
   0-1) between packets; display on/off uses the same form. The 24 bpp source
   experiment (`mondrianfb_rgb888=1`: `present()` packs B,G,R, SSPP `0x2243c`,
-  stride 4320) is a loss: the packed copy measures 3.2-4.7 ms against 2.7-2.9
-  for the 32 bpp `memcpy`, so the shuffle costs more than the bytes it saves.
+  stride 4320) is a loss: with the cache clean and the GPU fence subtracted the
+  packed copy costs about 2.2 ms against 1.9 ms for the 32 bpp `memcpy`, so the
+  shuffle costs more than the quarter of the writes it saves.
   The live tree is DSC 8 bpp, 10 bpc, 720-px slices, compressed end to end.
   The compositor is the second limit: a full-screen Settings scroll presents
   90-106 frames a second (`MONDRIAN FB: fps`), the frame arriving 4 ms after
