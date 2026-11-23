@@ -1365,6 +1365,26 @@ bridge_card_next(char *bid, size_t len)
 	return true;
 }
 
+/*
+ * A switcher card is a UIImageView-sized layer between the icon, the strip
+ * cards (321..464 x 1067) and the focused card (336x747). The full-screen app
+ * window image view is 480x1067 and must not be touched: it is the app's own
+ * picture, not a card.
+ */
+static bool
+bridge_is_card_layer(id layer)
+{
+	CGRect bounds;
+
+	if (layer == nil) {
+		return false;
+	}
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("bounds"));
+	return bounds.size.width >= 250 && bounds.size.width <= 478 &&
+	    bounds.size.height >= 500 && bounds.size.height <= 1200;
+}
+
 static void
 bridge_set_contents(id self, SEL cmd, id contents)
 {
@@ -1383,13 +1403,14 @@ bridge_set_contents(id self, SEL cmd, id contents)
 		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
 
 		/*
-		 * The card's UIImageView is handed the render server's full-size
-		 * poison (1008x2240 for a 336x747 card), not the cache thumbnail
-		 * patched above. Every card is patched and joined to its app by
-		 * the display item in its view chain: the switcher can hold two
-		 * cards for one app and a page can hold several apps.
+		 * The switcher's cards are UIImageViews whose images come from the
+		 * render server (1008x2240 for the focused card, 1080x2400 for
+		 * the strip) and are allocator poison. The full-screen app window
+		 * view is also a UIImageView with a big image, so the layer's own
+		 * bounds select the card-sized ones; the app is taken from the
+		 * snapshot-request order, then from the view chain.
 		 */
-		if (w == 1008 && h == 2240) {
+		if (w >= 900 && h >= 1800 && bridge_is_card_layer(self)) {
 			id delegate = ((id (*)(id, SEL))objc_msgSend)(self,
 			    sel_registerName("delegate"));
 			const char *owner = delegate != nil ?
@@ -1436,12 +1457,13 @@ bridge_set_contents(id self, SEL cmd, id contents)
 						bridge_card_filled_h = h;
 					}
 					if (bridge_card_filled != NULL) {
-						char line[180];
+						char line[200];
 
 						image = bridge_card_filled;
 						snprintf(line, sizeof(line),
-						    "CARD %s filled",
-						    bid[0] != '\0' ? bid : "-");
+						    "CARD %s filled %zux%zu",
+						    bid[0] != '\0' ? bid : "-",
+						    w, h);
 						bridge_chain_line(line);
 					}
 				}
