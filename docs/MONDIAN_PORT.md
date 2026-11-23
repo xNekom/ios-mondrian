@@ -208,8 +208,8 @@ the boot splash. CoreAnimation needs `TimingElements`/`ColorElements` and an
 which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
 `pmap_remove_pv`, `0115`); the dylib forces activation.
 
-Open: the UI renders at 1440x3200 (480x1066 pt, scale 3); the canvas scaler
-(`0268`) is off and `docs/UI_PERFORMANCE.md` has the smoothness numbers.
+Open: 120 Hz. The tick and the panel's `timing@2` switch run at 120, but a
+frame is 8.9-14.6 ms against 8.33, so the glass stays at 60; the UI is budgeted the same (9.4 ms GL + 4.7 ms copy). The UI renders at 1440x3200 (480x1066 pt, scale 3) with the canvas scaler (`0268`) off (`docs/MONDIAN_GPU.md`, `docs/UI_PERFORMANCE.md`).
 `0302`/`0303` blank the panel on the power key and on idle sleep, and `0342`
 switches it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key
 or a touch un-blanks and the tick sends `0x29` -- a wake cannot wait for a
@@ -288,7 +288,7 @@ ones:
 | `cpus=8` | every core the tree has, which is seven: the X2, the three A710s and three of the A510s. The A510 at Aff1 0 runs the shim and is parked, left out of the device tree (PSCI `CPU_OFF` does not take it down on this TZ). `cpus=1` is the safe fallback |
 | `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
 | `wdt=-1 wdt_test=no_user_checkin` | no hardware watchdog, no userspace watchdog check-in |
-| `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn); the frame tick is a compile-time 60 Hz (`MONDRIAN_FB_REFRESH_HZ`), not a boot argument |
+| `mondrianfb_noconsole=1` | stop drawing kernel text over the GUI (panics are still drawn); the frame tick is a compile-time 120 Hz (`MONDRIAN_FB_REFRESH_HZ`), not a boot argument |
 | `mondrian_gpu_hook=1` | bit 2 of `mondrian_ui_hook` hands `backboardd` `/private/var/vm/mondrian-inject.dylib` instead of the hook, the only configuration in which CoreAnimation can pick its GLES renderer (`0344`); without the blob backboardd is left alone |
 | `glblob=1` | write the kernel's embedded GL, injector and UI-hook dylibs into `/private/var/vm` at mount; `kern_exec` prefers them, so a userland change needs one kernel build, not a userdata flash |
 | `mondrianunlock=1` | the hook unlocks the lock screen and re-requests it every minute |
