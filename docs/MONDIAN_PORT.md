@@ -208,18 +208,18 @@ the boot splash. CoreAnimation needs `TimingElements`/`ColorElements` and an
 which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
 `pmap_remove_pv`, `0115`); the dylib forces activation.
 
-Open: 120 Hz. The tick and the panel's `timing@2` switch run at 120, but a
-frame is 8.9-14.6 ms against 8.33, so the glass stays at 60; the UI is budgeted the same (9.4 ms GL + 4.7 ms copy). The UI renders at 1440x3200 (480x1066 pt, scale 3) with the canvas scaler (`0268`) off (`docs/MONDIAN_GPU.md`, `docs/UI_PERFORMANCE.md`).
-`0302`/`0303` blank the panel on the power key and on idle sleep, and `0342`
-switches it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key
-or a touch un-blanks and the tick sends `0x29` -- a wake cannot wait for a
-frame. The fallback timer (`mondrianfb_blank`) is 0 in the board cmdline: the
-DCS blank resets the phone while CoreAnimation renders through Mesa
-(`docs/MONDIAN_GPU.md`); the hook's holds are off (`mondriankeepawake=0`) and
-iOS's timer never arms -- `SBLockScreenAutoLockTime` was missing and the hook
-writes it, and `SBLockScreenManager` has no `_idleTimerPolicyAggregator`.
-`0305` brightness and `0304` battery; sweet's `0056`/`0079`
-(`RequestPowerChange`) still need a rebase.
+Open: 120 Hz. The tick and `timing@2` run at 120, but a frame is 8.88 ms
+against 8.33 (7.74 ms DSI stream + 1.14 ms fill), so the glass stays at 60 and
+pacing is settled (kick-on-clear, reverted): the frame must shrink
+(DSC, as the live tree configures it, or a smaller source format).
+`0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
+it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
+un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
+0 in the board cmdline (the DCS blank resets the phone while CoreAnimation
+renders through Mesa, `docs/MONDIAN_GPU.md`); iOS's timer never arms --
+`SBLockScreenAutoLockTime` was missing and the hook writes it, and
+`SBLockScreenManager` has no `_idleTimerPolicyAggregator`. `0305` brightness
+and `0304` battery; sweet's `0056`/`0079` still need a rebase.
 
 ### 4. The touch
 
