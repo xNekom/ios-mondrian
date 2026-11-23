@@ -135,6 +135,19 @@ them has Metal. That is the path this port follows.
   `HFI_CTRL_STATUS=0x1`. The kernel then boots the UI normally. Pong's
   RSCC/PDC and TCM-retention writes are in the tree behind `gpurscc=1`; the
   successful boot did not use them.
+- **Display SMMU**: a read-only dump of `apps_smmu` (`0x15000000`, 1 MiB) shows
+  `sCR0 0x280406` (client port enabled, fault reporting on), `sACR 0x1c`, and
+  4 KiB tables (`ID1 0x6000004b`: PAGESIZE 0, NUMPAGENDXB 6, NUMCB 75). SID
+  `0x2800` matches SMR3 (`0x84022800`, mask 0x8402) to S2CR `0x3`: type TRANS,
+  bank 3. CB3 (`0x15083000`) reads SCTLR `0xe0` (M=0) with TTBR0 and TCR zero,
+  and CB0..5 all share CBAR `0x1f000`. Stage 1 off with stage 2 bypassed means
+  the fetch passes through untranslated, which is why `SRC0` carries the
+  physical `0xb8000000` and no table exists for the display anywhere. A direct
+  scanout therefore programs CB3 itself - 4 KiB tables, 4 GiB input, Non-
+  Cacheable walks, the ARM SMMU-500 register layout in the arm-smmu driver -
+  and maps the surface pages into the 32-bit IOVA window `SRC0` can address.
+  The copy path depends on the bank staying in bypass, so the prototype is
+  opt-in (`mfs` in the boot arguments).
 - **Local firmware build**: `tools/gen-gmu-fw.py <gmu_gen70000.bin>
   <build>/bsd/dev/mondrian_gmu_fw.h` before building with `gmustart=1`. The
   header is a local input, not committed; without it `mondrian_gpu.c` does not
