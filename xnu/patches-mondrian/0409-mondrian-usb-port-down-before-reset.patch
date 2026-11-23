@@ -1,0 +1,54 @@
+xnu 0409: power the port down before a reset to fastboot
+
+`reboot` from the ring, and the watchdog that stands in for it, both reach
+ABL's fastboot and the host then sees no USB device at all: no fastboot, no
+ring, and Windows lists nothing new on the port, so the only way out is the
+hardware keys. The port is left in the state XNU had it in -- eUSB2 PHY
+enabled, repeater powered -- and the bootloader's own enumeration does not
+recover from that, while a cold start, where both are off, always enumerates.
+
+So the reset path clears EUSB2_HS_PHY_COMMON0.PHY_ENABLE and votes the
+repeater's rails (PM8350 S10 1.8 V, L2 3.072 V) off, then waits 20 ms. ABL
+powers the repeater itself when it finds it silent (0313 votes the same two
+rails for the cold-boot case), so the boot that follows is not left without
+the part.
+
+The PHY write is guarded: a boot whose gadget never came up returns earlier
+from mondrian_usb_stop(), and an unclocked block reads 0x09090909.
+
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -3464,6 +3464,33 @@ mondrian_usb_stop(void)
+ 	}
+ 	printf("MONDR USB: stopped before reset (DCTL 0x%08x DSTS 0x%08x after %d ms)\n",
+ 	    dwc_rd(DCTL), dwc_rd(DSTS), i);
++	/*
++	 * Hand the port back the way a power-on leaves it. A warm reset keeps
++	 * the eUSB2 PHY enabled and the repeater powered in the state XNU left
++	 * them, and the bootloader's fastboot then never enumerates: the host
++	 * sees no new device at all and the phone has to be power-cycled by
++	 * hand (measured on every reset from this kernel). ABL powers the
++	 * repeater itself on a cold start -- 0313 votes the same two rails when
++	 * it finds the part silent -- so dropping them here cannot leave it
++	 * unpowered for the next boot.
++	 *
++	 * The PHY's registers only answer while the block is clocked; a boot
++	 * that never brought the gadget up returns above, and 0x09090909 is
++	 * what an unclocked block reads back as.
++	 */
++	{
++		vm_offset_t phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++
++		if (phy != 0 && usb_rd(phy, EUSB2_HS_PHY_COMMON0) != 0x09090909u) {
++			/* PHY_ENABLE|RETENABLEN off */
++			eusb2_mask(phy, EUSB2_HS_PHY_COMMON0, 0x9u, 0);
++		}
++		(void)mondrian_rpmh_rail("smpb10", 1800, 0);
++		(void)mondrian_rpmh_rail("ldob2", 3072, 0);
++		delay(20000);
++		printf("MONDR USB: port powered down before reset (phy %s)\n",
++		    phy != 0 ? "disabled" : "unmapped");
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_MONDRIAN */

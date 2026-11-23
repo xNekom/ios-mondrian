@@ -1,0 +1,989 @@
+xnu 0410: scan the compositor's surface out at 120 Hz
+
+The panel is a command-mode 120 Hz AMOLED and the compositor's surface is
+already 1440x3200 RGBA with the panel's stride, so the copy into the low
+carve-out is pure overhead: 2.6 ms of every frame, and it is what a 117 fps
+scroll spends its margin on.
+
+`mfs=N` stages the feature: 1 builds the SMMU tables, 2 configures context
+bank 3 with translation off, 3 turns it on, 4 also flips SRC0 at the panel's
+tick, 5 presents from swap() instead of the tick. The bank identity-maps the
+low 4 GiB and places the two compositor surfaces in a 32-bit IOVA window so
+SRC0 can carry an IOVA. The tick arms on a fixed deadline chain, takes the
+queued record and flips; the renderer waits for that flip. Returning before
+it (mfs=6) measured 89-96 fps instead: the GPU is then handed a surface the
+display is about to take, and its fence lands inside the tick.
+
+The cache clean moves to the paths that read the surface with the CPU -- the
+scaled canvas and the copy. Direct scanout never reads it, and the clean's
+0.5 ms sat inside the renderer's wait.
+
+The per-second report is one line instead of a dozen: the old burst held the
+work loop past a vsync and the deadline chain skipped a tick, which is a
+held frame on the glass. `mondrianfb_verbose=1` restores the detail.
+
+`mondrian_fb_shutdown()` is the reset side of the same work: it puts SRC0
+back on the physical carve-out and clears the bank's SCTLR, which is the
+state the bootloader expects (0411 calls it).
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -45,7 +45,9 @@
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <pexpert/pexpert.h>
++#include <arm/caches_internal.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+@@ -219,6 +221,8 @@ extern "C" uint64_t mondrian_early_fb_va(void);
+ /* ... and the console letting go of it when the compositor has the screen. */
+ extern "C" void mondrian_early_ui_owns(void);
+ extern "C" int mondrian_gpu_uc_flush(uint64_t pa, uint64_t bytes);
++/* bsd/dev/mondrian_usb.c: the PMIC reset that lands in ABL's fastboot. */
++extern "C" void mondrian_reboot_to_fastboot(void);
+ 
+ /*
+  * mondrianfb_probe=N: for the first N layers a swap sends to the panel, say
+@@ -240,6 +244,14 @@ static int mondrian_fb_coherent = 1;
+  * of the boot still shows the UI.
+  */
+ static int mondrian_fb_nocopy;
++/*
++ * mondrianfb_verbose=1 keeps the per-second register dump the bring-up
++ * needed: interface state, SSPP source, the selector counters, the panel
++ * sample. That is a dozen IOLog lines inside the work loop every second, and
++ * a burst that long holds the loop past one vsync -- the tick chain skips a
++ * period and the glass shows a held frame. The merged line below stays.
++ */
++static int mondrian_fb_verbose;
+ /*
+  * Wait for the compositor's own fence before copying a surface into the panel.
+  * Without it the copy can read a surface the GPU is still drawing, because
+@@ -284,6 +296,370 @@ mondrian_fb_clean(MondrianSurface *s)
+ 	}
+ }
+ 
++/*
++ * Direct scanout (`mfs` in the boot arguments: 1 gives the bank its stage-1
++ * tables and keeps the copy, 2 also points SRC0 at the compositor's surface).
++ *
++ * The display fetches through apps_smmu (0x15000000), SID 0x2800, whose stream
++ * table entry selects context bank 3; the bootloader left that bank with
++ * stage-1 translation off (SCTLR.M=0), so SRC0 carries a physical address and
++ * the port copies every frame into the low carve-out. SRC0 is 32 bits wide and
++ * CoreAnimation's surfaces live at 0x840000000, so a flip needs that bank to
++ * translate: a 4 GiB input space with the low region identity-mapped and the
++ * surfaces placed in a 32-bit IOVA window. The copy stays the default path.
++ */
++#define MONDRIAN_SCAN_SLOTS      2
++#define MONDRIAN_SCAN_IOVA       0x90000000ULL
++#define MONDRIAN_SCAN_STRIDE     0x02000000ULL     /* 32 MiB per surface */
++#define MONDRIAN_SCAN_TABLES     0x22000ULL        /* L1, L2, 32 L3: 4 KiB each */
++#define MONDRIAN_SCAN_WATCHDOG_S 900               /* mfs test boots return to fastboot */
++#define MONDRIAN_SCAN_SMMU       0x15000000ULL
++#define MONDRIAN_SCAN_SMMU_LEN   0x100000ULL
++
++static int mondrian_fb_scan;                    /* 1 tables, 2 config, 3 translate, 4 flip */
++static volatile uint8_t *mondrian_scan_regs;
++static uint32_t mondrian_scan_cb = 0xffffffffu; /* context bank that serves SID 0x2800 */
++static uint32_t mondrian_scan_cb_off;           /* that bank's register base */
++static IOBufferMemoryDescriptor *mondrian_scan_mem;
++static void *mondrian_scan_tables;
++static uint32_t mondrian_scan_slots[MONDRIAN_SCAN_SLOTS];
++static bool mondrian_scan_slot_logged;
++
++static inline uint32_t
++mondrian_scan_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(mondrian_scan_regs + off);
++}
++
++static inline void
++mondrian_scan_wr(uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(mondrian_scan_regs + off) = value;
++}
++
++/*
++ * The physical address of the 4 KiB table at an offset inside the table
++ * memory. The tables do not need to be contiguous with each other, only each
++ * table with itself (4 KiB inside one 16 KiB kernel page), so an ordinary
++ * buffer descriptor is enough and IOMallocContiguous - whose physical-mask
++ * path returns nothing on this board - is not needed.
++ */
++static addr64_t
++mondrian_scan_table_pa(uint32_t off)
++{
++	IOByteCount len = 0;
++	addr64_t pa;
++
++	if (mondrian_scan_mem == NULL) {
++		return 0;
++	}
++	pa = mondrian_scan_mem->getPhysicalSegment(off, &len);
++	return len != 0 ? pa : 0;
++}
++
++/* Invalidate the non-secure stage-1 TLBs and wait for the hardware. */
++static void
++mondrian_scan_tlb(void)
++{
++	if (mondrian_scan_regs == NULL) {
++		return;
++	}
++	mondrian_scan_wr(0x68, 1);              /* GR0_sTLBIALLNSNH */
++	mondrian_scan_wr(0x70, 1);              /* GR0_sTLBGSYNC */
++	for (uint32_t i = 0; i < 1000000; i++) {
++		if ((mondrian_scan_rd(0x74) & 1) == 0) {
++			break;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * Give the display's context bank a stage-1 table: identity for the low 4 GiB
++ * (the panel carve-out is at 0xb8000000) and 4 KiB leaves over the 64 MiB the
++ * two surface slots occupy. The walk is Non-Cacheable, Outer Shareable, and
++ * every descriptor is cleaned to the point of coherency before the bank is
++ * enabled.
++ */
++static void
++mondrian_scan_enable(void)
++{
++	uint32_t id0, id1, id2, smrg, ncb, pgshift, npage, n;
++	uint32_t ias, oas, ps;
++
++	mondrian_scan_regs = (volatile uint8_t *)ml_io_map(MONDRIAN_SCAN_SMMU,
++	    MONDRIAN_SCAN_SMMU_LEN);
++	if (mondrian_scan_regs == NULL) {
++		IOLog("MONDRIAN SCAN: apps_smmu not mapped\n");
++		return;
++	}
++	id0 = mondrian_scan_rd(0x20);
++	id1 = mondrian_scan_rd(0x24);
++	id2 = mondrian_scan_rd(0x28);
++	smrg = id0 & 0xffu;
++	ncb = id1 & 0xffu;
++	pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	npage = 1u << (((id1 >> 28) & 7u) + 1u);
++	/*
++	 * ID2 carries both address sizes as io-pgtable codes: 0 32, 1 36,
++	 * 2 40, 3 42, 4 44, 5 48, 6 52. PASIZE (TCR2[3:0]) takes the OAS
++	 * code, not the bit count; a value larger than the OAS the SMMU
++	 * supports is a programming error and every walk can fault.
++	 */
++	ias = id2 & 0xfu;
++	oas = (id2 >> 4) & 0xfu;
++	ps = oas <= 6u ? oas : 2u;
++	for (n = 0; n < smrg && n < 256; n++) {
++		uint32_t smr = mondrian_scan_rd(0x800 + n * 4);
++		uint32_t mask = (smr >> 16) & 0xffffu;
++		uint32_t sid = smr & 0xffffu;
++
++		if ((smr & (1u << 31)) == 0) {
++			continue;
++		}
++		if ((0x2800u & ~mask) == (sid & ~mask)) {
++			uint32_t s2cr = mondrian_scan_rd(0xc00 + n * 4);
++
++			IOLog("MONDRIAN SCAN: sid 0x2800 smr%u 0x%x s2cr 0x%x bank %u type %u\n",
++			    n, smr, s2cr, s2cr & 0xffu, (s2cr >> 16) & 3u);
++			IOLog("MONDRIAN SCAN: id2 0x%x ias %u oas %u pasize %u\n",
++			    id2, ias, oas, ps);
++			if (((s2cr >> 16) & 3u) == 0) {
++				mondrian_scan_cb = s2cr & 0xffu;
++			}
++			break;
++		}
++	}
++	if (mondrian_scan_cb >= ncb) {
++		IOLog("MONDRIAN SCAN: no translation bank for sid 0x2800\n");
++		mondrian_scan_cb = 0xffffffffu;
++		return;
++	}
++	mondrian_scan_cb_off = (npage << pgshift) + (mondrian_scan_cb << pgshift);
++	mondrian_scan_mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared,
++	    (vm_size_t)MONDRIAN_SCAN_TABLES, page_size);
++	if (mondrian_scan_mem == NULL ||
++	    (mondrian_scan_tables = mondrian_scan_mem->getBytesNoCopy()) == NULL) {
++		IOLog("MONDRIAN SCAN: no table memory\n");
++		OSSafeReleaseNULL(mondrian_scan_mem);
++		mondrian_scan_tables = NULL;
++		mondrian_scan_cb = 0xffffffffu;
++		return;
++	}
++	bzero(mondrian_scan_tables, (size_t)MONDRIAN_SCAN_TABLES);
++	{
++		uint64_t *l1 = (uint64_t *)mondrian_scan_tables;
++		uint64_t *l2 = (uint64_t *)((uint8_t *)mondrian_scan_tables + 0x1000);
++		addr64_t l1_pa = mondrian_scan_table_pa(0);
++		addr64_t l2_pa = mondrian_scan_table_pa(0x1000);
++		uint32_t i;
++
++		if (l1_pa == 0 || l2_pa == 0) {
++			IOLog("MONDRIAN SCAN: tables have no physical address\n");
++			OSSafeReleaseNULL(mondrian_scan_mem);
++			mondrian_scan_tables = NULL;
++			mondrian_scan_cb = 0xffffffffu;
++			return;
++		}
++		/*
++		 * 0x440 is AP[1] (EL0 read/write): the display's scanout fetch is
++		 * privileged, but the DSI command DMA that reads the low DCS page
++		 * (0xbaaf0000) is not, and AP=00 made that read a permission
++		 * fault - the panel then stayed at 60 Hz because the command that
++		 * switches it to 120 never left the DMA.
++		 */
++		l1[0] = 0x00000000ULL | 0x441ULL;
++		l1[1] = 0x40000000ULL | 0x441ULL;
++		l1[2] = l2_pa | 0x3ULL;
++		l1[3] = 0xC0000000ULL | 0x441ULL;
++		for (i = 0; i < 512; i++) {
++			l2[i] = (0x80000000ULL + (uint64_t)i * 0x200000ULL) | 0x441ULL;
++		}
++		for (i = 0; i < 32; i++) {
++			addr64_t l3_pa = mondrian_scan_table_pa(0x2000 + i * 0x1000);
++
++			if (l3_pa == 0) {
++				IOLog("MONDRIAN SCAN: l3 %u has no physical address\n", i);
++				OSSafeReleaseNULL(mondrian_scan_mem);
++				mondrian_scan_tables = NULL;
++				mondrian_scan_cb = 0xffffffffu;
++				return;
++			}
++			l2[128 + i] = l3_pa | 0x3ULL;
++		}
++	}
++	flush_dcache64((addr64_t)(uintptr_t)mondrian_scan_tables,
++	    (unsigned)MONDRIAN_SCAN_TABLES, FALSE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	IOLog("MONDRIAN SCAN: tables %p l1 0x%llx l2 0x%llx l3 0x%llx\n",
++	    mondrian_scan_tables, (unsigned long long)mondrian_scan_table_pa(0),
++	    (unsigned long long)mondrian_scan_table_pa(0x1000),
++	    (unsigned long long)mondrian_scan_table_pa(0x2000));
++	/*
++	 * mfs=1 stops here: the tables are built and cleaned but the bank keeps
++	 * bypassing, so a mistake in them cannot take the phone down. mfs=2
++	 * programs the context bank but still leaves SCTLR.M=0, so the display
++	 * keeps fetching physical addresses; mfs=3 turns translation on (the
++	 * identity map covers the physical SRC0 the panel already uses); mfs=4
++	 * also points SRC0 at a compositor surface.
++	 */
++	if (mondrian_fb_scan < 2) {
++		IOLog("MONDRIAN SCAN: bank %u left off (mfs %d)\n",
++		    mondrian_scan_cb, mondrian_fb_scan);
++		return;
++	}
++	/*
++	 * The order is the one Linux writes a context bank in and every access
++	 * is 32 bits: TTBR0 is split in its two halves, because a single
++	 * 64-bit store is the one access this register file has not been
++	 * proven with yet. CONTEXTIDR is not written at all - Linux only uses
++	 * it for the AArch32 format.
++	 */
++	IOLog("MONDRIAN SCAN: write cbar\n");
++	mondrian_scan_wr(0x1000 + mondrian_scan_cb * 4, 0x1f000);       /* CBAR: measured value */
++	/*
++	 * CBA2R lives in GR1 at 0x800 + n*4, so 0x1800 + n*4 from the base. The
++	 * absolute 0x800 + n*4 of the first version is GR0 SMR[n] - the
++	 * display's own stream entry, whose loss makes SID 0x2800 unmatched
++	 * while sCR0.USFCFG is set.
++	 */
++	mondrian_scan_wr(0x1800 + mondrian_scan_cb * 4, 1);             /* CBA2R: VA64 */
++	IOLog("MONDRIAN SCAN: write tcr\n");
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x10,
++	    0x38010u | ps);                                           /* TCR2: PASIZE, SEP, 16-bit ASID */
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x30, 0x80802020);      /* TCR: EAE (AArch64), T0SZ 32, SH0 OS */
++	IOLog("MONDRIAN SCAN: write ttbr0\n");
++	{
++		addr64_t l1 = mondrian_scan_table_pa(0);
++
++		mondrian_scan_wr(mondrian_scan_cb_off + 0x24,
++		    (uint32_t)(0x10000ULL | (l1 >> 32)));                  /* ASID 1, high half */
++		mondrian_scan_wr(mondrian_scan_cb_off + 0x20, (uint32_t)l1);
++	}
++	IOLog("MONDRIAN SCAN: write mair\n");
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x38, 0x44);           /* MAIR0: Normal Non-Cacheable */
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x3c, 0);              /* MAIR1 */
++	__asm__ volatile("dsb sy" ::: "memory");
++	/*
++	 * mfs=2 leaves SCTLR.M=0 on purpose: the bank now holds the whole
++	 * configuration but keeps bypassing, so a wrong descriptor or a bad
++	 * attribute cannot reach the display yet. mfs=3 turns translation on.
++	 */
++	if (mondrian_fb_scan < 3) {
++		IOLog("MONDRIAN SCAN: bank %u configured, M=0 (mfs %d)\n",
++		    mondrian_scan_cb, mondrian_fb_scan);
++		return;
++	}
++	/* Drop the bootloader's stale status so a later read is a new fault. */
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x58, 0xffffffff);
++	IOLog("MONDRIAN SCAN: write sctlr\n");
++	mondrian_scan_wr(mondrian_scan_cb_off + 0x00, 0x127);          /* SCTLR: M, TRE, AFE, CFRE */
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_scan_tlb();
++	IOLog("MONDRIAN SCAN: bank %u cbar 0x%x sctlr 0x%x ttbr0 0x%llx tcr 0x%x tcr2 0x%x fsr 0x%x\n",
++	    mondrian_scan_cb, mondrian_scan_rd(0x1000 + mondrian_scan_cb * 4),
++	    mondrian_scan_rd(mondrian_scan_cb_off),
++	    (unsigned long long)*(volatile uint64_t *)(mondrian_scan_regs +
++	    mondrian_scan_cb_off + 0x20),
++	    mondrian_scan_rd(mondrian_scan_cb_off + 0x30),
++	    mondrian_scan_rd(mondrian_scan_cb_off + 0x10),
++	    mondrian_scan_rd(mondrian_scan_cb_off + 0x58));
++}
++
++/* Point the slot's leaves at the surface's pages; the slot is empty first. */
++static bool
++mondrian_scan_fill(MondrianSurface *s, uint32_t slot)
++{
++	uint8_t *tables = (uint8_t *)mondrian_scan_tables + 0x2000 +
++	    (uint64_t)slot * 16 * 0x1000;
++	uint64_t len, off = 0;
++
++	if (s->memory == NULL) {
++		return false;
++	}
++	len = s->memory->getLength();
++	if (len == 0 || len > MONDRIAN_SCAN_STRIDE) {
++		return false;
++	}
++	bzero(tables, 16 * 0x1000);
++	while (off < len) {
++		IOByteCount seglen = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seglen);
++
++		if (pa == 0 || seglen == 0) {
++			return false;
++		}
++		if (off + seglen > len) {
++			seglen = (IOByteCount)(len - off);
++		}
++		for (uint64_t o = 0; o < seglen; o += 0x1000) {
++			uint64_t page = (off + o) >> 12;
++			uint64_t *l3 = (uint64_t *)(tables + (page >> 9) * 0x1000);
++
++			l3[page & 0x1ff] = (pa + o) | 0x443ULL;
++		}
++		off += seglen;
++	}
++	flush_dcache64((addr64_t)(uintptr_t)tables, 16 * 0x1000, FALSE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return true;
++}
++
++/* The IOVA of the surface, mapping it into a free slot on first use. */
++static bool
++mondrian_scan_map(MondrianSurface *s, uint64_t *iova)
++{
++	uint32_t slot = MONDRIAN_SCAN_SLOTS;
++
++	if (mondrian_scan_tables == NULL || mondrian_scan_cb == 0xffffffffu) {
++		return false;
++	}
++	for (uint32_t i = 0; i < MONDRIAN_SCAN_SLOTS; i++) {
++		if (mondrian_scan_slots[i] == s->id) {
++			*iova = MONDRIAN_SCAN_IOVA + (uint64_t)i * MONDRIAN_SCAN_STRIDE;
++			return true;
++		}
++	}
++	for (uint32_t i = 0; i < MONDRIAN_SCAN_SLOTS; i++) {
++		if (mondrian_scan_slots[i] == 0) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot == MONDRIAN_SCAN_SLOTS) {
++		if (!mondrian_scan_slot_logged) {
++			mondrian_scan_slot_logged = true;
++			IOLog("MONDRIAN SCAN: no slot for surface %u, keeping the copy\n",
++			    s->id);
++		}
++		return false;
++	}
++	if (!mondrian_scan_fill(s, slot)) {
++		IOLog("MONDRIAN SCAN: surface %u cannot be mapped\n", s->id);
++		return false;
++	}
++	mondrian_scan_slots[slot] = s->id;
++	mondrian_scan_tlb();
++	*iova = MONDRIAN_SCAN_IOVA + (uint64_t)slot * MONDRIAN_SCAN_STRIDE;
++	IOLog("MONDRIAN SCAN: surface %u -> iova 0x%llx off %u bpr %u %ux%u\n",
++	    s->id, (unsigned long long)*iova, s->offset, s->bytesPerRow,
++	    s->width, s->height);
++	return true;
++}
++
++/* Both fetch paths the bootloader left point at the panel; keep them together. */
++static void
++mondrian_scan_src0(volatile uint32_t *mdp, uint32_t addr)
++{
++	if (mdp == NULL) {
++		return;
++	}
++	mondrian_mdp_wr(mdp, 0x5000 + MONDRIAN_SSPP_SRC0, addr);
++	mondrian_mdp_wr(mdp, 0x7000 + MONDRIAN_SSPP_SRC0, addr);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ #define MONDRIAN_FB_REFRESH_HZ             120
+ #define MONDRIAN_FB_TIMING_ID              1
+ #define MONDRIAN_FB_COLOR_ID               1
+@@ -563,6 +939,12 @@ public:
+ 	bool          fTestShown;
+ 	uint32_t      fTestY;
+ 	uint32_t     *fTestSave;
++	/* Direct scanout: the surface the display fetches, or 0 for the copy. */
++	uint32_t      fScanID;
++	uint32_t      fScanFrames;
++	bool          fWatchdogOn;       /* mfs test boot, reboot to fastboot at the deadline */
++	uint64_t      fWatchdogDeadline;
++	IOLock       *fSwapWait;         /* a swap waits for the tick that flips it */
+ 
+ 	/* The swap the next display tick presents, and how it went. */
+ 	uint8_t       fPendingRec[MONDRIAN_FB_SWAP_REC_SIZE];
+@@ -575,6 +957,20 @@ public:
+ 	uint32_t      fTickRec[4];       /* ticks that saw 0, 1, 2, 3+ records */
+ 	uint32_t      fSwapGapUs[8];     /* the last eight gaps between records */
+ 	uint32_t      fSwapGapIndex;
++	/*
++	 * Pacing: a record is numbered, so a swap waits for the tick that
++	 * actually consumed it instead of "the next tick", which is a whole
++	 * period away when the tick fires between the queue and the read.
++	 */
++	uint32_t      fQueueSeq[MONDRIAN_FB_QUEUE];
++	uint32_t      fSwapSeq;
++	uint32_t      fPresentedSeq;
++	/* When in the second the empty ticks fell, and how late the swaps were. */
++	uint32_t      fEmptyAt[16];
++	uint32_t      fEmptyN;
++	uint32_t      fLateAt[16];
++	uint32_t      fLateN;
++	uint64_t      fSecondStart;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -1056,6 +1452,34 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The reset path needs the interface back on the memory the bootloader owns
++ * before the SoC goes down: a warm reset with SRC0 still on an IOVA stops
++ * ABL before its own USB comes up. The driver keeps its instance here for
++ * that one call, which comes from the UFS reset code.
++ */
++static AppleCLCD *mondrian_fb_live;
++
++extern "C" void
++mondrian_fb_shutdown(void)
++{
++	AppleCLCD *fb = mondrian_fb_live;
++
++	if (fb == NULL || fb->fMdp == NULL) {
++		return;
++	}
++	/* Fetch from the carve-out again, with the bank bypassing as ABL left it. */
++	mondrian_scan_src0(fb->fMdp, (uint32_t)fb->fPhys);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (mondrian_scan_regs != NULL && mondrian_scan_cb != 0xffffffffu) {
++		mondrian_scan_wr(mondrian_scan_cb_off + 0x00, 0);	/* SCTLR.M=0 */
++		__asm__ volatile("dsb sy" ::: "memory");
++		mondrian_scan_tlb();
++	}
++	IOLog("MONDRIAN SCAN: shutdown, src0 0x%x, bank %u bypassed\n",
++	    (uint32_t)fb->fPhys, mondrian_scan_cb);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -1094,6 +1518,19 @@ AppleCLCD::start(IOService *provider)
+ 	fTestShown = false;
+ 	fTestY = 0;
+ 	fTestSave = NULL;
++	fScanID = 0;
++	fScanFrames = 0;
++	fWatchdogOn = false;
++	fWatchdogDeadline = 0;
++	fSwapSeq = 0;
++	fPresentedSeq = 0;
++	fEmptyN = 0;
++	fLateN = 0;
++	fSecondStart = 0;
++	for (unsigned i = 0; i < MONDRIAN_FB_QUEUE; i++) {
++		fQueueSeq[i] = 0;
++	}
++	fSwapWait = NULL;
+ 	for (unsigned i = 0; i < MONDRIAN_INTF_N; i++) {
+ 		fIntfFrames[i] = 0;
+ 	}
+@@ -1128,6 +1565,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
++	fSwapWait = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	/*
+ 	 * The panel is device memory: write it through the alias the console
+@@ -1184,6 +1622,8 @@ AppleCLCD::start(IOService *provider)
+ 	    sizeof(mondrian_fb_probe));
+ 	(void)PE_parse_boot_argn("mondrianfb_nocopy", &mondrian_fb_nocopy,
+ 	    sizeof(mondrian_fb_nocopy));
++	(void)PE_parse_boot_argn("mondrianfb_verbose", &mondrian_fb_verbose,
++	    sizeof(mondrian_fb_verbose));
+ 	(void)PE_parse_boot_argn("mondrianfb_gpuwait", &mondrian_fb_gpuwait,
+ 	    sizeof(mondrian_fb_gpuwait));
+ 	fDeferPresent = true;
+@@ -1202,6 +1642,26 @@ AppleCLCD::start(IOService *provider)
+ 			mondrian_fb_coherent = 0;
+ 		}
+ 	}
++	(void)PE_parse_boot_argn("mfs", &mondrian_fb_scan, sizeof(mondrian_fb_scan));
++	mondrian_fb_live = this;
++	IOLog("MONDRIAN FB: scan %d\n", mondrian_fb_scan);
++	if (mondrian_fb_scan != 0) {
++		mondrian_scan_enable();
++		/*
++		 * A prototype boot has no way back from the host once the gadget
++		 * drops: the USB dies after a few minutes and only a key press
++		 * recovers the phone. The panel timer is reliable, so use it to
++		 * return to the bootloader where ABL's USB works.
++		 */
++		uint64_t wd;
++
++		nanoseconds_to_absolutetime(
++		    (uint64_t)MONDRIAN_SCAN_WATCHDOG_S * 1000000000ULL, &wd);
++		fWatchdogDeadline = mach_absolute_time() + wd;
++		fWatchdogOn = true;
++		IOLog("MONDRIAN WATCHDOG: mfs %d, back to fastboot in %u s\n",
++		    mondrian_fb_scan, MONDRIAN_SCAN_WATCHDOG_S);
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -1362,6 +1822,13 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("MONDRIAN BL: %d of %u from the command line\n",
+ 		    (int)level, 4095);
+ 	}
++	/*
++	 * The read-only apps_smmu dump that answered which bank the display uses
++	 * lived here. It mapped the SMMU window a second time, and the io_submap
++	 * is only 8 MiB: with `mfs` set the enable already holds that mapping, the
++	 * second one fails, and io_map's KMA_NOFAIL allocation panics the kernel
++	 * (`kmem_alloc(...): failed`). The enable logs the same bank state.
++	 */
+ 	return true;
+ }
+ 
+@@ -1372,6 +1839,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 
++	if (fb->fWatchdogOn && now >= fb->fWatchdogDeadline) {
++		fb->fWatchdogOn = false;
++		IOLog("MONDRIAN WATCHDOG: mfs %d reached %u s, resetting to fastboot\n",
++		    mondrian_fb_scan, MONDRIAN_SCAN_WATCHDOG_S);
++		mondrian_reboot_to_fastboot();
++	}
++
+ 	/*
+ 	 * The interval between vsyncs is the clock the whole UI runs on: the
+ 	 * compositor draws when it is told to, and the panel shows what the
+@@ -1453,6 +1927,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fDeferPresent) {
+ 		uint8_t rec[MONDRIAN_FB_SWAP_REC_SIZE];
+ 		bool have;
++		uint32_t seq = 0;
+ 		uint32_t got = fb->fSwapCount - fb->fTickSwaps;
+ 
+ 		/*
+@@ -1464,17 +1939,35 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 */
+ 		fb->fTickSwaps = fb->fSwapCount;
+ 		fb->fTickRec[got < 3 ? got : 3]++;
++		if (got == 0 && fb->fEmptyN < 16) {
++			uint64_t at = now > fb->fSecondStart ? now - fb->fSecondStart : 0;
++			uint64_t atNs = 0;
++
++			absolutetime_to_nanoseconds(at, &atNs);
++			fb->fEmptyAt[fb->fEmptyN++] = (uint32_t)(atNs / 1000);
++		}
+ 
+ 		IOLockLock(fb->fLock);
+ 		have = fb->fQueueCount != 0;
+ 		if (have) {
+ 			memcpy(rec, fb->fQueue[fb->fQueueHead], sizeof(rec));
++			seq = fb->fQueueSeq[fb->fQueueHead];
+ 			fb->fQueueHead = (fb->fQueueHead + 1) % MONDRIAN_FB_QUEUE;
+ 			fb->fQueueCount--;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (have) {
+ 			fb->present(rec);
++			/*
++			 * The record is on the panel, so the surface it drew can be
++			 * drawn into again. Advance the count and wake in the same
++			 * lock its waiter holds: a swap that arrives now cannot see
++			 * the record unconsumed and sleep past this tick.
++			 */
++			IOLockLock(fb->fSwapWait);
++			fb->fPresentedSeq = seq;
++			IOLockWakeup(fb->fSwapWait, &fb->fPresentedSeq, false);
++			IOLockUnlock(fb->fSwapWait);
+ 		}
+ 	}
+ 	/*
+@@ -1853,6 +2346,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		uint32_t n = swaps - fb->fFpsLast;
+ 		uint64_t copy_avg = 0, copy_max = 0, late_avg = 0, late_max = 0;
+ 		uint64_t clean_avg = 0, scale_avg = 0, gpuwait_avg = 0;
++
++		fb->fSecondStart = now;
+ 		uint64_t gap_avg = 0, gap_max = 0, gap_min = 0;
+ 		uint64_t vsync_avg = 0, vsync_min = 0, vsync_max = 0;
+ 		uint64_t present_avg = 0, present_max = 0;
+@@ -1891,15 +2386,31 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		 * copy: the memcpy of every layer into the panel, in the caller's
+ 		 * thread. late: how long after the last vsync the swap arrived. A
+ 		 * large late with a small copy is the software rasterizer.
++		 *
++		 * One line, not a dozen: the counters that used to be printed on
++		 * their own lines are here, so the work loop spends one IOLog a
++		 * second instead of ten and the tick keeps its period.
+ 		 */
+-		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us touch %u/s rep %u/s clean avg %llu us scale avg %llu us gpuwait avg %llu us poll %u/s ev %u/s mode %s\n",
++		int32_t intf_delta = 0;
++
++		if (fb->fMdp != NULL) {
++			uint32_t f = mondrian_mdp_rd(fb->fMdp,
++			    MONDRIAN_INTF_OFF + MONDRIAN_INTF_STRIDE +
++			    MONDRIAN_INTF_FRAME_COUNT);
++
++			intf_delta = (int32_t)(f - fb->fIntfFrames[1]);
++		}
++		IOLog("MONDRIAN FB: fps %u copy avg %llu us max %llu us late avg %llu us max %llu us clean avg %llu us gpuwait avg %llu us mode %s tick %u %u %u %u gap %llu/%llu us vsync %llu/%llu us present %u intf +%d\n",
+ 		    n, copy_avg / 1000, copy_max / 1000, late_avg / 1000, late_max / 1000,
+-		    fb->fTouchRate, fb->fTouchRepeatRate, clean_avg / 1000, scale_avg / 1000,
+-		    gpuwait_avg / 1000, fb->fTouchPollRate, fb->fTouchEventRate,
++		    clean_avg / 1000, gpuwait_avg / 1000,
+ 		    (mondrian_fb_nocopy > 0 &&
+ 			    (count % (MONDRIAN_FB_REFRESH_HZ * 10)) <
+ 			    (uint64_t)mondrian_fb_nocopy * MONDRIAN_FB_REFRESH_HZ) ?
+-		    "nocopy" : "copy");
++		    "nocopy" : "copy",
++		    fb->fTickRec[0], fb->fTickRec[1], fb->fTickRec[2], fb->fTickRec[3],
++		    gap_avg / 1000, gap_max / 1000, vsync_avg / 1000, vsync_max / 1000,
++		    fb->fPresentCount, intf_delta);
++		if (mondrian_fb_verbose) {
+ 		IOLog("MONDRIAN FB: gap avg %llu us min %llu us max %llu us lt15 %u 15-18 %u 18-21 %u 21-26 %u 26-34 %u gt34 %u\n",
+ 		    gap_avg / 1000, gap_min / 1000, gap_max / 1000, fb->fGapUnder15,
+ 		    fb->fGap15, fb->fGap18, fb->fGap21, fb->fGap26, fb->fGapOver34);
+@@ -1924,6 +2435,32 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    fb->fSwapGapUs[0], fb->fSwapGapUs[1], fb->fSwapGapUs[2],
+ 		    fb->fSwapGapUs[3], fb->fSwapGapUs[4], fb->fSwapGapUs[5],
+ 		    fb->fSwapGapUs[6], fb->fSwapGapUs[7]);
++		/*
++		 * Where in the second the held frames fell, and how late the
++		 * worst swaps were: a cluster at +0-2 ms is the one-second log
++		 * burst blocking the renderer, an even spread is the renderer's
++		 * own tail.
++		 */
++		{
++			char line[280];
++			int used = 0;
++
++			used = snprintf(line, sizeof(line), "MONDRIAN FB: empty %u",
++			    fb->fEmptyN);
++			for (uint32_t i = 0; i < fb->fEmptyN && used < (int)sizeof(line) - 12; i++) {
++				used += snprintf(line + used, sizeof(line) - used, " %u",
++				    fb->fEmptyAt[i]);
++			}
++			if (used < (int)sizeof(line) - 24) {
++				used += snprintf(line + used, sizeof(line) - used,
++				    " late7 %u", fb->fLateN);
++			}
++			for (uint32_t i = 0; i < fb->fLateN && used < (int)sizeof(line) - 12; i++) {
++				used += snprintf(line + used, sizeof(line) - used, " %u",
++				    fb->fLateAt[i]);
++			}
++			IOLog("%s\n", line);
++		}
+ 		IOLog("MONDRIAN FB: sel 4:%u 5:%u 6:%u 9:%u 12:%u 15:%u 33:%u 50:%u 55:%u 68:%u 74:%u 79:%u 84:%u\n",
+ 		    mondrian_fb_selectors_called[4], mondrian_fb_selectors_called[5], mondrian_fb_selectors_called[6],
+ 		    mondrian_fb_selectors_called[9], mondrian_fb_selectors_called[12], mondrian_fb_selectors_called[15],
+@@ -1933,6 +2470,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		for (unsigned s = 0; s < MONDRIAN_FB_SELECTORS; s++) {
+ 			mondrian_fb_selectors_called[s] = 0;
+ 		}
++		}
+ 		fb->fFpsLast = swaps;
+ 		fb->fCopyTicks = fb->fCopyMaxTicks = 0;
+ 		fb->fLateTicks = fb->fLateMaxTicks = 0;
+@@ -1990,6 +2528,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		fb->fTickRec[0] = fb->fTickRec[1] = 0;
+ 		fb->fTickRec[2] = fb->fTickRec[3] = 0;
++		fb->fEmptyN = 0;
++		fb->fLateN = 0;
++	}
++	if (mondrian_fb_scan != 0 && mondrian_scan_cb != 0xffffffffu &&
++	    (count % MONDRIAN_FB_REFRESH_HZ) == 0) {
++		IOLog("MONDRIAN SCAN: frames %u surface %u src0 0x%x fsr 0x%x far 0x%llx\n",
++		    fb->fScanFrames, fb->fScanID,
++		    fb->fMdp != NULL ? mondrian_mdp_rd(fb->fMdp,
++		    0x5000 + MONDRIAN_SSPP_SRC0) : 0,
++		    mondrian_scan_rd(mondrian_scan_cb_off + 0x58),
++		    (unsigned long long)((uint64_t)mondrian_scan_rd(mondrian_scan_cb_off + 0x60) |
++		    ((uint64_t)mondrian_scan_rd(mondrian_scan_cb_off + 0x64) << 32)));
+ 	}
+ }
+ 
+@@ -2044,6 +2594,22 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	if (late > fLateMaxTicks) {
+ 		fLateMaxTicks = late;
+ 	}
++	/*
++	 * A frame that reaches the tick at the last moment is the one that
++	 * decides whether the panel holds this period: keep where it fell in
++	 * the second, next to the empty ticks, to tell a renderer tail from a
++	 * periodic stall.
++	 */
++	if (late > 7000000ULL) {
++		uint64_t lateNs = 0;
++		uint32_t n = fLateN;
++
++		absolutetime_to_nanoseconds(late, &lateNs);
++		if (n < 16) {
++			fLateAt[n] = (uint32_t)(lateNs / 1000);
++			fLateN = n + 1;
++		}
++	}
+ 	/*
+ 	 * The gap between requests is the producer's cadence, which is what an
+ 	 * uneven drag shows when the presentations are even.
+@@ -2081,6 +2647,18 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		present(rec);
+ 		return;
+ 	}
++	/*
++	 * mfs=5: take the frame to the panel here, the moment the renderer is
++	 * done with it, instead of holding it for the tick. It is the same
++	 * direct scanout without the one-period beat between the compositor and
++	 * this timer: if the rate is still below the panel's, the beat is not
++	 * what limits it, and if the glass tears the flip is not landing on the
++	 * panel's own frame boundary and the tick has to stay.
++	 */
++	if (mondrian_fb_scan >= 5) {
++		present(rec);
++		return;
++	}
+ 	/*
+ 	 * Queue the frame for the tick, oldest first. A period holds one frame, so
+ 	 * the second record of a burst cannot go on the panel at the tick it
+@@ -2100,10 +2678,60 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		fQueueCount--;
+ 		fQueueDrop++;
+ 	}
+-	memcpy(fQueue[(fQueueHead + fQueueCount) % MONDRIAN_FB_QUEUE], rec,
+-	    sizeof(fQueue[0]));
++	uint32_t seq = ++fSwapSeq;
++	uint32_t tail = (fQueueHead + fQueueCount) % MONDRIAN_FB_QUEUE;
++
++	memcpy(fQueue[tail], rec, sizeof(fQueue[0]));
++	fQueueSeq[tail] = seq;
+ 	fQueueCount++;
+ 	IOLockUnlock(fLock);
++	/*
++	 * With direct scanout the surface is still the display's when swap()
++	 * returns, so CoreAnimation must not render into it again until a tick
++	 * has flipped away from it: wait for the tick that takes this record,
++	 * the pacing the glass imposes anyway. Waiting for "the next tick"
++	 * instead loses a whole period whenever the tick fires between the
++	 * queue and the read, and that is a held frame the glass shows. The
++	 * deadline is the safety net: a missed wakeup once left the main
++	 * thread in this loop for ever (the app switcher froze and its
++	 * CADisplayLink stopped), and the compositor must never depend on a
++	 * kernel timer to make progress.
++	 *
++	 * mfs=6 waits for the record *before* this one instead. That flip
++	 * happened a period ago, so the wait is already satisfied and the call
++	 * returns at once, which keeps the tick's own present -- 1.0 to 1.25 ms
++	 * with the cache clean -- off the renderer's critical path. mfs=4 puts
++	 * it there: measured 7.35 ms of renderer work plus 1.2 ms of wait is
++	 * the 8.55 ms frame that reads as 116-117 fps on a 120 Hz panel.
++	 */
++	uint32_t target = (mondrian_fb_scan >= 6) ? seq - 1 : seq;
++
++	if (mondrian_fb_scan >= 4 && fSwapWait != NULL) {
++		uint64_t period, deadline;
++		bool timedOut = false;
++
++		nanoseconds_to_absolutetime(1000000000ULL / MONDRIAN_FB_REFRESH_HZ,
++		    &period);
++		deadline = mach_absolute_time() + 3 * period;
++		IOLockLock(fSwapWait);
++		while ((int32_t)(fPresentedSeq - target) < 0) {
++			if (IOLockSleepDeadline(fSwapWait, &fPresentedSeq,
++			    deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++				timedOut = true;
++				break;
++			}
++		}
++		IOLockUnlock(fSwapWait);
++		if (timedOut) {
++			static uint32_t timeouts;
++
++			timeouts++;
++			if (timeouts <= 3 || (timeouts % 120) == 0) {
++				IOLog("MONDRIAN SCAN: swap wait timeout %u (seq %u presented %u)\n",
++				    timeouts, seq, fPresentedSeq);
++			}
++		}
++	}
+ }
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -2113,6 +2741,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	uint32_t mask = get32(rec, 0x104);
+ 	uint64_t began;
+ 	uint64_t elapsed;
++	bool scanned = false;
+ 
+ 	/*
+ 	 * Two callers: the tick, and a swap() that has to present at once when
+@@ -2315,13 +2944,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 * drop the lines by physical address before the copy, every
+ 		 * layer, so what is on the panel is what was drawn.
+ 		 */
+-		uint64_t cleanBegan = mach_absolute_time();
+-
+-		if (mondrian_fb_coherent) {
+-			mondrian_fb_clean(s);
+-		}
+-		fCleanTicks += mach_absolute_time() - cleanBegan;
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		/*
++		 * The clean is only needed where the CPU reads the pixels: the
++		 * scaled canvas and the straight copy. Direct scanout hands the
++		 * surface's IOVA to the display, which reads DRAM, so cleaning
++		 * 18 MB there was half a millisecond of the renderer's wait every
++		 * frame for nothing -- the scan path never reads this mapping.
++		 * The cost of the one case that does need it (a readback that left
++		 * dirty lines, then a scan of the same surface) is a single frame
++		 * of stale rows, and that frame is the one the copy would have
++		 * taken anyway.
++		 */
++		bool cleaned = false;
+ 		/*
+ 		 * A full canvas-sized layer is scaled to the panel. Nearest
+ 		 * neighbour on purpose: the copy stays in the few-ms budget and
+@@ -2333,6 +2968,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL &&
+ 		    (uint64_t)s->offset + (uint64_t)(s->height - 1) * s->bytesPerRow +
+ 		    (uint64_t)s->width * 4 <= s->memory->getLength()) {
++			if (!cleaned) {
++				uint64_t cleanBegan = mach_absolute_time();
++
++				if (mondrian_fb_coherent) {
++					mondrian_fb_clean(s);
++				}
++				fCleanTicks += mach_absolute_time() - cleanBegan;
++				cleaned = true;
++			}
+ 			/*
+ 			 * The canvas needs an index, not a filter, and the index is the
+ 			 * same every frame: `fColMap` holds the source column of each
+@@ -2519,7 +3163,40 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		/*
++		 * Direct scanout: one layer that covers the panel exactly is
++		 * already in the format and stride the SSPP fetches, so hand the
++		 * display its IOVA and skip the copy. Anything else (an overlay,
++		 * a scaled canvas, a third surface) keeps the copy.
++		 */
++		if (!scanned && mondrian_fb_scan >= 4 && mask == 1 && layer == 0 &&
++		    s != fSurface && bpe == 4 && s->elementWidth == 1 &&
++		    s->elementHeight == 1 && s->memory != NULL &&
++		    sx == 0 && sy == 0 && dx == 0 && dy == 0 &&
++		    w == (int32_t)fWidth && h == (int32_t)fHeight &&
++		    s->width == fWidth && s->height == fHeight &&
++		    s->bytesPerRow == fRowBytes) {
++			uint64_t iova = 0;
++
++			if (mondrian_scan_map(s, &iova)) {
++				mondrian_scan_src0(fMdp, (uint32_t)(iova + s->offset));
++				fScanID = id;
++				fScanFrames++;
++				scanned = true;
++				s->release();
++				continue;
++			}
++		}
+ 		if (src != 0 && bpe == 4) {
++			if (!cleaned) {
++				uint64_t cleanBegan = mach_absolute_time();
++
++				if (mondrian_fb_coherent) {
++					mondrian_fb_clean(s);
++				}
++				fCleanTicks += mach_absolute_time() - cleanBegan;
++				cleaned = true;
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -2546,6 +3223,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	/*
++	 * A frame the scanout could not take leaves the SSPP on the surface of
++	 * the frame before it; put the fetch back on the panel memory the copy
++	 * just wrote.
++	 */
++	if (!scanned && fScanID != 0) {
++		fScanID = 0;
++		mondrian_scan_src0(fMdp, (uint32_t)fPhys);
++	}
+ 
+ 	elapsed = mach_absolute_time() - began;
+ 	fCopyTicks += elapsed;
+@@ -2816,6 +3502,23 @@ mondrian_fb_capture_row(uint32_t y, uint8_t *dst, uint32_t dstLen)
+ 	}
+ 	const uint32_t *src = (const uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 	uint16_t *out = (uint16_t *)dst;
++	/*
++	 * With direct scanout the panel memory holds the last copied frame, not
++	 * what the glass shows: sample the surface the SSPP fetches instead.
++	 */
++	MondrianSurface *scan = NULL;
++
++	if (fb->fScanID != 0) {
++		scan = mondrian_surface_copy(fb->fScanID);
++		if (scan != NULL && scan->memory != NULL &&
++		    scan->width == fb->fWidth && scan->height == fb->fHeight &&
++		    scan->kernelAddress() != 0) {
++			src = (const uint32_t *)(scan->kernelAddress() + scan->offset +
++			    (uint64_t)y * scan->bytesPerRow);
++		} else {
++			OSSafeReleaseNULL(scan);
++		}
++	}
+ 
+ 	for (i = 0; i < half; i++) {
+ 		uint32_t p = src[i * 2];
+@@ -2825,6 +3528,7 @@ mondrian_fb_capture_row(uint32_t y, uint8_t *dst, uint32_t dstLen)
+ 
+ 		out[i] = (uint16_t)((r << 11) | (g << 5) | b);
+ 	}
++	OSSafeReleaseNULL(scan);
+ 	return half * 2;
+ }
+ 

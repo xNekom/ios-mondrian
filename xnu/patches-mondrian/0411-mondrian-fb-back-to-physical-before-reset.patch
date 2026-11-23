@@ -1,0 +1,32 @@
+xnu 0411: put the interface back on the carve-out before a reset
+
+A `reboot` from the direct-scanout path leaves the bootloader's fastboot
+with no USB at all: SRC0 still names an IOVA and context bank 3 still
+translates it, and ABL does not recover the port from that -- measured on
+every reset from an `mfs` boot, while the copy path resets cleanly. 0409's
+port power-down alone was not enough.
+
+So the reset path calls the framebuffer before the gadget: SRC0 goes back to
+the physical carve-out and the bank's SCTLR is cleared, then the USB port is
+powered down (0409) and the SoC resets.
+
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1661,9 +1661,17 @@ void
+ mondrian_reboot_to_fastboot(void)
+ {
+ 	extern void mondrian_usb_stop(void);
++	extern void mondrian_fb_shutdown(void);
+ 
+ 	mondrian_sync_before_reset("the reset to fastboot");
+ 	mondrian_log_flush_now();
++	/*
++	 * The interface must not still be fetching from an IOVA when the SoC
++	 * goes down: a warm reset from the direct-scanout path leaves the
++	 * bootloader with no USB at all, while the copy path resets cleanly.
++	 * Put SRC0 back on the carve-out and leave the bank bypassing first.
++	 */
++	mondrian_fb_shutdown();
+ 	/* The gadget must be idle before the SoC reset (0307). */
+ 	mondrian_usb_stop();
+ 	/* "bootloader", not "boot-fastboot": the latter is fastbootd, which
