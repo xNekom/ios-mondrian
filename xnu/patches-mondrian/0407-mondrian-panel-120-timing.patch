@@ -1,0 +1,195 @@
+xnu 0407: switch the panel to its 120 Hz timing
+
+The 0406 build proves the timer and the published refresh at 120 (ring:
+`vsync avg 8332 us`) but the glass stays at 60: `intf ... fc` moves +60 a
+second and `panel` changes on 59 of 120 ticks, while the renderer reaches
+108 swaps during a drag and the extra presents are coalesced. The ABL left
+the panel in its 60 Hz timing for the splash.
+
+The live device tree carries the panel's three timings and the vendor
+timing-switch command for the 120 one (`timing@2`: 0x2f 0x00, 0x8b 0x00,
+0xdf 0x20 and 0xce 0x01 around the two 0xf0 page writes). Send that
+sequence once, after the first brightness write has proved the DSI path.
+
+Every packet goes through one DSI DMA helper: the first version mixed the
+embedded TPG shorts with the DMA long writes and the second page write never
+completed (`long 6 bytes ... done 0`, `wedged dsi`), leaving the panel frozen
+on its last frame. The stop-on-failure keeps a bad packet from costing the
+next one's timeout too.
+
+A 120 glass is proven by `intf ... fc` moving +120 a second and `panel`
+near 120/120 while the UI moves; if only `present` doubles, the panel did
+not take the new timing.
+
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -557,6 +557,7 @@
+ 	uint64_t      fWakeArmedTicks;    /* input asked for the next frame */
+ 	uint64_t      fActivityTicks;     /* no blank before this after input */
+ 	bool          fPanelOnPending;    /* the tick sends DCS display on */
++	bool          fMode120;           /* the tick sends the 120 Hz timing */
+ 	/* mondrianfb_test: the band, and the pixels it covers. */
+ 	bool          fTest;
+ 	bool          fTestShown;
+@@ -800,6 +801,136 @@
+ }
+ 
+ /*
++ * One DCS packet of up to 16 bytes out of the command page, sent through the
++ * same DSI DMA the brightness path uses. The timing-switch sequence mixes
++ * short 0x15 writes with six-byte 0x39 ones; sending every packet through
++ * this path keeps the engine's done bit in one place. Mixing it with the
++ * embedded TPG writes (`mondrian_dsi_packet`) wedged the controller on the
++ * second page write (measured: `long 6 bytes ... done 0`, `wedged dsi`,
++ * panel frozen on its last frame).
++ */
++static int
++mondrian_dsi_dma_write(AppleCLCD *fb, uint8_t type, const uint8_t *data,
++    uint32_t len)
++{
++	volatile uint32_t *dsi = fb->fDsi;
++	volatile uint32_t *buf = (volatile uint32_t *)fb->fBrightBuf;
++	uint32_t save3c, save50, status, back, iv = 0, n, wire;
++	bool done = false;
++	int rc;
++
++	if (dsi == NULL || buf == NULL || data == NULL || len == 0 || len > 16) {
++		return -1;
++	}
++	buf[0x3c / 4] = 0xa5c3f00du;
++	__asm__ volatile("dsb sy" ::: "memory");
++	back = buf[0x3c / 4];
++	buf[0x3c / 4] = 0;
++	if (back != 0xa5c3f00du) {
++		return -1;
++	}
++	buf[0] = 0xc0000000u | ((uint32_t)type << 16) | (len & 0xff);
++	for (uint32_t i = 0; i < len; i++) {
++		((uint8_t *)&buf[1])[i] = data[i];
++	}
++	for (uint32_t i = 1 + (len + 3) / 4; i < 16; i++) {
++		buf[i] = 0xffffffff;
++	}
++	wire = 4 + len;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CTRL, 0);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 1);
++	delay(10);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 0);
++
++	save3c = mondrian_mdp_rd(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL);
++	save50 = mondrian_mdp_rd(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL,
++	    ((fb->fBrightFmt & 0x10) ? 0x54000000u : 0x50000000u) |
++	    (save3c & 0x0AFFFFFFu));
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50 | 0x00110000u);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_OFFSET,
++	    (uint32_t)fb->fBrightPhys);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_CMD_LENGTH, wire);
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_DMA_DONE, 1);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	status = mondrian_mdp_rd(dsi, MONDRIAN_DSI_STATUS);
++	for (n = 0; ; n++) {
++		iv = mondrian_mdp_rd(dsi, MONDRIAN_DSI_CMD_DMA_DONE);
++		if ((iv & 1) != 0) {
++			done = true;
++			break;
++		}
++		delay(500);
++		if (n > 0xc6) {
++			break;
++		}
++	}
++	if (done) {
++		mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_DMA_DONE, 1);
++		rc = 0;
++	} else {
++		rc = -2;
++	}
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50);
++	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL, save3c);
++	IOLog("MONDRIAN FB: dma type 0x%x %u bytes status 0x%x done %d\n",
++	    type, len, status, done ? 1 : 0);
++	return rc;
++}
++
++/*
++ * The panel's 120 Hz timing, from the live device tree's timing@2
++ * (`qcom,mdss-dsi-timing-switch-command`): 0x2f 0x00 and 0x8b 0x00 select the
++ * mode, the 0xf0 page writes set 0xc0 and 0xdf, and 0xce 0x01 commits it. The
++ * ABL leaves the panel in its 60 Hz timing for the splash, and the driver
++ * clears the interface's autorefresh at the first kick, so the panel's own TE
++ * is the only pace left.
++ */
++static int
++mondrian_panel_mode_120(AppleCLCD *fb)
++{
++	static const uint8_t m2f[] = {0x2f, 0x00};
++	static const uint8_t m8b[] = {0x8b, 0x00};
++	static const uint8_t f0a[] = {0xf0, 0x55, 0xaa, 0x52, 0x08, 0x00};
++	static const uint8_t m6f3[] = {0x6f, 0x03};
++	static const uint8_t mc010[] = {0xc0, 0x10};
++	static const uint8_t m6f31[] = {0x6f, 0x31};
++	static const uint8_t mdf20[] = {0xdf, 0x20};
++	static const uint8_t f0b[] = {0xf0, 0x55, 0xaa, 0x52, 0x08, 0x02};
++	static const uint8_t mcc30[] = {0xcc, 0x30};
++	static const uint8_t mce01[] = {0xce, 0x01};
++	int rc = 0;
++
++#define MODE_PACKET(t, d, n) do {					\
++	rc = mondrian_dsi_dma_write(fb, (t), (d), (n));			\
++	if (rc != 0) {							\
++		goto out;						\
++	}								\
++} while (0)
++
++	MODE_PACKET(0x15, m2f, 2);
++	MODE_PACKET(0x15, m8b, 2);
++	MODE_PACKET(0x39, f0a, sizeof(f0a));
++	MODE_PACKET(0x15, m6f3, 2);
++	MODE_PACKET(0x15, mc010, 2);
++	MODE_PACKET(0x15, m6f31, 2);
++	MODE_PACKET(0x15, mdf20, 2);
++	MODE_PACKET(0x39, f0b, sizeof(f0b));
++	MODE_PACKET(0x15, mcc30, 2);
++	MODE_PACKET(0x15, mce01, 2);
++#undef MODE_PACKET
++out:
++	IOLog("MONDRIAN FB: panel 120 timing -> %d\n", rc);
++	return rc;
++}
++
++/*
+  * The panel's own display on/off (DCS 0x29 / 0x28). The driver used to paint
+  * the framebuffer black instead, which destroys the only frame the panel has:
+  * iOS stops its display link when it sleeps, so the tap that should wake the
+@@ -1142,6 +1273,7 @@
+ 	fBrightFmt = 0;
+ 	fBrightCmd = 0x51;
+ 	fBrightPending = false;
++	fMode120 = true;
+ 	{
+ 		uint64_t pa = MONDRIAN_BL_PHYS;
+ 
+@@ -1566,6 +1698,16 @@
+ 		mondrian_fb_brightness_apply(fb);
+ 	}
+ 	/*
++	 * The ABL leaves the panel in its 60 Hz timing. The switch is the
++	 * vendor's timing-switch sequence; send it once, after the first
++	 * brightness write has proved the DSI command path.
++	 */
++	if (fb->fMode120 && fb->fDsi != NULL && fb->fKick &&
++	    count >= fb->fKickFrom) {
++		fb->fMode120 = false;
++		mondrian_panel_mode_120(fb);
++	}
++	/*
+ 	 * A wake that came from input is the same kind of write, and it must not
+ 	 * wait for a frame: iOS presents nothing after its display link stops.
+ 	 */

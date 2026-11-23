@@ -1,0 +1,36 @@
+xnu 0406: pace the panel and the display link at 120 Hz
+
+The panel is a 120 Hz command-mode unit; the driver was the only 60 Hz
+pace left. The bootloader's interface autorefresh is cleared at the
+first kick and nothing in the hardware paces a sent frame, so the tick
+deadline, the TimingElements rate and IOMFBDisplayRefresh are what the
+glass and CoreAnimation run at. MONDRIAN_FB_REFRESH_HZ is the one
+constant all three read: raise it to 120.
+
+Measured on the 60 Hz build: present 59-60/s, gap 16.7-17.0 ms, and the
+iPhone X mode's display link at 60. A 120 build is proven by `fps` (the
+panel memory changes, i.e. unique frames) near 120 with `present` at
+120; present 120 with fps 60 would be the tick repeating one 60 Hz
+frame, and then the GL frame time, not the tick, is the cap.
+
+diff --git a/iokit/Kernel/arm/MondrianFramebuffer.cpp b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -284,7 +284,7 @@
+ 	}
+ }
+ 
+-#define MONDRIAN_FB_REFRESH_HZ             60
++#define MONDRIAN_FB_REFRESH_HZ             120
+ #define MONDRIAN_FB_TIMING_ID              1
+ #define MONDRIAN_FB_COLOR_ID               1
+ 
+@@ -1659,7 +1659,7 @@
+ 	/*
+ 	 * mondrianfb_fps=1: the swap rate, once a second. The UI is drawn by
+ 	 * the CPU, so this is the number that moves when the renderer or the
+-	 * CPU clock changes; 60 is the panel's and the iPhone X mode's rate.
++	 * CPU clock changes; 120 is the panel's rate and twice the iPhone X mode's 60.
+ 	 */
+ 	if (fb->fFpsLog && (count % MONDRIAN_FB_REFRESH_HZ) == 0) {
+ 		uint32_t swaps = fb->fSwapCount;
