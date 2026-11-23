@@ -484,6 +484,7 @@ fetch_switch(void)
 
 static const char *eagl_slot_name(unsigned offset);
 static void census_report(void);
+static int boot_argument(const char *argument);
 static void clear_now(struct eagl *e);
 static void fetch_flush(struct eagl *e);
 
@@ -1918,12 +1919,24 @@ frame_end(struct eagl *e, bool finished)
 	if (e->triangles > e->most_triangles) {
 		e->most_triangles = e->triangles;
 	}
-	if (e->frames <= 40 || e->frames % 20 == 0) {
-		say("mondrian-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
-		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
-		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
-		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
-		    after - waited, e->attaching);
+	{
+		/*
+		 * The per-frame line is opt-in (glstat=1): at 120 Hz it is six
+		 * console writes a second from the render thread, and a write
+		 * that waits on the log ring is a held frame.
+		 */
+		static int stat_lines = -1;
+
+		if (stat_lines < 0) {
+			stat_lines = boot_argument("glstat=1");
+		}
+		if (stat_lines && (e->frames <= 40 || e->frames % 20 == 0)) {
+			say("mondrian-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
+			    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
+			    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
+			    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
+			    after - waited, e->attaching);
+		}
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
