@@ -1,11 +1,13 @@
 # GPU and boot time
 
 The UI renders through the GPU: the draw completes, the frame is drawn in
-place (no readback, no copy), and a burst of frames runs at the panel's 60 Hz
-(11-17 ms apart, `glframes=1`). What the user feels is not rasterisation but
-whether a finished frame reaches the panel at the tick it was made for: the
-compositor commits in bursts on a clock of its own, so the frames are fitted to
-the free-running panel with a two-deep queue (see "The cadence" below).
+place (no readback, no copy), and a burst of frames is fitted to the panel's
+tick, 8.33 ms apart at 120 Hz (`vsync avg 8332 us`; the burst read 11-17 ms
+when the glass was at 60, `glframes=1`). What the user feels is not
+rasterisation but whether a finished frame reaches the panel at the tick it was
+made for: the compositor commits in bursts on a clock of its own, so the frames
+are fitted to the free-running panel with a two-deep queue (see "The cadence"
+below).
 The other ios-sweet ports render through
 **Mesa/freedreno OpenGL ES behind CoreAnimation's OpenGL ES renderer**; none of
 them has Metal. That is the path this port follows.
@@ -68,12 +70,16 @@ them has Metal. That is the path this port follows.
   (`0408`). A short packet puts the data type and data bytes in the descriptor
   word, four bytes on the wire, and the engine must be idle (DSI_STATUS bits
   0-1) between packets; display on/off uses the same form. The 24 bpp source
-  experiment (`present()` packs B,G,R, SSPP `0x2243c`, stride 4320) halves the
-  copy but does not change the rate; the live tree is DSC 8 bpp, 10 bpc,
-  720-px slices, compressed end to end. The compositor is the second limit: a
-  full-screen Settings scroll presents 90-106 frames a second (`MONDRIAN FB:
-  fps`), with the frame 4 ms after the tick and the 18 MB copy 2.7 ms, so the
-  panel repeats some frames while the scanout stays at +120.
+  experiment (`mondrianfb_rgb888=1`: `present()` packs B,G,R, SSPP `0x2243c`,
+  stride 4320) is a loss: the packed copy measures 3.2-4.7 ms against 2.7-2.9
+  for the 32 bpp `memcpy`, so the shuffle costs more than the bytes it saves.
+  The live tree is DSC 8 bpp, 10 bpc, 720-px slices, compressed end to end.
+  The compositor is the second limit: a full-screen Settings scroll presents
+  90-106 frames a second (`MONDRIAN FB: fps`), the frame arriving 4 ms after
+  the tick and the 18 MB copy costing 2.8 ms (0.5 of it the cache clean, 0.4
+  the GPU fence). With the copy skipped (`mondrianfb_nocopy=5`) a second
+  reaches 119 presents, so the copy, not the producer, is the wall; moving it
+  off the tick means direct scanout of the CA surface.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
