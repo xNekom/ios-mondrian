@@ -832,9 +832,15 @@ boot each, so the three columns differ only in what changed:
   (`SBDisplayItem.bundleIdentifier`), hands it to the cache, and draws the app
   picture at the exact pixel size of the card image it replaces; cards are
   matched to apps by request order, deduplicated, because the card view chain
-  answers none of `displayItem`, `appLayout` and `bundleIdentifier`.
-  Measured 2026-11-23: Messages and Settings open together in the switcher with
-  each card showing its own app. `respring` (killing SpringBoard and
+  answers none of `displayItem`, `appLayout` and `bundleIdentifier`. The strip
+  cards are a second slot size: the focused card is 1008x2240 and the cards
+  either side are 1080x2400, both allocator poison, so the patch takes any card
+  image of at least 900x1800 on a layer 250-478 points wide. Patching only
+  1008x2240 left the side cards black or checked while the focused one drew
+  (measured 2026-11-23).
+  Measured 2026-11-23: a four-app switcher (App Store focused, Settings,
+  Messages, Safari) draws every card with its own app, and
+  `CARD <bundle> filled 1080x2400` names the join in the chain log. `respring` (killing SpringBoard and
   backboardd) twice left the panel black with SpringBoard's UI loop at 0; a
   reboot plus `tools/wsl/cycle.sh --no-build` recovers, and the uploaded dylib
   and the `mondrian-snap-probe` marker survive the reboot, so the bridge reloads
