@@ -64,14 +64,17 @@ them has Metal. That is the path this port follows.
   `CTL_START` to clear is 7.74 ms of DSI stream (the 1.2 GHz time) plus 1.14 ms
   before the first line leaves, 8.88 ms against the 8.33 ms period, so every
   second kick is coalesced. Pacing is not the lever: kicking the moment the
-  control block clears (kick-on-clear, reverted) starts frames 16.5 ms apart, and when
-  the panel blanks the block never clears at all, so the display freezes on the
-  last frame. The 1.14 ms is a
-  fill before the first line leaves, not a wait for the panel's TE (the live
-  m11a node sets `qcom,mdss-dsi-mdp-trigger = "none"`), and the 7.74 ms is the
-  link time. A frame only fits 8.33 ms if the scanout goes out compressed: the
-  live tree configures DSC (8 bpp, 10 bpc, 1440-px slices) and the vendor's own
-  `qcom,mdss-mdp-transfer-time-us` is 7300.
+  control block clears starts frames 16.5 ms apart, and when the panel blanks
+  the block never clears at all, so the display freezes on the last frame. The
+  1.14 ms is a fill before the first line leaves and the 7.74 ms is the link
+  time. The scanout fetch is not the limit either: a 24 bpp source (`present()`
+  packs B,G,R, SSPP format `0x2243c`, unpack `0x20001`, stride 4320) leaves the
+  rate at +60 and halves the copy to 1.9 ms, because the interface still emits
+  5760 bytes a line and the panel then repeats every 1080 px. The line format is
+  the knob: a frame fits 8.33 ms when the pipe is 24 bpp end to end (INTF panel
+  format, DSI MDP stream, DDIC COLMOD) or compressed, which is what the live
+  tree configures (DSC 8 bpp, 10 bpc, 1440-px slices;
+  `qcom,mdss-mdp-transfer-time-us` 7300).
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).

@@ -210,8 +210,8 @@ which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
 
 Open: 120 Hz. The tick and `timing@2` run at 120, but a frame is 8.88 ms
 against 8.33 (7.74 ms DSI stream + 1.14 ms fill), so the glass stays at 60 and
-pacing is settled (kick-on-clear, reverted): the frame must shrink
-(DSC, as the live tree configures it, or a smaller source format).
+pacing is settled (kick-on-clear, reverted): the frame must shrink, so the pipe
+goes 24 bpp end to end or DSC (a 24 bpp scanout alone stays at +60).
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
