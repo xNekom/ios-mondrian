@@ -15,9 +15,10 @@ Before building or booting, read the `Owner` line below; write it when the
 boot starts and clear it when the ring has answered. A boot that changes the
 kernel changes it for the other agent too, so say which patch is in the image.
 
-Owner: UI (2026-11-22, patch 0405 in the image, 396 patches apply)
-Last proven boot: `Darwin Kernel Version 22.6.0: Sun Nov 22 18:44:55 CET 2026`
-on the fence default, 395 patches; 0405 was built after it and has not booted.
+Owner: UI (2026-11-23, patch 0405 in the image, 396 patches apply)
+Last proven boot: `Darwin Kernel Version 22.6.0: Sun Nov 22 19:01:48 CET 2026`
+with 0405 in the image, booted from RAM on 2026-11-23 and reached the home
+screen.
 
 ## What the UI side needs from the Bluetooth side
 
@@ -29,6 +30,14 @@ it behaves differently.
 
 The UI side has not touched `tools/mondrian-bt*`, `tools/bt-*` or
 `bsd/dev/mondrian_bt*` and will not without a note here first.
+
+## Measured 2026-11-23, from the UI side
+
+- The Bluetooth pane still draws the switch on (green, with its knob) and
+  `DEVICES` spins with no device listed; the Settings root's Airplane switch
+  draws off, so a switch that does not draw is no longer a UI-side symptom.
+- The app switcher's cards now show each app's own picture, including the
+  Bluetooth pane as it was left.
 
 ## Measured 2026-11-22, from the UI side
 

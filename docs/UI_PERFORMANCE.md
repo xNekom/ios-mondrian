@@ -806,50 +806,45 @@ boot each, so the three columns differ only in what changed:
   calling a launch pink. The hook the kernel loads is written from the image at mount
   (`glblob=1`), so a copy pushed to `/private/var/vm` only lives until the next
   boot; a fix that must survive a reboot goes into the image.
-- **The app switcher's snapshot is unwritten memory (2026-11-22).** The cards
-  show a blank white card, a black card with a few readable rows, or a card
-  filled with a flat colour, and the `setContents` watch is how the picture's
-  road was named. Two details cost a wrong conclusion. The card and the
-  wallpaper replica are both a plain `CALayer 480x1067` for `-[CALayer
-  setContents:]`, so a watch keyed on the layer class and bounds prints the
-  replica once and hides the card behind it. Keyed on the owning view, every
-  line is a replica or poster view (`PBUISnapshotReplicaView`,
-  `PBUIPosterFloatingView`, `UIImageView`).
-  The picture is not missing at the cache: hooking
-  `SBAppSwitcherSnapshotImageCache` prints `create for SBDisplayItem full 0`,
-  `load`, `finished, XBApplicationSnapshotImage 336x746` and
-  `cached XBApplicationSnapshotImage`, so the request completes. The pixels are
-  the failure. `_FBSSnapshot` runs in SpringBoard (`init 480x1067 scale 3.00
-  layers 1` or `4`, `capture ok`), and the picture it returns is **one flat
-  colour**: the 1440x3200 image is 16 bits a channel DisplayP3 with its first
-  pixels `ff ff 00 00` (red), the 1008x2240 cache image is 8 bits a channel with
-  `ff 00 00 ff` (red) in one run and `ff 00 b7 ff` (magenta) in another.
-  Drawing the image into a zeroed bitmap (`bridge_bitmap_probe`) gives 100 % of
-  one colour every time -- `(255,0,0)` in one boot, `(255,0,188)` in the next --
-  so the source really is uniform; the colour is the allocator's, not a drawing.
-  The card follows that colour (white, red or magenta), and the rows that
-  sometimes show over it come from the live scene layer, not the snapshot.
-  Instrumenting `glClear` for a magenta colour records **zero** clears, so the
-  shim does not paint it either.
-  The magic is the layer: `_FBSSnapshotLayer` only has `baseTransform`,
-  `initWithContextID:baseTransform:` and `contextID`; `contents` is nil because
-  the picture lives in the render server, not in the wrapper. The snapshot's
-  own IOSurface is `w30r` (30-bit wide gamut), 1440x3200, row 5888, and its ID
-  **never appears in backboardd's GL log** -- the render server never attaches
-  or draws into it. The 1440x3200 surface the shim does attach at that moment
-  is the panel. So the destination is created, handed to a renderer that does
-  nothing, and read back as allocator poison.
-  The next target is the render itself: either `_FBSSnapshot capture` never
-  reaches the render server for these context IDs, or the server's offscreen
-  path skips a surface in this format. The display is not a substitute:
-  `CARenderServerRenderDisplay` from the bridge returns black both at the
-  snapshot request and while an app is on screen (marker
-  `/private/var/vm/mondrian-capture-now`), so the picture has to come from the
-  render server or from the app itself. `mondrian-snap-probe` mode `2` prints
-  the layer class, `contextID` and the snapshot surface; mode `1` only arms the
-  cache hooks. `/private/var/vm/mondrian-dump-picture` writes a quarter-scale
-  copy of a picture too large for the ring, and `tools/card-surface-map.py`
-  measures its box and colours.
+- **The app switcher's cards now carry the app's own picture (2026-11-22/23).**
+  The cards used to show a blank card, a black card or a flat colour. The cache
+  request completes (`create for SBDisplayItem full 0`, `load`, `finished,
+  XBApplicationSnapshotImage 336x746`, `cached ...`), and `_FBSSnapshot` runs in
+  SpringBoard (`init 480x1067 scale 3.00 layers 1` or `4`, `capture ok`), but the
+  picture it returns is one flat colour: the 1440x3200 image is 16-bit
+  DisplayP3 starting `ff ff 00 00` (red), the 1008x2240 image is `ff 00 00 ff` in
+  one run and `ff 00 b7 ff` in another. Drawing the image into a zeroed bitmap
+  (`bridge_bitmap_probe`) gives 100 % of one colour, so the source is allocator
+  memory; `glClear` records zero clears, so the shim does not paint it either.
+  `_FBSSnapshotLayer` has only `baseTransform`,
+  `initWithContextID:baseTransform:` and `contextID`; its `w30r` surface's ID
+  never appears in backboardd's GL log, so the render server creates the
+  destination and never draws into it.
+  The picture therefore comes from the app. The bridge observes
+  `UIApplicationWillResignActiveNotification` and
+  `UIApplicationDidEnterBackgroundNotification`, draws the key window with
+  `drawViewHierarchyInRect:afterScreenUpdates:` into a bitmap on the main queue,
+  and writes
+  `/private/var/mobile/Library/Preferences/mondrian-app-snap-<bundle>.png`. A
+  window snapshot has no status bar (iOS draws it in another window), so the
+  first painted row's colour is copied up into the transparent rows. In
+  SpringBoard the bridge reads that PNG when the snapshot request names its app
+  (`SBDisplayItem.bundleIdentifier`), hands it to the cache, and draws the app
+  picture at the exact pixel size of the card image it replaces; cards are
+  matched to apps by request order, deduplicated, because the card view chain
+  answers none of `displayItem`, `appLayout` and `bundleIdentifier`.
+  Measured 2026-11-23: Messages and Settings open together in the switcher with
+  each card showing its own app. `respring` (killing SpringBoard and
+  backboardd) twice left the panel black with SpringBoard's UI loop at 0; a
+  reboot plus `tools/wsl/cycle.sh --no-build` recovers, and the uploaded dylib
+  and the `mondrian-snap-probe` marker survive the reboot, so the bridge reloads
+  without another upload. The display is still not a substitute for the
+  snapshot: `CARenderServerRenderDisplay` from the bridge returns black.
+  `mondrian-snap-probe` mode `2` prints the layer class, `contextID` and the
+  surface, and `/private/var/vm/mondrian-dump-picture` writes a quarter-scale
+  copy of a picture too large for the ring (`tools/card-surface-map.py` measures
+  its box and colours).
+
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
   never does, yet its surfaces appear (`MONDRIAN SURF: Spotlight create`), so the
