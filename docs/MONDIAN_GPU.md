@@ -56,12 +56,15 @@ them has Metal. That is the path this port follows.
   firmware. The references are a6xx: the a7xx registers, GMU/HFI, ZAP and
   SQE preamble are the new work.
 - Display: `mondrianfb` writes the panel and kicks its command-mode DSI
-  interface at 60 Hz; the DPU scans the ABL's splash carve-out. The GPU path
-  needs the IOSurface/`IOMobileFramebuffer` presentation (topaz's
-  `SweetSurface`), with the iPhone X 1125x2436 canvas on the 1440x3200 panel.
-  The panel is **120 Hz**, but the iPhone X userland and CoreAnimation run at
-  60 (no ProMotion): 60 is the first target, 120 only by forcing the display
-  link/ProMotion.
+  interface; the DPU scans the ABL's splash carve-out. The GPU path needs the
+  IOSurface/`IOMobileFramebuffer` presentation (topaz's `SweetSurface`), with
+  the iPhone X 1125x2436 canvas on the 1440x3200 panel. The tick, the
+  TimingElements rate and the panel's `timing@2` switch run at 120 Hz
+  (`vsync avg 8332 us`), but the glass stays at 60: a frame takes 8.9-14.6 ms
+  from `CTL_START` to clear against the 8.33 ms period, so every second kick
+  is coalesced. The DSI stream is about 7.7 ms of that; the rest is the fetch
+  and end latency, which the vendor overlaps across frames (ping-pong) and
+  runs with display clocks our driver never programs.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
