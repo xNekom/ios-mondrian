@@ -79,8 +79,15 @@ them has Metal. That is the path this port follows.
   90-106 frames a second (`MONDRIAN FB: fps`), the frame arriving 4 ms after
   the tick and the 18 MB copy costing 2.8 ms (0.5 of it the cache clean, 0.4
   the GPU fence). With the copy skipped (`mondrianfb_nocopy=5`) a second
-  reaches 119 presents, so the copy, not the producer, is the wall; moving it
-  off the tick means direct scanout of the CA surface.
+  reaches 119 presents, so the copy, not the producer, is the wall. Direct
+  scanout needs the display's SMMU: `SRC0` is a 32-bit address (`0x14`), the
+  surfaces CoreAnimation alternates (ids 2 and 3, 1440x3200) live in the kernel
+  window at `0x840000000`, and the display's context on cape is `apps_smmu`
+  SID `0x2800` with a `0x00020000..0xfffe0000` IOVA pool and
+  `qcom,iommu-earlymap` for the continuous splash. Mapping those two surfaces
+  into that context and switching `SRC0` at the tick is the work item;
+  wrapping the low carve-out in an `IOMemoryDescriptor` is not an option
+  (0115).
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
