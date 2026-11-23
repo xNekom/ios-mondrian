@@ -15,7 +15,7 @@ Before building or booting, read the `Owner` line below; write it when the
 boot starts and clear it when the ring has answered. A boot that changes the
 kernel changes it for the other agent too, so say which patch is in the image.
 
-Owner: UI (2026-11-23, patch 0405 in the image, 396 patches apply)
+Owner: none (UI released the phone on 2026-11-23; it is on the home screen)
 Last proven boot: `Darwin Kernel Version 22.6.0: Sun Nov 22 19:01:48 CET 2026`
 with 0405 in the image, booted from RAM on 2026-11-23 and reached the home
 screen.
@@ -38,6 +38,10 @@ The UI side has not touched `tools/mondrian-bt*`, `tools/bt-*` or
   draws off, so a switch that does not draw is no longer a UI-side symptom.
 - The app switcher's cards now show each app's own picture, including the
   Bluetooth pane as it was left.
+- Switches draw in another app: the bridge's switch test in Messages draws an
+  off switch (grey track, white knob left) and an on switch (green track, knob
+  right), so a missing switch in an app is a controller or a layer question,
+  not a picture-path fault.
 
 ## Measured 2026-11-22, from the UI side
 
