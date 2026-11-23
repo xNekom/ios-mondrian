@@ -201,17 +201,16 @@ register state and remaining GPT-reader overflow debt are in `NOTES.md`.
 The panel is command mode, not a scanout the ABL keeps running: it needs one
 `CTL_START` per frame, which `MondrianFramebuffer` issues (`NOTES.md`,
 "Display"). `0083` reserves the panel memory and `0085` presents IOSurface
-swaps, so the lock screen and the home screen draw. `0084`'s colour bars were a
-one-off packing test, off since `0208`; `0210` paints the kernel log and clears
-the boot splash. CoreAnimation needs `TimingElements`/`ColorElements` and an
-`IOAcceleratorES` service (`0114`); the panel goes through the console alias,
-which `0351` stops at the first swap (an `IOMemoryDescriptor` there panics
-`pmap_remove_pv`, `0115`); the dylib forces activation.
+swaps, so the lock screen and the home screen draw, and `0210` paints the
+kernel log and clears the boot splash. CoreAnimation needs
+`TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`);
+`0351` stops the console at the first swap (an `IOMemoryDescriptor` there
+panics `pmap_remove_pv`, `0115`), and the dylib forces activation.
 
-120 Hz is reached: the interface completes +120 frames a second and a frame
-clears in about 4 ms of the 8.33 ms period. The gate was the panel's timing
-switch, not the frame budget: its `0x15` writes went out as long packets and
-the panel kept its 60 Hz timing (`0408`).
+120 Hz is reached: the interface completes +120 frames a second and the tick
+arms on a deadline chain; a scroll shows 117-119 because the compositor's own
+frame is 8.4-9.2 ms of 8.33. `mfs=4` (`0410`) scans the surface out instead of
+copying it and the reset restores `SRC0` (`0411`); the timing gate was `0408`.
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is

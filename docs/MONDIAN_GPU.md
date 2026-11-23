@@ -1375,6 +1375,29 @@ and `fAltMap` and did not initialise them in `AppleCLCD::start()`; a garbage
 the copy into memory nobody mapped. Both read as a kernel that does not boot at
 all. Every member the driver adds goes in `start()` with the rest.
 
+### At 120 the renderer, not the tick, is the wall
+
+The tick is `MONDRIAN_FB_REFRESH_HZ` (120) on a fixed deadline chain, and the
+interface agrees: `intf (+120)` every second. A `CADisplayLink` of the probe
+asking for the maximum reports `dur 0.0083 target 0.0083` and puts 573 of 583
+intervals in 8.0-8.6 ms with **none** at 16.7, so the link runs at 120 too;
+the `early 116` the same line printed was its own `say()` holding SpringBoard's
+main run loop for ~200 ms a window, not a slow display. A scroll in Settings
+(fast flicks, ring injection) then reads `fps 117-119`, `gap avg 8.44-8.67 ms`,
+`tick rec0 3-4`, `late avg 4-6 ms`: the compositor delivers one frame short of
+the panel because its own frame is 8.4-9.2 ms of the 8.33 ms period, and the
+rate follows the renderer (a warm phone with the governor at 1881-2112 MHz
+measures 83-89 with the same kernel that reads 117 cool).
+
+The driver's per-second report was part of that: a dozen `IOLog` lines inside
+the work loop held it past a vsync and the deadline chain skipped a tick
+(`vsync min 7410 max 9334 us` with `over17 0`), one held frame a second. It is
+one merged line now; `mondrianfb_verbose=1` brings the detail back.
+
+`mfs=6` (return from `swap()` before the flip, one frame of slack) measured
+89-96 fps: the tick then waits for a fence on a surface the GPU is still
+drawing, so the wait it removed from the renderer reappears on the glass.
+
 ### Running the GPU test from the UI hook
 
 The UI hook dlopens it in every daemon the kernel injects it into, so there is

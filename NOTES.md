@@ -22,22 +22,18 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
   resets flag and budget without writing a partition (AGENTS.md has the symptom).
   From a running iOS the ring's `reboot` is the way in with no buttons: it writes
-  the PMK8350 restart reason over SPMI (`sdam@7100` 0x48 bits 7:1, 2 = bootloader,
-  1 = recovery, `0309`), flushes the ring and resets; fastboot answers about 2 s
-  later. A boot that falls back to `boot_b` answers with the previous kernel: the
-  one measured 2026-11-18 prints `Ticket spinlock timeout`, will not unlock, and
-  carries no HFS fix, so its shutdown marks the volume inconsistent
-  (`hfs_mark_inconsistent`) and the next mount fsck's `iOSRoot` -- a failed boot
-  costs a repair, not just a retry.
+  the PMK8350 restart reason over SPMI (`0309`) and fastboot answers about 2 s
+  later. A boot that falls back to `boot_b` answers with the previous kernel, and
+  that one's shutdown marks the volume inconsistent (`hfs_mark_inconsistent`,
+  2026-11-18), so a failed boot costs a repair, not just a retry.
   **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
   OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
   scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
-- **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken through
-  the device well-known LUN, the GPT parsed, `userdata` located, HFS+ root
-  mounted and `launchd` exec'd. `0398` grows the 16 GiB volume to the device
-  (`userdata`, 223.6 GiB here) on the first read-write mount; the 4 MiB ring
-  at the end of the partition stays outside it.
+- **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken, the GPT
+  parsed, `userdata` located, HFS+ root mounted and `launchd` exec'd. `0398`
+  grows the 16 GiB volume to `userdata` (223.6 GiB here); the 4 MiB ring at the
+  end of the partition stays outside it.
 - **USB, both directions.** `usb=1` probes the DWC3 the ABL leaves powered;
   `usb=2` runs the gadget: an ECM device at 192.168.7.2, control on udp/5141.
   `tools/usb-ring.py` dumps the ring, photographs the panel, injects input and
@@ -48,13 +44,12 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   DWC3 reset (PHY powered, PIPE clock from UTMI) and `0313` votes the eUSB2
   repeater's rails; it answers nothing on i2c5 even when powered, and
   `mondrianusbfallback=N` returns to fastboot. This core has one RX FIFO per
-  OUT endpoint (`GRXFIFOSIZ`, depth in 8-byte units) and the bootloader only
-  sizes the ones it uses; depth 0 NAKs every packet and `DEPCFG` still says 0.
-- **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) reads 268 671 s
-  (1975) and belongs to another processor (owner 4), so a write is refused:
-  `mondriantime=<seconds>` seeds the date, `rtc set SECONDS` moves the clock
-  (`0315`), and the hook repoints `/var/db/timezone/localtime` from
-  `America/Los_Angeles` to `Europe/Madrid` and resets `NSTimeZone`.
+  OUT endpoint and the bootloader only sizes the ones it uses; depth 0 NAKs
+  every packet (`GRXFIFOSIZ`, `DEPCFG`).
+- **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) belongs to another
+  processor (owner 4), so a write is refused: `mondriantime=<seconds>` seeds the
+  date and `rtc set SECONDS` moves the clock (`0315`); the hook repoints
+  `/var/db/timezone/localtime` and resets `NSTimeZone`.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes.
@@ -306,6 +301,11 @@ back. `CTL_START` (`0x01c`) bit 0 clears on completion and stays 1 if it never d
 stores. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 Diagnostics: `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test`, `mondrianfb_defer=0`.
+
+**Direct scanout needs the reset path too.** `mfs=4` (`0410`) flips `SRC0` to
+the compositor's surface through `apps_smmu`, and a warm reset in that state
+leaves the bootloader with **no USB at all**; `mondrian_fb_shutdown()` puts
+`SRC0` back on the carve-out and clears the bank's `SCTLR` (`0411`).
 
 **Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
 through the embedded DMA (a FIFO send wedges the engine: `INT_CTRL` `0x500`,
