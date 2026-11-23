@@ -61,12 +61,41 @@ static bool bridge_log_started;
 
 static void bridge_snapshot_hooks(void);
 static void bridge_fbs_hooks(void);
+static void bridge_chain_line(const char *what);
 static void bridge_chain_dump(const char *tag, CGImageRef image);
 static void bridge_capture_check(void);
+static void bridge_app_snapshot_watch(void);
 
 /* Prefix for a dump made from a named checkpoint, so a picture converted from
  * the cache can be told from one converted on its way to a layer. */
 static const char *bridge_dump_tag;
+static CGImageRef bridge_last_app_image;
+
+/*
+ * The pictures apps made for themselves, by bundle id. The switcher can hold a
+ * card per display item, and a display item names its app; joining by bundle
+ * id is what keeps one app's picture out of another app's card. The last
+ * picture is the fallback for a card whose view chain names no bundle id.
+ */
+#define BRIDGE_SNAP_SLOTS 8
+static struct {
+	char bid[96];
+	CGImageRef image;
+} bridge_app_snaps[BRIDGE_SNAP_SLOTS];
+static unsigned bridge_app_snap_next;
+
+/*
+ * The order in which the snapshot service was asked for a card's app. The card
+ * view itself does not name its bundle (measured: the chain from the card's
+ * UIImageView answers none of displayItem, appLayout, bundleIdentifier), so the
+ * request that produced the card is what says which app it is.
+ */
+#define BRIDGE_CARD_QUEUE 8
+static char bridge_card_queue[BRIDGE_CARD_QUEUE][96];
+static unsigned bridge_card_queue_head, bridge_card_queue_tail;
+static CGImageRef bridge_card_filled;
+static CGImageRef bridge_card_filled_src;
+static size_t bridge_card_filled_w, bridge_card_filled_h;
 
 /*
  * A second channel for the dump.
@@ -1029,6 +1058,313 @@ bridge_watch_contents(id layer, id contents)
 	return 1;
 }
 
+/*
+ * The focused card's picture is in, but the switcher may still be showing the
+ * (now black) live layer: the snapshot view is the layer whose contents we
+ * just set, and its own opacity is what decides. Report it and, a second
+ * later, make that layer visible; if the card then shows the app, the missing
+ * piece was only the handoff.
+ */
+static void
+bridge_show_card(id layer)
+{
+	id delegate = ((id (*)(id, SEL))objc_msgSend)(layer,
+	    sel_registerName("delegate"));
+	const char *owner = delegate != nil ? object_getClassName(delegate) : "-";
+
+	if (strstr(owner, "SnapshotView") == NULL) {
+		return;
+	}
+	((id (*)(id, SEL))objc_msgSend)(layer, sel_registerName("retain"));
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000ull),
+	    dispatch_get_main_queue(), ^{
+		float opacity = ((float (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("opacity"));
+		BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("isHidden"));
+		char line[200];
+
+		snprintf(line, sizeof(line),
+		    "CARDVIEW %s opacity %.2f hidden %d", owner,
+		    (double)opacity, (int)hidden);
+		bridge_chain_line(line);
+		((void (*)(id, SEL, float))objc_msgSend)(layer,
+		    sel_registerName("setOpacity:"), 1.0f);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(layer,
+		    sel_registerName("setHidden:"), NO);
+		((void (*)(id, SEL))objc_msgSend)(layer,
+		    sel_registerName("release"));
+	});
+}
+
+/*
+ * The card's slot is in pixels, and the app's own picture is at the app
+ * window's size. Handing the layer a smaller picture lets its gravity decide
+ * where the rest of the card goes (measured: the focused card showed the
+ * Settings content on the left and black on the right). The replacement is
+ * therefore the app's picture drawn at exactly the size of the image it
+ * replaces, so the card fills the same way the poison did.
+ */
+/*
+ * The window snapshot has no status bar: iOS draws it in another window, so
+ * the top rows of the picture come out transparent and, over the card's black
+ * backing, read as a black band. The app's own colour behind the status bar is
+ * the first row that is actually painted (the navigation bar), so that row's
+ * colour is copied upward into the transparent rows.
+ */
+static void
+bridge_fill_transparent_top(CGContextRef ctx, size_t w, size_t h)
+{
+	uint8_t *data = CGBitmapContextGetData(ctx);
+	size_t row = CGBitmapContextGetBytesPerRow(ctx);
+	size_t first = 0, y, x, pick = w / 2;
+	uint8_t r, g, b;
+
+	if (data == NULL || row == 0 || w == 0 || h == 0) {
+		return;
+	}
+	for (y = 0; y < h; y++) {
+		bool opaque = false;
+
+		for (x = 0; x < w; x += 8) {
+			if (data[y * row + x * 4 + 3] > 128) {
+				opaque = true;
+				break;
+			}
+		}
+		if (opaque) {
+			first = y;
+			break;
+		}
+	}
+	if (first == 0) {
+		return;
+	}
+	for (x = pick; x < w; x++) {
+		if (data[first * row + x * 4 + 3] > 128) {
+			pick = x;
+			break;
+		}
+	}
+	if (data[first * row + pick * 4 + 3] <= 128) {
+		for (x = 0; x < w; x++) {
+			if (data[first * row + x * 4 + 3] > 128) {
+				pick = x;
+				break;
+			}
+		}
+	}
+	b = data[first * row + pick * 4 + 0];
+	g = data[first * row + pick * 4 + 1];
+	r = data[first * row + pick * 4 + 2];
+	for (y = 0; y < first; y++) {
+		uint8_t *line = data + y * row;
+
+		for (x = 0; x < w; x++) {
+			line[x * 4 + 0] = b;
+			line[x * 4 + 1] = g;
+			line[x * 4 + 2] = r;
+			line[x * 4 + 3] = 255;
+		}
+	}
+}
+
+static CGImageRef
+bridge_scaled_copy(CGImageRef src, size_t w, size_t h)
+{
+	CGColorSpaceRef rgb;
+	CGContextRef ctx;
+	CGImageRef out = NULL;
+
+	if (src == NULL || w == 0 || h == 0) {
+		return NULL;
+	}
+	rgb = CGColorSpaceCreateDeviceRGB();
+	if (rgb == NULL) {
+		return NULL;
+	}
+	ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, rgb,
+	    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+	CGColorSpaceRelease(rgb);
+	if (ctx == NULL) {
+		return NULL;
+	}
+	CGContextSetInterpolationQuality(ctx, kCGInterpolationMedium);
+	CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), src);
+	bridge_fill_transparent_top(ctx, w, h);
+	out = CGBitmapContextCreateImage(ctx);
+	CGContextRelease(ctx);
+	return out;
+}
+
+/*
+ * A card's app, read from its view chain: the switcher's `SBDisplayItem`
+ * names the bundle, and the chain from the card's UIImageView up to the
+ * snapshot view carries it. An empty string means the chain did not answer
+ * and the caller falls back to the last app picture.
+ */
+static void
+bridge_card_bid(id view, char *buf, size_t len)
+{
+	id node = view;
+	unsigned depth;
+
+	buf[0] = '\0';
+	for (depth = 0; depth < 12 && node != nil; depth++) {
+		id item = nil;
+
+		/*
+		 * The display item is what the switcher builds a card from. Two
+		 * shapes occur: the view carries `displayItem` itself, or it
+		 * carries an `appLayout` that owns one.
+		 */
+		if ([node respondsToSelector:sel_registerName("displayItem")]) {
+			item = ((id (*)(id, SEL))objc_msgSend)(node,
+			    sel_registerName("displayItem"));
+		} else if ([node respondsToSelector:
+		    sel_registerName("appLayout")]) {
+			id layout = ((id (*)(id, SEL))objc_msgSend)(node,
+			    sel_registerName("appLayout"));
+
+			if (layout != nil && [layout respondsToSelector:
+			    sel_registerName("displayItem")]) {
+				item = ((id (*)(id, SEL))objc_msgSend)(layout,
+				    sel_registerName("displayItem"));
+			}
+		}
+		if (item != nil && [item respondsToSelector:
+		    sel_registerName("bundleIdentifier")]) {
+			id name = ((id (*)(id, SEL))objc_msgSend)(item,
+			    sel_registerName("bundleIdentifier"));
+
+			if (name != nil) {
+				const char *utf8 =
+				    ((const char *(*)(id, SEL))objc_msgSend)(name,
+				    sel_registerName("UTF8String"));
+
+				if (utf8 != NULL) {
+					snprintf(buf, len, "%s", utf8);
+					return;
+				}
+			}
+		}
+		if ([node respondsToSelector:
+		    sel_registerName("bundleIdentifier")]) {
+			id name = ((id (*)(id, SEL))objc_msgSend)(node,
+			    sel_registerName("bundleIdentifier"));
+
+			if (name != nil) {
+				const char *utf8 =
+				    ((const char *(*)(id, SEL))objc_msgSend)(name,
+				    sel_registerName("UTF8String"));
+
+				if (utf8 != NULL) {
+					snprintf(buf, len, "%s", utf8);
+					return;
+				}
+			}
+		}
+		if ([node respondsToSelector:
+		    sel_registerName("applicationIdentifier")]) {
+			id name = ((id (*)(id, SEL))objc_msgSend)(node,
+			    sel_registerName("applicationIdentifier"));
+
+			if (name != nil) {
+				const char *utf8 =
+				    ((const char *(*)(id, SEL))objc_msgSend)(name,
+				    sel_registerName("UTF8String"));
+
+				if (utf8 != NULL) {
+					snprintf(buf, len, "%s", utf8);
+					return;
+				}
+			}
+		}
+		node = ((id (*)(id, SEL))objc_msgSend)(node,
+		    sel_registerName("superview"));
+	}
+}
+
+static void
+bridge_remember_app_image(const char *bid, CGImageRef cg)
+{
+	unsigned i;
+
+	if (bid == NULL || bid[0] == '\0' || cg == NULL) {
+		return;
+	}
+	for (i = 0; i < BRIDGE_SNAP_SLOTS; i++) {
+		if (bridge_app_snaps[i].image != NULL &&
+		    strcmp(bridge_app_snaps[i].bid, bid) == 0) {
+			CGImageRelease(bridge_app_snaps[i].image);
+			bridge_app_snaps[i].image = CGImageRetain(cg);
+			return;
+		}
+	}
+	i = bridge_app_snap_next++ % BRIDGE_SNAP_SLOTS;
+	if (bridge_app_snaps[i].image != NULL) {
+		CGImageRelease(bridge_app_snaps[i].image);
+	}
+	snprintf(bridge_app_snaps[i].bid, sizeof(bridge_app_snaps[i].bid),
+	    "%s", bid);
+	bridge_app_snaps[i].image = CGImageRetain(cg);
+}
+
+static CGImageRef
+bridge_app_image_for(const char *bid)
+{
+	unsigned i;
+
+	if (bid != NULL) {
+		for (i = 0; i < BRIDGE_SNAP_SLOTS; i++) {
+			if (bridge_app_snaps[i].image != NULL &&
+			    strcmp(bridge_app_snaps[i].bid, bid) == 0) {
+				return bridge_app_snaps[i].image;
+			}
+		}
+	}
+	return bridge_last_app_image;
+}
+
+/* The app a snapshot request was for, in request order. Consecutive repeats are
+ * one card asked twice, not two cards. */
+static void
+bridge_card_note(const char *bid)
+{
+	unsigned prev;
+
+	if (bid == NULL || bid[0] == '\0') {
+		return;
+	}
+	if (bridge_card_queue_tail != bridge_card_queue_head) {
+		prev = (bridge_card_queue_tail + BRIDGE_CARD_QUEUE - 1) %
+		    BRIDGE_CARD_QUEUE;
+		if (strcmp(bridge_card_queue[prev], bid) == 0) {
+			return;
+		}
+	}
+	snprintf(bridge_card_queue[bridge_card_queue_tail],
+	    sizeof(bridge_card_queue[bridge_card_queue_tail]), "%s", bid);
+	bridge_card_queue_tail = (bridge_card_queue_tail + 1) %
+	    BRIDGE_CARD_QUEUE;
+	if (bridge_card_queue_tail == bridge_card_queue_head) {
+		bridge_card_queue_head = (bridge_card_queue_head + 1) %
+		    BRIDGE_CARD_QUEUE;
+	}
+}
+
+static bool
+bridge_card_next(char *bid, size_t len)
+{
+	if (bid == NULL || bridge_card_queue_head == bridge_card_queue_tail) {
+		return false;
+	}
+	snprintf(bid, len, "%s", bridge_card_queue[bridge_card_queue_head]);
+	bridge_card_queue_head = (bridge_card_queue_head + 1) %
+	    BRIDGE_CARD_QUEUE;
+	return true;
+}
+
 static void
 bridge_set_contents(id self, SEL cmd, id contents)
 {
@@ -1038,6 +1374,7 @@ bridge_set_contents(id self, SEL cmd, id contents)
 	bridge_snapshot_hooks();
 	bridge_fbs_hooks();
 	bridge_capture_check();
+	bridge_app_snapshot_watch();
 	watched = bridge_watch_contents(self, contents);
 
 	if (contents != NULL && !bridge_off() &&
@@ -1045,6 +1382,71 @@ bridge_set_contents(id self, SEL cmd, id contents)
 		CGImageRef image = (CGImageRef)contents;
 		size_t w = CGImageGetWidth(image), h = CGImageGetHeight(image);
 
+		/*
+		 * The card's UIImageView is handed the render server's full-size
+		 * poison (1008x2240 for a 336x747 card), not the cache thumbnail
+		 * patched above. Every card is patched and joined to its app by
+		 * the display item in its view chain: the switcher can hold two
+		 * cards for one app and a page can hold several apps.
+		 */
+		if (w == 1008 && h == 2240) {
+			id delegate = ((id (*)(id, SEL))objc_msgSend)(self,
+			    sel_registerName("delegate"));
+			const char *owner = delegate != nil ?
+			    object_getClassName(delegate) : NULL;
+
+			if (owner != NULL && strstr(owner, "UIImageView") != NULL) {
+				char bid[96];
+				CGImageRef src;
+
+				/*
+				 * The card view does not name its bundle, but the
+				 * snapshot request that built it does, and those
+				 * requests arrive in card order; the view chain is
+				 * the fallback when the queue is empty.
+				 */
+				if (!bridge_card_next(bid, sizeof(bid))) {
+					bid[0] = '\0';
+					bridge_card_bid(delegate, bid,
+					    sizeof(bid));
+				}
+				src = bridge_app_image_for(
+				    bid[0] != '\0' ? bid : NULL);
+				if (src != NULL) {
+					/*
+					 * Fill the card's own pixel slot. A smaller
+					 * picture leaves the rest of the card to
+					 * the layer's gravity (measured: content on
+					 * the left, black on the right), so the
+					 * replacement is the app's picture drawn at
+					 * the size of the image it replaces.
+					 */
+					if (bridge_card_filled == NULL ||
+					    bridge_card_filled_src != src ||
+					    bridge_card_filled_w != w ||
+					    bridge_card_filled_h != h) {
+						if (bridge_card_filled != NULL) {
+							CGImageRelease(
+							    bridge_card_filled);
+						}
+						bridge_card_filled =
+						    bridge_scaled_copy(src, w, h);
+						bridge_card_filled_src = src;
+						bridge_card_filled_w = w;
+						bridge_card_filled_h = h;
+					}
+					if (bridge_card_filled != NULL) {
+						char line[180];
+
+						image = bridge_card_filled;
+						snprintf(line, sizeof(line),
+						    "CARD %s filled",
+						    bid[0] != '\0' ? bid : "-");
+						bridge_chain_line(line);
+					}
+				}
+			}
+		}
 		if (w >= 4 && h >= 4) {
 			surface = bridge_cached(image);
 			if (surface != NULL) {
@@ -1098,6 +1500,9 @@ bridge_set_contents(id self, SEL cmd, id contents)
 			if (surface != NULL) {
 				bridge_side_set(self, surface, image);
 				contents = (id)surface;
+				if (watched && w == 480 && h == 1067) {
+					bridge_show_card(self);
+				}
 			}
 		}
 	}
@@ -1346,6 +1751,241 @@ bridge_deep_probe(void)
 	bridge_deep_dump();
 }
 
+/*
+ * The app's own picture of itself, at the moment it stops being frontmost.
+ * The render server's snapshot of an app context is the broken path on this
+ * port (its destination stays unwritten), while the app's window is already
+ * correctly composited on screen; UIKit can draw that same hierarchy into a
+ * bitmap without the render server. The picture is left as a PNG in
+ * Preferences, where SpringBoard's bridge can read it.
+ *
+ * The drawing and the encode happen on the main queue, inside the
+ * will-resign-active notification: the window is still on screen then, and
+ * drawViewHierarchyInRect is main-thread-only.
+ */
+extern void UIGraphicsBeginImageContextWithOptions(CGSize size, BOOL opaque,
+    CGFloat scale);
+extern id UIGraphicsGetImageFromCurrentImageContext(void);
+extern void UIGraphicsEndImageContext(void);
+extern id UIImagePNGRepresentation(id image);
+extern void UIRectFill(CGRect rect);
+
+/*
+ * The window snapshot has no status bar: iOS draws it in a separate window, so
+ * the top of drawViewHierarchyInRect comes out transparent and, over the
+ * card's black backing, reads as a black band. The app's own background is
+ * what is behind the status bar on the glass, so it is painted first.
+ */
+static void
+bridge_fill_window_background(id window, CGRect bounds)
+{
+	Class color_cls = objc_getClass("UIColor");
+	id bg, root, view;
+	CGColorRef cg = NULL;
+
+	if (window == nil) {
+		return;
+	}
+	bg = ((id (*)(id, SEL))objc_msgSend)(window,
+	    sel_registerName("backgroundColor"));
+	if (bg == nil) {
+		root = ((id (*)(id, SEL))objc_msgSend)(window,
+		    sel_registerName("rootViewController"));
+		if (root != nil) {
+			view = ((id (*)(id, SEL))objc_msgSend)(root,
+			    sel_registerName("view"));
+			if (view != nil) {
+				bg = ((id (*)(id, SEL))objc_msgSend)(view,
+				    sel_registerName("backgroundColor"));
+			}
+		}
+	}
+	if (bg != nil) {
+		cg = ((CGColorRef (*)(id, SEL))objc_msgSend)(bg,
+		    sel_registerName("CGColor"));
+	}
+	if ((cg == NULL || CGColorGetAlpha(cg) < 0.05) && color_cls != Nil) {
+		bg = ((id (*)(id, SEL))objc_msgSend)((id)color_cls,
+		    sel_registerName("whiteColor"));
+	}
+	if (bg == nil) {
+		return;
+	}
+	((void (*)(id, SEL))objc_msgSend)(bg, sel_registerName("setFill"));
+	UIRectFill(bounds);
+}
+
+static id
+bridge_app_window(void)
+{
+	Class app_cls = objc_getClass("UIApplication");
+	id app, scenes, fallback = nil;
+
+	if (app_cls == Nil) {
+		return nil;
+	}
+	app = ((id (*)(id, SEL))objc_msgSend)((id)app_cls,
+	    sel_registerName("sharedApplication"));
+	if (app == nil) {
+		return nil;
+	}
+	/*
+	 * A scene-based app answers an empty -windows (measured 2026-11-22), so
+	 * the windows come from the connected scenes; the foreground-active
+	 * scene's key window is the one on the glass.
+	 */
+	scenes = ((id (*)(id, SEL))objc_msgSend)(app,
+	    sel_registerName("connectedScenes"));
+	if (scenes != nil) {
+		NSArray *each = [(NSSet *)scenes allObjects];
+		unsigned count = (unsigned)[each count], i;
+
+		for (i = 0; i < count; i++) {
+			id scene = [each objectAtIndex:i];
+			id wins = ((id (*)(id, SEL))objc_msgSend)(scene,
+			    sel_registerName("windows"));
+			unsigned n = wins != nil ?
+			    (unsigned)[(NSArray *)wins count] : 0;
+			unsigned k;
+
+			for (k = 0; k < n; k++) {
+				id window = [(NSArray *)wins objectAtIndex:k];
+
+				if (((BOOL (*)(id, SEL))objc_msgSend)(window,
+				    sel_registerName("isKeyWindow"))) {
+					return window;
+				}
+				if (fallback == nil) {
+					fallback = window;
+				}
+			}
+		}
+	}
+	return fallback;
+}
+
+static void
+bridge_app_snapshot(void)
+{
+	id window = bridge_app_window();
+	id image, data;
+	CGRect bounds;
+	CGFloat scale;
+	const void *bytes;
+	unsigned long length;
+	const char *bid = "?";
+	char path[240];
+	char line[260];
+	BOOL drew;
+	int fd;
+
+	if (window == nil) {
+		bridge_chain_line("APPSNAP no window");
+		return;
+	}
+	{
+		Class bundle = objc_getClass("NSBundle");
+
+		if (bundle != Nil) {
+			id main = ((id (*)(id, SEL))objc_msgSend)((id)bundle,
+			    sel_registerName("mainBundle"));
+			id name = main != nil ?
+			    ((id (*)(id, SEL))objc_msgSend)(main,
+			    sel_registerName("bundleIdentifier")) : nil;
+			const char *utf8 = name != nil ?
+			    ((const char *(*)(id, SEL))objc_msgSend)(name,
+			    sel_registerName("UTF8String")) : NULL;
+
+			if (utf8 != NULL) {
+				bid = utf8;
+			}
+		}
+	}
+	bounds = ((CGRect (*)(id, SEL))objc_msgSend)(window,
+	    sel_registerName("bounds"));
+	scale = ((CGFloat (*)(id, SEL))objc_msgSend)(window,
+	    sel_registerName("contentScaleFactor"));
+	if (scale <= 0) {
+		scale = 3;
+	}
+	UIGraphicsBeginImageContextWithOptions(bounds.size, NO, scale);
+	bridge_fill_window_background(window, bounds);
+	drew = ((BOOL (*)(id, SEL, CGRect, BOOL))objc_msgSend)(window,
+	    sel_registerName("drawViewHierarchyInRect:afterScreenUpdates:"),
+	    bounds, NO);
+	image = UIGraphicsGetImageFromCurrentImageContext();
+	UIGraphicsEndImageContext();
+	if (image == nil) {
+		snprintf(line, sizeof(line),
+		    "APPSNAP %s drew %d no image", bid, (int)drew);
+		bridge_chain_line(line);
+		return;
+	}
+	data = UIImagePNGRepresentation(image);
+	if (data == nil) {
+		snprintf(line, sizeof(line),
+		    "APPSNAP %s drew %d no png", bid, (int)drew);
+		bridge_chain_line(line);
+		return;
+	}
+	bytes = ((const void *(*)(id, SEL))objc_msgSend)(data,
+	    sel_registerName("bytes"));
+	length = (unsigned long)((unsigned long (*)(id, SEL))objc_msgSend)(data,
+	    sel_registerName("length"));
+	snprintf(path, sizeof(path),
+	    "/private/var/mobile/Library/Preferences/"
+	    "mondrian-app-snap-%s.png", bid);
+	fd = bytes != NULL ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+	if (fd >= 0) {
+		(void)write(fd, bytes, length);
+		close(fd);
+	}
+	snprintf(line, sizeof(line),
+	    "APPSNAP %s drew %d %.0fx%.0f png %lu", bid, (int)drew,
+	    (double)bounds.size.width, (double)bounds.size.height, length);
+	bridge_chain_line(line);
+}
+
+static void
+bridge_app_snapshot_watch(void)
+{
+	static bool once;
+	Class center_cls, queue_cls;
+	id center, queue;
+	void (^handler)(id);
+
+	if (once || getprogname() == NULL ||
+	    strcmp(getprogname(), "SpringBoard") == 0) {
+		return;
+	}
+	center_cls = objc_getClass("NSNotificationCenter");
+	queue_cls = objc_getClass("NSOperationQueue");
+	if (center_cls == Nil || queue_cls == Nil) {
+		return;
+	}
+	once = true;
+	center = ((id (*)(id, SEL))objc_msgSend)((id)center_cls,
+	    sel_registerName("defaultCenter"));
+	queue = ((id (*)(id, SEL))objc_msgSend)((id)queue_cls,
+	    sel_registerName("mainQueue"));
+	if (center == nil || queue == nil) {
+		return;
+	}
+	handler = ^(id note) {
+		(void)note;
+		bridge_app_snapshot();
+	};
+	((id (*)(id, SEL, id, id, id, void (^)(id)))objc_msgSend)(center,
+	    sel_registerName("addObserverForName:object:queue:usingBlock:"),
+	    CFSTR("UIApplicationWillResignActiveNotification"), nil, queue,
+	    handler);
+	((id (*)(id, SEL, id, id, id, void (^)(id)))objc_msgSend)(center,
+	    sel_registerName("addObserverForName:object:queue:usingBlock:"),
+	    CFSTR("UIApplicationDidEnterBackgroundNotification"), nil, queue,
+	    handler);
+	bridge_chain_line("APPSNAP watching");
+}
+
 /* Armed by /private/var/vm/mondrian-switch-test, read from the main-queue timer. */
 static int bridge_switch_added;
 
@@ -1446,6 +2086,122 @@ static void (*bridge_snap_cache_original)(id, SEL, id, id);
  * produced the placeholder; no line at all means the request never completed.
  */
 static void
+bridge_patch_fail(const char *why, const char *path)
+{
+	static unsigned said;
+	char line[280];
+
+	if (said++ >= 6) {
+		return;
+	}
+	snprintf(line, sizeof(line), "PATCH fail %s path %s", why,
+	    path != NULL ? path : "-");
+	bridge_chain_line(line);
+}
+
+/*
+ * The picture the app made for itself, if it left one. The cache's own image
+ * is a UIImage subclass whose CGImage is the render server's poison; the app's
+ * PNG is the same window, drawn by UIKit. The display item names the app, so
+ * the two are joined by bundle id, not by geometry.
+ */
+static id
+bridge_snap_from_app(id request)
+{
+	Class xb = objc_getClass("XBApplicationSnapshotImage");
+	Class ui = objc_getClass("UIImage");
+	Class str = objc_getClass("NSString");
+	id item, bid, path, image, made;
+	const char *utf8;
+	char path_bytes[240];
+	CGImageRef cg;
+
+	if (xb == Nil || ui == Nil || str == Nil || request == nil ||
+	    ![request respondsToSelector:sel_registerName("displayItem")]) {
+		bridge_patch_fail("no class or request", NULL);
+		return nil;
+	}
+	item = ((id (*)(id, SEL))objc_msgSend)(request,
+	    sel_registerName("displayItem"));
+	if (item == nil ||
+	    ![item respondsToSelector:sel_registerName("bundleIdentifier")]) {
+		bridge_patch_fail("no item", NULL);
+		return nil;
+	}
+	bid = ((id (*)(id, SEL))objc_msgSend)(item,
+	    sel_registerName("bundleIdentifier"));
+	if (bid == nil) {
+		bridge_patch_fail("no bid", NULL);
+		return nil;
+	}
+	utf8 = ((const char *(*)(id, SEL))objc_msgSend)(bid,
+	    sel_registerName("UTF8String"));
+	if (utf8 == NULL) {
+		bridge_patch_fail("no utf8", NULL);
+		return nil;
+	}
+	snprintf(path_bytes, sizeof(path_bytes),
+	    "/private/var/mobile/Library/Preferences/"
+	    "mondrian-app-snap-%s.png", utf8);
+	path = ((id (*)(id, SEL, const char *))objc_msgSend)(
+	    ((id (*)(id, SEL))objc_msgSend)((id)str,
+	    sel_registerName("alloc")),
+	    sel_registerName("initWithUTF8String:"), path_bytes);
+	if (path == nil) {
+		bridge_patch_fail("no path string", path_bytes);
+		return nil;
+	}
+	image = ((id (*)(id, SEL, id))objc_msgSend)((id)ui,
+	    sel_registerName("imageWithContentsOfFile:"), path);
+	if (image == nil) {
+		bridge_patch_fail("no uiimage", path_bytes);
+		return nil;
+	}
+	cg = ((CGImageRef (*)(id, SEL))objc_msgSend)(image,
+	    sel_registerName("CGImage"));
+	if (cg == NULL) {
+		bridge_patch_fail("no cgimage", path_bytes);
+		return nil;
+	}
+	if (bridge_last_app_image != NULL) {
+		CGImageRelease(bridge_last_app_image);
+	}
+	{
+		/* The status bar is not in the window: paint its rows with the
+		 * app's own colour before the picture is stored or wrapped. */
+		CGImageRef filled = bridge_scaled_copy(cg,
+		    CGImageGetWidth(cg), CGImageGetHeight(cg));
+
+		if (filled == NULL) {
+			filled = CGImageRetain(cg);
+		}
+		bridge_last_app_image = CGImageRetain(filled);
+		bridge_remember_app_image(utf8, filled);
+		bridge_card_note(utf8);
+		made = ((id (*)(id, SEL))objc_msgSend)((id)xb,
+		    sel_registerName("alloc"));
+		made = ((id (*)(id, SEL, CGImageRef, CGFloat, int))objc_msgSend)(
+		    made, sel_registerName("initWithCGImage:scale:orientation:"),
+		    filled, 1.0, 0);
+		CGImageRelease(filled);
+	}
+	if (made == nil) {
+		bridge_patch_fail("no snapshot image", path_bytes);
+		return nil;
+	}
+	{
+		char line[240];
+
+		snprintf(line, sizeof(line),
+		    "CACHE patched %s %s %zux%zu", utf8,
+		    object_getClassName(made), CGImageGetWidth(cg),
+		    CGImageGetHeight(cg));
+		bridge_chain_line(line);
+	}
+	return made;
+}
+
+static void
 bridge_snap_image(id self, SEL cmd, id image, id request)
 {
 	static unsigned said;
@@ -1491,7 +2247,80 @@ bridge_snap_image(id self, SEL cmd, id image, id request)
 		}
 		bridge_say(line);
 	}
+	if (image != nil &&
+	    bridge_file_byte("/private/var/vm/mondrian-snap-probe") == '2') {
+		static bool told;
+
+		if (!told) {
+			unsigned mcount = 0, k;
+			Method *methods = class_copyMethodList(object_getClass(image),
+			    &mcount);
+
+			told = true;
+			snprintf(line, sizeof(line), "SNAPIMG %s %u methods",
+			    object_getClassName(image), mcount);
+			bridge_chain_line(line);
+			for (k = 0; k < mcount && k < 40; k++) {
+				snprintf(line, sizeof(line), " snapimg %s",
+				    sel_getName(method_getName(methods[k])));
+				bridge_chain_line(line);
+			}
+			free(methods);
+			{
+				Class super = class_getSuperclass(
+				    object_getClass(image));
+
+				snprintf(line, sizeof(line), "SNAPIMG super %s",
+				    super != Nil ? class_getName(super) : "-");
+				bridge_chain_line(line);
+			}
+			if ([image respondsToSelector:sel_registerName("IOSurface")]) {
+				IOSurfaceRef s = (IOSurfaceRef)
+				    ((id (*)(id, SEL))objc_msgSend)(image,
+				    sel_registerName("IOSurface"));
+
+				if (s != NULL) {
+					snprintf(line, sizeof(line),
+					    "SNAPIMG surface %u %zux%zu row %zu fmt 0x%x",
+					    IOSurfaceGetID(s), IOSurfaceGetWidth(s),
+					    IOSurfaceGetHeight(s),
+					    IOSurfaceGetBytesPerRow(s),
+					    (unsigned)IOSurfaceGetPixelFormat(s));
+				} else {
+					snprintf(line, sizeof(line),
+					    "SNAPIMG surface nil");
+				}
+				bridge_chain_line(line);
+			}
+			if (request != nil &&
+			    [request respondsToSelector:sel_registerName("displayItem")]) {
+				id item = ((id (*)(id, SEL))objc_msgSend)(request,
+				    sel_registerName("displayItem"));
+				const char *bid = "-";
+
+				if (item != nil &&
+				    [item respondsToSelector:sel_registerName("bundleIdentifier")]) {
+					id name = ((id (*)(id, SEL))objc_msgSend)(item,
+					    sel_registerName("bundleIdentifier"));
+
+					if (name != nil) {
+						bid = ((const char *(*)(id, SEL))objc_msgSend)(
+						    name, sel_registerName("UTF8String"));
+					}
+				}
+				snprintf(line, sizeof(line), "SNAPIMG item %s bid %s",
+				    item != nil ? object_getClassName(item) : "nil",
+				    bid != NULL ? bid : "-");
+				bridge_chain_line(line);
+			}
+		}
+	}
 	if (bridge_snap_image_original != NULL) {
+		id patched = bridge_snap_from_app(request);
+
+		if (patched != nil) {
+			image = patched;
+		}
 		bridge_snap_image_original(self, cmd, image, request);
 	}
 }
@@ -1510,6 +2339,11 @@ bridge_snap_cache(id self, SEL cmd, id image, id request)
 		bridge_say(line);
 	}
 	if (bridge_snap_cache_original != NULL) {
+		id patched = bridge_snap_from_app(request);
+
+		if (patched != nil) {
+			image = patched;
+		}
 		bridge_snap_cache_original(self, cmd, image, request);
 	}
 }
