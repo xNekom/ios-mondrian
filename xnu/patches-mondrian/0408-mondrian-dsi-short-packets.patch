@@ -1,0 +1,90 @@
+xnu 0408: send the timing switch as real short packets
+
+The 0407 timing switch reports success but the panel stays at 60 Hz, and
+its DMA log names two faults. Every packet was set up while the previous
+one was still on the wire (status 0x8007 on the second page write), and
+the short 0x15 writes went out through the 0xc0 long-packet form: the
+panel drops a long packet whose data type is 0x15, so the 0x2f/0x8b
+selectors and the 0x6f/0xc0/0xdf/0xcc/0xce writes never landed.
+
+Wait for the command engine and its DMA (DSI_STATUS bits 0 and 1) around
+each packet, and encode a short packet the way the display-on path already
+does: data type and data bytes in the descriptor word, four bytes on the
+wire, no payload. The long 0xf0 page writes keep the 0xc0 form.
+--- a/iokit/Kernel/arm/MondrianFramebuffer.cpp
++++ b/iokit/Kernel/arm/MondrianFramebuffer.cpp
+@@ -810,11 +810,29 @@
+  * second page write (measured: `long 6 bytes ... done 0`, `wedged dsi`,
+  * panel frozen on its last frame).
+  */
++/*
++ * Wait for the command engine and its DMA to be idle: DSI_STATUS bits 0
++ * and 1. The timing-switch packets were being set up while the previous
++ * one was still on the wire; the second page write logged status 0x8007
++ * and the panel kept the old page. Bit 2 is the MDP stream, which a
++ * frame may hold for its whole transfer, so it is not waited on here.
++ */
++static bool
++mondrian_dsi_wait_idle(AppleCLCD *fb)
++{
++	for (uint32_t i = 0; i < 300; i++) {
++		if ((mondrian_mdp_rd(fb->fDsi, MONDRIAN_DSI_STATUS) & 0x3u) == 0) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
+ static int
+ mondrian_dsi_dma_write(AppleCLCD *fb, uint8_t type, const uint8_t *data,
+     uint32_t len)
+-{
+-	volatile uint32_t *dsi = fb->fDsi;
++{	volatile uint32_t *dsi = fb->fDsi;
+ 	volatile uint32_t *buf = (volatile uint32_t *)fb->fBrightBuf;
+ 	uint32_t save3c, save50, status, back, iv = 0, n, wire;
+ 	bool done = false;
+@@ -838,8 +856,32 @@
+ 		buf[i] = 0xffffffff;
+ 	}
+ 	wire = 4 + len;
++	/*
++	 * A short packet is not a long one with a small payload: the
++	 * descriptor carries the data type and the data bytes in the word
++	 * itself and the DMA sends four bytes (the display-on path,
++	 * 0x00050000 | cmd, is the same form). The timing switch's 0x15
++	 * writes used the 0xc0 form below and reached the panel as long
++	 * packets of data type 0x15, which it drops, so the 0x2f/0x8b and
++	 * page writes never took.
++	 */
++	if (type == 0x05 || type == 0x15) {
++		uint32_t shortword = ((uint32_t)type << 16) | (uint32_t)data[0];
++
++		if (len > 1) {
++			shortword |= (uint32_t)data[1] << 8;
++		}
++		for (uint32_t i = 1; i < 16; i++) {
++			buf[i] = 0xffffffff;
++		}
++		buf[0] = shortword;
++		wire = 4;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 
++	if (!mondrian_dsi_wait_idle(fb)) {
++		IOLog("MONDRIAN FB: dsi busy before 0x%x\n", type);
++	}
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_CTRL, 0);
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_TPG_DMA_FIFO_RESET, 1);
+ 	delay(10);
+@@ -878,6 +920,9 @@
+ 	} else {
+ 		rc = -2;
+ 	}
++	if (!mondrian_dsi_wait_idle(fb)) {
++		IOLog("MONDRIAN FB: dsi busy after 0x%x\n", type);
++	}
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_DMA_FIFO_CTRL, save50);
+ 	mondrian_mdp_wr(dsi, MONDRIAN_DSI_CMD_MODE_DMA_CTRL, save3c);
+ 	IOLog("MONDRIAN FB: dma type 0x%x %u bytes status 0x%x done %d\n",
