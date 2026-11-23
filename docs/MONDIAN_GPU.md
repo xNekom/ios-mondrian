@@ -70,7 +70,10 @@ them has Metal. That is the path this port follows.
   0-1) between packets; display on/off uses the same form. The 24 bpp source
   experiment (`present()` packs B,G,R, SSPP `0x2243c`, stride 4320) halves the
   copy but does not change the rate; the live tree is DSC 8 bpp, 10 bpc,
-  720-px slices, compressed end to end.
+  720-px slices, compressed end to end. The compositor is the second limit: a
+  full-screen Settings scroll presents 90-106 frames a second (`MONDRIAN FB:
+  fps`), with the frame 4 ms after the tick and the 18 MB copy 2.7 ms, so the
+  panel repeats some frames while the scanout stays at +120.
 - CoreAnimation: the `eagl`/`gl_osmesa`/`inject` userland, the Mesa `FD730` and
   the AMFI/dyld policy that lets the Mesa GLES context load
   (`RedwoodWaitsForGpu` in topaz's 0109).
