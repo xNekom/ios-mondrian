@@ -59,8 +59,10 @@ power + volume down) and check nothing is left holding a pipe while you wait.
 A tap that "does nothing" is usually this, not a wrong coordinate (measured
 2026-11-19: the same dock tap opened Safari on one attempt and was swallowed on
 the next). Send a throwaway tap at a harmless point, wait two seconds, then the
-real one. `respring` plus `key 3` (home) puts the phone on a known screen between
-attempts, and a `screen` capture costs about a minute when you need to be sure.
+real one. `key 3` (home) puts the phone on a known screen between attempts;
+`respring` is not a reload path (it leaves the panel black and needs a reboot,
+measured 2026-11-23), and a `screen` capture costs about a minute when you need
+to be sure.
 
 The upload is the expensive part of a round, not the taps: 22 MB over the
 windowed `wfile` takes ten to fifteen minutes, so keep a dylib on the phone

@@ -840,10 +840,10 @@ boot each, so the three columns differ only in what changed:
   (measured 2026-11-23).
   Measured 2026-11-23: a four-app switcher (App Store focused, Settings,
   Messages, Safari) draws every card with its own app, and
-  `CARD <bundle> filled 1080x2400` names the join in the chain log. `respring` (killing SpringBoard and
-  backboardd) twice left the panel black with SpringBoard's UI loop at 0; a
-  reboot plus `tools/wsl/cycle.sh --no-build` recovers, and the uploaded dylib
-  and the `mondrian-snap-probe` marker survive the reboot, so the bridge reloads
+  `CARD <bundle> filled 1080x2400` names the join in the chain log. A dylib
+  reload is a reboot plus `tools/wsl/cycle.sh --no-build` (`respring` leaves the
+  panel black, see the trap below); the uploaded dylib and the
+  `mondrian-snap-probe` marker survive the reboot, so the bridge reloads
   without another upload. The display is still not a substitute for the
   snapshot: `CARenderServerRenderDisplay` from the bridge returns black.
   `mondrian-snap-probe` mode `2` prints the layer class, `contextID` and the
@@ -920,19 +920,30 @@ boot each, so the three columns differ only in what changed:
   the right for on; Settings draws the on switch the same way. The off track is
   Apple's faint grey on white and reads as "almost missing" at a glance, which is
   the control's own look, not a picture failure. `tools/wsl/ui-switch-audit.sh`
-  still flips the Settings switches, and a switch that draws but ignores a tap is
+  still flips the Settings switches (a 150 ms drag inside the control; a 0 ms
+  tap is ignored), and a switch that draws but ignores a tap is
   a control with no controller behind it (Wi-Fi), not a drawing fault.
-- **A respring must restart backboardd, not only SpringBoard.** Measured
-  2026-11-21: `kill SpringBoard` alone leaves the new one at its boot spinner
-  (`ca begin 0 commit 0`, `present 0/s`) while `CollectionsPoster` crash-loops
-  with `extension check-in timeout`; killing backboardd restarts the window
-  server and SpringBoard together and the new SpringBoard presents (a
-  `present 27/s`, `ca begin 9 commit 9` burst, then the lock screen).
-  `usb-ring.py respring` signals backboardd and lets SpringBoard follow. A
-  second restart in a row can still leave the previous frame on the glass, so
-  a RAM boot is the fallback when the panel does not change; a hook change is
-  also testable by rebuilding only the app bridge, which is read when an app
-  execs (kill the app and tap its icon).
+- **The Notifications pane aborts Preferences; the root image has no
+  notification daemon.** Measured 2026-11-23 with the current and the pre-fix
+  app bridge: opening `Settings > Notifications` builds the page
+  (`MONDRIAN APPDEEP: NCNotificationListView`) and then aborts Preferences with
+  `sig 11` and `pc 0x0`, so nothing is drawn. `7z` over the expanded root image
+  finds no `usernotificationsd`, and the page's settings query therefore has no
+  server; that is the expected cause, not a proven one. The neighbouring Sounds
+  pane opens and draws its slider and three switches in both appearances, so a
+  Preferences abort is not a renderer fault.
+- **`respring` is not a reload path; only a reboot brings the panel back.**
+  Measured 2026-11-23 from a healthy SpringBoard (UI loop 19/s, panel mean 95.7):
+  killing SpringBoard alone gives a new pid with `ca begin 0 ... loop 0 in 1 s`
+  and a black panel; killing backboardd afterwards gives a new pair, still
+  `loop 0`. The reverse order (backboardd, 4 s, SpringBoard), both pids together,
+  and a wake tap afterwards all end black. The loop counter says SpringBoard's
+  main queue is blocked before it presents, and the panel is not the DCS blank
+  because a tap does not wake it. A 2026-11-21 pass had backboardd-only present
+  a new SpringBoard at 27/s, so that result does not generalise. Reload a dylib
+  with `usb-ring.py reboot` and `tools/wsl/cycle.sh --no-build`: the reboot lands
+  in fastboot, `cycle.sh` re-activates the slot, and the uploaded hook and app
+  bridge are read again.
 - **The keyboard is full width and its first presentation is the one that was
   clipped.** Measured 2026-11-21: the Search pill under the dock opens Spotlight
   and puts the keyboard on the glass; before the fix the ten-key row sat at
