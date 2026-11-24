@@ -1,11 +1,11 @@
-# The mondrian touch screen: bring-up plan
+# The mondrian touch screen: bring-up record
 
 The panel's digitizer is a Goodix part on **SPI**, wired to QUPv3 SE4. This
 file is the register-level record: what the live device tree says
 (`/sys/firmware/fdt`, dumped with `dtc -I dtb -O dts`), what the working
 system's driver measures, and what the port has proved with the bit-banged
 transport in `bsd/dev/mondrian_touch.c`. The work list entry is
-`docs/MONDIAN_PORT.md` §5.
+`docs/MONDIAN_PORT.md` §4.
 
 ## What the device tree says
 
