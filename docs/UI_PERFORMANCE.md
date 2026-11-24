@@ -119,6 +119,35 @@ frame (and the first 40), both steered by boot args (`mondrianfb_fps=1`,
 time, doorbell to fence against the wall clock) and `gpuperf` moves the GPU's
 perf index at run time.
 
+Measured 2026-11-24 at the panel's own 120 Hz, eight flicks in one boot each
+(`MONDRIAN FB: fps`; `tick` is how many swap records each tick found):
+
+| | Settings list | Home screen pages |
+| --- | --- | --- |
+| frames the compositor produced | 113-118/s | 81-87/s |
+| copy into the panel | 2.8 ms | 4.7-5.3 ms |
+| wait for the GPU fence | 0.5 ms | 1.9-2.3 ms |
+| `late` (the swap after its tick) | 3.2-3.7 ms | 3.5-4.1 ms |
+| ticks that found no frame | 2-8/s | 35-43/s |
+| backboardd's GL frame | -- | 11.7-13.6 ms, 700-800 calls, 129 draws |
+| of that, waiting for the GPU | -- | 0.5-1.0 ms |
+
+- **The page swipe is CPU inside the GL calls, not the present path.** Its
+  frames hand 700-800 commands to Mesa for 129 draws and wait 0.6 ms for the
+  picture to be drawn; the copy and the fence fit beside them. `glflushdraws=0`
+  (the pre-2026-11-21 behaviour) takes the same swipes from 81-87 to 90-102 by
+  dropping the submits between draws, and it is also what corrupted the Control
+  Center's backdrop, so it stays an option and not the default.
+- **Direct scanout is not the faster path.** `mfs=4` measured 68-71 fps on the
+  same pages: the surface on the glass is held for a whole period,
+  CoreAnimation has one buffer left and the renderer serialises on the flip.
+  The copy frees the surface at the tick, which is why it wins despite the
+  memcpy.
+- **Turning the fence wait off makes the page swipe worse.** `gpuwait=0` drops
+  the copy from 5.3 to 3.0 ms and the frames from 86 to 74-79: the copy then
+  runs while the GPU still draws the surface it reads, and the renderer pays
+  for the contention.
+
 Measured 2026-11-17 with the same eight page swipes (~20 s of motion) in one
 boot each, so the three columns differ only in what changed:
 
@@ -1447,6 +1476,10 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
 
 ## Measurement traps
 
+- **A panel capture in the same second pollutes the frame numbers.** Right after
+  `usb-ring.py screen` the copy reads 3.9 ms and `tick rec0` 20-22, against
+  2.8 ms and 2-8 with the same image and no capture: take the capture after the
+  flicks, never before.
 - **A corrupt iOS root looks exactly like a compositor fault.** Measured
   2026-11-17: `hfs_mark_inconsistent: Runtime corruption detected on iOSRoot`
   31 268 times in one boot. Two consequences that read as other bugs: the ring

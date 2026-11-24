@@ -301,11 +301,11 @@ back. `CTL_START` (`0x01c`) bit 0 clears on completion and stays 1 if it never d
 stores. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
 
-**Direct scanout strands the bootloader on a reset.** `mfs=4` (`0410`) flips
-`SRC0` to the compositor's surface through `apps_smmu`, and a warm reset in that
-state leaves the bootloader with **no USB at all**; restoring `SRC0` and the
-bank (`0411`) plus the port down (`0409`) does not fix it, while the copy path
-resets cleanly.
+**Direct scanout is slower and strands the bootloader.** `mfs=4` (`0410`) holds
+the surface on the glass for a period: the home screen measures 68-71 fps against
+81-87 with the copy. Even `mfs=2` -- bank configured, translation off, `SRC0`
+still the carve-out -- leaves ABL with **no USB at all** on a warm reset, and
+restoring the bank's registers does not fix it. The copy path is the default.
 
 **Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
 through the embedded DMA (a FIFO send wedges the engine: `INT_CTRL` `0x500`,

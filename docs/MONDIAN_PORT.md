@@ -208,9 +208,10 @@ kernel log and clears the boot splash. CoreAnimation needs
 panics `pmap_remove_pv`, `0115`), and the dylib forces activation.
 
 120 Hz is reached: the interface completes +120 frames a second and the tick
-arms on a deadline chain; a scroll shows 117-119 because the compositor's own
-frame is 8.4-9.2 ms of 8.33. `mfs=4` (`0410`) scans the surface out instead of
-copying it and the reset restores `SRC0` (`0411`); the timing gate was `0408`.
+arms on a deadline chain. A list scroll shows 113-118 fps; the home screen 81-87,
+where backboardd's GL frame is 11.7-13.6 ms of CPU (700-800 calls, 129 draws,
+0.6 ms waiting). `mfs=4` (`0410`) scans the surface out and measures *slower*
+(68-71: the display holds a surface a period), so the copy stays the default.
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
