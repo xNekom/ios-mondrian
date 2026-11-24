@@ -211,9 +211,10 @@ mondrian_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * No mmap() on a device here: the kernel's user client maps the whole
 	 * buffer into this task and hands back the address, and the type of the
 	 * client memory is the buffer's GEM handle
-	 * (MondrianGPUUserClient::clientMemoryForType). Linux maps buffers
-	 * write-combined and freedreno depends on that; here the memory belongs
-	 * to the kernel's driver and this mapping is as the kernel made it.
+	 * (MondrianGPUUserClient::clientMemoryForType). The mapping is cacheable
+	 * and the driver writes it back on both hand-offs; asking for a
+	 * write-combined mapping here made every map fail on this port (no map
+	 * line, no GL context, no surfaces), so it stays as the kernel makes it.
 	 */
 	if (IOConnectMapMemory64(connection, handle, mach_task_self(),
 	    &address, &mapped, kIOMapAnywhere) != 0) {

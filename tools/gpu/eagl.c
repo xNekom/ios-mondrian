@@ -314,6 +314,11 @@ struct eagl {
 	bool reads_picture;             /* the draw plain_draw_begin() just set up reads the picture it draws into */
 	bool picture_read;              /* the last draw read it (fetch_flush()) */
 	unsigned fetch_flushes;         /* submits those reads cost (see fetch_flush()) */
+	uint64_t fetch_flush_us, fetch_flush_us_all;    /* time inside them, this frame and all */
+	uint64_t fetch_flush_max, fetch_flush_max_all;  /* the longest one, this frame and all */
+	unsigned fetch_flush_n, fetch_flush_n_all;      /* how many, this frame and all */
+	unsigned fetch_cause[5];        /* by cause: program, texture, full, picture, every draw */
+	unsigned fetch_cause_all[5];
 	unsigned unit;                  /* the texture unit being spoken of */
 	GLuint bound[8];                /* the 2D texture bound to each of the first units */
 	const GLfloat *matrix;          /* where CoreAnimation keeps the matrix it gives its programs */
@@ -699,6 +704,17 @@ summary(struct eagl *e)
 		    e->frames_on_p, e->frames_on_e, eagl_slot_name(top[0] * 8), slot_us[top[0]], eagl_slot_name(top[1] * 8),
 		    slot_us[top[1]], eagl_slot_name(top[2] * 8), slot_us[top[2]], eagl_slot_name(top[3] * 8), slot_us[top[3]],
 		    eagl_slot_name(top[4] * 8), slot_us[top[4]]);
+	}
+	if (e->fetch_flush_n_all != 0) {
+		unsigned n = (e->fetch_flush_n_all + frames / 2) / frames;
+		unsigned by_program = (e->fetch_cause_all[0] + frames / 2) / frames;
+		unsigned by_texture = (e->fetch_cause_all[1] + frames / 2) / frames;
+		unsigned by_full = (e->fetch_cause_all[2] + frames / 2) / frames;
+		unsigned by_picture = (e->fetch_cause_all[3] + frames / 2) / frames;
+
+		say("mondrian-gl: submits: %u a frame, %llu us a frame inside them, %llu us the longest; causes: program reads the picture %u, texture written since the last submit %u, list full %u, draw after a picture read %u\n",
+		    n, e->fetch_flush_us_all / frames, e->fetch_flush_max_all,
+		    by_program, by_texture, by_full, by_picture);
 	}
 	for (unsigned i = 0; i < sizeof(formats) / sizeof(formats[0]) && formats[i].count; i++) {
 		say("mondrian-gl:   textures: %s %#x/%#x/%#x: %u times, up to %u x %u\n", formats[i].how, formats[i].internal,
@@ -1903,6 +1919,14 @@ frame_end(struct eagl *e, bool finished)
 	e->readback_us += after - waited;
 	e->attach_us += e->attaching;
 	e->flush_us += e->flushing;
+	e->fetch_flush_us_all += e->fetch_flush_us;
+	e->fetch_flush_n_all += e->fetch_flush_n;
+	if (e->fetch_flush_max > e->fetch_flush_max_all) {
+		e->fetch_flush_max_all = e->fetch_flush_max;
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		e->fetch_cause_all[i] += e->fetch_cause[i];
+	}
 	e->frame_us += after - e->began;
 	{
 		uint64_t cpu;
@@ -1948,6 +1972,8 @@ frame_end(struct eagl *e, bool finished)
 	e->last_draws = e->draws;
 	e->calls = e->draws = e->triangles = e->uploads = e->clears = 0;
 	e->upload_bytes = e->attaching = e->flushing = 0;
+	e->fetch_flush_us = e->fetch_flush_n = e->fetch_flush_max = 0;
+	bzero(e->fetch_cause, sizeof(e->fetch_cause));
 }
 
 #ifndef GL_BLEND
@@ -3869,6 +3895,31 @@ static unsigned fetch_flushes_told;
  */
 static int flush_draws = 2;
 
+/*
+ * What each of those submits costs at the boundary: every glFlush below is a
+ * batch flush in the driver, a kernel submission and a fence. The draw times
+ * carry them because they happen inside a draw, so the summary could not say
+ * how much of a draw was the submit and how much the drawing. Timed here, with
+ * the reason, so a change in the flush rule can be weighed against its cost.
+ */
+static void
+flush_for(struct eagl *e, unsigned cause)
+{
+	uint64_t began = now_us();
+	uint64_t took;
+
+	glFlush();
+	took = now_us() - began;
+	if (took > e->fetch_flush_max) {
+		e->fetch_flush_max = took;
+	}
+	e->fetch_flush_us += took;
+	e->fetch_flush_n++;
+	if (cause < 5) {
+		e->fetch_cause[cause]++;
+	}
+}
+
 static void
 flush_before_draw(struct eagl *e)
 {
@@ -3876,7 +3927,7 @@ flush_before_draw(struct eagl *e)
 		return;
 	}
 	if (flush_draws == 1) {
-		glFlush();
+		flush_for(e, 4);
 		e->written_count = 0;
 		e->fetch_flushes++;
 		return;
@@ -3890,7 +3941,7 @@ flush_before_draw(struct eagl *e)
 	 * that reads the picture saw pixels of another tile, or none at all.
 	 */
 	if (e->program_reads_picture) {
-		glFlush();
+		flush_for(e, 0);
 		e->written_count = 0;
 		e->fetch_flushes++;
 		return;
@@ -3901,7 +3952,7 @@ flush_before_draw(struct eagl *e)
 		}
 		for (unsigned k = 0; k < e->written_count; k++) {
 			if (e->written[k] == e->bound[i]) {
-				glFlush();
+				flush_for(e, 1);
 				e->written_count = 0;
 				e->fetch_flushes++;
 				return;
@@ -3922,7 +3973,7 @@ written_mark(struct eagl *e, GLuint texture)
 		}
 	}
 	if (e->written_count >= sizeof(e->written) / sizeof(e->written[0])) {
-		glFlush();                      /* (a submit is always safe, and it empties the list) */
+		flush_for(e, 2);                /* (a submit is always safe, and it empties the list) */
 		e->written_count = 0;
 		return;
 	}
@@ -3939,7 +3990,7 @@ fetch_flush(struct eagl *e)
 	if (!fetch_flush_on) {
 		return;
 	}
-	glFlush();
+	flush_for(e, 3);
 	if (fetch_flushes_told++ < 4) {
 		say("mondrian-gl: a draw that reads the picture follows one that does not: flushed first (%u)\n",
 		    e->fetch_flushes);
