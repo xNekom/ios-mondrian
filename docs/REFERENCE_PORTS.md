@@ -10,7 +10,7 @@ separates a device-verified result from code that was only read.
 | Project | What it gives | Evidence | Licence |
 | --- | --- | --- | --- |
 | [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) | the base XNU/shim/root tooling and the sweet patch series | works on sweet; this fork's base | MIT |
-| [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | the GLES/GPU path, the Mesa patches and the userland dylibs | its phones; the reference behind `docs/MONDIAN_GPU.md` | APSL 2.0 kernel, MIT userland (per its README) |
+| [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | the GLES/GPU path, the Mesa patches, the userland dylibs and the virtual audio HAL plug-in | its phones; the reference behind `docs/MONDIAN_GPU.md` | APSL 2.0 kernel, MIT userland (per its README) |
 | [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) | `SweetSurface`, the `IOMobileFramebuffer`/`AppleCLCD` presenter and the EAGL/OSMesa path | read; `docs/MONDIAN_GPU.md` | no root licence declared; read, do not copy |
 | [akshaynexus/OneiOS](https://github.com/akshaynexus/OneiOS) | the VideoToolbox paravirtualization service, the HEVC tile session and the Rust runtime tools | its README marks the iOS 27 tile session host-tested, not booted | no licence file: all rights reserved; read, do not copy |
 | [akshaynexus/iOSPlus10](https://github.com/akshaynexus/iOSPlus10) | QCA6490 Wi-Fi, PM8350B hBoost/PBS haptics, WCD938x/LPASS audio and Adreno 730 Metal2Vulkan | the repo's plans report built stages; its Wi-Fi audit says the host side has not run on the chip | MIT |
@@ -39,7 +39,12 @@ separates a device-verified result from code that was only read.
   `bsd/dev/negroni_adsp.c`, `negroni_audio.c` and
   `userland/audio/NegroniAudio.c`. Our codec is the same WCD938x, but our
   speaker amps are AW882xx, not the TFA9874 of the OnePlus, so the amp driver
-  is the part to replace.
+  is the part to replace. The HAL side has a working reference:
+  `oosexgang/hakios-xnu-kernel`'s `userland/src/audio_plugin.c` is a virtual
+  `AudioServerPlugIn` (MIT) that presents Speaker, Actuator and Codec, and
+  `open-mapple/mapple_userland/audio` installs it beside `VirtualAudio.plugin`
+  and uses it in its realme 8i release (iOS 16.7.16). Our kernel still needs the
+  `/dev` sink that drives the WCD938x and the AW882xx.
 - **Video and HEVC.** `DenialOfGravity/ios-redfin`: `phone/video/vtvenc.c`
   registers a VideoToolbox hardware encoder, and `venusd.c` plus `venus_*`
   drive the Venus block. This is the native path; `akshaynexus/OneiOS`
@@ -51,6 +56,10 @@ separates a device-verified result from code that was only read.
   half (`docs/MONDIAN_GPU.md`). `DenialOfGravity/ios-redfin`'s `phone/hmetal/`
   is a complete native Metal driver for a6xx, not a drop-in for the a730; its
   CoreAnimation plug-in also has a licence that its README says is unverified.
+  `open-mapple/mapple_gpu_mali` (viva-gpu, GPL-3.0 with attribution) is a
+  native Metal front-end on Mesa for Mali; its Adreno overlay is host-tested
+  only and expects the `sweetgpuabi` client, so read the AIR/NIR path, do not
+  drop it in.
 - **Cellular, camera, brightness and sensors.** `DenialOfGravity/ios-redfin`
   has the native MPSS/IPA/QRTR path (`xnu/patches/1295-1297`, `1067`, `1072`,
   `1076`, `1124`, `phone/wifi/ipa*`), the camera services and the TCS3701

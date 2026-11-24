@@ -2,9 +2,9 @@
 
 Measured on this phone running LineageOS 24 (kernel 5.10.269, vendor modules
 from `vendor_dlkm`), with `tools/android-capture.sh` and `tracefs`. This is the
-reference for the subsystems the port has not reached yet: the node, the
-address and the userspace interface the working system uses. The touch has its
-own document, `docs/MONDIAN_TOUCH.md`.
+reference for each subsystem's node, address and userspace interface in the
+working system, including the ones the port has not reached yet. The touch has
+its own document, `docs/MONDIAN_TOUCH.md`.
 
 Keep it as a table of facts, not a plan; the work items are in
 `docs/MONDIAN_PORT.md`.
@@ -39,7 +39,7 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
   8bpp, timing nodes at 60/90/120 Hz, `te-using-te-pin`, `te-check-enable`,
   `te-pin-select=1`, `mdp-trigger=none`, `dma-trigger=trigger_sw`,
   `dsi-ctrl-num=0`. A command-mode panel needs one `CTL_START` per frame; the
-  iPhone X userland and CA target 60.
+  iPhone X userland's native target is 60, the port's tick is 120 (`0406`).
 - Brightness is `bl_ctrl_dcs`: a DCS command to the panel, scale 0..4095
   (`/sys/class/backlight/panel0-backlight`), not a PWM.
 - AMOLED rails: `qcom,qpnp-amoled-regulator`, `oledb@fa00` (5.0-8.0 V).
@@ -54,7 +54,9 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
   220-900 MHz (table in `/sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies`).
 - Firmware: `a730_sqe.fw`, `a730_zap.*`, `gmu_gen70000.bin` in
   `/vendor/firmware`.
-- A Metal driver is out of scope for now; the port renders in software.
+- Metal is partial: Metal2Vulkan creates a device and passes blit/clear tests,
+  but no iOS process asks for it; the UI composites through Mesa GLES
+  (`docs/MONDIAN_GPU.md`).
 
 ## Audio
 
