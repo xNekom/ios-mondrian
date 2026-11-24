@@ -38,9 +38,11 @@ install bison`; the script puts `/opt/homebrew/opt/bison/bin` first). It makes
 its own meson venv, so no global meson is needed. A `MESA=` tree is edited in
 place, so point it at a scratch checkout. After changing
 `mondrian-darwin.patch`, the script applies the base diff once (its marker is
-`meson.build` naming `mondrian-drm`) and then applies only the A725 warm-up
-hunk set when `fd6_context.h` lacks it; an edit to either existing hunk needs a
-fresh `out/mesa/mesa-25.0.7`.
+`meson.build` naming `mondrian-drm`) and then only the hunk sets a tree from
+before them lacks: the A725 warm-up (`fd6_context.h`), the framebuffer-fetch
+barrier (`freedreno_batch.h`) and the a7xx binning packet (`fd6_gmem.cc` naming
+`CP_SET_BIN_DATA5_OFFSET`). An edit to an existing hunk needs a fresh
+`out/mesa/mesa-25.0.7`.
 
 The result is in `out/mesa/stage/`: `libOSMesa.8.dylib` (ad-hoc signed,
 install name `/usr/lib/libOSMesa.8.dylib`), `gl.xml` (Mesa's GL registry, for

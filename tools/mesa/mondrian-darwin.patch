@@ -618,3 +618,92 @@
     if (ctx->batch->barrier)
        fd6_barrier_flush<CHIP>(ctx->batch);
  
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -550,6 +550,7 @@
+    }
+ }
+ 
++template <chip CHIP>
+ static void
+ update_vsc_pipe(struct fd_batch *batch)
+ {
+@@ -627,6 +628,27 @@
+       ring, A6XX_VSC_DRAW_STRM_ADDRESS(.bo = fd6_ctx->vsc_draw_strm),
+       A6XX_VSC_DRAW_STRM_PITCH(.dword = fd6_ctx->vsc_draw_strm_pitch),
+       A6XX_VSC_DRAW_STRM_LIMIT(.dword = fd6_ctx->vsc_draw_strm_pitch - 64));
++
++   if (CHIP >= A7XX) {
++      /* a7xx takes the per-bin stream addresses from the SQE's private
++       * pseudo-registers, not from the VSC registers: a6xx's seven-dword
++       * CP_SET_BIN_DATA5 below leaves the a730 SQE without a memory read
++       * length and parks it (pc 0x603/0x604, no fence). Turnip sets the
++       * three addresses once (CP_SET_PSEUDO_REG) and then points each bin
++       * at an offset from them (CP_SET_BIN_DATA5_OFFSET).
++       */
++      OUT_PKT7(ring, CP_SET_PSEUDO_REG, 3 * 3);
++      OUT_RING(ring,
++               A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(DRAW_STRM_ADDRESS));
++      OUT_RELOC(ring, fd6_ctx->vsc_draw_strm, 0, 0, 0);
++      OUT_RING(ring,
++               A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(DRAW_STRM_SIZE_ADDRESS));
++      OUT_RELOC(ring, fd6_ctx->vsc_draw_strm,
++                max_vsc_pipes * fd6_ctx->vsc_draw_strm_pitch, 0, 0);
++      OUT_RING(ring,
++               A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(PRIM_STRM_ADDRESS));
++      OUT_RELOC(ring, fd6_ctx->vsc_prim_strm, 0, 0, 0);
++   }
+ }
+ 
+ /*
+@@ -972,7 +994,7 @@
+ 
+    OUT_REG(ring, A6XX_VFD_MODE_CNTL(.render_mode = BINNING_PASS));
+ 
+-   update_vsc_pipe(batch);
++   update_vsc_pipe<CHIP>(batch);
+ 
+    if (CHIP == A6XX) {
+       OUT_REG(ring, A6XX_PC_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
+@@ -1276,17 +1298,30 @@
+       OUT_PKT7(ring, CP_SET_MODE, 1);
+       OUT_RING(ring, 0x0);
+ 
+-      OUT_PKT7(ring, CP_SET_BIN_DATA5, 7);
+-      OUT_RING(ring, CP_SET_BIN_DATA5_0_VSC_SIZE(pipe->w * pipe->h) |
+-                        CP_SET_BIN_DATA5_0_VSC_N(tile->n));
+-      OUT_RELOC(ring, fd6_ctx->vsc_draw_strm, /* per-pipe draw-stream address */
+-                (tile->p * fd6_ctx->vsc_draw_strm_pitch), 0, 0);
+-      OUT_RELOC(
+-         ring, fd6_ctx->vsc_draw_strm, /* VSC_DRAW_STRM_ADDRESS + (p * 4) */
+-         (tile->p * 4) + (num_vsc_pipes * fd6_ctx->vsc_draw_strm_pitch),
+-         0, 0);
+-      OUT_RELOC(ring, fd6_ctx->vsc_prim_strm,
+-                (tile->p * fd6_ctx->vsc_prim_strm_pitch), 0, 0);
++      if (CHIP >= A7XX) {
++         /* The per-pipe addresses are offsets from the pseudo-registers that
++          * update_vsc_pipe() set for this binning pass.
++          */
++         OUT_PKT7(ring, CP_SET_BIN_DATA5_OFFSET, 4);
++         OUT_RING(ring,
++                  CP_SET_BIN_DATA5_OFFSET_0_VSC_SIZE(pipe->w * pipe->h) |
++                     CP_SET_BIN_DATA5_OFFSET_0_VSC_N(tile->n));
++         OUT_RING(ring, tile->p * fd6_ctx->vsc_draw_strm_pitch);
++         OUT_RING(ring, tile->p * 4); /* VSC_DRAW_STRM_SIZE + (p * 4) */
++         OUT_RING(ring, tile->p * fd6_ctx->vsc_prim_strm_pitch);
++      } else {
++         OUT_PKT7(ring, CP_SET_BIN_DATA5, 7);
++         OUT_RING(ring, CP_SET_BIN_DATA5_0_VSC_SIZE(pipe->w * pipe->h) |
++                           CP_SET_BIN_DATA5_0_VSC_N(tile->n));
++         OUT_RELOC(ring, fd6_ctx->vsc_draw_strm, /* per-pipe draw-stream address */
++                   (tile->p * fd6_ctx->vsc_draw_strm_pitch), 0, 0);
++         OUT_RELOC(
++            ring, fd6_ctx->vsc_draw_strm, /* VSC_DRAW_STRM_ADDRESS + (p * 4) */
++            (tile->p * 4) + (num_vsc_pipes * fd6_ctx->vsc_draw_strm_pitch),
++            0, 0);
++         OUT_RELOC(ring, fd6_ctx->vsc_prim_strm,
++                   (tile->p * fd6_ctx->vsc_prim_strm_pitch), 0, 0);
++      }
+ 
+       OUT_PKT7(ring, CP_SET_VISIBILITY_OVERRIDE, 1);
+       OUT_RING(ring, 0x0);
