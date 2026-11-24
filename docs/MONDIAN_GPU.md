@@ -485,15 +485,22 @@ them has Metal. That is the path this port follows.
   1.5 MiB in 57 us, but the cost does not follow the bytes: the frame then
   carries 46 buffers instead of 25, the submit time stays (4136 us a frame), and
   the UI settled at a 41.7 ms cadence, so the heaps stay.
-  Marking the byte ranges instead (the form the reader
-  below describes) parked the CP -- `uc retired 28 of 76`, `fault 0x0`, black
-  panel, `present 0` -- because two writers that both find the counter at zero
-  reset the recorded range and one is lost, and because the ring heap puts
-  several command streams in one block. What it bought was 4.3 MiB less, 0.3 ms
-  of a 3.4-5.9 ms budget: the scanout copy (about 3.9 ms a present) is the
-  frame's largest item, not the writeback. `gpusyncwrites=1` switches the
-  announced rule on, `gpusyncall=1` still writes everything back, and
-  `gpusynclog=1` names each buffer of the fourth submission.
+  Marking the byte ranges instead does not work on this port, and two attempts
+  say why. The first carried the range in the per-buffer counter: two writers
+  that both find it at zero reset it and one range is lost, and the ring heap
+  puts several command streams in one block, so the boot parked (`fault 0x0`,
+  black panel, `present 0`). The second removed the shared state -- Mesa builds
+  the range at submit time as the hull of the slices that submission attaches --
+  and the kernel checks every command of the submission against it, falling back
+  to the whole block when one falls outside. The check never fired, the
+  submission dropped to 4.4-4.9 MiB, and the GPU still waited 139 ms a present:
+  the CP fetches command data that is neither one of the submission's command
+  ranges nor one of its attached slices. The heap block is the unit of the
+  writeback; anything finer is a stall, and what it would buy is 0.3 ms of a
+  3.4-5.9 ms budget. The scanout copy (about 3.9 ms a present) is the frame's
+  largest item, not the writeback. `gpusyncwrites=1` switches the announced
+  rule on, `gpusyncall=1` still writes everything back, and `gpusynclog=1`
+  names each buffer of the fourth submission.
   Mapping the buffers write-combined (`kIOMapWriteCombineCache`, the way Linux
   maps GEM buffers) would remove the writeback altogether, but on this port the
   first `IOConnectMapMemory64` with that flag fails: zero `MONDRIAN DRM: map`
