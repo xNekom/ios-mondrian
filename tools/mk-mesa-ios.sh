@@ -134,17 +134,6 @@ if ! grep -q 'MSM_SUBMIT_BO_CPU_WRITE' "$src/include/drm-uapi/msm_drm.h"; then
 		echo "error: could not apply $writepatch" >&2
 		exit 1
 	fi
-elif ! grep -q 'fd_bo_note_cpu_write' \
-    "$src/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h"; then
-	# A tree patched before the ringbuffer objects were announced: apply
-	# that hunk alone, from its file marker to the end of the patch.
-	echo "== applying the ringbuffer-object announcements"
-	if ! sed -n '/^--- a\/src\/freedreno\/drm\/freedreno_ringbuffer_sp_reloc.h/,$p' \
-	    "$writepatch" | patch -p1 -d "$src" --batch --forward \
-	    --no-backup-if-mismatch; then
-		echo "error: could not apply the ringbuffer-object hunk" >&2
-		exit 1
-	fi
 fi
 
 # meson, and the python modules Mesa's generators import.
