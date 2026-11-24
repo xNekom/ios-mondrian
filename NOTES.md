@@ -300,12 +300,12 @@ back. `CTL_START` (`0x01c`) bit 0 clears on completion and stays 1 if it never d
 `CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`, with Normal Non-cacheable
 stores. CTL0 is the active controller, INTF1 the interface; in command
 mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
-Diagnostics: `mondrianfb_mdp`, `mondrianfb_kick=N`, `mondrianfb_test`, `mondrianfb_defer=0`.
 
-**Direct scanout needs the reset path too.** `mfs=4` (`0410`) flips `SRC0` to
-the compositor's surface through `apps_smmu`, and a warm reset in that state
-leaves the bootloader with **no USB at all**; `mondrian_fb_shutdown()` puts
-`SRC0` back on the carve-out and clears the bank's `SCTLR` (`0411`).
+**Direct scanout strands the bootloader on a reset.** `mfs=4` (`0410`) flips
+`SRC0` to the compositor's surface through `apps_smmu`, and a warm reset in that
+state leaves the bootloader with **no USB at all**; restoring `SRC0` and the
+bank (`0411`) plus the port down (`0409`) does not fix it, while the copy path
+resets cleanly.
 
 **Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
 through the embedded DMA (a FIFO send wedges the engine: `INT_CTRL` `0x500`,
