@@ -1,0 +1,243 @@
+--- a/include/drm-uapi/msm_drm.h
++++ b/include/drm-uapi/msm_drm.h
+@@ -239,6 +239,15 @@
+ #define MSM_SUBMIT_BO_DUMP             0x0004
+ #define MSM_SUBMIT_BO_NO_IMPLICIT      0x0008
+ 
++/*
++ * The kernel never sees the device's cache hierarchy, so on a platform whose
++ * CPU mappings are not coherent with the GPU it has to be told that the CPU
++ * wrote a buffer: freedreno's mappings persist and no per-write ioctl marks
++ * them, so this rides on the submission that follows the write.  A buffer
++ * carrying it is written back before the CP fetches it.  Not upstream's flag.
++ */
++#define MSM_SUBMIT_BO_CPU_WRITE        0x10000000
++
+ #define MSM_SUBMIT_BO_FLAGS            (MSM_SUBMIT_BO_READ | \
+ 					MSM_SUBMIT_BO_WRITE | \
+ 					MSM_SUBMIT_BO_DUMP | \
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -230,6 +230,14 @@
+    struct list_head node; /* bucket-list entry */
+    time_t free_time;      /* time when added to bucket-list */
+ 
++   /**
++    * The CPU wrote this buffer since the last submission that carried the
++    * mark.  A counter, not a flag: the submit thread clears it only if no
++    * write happened while the submit was in flight, so a write that races
++    * the submit is carried by the next one instead of being lost.
++    */
++   uint32_t cpu_dirty;
++
+    unsigned short nr_fences, max_fences;
+    struct fd_fence **fences;
+ 
+@@ -302,6 +310,11 @@
+ uint32_t fd_bo_size(struct fd_bo *bo);
+ void *fd_bo_map(struct fd_bo *bo);
+ void fd_bo_upload(struct fd_bo *bo, void *src, unsigned off, unsigned len);
++/* The CPU wrote this buffer; the next submission must write it back.  A
++ * suballocated bo carries the mark on its heap block, which is what the
++ * submit's bo table names.
++ */
++void fd_bo_mark_cpu_dirty(struct fd_bo *bo);
+ bool fd_bo_prefer_upload(struct fd_bo *bo, unsigned len);
+ int fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op);
+ bool fd_bo_is_cached(struct fd_bo *bo);
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -672,8 +672,19 @@
+ }
+ 
+ void
++fd_bo_mark_cpu_dirty(struct fd_bo *bo)
++{
++   if (suballoc_bo(bo))
++      bo = fd_bo_heap_block(bo);
++
++   p_atomic_inc(&bo->cpu_dirty);
++}
++
++void
+ fd_bo_upload(struct fd_bo *bo, void *src, unsigned off, unsigned len)
+ {
++   fd_bo_mark_cpu_dirty(bo);
++
+    if (bo->funcs->upload) {
+       bo->funcs->upload(bo, src, off, len);
+       return;
+--- a/src/freedreno/drm/msm/msm_ringbuffer_sp.c
++++ b/src/freedreno/drm/msm/msm_ringbuffer_sp.c
+@@ -116,10 +116,27 @@
+       submit_bos = malloc(fd_submit->nr_bos * sizeof(submit_bos[0]));
+    }
+ 
++   /* The CPU-write counter each bo carried when its flags were built: after
++    * the submit, only a bo whose counter still matches is clean.
++    */
++   uint32_t dirty_seq[fd_submit->nr_bos ? fd_submit->nr_bos : 1];
++
+    for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
+-      submit_bos[i].flags = fd_submit->bos[i]->reloc_flags;
+-      submit_bos[i].handle = fd_submit->bos[i]->handle;
++      struct fd_bo *bo = fd_submit->bos[i];
++
++      submit_bos[i].flags = bo->reloc_flags;
++      submit_bos[i].handle = bo->handle;
+       submit_bos[i].presumed = 0;
++      /* A command stream is the CPU's own writing by definition, and a bo
++       * the CPU marked is one it wrote since the last submission.  Both have
++       * to reach DRAM before the CP fetches them, and the kernel writes the
++       * whole buffer back: a byte range that misses one write leaves the CP
++       * executing stale dwords.  The mark's counter is kept so a write that
++       * races this submission is not cleared below.
++       */
++      dirty_seq[i] = p_atomic_read(&bo->cpu_dirty);
++      if (dirty_seq[i] || (bo->alloc_flags & FD_BO_HINT_COMMAND))
++         submit_bos[i].flags |= MSM_SUBMIT_BO_CPU_WRITE;
+    }
+ 
+    req.bos = VOID2U64(submit_bos);
+@@ -135,6 +152,12 @@
+       ERROR_MSG("submit failed: %d (%s)", ret, strerror(errno));
+       msm_dump_submit(&req);
+    } else if (!ret) {
++      for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
++         struct fd_bo *bo = fd_submit->bos[i];
++
++         if (dirty_seq[i] && p_atomic_read(&bo->cpu_dirty) == dirty_seq[i])
++            p_atomic_set(&bo->cpu_dirty, 0);
++      }
+       fd_submit->out_fence->kfence = req.fence;
+       fd_submit->out_fence->fence_fd = req.fence_fd;
+    }
+--- a/src/gallium/auxiliary/util/u_upload_mgr.c
++++ b/src/gallium/auxiliary/util/u_upload_mgr.c
+@@ -304,6 +304,18 @@
+    *ptr = upload->map + offset;
+    *out_offset = offset;
+ 
++   if (upload->map_persistent) {
++      /*
++       * This mapping is never unmapped, so a driver that only hears about
++       * CPU writes from the unmap path would never hear about these.  Tell
++       * it the range is being written: a driver whose CPU mapping is not
++       * coherent with the GPU turns this into the cache maintenance the
++       * next submission needs, and a coherent driver has nothing to do.
++       */
++      pipe_buffer_flush_mapped_range(upload->pipe, upload->transfer,
++                                     offset - upload->transfer->box.x, size);
++   }
++
+    if (*outbuf != upload->buffer) {
+       pipe_resource_reference(outbuf, NULL);
+       *outbuf = upload->buffer;
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -666,6 +666,15 @@
+       util_range_add(&rsc->b.b, &rsc->valid_buffer_range,
+                      ptrans->box.x + box->x,
+                      ptrans->box.x + box->x + box->width);
++
++   /*
++    * A mapped range was written: a persistent mapping never reaches the
++    * unmap path (u_upload's is the important one), so this is the only
++    * signal the submission gets that the buffer has to go back to DRAM.
++    * The kernel is told the whole buffer is CPU-written, because a byte
++    * range that misses one write leaves the CP executing stale dwords.
++    */
++   fd_bo_mark_cpu_dirty(rsc->bo);
+ }
+ 
+ static void
+@@ -789,6 +798,9 @@
+ 
+    ctx->stats.staging_uploads++;
+ 
++   if (usage & PIPE_MAP_WRITE)
++      fd_bo_mark_cpu_dirty(staging_rsc->bo);
++
+    return fd_bo_map(staging_rsc->bo);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -305,6 +305,7 @@
+ 
+    fd_context_add_private_bo(&fd6_ctx->base, fd6_ctx->control_mem);
+ 
++   fd_bo_mark_cpu_dirty(fd6_ctx->control_mem);
+    memset(fd_bo_map(fd6_ctx->control_mem), 0, sizeof(struct fd6_control));
+ 
+    fd_context_setup_common_vbos(&fd6_ctx->base);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -1109,6 +1109,7 @@
+       fd_bo_del(shader_bo);
+       return false;
+    }
++   fd_bo_mark_cpu_dirty(shader_bo);
+    memcpy(shader_map, raw_shader, sizeof(raw_shader));
+ 
+    ring = fd_ringbuffer_new_object(ctx->pipe, 47 * 4);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -714,6 +714,7 @@
+       return;
+ 
+    /* clear overflow flag: */
++   fd_bo_mark_cpu_dirty(fd6_ctx->control_mem);
+    control->vsc_overflow = 0;
+ 
+    unsigned buffer = vsc_overflow & 0x3;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+@@ -207,6 +207,7 @@
+ 
+       uint32_t *desc_buf = (uint32_t *)fd_bo_map(set->bo);
+ 
++      fd_bo_mark_cpu_dirty(set->bo);
+       memcpy(desc_buf, set->descriptor, sizeof(set->descriptor));
+ 
+       if (unlikely(append_fb_read)) {
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+@@ -239,6 +239,7 @@
+       return 0;
+    }
+ 
++   fd_bo_mark_cpu_dirty(fd6_ctx->bcolor_mem);
+    entries[idx] = key;
+ 
+    _mesa_hash_table_insert_pre_hashed(fd6_ctx->bcolor_cache, hash,
+--- a/src/gallium/drivers/freedreno/ir3/ir3_const.h
++++ b/src/gallium/drivers/freedreno/ir3/ir3_const.h
+@@ -506,6 +506,7 @@
+       void *ptr;
+ 
+       ptr = fd_bo_map(fd_resource(vertex_params_rsc)->bo);
++      fd_bo_mark_cpu_dirty(fd_resource(vertex_params_rsc)->bo);
+       memcpy(ptr, vertex_params, vertex_params_size * 4);
+ 
+       if (info->index_size) {
+--- a/src/gallium/drivers/freedreno/freedreno_query_acc.c
++++ b/src/gallium/drivers/freedreno/freedreno_query_acc.c
+@@ -45,6 +45,7 @@
+    fd_bo_cpu_prep(rsc->bo, ctx->pipe, FD_BO_PREP_WRITE);
+ 
+    map = fd_bo_map(rsc->bo);
++   fd_bo_mark_cpu_dirty(rsc->bo);
+    memset(map, 0, aq->size);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/freedreno_context.c
++++ b/src/gallium/drivers/freedreno/freedreno_context.c
+@@ -489,6 +489,7 @@
+ 
+    if (ring->cur == batch->last_timestamp_cmd) {
+       uint64_t *ts = fd_bo_map(fd_resource(buffer)->bo) + offset_B;
++      fd_bo_mark_cpu_dirty(fd_resource(buffer)->bo);
+       *ts = U_TRACE_NO_TIMESTAMP;
+       return;
+    }

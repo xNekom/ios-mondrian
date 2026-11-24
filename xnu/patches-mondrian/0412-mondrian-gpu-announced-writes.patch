@@ -1,0 +1,370 @@
+xnu 0412: a submission writes back the buffers the client marks as CPU-written
+
+A home-screen frame makes 11-17 submissions and 3.4-5.9 ms of it is inside
+them, 260-300 us each (`mondrian-gl: submits:`), while the ring clean and the
+doorbell cost 370 ns. The submission is not the GPU: `MondrianGPU: wrote back
+16 of 22 buffers (12496 KiB), 371 us` is the user client writing back every
+mapped buffer, because a mapping is the only evidence it has that the CPU
+*wrote* it. freedreno's mappings persist and fd_bo_cpu_prep returns without an
+ioctl for a buffer it does not share, so 0221's exact rule had to fall back to
+"mapped means written" and 0252 could only cap it by size.
+
+The client can say it exactly: Mesa marks each buffer the CPU wrote -- the
+upload path, writable transfer maps and flushes, the driver's own control,
+border-colour, descriptor, vertex-parameter and warm-up buffers -- and the
+submission that carries the buffer sets MSM_SUBMIT_BO_CPU_WRITE. The mark
+rides on the submission, so no per-write ioctl is needed, and the submission
+after the write writes back those buffers and the kernel's own dirty ones, and
+holds the rest: the home screen's fourth submission becomes 3 of 25 buffers
+(8208 KiB) in 193-234 us instead of 16 of 22 (12496 KiB) in 371 us. A counter,
+not a flag, keeps a write that races the submit from being cleared without
+going out (tools/mesa/mondrian-gpu-writes.patch).
+
+The buffer goes back whole, not by the byte range the client wrote. The range
+was tried: with (offset << 32) | length in `presumed`, the fourth submission
+announced 25 KiB and the boot stopped at the black spinner (`present 0`,
+`uc retired 28 of 76`, `fault 0x0`). Two writers that both find the counter at
+zero reset the recorded range and one of them is lost, and the ring heap
+suballocates several of them into one 4 MiB block, so the range describes
+whoever marked last instead of everyone. A range that misses one write is a
+command stream the CP executes stale, which parks it. The announcement is what
+removes the 12.5 MiB; the bytes it saves on top did not reach the frame anyway
+(see the paragraph above: 4.3 MiB less is 0.3 ms of a 3.4-5.9 ms budget).
+
+An adopted IOSurface is the one buffer whose writer is not this client: an app
+locks it, writes the pixels, unlocks. MondrianSurface already bumps a seed on
+every write unlock, so surfaceBuffer hands the seed to bufferAdopt and a
+re-adoption of pixels nobody wrote no longer dirties the whole surface: the
+4.5 MB surfaces the window server re-adopts every frame were written back on
+every submission before. Memory with no seed (a process's own pages) keeps
+the conservative rule, and gpusynclog=1 names each buffer of the fourth
+submission with its size, flags and seed.
+
+gpusyncwrites=1 switches the rule on; without it the mapped rule stands, so a
+boot that reads a buffer stale has one argument to blame and one to remove.
+gpusyncall=1 still writes everything back.
+--- a/iokit/Kernel/arm/MondrianGPU.cpp
++++ b/iokit/Kernel/arm/MondrianGPU.cpp
+@@ -133,6 +133,14 @@ struct mondrian_user_memory {
+ #define MSM_INFO_GET_FLAGS	0x05
+ #define MSM_SUBMIT_CMD_BUF	1
+ #define MSM_PREP_NOSYNC		0x04
++/*
++ * The client's submit says the CPU wrote the buffer since it last handed it
++ * on, so the buffer has to reach DRAM before the CP fetches it. The flag
++ * rides on the submission because freedreno's mappings are persistent: a
++ * per-write ioctl would cost more than the writeback it replaces. The client
++ * side is tools/mesa/mondrian-gpu-writes.patch.
++ */
++#define MSM_SUBMIT_BO_CPU_WRITE	0x10000000
+ 
+ #define kMondrianBufferMax	(256u << 20)
+ #define kMondrianBuffers	1024
+@@ -169,6 +177,47 @@ mondrian_sync_all(void)
+ 	return all != 0;
+ }
+ 
++/*
++ * gpusyncwrites=1: trust the submission's CPU-write flags (the client marks
++ * every buffer it wrote, see MSM_SUBMIT_BO_CPU_WRITE) and stop writing back
++ * a buffer merely because the task holds a mapping of it. Without the
++ * argument the old rule stands: mapped buffers are written back on every
++ * submission. Measured on the home screen: 15-17 submissions a frame and
++ * 4.5-5.0 ms inside them, 260-300 us each, while a submission writes back
++ * 12.5 MB of mapped buffers the frame may barely have touched.
++ */
++static bool
++mondrian_sync_writes(void)
++{
++	static int parsed;
++	static int writes;
++
++	if (parsed == 0) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("gpusyncwrites", &writes,
++		    sizeof(writes));
++	}
++	return writes != 0;
++}
++
++/*
++ * gpusynclog=1: name every buffer of the fourth submission (the first one the
++ * startup has settled into) with its size and the reason it is synced. That
++ * is what can attribute a writeback to a handle instead of a total.
++ */
++static bool
++mondrian_sync_log(void)
++{
++	static int parsed;
++	static int on;
++
++	if (parsed == 0) {
++		parsed = 1;
++		(void)PE_parse_boot_argn("gpusynclog", &on, sizeof(on));
++	}
++	return on != 0;
++}
++
+ /*
+  * gpusyncmapmax=<KiB>: a mapped buffer larger than that is written back only
+  * when it is a command stream or the kernel wrote it, not because the task
+@@ -177,7 +226,9 @@ mondrian_sync_all(void)
+  * surfaces the compositor renders into are most of it -- bytes the CPU never
+  * wrote, which the GPU then reads back. The panel copy invalidates what it
+  * reads (mondrian_fb_clean), so the display surface needs no writeback here.
+- * Zero keeps the old rule: every mapped buffer is written back.
++ * Zero keeps the old rule: every mapped buffer is written back. It is only
++ * consulted without gpusyncwrites=1; that argument trusts the client's
++ * per-buffer marks instead.
+  */
+ static uint32_t
+ mondrian_sync_map_max(void)
+@@ -198,16 +249,20 @@ mondrian_sync_map_max(void)
+  *
+  *	dirty	fresh memory (the zero fill sits in the cache) or the kernel
+  *		wrote it; bufferSync clears it.
+- *	mapped	the task holds a mapping of it, which is the only way its CPU
+- *		writes reach the buffer (clientMemoryForType). It is never
+- *		cleared: the task may write anywhere in it at any time, and
+- *		freedreno does not announce a write -- fd_bo_cpu_prep returns
+- *		without an ioctl for a buffer it does not share, so msm's
+- *		cpu_prep is not a per-write signal here.
++ *	wrote	the client set MSM_SUBMIT_BO_CPU_WRITE: it wrote the buffer
++ *		since the last submission. The client marks fd_bo_upload, a
++ *		transfer map/flush and its own state buffers
++ *		(tools/mesa/mondrian-gpu-writes.patch); this is the exact
++ *		signal, and gpusyncwrites=1 uses it instead of `mapped`.
++ *	mapped	the task holds a mapping of it (clientMemoryForType). It
++ *		says the CPU *can* write the buffer, not that it did, so
++ *		writing back on it costs the whole buffer on every submission
++ *		-- the frame's largest item. Without gpusyncwrites=1 it stays
++ *		the fallback for a client that does not mark its writes.
+  *
+- * A buffer that is neither mapped nor a command stream therefore cannot have
+- * been written by the task at all, and after its first writeback it never
+- * needs another one.
++ * A buffer that is neither mapped nor a command stream cannot have been
++ * written by the task at all, and after its first writeback it never needs
++ * another one.
+  */
+ struct mondrian_buffer {
+ 	uint32_t handle;
+@@ -217,6 +272,7 @@ struct mondrian_buffer {
+ 	bool dirty;
+ 	bool mapped;
+ 	bool prepared;		/* the descriptor was prepared here: complete it on free */
++	uint32_t surfaceSeed;	/* the IOSurface write seed last adopted, 0 if none */
+ };
+ 
+ class MondrianGPU;
+@@ -255,7 +311,8 @@ private:
+ 	    uint32_t outMax);
+ 	mondrian_buffer *bufferForType(uint32_t type);
+ 	mondrian_buffer *bufferNew(uint64_t size);
+-	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size);
++	mondrian_buffer *bufferAdopt(IOMemoryDescriptor *memory, uint64_t size,
++	    bool surface, uint32_t seed);
+ 	void bufferFree(mondrian_buffer *buffer);
+ 	void bufferSync(mondrian_buffer *buffer);
+ 	void freeAll(void);
+@@ -278,6 +335,7 @@ private:
+ 	uint32_t fSurfaceLogged;     /* surfaceBuffer() lines printed */
+ 	uint32_t fPrepLogged;
+ 	bool fSyncAll;
++	bool fSyncWrites;
+ 	bool f2dFillDone;           /* the gpu2dfill test ran */
+ 	bool f2dSurfaceDone;        /* the surface fill ran */
+ 	bool f2dFaultDone;          /* the unmapped-destination blit ran */
+@@ -414,6 +472,7 @@ MondrianGPUUserClient::initWithTask(task_t owningTask, void *securityToken,
+ 	fEntries = 0;
+ 	fSubmitLogged = 0;
+ 	fSyncAll = mondrian_sync_all();
++	fSyncWrites = mondrian_sync_writes();
+ 	fSurfaceLogged = 0;
+ 	f2dFillDone = false;
+ 	f2dSurfaceDone = false;
+@@ -637,7 +696,8 @@ mondrian_refuse(const char *why)
+ }
+ 
+ mondrian_buffer *
+-MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
++MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size,
++    bool surface, uint32_t seed)
+ {
+ 	mondrian_buffer *buffer;
+ 	uint64_t iova, off;
+@@ -657,18 +717,29 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 	 * would no longer be one number, and nothing says they stay in step.
+ 	 * One buffer per memory descriptor: the same pixels, one iova.
+ 	 *
+-	 * The return keeps `dirty` set: the CPU may have written the pixels
+-	 * since the last submit, and the second adoption is not the moment to
+-	 * assume it has not.
++	 * A surface's pixels belong to whoever writes them, and the CPU is the
++	 * one that can write them behind the GPU's back. Its write seed (bumped
++	 * by every write unlock, MondrianSurface.cpp) says whether that has
++	 * happened since the last adoption, so a re-adoption of pixels nobody
++	 * wrote is not a reason to write 4 MiB back on every submission. Memory
++	 * with no seed -- a process's own pages -- keeps the conservative rule.
+ 	 */
+ 	for (i = 0; i < fBufferCount; i++) {
+ 		if (fBuffers[i]->memory == memory &&
+ 		    fBuffers[i]->size == size) {
+-			fBuffers[i]->dirty = true;
++			bool again = !surface || fBuffers[i]->surfaceSeed != seed;
++
++			if (again) {
++				fBuffers[i]->dirty = true;
++				if (surface) {
++					fBuffers[i]->surfaceSeed = seed;
++				}
++			}
+ 			IOLog("MondrianGPU: adopt reuse handle %u iova 0x%llx "
+-			    "size %llu\n", fBuffers[i]->handle,
++			    "size %llu seed %u%s\n", fBuffers[i]->handle,
+ 			    (unsigned long long)fBuffers[i]->iova,
+-			    (unsigned long long)fBuffers[i]->size);
++			    (unsigned long long)fBuffers[i]->size,
++			    surface ? seed : 0, again ? " dirty" : " clean");
+ 			return fBuffers[i];
+ 		}
+ 	}
+@@ -710,10 +781,13 @@ MondrianGPUUserClient::bufferAdopt(IOMemoryDescriptor *memory, uint64_t size)
+ 	buffer->memory = memory;
+ 	/* Fresh memory is zeroed through the caches and an adopted IOSurface
+ 	 * was filled by somebody else, so the next submission writes it back
+-	 * once. After that it is only ever synced if the task maps it. */
++	 * once. After that a surface only comes back when its write seed
++	 * changed, and a mapping is no longer evidence of a write when
++	 * gpusyncwrites=1 (see struct mondrian_buffer). */
+ 	buffer->dirty = true;
+ 	buffer->mapped = false;
+ 	buffer->prepared = false;
++	buffer->surfaceSeed = surface ? seed : 0;
+ 	fBuffers[fBufferCount++] = buffer;
+ 	mondrian_gpu_buffer_bytes += size;
+ 	mondrian_gpu_buffer_count++;
+@@ -773,7 +847,7 @@ MondrianGPUUserClient::bufferNew(uint64_t size)
+ 			return NULL;
+ 		}
+ 	}
+-	buffer = bufferAdopt(memory, size);
++	buffer = bufferAdopt(memory, size, false, 0);
+ 	memory->release();
+ 	return buffer;
+ }
+@@ -911,7 +985,8 @@ MondrianGPUUserClient::surfaceBuffer(struct mondrian_surface *request)
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockLock(fLock);
+-	buffer = bufferAdopt(surface->memory, surface->allocSize);
++	buffer = bufferAdopt(surface->memory, surface->allocSize, true,
++	    mondrian_surface_seed_value(surface));
+ 	IOLockUnlock(fLock);
+ 	surface->release();
+ 	if (buffer == NULL) {
+@@ -959,7 +1034,7 @@ MondrianGPUUserClient::userMemory(struct mondrian_user_memory *request)
+ 		return kIOReturnNoMemory;
+ 	}
+ 	IOLockLock(fLock);
+-	buffer = bufferAdopt(memory, request->size);
++	buffer = bufferAdopt(memory, request->size, false, 0);
+ 	IOLockUnlock(fLock);
+ 	if (buffer == nullptr) {
+ 		memory->complete(kIODirectionInOut);
+@@ -1670,16 +1745,18 @@ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ 	 * submits the 18 MiB display surface too, 4500 pages of
+ 	 * getPhysicalSegment and flush_dcache64, and the writes that buffer
+ 	 * needs are the GPU's. See struct mondrian_buffer for what "the CPU
+-	 * can have written" rests on: mapped by the task (a mapping is the
+-	 * only channel), dirty (fresh, or written by this driver), or a
+-	 * command stream, which the CP fetches itself and the rewrites above
+-	 * write into.
++	 * can have written" rests on: the submission's CPU-write flag (the
++	 * client marks each buffer it wrote), dirty (fresh, or written by this
++	 * driver), a command stream, which the CP fetches itself and the
++	 * rewrites above write into, or -- without gpusyncwrites=1 -- the
++	 * task's mapping.
+ 	 */
+ 	syncStart = mach_absolute_time();
+ 	const uint32_t map_max = mondrian_sync_map_max() << 10;
+ 	for (i = 0; i < request->nr_bos; i++) {
+ 		mondrian_buffer *bo = bufferForType(bos[i].handle);
+ 		bool stream = false;
++		bool wrote = (bos[i].flags & MSM_SUBMIT_BO_CPU_WRITE) != 0;
+ 		uint32_t j;
+ 
+ 		if (bo == NULL) {
+@@ -1691,8 +1768,25 @@ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ 				stream = true;
+ 			}
+ 		}
+-		if (fSyncAll || stream || bo->dirty ||
+-		    (bo->mapped && (map_max == 0 || bo->size <= map_max))) {
++		if (mondrian_sync_log() && fSyncLogged == 3) {
++			IOLog("MondrianGPU: bo %u size %llu KiB dirty %u "
++			    "wrote %u stream %u mapped %u seed %u\n",
++			    bo->handle, (unsigned long long)(bo->size >> 10),
++			    bo->dirty, wrote, stream, bo->mapped,
++			    bo->surfaceSeed);
++		}
++		/*
++		 * An announced buffer goes back whole. The client names the
++		 * buffer, not the bytes it wrote: a range that misses one write
++		 * leaves the CP fetching stale dwords, and the ring parks with
++		 * `uc retired 28 of 76`, `fault 0x0` and the panel black. The
++		 * announcement still earns its keep -- it is what makes the
++		 * 12.5 MiB of "mapped means written" go away -- and the
++		 * 16-64 KiB buffers it carries are cheap to flush whole.
++		 */
++		if (fSyncAll || bo->dirty || wrote || stream ||
++		    (!fSyncWrites && bo->mapped &&
++		     (map_max == 0 || bo->size <= map_max))) {
+ 			bufferSync(bo);
+ 			synced++;
+ 			syncedBytes += bo->size;
+@@ -1717,6 +1811,12 @@ MondrianGPUUserClient::submit(struct msm_gem_submit *request)
+ 			IOLog("MondrianGPU: gpusyncall=1: wrote back all %u "
+ 			    "buffers (%llu KiB) in %llu us\n", synced,
+ 			    (unsigned long long)(syncedBytes >> 10), used / 1000);
++		} else if (fSyncWrites) {
++			IOLog("MondrianGPU: wrote back %u of %u buffers "
++			    "(%llu KiB) by announcement, held %u back "
++			    "(%llu KiB), %llu us\n", synced, request->nr_bos,
++			    (unsigned long long)(syncedBytes >> 10), held,
++			    (unsigned long long)(heldBytes >> 10), used / 1000);
+ 		} else {
+ 			IOLog("MondrianGPU: wrote back %u of %u buffers "
+ 			    "(%llu KiB), held %u back (%llu KiB), %llu us\n",
+--- a/iokit/Kernel/arm/MondrianSurface.cpp
++++ b/iokit/Kernel/arm/MondrianSurface.cpp
+@@ -142,6 +142,16 @@ mondrian_surface_seed(MondrianSurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + MONDRIAN_SURFACE_STATE_SEED);
+ }
+ 
++/*
++ * The same seed for a client that only needs its value (the GPU user client:
++ * the surface's pixels are the CPU's until a write unlock bumps it).
++ */
++uint32_t
++mondrian_surface_seed_value(MondrianSurface *surface)
++{
++	return *(volatile uint32_t *)mondrian_surface_seed(surface);
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+--- a/iokit/Kernel/arm/MondrianSurface.h
++++ b/iokit/Kernel/arm/MondrianSurface.h
+@@ -50,6 +50,10 @@ public:
+ /* Retained surface for an id, or NULL. */
+ MondrianSurface *mondrian_surface_copy(uint32_t id);
+ 
++/* The surface's write seed: it increments on every write unlock, so a client
++ * that cached the pixels can tell whether somebody wrote them since. */
++uint32_t mondrian_surface_seed_value(MondrianSurface *surface);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller

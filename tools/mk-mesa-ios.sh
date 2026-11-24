@@ -122,6 +122,31 @@ else
 	fi
 fi
 
+# The CPU-write announcements: which buffers the CPU wrote, carried on the
+# submission so the kernel writes back only those (the Darwin port's CPU
+# mapping is not coherent with the GPU). Separate from the base patch because
+# it is applied to the already-patched tree above, in either branch.
+writepatch=$root/tools/mesa/mondrian-gpu-writes.patch
+if ! grep -q 'MSM_SUBMIT_BO_CPU_WRITE' "$src/include/drm-uapi/msm_drm.h"; then
+	echo "== applying the CPU-write announcements"
+	if ! patch -p1 -d "$src" --batch --forward --no-backup-if-mismatch \
+		< "$writepatch"; then
+		echo "error: could not apply $writepatch" >&2
+		exit 1
+	fi
+elif ! grep -q 'fd_bo_note_cpu_write' \
+    "$src/src/freedreno/drm/freedreno_ringbuffer_sp_reloc.h"; then
+	# A tree patched before the ringbuffer objects were announced: apply
+	# that hunk alone, from its file marker to the end of the patch.
+	echo "== applying the ringbuffer-object announcements"
+	if ! sed -n '/^--- a\/src\/freedreno\/drm\/freedreno_ringbuffer_sp_reloc.h/,$p' \
+	    "$writepatch" | patch -p1 -d "$src" --batch --forward \
+	    --no-backup-if-mismatch; then
+		echo "error: could not apply the ringbuffer-object hunk" >&2
+		exit 1
+	fi
+fi
+
 # meson, and the python modules Mesa's generators import.
 if [ ! -x "$out/venv/bin/meson" ]; then
 	echo "== creating $out/venv"
