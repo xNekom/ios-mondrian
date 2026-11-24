@@ -74,6 +74,15 @@ A RAM boot that dies falls back to `boot_b`, so "command not found" means "old
 kernel" as often as "bug". Compare the ring's `Darwin Kernel Version` line with
 the kernel on disk before reading anything else the ring says.
 
+The fallback image is whatever was flashed last, which can predate the kernel in
+the tree by days, and the `wfile` limit belongs to the running kernel, not to the
+host tool. Measured 2026-11-24: after a fallback to the 17 November image, the
+same `wfile` that had carried 14.8 MB reported `wfile needs a length up to
+1048576` and left a truncated `libOSMesa` on the root; the ring answered and the
+probe boot looked healthy. A deploy checks the banner first, and the durable fix
+is `tools/wsl/flash-image.sh --no-build`, which writes `boot_<slot>` so the
+fallback is the current image.
+
 A `grep -c "MONDRIAN HAP" kernel` written inline in PowerShell comes back 0
 because the quotes never reach grep. Put the check in a script file.
 
