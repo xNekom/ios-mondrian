@@ -14,6 +14,12 @@ __pycache__/
 /ring.bin
 /ring.txt
 
+# iOSOnAnd tracker: local login, CLI and offline queue; the token is never tracked
+.env
+.env.*
+cli.mjs
+TRACKER_QUEUE.md
+
 .DS_Store
 usb-*.txt
 !usb-ring.py

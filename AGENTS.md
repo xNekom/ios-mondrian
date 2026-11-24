@@ -18,8 +18,7 @@ Pro, SM8475) is the port being done here.
 
 ## Repository checks
 
-`python3 tools/check-agent.py` is the whole gate; it fails when a rule declared
-in this file has no check, so a rule cannot be prose only.
+`python3 tools/check-agent.py` is the whole gate and fails when a rule here has no check.
 
 | Id | Check |
 | --- | --- |
@@ -33,9 +32,8 @@ in this file has no check, so a rule cannot be prose only.
 | R08 | Patch numbering, hunk headers and tool syntax (`tools/validate-repo.py`) |
 | R09 | The first-party tests under `tools/tests` pass |
 
-`--only R06` runs one check, `--list` prints the ids, `--verbose` adds detail.
-CI runs the same file (`.github/workflows/validate.yml`), so a local pass is
-the same reading as a red workflow.
+`--only R06` runs one check; `--list`/`--verbose` add detail. CI runs the same file,
+so a local pass is the same reading as a red workflow.
 
 ## Safety: what can and cannot brick the phone
 
@@ -191,10 +189,8 @@ them. A fact that only mattered while debugging is not documentation.
 | `xnu/README.md` | 80 |
 | `xnu/patches-mondrian/README.md` | 80 |
 
-A budget is a ceiling, not a target: if new text would exceed one, delete or
-merge something old in the same edit. `docs/MONDIAN_PORT.md` is 15 lines over
-its old 300 until the safety section folds into this file; it is capped at 320
-in the meantime.
+A budget is a ceiling: delete or merge old text in the same edit. `docs/MONDIAN_PORT.md` is
+capped at 320 until the safety section folds into this file.
 
 ## Repository hygiene
 
@@ -222,17 +218,22 @@ in the meantime.
   `Darwin Kernel Version` line and the console excerpt. Per-session and
   per-round tags are noise: the rollback anchor is the pushed commit.
 
+## iOSOnAnd tracker
+
+The port is at https://hackios.appaiproxy.com/device/poco-f5-pro. Read
+`node cli.mjs status-get --device poco-f5-pro` before a change, then record what
+a build, log or test shows in the same session:
+`node cli.mjs status-set poco-f5-pro <area> works|in-progress|broken --detail
+"<evidence>" --source "<commit or log>"` (`--os`, `--version`, `--photo`).
+Unproven stays `unknown`; post progress with `node cli.mjs update poco-f5-pro
+<files> --text "..."`. The token stays in `TRACKER_TOKEN` or the CLI login.
+
+New code is Rust (boot/loaders, UEFI via `uefi`, host/flash tools, daemons,
+driver logic behind a thin C/C++ shim); C/C++ only for XNU, IOKit's C++
+interfaces, existing C/C++ patches and vendor ABIs. Python is dev-only. Reuse
+OneiOS and iOSPlus10 (`akshaynexus/*`, MIT; credit them) before writing a tool.
+
 ## Skills
 
-- `mondrian-ufs-debug` - a boot that leaves no log, or stops before the UFS
-  root; UPIU/OCS/sense decoding.
-- `qualcomm-device-tree` - pulling numbers out of the live DTB or the vendor
-  dtsi into `boards.py` and `shim/board.h`.
-- `xnu-arm64-board-port` - memory window, pmap, GIC, timer, early console, and
-  "why does XNU not get past <milestone>".
-- `xnu-fb-console-triage` - reading a boot photo or a screen transcript,
-  including the colour-bar self-test.
-- `xnu-patch-stack` - authoring, rebasing and validating `00NN` patches, and
-  the CI run that builds them.
-- `mondrian-device-cycle` - one experiment end to end: slot recovery, proving
-  the kernel, attaching the phone to WSL, never piping a build.
+Load the skill for the subsystem from `.github/skills/<id>/SKILL.md` before
+re-deriving a trap; the directory is the list.
