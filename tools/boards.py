@@ -332,10 +332,11 @@ MONDRIAN = Board(
     # The panel is the canvas: 1440x3200 at scale 3 is 480x1066 pt. Rendering
     # into a smaller 1125x2436 surface and upscaling it in swap() made the UI
     # both soft and 7% oversized, which is what "the UI looks zoomed" was.
-    # glenv=FD_MESA_DEBUG=nobin: freedreno's GL driver emits the a6xx
-    # 7-dword CP_SET_BIN_DATA5 for a7xx too, and the a730 SQE parks on it
-    # (docs/MONDIAN_GPU.md). The compositor renders off-screen, so binning
-    # buys nothing.
+    # Binning is on. The a7xx packet (CP_SET_PSEUDO_REG plus
+    # CP_SET_BIN_DATA5_OFFSET) is in tools/mesa/mondrian-darwin.patch and
+    # measures 93-94 fps on the home-screen pages against 81-87 with
+    # `glenv=FD_MESA_DEBUG=nobin`, which stays the fallback: a boot that parks
+    # the SQE or draws 50+ ms frames is a binning fault (docs/MONDIAN_GPU.md).
     cmdline=('debug=0xc serial=0 cpus=8 cpufreq=2 usb=2 keepsyms=1 -noprogress '
              'rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 '
              'wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 '
@@ -407,7 +408,6 @@ MONDRIAN = Board(
              # table; the points are sorted by voltage, whatever order they are
              # written in.
              'battfix=3350:0,3701:18,4420:100 '
-             'glenv=FD_MESA_DEBUG=nobin '
              'gpu=1 gpupower=1 gmustart=1 gpugx=1 gpucp=1 gpusubmit=1 '
              # The panel comes up at this DBV (of 4095) on every boot: the
              # hardware has no saved brightness of its own, and CoreBrightness
