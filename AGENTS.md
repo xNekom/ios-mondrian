@@ -231,7 +231,8 @@ Unproven stays `unknown`; post progress with `node cli.mjs update poco-f5-pro
 New code is Rust (boot/loaders, UEFI via `uefi`, host/flash tools, daemons,
 driver logic behind a thin C/C++ shim); C/C++ only for XNU, IOKit's C++
 interfaces, existing C/C++ patches and vendor ABIs. Python is dev-only. Reuse
-OneiOS and iOSPlus10 (`akshaynexus/*`, MIT; credit them) before writing a tool.
+iOSPlus10 (MIT) before writing a tool; OneiOS has no licence file, so read it
+but do not copy it.
 
 ## Skills
 

@@ -100,8 +100,9 @@ Keep the tarball out of git; it is a device dump.
 
 ## Other ports worth reading
 
-Read the file named, not the project: each one below answers a question this
-port has already paid for once.
+The donor and licence list is in `docs/REFERENCE_PORTS.md`; this table is the
+code-level fixes read from those ports. Read the file named, not the project:
+each one below answers a question this port has already paid for once.
 
 | Source | What it answers | Status here |
 | --- | --- | --- |

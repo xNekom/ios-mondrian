@@ -1242,7 +1242,7 @@ them has Metal. That is the path this port follows.
   mach port delivered through `IOConnectSetNotificationPort`; the port's
   method 72 takes three arguments and no ABI has it. `0256` implements 9 beside
   72 and counts every selector call. Nothing calls either (`9:0` every second)
-  even in boots whose links tick, so the 60 Hz timer in the driver has no
+  even in boots whose links tick, so the 120 Hz timer in the driver has no
   client and CoreAnimation is not the one that would have been waiting for it.
 - **The panel console is silenced when the framebuffer starts, not at the first
   swap.** `mondrianfb_noconsole=1` (in the board cmdline) used to take effect
@@ -1370,7 +1370,7 @@ them has Metal. That is the path this port follows.
 
 The compositor draws into an ordinary-memory IOSurface; the driver copies that
 canvas into the panel carve-out at `0xb8000000` on every present (`mode copy`)
-and the 60 Hz timer tick starts the interface. Panel and canvas are the same
+and the timer tick starts the interface. Panel and canvas are the same
 size (`1440x3200`, stride `5760`), so the copy is 1:1 and costs 2.8-3.9 ms
 (measured 2026-11-17, injector in `backboardd`).
 
@@ -1585,14 +1585,14 @@ Measured 2026-11-17 with `0x4`: the compositor stays in `mode copy`, every
 SpringBoard is the stale `/usr/libexec` copy, which returns at once because its
 constructor arms for `backboardd` alone.
 
-**The idle blank resets the phone while Mesa renders.** Measured 2026-11-17 with
-`mondrian_gpu_hook=1`: `mondrianfb_blank=30` reset the phone about 30 s into
-every boot, four boots of four, before the ring answered, and `boot_b` answered
-instead; `blank=0` booted the same image twice of twice, with the injector in
-backboardd and Mesa drawing frames in the ring. The timer only starts once
-`fLastPresentTicks` is set, so the DCS `0x28` goes out while the interface is
-presenting. `tools/boards.py` carries 0 until that path is fixed, so the panel
-now stays lit when idle.
+**The idle blank used to reset the phone while Mesa rendered.** Measured
+2026-11-17 with `mondrian_gpu_hook=1`: `mondrianfb_blank=30` reset the phone
+about 30 s into every boot, four boots of four, before the ring answered, and
+`boot_b` answered instead; `blank=0` booted the same image twice of twice. The
+timer only starts once `fLastPresentTicks` is set, so the DCS `0x28` went out
+while the interface was presenting. The gate was instrumented and on 2026-11-19
+the lock screen blanked three times and woke on touch with no reset, so
+`tools/boards.py` now carries 30 and the panel blanks when idle.
 
 ### The hook that was measured was not the hook in the tree
 
@@ -1740,7 +1740,7 @@ block has to be removed in the logging path itself (the firehose wait that
 
 ## Android capture (2026-10-28)
 
-A temporary split (`docs/DUAL_BOOT.md`) booted LineageOS 24.0 userdebug
+A temporary split booted LineageOS 24.0 userdebug
 (`lineage_mondrian-userdebug`, Android 17) on the 5.10.269 GKI kernel, with
 the vendor GPU modules `gpucc-waipio.ko`, `gdsc-regulator.ko`,
 `qcom_rpmh.ko` and `icc-rpmh.ko`. Measured:
@@ -2046,8 +2046,8 @@ frequency and debug I/O:
   `qcom,lut-row-size=4`; HackiOS's own base is 0x18591000.
 - **`IOAcceleratorES`**: topaz's 0138 (an empty `IOAcceleratorES`) saves ~30 s
   at every backboardd start; check what the mondrian's `0114` publishes.
-- **Display refresh**: the topaz 0941-0949 add the vsync/presenter, direct
-  frames and 60 Hz; today `mondrianfb_hz=60` (the panel itself is 120 Hz).
+- **Display refresh**: the topaz 0941-0949 add the vsync/presenter and direct
+  frames; the tick is a compile-time 120 Hz (`MONDRIAN_FB_REFRESH_HZ`).
 - **Canvas**: `mondrianfb_canvas_w/h` (default the panel) renders
   CoreAnimation into a smaller surface and scales it to the panel in `swap()`.
   The board does not set them: a 1125x2436 canvas is the iPhone X's 375x812 pt,
@@ -2084,11 +2084,11 @@ frequency and debug I/O:
 
 ## Milestones
 
-Done: GPU memory, command submission and the Mesa `FD725` context; the
-command-mode panel is kicked from the kernel at 60 fps, and the lock screen and
-the home screen draw -- 59.9 fps over 180 s with no frame held (`mondriananim=1`).
+Done: GPU memory, command submission, the Mesa `FD725` context and the
+GPU-composited UI; the command-mode panel ticks at 120 Hz, the compositor
+reaches 81-87 fps on the home screen and 113-118 on a list scroll, and the apps
+launch.
 
-Open: the jagged 1125x2436 -> 1440x3200 upscale (the DPU SSPP scaler is the
-candidate), the idle-timer sleep (the hook's fix is not boot-verified), the
-live wallpaper poster (the hook's still image draws), the panel's report rate
-(`0xC0`), `cpufreq`, the release kernel and the boot-time measurements.
+Open: the a7xx binning artifacts, Metal/WebKit (Safari's page is black and the
+live wallpaper poster needs Metal), the release kernel and the boot-time
+measurements.

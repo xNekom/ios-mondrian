@@ -68,11 +68,9 @@ findings on this series are known and harmless: the prose preamble of `0087`
 
 ## What is still missing
 
-The patches that talk to the sweet phone's hardware. They are listed in
-`HARDWARE_PATCHES` of `tools/port-series.py`; `docs/MONDIAN_PORT.md` has the
-work items:
-
-* the dual-boot slot switch.
+The open subsystems are in `docs/MONDIAN_PORT.md`. `HARDWARE_PATCHES` in
+`tools/port-series.py` marks the sweet patches that need a hardware delta; a
+new port starts there.
 
 `tools/port-series.py` does the mechanical part of a port: it takes a patch from
 the sweet series, renames the board identifiers, drops the context lines that

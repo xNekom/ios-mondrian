@@ -35,7 +35,7 @@ AMOLED and a Goodix touch on SPI.
 | Display | done (LCD, DSC) | **command-mode AMOLED, 120 Hz**; the kernel kicks the panel |
 | Touch | done (Goodix on I²C) | **done** (Goodix on SPI); home and app-switcher gestures |
 | Keys and battery | done (PM6150) | keys work (SPMI); battery level published from the VADC |
-| Boot menu / dual boot | n/a | menu with keys works; slot switch pending |
+| Boot menu | n/a | bypassed: the shim boots iOS directly; no Android dual boot |
 | iOS userland | boots to the home screen | yes (GPU via Mesa/freedreno GLES, touch, Settings, Bluetooth) |
 
 On `sweet`, the stock bootloader boots the shim volatile, XNU mounts a journaled
@@ -61,10 +61,10 @@ ABL (stock Xiaomi bootloader, unlocked)
 
 There is no serial port (the debug UART is wired as SPI on these boards). The
 kernel draws its console into the framebuffer the bootloader leaves — 1440x3200
-at `0xb8000000` on mondrian, 1080x2400 at `0x9c000000` on sweet, kicked at 60 Hz
-— and keeps the whole log in a 4 MiB ring at the end of `userdata` (`0096`).
-The ring is written from the UFS path, so a boot reset before userland writes
-leaves the previous ring: unchanged is not proof of failure.
+at `0xb8000000` on mondrian (120 Hz tick), 1080x2400 at `0x9c000000` on sweet
+(30 Hz) — and keeps the whole log in a 4 MiB ring at the end of `userdata`
+(`0096`). The ring is written from the UFS path, so a boot reset before userland
+writes leaves the previous ring: unchanged is not proof of failure.
 
 ## Boards
 
@@ -148,7 +148,7 @@ img2simg ios16-root.img ios16-root.simg
 ```
 
 `mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive
-HFS+ volume, journal off before boot (`docs/DUAL_BOOT.md`), and adds the dyld
+HFS+ volume, journal off before boot (`NOTES.md`), and adds the dyld
 cache links, the system keybag and the log directories the daemons expect. `ios-root-tweaks.py` applies the
 bring-up changes (skip Setup, seed activation, drop daemons that need missing
 hardware, disable the watchdogs that kill slow apps); its header explains each
@@ -226,7 +226,7 @@ tools/phone-log.sh out/boot-mondrian.img ring.txt
 | `tools/ios-log-pull.sh`, `ios-log.py`, `ios-crash.py` | read and symbolicate the persistent kernel log |
 | `tools/qemu-ios.py`, `qemu-triage.py` | host boots of the same payload, with console text decoding |
 | `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py`, `hfs-audit.py` | helpers; `hfs-audit.py` checks what `fsck` does not: bitmap against the header's count, forks sharing blocks, sizes that do not fit |
-| `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro |
+| `docs/MONDIAN_PORT.md` | the port plan for the POCO F5 Pro; donors and licences in `docs/REFERENCE_PORTS.md` |
 | `docs/MONDIAN_TOUCH.md` | the touch bring-up: live-tree facts and milestones |
 | `docs/BUILD_LINUX.md` | building the kernel on Windows/WSL2, with no Mac |
 | `NOTES.md` | port state, measured hardware facts and the traps already paid for |
@@ -237,14 +237,14 @@ firmware, root images and build trees — serials, calibration data or Apple's f
 ## Credits
 
 Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs),
-[BearSSL](https://bearssl.org),
-[blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build),
-[ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux
-kernel sources for the hardware details, and
-[OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is
-not distributed here.
+[BearSSL](https://bearssl.org), [blacktop](https://github.com/blacktop)'s
+darwin-xnu-build and ipsw, Qualcomm/Xiaomi's published Linux kernel sources
+for the hardware details, and [OrangeFox Recovery](https://orangefox.download).
+iOS itself is Apple's and is not distributed here.
 
 The sweet half of this repository is the work of
 [dipa-studio](https://github.com/dipa-studio); this fork adds the mondrian
-(POCO F5 Pro) port on top of it. Other ports this work learned from are listed
-in `NOTES.md`.
+(POCO F5 Pro) port on top of it. It also builds on HackiOS, ios-topaz,
+OneiOS/iOSPlus10, UniXNU, the MIX Fold 2 Wi-Fi work and the Pixel 5 port;
+`docs/REFERENCE_PORTS.md` says what each solves, its evidence and its
+licence.

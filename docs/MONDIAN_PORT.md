@@ -91,16 +91,15 @@ Written — the allow-list; everything else is off:
 | `boot_b` | the shim slot | the routine target of the port |
 | `boot_a` | stock Android, the escape hatch | the deploy tooling refuses it (`BOOT_A=1` is the deliberate override); a verified backup precedes any write |
 | `vendor_boot` | the shim reads its live device tree from it | dump verified by SHA256 first |
-| `misc` | the A/B boot-control block; the shim menu's slot switch is not wired yet | wrong content only selects the wrong slot; `fastboot --set-active` fixes it without flashing |
+| `misc` | the A/B boot-control block; nothing here switches slots | wrong content only selects the wrong slot; `fastboot --set-active` fixes it without flashing |
 | `init_boot`, `recovery` | untouched so far (this device has no `init_boot`) | the same safeguards whenever a write is needed |
 | `userdata` | the iOS root | erasing Android user data here is acceptable and recoverable; `tools/flash-root.sh` writes it and asks first |
 
-On 2026-10-28 `boot_b` held Lineage userdebug and the iOS image ran from
-`fastboot boot`; the temporary Android split and its exact restore are in
-`docs/DUAL_BOOT.md`.
+On 2026-10-28 a temporary Android split was used to capture the vendor data;
+it is gone and `userdata` is a single partition again. No dual boot is planned.
 
 Repeated volatile `fastboot boot` runs — including failures and panics — touch
-no partition, and a slot switch only marks state.
+no partition, and `fastboot --set-active` only marks state.
 
 Never written — an irreversible brick: `xbl`, `xbl_config`, `abl`, `tz`,
 `hyp`, `uefi*`/`uefisecapp`, `modem*`, `persist`, and every other low-level
@@ -215,8 +214,9 @@ where backboardd's GL frame is 11.7-13.6 ms of CPU (700-800 calls, 129 draws,
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
-0 in the board cmdline (the DCS blank resets the phone while CoreAnimation
-renders through Mesa, `docs/MONDIAN_GPU.md`); iOS's timer never arms --
+30 s in the board cmdline: the 2026-11-17 reset was fixed on 2026-11-19
+(`docs/MONDIAN_GPU.md`); the home screen keeps presenting, so the fallback only
+fires on a still screen, and iOS's own timer never arms --
 `SBLockScreenAutoLockTime` was missing and the hook writes it, and
 `SBLockScreenManager` has no `_idleTimerPolicyAggregator`. `0305` brightness
 and `0304` battery; sweet's `0056`/`0079` still need a rebase.
@@ -232,15 +232,15 @@ vsync and coalesces each drain into one HID event per finger per display tick
 `kIOHIDDigitizerEventFromEdgeTip`, UIKit's touch edge type; a tap inside one
 tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 
-### 5. The buttons, the battery and the menu
+### 5. The buttons and the battery
 
-The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`) and
-drives the menu; `0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
+The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`);
+`0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
 thread polls the PMK8350 PON and PM8350 GPIO6 and publishes both edges through
 `MondrianHIDButtons`. `0304` publishes the pack level as an `IOPMPowerSource`
 from its own thread, and `0305` sends the panel brightness (`bl LEVEL` over
-USB) as a DCS long write. Nothing charges the phone, because the SMB5 is
-behind the ADSP; dual-boot and heat remain (`docs/MONDIAN_POWER.md`).
+USB) as a DCS long write. The AP cannot control charging (the SMB5 is behind
+the ADSP); the level is published and heat remains (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 
@@ -316,5 +316,5 @@ Sources for the numbers above:
   (`osfmk/arm64/proc_reg.h`) and page size selection
   (`osfmk/mach/arm/vm_param.h`)
 
-Other ports worth reading are listed in `NOTES.md`; the WiFi/Bluetooth
-hardware and what iOS expects are in `docs/MONDIAN_WIRELESS.md`.
+Other ports, what each solves and its licence are in `docs/REFERENCE_PORTS.md`;
+the WiFi/Bluetooth hardware and what iOS expects are in `docs/MONDIAN_WIRELESS.md`.

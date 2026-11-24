@@ -10,7 +10,7 @@ learn; the work list, the hardware delta and the partition rules are in
 `docs/MONDIAN_PORT.md`. The upstream `sweet` port is the reference
 implementation and is not re-described here: `xnu/patches/` is its record.
 
-## State (2026-11-10)
+## State (2026-11-25)
 
 - **Boot chain.** ABL → `fastboot boot` (or the `boot_b` image) → shim → XNU.
   The shim reads the live device tree, unpacks the LZ4 payload and jumps. The
@@ -52,29 +52,30 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   `/var/db/timezone/localtime` and resets `NSTimeZone`.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
-  `DKIOCISWRITABLE` must agree or HFS disables writes.
+  `DKIOCISWRITABLE` must agree or HFS disables writes. Settings, Messages,
+  Photos and Safari launch; keyboard, Bluetooth pairing and the VADC battery
+  level work (`docs/MONDIAN_WIRELESS.md`, `docs/MONDIAN_POWER.md`).
 - **Display and UI.** The home screen and Settings draw on the 1440x3200 canvas
-  (`docs/UI_PERFORMANCE.md` has the frame meter and the boot traps);
-  `mondrian_ui_hook` (the mask in `tools/boards.py`) plus
-  `/private/var/vm/mondrian-xpc` brings up the shell.
+  (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
+  FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
+  place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
 
 Current blockers, in order:
 
-1. **The panel sleeps, and iOS stops drawing before it does.** `mondrianfb_blank`
-   seconds (0 in the board table: the DCS blank resets the phone with the
-   injector in `backboardd`, `docs/MONDIAN_GPU.md`) without a present switches the
-   panel off with DCS `0x28`; a key or touch switches it back on (`0x29`) from the
-   tick, never from a frame -- iOS has stopped its display link, so a tap presents
-   nothing (`0342`) -- and the holds stay on (`mondriankeepawake=1`).
-2. **Charge level.** Charging works by itself (the charger sits behind the ADSP,
-   +1.27 A through `ichg_fb`), but the coulomb counter is out of reach: the level
-   is a voltage table (`0304`) anchored to the Android sample with `battfix=mv:pct,...`.
-3. **Control Center and the rest.** The CC grid is 430 pt wide whatever the
-   screen is. A picture does not cross to the window server as a CGImage, so a
-   bridge-only dylib converts every image element in every `.app` bundle and in
-   the WebKit services (`0402`); a web page still draws black because its
-   renderer runs through Metal, which this port has no driver for. Audio, modem
-   and cameras remain (`docs/MONDIAN_GPU.md`).
+1. **Wi-Fi, audio, camera and cellular are not implemented.** The QCA6490
+   WLAN half has no driver; there is no audio route or codec/amp path (A2DP
+   waits on it), and the camera and modem have no iOS device. The next source
+   for each is in `docs/REFERENCE_PORTS.md`.
+2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
+   tests, but no iOS process asks for it: Safari's page stays black and the live
+   wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
+3. **Haptics do not move.** The PM8350B block answers and CFG/PTN accept
+   writes; the HBST boost belongs to the charger firmware and there is no PBS
+   client yet (`docs/MONDIAN_POWER.md`).
+4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
+   drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
+5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm
+   reboot can leave the boot core unstarted (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 
@@ -143,8 +144,8 @@ From the live device tree (and from the shim's own dump):
 Partition geometry (from `fastboot getvar`): `boot` 192 MiB, `vendor_boot`
 96 MiB, `recovery` 100 MiB, `misc` 4 MiB (holds the A/B BCB), `vbmeta`
 0x20000, `dtbo` 0x1800000, `userdata` on LUN 0 starting at block `0x2f8a00`;
-the temporary Android split and its exact restore are in `docs/DUAL_BOOT.md`.
-This device has **no `init_boot`**.
+the temporary Android split used for the 2026-10-28 capture is gone, `userdata`
+is a single partition and no dual boot is planned. This device has **no `init_boot`**.
 
 ## Traps already paid for
 
@@ -183,7 +184,7 @@ The shim reserves the payload's room first and gives ABL's line what is left;
 `fastboot boot --cmdline "..."` still overrides.
 
 **Page size: 16 KiB, and the three pieces must agree.** `ID_AA64MMFR0_EL1`
-reports `TGran16=1` (measured 2026-10-23; the menu prints it as `tg16`), so
+reports `TGran16=1` (measured 2026-10-23; the shim prints it as `tg16`), so
 mondrian runs the granule iOS is built for. These are the failures that cost
 time:
 
@@ -323,18 +324,17 @@ to 11 V in one series), and `DATA0` is the low byte. `0304` waits, checks EOC
 and fault, publishes only a pair that agrees (`sav` prints one), and stays off
 the frame path: in `vsyncFired` that wait was `1 frame in ~5000 ms`.
 
-## Boot menu and dual boot
+## Keys over SPMI
 
-`shim/menu.c` + `shim/menu_logos.h` (rasterized by `tools/gen-menu-logos.py`),
-preview in `docs/menu-preview.png`. Full-screen page, one card per choice,
-selection as a ring; a selection change repaints only the two card borders.
+The shim no longer shows a boot menu: `shim.c` boots the payload directly and
+the key probe still runs, because the status bytes are worth a photo of a failed boot.
 
-**Keys (SPMI).** The arbiter is version 7: observer channel stride `0x20`, APID
+The arbiter is version 7: observer channel stride `0x20`, APID
 map at `core+0x2000+4n`, owner table at `cnfg+4n`. `KPDPWR` is bit 7 (power),
 `RESIN` bit 6 (volume down — hence no `vol_down` node); volume up is PM8350
 GPIO6 on peripheral page `0x8d`, level bit 0, held LOW. A PMIC gpio is its own
 page (`0x88 + index - 1`), and the PON node has no `__symbols__` label: find it
-by the `pon` compatible. Rising edges drive the menu. A refusal prints
+by the `pon` compatible. A refusal prints
 `spmi code N` with N naming the failing step in `shim/spmi.c`: one photo names
 it. A failed transaction is a busy arbiter, not a broken bus -- the battery's
 conversion runs on it every 2 s -- and treating one collision as fatal ended
@@ -347,4 +347,4 @@ at all (`ppid 0x310`, PM8350B's SMB5) because `pmic_glink` on the ADSP reaches
 it. An `smw` write wedges the arbiter: the SPMI thread never returns and the ADC
 tick dies with it, while ping still answers.
 
-Other ports worth reading, with what each solves: `docs/MONDIAN_REFERENCE.md`.
+Other ports worth reading, with what each solves and its licence: `docs/REFERENCE_PORTS.md`.

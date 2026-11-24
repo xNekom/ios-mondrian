@@ -2,15 +2,14 @@
 
 Wi-Fi does not work yet. Bluetooth does: iOS's own `bluetoothd` drives the
 QCA6490's BT half over the QUP UART, and this port supplies the HCI transport,
-the firmware load and the vendor-command translations (the measured state is in
-`docs/BLUETOOTH_AGENT.md`). The kernel exports no `IO80211`, `IOBluetooth`,
+the firmware load and the vendor-command translations (the measured state is
+below). The kernel exports no `IO80211`, `IOBluetooth`,
 `IOEthernet` or `IOSerial` symbol (measured with `nm`); Wi-Fi still needs the
 PCIe, MHI, QMI and `ath11k` bring-up. The phone carries a Qualcomm **QCA6490**
 combo, whose two halves are separate buses and separate projects.
 
 This document records the hardware, what the iOS userland expects, what the
-existing ports teach, and the order to attack it. It is a plan, not a status
-report.
+existing ports teach, and what is left.
 
 ## The hardware
 
@@ -1131,29 +1130,15 @@ Concrete traps paid for by those ports, all relevant here:
   (kext matching does this; a launch daemon loses the race), and firmware held
   in RAM does not survive a power cycle.
 
-## The order to do it
+## What is next
 
-Bluetooth first: it exercises the QCA firmware, power and reset sequence
-without PCIe, MHI or a 802.11 stack, and it produces a visible result
-(CoreBluetooth, AirPods) from a comparatively small driver. Steps 1-3 and
-PC-initiated pairing are measured; A2DP waits for an audio route
-(`docs/BLUETOOTH_AGENT.md`).
+Bluetooth is done: the controller, the RAM patch/NVM and the tty (`0386`,
+`0388`) work, and a pairing started from the PC completes. A2DP still waits for
+an audio route: `MONDRIAN TONE: play 0 duration 1.00 route` returns an empty
+route, and the choice between a virtual `AudioServerPlugIn` and a codec driver
+is still open.
 
-1. Power the chip from `bt_qca6490` (rails, reset/sw-ctrl/xo GPIOs) and read
-   the ROM version over the QUP UART, the way `hci_qca` starts.
-2. Download the RAM patch and NVM, reset, and check that HCI Reset and Read
-   Local Version answer.
-3. The node is `0386`: a tty created before `bluetoothd` looks for it, powered
-   and programmed on first open, with its first packets on the ring. The
-   command line carries `wlan.debug.generate-mac` because without a local
-   address the process exits before any transport, and `mondrianbt=1` because
-   the daemon otherwise selects USB and exits before it opens the node
-   (`0388`). The next measurement is the tty's `open`/`termios`/`tx`/`rx`
-   lines.
-4. Pairing and A2DP. SCO audio needs the SLIMbus/PCM route, which is a
-   separate piece of work.
-
-WiFi after that, and only with a decision made up front:
+Wi-Fi is the remaining half, and it needs a decision made up front:
 
 - The driver work is PCIe enumeration (PERST, wake, clocks) → MHI → QMI
   (`cnss2`) → `ath11k` WMI (scan, join, keys). The `qwz` port in
@@ -1166,7 +1151,6 @@ WiFi after that, and only with a decision made up front:
   the Wi-Fi menu does not.
 - Do not plan on AWDL/AirDrop either way.
 
-Estimate from the precedents: Bluetooth is weeks to months; WiFi with the
-native interface is six to twelve months of driver and compatibility work,
-and the IP-only path is shorter but still needs the full firmware/MHI/WMI
-bring-up first.
+Estimate from the precedents: Wi-Fi with the native interface is six to twelve
+months of driver and compatibility work, and the IP-only path is shorter but
+still needs the full firmware/MHI/WMI bring-up first.

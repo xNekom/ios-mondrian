@@ -1690,9 +1690,9 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   `start_heartbeat()`), and the per-process CPU line replaces it as the cheap
   default.
 - **The boot arg `mondrianfb_blank` is a fallback timer** (seconds without a
-  present, 0 disables it), not the power key. The board cmdline carried 30 and
-  now carries 0 while CoreAnimation renders through Mesa: the DCS blank resets
-  the phone (`docs/MONDIAN_GPU.md`).
+  present, 0 disables it), not the power key. The board carries 30, and the
+  2026-11-19 lock-screen test blanked and woke three times with no reset
+  (line 40 above).
 
 ## Next probes
 
