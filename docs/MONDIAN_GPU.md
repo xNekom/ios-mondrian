@@ -481,7 +481,11 @@ them has Metal. That is the path this port follows.
   The four MiB that remain are unavoidable at this granularity: freedreno
   suballocates its small buffers and its command pools out of 4 MiB heap blocks,
   and a block is one kernel buffer, so a submission that touches any part of it
-  writes it back whole. Marking the byte ranges instead (the form the reader
+  writes it back whole. Removing the heaps in Mesa takes the same submission to
+  1.5 MiB in 57 us, but the cost does not follow the bytes: the frame then
+  carries 46 buffers instead of 25, the submit time stays (4136 us a frame), and
+  the UI settled at a 41.7 ms cadence, so the heaps stay.
+  Marking the byte ranges instead (the form the reader
   below describes) parked the CP -- `uc retired 28 of 76`, `fault 0x0`, black
   panel, `present 0` -- because two writers that both find the counter at zero
   reset the recorded range and one is lost, and because the ring heap puts
