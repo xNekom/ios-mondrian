@@ -687,6 +687,23 @@ boot each, so the three columns differ only in what changed:
   and the **App Store** stops at `LOADING` because it needs the network. So a
   black screen after a tap is not one failure: read the ring's `exec` line to
   tell "never launched" from "launched and had nothing to draw".
+- **The first-party apps are installed by the restore, not by the filesystem.**
+  This root is built from the IPSW's disk images, so the apps iOS keeps staged
+  are still staged: `/Applications` carries the service bundles plus Photos,
+  Settings, Safari, App Store, Messages and Phone, while Notes, Books, Health,
+  Reminders, Podcasts, TV, Files, Maps, Mail, Weather, Music, Calendar, Wallet,
+  Shortcuts and 20 more sit **complete, executable included**, in
+  `/private/var/staged_system_apps`, with their icons in
+  `/System/Library/AppPlaceholders`. `installd`'s own log from the image build
+  (2026-10-27) records `System App Migration is complete` without adding them,
+  and `MISystemAppMigrator` does not run again. Hard-linking the 32 bundles into
+  `/Applications` (3 840 files; the staged copies stay) is not an install: the
+  App Library showed four categories in the boot that followed, but SpringBoard
+  rewrote `IconState.plist` without the added bundle ids and the page kept its
+  four icons. The gate is the installation record (`MISystemAppStateWrapper`
+  and LaunchServices' map), so the fix is to run or seed the migrator
+  (`/System/Library/DataClassMigrators/SystemAppMigrator.migrator`), not to put
+  files under `/Applications`.
 - **A switch draws its track and not its knob, and the knob is an image.**
   Measured 2026-11-20 on the Settings list (its Airplane Mode row is the first
   one on screen): the track is a plain colour layer (`bg 78788052`,
