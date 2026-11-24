@@ -465,6 +465,26 @@ them has Metal. That is the path this port follows.
   drew -- the display wedged (`ctl 0x1 start 0x1`, `fc 147`, black panel) -- so
   81-87 is the earlier `nobin` boot. `glenv=FD_MESA_DEBUG=nobin` is the
   fallback switch.
+- **A submission writes back every mapped buffer, and that is 4.5 ms of a
+  home-screen frame.** The user client writes back every buffer the task has
+  mapped (under the map cap) on each submission, because freedreno does not
+  announce its CPU writes: `fd_bo_cpu_prep` returns without an ioctl for a
+  buffer it does not share, so a mapping is the only evidence the client has.
+  `MondrianGPU: wrote back 16 of 22 buffers (12496 KiB), 371 us` is one of the
+  15-17 submissions a home-screen frame makes. Measured with the interposer's
+  per-submit timer (`mondrian-gl: submits:`): 15-17 flushes a frame, 4.5-5.0 ms
+  inside them, 260-300 us each, while the kernel's ring clean and doorbell cost
+  370 ns (`MONDRIAN GPU: uc ring ... ns a clean`). The writeback is the frame's
+  largest single item, larger than the draw state; the timings are the ones the
+  `submits:` line and the driver's own `wrote back` line print.
+  Mapping the buffers write-combined (`kIOMapWriteCombineCache`, the way Linux
+  maps GEM buffers) would remove it, but on this port the first
+  `IOConnectMapMemory64` with that flag fails: zero `MONDRIAN DRM: map` lines, no
+  GL context and no SpringBoard surface, under both the old and the new submit
+  policy. The change was reverted and the mapping stays cacheable. The next
+  attempt has to make Mesa announce its writes (a `cpu_prep` with
+  `MSM_PREP_NOSYNC` that only sets the dirty flag) and write back only those
+  buffers, or find a cache attribute this port accepts.
 - **Nothing on this board is IO-coherent, and XNU's cache helpers are a barrier
   here.** `__ARM_COHERENT_IO__` is defined for arm64
   (`pexpert/pexpert/arm64/apple_arm64_common.h:36`), so `flush_dcache()` and
