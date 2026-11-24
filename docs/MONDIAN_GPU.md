@@ -452,9 +452,19 @@ them has Metal. That is the path this port follows.
   with a four-dword `CP_SET_BIN_DATA5_OFFSET` (`VSC_SIZE`|`VSC_N`, then the draw,
   size and prim offsets), which is Turnip's shape and the >=8-dword path the
   a730 firmware initialises. Measured on the home screen's page swipe: 93-94 fps
-  against 81-87 with `nobin`, captures clean, no park; the submissions per frame
-  do not change (~40-43), so binning buys less GPU work per frame and not fewer
-  batches. `glenv=FD_MESA_DEBUG=nobin` is the fallback switch.
+  against 81-87 with `nobin`, and a rebuild from the tarball with only
+  `mondrian-darwin.patch` gives 93, 88 and 91 in one boot, so the artifact
+  carries the gain. The submissions per frame do not change (~40-43): binning
+  buys less GPU work per frame, not fewer batches. Settings' list measures
+  105-115 against the `nobin` boot's 113-118, inside this port's boot-to-boot
+  spread, and a default boot (no `glenv`)
+  opened Control Center, the App Library and Settings with no `uc sqe pc`, no
+  softpipe frame and no corruption in the captures; Spotlight's process starts
+  and builds its surfaces but its window never reaches the glass, a userland
+  state and not the packet. The `nobin` boot made for the A/B never
+  drew -- the display wedged (`ctl 0x1 start 0x1`, `fc 147`, black panel) -- so
+  81-87 is the earlier `nobin` boot. `glenv=FD_MESA_DEBUG=nobin` is the
+  fallback switch.
 - **Nothing on this board is IO-coherent, and XNU's cache helpers are a barrier
   here.** `__ARM_COHERENT_IO__` is defined for arm64
   (`pexpert/pexpert/arm64/apple_arm64_common.h:36`), so `flush_dcache()` and
