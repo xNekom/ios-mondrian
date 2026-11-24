@@ -446,8 +446,15 @@ them has Metal. That is the path this port follows.
   `glenv=FD_MESA_DEBUG=nobin` removes the packet: `use_hw_binning()`
   (`fd6_gmem.cc:370`) returns false and the tile stream takes the
   `CP_SET_VISIBILITY_OVERRIDE(1)` path that the 71- and 168-dword streams already
-  exercised. Binning has nothing to buy here (the compositor renders off-screen),
-  and the argument is in `tools/boards.py`.
+  exercised. **The a7xx packet works** (`mondrian-darwin.patch`): a nine-dword
+  `CP_SET_PSEUDO_REG` sets `DRAW_STRM_ADDRESS`, its size array and
+  `PRIM_STRM_ADDRESS` once per binning pass, and each bin then points at them
+  with a four-dword `CP_SET_BIN_DATA5_OFFSET` (`VSC_SIZE`|`VSC_N`, then the draw,
+  size and prim offsets), which is Turnip's shape and the >=8-dword path the
+  a730 firmware initialises. Measured on the home screen's page swipe: 93-94 fps
+  against 81-87 with `nobin`, captures clean, no park; the submissions per frame
+  do not change (~40-43), so binning buys less GPU work per frame and not fewer
+  batches. `glenv=FD_MESA_DEBUG=nobin` is the fallback switch.
 - **Nothing on this board is IO-coherent, and XNU's cache helpers are a barrier
   here.** `__ARM_COHERENT_IO__` is defined for arm64
   (`pexpert/pexpert/arm64/apple_arm64_common.h:36`), so `flush_dcache()` and
