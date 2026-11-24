@@ -32,11 +32,11 @@ AMOLED and a Goodix touch on SPI.
 | Generic series (mockfs, AMFI, HFS, console, HID, SMP) | done | **done** |
 | UFS root device | done (UFSHCI 2.1) | **reads and writes** (UFS 3.1) |
 | iOS root mount | done | **done** (non-journaled HFS+ in `userdata`) |
-| Display | done (LCD, DSC) | **command-mode AMOLED, 60 fps**; the kernel kicks the panel |
-| Touch | done (Goodix on I²C) | **done** (Goodix on SPI); no home-swipe gesture |
-| Keys and battery | done (PM6150) | keys work in the shim; kernel side to write |
+| Display | done (LCD, DSC) | **command-mode AMOLED, 120 Hz**; the kernel kicks the panel |
+| Touch | done (Goodix on I²C) | **done** (Goodix on SPI); home and app-switcher gestures |
+| Keys and battery | done (PM6150) | keys work (SPMI); battery level published from the VADC |
 | Boot menu / dual boot | n/a | menu with keys works; slot switch pending |
-| iOS userland | boots to the home screen | yes (CPU rendering, touch, Settings) |
+| iOS userland | boots to the home screen | yes (GPU via Mesa/freedreno GLES, touch, Settings, Bluetooth) |
 
 On `sweet`, the stock bootloader boots the shim volatile, XNU mounts a journaled
 HFS+ root from `userdata` read/write, and the userland reaches the home screen

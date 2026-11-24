@@ -1,9 +1,12 @@
 # WiFi and Bluetooth on mondrian
 
-Neither works, and neither has anything in the kernel yet: the built kernel
-exports no `IO80211`, `IOBluetooth`, `IOEthernet` or `IOSerial` symbol
-(measured with `nm`). The phone carries a Qualcomm **QCA6490** combo, whose two
-halves are separate buses and separate projects.
+Wi-Fi does not work yet. Bluetooth does: iOS's own `bluetoothd` drives the
+QCA6490's BT half over the QUP UART, and this port supplies the HCI transport,
+the firmware load and the vendor-command translations (the measured state is in
+`docs/BLUETOOTH_AGENT.md`). The kernel exports no `IO80211`, `IOBluetooth`,
+`IOEthernet` or `IOSerial` symbol (measured with `nm`); Wi-Fi still needs the
+PCIe, MHI, QMI and `ath11k` bring-up. The phone carries a Qualcomm **QCA6490**
+combo, whose two halves are separate buses and separate projects.
 
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and the order to attack it. It is a plan, not a status
@@ -1132,7 +1135,9 @@ Concrete traps paid for by those ports, all relevant here:
 
 Bluetooth first: it exercises the QCA firmware, power and reset sequence
 without PCIe, MHI or a 802.11 stack, and it produces a visible result
-(CoreBluetooth, AirPods) from a comparatively small driver.
+(CoreBluetooth, AirPods) from a comparatively small driver. Steps 1-3 and
+PC-initiated pairing are measured; A2DP waits for an audio route
+(`docs/BLUETOOTH_AGENT.md`).
 
 1. Power the chip from `bt_qca6490` (rails, reset/sw-ctrl/xo GPIOs) and read
    the ROM version over the QUP UART, the way `hci_qca` starts.
