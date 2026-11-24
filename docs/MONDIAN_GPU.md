@@ -465,26 +465,37 @@ them has Metal. That is the path this port follows.
   drew -- the display wedged (`ctl 0x1 start 0x1`, `fc 147`, black panel) -- so
   81-87 is the earlier `nobin` boot. `glenv=FD_MESA_DEBUG=nobin` is the
   fallback switch.
-- **A submission writes back every mapped buffer, and that is 4.5 ms of a
-  home-screen frame.** The user client writes back every buffer the task has
-  mapped (under the map cap) on each submission, because freedreno does not
-  announce its CPU writes: `fd_bo_cpu_prep` returns without an ioctl for a
-  buffer it does not share, so a mapping is the only evidence the client has.
-  `MondrianGPU: wrote back 16 of 22 buffers (12496 KiB), 371 us` is one of the
-  15-17 submissions a home-screen frame makes. Measured with the interposer's
-  per-submit timer (`mondrian-gl: submits:`): 15-17 flushes a frame, 4.5-5.0 ms
-  inside them, 260-300 us each, while the kernel's ring clean and doorbell cost
-  370 ns (`MONDRIAN GPU: uc ring ... ns a clean`). The writeback is the frame's
-  largest single item, larger than the draw state; the timings are the ones the
-  `submits:` line and the driver's own `wrote back` line print.
+- **A submission writes back only the buffers the client marks as CPU-written,
+  and the writeback is not what the frame waits for.** The user client used to
+  write back every buffer the task had mapped (under the map cap) on each
+  submission, because freedreno did not announce its CPU writes:
+  `fd_bo_cpu_prep` returns without an ioctl for a buffer it does not share, so a
+  mapping was the only evidence the client had: `MondrianGPU: wrote back 16 of
+  22 buffers (12496 KiB), 371 us` for one of the 11-17 submissions a home-screen
+  frame makes. Mesa now marks the buffers it wrote -- the upload path, writable
+  transfer maps and flushes, the control, border-colour, descriptor,
+  vertex-parameter and warm-up buffers -- and the submission carries
+  `MSM_SUBMIT_BO_CPU_WRITE`; the same submission becomes 3 of 25 buffers
+  (8208 KiB) in 193-234 us, and the surfaces the window server re-adopts come
+  out `clean` because the surface's write seed decides.
+  The four MiB that remain are unavoidable at this granularity: freedreno
+  suballocates its small buffers and its command pools out of 4 MiB heap blocks,
+  and a block is one kernel buffer, so a submission that touches any part of it
+  writes it back whole. Marking the byte ranges instead (the form the reader
+  below describes) parked the CP -- `uc retired 28 of 76`, `fault 0x0`, black
+  panel, `present 0` -- because two writers that both find the counter at zero
+  reset the recorded range and one is lost, and because the ring heap puts
+  several command streams in one block. What it bought was 4.3 MiB less, 0.3 ms
+  of a 3.4-5.9 ms budget: the scanout copy (about 3.9 ms a present) is the
+  frame's largest item, not the writeback. `gpusyncwrites=1` switches the
+  announced rule on, `gpusyncall=1` still writes everything back, and
+  `gpusynclog=1` names each buffer of the fourth submission.
   Mapping the buffers write-combined (`kIOMapWriteCombineCache`, the way Linux
-  maps GEM buffers) would remove it, but on this port the first
-  `IOConnectMapMemory64` with that flag fails: zero `MONDRIAN DRM: map` lines, no
-  GL context and no SpringBoard surface, under both the old and the new submit
-  policy. The change was reverted and the mapping stays cacheable. The next
-  attempt has to make Mesa announce its writes (a `cpu_prep` with
-  `MSM_PREP_NOSYNC` that only sets the dirty flag) and write back only those
-  buffers, or find a cache attribute this port accepts.
+  maps GEM buffers) would remove the writeback altogether, but on this port the
+  first `IOConnectMapMemory64` with that flag fails: zero `MONDRIAN DRM: map`
+  lines, no GL context and no SpringBoard surface, under both the old and the
+  new submit policy. The change was reverted and the mapping stays cacheable.
+
 - **Nothing on this board is IO-coherent, and XNU's cache helpers are a barrier
   here.** `__ARM_COHERENT_IO__` is defined for arm64
   (`pexpert/pexpert/arm64/apple_arm64_common.h:36`), so `flush_dcache()` and

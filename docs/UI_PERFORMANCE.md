@@ -879,6 +879,11 @@ boot each, so the three columns differ only in what changed:
   surface, and `/private/var/vm/mondrian-dump-picture` writes a quarter-scale
   copy of a picture too large for the ring (`tools/card-surface-map.py` measures
   its box and colours).
+  Frame rate with the pictures in place: **24 fps steady** for eight drag
+  seconds, `submits: 17 a frame, 5366 us a frame inside them`,
+  `copy avg 1.9-2.2 ms` (measured 2026-11-24, the kernel that writes back only
+  the buffers the client announced). The submission path is the cost here, not
+  the scanout copy, so the next lever is what each card's draw submits.
 
 - **An app's console output does not reach the ring (2026-11-22).** The bridge
   logs `loaded in <app>` to `/dev/console` and `Preferences` shows it; Spotlight
