@@ -58,7 +58,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
   FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
   place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
-- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9, programs the SMMU/queues, completes HFI `SYS_PROP` and opens a HEVC decode session (V2); buffers/IRQ next.
+- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9 and accepts the iris2 data path: properties on their ports, BIN/LINE/COMV/NON_COMV before `START(1)`, DPB/raw after `START(2)` (both `flags=0x1`); firmware 2.4 marks `COMV_BUFFER_COUNT`, `OPB_ENABLE` and `PARTIAL_DATA` unsupported (info only). A 128x128 HEVC sample is parsed and answers `SETTINGS_CHANGE` with its resolution; output data and the IRQ are next.
 
 Current blockers, in order:
 
@@ -69,9 +69,9 @@ Current blockers, in order:
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics boost but do not move.** PMK8350 SDAM/PBS raises `hbst-vreg` to
-   `0x80`; 1250/1650 mV leave impedance/`hpwr` at zero. 2700 mV corrupted PMIC
-   reads and hung the UI, so `hapv` caps at 2000 mV (`docs/MONDIAN_POWER.md`).
+3. **Haptics play is accepted; the boost is not.** `vib` rejects `ms > 2000`;
+   `vib 2000 0xff 1` writes VMAX/amp and returns `sent`, but the SDAM trigger
+   (`0x42`/`0xe5`) reads back zero and `hbst-vreg`/`hbst-status4` stay `0x00`.
 4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
    drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
 5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm
