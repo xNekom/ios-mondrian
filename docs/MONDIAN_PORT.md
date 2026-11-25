@@ -267,9 +267,9 @@ exception and `PhotosFileProvider` in PlugInKit's container check; Phone still f
 
 ### 8. Video and HEVC
 
-`0420` accepts the data path on `vpu20_4v.mbn` behind `mondrianvenus=1`: `START`
-succeeds on both ports and a 128x128 sample makes firmware 2.4 report its
-resolution in `SETTINGS_CHANGE`; CSD/frame split, the IRQ and VideoToolbox next.
+`0420` accepts the iris2 path on `vpu20_4v.mbn`: `START` succeeds on both ports
+and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
+with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 
 ## Getting the numbers off the device
 

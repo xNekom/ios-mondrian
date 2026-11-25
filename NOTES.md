@@ -58,7 +58,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
   FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
   place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
-- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9 and accepts the iris2 data path: properties on their ports, BIN/LINE/COMV/NON_COMV before `START(1)`, DPB/raw after `START(2)` (both `flags=0x1`); firmware 2.4 marks `COMV_BUFFER_COUNT`, `OPB_ENABLE` and `PARTIAL_DATA` unsupported (info only). A 128x128 HEVC sample is parsed and answers `SETTINGS_CHANGE` with its resolution; output data and the IRQ are next.
+- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9 and accepts the iris2 data path: properties on their ports, BIN/LINE/COMV/NON_COMV before `START(1)`, DPB/raw after `START(2)` (both `flags=0x1`); firmware 2.4 marks `COMV_BUFFER_COUNT`, `OPB_ENABLE` and `PARTIAL_DATA` unsupported (info only). A 128x128 HEVC Main sample parses and answers `SETTINGS_CHANGE`; V19 (whole-batch `wait_session`) still returns raw 0 with `LAST`/`data=0`, and the raw port's `SETTINGS_CHANGE` arrives after the frame, so output reconfig is next.
 
 Current blockers, in order:
 
