@@ -37,6 +37,12 @@ back `0x60200004`, and the bus-master bit sets (`command=0x0006`) and clears
 the MHI registers wait for the guarded accessor; no ring, DMA, MSI, firmware or
 network is started.
 
+`0423` reads the MHI block through a one-page BAR map. A 2 MiB `ml_io_map()`
+stalled the worker; one page holds MHI and BHI. Measured 2026-11-25:
+`MHIVER=0xdeadbeef`, `MHICFG=0x800080`, `MHISTATUS=0x0`, `BHIOFF=0x100`,
+`BHIEOFF=0x224`; the guarded read completes, so the BAR decodes. The BHI
+registers at `BHIOFF` are the next read.
+
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
 
