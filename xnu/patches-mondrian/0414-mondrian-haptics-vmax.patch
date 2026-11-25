@@ -1,0 +1,107 @@
+xnu 0414: expose haptics VMAX for live drive tests
+
+The PBS boost now comes up, but amplitudes 0x40 and 0xff do not move the LRA
+at the conservative 1250 mV default. Add hapv MV so the next boot can change
+VMAX from the live ring without another kernel build; vib uses the selected
+value and logs it. The command is explicit, defaults are unchanged, and the
+range is capped at 2000 mV after 2700 mV corrupted live PMIC reads.
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index 73124f0..dc572a4 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -73,9 +73,11 @@ extern void delay(int us);
+ #define HAP_SINE			0x01
+ #define HAP_FORCE_VREG_RDY	0x01
+ #define HAP_FORCE_VSET_ACK	0x02	/* HAP525_HV only */
+-#define HAP_VMAX_MV		1250	/* the DT's qcom,vmax-mv */
++#define HAP_VMAX_MV		1250	/* conservative first-drive default */
+ #define HAP_VMAX_STEP_MV	50
+ 
++static unsigned int hap_vmax_mv = HAP_VMAX_MV;
++
+ /*
+  * HBST is read-only on this board. A write there (the vendor's SW_CTRL_HBST
+  * path, taken because the block reports HAP_BOOST_V0P1) never completes: the
+@@ -159,6 +161,17 @@ mondrian_haptics_boost(unsigned int on)
+ 	return hap_boost(on) ? 0 : -1;
+ }
+ 
++int
++mondrian_haptics_set_vmax(unsigned int mv)
++{
++	if (mv < 500 || mv > 2000) {
++		return -1;
++	}
++	hap_vmax_mv = (mv / HAP_VMAX_STEP_MV) * HAP_VMAX_STEP_MV;
++	printf("MONDRIAN HAP: vmax %u mV\n", hap_vmax_mv);
++	return 0;
++}
++
+ /* One register, one transaction: the unit the USB side walks. */
+ int
+ mondrian_haptics_peek(unsigned int block, unsigned int reg, uint8_t *out)
+@@ -191,7 +204,7 @@ mondrian_haptics_poke(unsigned int block, unsigned int reg, unsigned int val)
+ int
+ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ {
+-	uint8_t vmax = HAP_VMAX_MV / HAP_VMAX_STEP_MV;
++	uint8_t vmax = hap_vmax_mv / HAP_VMAX_STEP_MV;
+ 	uint8_t z = 0, st = 0, hpwr = 0, vset = 0, autores = 0, sine = 0;
+ 	int ok = 1;
+ 
+@@ -249,7 +262,7 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	delay(2000 * 1000);
+ 	ok &= hap_boost(0);
+ 	printf("MONDRIAN HAP: buzz %u ms amp 0x%02x vmax %d force %u %s\n", ms,
+-	    amp, HAP_VMAX_MV, force, ok ? "sent" : "with a failed write");
++	    amp, hap_vmax_mv, force, ok ? "sent" : "with a failed write");
+ 	return ok ? 0 : -1;
+ }
+ 
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 5d6542d..fb956c6 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2131,7 +2131,8 @@ ud_cmd_burn(socket_t so, struct sockaddr_in *to, const char *line)
+ 
+ /*
+  * "haps" prints the PMIC's HV haptics block, "hapb [0|1]" votes the PMIC's
+- * PBS boost through SDAM, "vib [ms [amp [force]]]" plays a constant tone, and
++ * PBS boost through SDAM, "hapv MV" sets VMAX, "vib [ms [amp [force]]]" plays
++ * a constant tone, and
+  * "hapr BLOCK REG" / "hapw BLOCK REG VAL" read and write one byte by page
+  * number (0 CFG, 1 PTN, 2 HBST read-only, 3 SDAM read-only). Both pairs
+  * are here because the first question is whether the block answers and the
+@@ -2145,6 +2146,7 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ 	extern int mondrian_haptics_buzz(unsigned int ms, unsigned int amp,
+ 	    unsigned int force);
+ 	extern int mondrian_haptics_boost(unsigned int on);
++	extern int mondrian_haptics_set_vmax(unsigned int mv);
+ 	char out[512];
+ 	int n;
+ 
+@@ -2158,6 +2160,15 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ 		n = snprintf(out, sizeof(out), "hapb %s %s\n",
+ 		    on ? "on" : "off",
+ 		    mondrian_haptics_boost(on) == 0 ? "sent" : "failed");
++	} else if (line[3] == 'v') {		/* "hapv MV" */
++		uint32_t mv = 0;
++
++		if (ud_cmd_num(line + 4, &mv) == NULL) {
++			n = snprintf(out, sizeof(out), "usage: hapv MV\n");
++		} else {
++			n = snprintf(out, sizeof(out), "hapv %u %s\n", mv,
++			    mondrian_haptics_set_vmax(mv) == 0 ? "sent" : "failed");
++		}
+ 	} else {				/* "vib [ms [amp [force]]]" */
+ 		uint32_t ms = 0, amp = 0, force = 0;
+ 		const char *p = ud_cmd_num(line + 3, &ms);
+@@ -2790,6 +2801,7 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strcmp(cmd, "haps") == 0 ||
+ 			    strcmp(cmd, "hapb") == 0 ||
+ 			    strncmp(cmd, "hapb ", 5) == 0 ||
++			    strncmp(cmd, "hapv ", 5) == 0 ||
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);

@@ -325,11 +325,18 @@ force-VSET, not a boost vote.
 
 `0413` takes the vendor's actual boost path: owner-gated writes to SDAM `0x9d00`
 bytes `0x42` and `0xe5`, then a read-only poll of HBST. `hapb 1` performs just
-that vote, `hapr 3 REG` reads the SDAM, and `haps` includes both pages. The first
-boot must show `spmimap` PPID `0x09d` with owner 0 before `hapb` is used; a
-foreign owner closes this path without a store. The donor was never booted, so
-the sequence is source-derived until `hbst-vreg`/`hbst-status4` change and the
-LRA moves.
+that vote, `hapr 3 REG` reads the SDAM, and `haps` includes both pages. `0414`
+adds `hapv MV` so VMAX can be changed from the live ring without a rebuild;
+the command is capped at 2000 mV. The first boot must show `spmimap` PPID
+`0x09d` with owner 0 before `hapb` is used; a foreign owner closes this path
+without a store. Measured 2026-11-25 on the `01:34:05` kernel: APID 428 answers
+PPID `0x09d` with owner 0, and `hapb 1` changed `hbst-vreg` from `0x00` to
+`0x80`. The SDAM bytes read back as zero even though the trigger runs, so the
+boost status is the proof. Amplitudes 0x40/0xff at 1250 mV and 0xff at 1650 mV
+left impedance/`hpwr` at zero and the LRA did not move. **2700 mV is unsafe in
+this sequence:** the following readback returned corrupted CFG/TLRA/HBST values,
+`vbat 825 mV out of range` appeared, and SpringBoard stopped presenting
+(`fps 0`, `DL total 0/0`). Do not repeat it.
 
 `vib [ms [amp [force]]]` plays a constant tone: a deliberately low 1.25 V VMAX,
 amplitude 0x40 of 0xff and 100 ms by default for the first drive. It sets

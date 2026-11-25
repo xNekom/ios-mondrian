@@ -540,7 +540,7 @@ def main():
                         choices=("dump", "prev", "wfile", "pos", "reboot", "respring", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
-                                 "thermal", "burn", "haps", "vib", "hapb", "hapr", "hapw", "spmimap",
+                                 "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapr", "hapw", "spmimap",
                                  "btuart",
                                  "rf", "kill", "say", "fps", "del", "deltree", "ls", "wait"))
     parser.add_argument("args", nargs="*")
@@ -627,7 +627,7 @@ def main():
         return 0
     if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob",
                         "rtc", "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
-                        "thermal", "burn", "haps", "vib", "hapb", "hapr", "hapw",
+                        "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapr", "hapw",
                         "spmimap", "kill", "say", "btuart"):
         answer = simple(" ".join([args.command] + list(args.args)))
         print(answer.decode(errors="replace").strip() if answer else "no answer")

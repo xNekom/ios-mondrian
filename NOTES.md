@@ -69,9 +69,9 @@ Current blockers, in order:
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics do not move.** The PM8350B block answers and CFG/PTN accept
-   writes; the HBST boost belongs to the charger firmware and there is no PBS
-   client yet (`docs/MONDIAN_POWER.md`).
+3. **Haptics boost but do not move.** PMK8350 SDAM/PBS raises `hbst-vreg` to
+   `0x80`; 1250/1650 mV leave impedance/`hpwr` at zero. 2700 mV corrupted PMIC
+   reads and hung the UI, so `hapv` caps at 2000 mV (`docs/MONDIAN_POWER.md`).
 4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
    drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
 5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm
