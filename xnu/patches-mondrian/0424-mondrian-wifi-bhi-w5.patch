@@ -1,0 +1,49 @@
+xnu 0424: read the QCA6490 BHI registers (mondrianwifi=1)
+
+W4 reaches the MHI block through a one-page map (`MHIVER=0xdeadbeef`,
+`BHIOFF=0x100`). W5 reads the BHI version, status, execution environment,
+serial, anti-rollback, segment count and hardware ID at `BHIOFF` with the
+guarded accessor. No image is written, no DMA starts and no firmware is loaded.
+
+Facts from mainline drivers/bus/mhi/core/internal.h (GPL-2.0, constants).
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index f519675..c3df3c3 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -999,6 +999,26 @@ wifi_mhi_probe(uint16_t command)
+ 			(void)mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhieoff);
+ 			wifi_log("W4 MHIVER=0x%x MHICFG=0x%x MHICTRL=0x%x MHISTATUS=0x%x BHIOFF=0x%x BHIEOFF=0x%x",
+ 			    mhiver, mhicfg, mhictrl, status, bhioff, bhieoff);
++			if (bhioff != 0 &&
++			    bhioff <= WIFI_BAR_MAP - 0x50) {
++				uint32_t bhi_min = 0, bhi_maj = 0, bhi_st = 0;
++				uint32_t bhi_exec = 0, bhi_serial = 0;
++				uint32_t bhi_anti = 0, bhi_segs = 0, bhi_hwid = 0;
++
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x00, &bhi_min);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x04, &bhi_maj);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &bhi_exec);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &bhi_st);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x40, &bhi_serial);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x44, &bhi_anti);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x48, &bhi_segs);
++				(void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x4c, &bhi_hwid);
++				wifi_log("W5 BHI ver=0x%x.%x status=0x%x execenv=0x%x serial=0x%x anti=0x%x segs=0x%x hwid=0x%x",
++				    bhi_maj, bhi_min, bhi_st, bhi_exec, bhi_serial,
++				    bhi_anti, bhi_segs, bhi_hwid);
++			} else {
++				wifi_log("W5 BHIOFF unusable 0x%x", bhioff);
++			}
+ 		}
+ 	} else {
+ 		wifi_log("W4 BAR0 not assigned; MHI deferred");
+@@ -1130,7 +1150,7 @@ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    WIFI_TLMM_DRIVE_2MA, 1), 0);
+ 	}
+ 	wifi_log(ok ?
+-	    "W1/W2/W3 complete; config-space proof; no DMA, firmware or network was started" :
++	    "W4/W5 complete; MHI and BHI read; no DMA, firmware or network was started" :
+ 	    "worker stopped after failure; normal iOS boot continues");
+ 	mondrian_log_flush_now();
+ 	(void)thread_terminate(current_thread());
