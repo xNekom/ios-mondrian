@@ -1,0 +1,187 @@
+xnu 0417: guard trapped 32-bit MMIO accesses
+
+Gunyah refuses apps-SMMU accesses that are not one plain 32-bit ldr/str.
+Add single-instruction accessors and an expected-fault path that accepts only
+a synchronous external abort at those two instructions. DEVELOPMENT/DEBUG
+kernels return an error to the caller; RELEASE builds touch nothing.
+
+Adapted from akshaynexus/iOSPlus10 0255-negroni-mmio-accessors and
+0297-negroni-mmio-try (MIT), with the MONDRIAN board guard.
+
+diff --git a/bsd/dev/mondrian_mmio.h b/bsd/dev/mondrian_mmio.h
+new file mode 100644
+index 0000000..aec9da4
+--- /dev/null
++++ b/bsd/dev/mondrian_mmio.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * Single-register 32-bit MMIO accessors for spaces Gunyah traps.
++ *
++ * Adapted from akshaynexus/iOSPlus10 patches 0255 and 0297 (MIT):
++ * 0255-negroni-mmio-accessors and 0297-negroni-mmio-try. The hypervisor
++ * emulates these accesses only when the syndrome identifies one plain
++ * 32-bit ldr/str with no base writeback, pair, 64-bit access or WZR store.
++ */
++#ifndef _MONDRIAN_MMIO_H_
++#define _MONDRIAN_MMIO_H_
++
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++static inline uint32_t
++mondrian_mmio_rd32(vm_offset_t a)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (v) : "r" (a) : "memory");
++	return v;
++}
++
++static inline void
++mondrian_mmio_wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (v), "r" (a) : "memory");
++}
++
++/* 0 = done, -1 = synchronous external abort, -2 = unsupported build. */
++extern int mondrian_mmio_try_rd32(vm_offset_t a, uint32_t *v);
++extern int mondrian_mmio_try_wr32(vm_offset_t a, uint32_t v);
++extern uint32_t mondrian_mmio_try_faults;
++
++#endif /* _MONDRIAN_MMIO_H_ */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 2b76420..acf54f7 100755
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -57,6 +57,10 @@
+ #include <pexpert/arm64/apple_arm64_regs.h>
+ #include <pexpert/arm64/board_config.h>
+ 
++#if defined(MONDRIAN) && defined(CONFIG_XNUPOST)
++static bool mondrian_mmio_try_fault(arm_saved_state_t *state);
++#endif
++
+ #include <vm/vm_page.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_fault.h>
+@@ -677,7 +681,13 @@ sleh_synchronous(arm_context_t *context, uint32_t esr, vm_offset_t far)
+ 		thread->machine.expected_fault_handler = NULL;
+ 		thread->machine.expected_fault_addr = 0;
+ 
+-		if (saved_expected_fault_addr == far) {
++		if (saved_expected_fault_addr == far
++#if defined(MONDRIAN)
++		    /* An SEA can be FnV; the MMIO handler validates the faulting PC. */
++		    || (saved_expected_fault_handler == mondrian_mmio_try_fault &&
++		    class == ESR_EC_DABORT_EL1 && (ESR_ISS(esr) & (1u << 10)))
++#endif
++			 ) {
+ 			expected_fault_handler = saved_expected_fault_handler;
+ 		}
+ 	}
+@@ -1685,6 +1695,13 @@ handle_kernel_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_ad
+ 		}
+ 	}
+ 
++#if defined(MONDRIAN) && defined(CONFIG_XNUPOST)
++	/* A hypervisor-refused trapped MMIO access returns to its caller. */
++	if (fault_code == FSC_SYNC_EXT_ABORT && expected_fault_handler != NULL &&
++	    expected_fault_handler(state)) {
++		return;
++	}
++#endif
+ 	panic_with_thread_kernel_state("Kernel data abort.", state);
+ }
+ 
+@@ -2243,3 +2260,91 @@ sleh_invalid_stack(arm_context_t *context, uint32_t esr __unused, vm_offset_t fa
+ 	panic_with_thread_kernel_state("Invalid kernel stack pointer (probable corruption).", &context->ss);
+ }
+ 
++
++#if defined(MONDRIAN)
++/*
++ * Guarded single-register MMIO. DEVELOPMENT/DEBUG builds arm XNU's expected-
++ * fault hook around exactly one ldr/str; an SEA at that instruction advances
++ * the PC and returns an error. RELEASE builds touch nothing and return -2.
++ */
++int mondrian_mmio_try_rd32(vm_offset_t a, uint32_t *v);
++int mondrian_mmio_try_wr32(vm_offset_t a, uint32_t v);
++uint32_t mondrian_mmio_try_faults;
++#if defined(CONFIG_XNUPOST)
++extern char mondrian_mmio_try_ld_insn[], mondrian_mmio_try_st_insn[];
++uint64_t mondrian_mmio_try_ld32_raw(vm_offset_t a);
++uint64_t mondrian_mmio_try_st32_raw(vm_offset_t a, uint64_t v);
++__asm__ (
++	"	.text\n"
++	"	.align 2\n"
++	"	.globl _mondrian_mmio_try_ld32_raw\n"
++	"_mondrian_mmio_try_ld32_raw:\n"
++	"	mov	x1, x0\n"
++	"	mov	x0, #-1\n"
++	"	.globl _mondrian_mmio_try_ld_insn\n"
++	"	.alt_entry _mondrian_mmio_try_ld_insn\n"
++	"_mondrian_mmio_try_ld_insn:\n"
++	"	ldr	w0, [x1]\n"
++	"	ret\n"
++	"	.globl _mondrian_mmio_try_st32_raw\n"
++	"_mondrian_mmio_try_st32_raw:\n"
++	"	mov	x2, x0\n"
++	"	mov	x0, #0\n"
++	"	.globl _mondrian_mmio_try_st_insn\n"
++	"	.alt_entry _mondrian_mmio_try_st_insn\n"
++	"_mondrian_mmio_try_st_insn:\n"
++	"	str	w1, [x2]\n"
++	"	dsb	sy\n"
++	"	ret\n"
++	);
++
++static bool
++mondrian_mmio_try_fault(arm_saved_state_t *state)
++{
++	uintptr_t pc = (uintptr_t)get_saved_state_pc(state);
++
++	if (pc != (uintptr_t)mondrian_mmio_try_ld_insn &&
++	    pc != (uintptr_t)mondrian_mmio_try_st_insn) {
++		return false;
++	}
++	set_saved_state_reg(state, 0, (register_t)~0ull);
++	add_saved_state_pc(state, 4);
++	os_atomic_inc(&mondrian_mmio_try_faults, relaxed);
++	return true;
++}
++
++int
++mondrian_mmio_try_rd32(vm_offset_t a, uint32_t *v)
++{
++	ml_expect_fault_begin(mondrian_mmio_try_fault, a);
++	uint64_t r = mondrian_mmio_try_ld32_raw(a);
++	ml_expect_fault_end();
++	if (r > 0xffffffffull) {
++		return -1;
++	}
++	*v = (uint32_t)r;
++	return 0;
++}
++
++int
++mondrian_mmio_try_wr32(vm_offset_t a, uint32_t v)
++{
++	ml_expect_fault_begin(mondrian_mmio_try_fault, a);
++	uint64_t r = mondrian_mmio_try_st32_raw(a, v);
++	ml_expect_fault_end();
++	return r ? -1 : 0;
++}
++#else /* !CONFIG_XNUPOST */
++int
++mondrian_mmio_try_rd32(vm_offset_t a __unused, uint32_t *v __unused)
++{
++	return -2;
++}
++
++int
++mondrian_mmio_try_wr32(vm_offset_t a __unused, uint32_t v __unused)
++{
++	return -2;
++}
++#endif /* CONFIG_XNUPOST */
++#endif /* MONDRIAN */
