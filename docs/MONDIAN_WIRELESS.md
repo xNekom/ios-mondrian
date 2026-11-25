@@ -8,6 +8,14 @@ below). The kernel exports no `IO80211`, `IOBluetooth`,
 PCIe, MHI, QMI and `ath11k` bring-up. The phone carries a Qualcomm **QCA6490**
 combo, whose two halves are separate buses and separate projects.
 
+`0415` adds the first Wi-Fi milestone behind `mondrianwifi=1`: PCIe0 cold link
+and QCA6490 config identity only, with bus mastering off and no SMMU, DMA, MSI,
+MHI or firmware. Measured 2026-11-25 on the `04:07:36` kernel with Bluetooth
+off: all eight WLAN/PCIe rails voted, the live 82-entry PHY table loaded, link
+came up **Gen2 x1**, and config read `17cb:1103`, subsystem `17cb:0108`,
+revision `01`; bus mastering read back clear. The worker reuses touch's early
+GCC window because a second late `ml_io_map()` of the same block stalled.
+
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
 

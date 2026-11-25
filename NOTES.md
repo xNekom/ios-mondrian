@@ -62,10 +62,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **Wi-Fi, audio, camera and cellular are not implemented.** The QCA6490
-   WLAN half has no driver; there is no audio route or codec/amp path (A2DP
-   waits on it), and the camera and modem have no iOS device. The next source
-   for each is in `docs/REFERENCE_PORTS.md`.
+1. **Wi-Fi PCIe is proven; the radio stack is missing.** `0415` reaches Gen2 x1
+   and reads QCA6490 `17cb:1103` with bus mastering off; MHI/QMI/ath11k, firmware
+   and the interface are absent. Audio, camera and cellular are not implemented
+   (`docs/REFERENCE_PORTS.md`).
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.

@@ -1,0 +1,1181 @@
+xnu 0415: prove PCIe0 and the QCA6490 endpoint (mondrianwifi=1)
+
+W1 is MMIO only: vote the WLAN/PCIe rails and clocks, load the live-DTB
+82-entry PHY table, train PCIe0, open the endpoint config window and read
+17cb:1103. Bus mastering is cleared and verified before the worker stops.
+There is no SMMU, DMA, MSI, MHI, firmware, ath11k or network interface yet.
+
+Cold-link order ported from qiumochen/UniXNU-zizhan 88f4eeb,
+drivers/PongWifi/PongWifiPlatform.cpp (BSD-2-Clause-Patent). The PHY
+table is board data from dtb/mondrian-live.dtb. No GPL ath11k or vendor
+driver code is included.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d579bb6..736a7af 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/mondrian_virtio.c		standard
+ bsd/dev/mondrian_sample.c		standard
+ bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
++bsd/dev/mondrian_wifi.c		standard
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+index d8a4bfd..360a8ba 100644
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -193,7 +193,19 @@ extern void mondrian_log_flush_now(void);
+ #define MONDRIAN_TOUCH_IRQ_GPIO		21
+ #define MONDRIAN_TOUCH_AVDD_GPIO	71
+ 
+-static uint32_t
++/* One early GCC window, shared with the optional PCIe worker. */
++static vm_offset_t mondrian_gcc_shared;
++
++vm_offset_t
++mondrian_gcc_map(void)
++{
++	if (mondrian_gcc_shared == 0) {
++		mondrian_gcc_shared = ml_io_map(MONDRIAN_GCC_BASE, 0xa0000);
++	}
++	return mondrian_gcc_shared;
++}
++
++uint32_t
+ mondrian_tlmm_read(vm_offset_t page, uint32_t off)
+ {
+ 	uint32_t value;
+@@ -203,7 +215,7 @@ mondrian_tlmm_read(vm_offset_t page, uint32_t off)
+ 	return value;
+ }
+ 
+-static void
++void
+ mondrian_tlmm_write(vm_offset_t page, uint32_t off, uint32_t value)
+ {
+ 	*(volatile uint32_t *)(page + off) = value;
+@@ -230,7 +242,7 @@ mondrian_tlmm_write_raw(vm_offset_t page, uint32_t off, uint32_t value)
+ 	*(volatile uint32_t *)(page + off) = value;
+ }
+ 
+-static uint32_t
++uint32_t
+ mondrian_tlmm_cfg(uint32_t function, uint32_t pull, uint32_t drive, int output)
+ {
+ 	return (function << 2) | pull | (drive << 6) | (output ? (1u << 9) : 0);
+@@ -238,7 +250,7 @@ mondrian_tlmm_cfg(uint32_t function, uint32_t pull, uint32_t drive, int output)
+ 
+ /* Set the pad's output value, then its configuration (so enabling the output
+  * does not drive the old value for a moment). */
+-static void
++void
+ mondrian_tlmm_output(vm_offset_t page, uint32_t function, uint32_t drive, int level)
+ {
+ 	mondrian_tlmm_write(page, MONDRIAN_TLMM_IN_OUT, level ? 2 : 0);
+@@ -370,7 +382,7 @@ mondrian_touch_geni_probe(void)
+ 
+ 	printf("MONDRIAN TOUCH: geni: mapping gcc/wrapper/se\n");
+ 	mondrian_log_flush_now();
+-	gcc = ml_io_map(MONDRIAN_GCC_BASE, 0x70000);
++	gcc = mondrian_gcc_map();
+ 	wrap = ml_io_map(MONDRIAN_QUPV3_WRAP0_BASE, 0x2000);
+ 	se = ml_io_map(MONDRIAN_SPI_SE4_BASE, 0x4000);
+ 	if (gcc == 0 || wrap == 0 || se == 0) {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index fb956c6..bf6e72e 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -265,6 +265,13 @@ mondrian_usb_probe(void)
+ 	 * resets the phone, the SMR/S2CR work is the one in anonbeat1's
+ 	 * 0091-sweet-spacewar-usb-net-smmu.patch (reuse ABL's SMR for the SID).
+ 	 */
++	{
++		extern void mondrian_wifi_start(void);
++
++		if (usb >= 2) {
++			mondrian_wifi_start();
++		}
++	}
+ 	printf("MONDR USB: probe done\n");
+ }
+ 
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+new file mode 100644
+index 0000000..b0a161b
+--- /dev/null
++++ b/bsd/dev/mondrian_wifi.c
+@@ -0,0 +1,1072 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/*
++ * Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Copyright (c) 2026, ios-mondrian contributors. All rights reserved.
++ *
++ * The SM8475 PCIe0 cold-link order and register sequence are adapted from
++ * qiumochen/UniXNU-zizhan, drivers/PongWifi/PongWifiPlatform.cpp at
++ * 88f4eeb21663a24e34670a2af96a8965432aa83e (BSD-2-Clause-Patent).
++ * Board constants and the PHY sequence are taken from this phone's live tree,
++ * dtb/mondrian-live.dtb. No Linux ath11k, MHI, vendor driver, firmware, DMA,
++ * SMMU or MSI implementation is included.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ *    this list of conditions and the following disclaimer in the documentation
++ *    and/or other materials provided with the distribution.
++ *
++ * Subject to the terms and conditions of this license, each copyright holder
++ * and contributor hereby grants to those receiving rights under this license
++ * a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++ * (except for failure to satisfy the conditions of this license) patent
++ * license to make, have made, use, offer to sell, sell, import, and otherwise
++ * transfer this software, where such license applies only to those patent
++ * claims, already acquired or hereafter acquired, licensable by such copyright
++ * holder or contributor that are necessarily infringed by:
++ *
++ * (a) their Contribution(s) (the licensed copyrights of copyright holders and
++ *     non-copyrightable additions of contributors, in source or binary form)
++ *     alone; or
++ *
++ * (b) combination of their Contribution(s) with the work of authorship to
++ *     which such Contribution(s) was added by such copyright holder or
++ *     contributor, if, at the time such Contribution is added, such addition
++ *     causes such combination to be necessarily infringed. The patent license
++ *     shall not apply to any other combinations which include the Contribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * MONDRIAN WIFI W1: PCIe0 MMIO cold link and QCA6490 identity only.
++ *
++ * mondrian_wifi_start() is called from mondrian_usb_probe() after the console
++ * ring and USB gadget are up. Root/UFS
++ * are already mounted there. The boot-argument check precedes every map and
++ * every register access. Success leaves the link up with endpoint bus
++ * mastering off. Failure asserts PERST# low when possible and lets the normal
++ * iOS boot continue.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdarg.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#include <vm/vm_kern.h>
++
++void mondrian_wifi_start(void);
++
++#if defined(MONDRIAN)
++
++/* osfmk/arm/machine_routines.h is not exported to the BSD layer. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void mondrian_log_flush_now(void);
++/* Present in XNU, but not declared by the BSD-visible thread header. */
++extern kern_return_t thread_terminate(thread_t thread);
++
++/*
++ * These four helpers live in mondrian_touch.c and are exported for this driver.
++ */
++extern vm_offset_t mondrian_gcc_map(void);
++extern uint32_t mondrian_tlmm_read(vm_offset_t page, uint32_t off);
++extern void mondrian_tlmm_write(vm_offset_t page, uint32_t off, uint32_t value);
++extern uint32_t mondrian_tlmm_cfg(uint32_t function, uint32_t pull,
++    uint32_t drive, int output);
++extern void mondrian_tlmm_output(vm_offset_t page, uint32_t function,
++    uint32_t drive, int level);
++
++/* Patch 0170 exports; patches 0179 keeps their windows map-once. */
++extern uint32_t mondrian_cmd_db_addr(const char *id);
++extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
++extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
++
++/* dtb/mondrian-live.dtb: /soc/qcom,pcie@1c00000/reg and reg-names. */
++#define WIFI_PARF_PA		0x1c00000UL
++#define WIFI_PARF_SIZE		0x3000
++#define WIFI_PHY_PA		0x1c06000UL
++#define WIFI_PHY_SIZE		0x2000
++#define WIFI_DBI_PA		0x60000000UL
++#define WIFI_DBI_SIZE		0x1000	/* DT window is 0xf1d; map one page */
++#define WIFI_ELBI_PA		0x60000f20UL
++#define WIFI_ELBI_SIZE		0xa8
++#define WIFI_IATU_PA		0x60001000UL
++#define WIFI_IATU_SIZE		0x1000
++#define WIFI_CFG_PA		0x60100000UL
++#define WIFI_CFG_SIZE		0x1000	/* DT window is 1 MiB; W1 needs one page */
++#define WIFI_BAR_BASE		0x60200000UL
++#define WIFI_BAR_END		0x63ffffffUL
++#define WIFI_BAR_SIZE		0x04000000UL
++
++/* /soc/qcom,gdsc@17b004 and its qcom,collapse-vote phandle. */
++#define WIFI_GCC_PA		0x01000000UL
++#define WIFI_GCC_SIZE		0x000a0000
++#define WIFI_GDSC_OFF		0x7b004
++#define WIFI_COLLAPSE_OFF	0x62128	/* PA 0x162128 */
++#define WIFI_COLLAPSE_BIT	(1u << 0)
++
++/* cnss and pcie0 GPIO properties; the TLMM pin block starts at 0x0f100000. */
++#define WIFI_TLMM_BASE		0x0f100000UL
++#define WIFI_TLMM_PAGE_SIZE	0x1000
++#define WIFI_TLMM_CFG		0x0
++#define WIFI_TLMM_IN_OUT		0x4
++#define WIFI_TLMM_INTR_CFG		0x8
++#define WIFI_TLMM_INTR_STATUS	0xc
++#define WIFI_TLMM_PULL_NONE	0
++#define WIFI_TLMM_PULL_DOWN	1
++#define WIFI_TLMM_PULL_UP	3
++#define WIFI_TLMM_DRIVE_2MA	0
++#define WIFI_TLMM_DRIVE_8MA	3
++#define WIFI_TLMM_DRIVE_16MA	7
++#define WIFI_TLMM_FUNC_GPIO	0
++#define WIFI_TLMM_FUNC_CLKREQ	1
++#define WIFI_TLMM_PRESENT	(1u << 11)
++#define WIFI_TLMM_OWNER		(1u << 12)
++
++#define WIFI_GPIO_WLAN_EN	80
++#define WIFI_GPIO_BT_EN		81
++#define WIFI_GPIO_PERST		94
++#define WIFI_GPIO_CLKREQ	95
++#define WIFI_GPIO_WAKE		96
++#define WIFI_GPIO_XO		204
++
++/* qcom,phy-status-*, qcom,phy-power-down-offset and qcom,aux-clk-freq. */
++#define WIFI_PHY_STATUS_OFF	0x214
++#define WIFI_PHY_STATUS_MASK	(1u << 6)
++#define WIFI_PHY_POWER_DOWN	0x240
++#define WIFI_PHY_VERSION	0x63
++#define WIFI_AUX_MHZ		20
++#define WIFI_EP_LATENCY_MS	10
++#define WIFI_PERST_DELAY_US	1000
++#define WIFI_REFGEN_INDEX	11	/* max-clock-frequency-hz[11] = 100 MHz */
++#define WIFI_XO_INDEX		3	/* max-clock-frequency-hz[3] = 19.2 MHz */
++#define WIFI_TARGET_GEN		2
++
++#define WIFI_PCI_ID_QCA6490	0x110317cbU
++#define WIFI_PCI_VENDOR_QCOM	0x17cbU
++#define WIFI_PCI_DEVICE_QCA6490	0x1103U
++#define WIFI_PCI_BUS_MASTER	(1u << 1)
++
++struct wifi_phy_entry {
++	uint16_t off;
++	uint8_t value;
++	uint8_t delay;
++};
++
++/* BEGIN MONDRIAN LIVE PHY TABLE */
++static const struct wifi_phy_entry wifi_phy_table[] = {
++	{ 0x240, 0x03, 0 },
++	{ 0x0c0, 0x01, 0 },
++	{ 0x0cc, 0x31, 0 },
++	{ 0x0d0, 0x01, 0 },
++	{ 0x060, 0xff, 0 },
++	{ 0x064, 0x06, 0 },
++	{ 0x000, 0x4c, 0 },
++	{ 0x004, 0x06, 0 },
++	{ 0x0e0, 0x90, 0 },
++	{ 0x0e4, 0x82, 0 },
++	{ 0x0f4, 0x07, 0 },
++	{ 0x070, 0x02, 0 },
++	{ 0x010, 0x02, 0 },
++	{ 0x074, 0x16, 0 },
++	{ 0x014, 0x16, 0 },
++	{ 0x078, 0x36, 0 },
++	{ 0x018, 0x36, 0 },
++	{ 0x110, 0x08, 0 },
++	{ 0x0bc, 0x0e, 0 },
++	{ 0x120, 0x42, 0 },
++	{ 0x080, 0x0a, 0 },
++	{ 0x084, 0x1a, 0 },
++	{ 0x020, 0x14, 0 },
++	{ 0x024, 0x34, 0 },
++	{ 0x088, 0x82, 0 },
++	{ 0x028, 0x68, 0 },
++	{ 0x090, 0xab, 0 },
++	{ 0x094, 0xea, 0 },
++	{ 0x098, 0x02, 0 },
++	{ 0x030, 0xab, 0 },
++	{ 0x034, 0xaa, 0 },
++	{ 0x038, 0x02, 0 },
++	{ 0x140, 0x14, 0 },
++	{ 0x164, 0x34, 0 },
++	{ 0x03c, 0x01, 0 },
++	{ 0x01c, 0x04, 0 },
++	{ 0x174, 0x16, 0 },
++	{ 0x1bc, 0x0f, 0 },
++	{ 0x170, 0xa0, 0 },
++	{ 0x11a4, 0x38, 0 },
++	{ 0x10dc, 0x11, 0 },
++	{ 0x1160, 0xbf, 0 },
++	{ 0x1164, 0xbf, 0 },
++	{ 0x1168, 0xb7, 0 },
++	{ 0x116c, 0xea, 0 },
++	{ 0x115c, 0x3f, 0 },
++	{ 0x1174, 0x5c, 0 },
++	{ 0x1178, 0x9c, 0 },
++	{ 0x117c, 0x1a, 0 },
++	{ 0x1180, 0x89, 0 },
++	{ 0x1170, 0xdc, 0 },
++	{ 0x1188, 0x94, 0 },
++	{ 0x118c, 0x5b, 0 },
++	{ 0x1190, 0x1a, 0 },
++	{ 0x1194, 0x89, 0 },
++	{ 0x10cc, 0xf0, 0 },
++	{ 0x1008, 0x09, 0 },
++	{ 0x1014, 0x05, 0 },
++	{ 0x104c, 0x08, 0 },
++	{ 0x1050, 0x08, 0 },
++	{ 0x10d8, 0x0f, 0 },
++	{ 0x1118, 0x1c, 0 },
++	{ 0x10f8, 0x07, 0 },
++	{ 0x11f8, 0x08, 0 },
++	{ 0x0e84, 0x15, 0 },
++	{ 0x0e90, 0x3f, 0 },
++	{ 0x0ee4, 0x02, 0 },
++	{ 0x0e40, 0x06, 0 },
++	{ 0x0e3c, 0x18, 0 },
++	{ 0x02dc, 0x05, 0 },
++	{ 0x0388, 0x77, 0 },
++	{ 0x0398, 0x0b, 0 },
++	{ 0x03e0, 0x0f, 0 },
++	{ 0x060c, 0x1d, 0 },
++	{ 0x0614, 0x07, 0 },
++	{ 0x0620, 0xc1, 0 },
++	{ 0x0694, 0x00, 0 },
++	{ 0x03d0, 0x8c, 0 },
++	{ 0x1424, 0x01, 0 },
++	{ 0x1428, 0x01, 0 },
++	{ 0x0200, 0x00, 0 },
++	{ 0x0244, 0x03, 0 },
++};
++/* END MONDRIAN LIVE PHY TABLE */
++
++struct wifi_rail {
++	const char *name;
++	uint32_t mv;
++};
++
++/* CNSS request tuples plus the PCIe vreg-1p8/vreg-0p9 tuples. */
++static const struct wifi_rail wifi_rails[] = {
++	{ "smpe2", 1012 },
++	{ "smpb11", 966 },
++	{ "smpb10", 1800 },
++	{ "smpc1", 1900 },
++	{ "smpb12", 1350 },
++	{ "ldoe7", 2800 },
++	{ "ldoc10", 1200 },
++	{ "ldob5", 880 },
++};
++
++static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,
++    wifi_iatu, wifi_cfg;
++static vm_offset_t wifi_wlan_en_page, wifi_bt_en_page, wifi_perst_page,
++    wifi_clkreq_page, wifi_wake_page, wifi_xo_page;
++
++static void wifi_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++wifi_log(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("MONDRIAN WIFI: %s\n", line);
++}
++
++static int
++wifi_fail(const char *message)
++{
++
++	wifi_log("%s", message);
++	return -1;
++}
++
++static vm_offset_t
++wifi_map_once(vm_offset_t *slot, vm_offset_t pa, vm_size_t size)
++{
++
++	if (*slot == 0) {
++		*slot = ml_io_map(pa, size);
++	}
++	return *slot;
++}
++
++static int
++wifi_wait(vm_offset_t page, uint32_t off, uint32_t mask, uint32_t value,
++    unsigned us)
++{
++	unsigned attempts = (us + 9) / 10;
++	unsigned i;
++
++	for (i = 0; i < attempts; i++) {
++		if ((mondrian_tlmm_read(page, off) & mask) == value) {
++			return 0;
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++static void
++wifi_reset(vm_offset_t page, uint32_t off)
++{
++
++	mondrian_tlmm_write(page, off, mondrian_tlmm_read(page, off) | 1u);
++	delay(1000);
++	mondrian_tlmm_write(page, off, mondrian_tlmm_read(page, off) & ~1u);
++	delay(1000);
++}
++
++static uint16_t
++wifi_read16(vm_offset_t page, uint32_t off)
++{
++	uint16_t value;
++
++	value = *(volatile uint16_t *)(page + off);
++	__builtin_arm_dsb(0xf);
++	return value;
++}
++
++static void
++wifi_write16(vm_offset_t page, uint32_t off, uint16_t value)
++{
++
++	*(volatile uint16_t *)(page + off) = value;
++	__builtin_arm_dsb(0xf);
++}
++
++static uint8_t
++wifi_read8(vm_offset_t page, uint32_t off)
++{
++	uint8_t value;
++
++	value = *(volatile uint8_t *)(page + off);
++	__builtin_arm_dsb(0xf);
++	return value;
++}
++
++static void
++wifi_pin_set(vm_offset_t page, uint32_t conf, int level)
++{
++	uint32_t old = mondrian_tlmm_read(page, WIFI_TLMM_CFG);
++
++	/* Match the donor's APPS ownership claim for pads that report PRESENT. */
++	conf = (old & ~0x3ffu) | (conf & 0x3ffu);
++	if ((old & WIFI_TLMM_PRESENT) != 0) {
++		conf |= WIFI_TLMM_OWNER;
++	}
++	if (level >= 0) {
++		mondrian_tlmm_write(page, WIFI_TLMM_IN_OUT, level ? 2 : 0);
++	}
++	mondrian_tlmm_write(page, WIFI_TLMM_CFG, conf);
++	if (level >= 0) {
++		mondrian_tlmm_write(page, WIFI_TLMM_IN_OUT, level ? 2 : 0);
++	}
++}
++
++static void
++wifi_xo_set(int level)
++{
++	uint32_t old = mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_CFG);
++
++	/* GPIO204 has no DT pinctrl state; reuse the BT driver's proven output. */
++	mondrian_tlmm_output(wifi_xo_page, WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_DRIVE_8MA, level);
++	if ((old & WIFI_TLMM_PRESENT) != 0) {
++		mondrian_tlmm_write(wifi_xo_page, WIFI_TLMM_CFG,
++		    mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_CFG) |
++		    WIFI_TLMM_OWNER);
++	}
++}
++
++static int
++wifi_map_pins(void)
++{
++
++	wifi_wlan_en_page = wifi_map_once(&wifi_wlan_en_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_WLAN_EN,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_bt_en_page = wifi_map_once(&wifi_bt_en_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_BT_EN,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_perst_page = wifi_map_once(&wifi_perst_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_PERST,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_clkreq_page = wifi_map_once(&wifi_clkreq_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_CLKREQ,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_wake_page = wifi_map_once(&wifi_wake_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_WAKE,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_xo_page = wifi_map_once(&wifi_xo_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_XO,
++	    WIFI_TLMM_PAGE_SIZE);
++	if (wifi_wlan_en_page == 0 || wifi_bt_en_page == 0 ||
++	    wifi_perst_page == 0 || wifi_clkreq_page == 0 ||
++	    wifi_wake_page == 0 || wifi_xo_page == 0) {
++		return wifi_fail("cannot map the PCIe/CNSS TLMM pages");
++	}
++	return 0;
++}
++
++static int
++wifi_pins_hold_reset(void)
++{
++
++	/* Do not reset the shared die while Bluetooth is already powered. */
++	if ((mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_IN_OUT) & 1u) != 0) {
++		return wifi_fail("BT_EN is high; shared-die Wi-Fi reset refused");
++	}
++	wifi_log("pins initial wlan=%x/%x perst=%x/%x clkreq=%x/%x wake=%x xo=%x/%x bt=%x/%x",
++	    mondrian_tlmm_read(wifi_wlan_en_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_wlan_en_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_perst_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_perst_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_wake_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_IN_OUT));
++
++	/* pcie0_perst_default, pcie0_clkreq_default and pcie0_wake_default. */
++	wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_DOWN, WIFI_TLMM_DRIVE_2MA, 1), 0);
++	wifi_pin_set(wifi_clkreq_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_CLKREQ,
++	    WIFI_TLMM_PULL_UP, WIFI_TLMM_DRIVE_2MA, 0), -1);
++	wifi_pin_set(wifi_wake_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_UP, WIFI_TLMM_DRIVE_2MA, 0), -1);
++
++	/* cnss_wlan_en_sleep: GPIO, pull-down, 2 mA, output low. */
++	wifi_pin_set(wifi_wlan_en_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_DOWN, WIFI_TLMM_DRIVE_2MA, 1), 0);
++	delay(150000);
++	return 0;
++}
++
++static void
++wifi_enable_wlan(void)
++{
++
++	wifi_log("WLAN enable start");
++	if ((mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_IN_OUT) & 1u) == 0) {
++		delay(100000);
++	}
++	wifi_xo_set(1);
++	delay(200);
++	/* cnss_wlan_en_active: GPIO, pull-up, 16 mA, output high. */
++	wifi_pin_set(wifi_wlan_en_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_UP, WIFI_TLMM_DRIVE_16MA, 1), 1);
++	delay(1000);
++	delay(3000);
++	wifi_xo_set(0);
++	delay(60000);
++	wifi_log("WLAN enable complete");
++}
++
++static uint16_t
++wifi_le16(const uint8_t *p)
++{
++
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++static uint32_t
++wifi_le32(const uint8_t *p)
++{
++
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	    ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static int
++wifi_vote_rail(const struct wifi_rail *rail)
++{
++	uint32_t addr = mondrian_cmd_db_addr(rail->name);
++
++	if (addr == 0) {
++		wifi_log("rail %s missing from cmd-db", rail->name);
++		return -1;
++	}
++	/* VRM mode, voltage, enable; the donor sends three single-word votes. */
++	if (mondrian_rpmh_write_one(addr + 8, 7) != 0 ||
++	    mondrian_rpmh_write_one(addr, rail->mv) != 0 ||
++	    mondrian_rpmh_write_one(addr + 4, 1) != 0) {
++		wifi_log("rail %s RPMh transaction failed", rail->name);
++		return -1;
++	}
++	wifi_log("rail %s addr 0x%x requested %u mV on", rail->name, addr,
++	    rail->mv);
++	return 0;
++}
++
++static int
++wifi_vote_arc(const char *name)
++{
++	uint32_t addr = mondrian_cmd_db_addr(name);
++	uint32_t len = 0;
++	const uint8_t *table = mondrian_cmd_db_data(name, &len);
++	uint16_t maximum = 0;
++	uint32_t i;
++
++	if (addr == 0 || table == NULL || len < 2 || (len & 1u) != 0) {
++		wifi_log("ARC resource %s missing or malformed", name);
++		return -1;
++	}
++	for (i = 0; i < len; i += 2) {
++		uint16_t value = wifi_le16(table + i);
++
++		if (value > maximum) {
++			maximum = value;
++		}
++	}
++	if (mondrian_rpmh_write_one(addr, maximum) != 0) {
++		wifi_log("ARC resource %s vote failed", name);
++		return -1;
++	}
++	wifi_log("arc %s addr 0x%x requested level 0x%x", name, addr, maximum);
++	return 0;
++}
++
++static int
++wifi_vote_xo(void)
++{
++	uint32_t addr = mondrian_cmd_db_addr("xo.lvl");
++
++	if (addr == 0) {
++		return wifi_fail("xo.lvl missing from cmd-db");
++	}
++	if (mondrian_rpmh_write_one(addr, 3) != 0) {
++		return wifi_fail("xo.lvl RPMh vote failed");
++	}
++	wifi_log("xo.lvl addr 0x%x requested level 3", addr);
++	return 0;
++}
++
++static int
++wifi_vote_sn7(void)
++{
++	uint32_t addr = mondrian_cmd_db_addr("SN7");
++	uint32_t len = 0;
++	const uint8_t *aux = mondrian_cmd_db_data("SN7", &len);
++	uint32_t unit;
++	uint16_t width;
++	uint64_t scaled, vote;
++	uint32_t value;
++
++	if (addr == 0 || aux == NULL || len < 8) {
++		return wifi_fail("PCIe NoC SN7 cmd-db resource absent/malformed");
++	}
++	unit = wifi_le32(aux);
++	width = wifi_le16(aux + 4);
++	if (unit == 0 || width == 0) {
++		return wifi_fail("PCIe NoC SN7 bandwidth unit/width is zero");
++	}
++	/* Donor's SM8450 pcie-anoc/qns_pcie_mem_noc plan: width 16, one channel. */
++	scaled = (2000000ULL * width + 15) / 16;
++	vote = (scaled * 1000 + unit - 1) / unit;
++	if (vote == 0) {
++		vote = 1;
++	}
++	if (vote > 0x3fff) {
++		vote = 0x3fff;
++	}
++	value = (1u << 30) | (1u << 29) | ((uint32_t)vote << 14) |
++	    (uint32_t)vote;
++	if (mondrian_rpmh_write_one(addr, value) != 0) {
++		return wifi_fail("PCIe NoC SN7 RPMh vote failed");
++	}
++	wifi_log("noc SN7 addr 0x%x unit %u width %u requested 0x%x", addr,
++	    unit, width, value);
++	return 0;
++}
++
++static int
++wifi_supplies(void)
++{
++	size_t i;
++
++	for (i = 0; i < sizeof(wifi_rails) / sizeof(wifi_rails[0]); i++) {
++		if (wifi_vote_rail(&wifi_rails[i]) != 0) {
++			return -1;
++		}
++	}
++	/* qcom,vdd-wlan-ipa-config has enable=0 on this phone. */
++	wifi_log("ipa rail smpe3 has DT enable=0; not voted");
++	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0 ||
++	    wifi_vote_xo() != 0 || wifi_vote_sn7() != 0) {
++		return -1;
++	}
++	delay(20000);
++	wifi_log("supplies complete; enabling WLAN");
++	return 0;
++}
++
++static int
++wifi_gcc_power(void)
++{
++	static const uint32_t branches[] = {
++		0x7b01c, 0x7b020, 0x7b028, 0x7b030, 0x7b034
++	};
++	uint32_t value, pipe;
++	size_t i;
++
++	/* Park PIPE on TCXO before touching the suspended PCIe domain. */
++	wifi_log("GCC map 0x%lx size 0x%x; read 0x62008",
++	    (unsigned long)wifi_gcc, WIFI_GCC_SIZE);
++	pipe = *(volatile uint32_t *)(wifi_gcc + 0x62008);
++	wifi_log("GCC 0x62008 read 0x%x", pipe);
++	*(volatile uint32_t *)(wifi_gcc + 0x62008) = pipe & ~(1u << 4);
++	wifi_log("GCC 0x62008 write done");
++	mondrian_tlmm_write(wifi_gcc, 0x7b060,
++	    (mondrian_tlmm_read(wifi_gcc, 0x7b060) & ~3u) | 2u);
++	wifi_log("GCC PIPE parked; collapse vote start");
++	mondrian_tlmm_write(wifi_gcc, WIFI_COLLAPSE_OFF,
++	    mondrian_tlmm_read(wifi_gcc, WIFI_COLLAPSE_OFF) &
++	    ~WIFI_COLLAPSE_BIT);
++	wifi_log("collapse vote done; GDSC off start");
++	mondrian_tlmm_write(wifi_gcc, WIFI_GDSC_OFF,
++	    mondrian_tlmm_read(wifi_gcc, WIFI_GDSC_OFF) & ~1u);
++	wifi_log("GDSC off written; value 0x%x",
++	    mondrian_tlmm_read(wifi_gcc, WIFI_GDSC_OFF));
++	if (wifi_wait(wifi_gcc, WIFI_GDSC_OFF, 1u << 31, 1u << 31, 100000) != 0) {
++		return wifi_fail("PCIe0 GDSC did not power up");
++	}
++
++	/* Refgen and PIPE branches, then the aggregate NoC votes. */
++	mondrian_tlmm_write(wifi_gcc, 0x7b068, 1);
++	mondrian_tlmm_write(wifi_gcc, 0x7b064,
++	    mondrian_tlmm_read(wifi_gcc, 0x7b064) | 1u);
++	mondrian_tlmm_write(wifi_gcc, 0x62018,
++	    mondrian_tlmm_read(wifi_gcc, 0x62018) | 1u);
++	if (wifi_wait(wifi_gcc, 0, 1u << 31, 1u << 31, 100000) != 0) {
++		return wifi_fail("PCIe refgen GPLL0 did not lock");
++	}
++	mondrian_tlmm_write(wifi_gcc, 0x7b04c, (1u << 8) | WIFI_REFGEN_INDEX);
++	mondrian_tlmm_write(wifi_gcc, 0x7b048,
++	    mondrian_tlmm_read(wifi_gcc, 0x7b048) | 1u);
++	if (wifi_wait(wifi_gcc, 0x7b064, 1u, 0, 20000) != 0 ||
++	    wifi_wait(wifi_gcc, 0x7b048, 1u, 0, 20000) != 0) {
++		return wifi_fail("PCIe clock source update timed out");
++	}
++	mondrian_tlmm_write(wifi_gcc, 0x62008,
++	    mondrian_tlmm_read(wifi_gcc, 0x62008) | 0x3fu);
++	mondrian_tlmm_write(wifi_gcc, 0x62000,
++	    mondrian_tlmm_read(wifi_gcc, 0x62000) |
++	    (1u << 11) | (1u << 12) | (1u << 19) | (1u << 22));
++	mondrian_tlmm_write(wifi_gcc, 0x9c004,
++	    mondrian_tlmm_read(wifi_gcc, 0x9c004) | 1u);
++	for (i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		if (wifi_wait(wifi_gcc, branches[i], 1u << 31, 0, 100000) != 0) {
++			wifi_log("PCIe clock branch 0x%x remains halted (0x%x)",
++			    branches[i], mondrian_tlmm_read(wifi_gcc, branches[i]));
++			return -1;
++		}
++	}
++	wifi_reset(wifi_gcc, 0x7b000);
++	wifi_reset(wifi_gcc, 0x7c01c);
++
++	value = mondrian_tlmm_read(wifi_gcc, WIFI_COLLAPSE_OFF);
++	wifi_log("pcie0 gdsc up collapse=0x%x refgen=0x%x pipe=0x%x", value,
++	    mondrian_tlmm_read(wifi_gcc, 0x7b04c),
++	    mondrian_tlmm_read(wifi_gcc, 0x7b060));
++	return 0;
++}
++
++static int
++wifi_map_host(void)
++{
++
++	wifi_parf = wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
++	wifi_phy = wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
++	wifi_dbi = wifi_map_once(&wifi_dbi, WIFI_DBI_PA, WIFI_DBI_SIZE);
++	wifi_elbi = wifi_map_once(&wifi_elbi, WIFI_ELBI_PA, WIFI_ELBI_SIZE);
++	wifi_iatu = wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
++	if (wifi_parf == 0 || wifi_phy == 0 || wifi_dbi == 0 || wifi_elbi == 0 ||
++	    wifi_iatu == 0) {
++		return wifi_fail("cannot map the PCIe0 host windows");
++	}
++	return 0;
++}
++
++static void
++wifi_parf_setup(void)
++{
++	uint32_t inherited = mondrian_tlmm_read(wifi_parf, 0x40);
++
++	mondrian_tlmm_write(wifi_parf, 0x1000, 4);
++	mondrian_tlmm_write(wifi_parf, 0x40, inherited & ~1u);
++	mondrian_tlmm_write(wifi_parf, 0x350, 0);
++	mondrian_tlmm_write(wifi_parf, 0x358, 0x04000000);
++	wifi_log("cold refclk PHY_CTRL=%x->%x mux=%x CLKREF=%x", inherited,
++	    mondrian_tlmm_read(wifi_parf, 0x40),
++	    mondrian_tlmm_read(wifi_gcc, 0x7b060),
++	    mondrian_tlmm_read(wifi_gcc, 0x9c004));
++
++	mondrian_tlmm_write(wifi_parf, 0, 0x365e);
++	mondrian_tlmm_write(wifi_parf, 0x174,
++	    mondrian_tlmm_read(wifi_parf, 0x174) | (1u << 4));
++	mondrian_tlmm_write(wifi_parf, 0x2b0, 0);
++	mondrian_tlmm_write(wifi_parf, 0x20,
++	    mondrian_tlmm_read(wifi_parf, 0x20) & ~(1u << 5));
++	mondrian_tlmm_write(wifi_parf, 0x1a8,
++	    mondrian_tlmm_read(wifi_parf, 0x1a8) | (1u << 31));
++}
++
++static int
++wifi_phy_load_table(void)
++{
++	size_t i;
++
++	/* QMP PCS v5: reset, stop SERDES/PCS, remove the analogue power vote. */
++	mondrian_tlmm_write(wifi_phy, 0x200, 1);
++	mondrian_tlmm_write(wifi_phy, 0x244, 0);
++	mondrian_tlmm_write(wifi_phy, WIFI_PHY_POWER_DOWN, 0);
++	delay(1000);
++
++	for (i = 0; i < sizeof(wifi_phy_table) / sizeof(wifi_phy_table[0]); i++) {
++		const struct wifi_phy_entry *entry = &wifi_phy_table[i];
++
++		if (entry->off == 0x200 && (entry->value & 1u) == 0) {
++			mondrian_tlmm_write(wifi_gcc, 0x7b060,
++			    mondrian_tlmm_read(wifi_gcc, 0x7b060) & ~3u);
++		}
++		mondrian_tlmm_write(wifi_phy, entry->off, entry->value);
++		if (entry->delay != 0) {
++			delay(entry->delay);
++		}
++	}
++	delay(1000);
++	if (wifi_wait(wifi_phy, WIFI_PHY_STATUS_OFF, WIFI_PHY_STATUS_MASK, 0,
++	    200000) != 0) {
++		wifi_log("PCIe PHY not ready status=0x%x (bit 6 must clear)",
++		    mondrian_tlmm_read(wifi_phy, WIFI_PHY_STATUS_OFF));
++		return -1;
++	}
++	wifi_log("pcie0 phy ready status=0x%x table=%u dt_phy_ver=0x%x",
++	    mondrian_tlmm_read(wifi_phy, WIFI_PHY_STATUS_OFF),
++	    (unsigned)(sizeof(wifi_phy_table) / sizeof(wifi_phy_table[0])),
++	    WIFI_PHY_VERSION);
++	return 0;
++}
++
++static void
++wifi_dbi_setup(void)
++{
++	uint32_t maximum;
++	unsigned speed;
++
++	mondrian_tlmm_write(wifi_dbi, 0x8bc,
++	    mondrian_tlmm_read(wifi_dbi, 0x8bc) | 1u);
++	/* x1, DLL_LINK_EN, no FAST_LINK. */
++	mondrian_tlmm_write(wifi_dbi, 0x710,
++	    (mondrian_tlmm_read(wifi_dbi, 0x710) &
++	    ~((0x3fu << 16) | (1u << 7))) | (1u << 16) | (1u << 5));
++	mondrian_tlmm_write(wifi_dbi, 0x80c,
++	    (mondrian_tlmm_read(wifi_dbi, 0x80c) & ~0x1f00u) | 0x100u);
++	mondrian_tlmm_write(wifi_dbi, 0xb40, WIFI_AUX_MHZ);
++	maximum = mondrian_tlmm_read(wifi_dbi, 0x7c) & 15u;
++	for (speed = 3; speed <= maximum && speed <= 4; speed++) {
++		mondrian_tlmm_write(wifi_dbi, 0x890,
++		    (mondrian_tlmm_read(wifi_dbi, 0x890) &
++		    ~((3u << 24) | 1u)) | ((speed - 3) << 24));
++		mondrian_tlmm_write(wifi_dbi, 0x8a8,
++		    mondrian_tlmm_read(wifi_dbi, 0x8a8) & ~0x00ffff00u);
++		mondrian_tlmm_write(wifi_dbi, 0x8ac,
++		    mondrian_tlmm_read(wifi_dbi, 0x8ac) & ~31u);
++	}
++	if (maximum >= 3) {
++		mondrian_tlmm_write(wifi_dbi, 0x154, 0x55555555);
++	}
++	if (maximum >= 4) {
++		mondrian_tlmm_write(wifi_dbi, 0x178, 0x55555555);
++	}
++	mondrian_tlmm_write(wifi_dbi, 0x8bc,
++	    mondrian_tlmm_read(wifi_dbi, 0x8bc) & ~1u);
++
++	mondrian_tlmm_write(wifi_parf, 0x2c4,
++	    mondrian_tlmm_read(wifi_parf, 0x2c4) | (1u << 8));
++	mondrian_tlmm_write(wifi_dbi, 0x714,
++	    mondrian_tlmm_read(wifi_dbi, 0x714) | (1u << 5));
++	mondrian_tlmm_write(wifi_dbi, 0x78,
++	    (mondrian_tlmm_read(wifi_dbi, 0x78) & ~0x7000u) | 0x2000u);
++	mondrian_tlmm_write(wifi_dbi, 0x80,
++	    mondrian_tlmm_read(wifi_dbi, 0x80) & ~0x13u);
++	mondrian_tlmm_write(wifi_dbi, 0x18, 0x10100);
++	wifi_write16(wifi_dbi, 4, 6);
++	mondrian_tlmm_write(wifi_dbi, 0xa0,
++	    (mondrian_tlmm_read(wifi_dbi, 0xa0) & ~15u) | WIFI_TARGET_GEN);
++	wifi_log("dbi ready max-link=Gen%u target=Gen%u", maximum,
++	    WIFI_TARGET_GEN);
++}
++
++static int
++wifi_link(void)
++{
++	uint64_t states = 0;
++	unsigned attempt;
++	int linked = 0;
++
++	for (attempt = 0; attempt < 2 && !linked; attempt++) {
++		unsigned polls;
++		uint32_t elbi, link;
++
++		if (attempt != 0) {
++			mondrian_tlmm_write(wifi_parf, 0x1b0,
++			    mondrian_tlmm_read(wifi_parf, 0x1b0) & ~(1u << 8));
++			wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(
++			    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
++			    WIFI_TLMM_DRIVE_2MA, 1), 0);
++			wifi_pin_set(wifi_wlan_en_page, mondrian_tlmm_cfg(
++			    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
++			    WIFI_TLMM_DRIVE_2MA, 1), 0);
++			delay(150000);
++			mondrian_tlmm_write(wifi_gcc, 0x7b060,
++			    (mondrian_tlmm_read(wifi_gcc, 0x7b060) & ~3u) | 2u);
++			mondrian_tlmm_write(wifi_gcc, 0x62008,
++			    mondrian_tlmm_read(wifi_gcc, 0x62008) & ~(1u << 4));
++			wifi_reset(wifi_gcc, 0x7c01c);
++			if (wifi_phy_load_table() != 0) {
++				return -1;
++			}
++			mondrian_tlmm_write(wifi_gcc, 0x62008,
++			    mondrian_tlmm_read(wifi_gcc, 0x62008) | (1u << 4));
++			wifi_enable_wlan();
++			wifi_log("retry uses full PHY reset/table/PIPE sequence");
++		}
++
++		delay(WIFI_EP_LATENCY_MS * 1000);
++		/* PCIe CEM: at least 100 ms stable power/refclk before PERST#. */
++		delay(100000);
++		wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(
++		    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
++		    WIFI_TLMM_DRIVE_2MA, 1), 1);
++		delay(WIFI_PERST_DELAY_US);
++		mondrian_tlmm_write(wifi_parf, 0x1b0,
++		    mondrian_tlmm_read(wifi_parf, 0x1b0) | (1u << 8));
++		if ((mondrian_tlmm_read(wifi_parf, 0x1b0) & (1u << 8)) == 0) {
++			return wifi_fail("PCIe0 LTSSM enable did not stick");
++		}
++
++		for (polls = 0; polls < 500; polls++) {
++			elbi = mondrian_tlmm_read(wifi_elbi, 8);
++			link = mondrian_tlmm_read(wifi_dbi, 0x80);
++			states |= 1ULL << ((elbi >> 12) & 63u);
++			if ((elbi & (1u << 10)) != 0 && (link & (1u << 29)) != 0) {
++				linked = 1;
++				break;
++			}
++			delay(2000);
++		}
++		if (!linked) {
++			wifi_log("training attempt=%u target=Gen%u states=%016llx LTSSM=%x CLKREQ=%x/%x WAKE=%x",
++			    attempt + 1, WIFI_TARGET_GEN,
++			    (unsigned long long)states,
++			    mondrian_tlmm_read(wifi_parf, 0x1b0),
++			    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_CFG),
++			    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_IN_OUT),
++			    mondrian_tlmm_read(wifi_wake_page, WIFI_TLMM_IN_OUT));
++		}
++	}
++	if (!linked) {
++		wifi_log("link timeout elbi=%x lnkctl=%x phy=%x LTSSM=%x clock=%x/%x collapse=%x",
++		    mondrian_tlmm_read(wifi_elbi, 8),
++		    mondrian_tlmm_read(wifi_dbi, 0x80),
++		    mondrian_tlmm_read(wifi_phy, WIFI_PHY_STATUS_OFF),
++		    mondrian_tlmm_read(wifi_parf, 0x1b0),
++		    mondrian_tlmm_read(wifi_gcc, 0x7b03c),
++		    mondrian_tlmm_read(wifi_gcc, 0x7b044),
++		    mondrian_tlmm_read(wifi_gcc, WIFI_COLLAPSE_OFF));
++		wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(
++		    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
++		    WIFI_TLMM_DRIVE_2MA, 1), 0);
++		return wifi_fail("PCIe0 link training timed out");
++	}
++
++	wifi_log("pcie0 link up gen=%u width=%u elbi=%x lnkctl=%x",
++	    (mondrian_tlmm_read(wifi_dbi, 0x80) >> 16) & 15u,
++	    (mondrian_tlmm_read(wifi_dbi, 0x80) >> 20) & 15u,
++	    mondrian_tlmm_read(wifi_elbi, 8),
++	    mondrian_tlmm_read(wifi_dbi, 0x80));
++	return 0;
++}
++
++static void
++wifi_bus_master_off(void)
++{
++	uint16_t command = wifi_read16(wifi_cfg, 4);
++
++	wifi_write16(wifi_cfg, 4, command & ~WIFI_PCI_BUS_MASTER);
++}
++
++static int
++wifi_config_identity(void)
++{
++	uint32_t negotiated = (mondrian_tlmm_read(wifi_dbi, 0x80) >> 16) & 15u;
++	uint32_t id, subsystem, command;
++	uint8_t revision;
++
++	/* After a real Gen1/Gen2 link, scale refgen to the DT's 19.2 MHz entry. */
++	if (negotiated == 1 || negotiated == 2) {
++		mondrian_tlmm_write(wifi_gcc, 0x7b04c,
++		    (1u << 8) | WIFI_XO_INDEX);
++		mondrian_tlmm_write(wifi_gcc, 0x7b048,
++		    mondrian_tlmm_read(wifi_gcc, 0x7b048) | 1u);
++		if (wifi_wait(wifi_gcc, 0x7b048, 1u, 0, 20000) != 0) {
++			return wifi_fail("PCIe negotiated refgen update timed out");
++		}
++	}
++
++	/* Donor's type-1 memory aperture for 0x60200000..0x63ffffff. */
++	mondrian_tlmm_write(wifi_dbi, 0x20, 0x63f06020);
++
++	/* DesignWare unrolled outbound region0: CFG0 to endpoint BDF 01:00.0. */
++	mondrian_tlmm_write(wifi_iatu, 0, 4);
++	mondrian_tlmm_write(wifi_iatu, 8, WIFI_CFG_PA);
++	mondrian_tlmm_write(wifi_iatu, 12, 0);
++	mondrian_tlmm_write(wifi_iatu, 16, WIFI_CFG_PA + WIFI_CFG_SIZE - 1);
++	mondrian_tlmm_write(wifi_iatu, 20, 0x01000000);
++	mondrian_tlmm_write(wifi_iatu, 24, 0);
++	mondrian_tlmm_write(wifi_iatu, 4, 0x80000000);
++	if (wifi_wait(wifi_iatu, 4, 0x80000000, 0x80000000, 20000) != 0) {
++		return wifi_fail("PCIe config iATU enable timed out");
++	}
++	wifi_cfg = wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
++	if (wifi_cfg == 0) {
++		return wifi_fail("cannot map the PCIe config aperture");
++	}
++
++	/* Safety first: no isolation exists yet, so clear any inherited DMA bit. */
++	wifi_bus_master_off();
++	id = mondrian_tlmm_read(wifi_cfg, 0);
++	if (id != WIFI_PCI_ID_QCA6490) {
++		wifi_log("endpoint identity mismatch got 0x%08x want 0x%08x", id,
++		    WIFI_PCI_ID_QCA6490);
++		return -1;
++	}
++	subsystem = mondrian_tlmm_read(wifi_cfg, 0x2c);
++	revision = wifi_read8(wifi_cfg, 8);
++	wifi_bus_master_off();
++	command = wifi_read16(wifi_cfg, 4);
++	if ((command & WIFI_PCI_BUS_MASTER) != 0) {
++		return wifi_fail("endpoint bus master did not clear");
++	}
++	wifi_log("qca6490 id %04x:%04x subsystem=%04x:%04x revision=%02x",
++	    (unsigned)(id & 0xffffu), (unsigned)(id >> 16),
++	    (unsigned)(subsystem & 0xffffu), (unsigned)(subsystem >> 16),
++	    revision);
++	wifi_log("bus master held off command=%04x aperture=%lx..%lx",
++	    command, (unsigned long)WIFI_BAR_BASE, (unsigned long)WIFI_BAR_END);
++	return 0;
++}
++
++static int
++wifi_cold_link(void)
++{
++
++	wifi_log("cold start; pins and supplies precede host MMIO");
++	wifi_gcc = mondrian_gcc_map();
++	if (wifi_gcc == 0) {
++		return wifi_fail("cannot map GCC");
++	}
++	{
++		uint32_t early = *(volatile uint32_t *)(wifi_gcc + 0x62008);
++
++		wifi_log("early GCC 0x62008 read 0x%x", early);
++	}
++	if (wifi_map_pins() != 0 || wifi_pins_hold_reset() != 0 ||
++	    wifi_supplies() != 0) {
++		return -1;
++	}
++	wifi_enable_wlan();
++	if (wifi_gcc_power() != 0 || wifi_map_host() != 0) {
++		return -1;
++	}
++	mondrian_tlmm_write(wifi_parf, 0x1b0,
++	    mondrian_tlmm_read(wifi_parf, 0x1b0) & ~(1u << 8));
++	wifi_parf_setup();
++	if (wifi_phy_load_table() != 0) {
++		return -1;
++	}
++	wifi_dbi_setup();
++	if (wifi_link() != 0 || wifi_config_identity() != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++static void __dead2
++mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int ok = wifi_cold_link() == 0;
++
++	if (!ok && wifi_perst_page != 0) {
++		wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(
++		    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
++		    WIFI_TLMM_DRIVE_2MA, 1), 0);
++	}
++	wifi_log(ok ?
++	    "W1 complete; no DMA, SMMU, MSI, MHI or firmware was started" :
++	    "worker stopped after failure; normal iOS boot continues");
++	mondrian_log_flush_now();
++	(void)thread_terminate(current_thread());
++	(void)thread_block(THREAD_CONTINUE_NULL);
++	__builtin_unreachable();
++}
++
++void
++mondrian_wifi_start(void)
++{
++	static uint32_t started;
++	thread_t thread;
++	kern_return_t kr;
++	uint32_t enabled = 0;
++
++	/* Absent, 0, or any value other than exactly 1 touches no Wi-Fi hardware. */
++	if (!PE_parse_boot_argn("mondrianwifi", &enabled, sizeof(enabled)) ||
++	    enabled != 1) {
++		return;
++	}
++	if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++	kr = kernel_thread_start(mondrian_wifi_thread, NULL, &thread);
++	if (kr != KERN_SUCCESS) {
++		__atomic_store_n(&started, 0, __ATOMIC_RELEASE);
++		wifi_log("worker allocation failed kr=0x%x", kr);
++		return;
++	}
++	thread_deallocate(thread);
++	wifi_log("worker started");
++}
++
++#else /* !MONDRIAN */
++
++void
++mondrian_wifi_start(void)
++{
++}
++
++#endif /* MONDRIAN */
