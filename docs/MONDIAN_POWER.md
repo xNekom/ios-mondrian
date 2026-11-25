@@ -285,8 +285,8 @@ The vibrator is not an I²C part. SM8475 drives an LRA from the PMIC's HV
 haptics block on `pm8350b@3`, three SPMI pages (`reg = <0xf000 0xf100 0xf200>`):
 CFG at 0xf000 (enable 0x46 bit 7, VMAX 0x48 = mV/50, play 0x4c = source | 0x80,
 autoresonance 0x63 bit 7), PTN at 0xf100 (waveform FIFO at 0x20 and the
-direct-play amplitude at 0x26) and HBST at 0xf200 (the vote for the PMIC's own
-boost, 0x46 bit 7). The I²C scan of a vendor boot has no haptic address, and
+direct-play amplitude at 0x26) and HBST at 0xf200 (read-only boost status,
+0x46 bit 7). The I²C scan of a vendor boot has no haptic address, and
 the vendor's three matching modules (AW86927, AW862xx, QCOM_HV_HAPTICS) are
 `=m` because only the last one matches this board.
 
@@ -300,10 +300,10 @@ a write to a channel another EE owns is refused by the arbiter. Reads are not
 restricted the same way (`qcom-hv-haptics.c` reads HBST on every play), and
 `mondrian_spmi_reg_read_raw()` exists for that one page.
 
-The boost is HBST's business, not the enable bit's: the vendor votes it by
-writing HBST 0x46 bit 7 (`SW_CTRL_HBST`) or treats the block as externally
-powered through the SWR slave regulator LPASS exposes
-(`qcom,hap-swr-slave-reg`). CFG 0x46 bit 7 only enables the module.
+The boost is the PMIC's own PBS sequencer, not an HBST write and not the enable
+bit: PMK8350 SDAM `0x9d00` byte `0x42` selects on (`1`) or off (`2`), then byte
+`0xe5 = 1` triggers it. CFG 0x46 bit 7 only enables the module. The vendor's
+`qcom,pbs-client` handle is for the charger ISC event, not for this haptics vote.
 
 `tools/usb-ring.py haps` walks the block one register at a time and stops at the
 first one that does not answer, `hapr BLOCK REG` reads a single byte and `hapw
@@ -316,38 +316,27 @@ idle, VMAX at 1.4 V, and `hpwr` at 0, which the vendor's masks read as
 the vendor is `cfg-rev`: its two-byte read at 0x00 returns 0x0002 where our
 single byte returns 0, so that byte alone does not identify the revision.
 
-**Measured, and blocked: the AP can configure the block but not raise its
-boost.** The vendor kernel says which path this board uses (`tools/vendor-dump.sh`
-dmesg): `haptics revision: HAP_CFG 0x2, HAP_PTN 0x2, HAP_HBST 0x1`, and
-`HAP_HBST 0x1` is `HAP_BOOST_V0P1`, the case where `qcom-hv-haptics.c` takes
-`SW_CTRL_HBST` and votes HBST 0x46 bit 7. `hap-swr-slave-reg: disabling` says
-nothing enabled that regulator, so the block is not externally powered.
+**Measured: the AP can configure the block, but a direct HBST write is
+forbidden.** The vendor kernel reports `HAP_HBST 0x1` and the live map puts that
+page on the charger firmware (owner 3). An older build's `vib 100 64 2` wrote
+HBST 0x46 and never answered; neither did any later command. The current series
+keeps HBST read-only: `hapw` refuses block 2 and `vib`'s third argument is
+force-VSET, not a boost vote.
 
-On the live kernel `haps` reads `vset 0x00 en 0x80 hbst-vreg 0x00 hbst-follow
-0xe0`: the module is enabled, the boost's vote is off. `vib 100 64 2`, which
-writes that bit through `mondrian_spmi_reg_write_raw()`, **never answered**, and
-neither did any command after it: a write to a page another EE owns is accepted
-and never completes, and it takes the command channel with it. Reads of the same
-page are fine, which is why `haps` shows them.
+`0413` takes the vendor's actual boost path: owner-gated writes to SDAM `0x9d00`
+bytes `0x42` and `0xe5`, then a read-only poll of HBST. `hapb 1` performs just
+that vote, `hapr 3 REG` reads the SDAM, and `haps` includes both pages. The first
+boot must show `spmimap` PPID `0x09d` with owner 0 before `hapb` is used; a
+foreign owner closes this path without a store. The donor was never booted, so
+the sequence is source-derived until `hbst-vreg`/`hbst-status4` change and the
+LRA moves.
 
-So CFG and PTN are the AP's (VMAX and amplitude read back as written, the DT's
-ranges included), and the HV boost is not: `hpwr` stays `HPWR_DISABLED` (0), the
-live impedance 0x0e reads 0 and the LRA does not move. The vendor gets away with
-that write because its driver also holds a `qcom,pbs-client` handle (the DT
-carries one, and the recovery kernel has `qpnp_pbs` loaded with `qcom_hv_haptics`
-as a user): the PBS is what puts the block in a state where the boost can be
-voted. This port has no PBS client.
-
-What would unblock it, in order of cost: a `qpnp_pbs` client in the port for the
-haptics cell, a boost vote made by whatever owns that page (the charger firmware,
-reachable only through `pmic_glink` on the ADSP, which this port does not start),
-or a boost the AP does own. Until one exists, a tone into the block cannot move
-the actuator and item 11 stays parked.
-
-`vib [ms [amp]]` plays a constant tone: the DT's 1.25 V VMAX, amplitude 0x40 of
-0xff and 100 ms by default, deliberately low for a first drive, and it logs the
-impedance and status 20 ms in. The DT's `effect_0..5` tables are a click
-waveform, not filler: eight samples of (amplitude, period, f_lra_x2) =
+`vib [ms [amp [force]]]` plays a constant tone: a deliberately low 1.25 V VMAX,
+amplitude 0x40 of 0xff and 100 ms by default for the first drive. It sets
+sine drive, disables auto-resonance, clears faults, starts PLAY and then votes
+hBoost; stop clears PLAY, leaves EN_CTL set and votes hBoost off two seconds
+later. It logs impedance and status 20 ms in. The DT's `effect_0..5` tables are
+a click waveform, not filler: eight samples of (amplitude, period, f_lra_x2) =
 (0x1f,0,0) (0x3f,0,0) (0x5f,0,0) (0x7f,0,0) (0x17f,0,0) (0x15f,0,0)
 (0x13f,0,0) (0x11f,0,0), written as 24 bytes at PTN 0x34 with TLRA 0x30 =
 period/5 and the source field set to PATTERN1.

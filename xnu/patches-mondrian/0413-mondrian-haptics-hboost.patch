@@ -1,0 +1,275 @@
+xnu 0413: vote haptics hBoost through the PMIC PBS
+
+The HBST page belongs to the charger firmware on this board; writing it
+wedged the SPMI command channel. Keep HBST read-only and trigger the PMIC's
+own boost sequencer through PMK8350 SDAM 0x9d00 bytes 0x42 and 0xe5.
+The play order now disables auto-resonance, clears faults and leaves EN_CTL
+set, matching the vendor sequence. The USB channel gets hapb and a read-only
+SDAM block so one boot can prove ownership, boost and motion separately.
+
+Ported from akshaynexus/iOSPlus10 146e889,
+patches/xnu/0300-negroni-haptic-direct-play.patch (MIT/APSL-2.0).
+The GPL-2.0 vendor driver was read as a register specification only.
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index 7de271f..73124f0 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -12,13 +12,15 @@
+  * HAP525_HV), the PTN direct-play amplitude 0x26 and the live LRA impedance
+  * 0x0e.
+  *
+- * The boost is HBST's business, not the enable bit's. The vendor votes it
+- * there, and falls back to force-VREG-ready only when the page is not its to
+- * write -- which is this board's case: 0x3f2 belongs to the charger firmware
+- * (owner 3 in the arbiter map that `spmimap` prints). Reading that page is
+- * what the vendor driver does on every play; writing it from this AP is what
+- * the arbiter refuses, so hap_r goes raw there and everything else stays
+- * gated.
++ * The boost is not an HBST write. The PMIC's PBS sequencer is triggered by
++ * PMK8350 SDAM 0x9d00 bytes 0x42 (1 on, 2 off) and 0xe5 (1). HBST stays
++ * read-only on this board (owner 3 in the arbiter map that `spmimap` prints);
++ * reading it proves whether the boost came up.
++ *
++ * PBS sequence ported from akshaynexus/iOSPlus10 146e889,
++ * patches/xnu/0300-negroni-haptic-direct-play.patch (MIT/APSL-2.0). The
++ * vendor qcom-hv-haptics.c was read as a register specification only
++ * (GPL-2.0); no vendor code is copied here.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -41,6 +43,7 @@ extern void delay(int us);
+ #define MONDRIAN_HAP_CFG	0x03f0u
+ #define MONDRIAN_HAP_PTN	0x03f1u
+ #define MONDRIAN_HAP_HBST	0x03f2u
++#define MONDRIAN_HAP_SDAM	0x009du
+ 
+ #define HAP_CFG_REV		0x00
+ #define HAP_CFG_STATUS_MSB	0x09
+@@ -49,9 +52,17 @@ extern void delay(int us);
+ #define HAP_CFG_IMPEDANCE	0x0e	/* REAL_TIME_LRA_IMPEDANCE */
+ #define HAP_CFG_EN_CTL		0x46
+ #define HAP_CFG_VMAX		0x48
++#define HAP_CFG_SINE		0x49
+ #define HAP_CFG_PLAY		0x4c
++#define HAP_CFG_TLRA_LO		0x5c
++#define HAP_CFG_TLRA_HI		0x5d
+ #define HAP_CFG_AUTORES		0x63
++#define HAP_CFG_FAULT_CLR	0x66
+ #define HAP_CFG_VSET_CFG	0x68
++#define HAP_HBST_VREG		0x46
++#define HAP_HBST_STATUS4	0x0b
++#define HAP_SDAM_PBS_ARG	0x42
++#define HAP_SDAM_PBS_TRIG	0xe5
+ #define HAP_PTN_REV		0x01
+ #define HAP_PTN_DIRECT		0x26
+ 
+@@ -59,6 +70,7 @@ extern void delay(int us);
+ #define HAP_PLAY_EN		0x80
+ #define HAP_SRC_DIRECT		0x01
+ #define HAP_AUTORES_EN		0x80
++#define HAP_SINE			0x01
+ #define HAP_FORCE_VREG_RDY	0x01
+ #define HAP_FORCE_VSET_ACK	0x02	/* HAP525_HV only */
+ #define HAP_VMAX_MV		1250	/* the DT's qcom,vmax-mv */
+@@ -87,15 +99,71 @@ hap_r(uint8_t block, uint8_t reg, uint8_t *out)
+ 	if (block == 2) {
+ 		return mondrian_spmi_reg_read_raw(MONDRIAN_HAP_HBST, reg, out);
+ 	}
++	if (block == 3) {
++		return mondrian_spmi_reg_read(MONDRIAN_HAP_SDAM, reg, out);
++	}
+ 	return mondrian_spmi_reg_read(
+ 	    block == 0 ? MONDRIAN_HAP_CFG : MONDRIAN_HAP_PTN, reg, out);
+ }
+ 
++/* The PMIC's own PBS raises hBoost; this AP only writes the two SDAM bytes. */
++static int
++hap_boost(unsigned int on)
++{
++	uint8_t arg = on ? 1 : 2, got_arg = 0, got_trig = 0;
++	int ok;
++
++	ok = mondrian_spmi_reg_write(MONDRIAN_HAP_SDAM,
++	    HAP_SDAM_PBS_ARG, arg);
++	ok &= mondrian_spmi_reg_write(MONDRIAN_HAP_SDAM,
++	    HAP_SDAM_PBS_TRIG, 1);
++	(void)mondrian_spmi_reg_read(MONDRIAN_HAP_SDAM,
++	    HAP_SDAM_PBS_ARG, &got_arg);
++	(void)mondrian_spmi_reg_read(MONDRIAN_HAP_SDAM,
++	    HAP_SDAM_PBS_TRIG, &got_trig);
++	printf("MONDRIAN HAP: hboost %s: sdam 0x42=0x%02x 0xe5=0x%02x"
++	    " ppid 0x09d %s\n", on ? "on" : "off", got_arg, got_trig,
++	    ok ? "sent" : "failed");
++	return ok;
++}
++
++static int
++hap_boost_ready(void)
++{
++	uint8_t vreg = 0, status4 = 0;
++	unsigned int i;
++
++	for (i = 0; i < 100; i++) {
++		if (mondrian_spmi_reg_read_raw(MONDRIAN_HAP_HBST,
++		    HAP_HBST_VREG, &vreg) &&
++		    mondrian_spmi_reg_read_raw(MONDRIAN_HAP_HBST,
++		    HAP_HBST_STATUS4, &status4) &&
++		    ((vreg & HAP_EN_BIT) != 0 || (status4 & 1) != 0)) {
++			printf("MONDRIAN HAP: hboost ready: vreg 0x%02x"
++			    " status4 0x%02x\n", vreg, status4);
++			return 1;
++		}
++		delay(200);
++	}
++	printf("MONDRIAN HAP: hboost did not come up after 20 ms"
++	    " (vreg 0x%02x status4 0x%02x)\n", vreg, status4);
++	return 0;
++}
++
++int
++mondrian_haptics_boost(unsigned int on)
++{
++	if (on > 1) {
++		return -1;
++	}
++	return hap_boost(on) ? 0 : -1;
++}
++
+ /* One register, one transaction: the unit the USB side walks. */
+ int
+ mondrian_haptics_peek(unsigned int block, unsigned int reg, uint8_t *out)
+ {
+-	if (block > 2 || reg > 0xff) {
++	if (block > 3 || reg > 0xff) {
+ 		return 0;
+ 	}
+ 	return hap_r((uint8_t)block, (uint8_t)reg, out);
+@@ -124,7 +192,7 @@ int
+ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ {
+ 	uint8_t vmax = HAP_VMAX_MV / HAP_VMAX_STEP_MV;
+-	uint8_t z = 0, st = 0, hpwr = 0;
++	uint8_t z = 0, st = 0, hpwr = 0, vset = 0, autores = 0, sine = 0;
+ 	int ok = 1;
+ 
+ 	if (ms == 0) {
+@@ -141,10 +209,22 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	if ((force & 0x1) != 0) {
+ 		ok &= hap_w(0, HAP_CFG_VSET_CFG,
+ 		    HAP_FORCE_VREG_RDY | HAP_FORCE_VSET_ACK);
++	} else if (hap_r(0, HAP_CFG_VSET_CFG, &vset)) {
++		ok &= hap_w(0, HAP_CFG_VSET_CFG,
++		    vset & ~HAP_FORCE_VREG_RDY);
++	}
++	if (hap_r(0, HAP_CFG_SINE, &sine)) {
++		ok &= hap_w(0, HAP_CFG_SINE, (sine & ~0x3u) | HAP_SINE);
++	}
++	if (hap_r(0, HAP_CFG_AUTORES, &autores)) {
++		ok &= hap_w(0, HAP_CFG_AUTORES,
++		    autores & ~HAP_AUTORES_EN);
+ 	}
+-	ok &= hap_w(0, HAP_CFG_AUTORES, HAP_AUTORES_EN);
++	ok &= hap_w(0, HAP_CFG_FAULT_CLR, 0x07);
+ 	ok &= hap_w(1, HAP_PTN_DIRECT, (uint8_t)amp);
+ 	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT | HAP_PLAY_EN);
++	ok &= hap_boost(1);
++	(void)hap_boost_ready();
+ 	delay(20 * 1000);
+ 	if (hap_r(0, HAP_CFG_IMPEDANCE, &z) && hap_r(0, HAP_CFG_STATUS_MSB, &st)) {
+ 		printf("MONDRIAN HAP: playing amp 0x%02x force %u: impedance 0x%02x"
+@@ -157,7 +237,7 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 		delay((ms - 20) * 1000);
+ 	}
+ 	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT);
+-	ok &= hap_w(0, HAP_CFG_EN_CTL, 0);
++	/* Leave EN_CTL alone: clearing it re-votes the boost. */
+ 	if ((force & 0x1) != 0) {
+ 		(void)hap_w(0, HAP_CFG_VSET_CFG, 0);
+ 	}
+@@ -166,6 +246,8 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 		printf("MONDRIAN HAP: stopped: status 0x%02x hpwr 0x%02x\n",
+ 		    st, hpwr);
+ 	}
++	delay(2000 * 1000);
++	ok &= hap_boost(0);
+ 	printf("MONDRIAN HAP: buzz %u ms amp 0x%02x vmax %d force %u %s\n", ms,
+ 	    amp, HAP_VMAX_MV, force, ok ? "sent" : "with a failed write");
+ 	return ok ? 0 : -1;
+@@ -186,19 +268,25 @@ static const struct {
+ 	{ 0, HAP_CFG_HPWR_INTF, "hpwr" },
+ 	{ 0, HAP_CFG_FAULT, "fault" },
+ 	{ 0, HAP_CFG_VMAX, "vmax" },
++	{ 0, HAP_CFG_SINE, "sine" },
++	{ 0, HAP_CFG_TLRA_LO, "tlra-lo" },
++	{ 0, HAP_CFG_TLRA_HI, "tlra-hi" },
+ 	{ 1, HAP_PTN_DIRECT, "amp" },
+ 	{ 0, HAP_CFG_PLAY, "play" },
+ 	{ 0, HAP_CFG_VSET_CFG, "vset" },
+ 	{ 0, HAP_CFG_EN_CTL, "en" },
+ 	/* The boost page: read only, and the bit that says if it is up. */
+-	{ 2, 0x46, "hbst-vreg" },
++	{ 3, HAP_SDAM_PBS_ARG, "sdam-arg" },
++	{ 3, HAP_SDAM_PBS_TRIG, "sdam-trig" },
++	{ 2, HAP_HBST_VREG, "hbst-vreg" },
++	{ 2, HAP_HBST_STATUS4, "hbst-status4" },
+ 	{ 2, 0x41, "hbst-follow" },
+ };
+ 
+ int
+ mondrian_haptics_dump(char *out, size_t len)
+ {
+-	char line[224];
++	char line[384];
+ 	size_t used;
+ 	unsigned int i;
+ 
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index c104f73..5d6542d 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2130,9 +2130,10 @@ ud_cmd_burn(socket_t so, struct sockaddr_in *to, const char *line)
+ }
+ 
+ /*
+- * "haps" prints the PMIC's HV haptics block, "vib [ms [amp [force]]]" plays a
+- * constant tone on it, and "hapr BLOCK REG" / "hapw BLOCK REG VAL" read and
+- * write one byte by page number (0 CFG, 1 PTN, 2 HBST, read only). Both pairs
++ * "haps" prints the PMIC's HV haptics block, "hapb [0|1]" votes the PMIC's
++ * PBS boost through SDAM, "vib [ms [amp [force]]]" plays a constant tone, and
++ * "hapr BLOCK REG" / "hapw BLOCK REG VAL" read and write one byte by page
++ * number (0 CFG, 1 PTN, 2 HBST read-only, 3 SDAM read-only). Both pairs
+  * are here because the first question is whether the block answers and the
+  * second is whether the actuator moves; one transaction at a time is what
+  * makes a wedge attributable to a register.
+@@ -2143,11 +2144,20 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ 	extern int mondrian_haptics_dump(char *out, size_t len);
+ 	extern int mondrian_haptics_buzz(unsigned int ms, unsigned int amp,
+ 	    unsigned int force);
+-	char out[256];
++	extern int mondrian_haptics_boost(unsigned int on);
++	char out[512];
+ 	int n;
+ 
+ 	if (line[3] == 's') {			/* "haps" */
+ 		n = mondrian_haptics_dump(out, sizeof(out));
++	} else if (line[3] == 'b') {		/* "hapb [0|1]" */
++		uint32_t on = 1;
++
++		(void)ud_cmd_num(line + 4, &on);
++		on = on != 0;
++		n = snprintf(out, sizeof(out), "hapb %s %s\n",
++		    on ? "on" : "off",
++		    mondrian_haptics_boost(on) == 0 ? "sent" : "failed");
+ 	} else {				/* "vib [ms [amp [force]]]" */
+ 		uint32_t ms = 0, amp = 0, force = 0;
+ 		const char *p = ud_cmd_num(line + 3, &ms);
+@@ -2778,6 +2788,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			} else if (strncmp(cmd, "spmimap", 7) == 0) {
+ 				ud_cmd_spmimap(so, peer, cmd);
+ 			} else if (strcmp(cmd, "haps") == 0 ||
++			    strcmp(cmd, "hapb") == 0 ||
++			    strncmp(cmd, "hapb ", 5) == 0 ||
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);
