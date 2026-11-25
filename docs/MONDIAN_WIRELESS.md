@@ -18,6 +18,16 @@ GCC window because a second late `ml_io_map()` of the same block stalled. The de
 boot (no `mondrianwifi`) emits no Wi‑Fi worker lines and `btuart` still reads the
 Bluetooth controller identity.
 
+`0417`/`0418` add W2 under the same gate: guarded apps-SMMU access, one wired
+canary, and readback of the SID `0x1c01` route. Measured 2026-11-25 on
+`05:19:47`: `IDR0=0x4c017e71`, `IDR1=0x6000004b`, `IDR2=0x5111` give native
+4K, 32-bit input, 36-bit output, 75 context banks and 120 SMR slots. The
+inherited `sCR0=0x280406` is preserved. Bank 74 programs `SCTLR=0x27` and
+`TTBR0=0x1c01000849ff0000`; slot 6 reads back `SMR=0x80001c01`, `S2CR=0x4a`.
+Bus mastering stays off and teardown completes. `ATOSNS=1` means `ATS1PR` is
+absent, so the result is **W2 PARTIAL**: context/route proof, not a hardware
+page walk or endpoint DMA.
+
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
 

@@ -1,0 +1,771 @@
+xnu 0418: prove the Wi-Fi apps-SMMU stage-1 walk
+
+After W1 identifies QCA6490 with bus mastering off, program one apps-SMMU
+context for SID/ASID 0x1c01 and install the exact stream route. If IDR0.ATOSNS
+is clear, translate a wired canary with ATS1PR and require a deliberate miss to
+return PAR.F; if ATOSNS is set, record W2 PARTIAL after context/route readback.
+No endpoint DMA, MSI, MHI, firmware or network interface is started.
+
+Register/table facts come from mainline arm-smmu/io-pgtable-arm (GPL-2.0,
+facts only), ARM IHI 0062D.c, and the MIT ArmSmmu4K/PongWifi profile at
+qiumochen/UniXNU-zizhan 88f4eeb. The guarded MMIO layer is 0417.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 88c3454..8dadbc8 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/mondrian_sample.c		standard
+ bsd/dev/mondrian_clock.c		standard
+ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mondrian_wifi.c		standard
++bsd/dev/mondrian_wifi_smmu.c		standard
+ bsd/dev/mondrian_audio_probe.c		standard
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index b0a161b..a60550f 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -973,6 +973,19 @@ wifi_config_identity(void)
+ 	if ((command & WIFI_PCI_BUS_MASTER) != 0) {
+ 		return wifi_fail("endpoint bus master did not clear");
+ 	}
++	{
++		extern int mondrian_wifi_smmu_prove(uint16_t command);
++
++		int w2rc = mondrian_wifi_smmu_prove((uint16_t)command);
++
++		if (w2rc == 0) {
++			wifi_log("W2 stage-1 proof complete");
++		} else if (w2rc == 1) {
++			wifi_log("W2 partial context/route proof; ATS unsupported");
++		} else {
++			wifi_log("W2 stage-1 proof failed; W1 remains valid");
++		}
++	}
+ 	wifi_log("qca6490 id %04x:%04x subsystem=%04x:%04x revision=%02x",
+ 	    (unsigned)(id & 0xffffu), (unsigned)(id >> 16),
+ 	    (unsigned)(subsystem & 0xffffu), (unsigned)(subsystem >> 16),
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+new file mode 100644
+index 0000000..3166415
+--- /dev/null
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -0,0 +1,717 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * MONDRIAN WI-FI W2: apps-SMMU stage-1 translation proof.
++ *
++ * Purpose: prove one apps-SMMU stage-1 walk and the SID 0x1c01 route while
++ * PCIe bus mastering remains off. No endpoint DMA, MSI, MHI or firmware.
++ *
++ * Register facts: Linux arm-smmu (GPL-2.0, facts only), ARM IHI 0062D.c.
++ * Table/context profile: qiumochen/UniXNU-zizhan ArmSmmu4K (MIT), pinned at
++ * 88f4eeb21663a24e34670a2af96a8965432aa83e.
++ * Single-register MMIO requirement: iOSPlus10 0255/0297 (MIT).
++ *
++ * Runs only from the opt-in Wi-Fi worker after W1 has established the link
++ * and verified bus mastering off. No endpoint DMA is attempted.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdarg.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "mondrian_mmio.h"
++
++#if defined(MONDRIAN)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void mondrian_log_flush_now(void);
++
++#define W2_SMMU_PA          0x15000000UL
++#define W2_SMMU_SIZE        0x00100000UL
++#define W2_SID              0x1c01u
++#define W2_ASID             0x1c01u
++#define W2_IOVA_BASE        0xa0000000ULL
++#define W2_IOVA_CANARY      (W2_IOVA_BASE + 0x1000ULL)
++#define W2_IOVA_MISS        (W2_IOVA_BASE + 0x2000ULL)
++#define W2_BANK_CAP         78u
++#define W2_SMR_CAP          120u
++#define W2_PHYS_LIMIT       (1ULL << 36)
++#define W2_PTE_ATTR         0x0060000000000f47ULL
++
++#define W2_SCR0             0x000u
++#define W2_IDR0             0x020u
++#define W2_IDR1             0x024u
++#define W2_IDR2             0x028u
++#define W2_GFSR             0x048u
++#define W2_SMR(n)           (0x800u + 4u * (n))
++#define W2_S2CR(n)          (0xc00u + 4u * (n))
++#define W2_CBAR(n)          (4u * (n))
++#define W2_CBA2R(n)         (0x800u + 4u * (n))
++
++#define W2_CB_SCTLR         0x000u
++#define W2_CB_TCR2          0x010u
++#define W2_CB_TTBR0         0x020u
++#define W2_CB_TTBR1         0x028u
++#define W2_CB_TCR           0x030u
++#define W2_CB_MAIR0         0x038u
++#define W2_CB_MAIR1         0x03cu
++#define W2_CB_PAR           0x050u
++#define W2_CB_FSR           0x058u
++#define W2_CB_FAR           0x060u
++#define W2_CB_FSYNR0        0x068u
++#define W2_CB_TLBIASID      0x610u
++#define W2_CB_TLBSYNC       0x7f0u
++#define W2_CB_TLBSTATUS     0x7f4u
++#define W2_CB_ATS1PR        0x800u
++#define W2_CB_ATSR          0x8f0u
++
++#define W2_FSR_FAULT        0xc00001feu
++#define W2_CBAR_VALUE       0x0001f300u
++#define W2_CBA2R_VALUE      0x00000001u
++#define W2_TCR2_VALUE       0x00038071u
++#define W2_TCR_VALUE        0x80803520u
++#define W2_MAIR0_VALUE      0x0000ff44u
++#define W2_SCTLR_VALUE      0x00000027u
++#define W2_S2CR_FAULT       0x00020000u
++
++struct w2_mem {
++    vm_offset_t raw;
++    vm_size_t raw_bytes;
++    vm_offset_t va;
++    vm_size_t bytes;
++    uint64_t pa;
++};
++
++struct w2_state {
++    vm_offset_t smmu;
++    uint32_t scr0, idr0, idr1, idr2;
++    uint32_t page_bytes, global_pages, banks, smr_slots;
++    uint32_t bank, slot, cb, gr1;
++    uint32_t old_smr, old_s2cr;
++    uint32_t route_smr, route_s2cr;
++    uint32_t valid_smr, valid_s2cr;
++    struct w2_mem tables, canary;
++    int bank_touched;
++    int slot_touched;
++    int context_programmed;
++    int sid_attached;
++    int poisoned;
++    int atos_supported;
++};
++
++static struct w2_state w2;
++
++static void
++w2_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++w2_log(const char *fmt, ...)
++{
++    char line[256];
++    va_list ap;
++
++    va_start(ap, fmt);
++    vsnprintf(line, sizeof(line), fmt, ap);
++    va_end(ap);
++    printf("MONDRIAN WIFI W2: %s\n", line);
++}
++
++static int
++w2_rd32(uint32_t off, uint32_t *value)
++{
++    if (off > W2_SMMU_SIZE - 4 || value == NULL) {
++        return -1;
++    }
++    return mondrian_mmio_try_rd32(w2.smmu + off, value);
++}
++
++static int
++w2_wr32(uint32_t off, uint32_t value)
++{
++    if (off > W2_SMMU_SIZE - 4) {
++        return -1;
++    }
++    return mondrian_mmio_try_wr32(w2.smmu + off, value);
++}
++
++static int
++w2_rd64(uint32_t off, uint64_t *value)
++{
++    uint32_t lo, hi;
++
++    if (off > W2_SMMU_SIZE - 8 || value == NULL) {
++        return -1;
++    }
++    if (w2_rd32(off, &lo) || w2_rd32(off + 4, &hi)) {
++        return -1;
++    }
++    *value = (uint64_t)lo | ((uint64_t)hi << 32);
++    return 0;
++}
++
++/* TTBR/PAR are read or written as two single-register accesses. Context walks
++ * are disabled while TTBR is programmed; PAR is stable after ATSR is idle. */
++static int
++w2_wr64(uint32_t off, uint64_t value)
++{
++    if (off > W2_SMMU_SIZE - 8) {
++        return -1;
++    }
++    if (w2_wr32(off, (uint32_t)value) ||
++        w2_wr32(off + 4, (uint32_t)(value >> 32))) {
++        return -1;
++    }
++    return 0;
++}
++
++static int
++w2_put32(uint32_t off, uint32_t want)
++{
++    uint32_t got;
++
++    if (w2_wr32(off, want)) {
++        w2_log("write refused off=0x%x want=0x%x", off, want);
++        return -1;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (w2_rd32(off, &got) || got != want) {
++        w2_log("readback mismatch off=0x%x want=0x%x got=0x%x", off,
++            want, got);
++        return -1;
++    }
++    return 0;
++}
++
++static int
++w2_check64(uint32_t off, uint64_t want)
++{
++    uint64_t got;
++
++    if (w2_rd64(off, &got) || got != want) {
++        w2_log("64-bit readback mismatch off=0x%x want=0x%llx got=0x%llx",
++            off, (unsigned long long)want, (unsigned long long)got);
++        return -1;
++    }
++    return 0;
++}
++
++static int
++w2_alloc_mem(struct w2_mem *m, vm_size_t bytes)
++{
++    kern_return_t kr;
++    ppnum_t pn;
++
++    bzero(m, sizeof(*m));
++    m->raw_bytes = bytes + 0x3fff;
++    kr = kmem_alloc_contig(kernel_map, &m->raw, m->raw_bytes, 0x3fff, 0, 3,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++    if (kr != KERN_SUCCESS) {
++        w2_log("contiguous allocation failed bytes=0x%lx kr=0x%x",
++            (unsigned long)bytes, kr);
++        return -1;
++    }
++    m->va = (m->raw + 0x3fff) & ~(vm_offset_t)0x3fff;
++    m->bytes = bytes;
++    pn = pmap_find_phys(kernel_pmap, (addr64_t)m->va);
++    if (pn == 0) {
++        w2_log("no physical address for va=0x%lx",
++            (unsigned long)m->va);
++        return -1;
++    }
++    m->pa = ptoa_64(pn);
++    if ((m->pa & 0xfff) != 0 || m->pa >= W2_PHYS_LIMIT ||
++        m->bytes > W2_PHYS_LIMIT - m->pa) {
++        w2_log("allocation outside 36-bit output pa=0x%llx",
++            (unsigned long long)m->pa);
++        return -1;
++    }
++    return 0;
++}
++
++static void
++w2_flush_pa(uint64_t pa, vm_size_t bytes)
++{
++    flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++w2_build_tables(void)
++{
++    uint64_t *root = (uint64_t *)w2.tables.va;
++    uint64_t *l2 = (uint64_t *)(w2.tables.va + 0x1000);
++    uint64_t *l3 = (uint64_t *)(w2.tables.va + 0x2000);
++    unsigned i1 = (W2_IOVA_CANARY >> 30) & 3u;
++    unsigned i2 = (W2_IOVA_CANARY >> 21) & 0x1ffu;
++    unsigned i3 = (W2_IOVA_CANARY >> 12) & 0x1ffu;
++
++    bzero((void *)w2.tables.va, w2.tables.bytes);
++    root[i1] = (w2.tables.pa + 0x1000) | 3u;
++    l2[i2] = (w2.tables.pa + 0x2000) | 3u;
++    l3[i3] = w2.canary.pa | W2_PTE_ATTR;
++    w2_flush_pa(w2.tables.pa, w2.tables.bytes);
++    return 0;
++}
++
++static int
++w2_shadow_walk(void)
++{
++    const uint64_t *root = (const uint64_t *)w2.tables.va;
++    uint64_t table_pa, leaf;
++    unsigned i1 = (W2_IOVA_CANARY >> 30) & 3u;
++    unsigned i2 = (W2_IOVA_CANARY >> 21) & 0x1ffu;
++    unsigned i3 = (W2_IOVA_CANARY >> 12) & 0x1ffu;
++    const uint64_t *l2, *l3;
++
++    if ((root[i1] & 3u) != 3u) {
++        return -1;
++    }
++    table_pa = root[i1] & 0x0000fffffffff000ULL;
++    l2 = (const uint64_t *)(w2.tables.va + (table_pa - w2.tables.pa));
++    if ((l2[i2] & 3u) != 3u) {
++        return -1;
++    }
++    table_pa = l2[i2] & 0x0000fffffffff000ULL;
++    l3 = (const uint64_t *)(w2.tables.va + (table_pa - w2.tables.pa));
++    leaf = l3[i3];
++    if ((leaf & 3u) != 3u ||
++        (leaf & 0x0000fffffffff000ULL) != w2.canary.pa) {
++        return -1;
++    }
++    return 0;
++}
++
++static int
++w2_read_ids(void)
++{
++    uint32_t gfsr, id7;
++
++    if (w2_rd32(W2_SCR0, &w2.scr0) || w2_rd32(W2_IDR0, &w2.idr0) ||
++        w2_rd32(W2_IDR1, &w2.idr1) || w2_rd32(W2_IDR2, &w2.idr2) ||
++        w2_rd32(0x3c, &id7) || w2_rd32(W2_GFSR, &gfsr)) {
++        w2_log("identification read refused");
++        return -1;
++    }
++    if ((w2.idr0 & (1u << 30)) == 0 || (w2.idr0 & (1u << 27)) == 0 ||
++        (w2.idr2 & (1u << 12)) == 0 || ((w2.idr2 >> 4) & 15u) < 1u ||
++        ((w2.idr2 >> 4) & 15u) > 5u || ((w2.idr2 >> 3) & 15u) > 5u ||
++        ((id7 >> 4) & 15u) != 2u) {
++        w2_log("unsupported ids idr0=0x%x idr1=0x%x idr2=0x%x id7=0x%x",
++            w2.idr0, w2.idr1, w2.idr2, id7);
++        return -1;
++    }
++    if ((w2.scr0 & 1u) != 0 || (w2.scr0 & (1u << 1)) == 0 || gfsr != 0) {
++        w2_log("global policy/fault refused scr0=0x%x gfsr=0x%x",
++            w2.scr0, gfsr);
++        return -1;
++    }
++    w2_log("global policy inherited scr0=0x%x gfie=%u usfcfg=0x%x "
++        "exidenable=%u exids=%u", w2.scr0,
++        !!(w2.scr0 & (1u << 2)), (w2.scr0 >> 10) & 3u,
++        !!(w2.scr0 & (1u << 3)), !!(w2.idr0 & (1u << 8)));
++
++    w2.atos_supported = (w2.idr0 & (1u << 26)) == 0;
++    w2.page_bytes = (w2.idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++    w2.global_pages = 1u << (((w2.idr1 >> 28) & 7u) + 1u);
++    w2.banks = (w2.idr1 & 0xffu) < W2_BANK_CAP ?
++        (w2.idr1 & 0xffu) : W2_BANK_CAP;
++    w2.smr_slots = (w2.idr0 & 0xffu) < W2_SMR_CAP ?
++        (w2.idr0 & 0xffu) : W2_SMR_CAP;
++    w2.gr1 = w2.page_bytes;
++    w2.valid_smr = (w2.idr0 & (1u << 8)) ? 0u : 0x80000000u;
++    w2.valid_s2cr = (w2.idr0 & (1u << 8)) ? 0x400u : 0u;
++
++    if (w2.page_bytes != 0x1000u || w2.banks < 2 ||
++        w2.smr_slots == 0 ||
++        (uint64_t)(w2.global_pages + w2.banks) * w2.page_bytes >
++        W2_SMMU_SIZE) {
++        w2_log("unsupported geometry pages=%u stride=0x%x banks=%u smrs=%u",
++            w2.global_pages, w2.page_bytes, w2.banks, w2.smr_slots);
++        return -1;
++    }
++    w2_log("ids scr0=0x%x idr0=0x%x idr1=0x%x idr2=0x%x exids=%u cttw=%u atos=%u",
++        w2.scr0, w2.idr0, w2.idr1, w2.idr2,
++        !!(w2.idr0 & (1u << 8)), !!(w2.idr0 & (1u << 14)),
++        !!(w2.idr0 & (1u << 26)));
++    return 0;
++}
++
++static int
++w2_asid_conflict(uint32_t candidate)
++{
++    uint32_t bank, sctlr, cbar;
++    uint64_t ttbr0, ttbr1;
++
++    for (bank = 0; bank < w2.banks; bank++) {
++        if (bank == candidate) {
++            continue;
++        }
++        if (w2_rd32((w2.global_pages + bank) * w2.page_bytes +
++            W2_CB_SCTLR, &sctlr) ||
++            w2_rd32(w2.gr1 + W2_CBAR(bank), &cbar)) {
++            return -1;
++        }
++        if ((sctlr & 1u) == 0 || ((cbar >> 16) & 3u) == 0) {
++            continue;
++        }
++        if (w2_rd64((w2.global_pages + bank) * w2.page_bytes +
++            W2_CB_TTBR0, &ttbr0) ||
++            w2_rd64((w2.global_pages + bank) * w2.page_bytes +
++            W2_CB_TTBR1, &ttbr1)) {
++            return -1;
++        }
++        if ((ttbr0 >> 48) == W2_ASID || (ttbr1 >> 48) == W2_ASID) {
++            w2_log("ASID conflict bank=%u", bank);
++            return -1;
++        }
++    }
++    return 0;
++}
++
++static int
++w2_pick_bank(void)
++{
++    uint32_t candidate, tries, n, sctlr, status, s2cr;
++    uint32_t s2cb = (w2.idr1 >> 16) & 0xffu;
++
++    for (candidate = w2.banks - 1, tries = 0;
++        candidate >= s2cb && candidate > 0 && tries < 8;
++        candidate--, tries++) {
++        int used = 0;
++
++        w2.cb = (w2.global_pages + candidate) * w2.page_bytes;
++        if (w2_rd32(w2.cb + W2_CB_SCTLR, &sctlr) ||
++            w2_rd32(w2.cb + W2_CB_TLBSTATUS, &status)) {
++            continue;
++        }
++        if ((sctlr & 1u) != 0 || (status & 1u) != 0) {
++            continue;
++        }
++        for (n = 0; n < w2.smr_slots; n++) {
++            if (w2_rd32(W2_S2CR(n), &s2cr)) {
++                used = 1;
++                break;
++            }
++            if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == candidate) {
++                used = 1;
++                break;
++            }
++        }
++        if (used || w2_asid_conflict(candidate)) {
++            continue;
++        }
++        w2.bank = candidate;
++        w2_log("bank=%u cb=0x%x asid=0x%x", w2.bank, w2.cb, W2_ASID);
++        return 0;
++    }
++    w2_log("no free context bank");
++    return -1;
++}
++
++static int
++w2_pick_slot(void)
++{
++    uint32_t n, smr, s2cr, free_slot = ~0u, exact_slot = ~0u;
++    uint32_t exact_count = 0;
++    uint32_t sid_mask = (w2.idr0 & (1u << 8)) ? 0xffffu :
++        (1u << ((w2.idr0 >> 9) & 15u)) - 1u;
++
++    for (n = 0; n < w2.smr_slots; n++) {
++        int valid;
++        uint32_t mask, id;
++
++        if (w2_rd32(W2_SMR(n), &smr) || w2_rd32(W2_S2CR(n), &s2cr)) {
++            return -1;
++        }
++        valid = (w2.idr0 & (1u << 8)) ? !!(s2cr & 0x400u) :
++            !!(smr & 0x80000000u);
++        id = smr & 0xffffu;
++        mask = (smr >> 16) & ((w2.idr0 & (1u << 8)) ? 0xffffu : 0x7fffu);
++        if (!valid) {
++            if (free_slot == ~0u) {
++                free_slot = n;
++            }
++            continue;
++        }
++        if (((W2_SID ^ id) & ~mask & sid_mask) == 0) {
++            if (mask != 0 || ((s2cr >> 16) & 3u) == 0) {
++                w2_log("SID slot %u conflicts smr=0x%x s2cr=0x%x", n,
++                    smr, s2cr);
++                return -1;
++            }
++            exact_slot = n;
++            exact_count++;
++        }
++    }
++    if (exact_count > 1) {
++        w2_log("duplicate exact SID matches=%u", exact_count);
++        return -1;
++    }
++    if (exact_count == 1) {
++        w2.slot = exact_slot;
++        if (w2_rd32(W2_SMR(w2.slot), &w2.old_smr) ||
++            w2_rd32(W2_S2CR(w2.slot), &w2.old_s2cr)) {
++            return -1;
++        }
++        w2_log("slot=%u exact non-translating SID reused", w2.slot);
++        return 0;
++    }
++    if (free_slot == ~0u) {
++        w2_log("no free SMR slot");
++        return -1;
++    }
++    w2.slot = free_slot;
++    w2_log("slot=%u free", w2.slot);
++    return 0;
++}
++
++static int
++w2_tlb_sync(void)
++{
++    uint32_t status;
++    unsigned i;
++
++    if (w2_wr32(w2.cb + W2_CB_TLBIASID, W2_ASID) ||
++        w2_wr32(w2.cb + W2_CB_TLBSYNC, 0xffffffffu)) {
++        return -1;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (i = 0; i < 500; i++) {
++        if (w2_rd32(w2.cb + W2_CB_TLBSTATUS, &status)) {
++            return -1;
++        }
++        if ((status & 1u) == 0) {
++            return 0;
++        }
++        delay(1);
++    }
++    w2_log("TLB sync timeout status=0x%x", status);
++    return -1;
++}
++
++static int
++w2_program_context(void)
++{
++    uint64_t ttbr0 = ((uint64_t)W2_ASID << 48) | w2.tables.pa;
++    uint64_t ttbr1 = (uint64_t)W2_ASID << 48;
++    uint32_t got;
++
++    w2.bank_touched = 1;
++    w2_log("context disable start cb=0x%x", w2.cb);
++    if (w2_put32(w2.cb + W2_CB_SCTLR, 0)) {
++        return -1;
++    }
++    w2_log("context bank registers start");
++    if (w2_put32(w2.gr1 + W2_CBA2R(w2.bank), W2_CBA2R_VALUE) ||
++        w2_put32(w2.gr1 + W2_CBAR(w2.bank), W2_CBAR_VALUE) ||
++        w2_put32(w2.cb + W2_CB_TCR2, W2_TCR2_VALUE) ||
++        w2_put32(w2.cb + W2_CB_TCR, W2_TCR_VALUE) ||
++        w2_wr64(w2.cb + W2_CB_TTBR0, ttbr0) ||
++        w2_wr64(w2.cb + W2_CB_TTBR1, ttbr1) ||
++        w2_check64(w2.cb + W2_CB_TTBR0, ttbr0) ||
++        w2_check64(w2.cb + W2_CB_TTBR1, ttbr1) ||
++        w2_put32(w2.cb + W2_CB_MAIR0, W2_MAIR0_VALUE) ||
++        w2_put32(w2.cb + W2_CB_MAIR1, 0)) {
++        return -1;
++    }
++    w2_log("context control registers programmed");
++    /* FSR is write-one-to-clear, so readback is zero rather than the mask. */
++    if (w2_wr32(w2.cb + W2_CB_FSR, W2_FSR_FAULT)) {
++        w2_log("FSR clear write refused");
++        return -1;
++    }
++    if (w2_rd32(w2.cb + W2_CB_FSR, &got)) {
++        w2_log("FSR clear read refused");
++        return -1;
++    }
++    if ((got & W2_FSR_FAULT) != 0) {
++        w2_log("FSR fault bits did not clear got=0x%x", got);
++        return -1;
++    }
++    if (got != 0) {
++        w2_log("FSR residual bits 0x%x (architectural faults clear)", got);
++    }
++    w2_log("context TLB sync start");
++    if (w2_tlb_sync() || w2_put32(w2.cb + W2_CB_SCTLR, W2_SCTLR_VALUE)) {
++        return -1;
++    }
++    w2_log("context enabled fsr=0x%x", got);
++    if (w2_rd32(w2.cb + W2_CB_FSR, &got) || (got & W2_FSR_FAULT) != 0) {
++        w2_log("context fault after enable fsr=0x%x", got);
++        return -1;
++    }
++    w2.context_programmed = 1;
++    w2_log("context cb=0x%x ttbr0=0x%llx sctlr=0x%x", w2.cb,
++        (unsigned long long)ttbr0, W2_SCTLR_VALUE);
++    return 0;
++}
++
++static int
++w2_ats_translate(uint64_t iova, uint64_t *par)
++{
++    uint32_t status, lo, hi;
++    unsigned i;
++
++    /* IHI 0062D.c 16.5.2: a 32-bit lower-word write is zero-extended. */
++    if (w2_wr32(w2.cb + W2_CB_ATS1PR, (uint32_t)iova)) {
++        return -1;
++    }
++    for (i = 0; i < 200; i++) {
++        if (w2_rd32(w2.cb + W2_CB_ATSR, &status)) {
++            return -1;
++        }
++        if ((status & 1u) == 0) {
++            if (w2_rd32(w2.cb + W2_CB_PAR, &lo) ||
++                w2_rd32(w2.cb + W2_CB_PAR + 4, &hi)) {
++                return -1;
++            }
++            *par = (uint64_t)lo | ((uint64_t)hi << 32);
++            return 0;
++        }
++        delay(1);
++    }
++    w2_log("ATS timeout iova=0x%llx", (unsigned long long)iova);
++    return -1;
++}
++
++static int
++w2_attach_sid(void)
++{
++    uint32_t route = w2.bank | w2.valid_s2cr;
++
++    w2.slot_touched = 1;
++    if (w2_put32(W2_S2CR(w2.slot), w2.bank)) {
++        return -1;
++    }
++    if (w2_put32(W2_SMR(w2.slot), w2.valid_smr | W2_SID)) {
++        return -1;
++    }
++    if (w2.valid_s2cr != 0 && w2_put32(W2_S2CR(w2.slot), route)) {
++        return -1;
++    }
++    w2.route_smr = w2.valid_smr | W2_SID;
++    w2.route_s2cr = route;
++    if (w2_rd32(W2_SMR(w2.slot), &w2.route_smr) ||
++        w2_rd32(W2_S2CR(w2.slot), &w2.route_s2cr) ||
++        w2.route_smr != (w2.valid_smr | W2_SID) ||
++        w2.route_s2cr != route) {
++        return -1;
++    }
++    w2.sid_attached = 1;
++    w2_log("sid 0x%x slot=%u smr=0x%x s2cr=0x%x", W2_SID, w2.slot,
++        w2.route_smr, w2.route_s2cr);
++    return 0;
++}
++
++static void
++w2_teardown(void)
++{
++    uint32_t got;
++
++    if (w2.slot_touched) {
++        if (w2_put32(W2_S2CR(w2.slot), W2_S2CR_FAULT | w2.valid_s2cr)) {
++            w2.poisoned = 1;
++        }
++        w2.slot_touched = 0;
++        w2.sid_attached = 0;
++    }
++    if (w2.bank_touched) {
++        if (w2_put32(w2.cb + W2_CB_SCTLR, 0) || w2_tlb_sync()) {
++            w2.poisoned = 1;
++        } else if (w2_rd32(w2.cb + W2_CB_SCTLR, &got) || got != 0) {
++            w2.poisoned = 1;
++        }
++        w2.bank_touched = 0;
++        w2.context_programmed = 0;
++    }
++    /* Do not restore CBAR/CBA2R. Retain tables and canary until reset. */
++    w2_log("teardown %s allocations retained", w2.poisoned ?
++        "UNCERTAIN" : "complete");
++}
++
++int
++mondrian_wifi_smmu_prove(uint16_t pci_command)
++{
++    uint64_t par = 0;
++    uint32_t fsr;
++    int result = -1;
++
++    if ((pci_command & (1u << 1)) != 0) {
++        w2_log("refusing proof with bus master set command=0x%x", pci_command);
++        return -1;
++    }
++    bzero(&w2, sizeof(w2));
++    w2.smmu = ml_io_map(W2_SMMU_PA, W2_SMMU_SIZE);
++    if (w2.smmu == 0 || w2_read_ids() || w2_pick_bank() ||
++        w2_pick_slot()) {
++        goto out;
++    }
++    if (w2_alloc_mem(&w2.tables, 0x4000) ||
++        w2_alloc_mem(&w2.canary, PAGE_SIZE) || w2_build_tables() ||
++        w2_shadow_walk()) {
++        goto out;
++    }
++    *(volatile uint32_t *)w2.canary.va = 0x5742464du; /* "BFMW" */
++    w2_flush_pa(w2.canary.pa, 0x1000);
++    w2_log("wired canary va=0x%lx pa=0x%llx iova=0x%llx",
++        (unsigned long)w2.canary.va,
++        (unsigned long long)w2.canary.pa,
++        (unsigned long long)W2_IOVA_CANARY);
++
++    if (w2_program_context()) {
++        goto out;
++    }
++    if (!w2.atos_supported) {
++        if (w2_attach_sid()) {
++            goto out;
++        }
++        w2_log("pci command=0x%x bus master off", pci_command);
++        w2_log("W2 PARTIAL context and SID route proven; ATS unsupported");
++        result = 1;
++        goto out;
++    }
++    if (w2_ats_translate(W2_IOVA_CANARY, &par) ||
++        (par & 1u) != 0 ||
++        (par & 0x0000fffffffff000ULL) != w2.canary.pa ||
++        w2_rd32(w2.cb + W2_CB_FSR, &fsr) || fsr != 0) {
++        w2_log("mapped ATS failed par=0x%llx", (unsigned long long)par);
++        goto out;
++    }
++    w2_log("ats mapped iova=0x%llx par=0x%llx fsr=0",
++        (unsigned long long)W2_IOVA_CANARY, (unsigned long long)par);
++
++    if (w2_ats_translate(W2_IOVA_MISS, &par) || (par & 1u) == 0 ||
++        w2_rd32(w2.cb + W2_CB_FSR, &fsr) || fsr != 0) {
++        w2_log("fault ATS failed par=0x%llx", (unsigned long long)par);
++        goto out;
++    }
++    w2_log("ats fault iova=0x%llx par=0x%llx expected PAR.F",
++        (unsigned long long)W2_IOVA_MISS, (unsigned long long)par);
++
++    if (w2_attach_sid()) {
++        goto out;
++    }
++    w2_log("pci command=0x%x bus master off", pci_command);
++    w2_log("W2 PASS hardware stage-1 walk proven; endpoint DMA not attempted");
++    result = 0;
++
++out:
++    w2_teardown();
++    mondrian_log_flush_now();
++    return result;
++}
++
++#else /* !MONDRIAN */
++
++int
++mondrian_wifi_smmu_prove(uint16_t pci_command __unused)
++{
++    return -1;
++}
++
++#endif /* MONDRIAN */

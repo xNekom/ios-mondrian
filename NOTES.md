@@ -62,10 +62,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **Wi-Fi PCIe is proven; the radio stack is missing.** `0415` reaches Gen2 x1
-   and reads QCA6490 `17cb:1103` with bus mastering off; MHI/QMI/ath11k, firmware
-   and the interface are absent. AW88261 IDs answer, but ADSP/codec/PCM, camera
-   and cellular are not implemented (`docs/REFERENCE_PORTS.md`).
+1. **Wi-Fi link/SMMU route proven; the radio stack is missing.** W1 reaches
+   Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01` with bus mastering
+   off (ATS unsupported). MHI/QMI/ath11k, ADSP/codec/PCM, camera and cellular
+   remain absent; AW88261 IDs answer (`docs/REFERENCE_PORTS.md`).
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
