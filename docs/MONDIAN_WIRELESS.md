@@ -14,7 +14,9 @@ MHI or firmware. Measured 2026-11-25 on the `04:07:36` kernel with Bluetooth
 off: all eight WLAN/PCIe rails voted, the live 82-entry PHY table loaded, link
 came up **Gen2 x1**, and config read `17cb:1103`, subsystem `17cb:0108`,
 revision `01`; bus mastering read back clear. The worker reuses touch's early
-GCC window because a second late `ml_io_map()` of the same block stalled.
+GCC window because a second late `ml_io_map()` of the same block stalled. The default
+boot (no `mondrianwifi`) emits no Wi‑Fi worker lines and `btuart` still reads the
+Bluetooth controller identity.
 
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
