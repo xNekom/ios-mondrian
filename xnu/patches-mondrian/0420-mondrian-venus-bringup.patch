@@ -48,10 +48,10 @@ index b432224..1f8930e 100644
  		mondrian_spmi_probe();
 diff --git a/bsd/dev/mondrian_venus.c b/bsd/dev/mondrian_venus.c
 new file mode 100644
-index 0000000..74353f6
+index 0000000..859d027
 --- /dev/null
 +++ b/bsd/dev/mondrian_venus.c
-@@ -0,0 +1,2388 @@
+@@ -0,0 +1,3174 @@
 +/* SPDX-License-Identifier: APSL-2.0 */
 +/*
 + * MONDRIAN VENUS V1: PAS 9 load and polled HFI system-property proof.
@@ -219,7 +219,7 @@ index 0000000..74353f6
 +#define VENUS_META_OFFSET       0x000f0000u
 +#define VENUS_META_SIZE         0x00010000u
 +#define VENUS_BUFFER_PA         0xa7800000ULL
-+#define VENUS_BUFFER_SIZE       0x0a000000ULL /* ends at 0xb1800000 */
++#define VENUS_BUFFER_SIZE       0x04e00000ULL /* stops at the UC region */
 +
 +/* HFI queue geometry: SM8475 vendor msm_vidc_internal.h. */
 +#define VENUS_QTABLE_SIZE       0x000001c8u
@@ -256,6 +256,97 @@ index 0000000..74353f6
 +#define VENUS_HFI_CODEC_HEVC    3u             /* decoder */
 +#define VENUS_HFI_SESSION_ID    1u
 +#define VENUS_HFI_MSG_SESSION_INIT 0x00020006u
++
++/* iris2 data path. A session property carries the port it configures: the
++ * bitstream ones go to port 1, the raw ones to port 2, and the persist buffer
++ * to port 0 (HFI_PORT_NONE). V3 sent everything on port 0 and queued buffers
++ * before START, and the firmware answered UNSUPPORTED and INVALID_STATE.
++ * The internal buffers must exist before START(bitstream); the DPB buffers
++ * are queued only after START(raw), when the session is streaming. */
++#define VENUS_HFI_CMD_START     0x01000005u
++#define VENUS_HFI_CMD_RESUME    0x01000008u
++#define VENUS_HFI_CMD_SETTINGS_CHANGE 0x0100000Cu
++#define VENUS_HFI_CMD_DRAIN     0x01000007u
++#define VENUS_HFI_CMD_STOP      0x01000006u
++#define VENUS_HFI_CMD_BUFFER    0x01000009u
++#define VENUS_HFI_CMD_SUBSCRIBE 0x0100000bu
++#define VENUS_HFI_PAYLOAD_U32_ARRAY 0x0bu
++#define VENUS_HFI_MODE_PORT_CHANGE 1u
++#define VENUS_HFI_MODE_PROPERTY 2u
++#define VENUS_HFI_PROP_NO_OUTPUT 0x0300016au
++#define VENUS_HFI_PROP_COLOR_FORMAT 0x03000101u
++#define VENUS_HFI_PROP_RAW_RESOLUTION 0x03000178u
++#define VENUS_HFI_PROP_BITSTREAM_RES 0x03000103u
++#define VENUS_HFI_PROP_LINEAR_STRIDE 0x03000104u
++#define VENUS_HFI_PROP_CROP_OFFSETS 0x03000105u
++#define VENUS_HFI_PROP_PROFILE 0x03000107u
++#define VENUS_HFI_PROP_LEVEL   0x03000108u
++#define VENUS_HFI_PROP_TIER    0x03000109u
++#define VENUS_HFI_PROP_BIT_DEPTH 0x0300010fu
++#define VENUS_HFI_PROP_MIN_OUTPUT 0x03000124u
++#define VENUS_HFI_PROP_STAGE 0x0300010au
++#define VENUS_HFI_PROP_CODED_FRAMES 0x03000120u
++#define VENUS_HFI_PROP_POC 0x03000128u
++#define VENUS_HFI_PROP_HOST_MAX 0x03000123u
++#define VENUS_HFI_PROP_SIGNAL_COLOR 0x03000155u
++#define VENUS_HFI_PROP_OPB_ENABLE 0x03000184u
++#define VENUS_HFI_PROP_COMV_COUNT 0x03000193u
++#define VENUS_HFI_PAYLOAD_STRUCTURE 5u
++#define VENUS_HFI_PAYLOAD_32_PACKED 0x0au
++#define VENUS_HFI_PAYLOAD_64_PACKED 0x0du
++#define VENUS_HFI_PORT_NONE     0u
++#define VENUS_HFI_PORT_BITSTREAM 1u
++#define VENUS_HFI_PORT_RAW      2u
++#define VENUS_HFI_BUFFER_BITSTREAM 1u
++#define VENUS_HFI_BUFFER_RAW    2u
++#define VENUS_HFI_BUFFER_PARTIAL 5u
++#define VENUS_HFI_BUFFER_DPB    6u
++#define VENUS_HFI_BUFFER_BIN    7u
++#define VENUS_HFI_BUFFER_LINE   8u
++#define VENUS_HFI_BUFFER_COMV   0x0au
++#define VENUS_HFI_BUFFER_NON_COMV 0x0bu
++#define VENUS_HFI_BUFFER_PERSIST 0x0cu
++#define VENUS_HFI_BUF_NONSECURE 0x200u
++#define VENUS_HFI_BUF_CODEC_CONFIG 0x100u
++#define VENUS_HFI_BUF_CODEC_CONFIG 0x100u
++#define VENUS_HFI_COLOR_NV12    1u
++#define VENUS_HFI_PROFILE_HEVC_MAIN 0u /* V4L2 value, as mainline sends it */
++#define VENUS_HFI_LEVEL_HEVC_6_1 11u   /* V4L2 value for HEVC level 6.1 */
++#define VENUS_HFI_TIER_HEVC_MAIN 0u
++#define VENUS_HFI_DRAIN_ERROR   0xffffffffu
++#define VENUS_PIC_W             128u
++#define VENUS_PIC_H             128u
++#define VENUS_DPB_COUNT         6u
++#define VENUS_BS_PA             0xa7800000ULL
++#define VENUS_BS_MAP            0x00200000u
++#define VENUS_BS_SIZE           0x00100000u
++#define VENUS_DPB_PA            0xa7a00000ULL
++#define VENUS_DPB_MAP           0x00800000u
++#define VENUS_DPB_SIZE          0x00100000u
++#define VENUS_RAW_PA            0xa8200000ULL
++#define VENUS_RAW_MAP           0x00200000u
++#define VENUS_RAW_SIZE          0x00040000u
++#define VENUS_RAW_COUNT         6u
++/* The H.265 BIN size is dominated by BIN_BUFFER_THRESHOLD, not by the
++ * 128x128 frame: mainline asks for 5.4 MiB even at the minimum resolution. */
++#define VENUS_BIN_PA            0xa8400000ULL
++#define VENUS_BIN_MAP           0x00800000u
++#define VENUS_BIN_SIZE          0x00800000u
++#define VENUS_COMV_PA           0xa8c00000ULL
++#define VENUS_COMV_MAP          0x00200000u
++#define VENUS_COMV_SIZE         0x00100000u
++#define VENUS_NONCOMV_PA        0xa8e00000ULL
++#define VENUS_NONCOMV_MAP       0x00200000u
++#define VENUS_NONCOMV_SIZE      0x00200000u
++#define VENUS_LINE_PA           0xa9000000ULL
++#define VENUS_LINE_MAP          0x00200000u
++#define VENUS_LINE_SIZE         0x00200000u
++#define VENUS_PARTIAL_PA        0xa9200000ULL
++#define VENUS_PARTIAL_MAP       0x00200000u
++#define VENUS_PARTIAL_SIZE      0x00100000u
++#define VENUS_PERSIST_PA        0xa9400000ULL
++#define VENUS_PERSIST_MAP       0x00200000u
++#define VENUS_PERSIST_SIZE      0x00100000u
 +
 +/* PIL SCM command numbers; Linux qcom_scm.c and the MIT donor agree. */
 +#define VENUS_SCM_PIL_BASE      0x42000200u
@@ -344,7 +435,9 @@ index 0000000..74353f6
 +static int venus_skip_protect;
 +static uint32_t venus_ares_before;
 +static vm_offset_t venus_core, venus_videocc, venus_fw_va, venus_queue_va,
-+    venus_aux_va;
++    venus_aux_va, venus_bs_va, venus_dpb_va, venus_raw_va, venus_bin_va,
++    venus_comv_va, venus_noncomv_va, venus_line_va, venus_partial_va,
++    venus_persist_va;
 +static uint32_t venus_header_id, venus_packet_id;
 +static uint8_t venus_fw_bounce[4096];
 +static uint32_t venus_response[VENUS_MAX_PACKET_SIZE / 4u];
@@ -1372,12 +1465,38 @@ index 0000000..74353f6
 +        venus_log("smmu: sfr map failed");
 +        return -1;
 +    }
++    if (venus_pt_map_range(VENUS_BS_PA, VENUS_BS_PA, VENUS_BS_MAP) ||
++        venus_pt_map_range(VENUS_DPB_PA, VENUS_DPB_PA, VENUS_DPB_MAP) ||
++        venus_pt_map_range(VENUS_RAW_PA, VENUS_RAW_PA, VENUS_RAW_MAP) ||
++        venus_pt_map_range(VENUS_BIN_PA, VENUS_BIN_PA, VENUS_BIN_MAP) ||
++        venus_pt_map_range(VENUS_COMV_PA, VENUS_COMV_PA, VENUS_COMV_MAP) ||
++        venus_pt_map_range(VENUS_NONCOMV_PA, VENUS_NONCOMV_PA,
++        VENUS_NONCOMV_MAP) ||
++        venus_pt_map_range(VENUS_LINE_PA, VENUS_LINE_PA, VENUS_LINE_MAP) ||
++        venus_pt_map_range(VENUS_PARTIAL_PA, VENUS_PARTIAL_PA,
++        VENUS_PARTIAL_MAP) ||
++        venus_pt_map_range(VENUS_PERSIST_PA, VENUS_PERSIST_PA,
++        VENUS_PERSIST_MAP)) {
++        venus_log("smmu: buffer map failed table_next=0x%x",
++            venus_smmu.table_next);
++        return -1;
++    }
++    venus_log("smmu: buffers mapped, table_next=0x%x", venus_smmu.table_next);
 +    venus_smmu_step("shadow");
 +    if (venus_pt_shadow(VENUS_FW_PA, VENUS_FW_PA) ||
 +        venus_pt_shadow(VENUS_FW_PA + VENUS_FW_SIZE - 4096,
 +        VENUS_FW_PA + VENUS_FW_SIZE - 4096) ||
 +        venus_pt_shadow(VENUS_QUEUE_PA, VENUS_QUEUE_PA) ||
-+        venus_pt_shadow(VENUS_SFR_PA, VENUS_SFR_PA)) {
++        venus_pt_shadow(VENUS_SFR_PA, VENUS_SFR_PA) ||
++        venus_pt_shadow(VENUS_BS_PA, VENUS_BS_PA) ||
++        venus_pt_shadow(VENUS_DPB_PA, VENUS_DPB_PA) ||
++        venus_pt_shadow(VENUS_RAW_PA, VENUS_RAW_PA) ||
++        venus_pt_shadow(VENUS_BIN_PA, VENUS_BIN_PA) ||
++        venus_pt_shadow(VENUS_COMV_PA, VENUS_COMV_PA) ||
++        venus_pt_shadow(VENUS_NONCOMV_PA, VENUS_NONCOMV_PA) ||
++        venus_pt_shadow(VENUS_LINE_PA, VENUS_LINE_PA) ||
++        venus_pt_shadow(VENUS_PARTIAL_PA, VENUS_PARTIAL_PA) ||
++        venus_pt_shadow(VENUS_PERSIST_PA, VENUS_PERSIST_PA)) {
 +        venus_log("smmu: table shadow failed");
 +        return -1;
 +    }
@@ -2107,7 +2226,7 @@ index 0000000..74353f6
 +
 +static int
 +venus_hfi_send(uint32_t session, uint32_t type, uint32_t flags,
-+    uint32_t payload_info, uint32_t payload)
++    uint32_t port, uint32_t payload_info, uint32_t payload)
 +{
 +    uint32_t packet[17];
 +    uint32_t words = payload_info == VENUS_HFI_PAYLOAD_NONE ? 16u : 17u;
@@ -2121,11 +2240,619 @@ index 0000000..74353f6
 +    packet[9] = type;
 +    packet[10] = flags;
 +    packet[11] = payload_info;
++    packet[12] = port;
 +    packet[13] = venus_packet_id++;
 +    if (payload_info != VENUS_HFI_PAYLOAD_NONE) {
 +        packet[16] = payload;
 +    }
 +    return venus_queue_write(packet, words);
++}
++
++static int
++venus_hfi_send_payload(uint32_t session, uint32_t type, uint32_t flags,
++    uint32_t port, uint32_t payload_info, const uint32_t *payload,
++    uint32_t bytes)
++{
++    uint32_t packet[32];
++    uint32_t words = VENUS_HFI_HEADER_WORDS + VENUS_HFI_PACKET_WORDS +
++        (bytes + 3u) / 4u;
++
++    if (bytes == 0 || bytes > 64u || words > 32u) {
++        return -1;
++    }
++    bzero(packet, sizeof(packet));
++    packet[0] = words * 4u;
++    packet[1] = session;
++    packet[2] = venus_header_id++;
++    packet[7] = 1;
++    packet[8] = words * 4u - VENUS_HFI_HEADER_WORDS * 4u;
++    packet[9] = type;
++    packet[10] = flags;
++    packet[11] = payload_info;
++    packet[12] = port;
++    packet[13] = venus_packet_id++;
++    bcopy(payload, &packet[16], bytes);
++    return venus_queue_write(packet, words);
++}
++
++static int
++venus_hfi_buffer_data(uint32_t type, uint32_t index, uint64_t pa,
++    uint32_t size, uint32_t data_size, uint32_t flags, uint32_t port)
++{
++    uint32_t buf[16];
++
++    bzero(buf, sizeof(buf));
++    buf[0] = type;
++    buf[1] = index;
++    buf[2] = (uint32_t)pa;
++    buf[3] = (uint32_t)(pa >> 32);
++    buf[4] = 0;                 /* addr_offset */
++    buf[5] = size;              /* buffer_size */
++    buf[6] = 0;                 /* data_offset */
++    buf[7] = data_size;
++    buf[10] = flags;
++    return venus_hfi_send_payload(VENUS_HFI_SESSION_ID,
++        VENUS_HFI_CMD_BUFFER, VENUS_HFI_HOST_INTR, port,
++        VENUS_HFI_PAYLOAD_STRUCTURE, buf, sizeof(buf));
++}
++
++static int
++venus_hfi_buffer(uint32_t type, uint32_t index, uint64_t pa, uint32_t size,
++    uint32_t port)
++{
++    return venus_hfi_buffer_data(type, index, pa, size, 0,
++        VENUS_HFI_BUF_NONSECURE, port);
++}
++
++static int
++venus_hfi_pkt_failed(uint32_t type, uint32_t flags)
++{
++    /* A rejected command echoes the session error in its flags (0x4/0x8) and
++     * a companion HFI_ERR packet carries the code. HFI_INFO packets (0x06)
++     * report an unsupported optional property but do not fail the session, so
++     * they are logged, not counted. */
++    (void)type;
++    return (flags & (VENUS_HFI_FW_SESSERR | VENUS_HFI_FW_SYSERR)) != 0;
++}
++
++static unsigned
++venus_hfi_drain_log(unsigned ms)
++{
++    unsigned attempt, seen = 0, errors = 0;
++
++    for (attempt = 0; attempt < ms; attempt++) {
++        uint32_t count = 0, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return seen;
++        }
++        if (rc == 0) {
++            delay(1000);
++            continue;
++        }
++        packets = venus_response[7];
++        if (packets == 0 || count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        seen++;
++        venus_log("HFI resp session=%u packets=%u bytes=%u",
++            venus_response[1], packets, count * 4u);
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++            uint32_t ptype, pflags, info, port, pid, payload0 = 0;
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                venus_log("HFI resp bad size %u", size);
++                return seen;
++            }
++            ptype = venus_response[i + 1];
++            pflags = venus_response[i + 2];
++            info = venus_response[i + 3];
++            port = venus_response[i + 4];
++            pid = venus_response[i + 5];
++            if (size > VENUS_HFI_PACKET_WORDS * 4u) {
++                payload0 = venus_response[i + VENUS_HFI_PACKET_WORDS];
++            }
++            venus_log("HFI pkt type=0x%x flags=0x%x info=%u port=%u id=%u "
++                "payload0=0x%x", ptype, pflags, info, port, pid, payload0);
++            if (info == VENUS_HFI_PAYLOAD_STRUCTURE &&
++                size >= VENUS_HFI_PACKET_WORDS * 4u + 64u) {
++                const uint32_t *b = &venus_response[i +
++                    VENUS_HFI_PACKET_WORDS];
++                venus_log("HFI buffer type=%u index=%u size=%u data=%u "
++                    "flags=0x%x", b[0], b[1], b[5], b[7], b[10]);
++                if (b[0] == VENUS_HFI_BUFFER_RAW && b[7] != 0) {
++                    const uint8_t *y = (const uint8_t *)venus_raw_va +
++                        (uint64_t)b[1] * VENUS_RAW_SIZE;
++
++                    venus_log("HFI raw %u Y %02x %02x %02x %02x",
++                        b[1], y[0], y[64], y[128], y[192]);
++                }
++            }
++            if (venus_hfi_pkt_failed(ptype, pflags)) {
++                venus_log("HFI error pkt type=0x%x flags=0x%x",
++                    ptype, pflags);
++                errors++;
++            }
++            i += size / 4u;
++        }
++    }
++    return errors ? VENUS_HFI_DRAIN_ERROR : seen;
++}
++
++static unsigned
++venus_hfi_decode_wait(unsigned ms)
++{
++    unsigned attempt, seen = 0, errors = 0, requeued = 0;
++
++    for (attempt = 0; attempt < ms; attempt++) {
++        uint32_t count = 0, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return seen;
++        }
++        if (rc == 0) {
++            delay(1000);
++            continue;
++        }
++        packets = venus_response[7];
++        if (packets == 0 || count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        seen++;
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++            uint32_t ptype, pflags, info, port, pid, payload0 = 0;
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                return seen;
++            }
++            ptype = venus_response[i + 1];
++            pflags = venus_response[i + 2];
++            info = venus_response[i + 3];
++            port = venus_response[i + 4];
++            pid = venus_response[i + 5];
++            if (size > VENUS_HFI_PACKET_WORDS * 4u) {
++                payload0 = venus_response[i + VENUS_HFI_PACKET_WORDS];
++            }
++            venus_log("HFI pkt type=0x%x flags=0x%x info=%u port=%u id=%u "
++                "payload0=0x%x", ptype, pflags, info, port, pid, payload0);
++            if (info == VENUS_HFI_PAYLOAD_STRUCTURE &&
++                size >= VENUS_HFI_PACKET_WORDS * 4u + 64u) {
++                const uint32_t *b = &venus_response[i +
++                    VENUS_HFI_PACKET_WORDS];
++                venus_log("HFI buffer type=%u index=%u size=%u data=%u "
++                    "flags=0x%x", b[0], b[1], b[5], b[7], b[10]);
++                /* A raw buffer that comes back empty is requeued, which is
++                 * what a capture client does when it dequeues one. */
++                if (b[0] == VENUS_HFI_BUFFER_RAW &&
++                    port == VENUS_HFI_PORT_RAW && b[7] == 0 &&
++                    requeued < 20u) {
++                    uint64_t pa = (uint64_t)b[2] |
++                        ((uint64_t)b[3] << 32);
++
++                    if (venus_hfi_buffer_data(VENUS_HFI_BUFFER_RAW, b[1],
++                        pa, b[5], b[5], VENUS_HFI_BUF_NONSECURE,
++                        VENUS_HFI_PORT_RAW) == 0) {
++                        requeued++;
++                        venus_log("HFI raw %u requeued", b[1]);
++                    }
++                }
++            }
++            if (venus_hfi_pkt_failed(ptype, pflags)) {
++                venus_log("HFI error pkt type=0x%x flags=0x%x",
++                    ptype, pflags);
++                errors++;
++            }
++            i += size / 4u;
++        }
++    }
++    return errors ? VENUS_HFI_DRAIN_ERROR : seen;
++}
++
++static int
++venus_hfi_first_ipsc(unsigned ms)
++{
++    unsigned attempt;
++    int failed = 0, seen = 0;
++
++    for (attempt = 0; attempt < ms; attempt++) {
++        uint32_t count = 0, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return -1;
++        }
++        if (rc == 0) {
++            delay(1000);
++            continue;
++        }
++        packets = venus_response[7];
++        if (packets == 0 || count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++            uint32_t ptype, pflags, pport, pid, payload0 = 0;
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                return -1;
++            }
++            ptype = venus_response[i + 1];
++            pflags = venus_response[i + 2];
++            pport = venus_response[i + 4];
++            pid = venus_response[i + 5];
++            if (size > VENUS_HFI_PACKET_WORDS * 4u) {
++                payload0 = venus_response[i + VENUS_HFI_PACKET_WORDS];
++            }
++            venus_log("HFI pkt type=0x%x flags=0x%x port=%u id=%u "
++                "payload0=0x%x", ptype, pflags, pport, pid, payload0);
++            if (venus_hfi_pkt_failed(ptype, pflags)) {
++                venus_log("HFI error pkt type=0x%x flags=0x%x",
++                    ptype, pflags);
++                failed = 1;
++            }
++            if (ptype == VENUS_HFI_CMD_SETTINGS_CHANGE &&
++                pport == VENUS_HFI_PORT_BITSTREAM) {
++                seen = 1;
++            }
++            i += size / 4u;
++        }
++        if (seen) {
++            return failed ? -1 : 1;
++        }
++    }
++    return failed ? -1 : 0;
++}
++
++static int
++venus_hfi_wait_session(uint32_t type, uint32_t port, unsigned ms,
++    uint32_t *out_flags)
++{
++    unsigned attempt;
++    int failed = 0, hit = 0;
++    uint32_t hit_flags = 0;
++
++    *out_flags = 0;
++    for (attempt = 0; attempt < ms; attempt++) {
++        uint32_t count = 0, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return -1;
++        }
++        if (rc == 0) {
++            delay(1000);
++            continue;
++        }
++        packets = venus_response[7];
++        if (packets == 0 || count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++            uint32_t ptype, pflags, info, pport, pid, payload0 = 0;
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                return -1;
++            }
++            ptype = venus_response[i + 1];
++            pflags = venus_response[i + 2];
++            info = venus_response[i + 3];
++            pport = venus_response[i + 4];
++            pid = venus_response[i + 5];
++            if (size > VENUS_HFI_PACKET_WORDS * 4u) {
++                payload0 = venus_response[i + VENUS_HFI_PACKET_WORDS];
++            }
++            venus_log("HFI pkt type=0x%x flags=0x%x port=%u id=%u "
++                "payload0=0x%x", ptype, pflags, pport, pid, payload0);
++            if (venus_hfi_pkt_failed(ptype, pflags)) {
++                venus_log("HFI error pkt type=0x%x flags=0x%x",
++                    ptype, pflags);
++                failed = 1;
++            }
++            if (info == VENUS_HFI_PAYLOAD_STRUCTURE &&
++                size >= VENUS_HFI_PACKET_WORDS * 4u + 64u) {
++                const uint32_t *b = &venus_response[i +
++                    VENUS_HFI_PACKET_WORDS];
++
++                venus_log("HFI buffer type=%u index=%u size=%u data=%u "
++                    "flags=0x%x", b[0], b[1], b[5], b[7], b[10]);
++            }
++            if (ptype == type && pport == port) {
++                hit = 1;
++                hit_flags = pflags;
++            }
++            i += size / 4u;
++        }
++        if (hit) {
++            *out_flags = hit_flags;
++            return failed ? -1 : 1;
++        }
++    }
++    return failed ? -1 : 0;
++}
++
++static int
++venus_hfi_subscribe(uint32_t port, const uint32_t *payload, uint32_t words)
++{
++    return venus_hfi_send_payload(VENUS_HFI_SESSION_ID,
++        VENUS_HFI_CMD_SUBSCRIBE,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP, port,
++        VENUS_HFI_PAYLOAD_U32_ARRAY, payload, words * sizeof(uint32_t));
++}
++
++static int
++venus_hfi_subscribe_input(void)
++{
++    uint32_t input[9];
++    uint32_t prop[2];
++
++    input[0] = VENUS_HFI_MODE_PORT_CHANGE;
++    input[1] = VENUS_HFI_PROP_BITSTREAM_RES;
++    input[2] = VENUS_HFI_PROP_CROP_OFFSETS;
++    input[3] = VENUS_HFI_PROP_BIT_DEPTH;
++    input[4] = VENUS_HFI_PROP_MIN_OUTPUT;
++    input[5] = VENUS_HFI_PROP_PROFILE;
++    input[6] = VENUS_HFI_PROP_LEVEL;
++    input[7] = VENUS_HFI_PROP_TIER;
++    input[8] = VENUS_HFI_PROP_SIGNAL_COLOR;
++    prop[0] = VENUS_HFI_MODE_PROPERTY;
++    prop[1] = VENUS_HFI_PROP_NO_OUTPUT;
++    return venus_hfi_subscribe(VENUS_HFI_PORT_BITSTREAM, input, 9) ||
++        venus_hfi_subscribe(VENUS_HFI_PORT_BITSTREAM, prop, 2);
++}
++
++static int
++venus_hfi_subscribe_output(void)
++{
++    uint32_t output[4];
++
++    output[0] = VENUS_HFI_MODE_PORT_CHANGE;
++    output[1] = VENUS_HFI_PROP_OPB_ENABLE;
++    output[2] = VENUS_HFI_PROP_COLOR_FORMAT;
++    output[3] = VENUS_HFI_PROP_LINEAR_STRIDE;
++    return venus_hfi_subscribe(VENUS_HFI_PORT_RAW, output, 4);
++}
++
++static uint32_t
++venus_bs_frame_off(const uint8_t *p, uint32_t len)
++{
++    uint32_t i = 0;
++
++    while (i + 4u < len) {
++        uint32_t sc = 0;
++
++        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) {
++            sc = 3;
++        } else if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 0 &&
++            p[i + 3] == 1) {
++            sc = 4;
++        }
++        if (sc != 0) {
++            if (((p[i + sc] >> 1) & 0x3fu) <= 31u) {
++                return i;
++            }
++            i += sc;
++        } else {
++            i++;
++        }
++    }
++    return len;
++}
++
++static int venus_bs_load(void);
++
++static int
++venus_bs_load2(void)
++{
++    uint8_t *va = (uint8_t *)venus_bs_va + VENUS_BS_SIZE;
++    int got = venus_bs_load();
++
++    if (got > 0 && (uint32_t)got <= VENUS_BS_SIZE) {
++        memcpy(va, (const void *)venus_bs_va, (size_t)got);
++        flush_dcache64((addr64_t)va, ((uint32_t)got + 4095u) & ~4095u,
++            FALSE);
++    }
++    return got;
++}
++
++static int
++venus_bs_load(void)
++{
++    int got = mondrian_root_read("/private/var/vm/venus.hevc",
++        (void *)venus_bs_va, VENUS_BS_SIZE, 0);
++
++    if (got <= 0) {
++        venus_log("bitstream read %d; submitting an empty buffer", got);
++        return 0;
++    }
++    flush_dcache64((addr64_t)venus_bs_va,
++        ((uint32_t)got + 4095u) & ~4095u, FALSE);
++    venus_log("bitstream %d bytes loaded", got);
++    return got;
++}
++
++static int
++venus_hfi_data_path(void)
++{
++    uint32_t res = (VENUS_PIC_W << 16) | VENUS_PIC_H;
++    uint32_t zero[2] = { 0, 0 };
++    uint32_t stride[2] = { res, (VENUS_PIC_W << 16) | (VENUS_PIC_H / 2) };
++    uint32_t flags = 0, i, bytes, csd;
++    int rc;
++
++    venus_log("V19 props: %ux%u, %u DPB + %u raw",
++        VENUS_PIC_W, VENUS_PIC_H, VENUS_DPB_COUNT, VENUS_RAW_COUNT);
++    if (venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_BITSTREAM_RES, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, res) ||
++        venus_hfi_send_payload(VENUS_HFI_SESSION_ID,
++            VENUS_HFI_PROP_CROP_OFFSETS, 0, VENUS_HFI_PORT_BITSTREAM,
++            VENUS_HFI_PAYLOAD_64_PACKED, zero, sizeof(zero)) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_BIT_DEPTH, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 8) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_MIN_OUTPUT, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32,
++            VENUS_DPB_COUNT) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_PROFILE, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM,
++            VENUS_HFI_PROFILE_HEVC_MAIN) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_LEVEL, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM,
++            VENUS_HFI_LEVEL_HEVC_6_1) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_TIER, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM,
++            VENUS_HFI_TIER_HEVC_MAIN) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_STAGE, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 1) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_SIGNAL_COLOR, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_32_PACKED, 0) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_PERSIST, 0, VENUS_PERSIST_PA,
++            VENUS_PERSIST_SIZE, VENUS_HFI_PORT_NONE) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_COMV_COUNT, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32,
++            VENUS_DPB_COUNT) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_BIN, 0, VENUS_BIN_PA,
++            VENUS_BIN_SIZE, VENUS_HFI_PORT_BITSTREAM) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_COMV, 0, VENUS_COMV_PA,
++            VENUS_COMV_SIZE, VENUS_HFI_PORT_BITSTREAM) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_NON_COMV, 0, VENUS_NONCOMV_PA,
++            VENUS_NONCOMV_SIZE, VENUS_HFI_PORT_BITSTREAM) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_LINE, 0, VENUS_LINE_PA,
++            VENUS_LINE_SIZE, VENUS_HFI_PORT_BITSTREAM) ||
++        venus_hfi_buffer(VENUS_HFI_BUFFER_PARTIAL, 0, VENUS_PARTIAL_PA,
++            VENUS_PARTIAL_SIZE, VENUS_HFI_PORT_BITSTREAM)) {
++        venus_log("V19 input properties/buffers not queued");
++        return -1;
++    }
++
++    if (venus_hfi_subscribe_input()) {
++        venus_log("V19 input subscriptions not queued");
++        return -1;
++    }
++    rc = venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_START,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP, VENUS_HFI_PORT_BITSTREAM,
++        VENUS_HFI_PAYLOAD_NONE, 0);
++    flags = 0;
++    rc = venus_hfi_wait_session(VENUS_HFI_CMD_START,
++        VENUS_HFI_PORT_BITSTREAM, 2000, &flags);
++    venus_log("V19 START bitstream rc=%d flags=0x%x", rc, flags);
++    if (rc != 1 || (flags & VENUS_HFI_FW_SUCCESS) == 0) {
++        return -1;
++    }
++
++    bytes = (uint32_t)venus_bs_load2();
++    csd = bytes ? venus_bs_frame_off((const uint8_t *)venus_bs_va, bytes) : 0;
++    if (venus_hfi_buffer_data(VENUS_HFI_BUFFER_BITSTREAM, 0, VENUS_BS_PA,
++            VENUS_BS_SIZE, bytes, VENUS_HFI_BUF_NONSECURE,
++            VENUS_HFI_PORT_BITSTREAM)) {
++        venus_log("V19 sequence not queued");
++        return -1;
++    }
++    venus_log("V19 sequence queued data=%u frame=%u", bytes, bytes - csd);
++    rc = venus_hfi_first_ipsc(3000);
++    venus_log("V19 first input port change rc=%d", rc);
++    if (rc != 1) {
++        return -1;
++    }
++    if (venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_BITSTREAM_RES, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 0x00800080u) ||
++        venus_hfi_send_payload(VENUS_HFI_SESSION_ID,
++            VENUS_HFI_PROP_CROP_OFFSETS, 0, VENUS_HFI_PORT_BITSTREAM,
++            VENUS_HFI_PAYLOAD_64_PACKED, zero, sizeof(zero)) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_BIT_DEPTH, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_32_PACKED,
++            0x00080008u) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_MIN_OUTPUT, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32,
++            VENUS_DPB_COUNT) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_PROFILE, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM, 2) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_LEVEL, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM, 0) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_TIER, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32_ENUM, 0) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_SIGNAL_COLOR, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_32_PACKED,
++            0x34021202u) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_CODED_FRAMES, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 1) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_POC, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 0) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_HOST_MAX, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 64)) {
++        venus_log("V19 input properties not echoed");
++        return -1;
++    }
++    venus_log("V19 input settings echoed");
++    if (venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_RAW_RESOLUTION, 0,
++            VENUS_HFI_PORT_RAW, VENUS_HFI_PAYLOAD_32_PACKED, res) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_COLOR_FORMAT, 0,
++            VENUS_HFI_PORT_RAW, VENUS_HFI_PAYLOAD_U32_ENUM,
++            VENUS_HFI_COLOR_NV12) ||
++        venus_hfi_send_payload(VENUS_HFI_SESSION_ID,
++            VENUS_HFI_PROP_LINEAR_STRIDE, 0, VENUS_HFI_PORT_RAW,
++            VENUS_HFI_PAYLOAD_64_PACKED, stride, sizeof(stride)) ||
++        venus_hfi_subscribe_output()) {
++        venus_log("V19 output properties not queued");
++        return -1;
++    }
++    if (venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_STAGE, 0,
++            VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_U32, 1)) {
++        venus_log("V19 stage not re-sent");
++        return -1;
++    }
++    venus_log("V18 no resume; input settings applied");
++    rc = venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_START,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP, VENUS_HFI_PORT_RAW,
++        VENUS_HFI_PAYLOAD_NONE, 0);
++    flags = 0;
++    rc = venus_hfi_wait_session(VENUS_HFI_CMD_START, VENUS_HFI_PORT_RAW,
++        2000, &flags);
++    venus_log("V19 START raw rc=%d flags=0x%x", rc, flags);
++    if (rc != 1 || (flags & VENUS_HFI_FW_SUCCESS) == 0) {
++        return -1;
++    }
++    for (i = 0; i < VENUS_DPB_COUNT; i++) {
++        if (venus_hfi_buffer(VENUS_HFI_BUFFER_DPB, i,
++            VENUS_DPB_PA + (uint64_t)i * VENUS_DPB_SIZE, VENUS_DPB_SIZE,
++            VENUS_HFI_PORT_RAW)) {
++            venus_log("V19 DPB %u not queued", i);
++            return -1;
++        }
++    }
++    for (i = 0; i < VENUS_RAW_COUNT; i++) {
++        if (venus_hfi_buffer_data(VENUS_HFI_BUFFER_RAW, i,
++            VENUS_RAW_PA + (uint64_t)i * VENUS_RAW_SIZE, VENUS_RAW_SIZE,
++            VENUS_RAW_SIZE, VENUS_HFI_BUF_NONSECURE,
++            VENUS_HFI_PORT_RAW)) {
++            venus_log("V19 raw %u not queued", i);
++            return -1;
++        }
++    }
++    venus_log("V19 capture buffers queued");
++    if (venus_hfi_buffer_data(VENUS_HFI_BUFFER_BITSTREAM, 1,
++            VENUS_BS_PA + VENUS_BS_SIZE, VENUS_BS_SIZE, bytes,
++            VENUS_HFI_BUF_NONSECURE, VENUS_HFI_PORT_BITSTREAM)) {
++        venus_log("V19 frame not queued");
++        return -1;
++    }
++    venus_log("V19 frame queued data=%u from the second region", bytes);
++    if (venus_hfi_decode_wait(6000) == VENUS_HFI_DRAIN_ERROR) {
++        venus_log("V19 firmware rejected the decode buffers");
++        return -1;
++    }
++    return 0;
 +}
 +
 +/*
@@ -2194,9 +2921,9 @@ index 0000000..74353f6
 +    int rc;
 +
 +    if (venus_hfi_send(0, VENUS_HFI_CMD_OPEN,
-+        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP, 0,
 +        VENUS_HFI_PAYLOAD_U32, VENUS_HFI_SESSION_ID) ||
-+        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_CODEC, 0,
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_CODEC, 0, 0,
 +        VENUS_HFI_PAYLOAD_U32_ENUM, VENUS_HFI_CODEC_HEVC)) {
 +        return -1;
 +    }
@@ -2207,11 +2934,24 @@ index 0000000..74353f6
 +    }
 +    venus_log("HFI SESSION OPEN session=%u codec=HEVC decode",
 +        VENUS_HFI_SESSION_ID);
++    rc = venus_hfi_data_path();
++    if (rc) {
++        venus_log("HFI data path failed");
++    } else {
++        venus_log("V19 PASS INPUT START");
++    }
++    (void)venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_STOP,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP | VENUS_HFI_HOST_NONDISC,
++        VENUS_HFI_PORT_BITSTREAM, VENUS_HFI_PAYLOAD_NONE, 0);
++    (void)venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_STOP,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP | VENUS_HFI_HOST_NONDISC,
++        VENUS_HFI_PORT_RAW, VENUS_HFI_PAYLOAD_NONE, 0);
++    (void)venus_hfi_drain_log(1000);
 +    (void)venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_CLOSE,
 +        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP | VENUS_HFI_HOST_NONDISC,
-+        VENUS_HFI_PAYLOAD_NONE, 0);
++        0, VENUS_HFI_PAYLOAD_NONE, 0);
 +    (void)venus_hfi_drain(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_CLOSE, 1000);
-+    return 0;
++    return rc;
 +}
 +
 +#define VENUS_FW_PATH "/private/var/vm/vpu20_4v.mbn"
@@ -2269,15 +3009,61 @@ index 0000000..74353f6
 +        VENUS_QUEUE_UC_SIZE, VM_WIMG_WCOMB);
 +    venus_aux_va = ml_io_map_unmappable(VENUS_AUX_PA, VENUS_AUX_SIZE,
 +        VM_WIMG_WCOMB);
-+    venus_log("step: low fw=0x%lx queue=0x%lx aux=0x%lx",
-+        (unsigned long)venus_fw_va, (unsigned long)venus_queue_va,
-+        (unsigned long)venus_aux_va);
++    venus_bs_va = ml_io_map_unmappable(VENUS_BS_PA, VENUS_BS_MAP,
++        VM_WIMG_WCOMB);
++    venus_dpb_va = ml_io_map_unmappable(VENUS_DPB_PA, VENUS_DPB_MAP,
++        VM_WIMG_WCOMB);
++    venus_raw_va = ml_io_map_unmappable(VENUS_RAW_PA, VENUS_RAW_MAP,
++        VM_WIMG_WCOMB);
++    venus_bin_va = ml_io_map_unmappable(VENUS_BIN_PA, VENUS_BIN_MAP,
++        VM_WIMG_WCOMB);
++    venus_comv_va = ml_io_map_unmappable(VENUS_COMV_PA, VENUS_COMV_MAP,
++        VM_WIMG_WCOMB);
++    venus_noncomv_va = ml_io_map_unmappable(VENUS_NONCOMV_PA,
++        VENUS_NONCOMV_MAP, VM_WIMG_WCOMB);
++    venus_line_va = ml_io_map_unmappable(VENUS_LINE_PA, VENUS_LINE_MAP,
++        VM_WIMG_WCOMB);
++    venus_partial_va = ml_io_map_unmappable(VENUS_PARTIAL_PA, VENUS_PARTIAL_MAP,
++        VM_WIMG_WCOMB);
++    venus_persist_va = ml_io_map_unmappable(VENUS_PERSIST_PA, VENUS_PERSIST_MAP,
++        VM_WIMG_WCOMB);
++    venus_log("step: low fw=0x%lx queue=0x%lx aux=0x%lx bs=0x%lx dpb=0x%lx "
++        "raw=0x%lx", (unsigned long)venus_fw_va,
++        (unsigned long)venus_queue_va, (unsigned long)venus_aux_va,
++        (unsigned long)venus_bs_va, (unsigned long)venus_dpb_va,
++        (unsigned long)venus_raw_va);
++    venus_log("step: codec bin=0x%lx comv=0x%lx noncomv=0x%lx line=0x%lx "
++        "partial=0x%lx persist=0x%lx", (unsigned long)venus_bin_va,
++        (unsigned long)venus_comv_va, (unsigned long)venus_noncomv_va,
++        (unsigned long)venus_line_va, (unsigned long)venus_partial_va,
++        (unsigned long)venus_persist_va);
 +    mondrian_log_flush_now();
 +    if (venus_core == 0 || venus_videocc == 0 || venus_fw_va == 0 ||
-+        venus_queue_va == 0 || venus_aux_va == 0) {
++        venus_queue_va == 0 || venus_aux_va == 0 || venus_bs_va == 0 ||
++        venus_dpb_va == 0 || venus_raw_va == 0 || venus_bin_va == 0 ||
++        venus_comv_va == 0 || venus_noncomv_va == 0 || venus_line_va == 0 ||
++        venus_partial_va == 0 || venus_persist_va == 0) {
 +        venus_log("cannot map core/videoCC/low-memory windows");
 +        return -1;
 +    }
++    venus_mem_zero(venus_bs_va, VENUS_BS_MAP);
++    venus_mem_zero(venus_dpb_va, VENUS_DPB_MAP);
++    venus_mem_zero(venus_raw_va, VENUS_RAW_MAP);
++    venus_mem_zero(venus_bin_va, VENUS_BIN_MAP);
++    venus_mem_zero(venus_comv_va, VENUS_COMV_MAP);
++    venus_mem_zero(venus_noncomv_va, VENUS_NONCOMV_MAP);
++    venus_mem_zero(venus_line_va, VENUS_LINE_MAP);
++    venus_mem_zero(venus_partial_va, VENUS_PARTIAL_MAP);
++    venus_mem_zero(venus_persist_va, VENUS_PERSIST_MAP);
++    flush_dcache64((addr64_t)venus_bs_va, VENUS_BS_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_dpb_va, VENUS_DPB_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_raw_va, VENUS_RAW_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_bin_va, VENUS_BIN_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_comv_va, VENUS_COMV_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_noncomv_va, VENUS_NONCOMV_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_line_va, VENUS_LINE_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_partial_va, VENUS_PARTIAL_MAP, FALSE);
++    flush_dcache64((addr64_t)venus_persist_va, VENUS_PERSIST_MAP, FALSE);
 +    venus_log("step: low-memory canary");
 +    mondrian_log_flush_now();
 +    if (venus_mem_canary()) {
@@ -2355,7 +3141,7 @@ index 0000000..74353f6
 +    if (venus_hfi_session_probe()) {
 +        goto out;
 +    }
-+    venus_log("V2 PASS SESSION; no buffers, encode, VT or IRQ");
++    venus_log("V19 PASS DATA PATH; full batch waits");
 +    rc = 0;
 +
 +out:
