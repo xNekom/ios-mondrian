@@ -48,10 +48,10 @@ index b432224..1f8930e 100644
  		mondrian_spmi_probe();
 diff --git a/bsd/dev/mondrian_venus.c b/bsd/dev/mondrian_venus.c
 new file mode 100644
-index 0000000..c414801
+index 0000000..74353f6
 --- /dev/null
 +++ b/bsd/dev/mondrian_venus.c
-@@ -0,0 +1,2265 @@
+@@ -0,0 +1,2388 @@
 +/* SPDX-License-Identifier: APSL-2.0 */
 +/*
 + * MONDRIAN VENUS V1: PAS 9 load and polled HFI system-property proof.
@@ -245,7 +245,17 @@ index 0000000..c414801
 +#define VENUS_HFI_FW_SYSERR     (1u << 3)
 +#define VENUS_HFI_PAYLOAD_NONE  0u
 +#define VENUS_HFI_PAYLOAD_U32   1u
++#define VENUS_HFI_PAYLOAD_U32_ENUM 9u
 +#define VENUS_HFI_VERSION_BYTES 127u
++
++/* iris2 session commands. OPEN carries the new session id in its payload and
++ * leaves the header session zero; the codec is a session property after it. */
++#define VENUS_HFI_CMD_OPEN      0x01000003u
++#define VENUS_HFI_CMD_CLOSE     0x01000004u
++#define VENUS_HFI_PROP_CODEC    0x03000100u
++#define VENUS_HFI_CODEC_HEVC    3u             /* decoder */
++#define VENUS_HFI_SESSION_ID    1u
++#define VENUS_HFI_MSG_SESSION_INIT 0x00020006u
 +
 +/* PIL SCM command numbers; Linux qcom_scm.c and the MIT donor agree. */
 +#define VENUS_SCM_PIL_BASE      0x42000200u
@@ -2095,6 +2105,115 @@ index 0000000..c414801
 +    return 0;
 +}
 +
++static int
++venus_hfi_send(uint32_t session, uint32_t type, uint32_t flags,
++    uint32_t payload_info, uint32_t payload)
++{
++    uint32_t packet[17];
++    uint32_t words = payload_info == VENUS_HFI_PAYLOAD_NONE ? 16u : 17u;
++
++    bzero(packet, sizeof(packet));
++    packet[0] = words * 4u;
++    packet[1] = session;
++    packet[2] = venus_header_id++;
++    packet[7] = 1;
++    packet[8] = words * 4u - VENUS_HFI_HEADER_WORDS * 4u;
++    packet[9] = type;
++    packet[10] = flags;
++    packet[11] = payload_info;
++    packet[13] = venus_packet_id++;
++    if (payload_info != VENUS_HFI_PAYLOAD_NONE) {
++        packet[16] = payload;
++    }
++    return venus_queue_write(packet, words);
++}
++
++/*
++ * Drain the message queue for up to `ms` and log every packet. The vendor
++ * OPEN confirmation is not in mainline's tables, so the first probe records
++ * whatever the firmware actually sends instead of guessing a type.
++ */
++static int
++venus_hfi_drain(uint32_t session, uint32_t type, unsigned ms)
++{
++    unsigned attempt;
++
++    for (attempt = 0; attempt < ms; attempt++) {
++        uint32_t count = 0, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return -1;
++        }
++        if (rc == 0) {
++            delay(1000);
++            continue;
++        }
++        packets = venus_response[7];
++        if (packets == 0 || count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        venus_log("HFI resp session=%u packets=%u bytes=%u",
++            venus_response[1], packets, count * 4u);
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++            uint32_t ptype, pflags, info, port, pid, payload0 = 0;
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                venus_log("HFI resp bad size %u", size);
++                return -1;
++            }
++            ptype = venus_response[i + 1];
++            pflags = venus_response[i + 2];
++            info = venus_response[i + 3];
++            port = venus_response[i + 4];
++            pid = venus_response[i + 5];
++            if (size > VENUS_HFI_PACKET_WORDS * 4u) {
++                payload0 = venus_response[i + VENUS_HFI_PACKET_WORDS];
++            }
++            venus_log("HFI pkt type=0x%x flags=0x%x info=%u port=%u id=%u "
++                "payload0=0x%x", ptype, pflags, info, port, pid, payload0);
++            if ((pflags & (VENUS_HFI_FW_SESSERR | VENUS_HFI_FW_SYSERR)) != 0) {
++                return -1;
++            }
++            if (venus_response[1] == session &&
++                (ptype == type || ptype == VENUS_HFI_MSG_SESSION_INIT)) {
++                return 1;
++            }
++            i += size / 4u;
++        }
++    }
++    return 0;
++}
++
++static int
++venus_hfi_session_probe(void)
++{
++    int rc;
++
++    if (venus_hfi_send(0, VENUS_HFI_CMD_OPEN,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP,
++        VENUS_HFI_PAYLOAD_U32, VENUS_HFI_SESSION_ID) ||
++        venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_PROP_CODEC, 0,
++        VENUS_HFI_PAYLOAD_U32_ENUM, VENUS_HFI_CODEC_HEVC)) {
++        return -1;
++    }
++    rc = venus_hfi_drain(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_OPEN, 2000);
++    if (rc != 1) {
++        venus_log("HFI OPEN response %s", rc == 0 ? "timed out" : "failed");
++        return -1;
++    }
++    venus_log("HFI SESSION OPEN session=%u codec=HEVC decode",
++        VENUS_HFI_SESSION_ID);
++    (void)venus_hfi_send(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_CLOSE,
++        VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP | VENUS_HFI_HOST_NONDISC,
++        VENUS_HFI_PAYLOAD_NONE, 0);
++    (void)venus_hfi_drain(VENUS_HFI_SESSION_ID, VENUS_HFI_CMD_CLOSE, 1000);
++    return 0;
++}
++
 +#define VENUS_FW_PATH "/private/var/vm/vpu20_4v.mbn"
 +#define VENUS_FW_FILE_SIZE 2023560u
 +
@@ -2232,7 +2351,11 @@ index 0000000..c414801
 +        venus_hfi_image_version()) {
 +        goto out;
 +    }
-+    venus_log("V1 PASS SYS_PROP; no session, encode, VT or IRQ");
++    venus_log("V1 PASS SYS_PROP");
++    if (venus_hfi_session_probe()) {
++        goto out;
++    }
++    venus_log("V2 PASS SESSION; no buffers, encode, VT or IRQ");
 +    rc = 0;
 +
 +out:
