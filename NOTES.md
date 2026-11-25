@@ -69,9 +69,9 @@ Current blockers, in order:
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics: drive configured, motion unconfirmed.** `hapb 0` then `hapb 1`
-   lifts `hbst-vreg` to `0x80`/`status4 0x01`; the play clears the fault, disables
-   auto-resonance and sets `0x498`; SDAM `0x46` holds `0x046E`, a measured count.
+3. **Haptics: direct play is silent.** `hapb 0` then `hapb 1` lifts the boost
+   (`0x80`/`0x01`), fault is 0 and `0x498` is programmed, but two 2 s tones at
+   `0xff` moved nothing (felt). Next: the stock PTN click pattern.
 4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
    drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
 5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm

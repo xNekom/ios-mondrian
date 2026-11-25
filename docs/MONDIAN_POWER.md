@@ -343,8 +343,9 @@ latch and disables auto-resonance, as the stock's `DIRECT_PLAY` path does.
 `impedance 0x00` is a closed-loop measurement and proves nothing in open loop,
 and `status 0x04` is the multiplexed `STATUS_DATA_MSB`, not a fault: fault
 reads 0. SDAM `0x46/0x47` returns `0x04/0x6E`, a measured count distinct from
-the open-loop `0x498`, so the block does see the LRA. Motion still needs a
-physical check; the next drive test is the stock PTN click pattern.
+the open-loop `0x498`, so the block does see the LRA. Measured: two 2 s tones
+at `0xff` produced no motion (felt), so direct play is silent on this LRA; the
+next drive test is the stock PTN click pattern.
 **2700 mV is unsafe in
 this sequence:** the following readback returned corrupted CFG/TLRA/HBST values,
 `vbat 825 mV out of range` appeared, and SpringBoard stopped presenting
