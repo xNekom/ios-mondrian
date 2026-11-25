@@ -221,6 +221,13 @@ the framebuffer: no ring, no userland left to undo it. `mondriannojnl=1` mounts
 ignoring it; the disable sysctl panics (`journal_close(NULL)` has no NULL check),
 and `backup/ios-root-repaired.simg` repairs a volume that will not mount.
 
+**DataMigration deletes its own gate before it runs.** It removes
+`LastSystemVersion` from `/private/var/mobile/Library/Preferences/com.apple.migration.plist`
+and restores it only on success. Forcing `20H391` leaves `migrationpluginwrapper`
+hung, so every boot repeats migration and stays on the Apple-logo progress bar.
+Parse the key: a grep for `20H392` also matches `DMUserDataDisposition.buildVersion`.
+Restore the key or reflash `backup/ios-root-repaired.simg`.
+
 **A record whose size outruns its blocks is what marks the volume.** `ExtendFileC`
 reserves blocks without touching the disk (`kEFDeferMask`) and grows the size with
 them; giving the reservation back for a real allocation that then fails leaves the
@@ -228,25 +235,20 @@ size without the blocks, and the record goes to disk because
 `hfs_prepare_fork_for_update` only checked invalid ranges (`0365` trims it). Every
 lookup then fails `EINVAL`; `0364` presents only the bytes the blocks can back.
 
-**The ABL does not hand the ramdisk over.** It gunzips it, and the bytes at
-`/chosen/linux,initrd-start` are not the payload: that travels **appended to the
-shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked by `shim/lz4.c`).
-Never write the blob over `shim/out/payload.bin`, the raw payload (a header
-promising 0 bytes, so `LOADER cannot unpack the payload`); the checker is
-`tools/check-shim-blob.py IMAGE`.
+**The ABL does not hand the ramdisk over.** It gunzips it; the payload travels
+**appended to the shim image** as an LZ4 blob (`shim/out/payload.lz4p`, unpacked
+by `shim/lz4.c`). Never overwrite raw `shim/out/payload.bin` with it (the header
+then promises 0 bytes); check with `tools/check-shim-blob.py IMAGE`.
 
 **The shim is not a no-op, and it can hide kernel bugs.** The full shim runs
-`test_gic()` before the jump: it arms `CNTV_TVAL`, storms until it gives up and
-leaves the UFS warm. With `SMALL_SHIM=1` the kernel arms the timer itself
-(`0173`) and wakes the UFS, and `test_ufs()` faults on a fastboot boot, so that
-build also needs `SHIM_NO_UFS`. IRQ lines and no `MONDRIAN EARLY` means the
-shim, not the kernel.
+`test_gic()` before the jump and leaves UFS warm. With `SMALL_SHIM=1` the kernel
+arms the timer (`0173`) and wakes UFS; `test_ufs()` faults on fastboot boot, so
+that build also needs `SHIM_NO_UFS`. IRQ lines without `MONDRIAN EARLY` mean
+shim, not kernel.
 
 **fastboot serves 768 MiB per download and cannot split a raw image.** A bigger
 raw file is resparsed and fails to read back; flash sparse (`tools/mk-simg.py`).
-
-**Kernel timeouts stop after userland starts.** Threads paced by
-`tsleep(timeout)` wake once and never again; pace from work (`0100`) or `delay()`.
+**Kernel timeouts stop after userland starts.** `tsleep(timeout)` wakes once; pace from work (`0100`) or `delay()`.
 
 **The console paints the kernel log and scrolls.** `0210` clears the panel once
 and scrolls half a screen at the last text row, `0213` paints from the log thread,
@@ -254,11 +256,9 @@ and `0005`'s fbcon puts text over the ABL logo. `0351` gives the panel to the
 compositor at its first swap and `0352` sends a survived kernel abort to the ring;
 `mondrianfb_noconsole=1` takes the screen at probe, `=0` is the only log with USB dead.
 
-**dyld ignores `DYLD_INSERT_LIBRARIES` unless the MAC policy named exactly
-`AMFI` answers `__mac_syscall` 0x5a.** Any other name returns `ENOPOLICY`;
-dyld then drops the variable silently (no error, no crash, the process stays
-healthy) and the library never loads. `0108` registers `AMFI` and allows
-everything for 0x5a and 0x60.
+**dyld ignores `DYLD_INSERT_LIBRARIES` unless MAC policy `AMFI` answers
+`__mac_syscall` 0x5a.** Another name returns `ENOPOLICY`; dyld drops the variable
+silently and the library never loads. `0108` registers `AMFI` for 0x5a/0x60.
 
 ## UFS bring-up, the sequence that works
 

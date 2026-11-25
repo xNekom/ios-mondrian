@@ -694,9 +694,17 @@ boot each, so the three columns differ only in what changed:
   Reminders, Podcasts, TV, Files, Maps, Mail, Weather, Music, Calendar, Wallet,
   Shortcuts and 20 more sit **complete, executable included**, in
   `/private/var/staged_system_apps`, with their icons in
-  `/System/Library/AppPlaceholders`. `installd`'s own log from the image build
-  (2026-10-27) records `System App Migration is complete` without adding them,
-  and `MISystemAppMigrator` does not run again. Hard-linking the 32 bundles into
+  `/System/Library/AppPlaceholders`. `installd`'s image-build log (2026-10-27)
+  records `System App Migration is complete` without adding them, and
+  `LastSystemVersion` in
+  `/private/var/mobile/Library/Preferences/com.apple.migration.plist` equals
+  the root build, so DataMigration does not run again. Forcing that key to
+  `20H391` starts DataMigration, but `migrationpluginwrapper` hangs on this
+  port and removes `LastSystemVersion`; every boot then repeats the migration
+  and stays on the Apple-logo progress bar. Restore the key to `20H392` (or
+  reflash the root) to recover. A grep for `20H392` is not a completion check:
+  `DMUserDataDisposition.buildVersion` keeps that string while
+  `LastSystemVersion` is missing. Hard-linking the 32 bundles into
   `/Applications` (3 840 files; the staged copies stay) is not an install: the
   App Library showed four categories in the boot that followed, but SpringBoard
   rewrote `IconState.plist` without the added bundle ids and the page kept its
