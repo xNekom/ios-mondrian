@@ -1,0 +1,92 @@
+xnu 0421: give the LRA its open-loop period before a haptics play
+
+The PBS boost comes up and the play chain clears the fault latch, but the LRA
+still reports impedance 0 and does not move. The block's open-loop period,
+CFG 0x5c (high nibble) and 0x5d (low byte), has never been written and the two
+defines are swapped, so the drive has no oscillation to follow. Program the
+live DT's 5882 us period with the vendor's RC-clock factor when the pair reads
+zero, as the donor's negroni_haptic.c does. Force VREG-ready only while the
+boost is up: bit 1 of VSET belongs to HAP525_HV, which this part is not, and
+clearing VSET at stop re-votes the boost rail.
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index dc572a4..b622a6c 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -54,8 +54,9 @@ extern void delay(int us);
+ #define HAP_CFG_VMAX		0x48
+ #define HAP_CFG_SINE		0x49
+ #define HAP_CFG_PLAY		0x4c
+-#define HAP_CFG_TLRA_LO		0x5c
+-#define HAP_CFG_TLRA_HI		0x5d
++#define HAP_CFG_TLRA_HI		0x5c
++#define HAP_CFG_TLRA_LO		0x5d
++#define HAP_CFG_CAL_EN		0x72
+ #define HAP_CFG_AUTORES		0x63
+ #define HAP_CFG_FAULT_CLR	0x66
+ #define HAP_CFG_VSET_CFG	0x68
+@@ -75,6 +76,8 @@ extern void delay(int us);
+ #define HAP_FORCE_VSET_ACK	0x02	/* HAP525_HV only */
+ #define HAP_VMAX_MV		1250	/* conservative first-drive default */
+ #define HAP_VMAX_STEP_MV	50
++#define HAP_LRA_PERIOD_US	5882	/* the live DT's qcom,lra-period-us */
++#define HAP_TLRA_STEP_US	5
+ 
+ static unsigned int hap_vmax_mv = HAP_VMAX_MV;
+ 
+@@ -205,7 +208,9 @@ int
+ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ {
+ 	uint8_t vmax = hap_vmax_mv / HAP_VMAX_STEP_MV;
+-	uint8_t z = 0, st = 0, hpwr = 0, vset = 0, autores = 0, sine = 0;
++	uint8_t z = 0, st = 0, hpwr = 0, autores = 0, sine = 0;
++	uint8_t th = 0, tl = 0, cal = 0, vreg = 0;
++	uint32_t t;
+ 	int ok = 1;
+ 
+ 	if (ms == 0) {
+@@ -217,15 +222,24 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	if (amp == 0 || amp > 0xffu) {
+ 		amp = 0x40;
+ 	}
++	if (hap_r(0, HAP_CFG_TLRA_HI, &th) && hap_r(0, HAP_CFG_TLRA_LO, &tl) &&
++	    (((th & 0x0fu) << 8) | tl) == 0) {
++		uint32_t us = HAP_LRA_PERIOD_US;
++
++		if (hap_r(0, HAP_CFG_CAL_EN, &cal) && ((cal >> 2) & 3u) == 1u) {
++			us = us * 1024u / 1000u;
++		}
++		t = us / HAP_TLRA_STEP_US;
++		ok &= hap_w(0, HAP_CFG_TLRA_HI, (uint8_t)((t >> 8) & 0x0fu));
++		ok &= hap_w(0, HAP_CFG_TLRA_LO, (uint8_t)(t & 0xffu));
++		printf("MONDRIAN HAP: T_LRA_OL set 0x%x (%u us)\n", t,
++		    HAP_LRA_PERIOD_US);
++	}
+ 	ok &= hap_w(0, HAP_CFG_VMAX, vmax);
+ 	ok &= hap_w(0, HAP_CFG_EN_CTL, HAP_EN_BIT);
+-	if ((force & 0x1) != 0) {
+-		ok &= hap_w(0, HAP_CFG_VSET_CFG,
+-		    HAP_FORCE_VREG_RDY | HAP_FORCE_VSET_ACK);
+-	} else if (hap_r(0, HAP_CFG_VSET_CFG, &vset)) {
+-		ok &= hap_w(0, HAP_CFG_VSET_CFG,
+-		    vset & ~HAP_FORCE_VREG_RDY);
+-	}
++	(void)hap_r(2, HAP_HBST_VREG, &vreg);
++	ok &= hap_w(0, HAP_CFG_VSET_CFG,
++	    (vreg & HAP_EN_BIT) != 0 ? HAP_FORCE_VREG_RDY : 0);
+ 	if (hap_r(0, HAP_CFG_SINE, &sine)) {
+ 		ok &= hap_w(0, HAP_CFG_SINE, (sine & ~0x3u) | HAP_SINE);
+ 	}
+@@ -250,10 +264,7 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 		delay((ms - 20) * 1000);
+ 	}
+ 	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT);
+-	/* Leave EN_CTL alone: clearing it re-votes the boost. */
+-	if ((force & 0x1) != 0) {
+-		(void)hap_w(0, HAP_CFG_VSET_CFG, 0);
+-	}
++	/* Leave EN_CTL and VSET alone: clearing either re-votes the boost. */
+ 	if (hap_r(0, HAP_CFG_STATUS_MSB, &st) &&
+ 	    hap_r(0, HAP_CFG_HPWR_INTF, &hpwr)) {
+ 		printf("MONDRIAN HAP: stopped: status 0x%02x hpwr 0x%02x\n",
