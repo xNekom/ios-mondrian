@@ -1,0 +1,2319 @@
+xnu 0420: bring Venus through PAS 9 to HFI SYS_PROP (mondrianvenus=1)
+
+The opt-in worker votes MMCX/MXC, enables the VideoCC/GCC domains and
+LUCID_OLE PLL, maps the fixed firmware/queue regions, programs the two
+Venus SMMU streams, loads the provenance-verified vpu20_4v.mbn through
+PAS 9 and polls the IRIS2 HFI queues for INIT and IMAGE_VERSION. It
+shuts PAS down and faults/disables the SMMU context after the proof.
+
+The firmware is read from /private/var/vm/vpu20_4v.mbn and is not embedded
+or committed. Stock vendor_a extraction SHA-256:
+532c97f749e83906932fae6c348fe9d55ca5dd47f5b74e245c597b1fda504c9d.
+
+Architecture follows DenialOfGravity/ios-redfin (MIT); SM8475 register and
+HFI facts come from the live DT, mainline and the pinned Qualcomm vendor
+driver (GPL-2.0, facts only). No GPL or vendor source is copied.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f301089..9b81a3f 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@ bsd/dev/mondrian_cpufreq.c		standard
+ bsd/dev/mondrian_spmi.c		standard
+ bsd/dev/mondrian_gpu.c			standard
+ bsd/dev/mondrian_scm.c		standard
++bsd/dev/mondrian_venus.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index b432224..1f8930e 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2209,6 +2209,7 @@ mondrian_log_start(void)
+ 		extern void mondrian_touch_probe(void);
+ 		extern void mondrian_usb_probe(void);
+ 		extern void mondrian_audio_probe_start(void);
++		extern void mondrian_venus_start(void);
+ 		extern void mondrian_bt_tty_init(void);
+ 		extern void mondrian_bt_ctl_init(void);
+ 		extern void mondrian_spmi_probe(void);
+@@ -2217,6 +2218,7 @@ mondrian_log_start(void)
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
+ 		mondrian_audio_probe_start();
++		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
+ 		mondrian_spmi_probe();
+diff --git a/bsd/dev/mondrian_venus.c b/bsd/dev/mondrian_venus.c
+new file mode 100644
+index 0000000..c414801
+--- /dev/null
++++ b/bsd/dev/mondrian_venus.c
+@@ -0,0 +1,2265 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * MONDRIAN VENUS V1: PAS 9 load and polled HFI system-property proof.
++ *
++ * Goal: load vpu20_4v through PAS 9, bring up IRIS2, and observe an HFI
++ * HFI_PROP_IMAGE_VERSION response. No session, encode, decode, camera,
++ * VideoToolbox registration, user client or IRQ is implemented.
++ *
++ * Architecture and safety rules:
++ *   - DenialOfGravity/ios-redfin, MIT (PIL/queue/SMMU bring-up architecture).
++ *   - akshaynexus/iOSPlus10 0255/0297, MIT (guarded MMIO concept).
++ *   - ios-mondrian patches 0417/0418, APSL-2.0 (guarded access and SMMU shape).
++ *
++ * Hardware/protocol facts only, no GPL/vendor source copied:
++ *   - dtb/mondrian-live.dtb.
++ *   - Linux v6.18 videocc-sm8450.c, gcc-sm8450.c, clk-alpha-pll.c,
++ *     arm-smmu.h, arm-smmu-qcom.c and qcom_scm.c.
++ *   - Qualcomm SM8475 vendor video driver at
++ *     HELLBOY017/kernel_nothing_sm8475@1e9dd6b500785e043314bc71bcb4255d418fd68c:
++ *       techpack/video/driver/variant/iris2/src/msm_vidc_iris2.c
++ *       techpack/video/driver/vidc/src/venus_hfi.c
++ *       techpack/video/driver/vidc/src/hfi_packet.c
++ *       techpack/video/driver/vidc/src/venus_hfi_response.c
++ *       techpack/video/driver/vidc/inc/{hfi_command.h,hfi_property.h,
++ *                                      msm_vidc_internal.h}
++ *
++ * The firmware provider reads /private/var/vm/vpu20_4v.mbn. The blob is
++ * extracted from the exact stock vendor_a image and is never committed.
++ * Wi-Fi W2 and Venus must not be enabled together until bank claiming is
++ * serialized.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdarg.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++
++#include "mondrian_mmio.h"
++#include "mondrian_scm.h"
++
++#if defined(MONDRIAN)
++
++/* DT: qcom,init-voltage-level of regulator-pm8450-s4-level and pm8350c-s2-level. */
++#define VENUS_MMCX_LEVEL 384u
++#define VENUS_MXC_LEVEL  384u
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern vm_offset_t mondrian_gcc_map(void);
++extern void mondrian_log_flush_now(void);
++extern int mondrian_root_read(const char *, void *, unsigned, off_t);
++extern kern_return_t thread_terminate(thread_t);
++extern uint32_t mondrian_cmd_db_addr(const char *);
++extern const void *mondrian_cmd_db_data(const char *, uint32_t *);
++extern int mondrian_rpmh_write_one(uint32_t, uint32_t);
++
++/* Measured in dtb/mondrian-live.dtb. */
++#define VENUS_CORE_PA          0x0aa00000UL
++#define VENUS_CORE_SIZE        0x000f0000UL
++#define VENUS_VIDEOCC_PA       0x0aaf0000UL
++#define VENUS_VIDEOCC_SIZE     0x00010000UL
++#define VENUS_SMMU_PA          0x15000000UL
++#define VENUS_SMMU_SIZE        0x00100000UL
++#define VENUS_PAS_ID           9u
++#define VENUS_DT_IRQ_SPI       174u            /* INTID 206; deliberately unused */
++#define VENUS_IOVA_POOL_BASE   0x25800000ULL
++#define VENUS_IOVA_POOL_SIZE   0x0ba800000ULL
++
++/* IRIS2 register file: SM8475 vendor msm_vidc_iris2.c. */
++#define VENUS_CS_BASE          0x000a0000u
++#define VENUS_WRAPPER_BASE     0x000b0000u
++#define VENUS_CTRL_INIT        (VENUS_CS_BASE + 0x0048u)
++#define VENUS_CTRL_STATUS      (VENUS_CS_BASE + 0x004cu)
++#define VENUS_QTBL_INFO        (VENUS_CS_BASE + 0x0050u)
++#define VENUS_QTBL_ADDR        (VENUS_CS_BASE + 0x0054u)
++#define VENUS_SFR_ADDR         (VENUS_CS_BASE + 0x005cu)
++#define VENUS_UC_REGION_ADDR   (VENUS_CS_BASE + 0x0064u)
++#define VENUS_UC_REGION_SIZE   (VENUS_CS_BASE + 0x0068u)
++#define VENUS_H2XSOFTINTEN     (VENUS_CS_BASE + 0x0148u)
++#define VENUS_CPU_IC_SOFTINT   (VENUS_CS_BASE + 0x0150u)
++#define VENUS_X2RPMH           (VENUS_CS_BASE + 0x0168u)
++#define VENUS_WRAPPER_INTR     (VENUS_WRAPPER_BASE + 0x000cu)
++#define VENUS_WRAPPER_MASK     (VENUS_WRAPPER_BASE + 0x0010u)
++#define VENUS_WRAPPER_POWER    (VENUS_WRAPPER_BASE + 0x0080u)
++#define VENUS_WRAPPER_CLOCKCFG (VENUS_WRAPPER_BASE + 0x0088u)
++#define VENUS_WRAPPER_TZ_CPU   (0x000c0000u + 0x0010u) /* WRAPPER_TZ_CPU_STATUS */
++#define VENUS_SPARE0           (VENUS_WRAPPER_BASE + 0x0078u)
++#define VENUS_A2HWD           (1u << 3)
++#define VENUS_A2H             (1u << 2)
++#define VENUS_CORE_POWER_ON   (1u << 1)
++#define VENUS_CTRL_READY      (1u << 0)
++#define VENUS_CTRL_ERROR      0x000000feu
++#define VENUS_UC_INVALID      0x00000004u
++
++/* Linux v6.18 videocc-sm8450.c / gcc-sm8450.c. */
++#define VENUS_GCC_VIDEO_BCR        0x042000u
++#define VENUS_GCC_VIDEO_AXI0       0x042018u
++#define VENUS_GCC_VIDEO_AXI0_ARES  (1u << 2)
++#define VENUS_GCC_VIDEO_AHB        0x042004u
++#define VENUS_GCC_VIDEO_XO         0x042028u
++#define VENUS_VCC_MVS0C_GDSC       0x00804cu
++#define VENUS_VCC_MVS0C_GDSC_STS   0x008050u
++#define VENUS_VCC_MVS0_GDSC        0x00809cu
++#define VENUS_VCC_MVS0_GDSC_STS    0x0080a0u
++#define VENUS_VCC_MVS0C_CLK        0x008064u
++#define VENUS_VCC_MVS0C_ARES       (1u << 2)
++#define VENUS_VCC_MVS0_CLK         0x0080b0u
++#define VENUS_VCC_AHB              0x0080e4u
++#define VENUS_VCC_XO               0x008114u
++#define VENUS_VCC_SLEEP            0x008130u
++#define VENUS_VCC_MVS0_CMD_RCGR    0x008000u
++#define VENUS_VCC_MVS0_CFG_RCGR    0x008004u
++#define VENUS_VCC_PLL0_MODE        0x000000u
++#define VENUS_VCC_PLL0_OPMODE      0x000004u
++#define VENUS_VCC_PLL0_STATUS      0x00000cu
++#define VENUS_VCC_PLL0_L           0x000010u
++#define VENUS_VCC_PLL0_ALPHA       0x000014u
++#define VENUS_VCC_PLL0_USER        0x000018u
++#define VENUS_VCC_PLL0_USER_U      0x00001cu
++#define VENUS_VCC_PLL0_CONFIG      0x000020u
++#define VENUS_VCC_PLL0_CONFIG_U    0x000024u
++#define VENUS_VCC_PLL0_CONFIG_U1   0x000028u
++#define VENUS_VCC_PLL0_TEST        0x00002cu
++#define VENUS_VCC_PLL0_TEST_U      0x000030u
++#define VENUS_VCC_PLL0_TEST_U1     0x000034u
++#define VENUS_VCC_PLL0_TEST_U2     0x000038u
++#define VENUS_PLL_OUTCTRL          (1u << 0)
++#define VENUS_PLL_BYPASSNL         (1u << 1)
++#define VENUS_PLL_RESET_N          (1u << 2)
++#define VENUS_PLL_LOCK             (1u << 31)
++#define VENUS_PLL_PCAL_NOT_DONE    (1u << 8)
++#define VENUS_PLL_RUN              0x00000001u
++#define VENUS_PLL_USER_OUTS        0x00000007u
++#define VENUS_RCG_ROOT_EN          (1u << 1)
++#define VENUS_RCG_UPDATE           (1u << 0)
++#define VENUS_RCG_ROOT_OFF         (1u << 31)
++#define VENUS_RCG_SRC_MASK         0x00000700u
++#define VENUS_RCG_HID_MASK         0x0000001fu
++#define VENUS_RCG_MODE_MASK        0x00003000u
++#define VENUS_RCG_SRC_PLL0         0x00000100u
++#define VENUS_GDSC_PWRSTS_ON       (1u << 31)
++
++/*
++ * Fixed low-memory layout. The 7 MiB firmware span leaves only 0xfe0 bytes in
++ * video_region, so metadata cannot live at the top of that carve-out.
++ */
++#define VENUS_FW_PA             0x85700000ULL
++#define VENUS_FW_SIZE           0x00700000ULL
++#define VENUS_QUEUE_PA          0xac600000ULL
++#define VENUS_QUEUE_ALLOC_SIZE  0x002fe000ULL /* vendor TOTAL_QSIZE */
++#define VENUS_QUEUE_UC_SIZE     0x00300000ULL /* vendor SHARED_QSIZE */
++#define VENUS_SFR_PA            0xac9e0000ULL /* 4 KiB, outside the UC region */
++#define VENUS_AUX_PA            0xac900000ULL
++#define VENUS_AUX_SIZE          0x00100000ULL
++#define VENUS_TABLE_OFFSET      0x00000000u
++#define VENUS_TABLE_SIZE        0x00020000u
++#define VENUS_CANARY_OFFSET     0x00020000u
++#define VENUS_META_OFFSET       0x000f0000u
++#define VENUS_META_SIZE         0x00010000u
++#define VENUS_BUFFER_PA         0xa7800000ULL
++#define VENUS_BUFFER_SIZE       0x0a000000ULL /* ends at 0xb1800000 */
++
++/* HFI queue geometry: SM8475 vendor msm_vidc_internal.h. */
++#define VENUS_QTABLE_SIZE       0x000001c8u
++#define VENUS_QHEADER_SIZE      0x00000038u
++#define VENUS_QUEUE_SIZE        0x000c8000u
++#define VENUS_QUEUE_WORDS       (VENUS_QUEUE_SIZE / 4u)
++#define VENUS_MAX_PACKET_SIZE   (1024u * 12u)
++
++/* New HFI framing used by vpu20_4v, not the IRIS1 donor framing. */
++#define VENUS_HFI_HEADER_WORDS  8u             /* 32 bytes */
++#define VENUS_HFI_PACKET_WORDS  8u             /* 32 bytes */
++#define VENUS_HFI_CMD_INIT      0x01000001u
++#define VENUS_HFI_CMD_PC_PREP   0x01000002u
++#define VENUS_HFI_PROP_IMAGE    0x03000001u
++#define VENUS_HFI_ARCH_LX       1u
++#define VENUS_HFI_HOST_INTR     (1u << 0)
++#define VENUS_HFI_HOST_RESP     (1u << 1)
++#define VENUS_HFI_HOST_NONDISC  (1u << 2)
++#define VENUS_HFI_HOST_GETPROP  (1u << 3)
++#define VENUS_HFI_FW_SUCCESS    (1u << 0)
++#define VENUS_HFI_FW_INFO       (1u << 1)
++#define VENUS_HFI_FW_SESSERR    (1u << 2)
++#define VENUS_HFI_FW_SYSERR     (1u << 3)
++#define VENUS_HFI_PAYLOAD_NONE  0u
++#define VENUS_HFI_PAYLOAD_U32   1u
++#define VENUS_HFI_VERSION_BYTES 127u
++
++/* PIL SCM command numbers; Linux qcom_scm.c and the MIT donor agree. */
++#define VENUS_SCM_PIL_BASE      0x42000200u
++#define VENUS_SCM_PIL_INIT      1u
++#define VENUS_SCM_PIL_MEM_SETUP 2u
++#define VENUS_SCM_PIL_AUTH      5u
++#define VENUS_SCM_PIL_SHUTDOWN  6u
++#define VENUS_SCM_PIL_SUPPORTED 7u
++#define VENUS_SCM_MP_VIDEO_VAR  0x42000c08u /* SIP fnid(0x0c, 0x08) */
++
++/* ARM SMMUv2 offsets, shared with patch 0418. */
++#define VENUS_SMMU_SCR0         0x000u
++#define VENUS_SMMU_IDR0         0x020u
++#define VENUS_SMMU_IDR1         0x024u
++#define VENUS_SMMU_IDR2         0x028u
++#define VENUS_SMMU_IDR7         0x03cu
++#define VENUS_SMMU_GFSR         0x048u
++#define VENUS_SMMU_SMR(n)       (0x800u + 4u * (n))
++#define VENUS_SMMU_S2CR(n)      (0xc00u + 4u * (n))
++#define VENUS_SMMU_CBAR(n)      (4u * (n))
++#define VENUS_SMMU_CBA2R(n)     (0x800u + 4u * (n))
++#define VENUS_SMMU_CB_SCTLR     0x000u
++#define VENUS_SMMU_CB_ACTLR     0x004u
++#define VENUS_SMMU_CB_TCR2      0x010u
++#define VENUS_SMMU_CB_TTBR0     0x020u
++#define VENUS_SMMU_CB_TTBR1     0x028u
++#define VENUS_SMMU_CB_TCR       0x030u
++#define VENUS_SMMU_CB_MAIR0     0x038u
++#define VENUS_SMMU_CB_MAIR1     0x03cu
++#define VENUS_SMMU_CB_FSR       0x058u
++#define VENUS_SMMU_CB_FAR       0x060u
++#define VENUS_SMMU_CB_FSYNR0    0x068u
++#define VENUS_SMMU_CB_TLBIASID  0x610u
++#define VENUS_SMMU_CB_TLBSYNC   0x7f0u
++#define VENUS_SMMU_CB_TLBSTATUS 0x7f4u
++#define VENUS_SMMU_FSR_FAULT   0xc00001feu
++#define VENUS_SMMU_CBAR_VALUE  0x0001f300u
++#define VENUS_SMMU_CBA2R_VALUE 0x00000001u
++#define VENUS_SMMU_TCR2_VALUE  0x00038071u
++#define VENUS_SMMU_TCR_VALUE   0x80803520u
++#define VENUS_SMMU_MAIR0_VALUE 0xf404ff44u /* attr0 = Normal-NC */
++#define VENUS_SMMU_ACTLR_VALUE 0x00000103u /* live DT qcom,actlr for 0x2180/0x400 */
++#define VENUS_SMMU_SCTLR_VALUE 0x00000027u
++#define VENUS_SMMU_S2CR_FAULT  0x00020000u
++#define VENUS_SMMU_PAGE_ATTR   0x0000000000000e43ULL
++#define VENUS_SMMU_TABLE_ATTR  0x0000000000000003ULL
++#define VENUS_SMMU_ASID        0x2180u
++#define VENUS_SMMU_SID0        0x2180u
++#define VENUS_SMMU_SID_MASK    0x400u  /* DT iommus <&apps_smmu 0x2180 0x400> */
++#define VENUS_SMMU_BANK_CAP    78u
++#define VENUS_SMMU_SMR_CAP     120u
++#define VENUS_TBU_SF0_PA       0x151f1000ULL
++#define VENUS_TBU_SF1_PA       0x151f5000ULL
++#define VENUS_TBU_PWR_STATUS   0x2204u
++
++struct venus_phdr {
++    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++struct venus_fw_source {
++    uint32_t size;
++    int (*read)(void *arg, uint32_t offset, void *buffer, uint32_t length);
++    void *arg;
++};
++
++void mondrian_venus_start(void);
++int mondrian_venus_fw_source(struct venus_fw_source *source);
++
++struct venus_smmu_state {
++    vm_offset_t base;
++    uint32_t scr0, idr0, idr1, idr2;
++    uint32_t page_bytes, global_pages, banks, smr_slots;
++    uint32_t bank, cb, gr1;
++    uint32_t slot[2];
++    uint32_t valid_smr, valid_s2cr;
++    uint32_t table_next;
++    int programmed;
++    int slots_touched;
++    int attached;
++};
++
++static struct venus_smmu_state venus_smmu;
++static int venus_probe_only;
++static int venus_vote_rails;
++static int venus_pll_cfg = 1;
++static int venus_skip_protect;
++static uint32_t venus_ares_before;
++static vm_offset_t venus_core, venus_videocc, venus_fw_va, venus_queue_va,
++    venus_aux_va;
++static uint32_t venus_header_id, venus_packet_id;
++static uint8_t venus_fw_bounce[4096];
++static uint32_t venus_response[VENUS_MAX_PACKET_SIZE / 4u];
++static int venus_pas_accepted;
++
++static void
++venus_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++venus_log(const char *fmt, ...)
++{
++    char line[256];
++    va_list ap;
++
++    va_start(ap, fmt);
++    vsnprintf(line, sizeof(line), fmt, ap);
++    va_end(ap);
++    printf("MONDRIAN VENUS: %s\n", line);
++}
++
++static int
++venus_rd32(vm_offset_t base, uint32_t offset, uint32_t *value)
++{
++    return mondrian_mmio_try_rd32(base + offset, value);
++}
++
++static int
++venus_wr32(vm_offset_t base, uint32_t offset, uint32_t value)
++{
++    return mondrian_mmio_try_wr32(base + offset, value);
++}
++
++static int
++venus_put32(vm_offset_t base, uint32_t offset, uint32_t want)
++{
++    uint32_t got;
++
++    if (venus_wr32(base, offset, want) != 0) {
++        venus_log("MMIO write refused off=0x%x want=0x%x", offset, want);
++        return -1;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (venus_rd32(base, offset, &got) != 0 || got != want) {
++        venus_log("MMIO readback off=0x%x want=0x%x got=0x%x", offset,
++            want, got);
++        return -1;
++    }
++    return 0;
++}
++
++static int
++venus_wait32(vm_offset_t base, uint32_t offset, uint32_t mask, uint32_t value,
++    unsigned timeout_us)
++{
++    unsigned i;
++
++    for (i = 0; i <= timeout_us; i++) {
++        uint32_t got;
++
++        if (venus_rd32(base, offset, &got) != 0) {
++            return -1;
++        }
++        if ((got & mask) == value) {
++            return 0;
++        }
++        if (i != timeout_us) {
++            delay(1);
++        }
++    }
++    return -1;
++}
++
++static inline uint32_t
++venus_mem_rd32(vm_offset_t va)
++{
++    uint32_t value;
++
++    __asm__ volatile("dsb sy" ::: "memory");
++    value = *(volatile uint32_t *)va;
++    __asm__ volatile("dsb sy" ::: "memory");
++    return value;
++}
++
++static inline void
++venus_mem_wr32(vm_offset_t va, uint32_t value)
++{
++    *(volatile uint32_t *)va = value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++venus_mem_zero(vm_offset_t va, vm_size_t size)
++{
++    vm_size_t i;
++
++    for (i = 0; i < size; i += 4) {
++        venus_mem_wr32(va + i, 0);
++    }
++}
++
++static int
++venus_mem_canary(void)
++{
++    vm_offset_t a = venus_aux_va + VENUS_CANARY_OFFSET;
++    vm_offset_t b = venus_aux_va + VENUS_META_OFFSET;
++
++    venus_mem_wr32(a, 0x56454e31u); /* "VEN1" */
++    venus_mem_wr32(a + 0x1000, 0x56454e32u);
++    venus_mem_wr32(b, 0x56454e33u);
++    if (venus_mem_rd32(a) != 0x56454e31u ||
++        venus_mem_rd32(a + 0x1000) != 0x56454e32u ||
++        venus_mem_rd32(b) != 0x56454e33u) {
++        return -1;
++    }
++    venus_mem_wr32(a, 0);
++    venus_mem_wr32(a + 0x1000, 0);
++    venus_mem_wr32(b, 0);
++    return 0;
++}
++
++static uint16_t
++venus_le16(const uint8_t *p)
++{
++    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static uint32_t
++venus_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/*
++ * The level is the DT's qcom,init-voltage-level (384 for both rails), not the
++ * largest 16-bit word in the cmd-db table: these ARC regulators advertise
++ * regulator-max-microvolt = 65535, and voting that value is not a valid corner.
++ */
++static int
++venus_vote_arc(const char *name, uint32_t level)
++{
++    uint32_t address = mondrian_cmd_db_addr(name);
++    uint32_t length = 0;
++    const uint8_t *table = mondrian_cmd_db_data(name, &length);
++
++    if (address == 0 || table == NULL || length < 2 || (length & 1u) != 0) {
++        venus_log("ARC resource %s absent or malformed", name);
++        return -1;
++    }
++    venus_log("ARC %s addr=0x%x table=%u level=0x%x", name, address, length,
++        level);
++    mondrian_log_flush_now();
++    if (mondrian_rpmh_write_one(address, level) != 0) {
++        venus_log("ARC resource %s vote failed", name);
++        return -1;
++    }
++    venus_log("rail %s voted level=0x%x", name, level);
++    mondrian_log_flush_now();
++    return 0;
++}
++
++static int
++venus_pll_enable(void)
++{
++    uint32_t mode, user;
++
++    /*
++     * sm8475 video PLL0 uses the LUCID_OLE register layout with the
++     * LUCID_EVO clock ops: videocc-sm8450.c swaps regs and config for
++     * sm8475 but keeps clk_alpha_pll_lucid_evo_ops. The EVO enable sets
++     * RESET_N, switches OPMODE to RUN, waits for LOCK and only then enables
++     * the outputs. BYPASSNL belongs to the generic PLL ops; leaving OPMODE
++     * at STANDBY (0), as the first port did, never starts the PLL.
++     */
++    if (venus_rd32(venus_videocc, VENUS_VCC_PLL0_MODE, &mode) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        mode | VENUS_PLL_RESET_N) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_OPMODE, VENUS_PLL_RUN)) {
++        return -1;
++    }
++    if (venus_wait32(venus_videocc, VENUS_VCC_PLL0_MODE, VENUS_PLL_LOCK,
++        VENUS_PLL_LOCK, 1500)) {
++        return -1;
++    }
++    if (venus_rd32(venus_videocc, VENUS_VCC_PLL0_USER, &user) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_USER,
++        user | VENUS_PLL_USER_OUTS) ||
++        venus_rd32(venus_videocc, VENUS_VCC_PLL0_MODE, &mode) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        mode | VENUS_PLL_OUTCTRL)) {
++        return -1;
++    }
++    return 0;
++}
++
++/*
++ * _alpha_pll_lucid_evo_disable(hw, reset = true): the calibration pass ends
++ * with RESET_N asserted so the next enable recalibrates.
++ */
++static void
++venus_pll_disable_reset(void)
++{
++    uint32_t mode, user;
++
++    if (venus_rd32(venus_videocc, VENUS_VCC_PLL0_MODE, &mode) ||
++        venus_rd32(venus_videocc, VENUS_VCC_PLL0_USER, &user)) {
++        return;
++    }
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        mode & ~VENUS_PLL_OUTCTRL);
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_USER,
++        user & ~VENUS_PLL_USER_OUTS);
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_OPMODE, 0);
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        mode & ~(VENUS_PLL_OUTCTRL | VENUS_PLL_RESET_N));
++}
++
++static int
++venus_pll_configure(void)
++{
++    uint32_t mode, opmode;
++
++    if (venus_rd32(venus_videocc, VENUS_VCC_PLL0_MODE, &mode) ||
++        venus_rd32(venus_videocc, VENUS_VCC_PLL0_OPMODE, &opmode)) {
++        return -1;
++    }
++    if ((opmode & 1u) != 0 && (mode & VENUS_PLL_OUTCTRL) != 0) {
++        venus_log("pll0 already enabled mode=0x%x", mode);
++        return 0;
++    }
++
++    venus_log("pll: write LUCID_OLE config");
++    mondrian_log_flush_now();
++    /* SM8475 LUCID_OLE config; L includes both 0x44 calibration fields. */
++    if (venus_wr32(venus_videocc, VENUS_VCC_PLL0_L, 0x44440045u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_ALPHA, 0x00006000u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_CONFIG, 0x20485699u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_CONFIG_U, 0x00182261u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_CONFIG_U1, 0x82aa299cu) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_USER, 0u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_USER_U, 0x00000005u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_TEST, 0u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_TEST_U, 0x00000003u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_TEST_U1, 0x00009000u) ||
++        venus_wr32(venus_videocc, VENUS_VCC_PLL0_TEST_U2, 0x00000034u)) {
++        return -1;
++    }
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        mode & ~VENUS_PLL_OUTCTRL);
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_OPMODE, 0);
++    (void)venus_wr32(venus_videocc, VENUS_VCC_PLL0_MODE,
++        (mode & ~VENUS_PLL_OUTCTRL) | VENUS_PLL_RESET_N);
++    venus_log("pll: config written, mode reset released");
++    mondrian_log_flush_now();
++
++    venus_log("pll: enable and wait for lock");
++    mondrian_log_flush_now();
++    if (venus_pll_enable()) {
++        return -1;
++    }
++    if (venus_rd32(venus_videocc, VENUS_VCC_PLL0_MODE, &mode)) {
++        return -1;
++    }
++    venus_log("pll0 locked mode=0x%x l=0x44440045 alpha=0x6000", mode);
++    return 0;
++}
++
++static int
++venus_videocc_ahb_on(void)
++{
++    uint32_t value;
++
++    if (venus_rd32(venus_videocc, VENUS_VCC_AHB, &value)) {
++        return -1;
++    }
++    venus_log("power: videoCC AHB before=0x%x", value);
++    if ((value & (1u << 31)) == 0) {
++        venus_log("power: videoCC AHB running");
++        return 0;
++    }
++    if (venus_wr32(venus_videocc, VENUS_VCC_AHB, value | 1u) ||
++        venus_rd32(venus_videocc, VENUS_VCC_AHB, &value)) {
++        return -1;
++    }
++    venus_log("power: videoCC AHB after=0x%x", value);
++    mondrian_log_flush_now();
++    /*
++     * CBCR bit 31 is CLK_OFF (1 = gated); bit 0 is the enable request. A 0x0
++     * read means the branch is not gated, which is how the donor port reads
++     * its gcc_video_ahb too. Only CLK_OFF is a failure here, and 0420ad
++     * measured the PLL locking with this register reading 0x0.
++     */
++    if ((value & (1u << 31)) != 0) {
++        venus_log("power: videoCC AHB CLK_OFF set after enable");
++    }
++    return 0;
++}
++
++static int
++venus_reset_bridges(void)
++{
++    vm_offset_t gcc = mondrian_gcc_map();
++    uint32_t value;
++
++    /*
++     * video_axi_reset is the GCC AXI0 ARES bit; the vendor never asserts the
++     * GCC video BCR at runtime and doing so resets the AHB/XO/AXI0 branches
++     * that must stay on for the videoCC register access.
++     */
++    if (gcc == 0) {
++        return -1;
++    }
++    if (venus_rd32(gcc, VENUS_GCC_VIDEO_AXI0, &value)) {
++        return -1;
++    }
++    if (venus_wr32(gcc, VENUS_GCC_VIDEO_AXI0,
++        value | VENUS_GCC_VIDEO_AXI0_ARES)) {
++        return -1;
++    }
++    if (venus_rd32(gcc, VENUS_GCC_VIDEO_AXI0, &value)) {
++        return -1;
++    }
++    if (venus_wr32(gcc, VENUS_GCC_VIDEO_AXI0,
++        value & ~VENUS_GCC_VIDEO_AXI0_ARES)) {
++        return -1;
++    }
++    return 0;
++}
++
++/*
++ * Enable a branch gate and report what the register actually accepted. The
++ * videoCC AHB gate reads 0xf8226000 with bit 0 clear even after the write, so
++ * the value is logged instead of turning a missing gate into a stop: the GDSC
++ * responses prove the videocc register block itself is reachable.
++ */
++static void
++venus_branch_on(vm_offset_t base, uint32_t offset, const char *name)
++{
++    uint32_t before = 0, after = 0;
++
++    (void)venus_rd32(base, offset, &before);
++    (void)venus_wr32(base, offset, before | 1u);
++    delay(1000);
++    (void)venus_rd32(base, offset, &after);
++    if ((after & 1u) == 0) {
++        (void)venus_wr32(base, offset, (after | 1u) & ~2u);
++        delay(1000);
++        (void)venus_rd32(base, offset, &after);
++    }
++    venus_log("power: %s before=0x%x after=0x%x", name, before, after);
++    mondrian_log_flush_now();
++}
++
++/*
++ * A gate the hardware owns: reading is safe and is the only thing this port
++ * may do. CBCR_CLK_OFF (bit 31) is the state; bit 0 is the software enable
++ * and is clear while the branch runs from its hardware request.
++ */
++static void
++venus_gate_report(vm_offset_t base, uint32_t offset, const char *name)
++{
++    uint32_t v = 0;
++
++    (void)venus_rd32(base, offset, &v);
++    venus_log("power: %s=0x%x%s", name, v,
++        (v & (1u << 31)) != 0 ? " halted" : " running");
++    mondrian_log_flush_now();
++}
++
++/*
++ * Take a GDSC back from hardware control before powering it. With HW_CONTROL
++ * set, clearing SW_COLLAPSE is dropped and the PWR_ON poll times out; the
++ * donor port measured the same on the video GDSCs. The caller re-reads the
++ * control register and the hand-off happens after auth_and_reset.
++ */
++static int
++venus_gdsc_sw_mode(vm_offset_t base, uint32_t offset, const char *name,
++    uint32_t *ctl)
++{
++    if ((*ctl & (1u << 1)) == 0) {
++        return 0;
++    }
++    if (venus_wr32(base, offset, *ctl & ~(1u << 1)) ||
++        venus_rd32(base, offset, ctl)) {
++        return -1;
++    }
++    venus_log("power: %s GDSC HW_CONTROL cleared (ctl=0x%x)", name, *ctl);
++    if ((*ctl & (1u << 1)) != 0) {
++        venus_log("power: %s GDSC HW_CONTROL won't clear (ctl=0x%x)",
++            name, *ctl);
++        return -1;
++    }
++    return 0;
++}
++
++static int
++venus_power_on(void)
++{
++    vm_offset_t gcc = mondrian_gcc_map();
++    uint32_t value, cfg, cmd;
++
++    if (gcc == 0) {
++        return -1;
++    }
++    /*
++     * The live display already consumes pm8450_s4_level (mmcx.lvl): the
++     * vendor dmesg shows disp_cc_mdss_core_gdsc supplied by that rail, and
++     * this port paints through the same MDSS pipeline, so the rail is on
++     * before this worker runs. Writing it under a live display is what reset
++     * the SoC on 2026-11-25 (ARC mmcx.lvl 0x180 logged, nothing after), so
++     * the vote stays behind mondrianvenusrails=1.
++     */
++    if (venus_vote_rails) {
++        venus_log("power: vote mmcx.lvl + mxc.lvl");
++        mondrian_log_flush_now();
++        if (venus_vote_arc("mmcx.lvl", VENUS_MMCX_LEVEL) ||
++            venus_vote_arc("mxc.lvl", VENUS_MXC_LEVEL)) {
++            return -1;
++        }
++        venus_log("power: rails voted");
++        mondrian_log_flush_now();
++        delay(20000);
++    } else {
++        venus_log("power: rails left as the display left them");
++        mondrian_log_flush_now();
++    }
++
++    /*
++     * Vendor order (kprobe trace of the videoCC probe and the Venus session):
++     * the GCC video parents and the videoCC AHB critical clock come up before
++     * the GDSC, then the GDSC, then the ARES toggle, then the PLL.
++     */
++    venus_branch_on(gcc, VENUS_GCC_VIDEO_AHB, "GCC video AHB");
++    venus_branch_on(gcc, VENUS_GCC_VIDEO_XO, "GCC video XO");
++
++    {
++        uint32_t ctl, sts;
++
++        /* mvs0c is software-owned; mvs0 carries qcom,support-hw-trigger and
++         * belongs to the firmware. Enable only mvs0c. Linux polls PWR_ON
++         * (bit 31) of the control register for this GDSC: it does not carry
++         * POLL_CFG_GDSCR, so CFG_GDSCR (gdscr + 4) is not the state.
++         */
++        if (venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC, &ctl) ||
++            venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC_STS, &sts)) {
++            venus_log("mvs0c GDSC read failed");
++            return -1;
++        }
++        venus_log("power: mvs0c GDSC ctl=0x%x cfg=0x%x", ctl, sts);
++        mondrian_log_flush_now();
++        /*
++         * gdsc_init() clears SW_COLLAPSE, then gdsc_check_status() reads
++         * PWR_ON (bit 31) of the same control register. The +4 register
++         * reported POWER_UP_COMPLETE (bit 16) while that poll still failed,
++         * which is why 0420w stopped before the PLL with the domain up.
++         */
++        if (venus_gdsc_sw_mode(venus_videocc, VENUS_VCC_MVS0C_GDSC,
++            "mvs0c", &ctl)) {
++            return -1;
++        }
++        if ((ctl & VENUS_GDSC_PWRSTS_ON) == 0) {
++            if (venus_wr32(venus_videocc, VENUS_VCC_MVS0C_GDSC,
++                ctl & ~1u)) {
++                return -1;
++            }
++            if (venus_wait32(venus_videocc, VENUS_VCC_MVS0C_GDSC,
++                VENUS_GDSC_PWRSTS_ON, VENUS_GDSC_PWRSTS_ON, 500)) {
++                (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC, &ctl);
++                (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC_STS,
++                    &sts);
++                venus_log("power: mvs0c GDSC did not power on "
++                    "(ctl=0x%x cfg=0x%x)", ctl, sts);
++                return -1;
++            }
++            /* RETAIN_FF_ENABLE (bit 11), set after the poll as gdsc_enable. */
++            (void)venus_wr32(venus_videocc, VENUS_VCC_MVS0C_GDSC,
++                (ctl & ~1u) | (1u << 11));
++            (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC, &ctl);
++            (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC_STS, &sts);
++            venus_log("power: mvs0c GDSC on ctl=0x%x cfg=0x%x", ctl, sts);
++            mondrian_log_flush_now();
++        }
++        /*
++         * mvs0 carries qcom,support-hw-trigger, but the vendor's msm_vidc
++         * driver still enables it as the "vcodec" regulator before PAS auth:
++         * clear SW_COLLAPSE, poll PWR_ON and keep RETAIN_FF (bit 11). The
++         * collapse goes to the firmware only after auth_and_reset, when the
++         * firmware owns vcodec; handing it over before the image is loaded
++         * lets the hardware collapse the domain again.
++         */
++        if (venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC, &ctl) ||
++            venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC_STS, &sts)) {
++            venus_log("mvs0 GDSC read failed");
++            return -1;
++        }
++        venus_log("power: mvs0 GDSC ctl=0x%x cfg=0x%x", ctl, sts);
++        if (venus_gdsc_sw_mode(venus_videocc, VENUS_VCC_MVS0_GDSC,
++            "mvs0", &ctl)) {
++            return -1;
++        }
++        if ((ctl & VENUS_GDSC_PWRSTS_ON) == 0) {
++            if (venus_wr32(venus_videocc, VENUS_VCC_MVS0_GDSC,
++                ctl & ~1u)) {
++                return -1;
++            }
++            if (venus_wait32(venus_videocc, VENUS_VCC_MVS0_GDSC,
++                VENUS_GDSC_PWRSTS_ON, VENUS_GDSC_PWRSTS_ON, 500)) {
++                (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC, &ctl);
++                (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC_STS,
++                    &sts);
++                venus_log("power: mvs0 GDSC did not power on "
++                    "(ctl=0x%x cfg=0x%x)", ctl, sts);
++                return -1;
++            }
++        }
++        (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC, &ctl);
++        if (venus_wr32(venus_videocc, VENUS_VCC_MVS0_GDSC,
++            (ctl & ~1u) | (1u << 11))) {
++            return -1;
++        }
++        (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC, &ctl);
++        (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC_STS, &sts);
++        venus_log("power: mvs0 GDSC on ctl=0x%x cfg=0x%x", ctl, sts);
++        mondrian_log_flush_now();
++    }
++    if (venus_videocc_ahb_on()) {
++        return -1;
++    }
++    venus_log("power: GDSCs on; reset bridges");
++    mondrian_log_flush_now();
++    if (venus_reset_bridges()) {
++        return -1;
++    }
++    venus_log("power: bridges reset");
++    mondrian_log_flush_now();
++
++    venus_branch_on(gcc, VENUS_GCC_VIDEO_AXI0, "GCC video AXI0");
++    /*
++     * These three are hardware-controlled. video_cc_ahb_clk reads 0x68226000
++     * before the worker touches it (CBCR_CLK_OFF clear: it is running) and
++     * writing bit 0 turns it into 0xf8226000 (CLK_OFF set), after which the
++     * PLL access panics with "Undefined kernel instruction: pc=0". Read them,
++     * never write them.
++     */
++    venus_gate_report(venus_videocc, VENUS_VCC_AHB, "videoCC AHB");
++    venus_gate_report(venus_videocc, VENUS_VCC_XO, "videoCC XO");
++    venus_gate_report(venus_videocc, VENUS_VCC_SLEEP, "videoCC SLEEP");
++    if (!venus_pll_cfg) {
++        /*
++         * The PLL is the first videocc register block the worker touches and
++         * every boot that reached it reset the SoC at the end of the hold.
++         * Keep it opt-in so the gates and the GDSCs can be measured on their
++         * own; SMMU and firmware access need the core clock, so stop here.
++         */
++        venus_log("power: PLL/core skipped by mondrianvenusnopll");
++        mondrian_log_flush_now();
++        return -1;
++    }
++    venus_log("power: configure PLL0");
++    mondrian_log_flush_now();
++    if (venus_pll_configure()) {
++        venus_log("PLL0 did not lock");
++        return -1;
++    }
++    venus_log("power: PLL0 locked");
++    mondrian_log_flush_now();
++
++    /* Vendor scales the source by 3: 720 MHz source -> nominal 240 MHz branch. */
++    if (venus_rd32(venus_videocc, VENUS_VCC_MVS0_CFG_RCGR, &cfg)) {
++        return -1;
++    }
++    cfg = (cfg & ~(VENUS_RCG_SRC_MASK | VENUS_RCG_HID_MASK |
++        VENUS_RCG_MODE_MASK)) | VENUS_RCG_SRC_PLL0;
++    if (venus_wr32(venus_videocc, VENUS_VCC_MVS0_CFG_RCGR, cfg) ||
++        venus_rd32(venus_videocc, VENUS_VCC_MVS0_CMD_RCGR, &cmd)) {
++        return -1;
++    }
++    cmd |= VENUS_RCG_ROOT_EN | VENUS_RCG_UPDATE;
++    if (venus_wr32(venus_videocc, VENUS_VCC_MVS0_CMD_RCGR, cmd) ||
++        venus_wait32(venus_videocc, VENUS_VCC_MVS0_CMD_RCGR,
++        VENUS_RCG_UPDATE, 0, 500) ||
++        venus_wait32(venus_videocc, VENUS_VCC_MVS0_CMD_RCGR,
++        VENUS_RCG_ROOT_OFF, 0, 500)) {
++        venus_log("mvs0 root switch timed out");
++        return -1;
++    }
++    /*
++     * video_core_reset: the live DT reset id 2 on VIDEOCC is
++     * VIDEO_CC_MVS0C_CLK_ARES (0x8064 bit 2). Mainline's power-on pulses
++     * every DT reset (reset_control_bulk_reset) before enabling the core
++     * clock. Without it the Xtensa can stay in reset while the GDSC, PLL
++     * and clock branch all read "on".
++     */
++    if (venus_rd32(venus_videocc, VENUS_VCC_MVS0C_CLK, &value)) {
++        return -1;
++    }
++    venus_ares_before = value;
++    venus_log("power: video_core_reset ARES before=0x%x", value);
++    mondrian_log_flush_now();
++    if (venus_wr32(venus_videocc, VENUS_VCC_MVS0C_CLK,
++        (value & ~1u) | VENUS_VCC_MVS0C_ARES)) {
++        return -1;
++    }
++    delay(1000);
++    if (venus_rd32(venus_videocc, VENUS_VCC_MVS0C_CLK, &value) ||
++        venus_wr32(venus_videocc, VENUS_VCC_MVS0C_CLK,
++        value & ~VENUS_VCC_MVS0C_ARES)) {
++        return -1;
++    }
++    delay(1000);
++    venus_log("power: video_core_reset pulsed");
++    if (venus_rd32(venus_videocc, VENUS_VCC_MVS0C_CLK, &value) ||
++        venus_wr32(venus_videocc, VENUS_VCC_MVS0C_CLK, value | 1u) ||
++        venus_wait32(venus_videocc, VENUS_VCC_MVS0C_CLK,
++        VENUS_RCG_ROOT_OFF, 0, 500) ||
++        venus_rd32(venus_videocc, VENUS_VCC_MVS0_CLK, &value) ||
++        venus_wr32(venus_videocc, VENUS_VCC_MVS0_CLK, value | 1u)) {
++        venus_log("videoCC core/vcodec branch enable failed");
++        return -1;
++    }
++
++    /* qcom,reg-presets: WRAPPER_CORE_CLOCK_CONFIG &= ~0x11. */
++    if (venus_rd32(venus_core, VENUS_WRAPPER_CLOCKCFG, &value) ||
++        venus_wr32(venus_core, VENUS_WRAPPER_CLOCKCFG, value & ~0x11u)) {
++        return -1;
++    }
++    if (venus_rd32(venus_core, VENUS_WRAPPER_POWER, &value)) {
++        return -1;
++    }
++    /*
++     * The wrapper power may only come up when the firmware starts; the
++     * vendor driver does not gate the PAS auth on it. Keep it as telemetry.
++     */
++    if ((value & VENUS_CORE_POWER_ON) == 0) {
++        venus_log("power: wrapper core power still off; continuing");
++    }
++    /* qcom,reg-presets leaves 0xb0088 at 0; unmask A2HWD|A2H here so the
++     * wrapper can raise SPI 174 once the firmware starts (Linux does this
++     * before the PIL load, not after CTRL_INIT). */
++    {
++        uint32_t mask;
++
++        if (venus_rd32(venus_core, VENUS_WRAPPER_MASK, &mask) ||
++            venus_wr32(venus_core, VENUS_WRAPPER_MASK,
++            mask & ~(VENUS_A2HWD | VENUS_A2H)) ||
++            venus_rd32(venus_core, VENUS_WRAPPER_MASK, &mask)) {
++            return -1;
++        }
++        venus_log("power: wrapper intr mask=0x%x (A2HWD|A2H unmasked)",
++            mask);
++    }
++    {
++        uint32_t mvs0c, mvs0;
++
++        (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0C_GDSC, &mvs0c);
++        (void)venus_rd32(venus_videocc, VENUS_VCC_MVS0_GDSC, &mvs0);
++        venus_log("clocks/gdsc up mvs0c=0x%x mvs0=0x%x root=720MHz branch~240MHz",
++            mvs0c, mvs0);
++    }
++    return 0;
++}
++
++static int
++venus_power_check(void)
++{
++    const struct {
++        vm_offset_t base;
++        uint32_t offset;
++        uint32_t mask;
++        uint32_t value;
++    } checks[] = {
++        { venus_videocc, VENUS_VCC_MVS0C_GDSC, VENUS_GDSC_PWRSTS_ON, VENUS_GDSC_PWRSTS_ON },
++        { venus_videocc, VENUS_VCC_PLL0_MODE, VENUS_PLL_LOCK, VENUS_PLL_LOCK },
++        { venus_videocc, VENUS_VCC_MVS0_CMD_RCGR, VENUS_RCG_ROOT_OFF, 0u },
++        { mondrian_gcc_map(), VENUS_GCC_VIDEO_AHB, 1u, 1u },
++        { mondrian_gcc_map(), VENUS_GCC_VIDEO_XO, 1u, 1u },
++        { mondrian_gcc_map(), VENUS_GCC_VIDEO_AXI0, 1u, 1u },
++    };
++    size_t i;
++
++    for (i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
++        uint32_t value;
++
++        if (venus_rd32(checks[i].base, checks[i].offset, &value) ||
++            (value & checks[i].mask) != checks[i].value) {
++            venus_log("power check failed off=0x%x value=0x%x",
++                checks[i].offset, value);
++            return -1;
++        }
++    }
++    return 0;
++}
++
++static int
++venus_smmu_rd64(uint32_t offset, uint64_t *value)
++{
++    uint32_t lo, hi;
++
++    if (venus_rd32(venus_smmu.base, offset, &lo) ||
++        venus_rd32(venus_smmu.base, offset + 4, &hi)) {
++        return -1;
++    }
++    *value = (uint64_t)lo | ((uint64_t)hi << 32);
++    return 0;
++}
++
++static int
++venus_smmu_wr64(uint32_t offset, uint64_t value)
++{
++    return venus_wr32(venus_smmu.base, offset, (uint32_t)value) ||
++        venus_wr32(venus_smmu.base, offset + 4, (uint32_t)(value >> 32));
++}
++
++static uint64_t
++venus_pt_alloc(void)
++{
++    uint64_t pa;
++
++    if (venus_smmu.table_next + 4096u > VENUS_TABLE_SIZE) {
++        return 0;
++    }
++    pa = VENUS_AUX_PA + VENUS_TABLE_OFFSET + venus_smmu.table_next;
++    venus_smmu.table_next += 4096u;
++    venus_mem_zero(venus_aux_va + VENUS_TABLE_OFFSET +
++        venus_smmu.table_next - 4096u, 4096);
++    return pa;
++}
++
++static int
++venus_pt_map_range(uint64_t iova, uint64_t pa, uint64_t length)
++{
++    volatile uint64_t *root = (volatile uint64_t *)(venus_aux_va +
++        VENUS_TABLE_OFFSET);
++
++    if (length == 0 || (iova & 0xfffu) != 0 || (pa & 0xfffu) != 0 ||
++        (length & 0xfffu) != 0 || iova + length > 0x100000000ULL ||
++        pa + length > (1ULL << 36)) {
++        return -1;
++    }
++    while (length != 0) {
++        unsigned i1 = (unsigned)(iova >> 30) & 3u;
++        unsigned i2 = (unsigned)(iova >> 21) & 0x1ffu;
++        unsigned i3 = (unsigned)(iova >> 12) & 0x1ffu;
++        uint64_t l2_pa, l3_pa;
++        volatile uint64_t *l2, *l3;
++
++        if (root[i1] == 0) {
++            l2_pa = venus_pt_alloc();
++            if (l2_pa == 0) {
++                return -1;
++            }
++            root[i1] = l2_pa | VENUS_SMMU_TABLE_ATTR;
++        } else {
++            l2_pa = root[i1] & 0x0000fffffffff000ULL;
++        }
++        l2 = (volatile uint64_t *)(venus_aux_va + VENUS_TABLE_OFFSET +
++            (l2_pa - VENUS_AUX_PA));
++        if (l2[i2] == 0) {
++            l3_pa = venus_pt_alloc();
++            if (l3_pa == 0) {
++                return -1;
++            }
++            l2[i2] = l3_pa | VENUS_SMMU_TABLE_ATTR;
++        } else {
++            l3_pa = l2[i2] & 0x0000fffffffff000ULL;
++        }
++        l3 = (volatile uint64_t *)(venus_aux_va + VENUS_TABLE_OFFSET +
++            (l3_pa - VENUS_AUX_PA));
++        l3[i3] = pa | VENUS_SMMU_PAGE_ATTR;
++        iova += 4096;
++        pa += 4096;
++        length -= 4096;
++    }
++    return 0;
++}
++
++static int
++venus_pt_shadow(uint64_t iova, uint64_t expected)
++{
++    const volatile uint64_t *root = (const volatile uint64_t *)(
++        venus_aux_va + VENUS_TABLE_OFFSET);
++    unsigned i1 = (unsigned)(iova >> 30) & 3u;
++    unsigned i2 = (unsigned)(iova >> 21) & 0x1ffu;
++    unsigned i3 = (unsigned)(iova >> 12) & 0x1ffu;
++    uint64_t l2_pa, l3_pa, leaf;
++    const volatile uint64_t *l2, *l3;
++
++    if ((root[i1] & 3u) != 3u) {
++        return -1;
++    }
++    l2_pa = root[i1] & 0x0000fffffffff000ULL;
++    l2 = (const volatile uint64_t *)(venus_aux_va + VENUS_TABLE_OFFSET +
++        (l2_pa - VENUS_AUX_PA));
++    if ((l2[i2] & 3u) != 3u) {
++        return -1;
++    }
++    l3_pa = l2[i2] & 0x0000fffffffff000ULL;
++    l3 = (const volatile uint64_t *)(venus_aux_va + VENUS_TABLE_OFFSET +
++        (l3_pa - VENUS_AUX_PA));
++    leaf = l3[i3];
++    return ((leaf & 3u) == 3u &&
++        (leaf & 0x0000fffffffff000ULL) == expected) ? 0 : -1;
++}
++
++static int
++venus_smmu_tlb_sync(void)
++{
++    uint32_t status;
++    unsigned i;
++
++    if (venus_wr32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_TLBIASID,
++        VENUS_SMMU_ASID) ||
++        venus_wr32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_TLBSYNC,
++        0xffffffffu)) {
++        return -1;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (i = 0; i < 500; i++) {
++        if (venus_rd32(venus_smmu.base,
++            venus_smmu.cb + VENUS_SMMU_CB_TLBSTATUS, &status)) {
++            return -1;
++        }
++        if ((status & 1u) == 0) {
++            return 0;
++        }
++        delay(1);
++    }
++    return -1;
++}
++
++static int
++venus_smmu_asid_conflict(uint32_t candidate)
++{
++    uint32_t bank;
++
++    for (bank = 0; bank < venus_smmu.banks; bank++) {
++        uint32_t cb, sctlr, cbar;
++        uint64_t ttbr0, ttbr1;
++
++        if (bank == candidate) {
++            continue;
++        }
++        cb = (venus_smmu.global_pages + bank) * venus_smmu.page_bytes;
++        if (venus_rd32(venus_smmu.base, cb + VENUS_SMMU_CB_SCTLR, &sctlr) ||
++            venus_rd32(venus_smmu.base, venus_smmu.gr1 +
++            VENUS_SMMU_CBAR(bank), &cbar)) {
++            return -1;
++        }
++        if ((sctlr & 1u) == 0 || ((cbar >> 16) & 3u) == 0) {
++            continue;
++        }
++        if (venus_smmu_rd64(cb + VENUS_SMMU_CB_TTBR0, &ttbr0) ||
++            venus_smmu_rd64(cb + VENUS_SMMU_CB_TTBR1, &ttbr1)) {
++            return -1;
++        }
++        if ((ttbr0 >> 48) == VENUS_SMMU_ASID ||
++            (ttbr1 >> 48) == VENUS_SMMU_ASID) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
++static int
++venus_smmu_pick_bank(void)
++{
++    uint32_t candidate, tries;
++    uint32_t s2cb = (venus_smmu.idr1 >> 16) & 0xffu;
++
++    for (candidate = venus_smmu.banks - 1, tries = 0;
++        candidate >= s2cb && candidate > 0 && tries < 8;
++        candidate--, tries++) {
++        uint32_t cb = (venus_smmu.global_pages + candidate) *
++            venus_smmu.page_bytes;
++        uint32_t sctlr, status, n, s2cr;
++        int used = 0, conflict;
++
++        if (venus_rd32(venus_smmu.base, cb + VENUS_SMMU_CB_SCTLR, &sctlr) ||
++            venus_rd32(venus_smmu.base, cb + VENUS_SMMU_CB_TLBSTATUS,
++            &status)) {
++            continue;
++        }
++        if ((sctlr & 1u) != 0 || (status & 1u) != 0) {
++            continue;
++        }
++        for (n = 0; n < venus_smmu.smr_slots; n++) {
++            if (venus_rd32(venus_smmu.base, VENUS_SMMU_S2CR(n), &s2cr)) {
++                used = 1;
++                break;
++            }
++            if (((s2cr >> 16) & 3u) == 0 && (s2cr & 0xffu) == candidate) {
++                used = 1;
++                break;
++            }
++        }
++        conflict = venus_smmu_asid_conflict(candidate);
++        if (used || conflict != 0) {
++            continue;
++        }
++        venus_smmu.bank = candidate;
++        venus_smmu.cb = cb;
++        return 0;
++    }
++    return -1;
++}
++
++static int
++venus_smmu_pick_slots(void)
++{
++    uint32_t n, found = 0;
++    uint32_t sid_mask = (venus_smmu.idr0 & (1u << 8)) ? 0xffffu :
++        (1u << ((venus_smmu.idr0 >> 9) & 15u)) - 1u;
++
++    for (n = 0; n < venus_smmu.smr_slots; n++) {
++        uint32_t smr, s2cr, mask, id;
++        int valid;
++
++        if (venus_rd32(venus_smmu.base, VENUS_SMMU_SMR(n), &smr) ||
++            venus_rd32(venus_smmu.base, VENUS_SMMU_S2CR(n), &s2cr)) {
++            return -1;
++        }
++        valid = (venus_smmu.idr0 & (1u << 8)) ? !!(s2cr & 0x400u) :
++            !!(smr & 0x80000000u);
++        if (!valid) {
++            if (found < 1) {
++                venus_smmu.slot[found++] = n;
++            }
++            continue;
++        }
++        id = smr & 0xffffu;
++        mask = (smr >> 16) & ((venus_smmu.idr0 & (1u << 8)) ?
++            0xffffu : 0x7fffu);
++        if (((VENUS_SMMU_SID0 ^ id) & ~mask & sid_mask) == 0) {
++            venus_log("SMR slot %u already matches Venus SID", n);
++            return -1;
++        }
++    }
++    return found == 1 ? 0 : -1;
++}
++
++static void
++venus_smmu_step(const char *what)
++{
++    venus_log("smmu: %s", what);
++    mondrian_log_flush_now();
++}
++
++static int
++venus_smmu_program(void)
++{
++    uint32_t id7, gfsr, got;
++    uint64_t ttbr0, ttbr1, ttbr_readback;
++    int i;
++
++    venus_smmu_step("map");
++    bzero(&venus_smmu, sizeof(venus_smmu));
++    venus_smmu.base = ml_io_map_unmappable(VENUS_SMMU_PA,
++        VENUS_SMMU_SIZE, VM_WIMG_IO);
++    if (venus_smmu.base == 0) {
++        return -1;
++    }
++    venus_log("smmu: base=0x%llx size=0x%x",
++        (unsigned long long)venus_smmu.base, VENUS_SMMU_SIZE);
++    venus_smmu_step("ids");
++    if (venus_rd32(venus_smmu.base, VENUS_SMMU_SCR0, &venus_smmu.scr0) ||
++        venus_rd32(venus_smmu.base, VENUS_SMMU_IDR0, &venus_smmu.idr0) ||
++        venus_rd32(venus_smmu.base, VENUS_SMMU_IDR1, &venus_smmu.idr1) ||
++        venus_rd32(venus_smmu.base, VENUS_SMMU_IDR2, &venus_smmu.idr2) ||
++        venus_rd32(venus_smmu.base, VENUS_SMMU_IDR7, &id7) ||
++        venus_rd32(venus_smmu.base, VENUS_SMMU_GFSR, &gfsr)) {
++        return -1;
++    }
++    venus_log("smmu: scr0=0x%x idr0=0x%x idr1=0x%x idr2=0x%x idr7=0x%x gfsr=0x%x",
++        venus_smmu.scr0, venus_smmu.idr0, venus_smmu.idr1, venus_smmu.idr2,
++        id7, gfsr);
++    if ((venus_smmu.idr0 & (1u << 30)) == 0 ||
++        (venus_smmu.idr0 & (1u << 27)) == 0 ||
++        (venus_smmu.idr2 & (1u << 12)) == 0 ||
++        ((venus_smmu.idr2 >> 4) & 15u) < 1u ||
++        ((venus_smmu.idr2 >> 4) & 15u) > 5u ||
++        ((id7 >> 4) & 15u) != 2u ||
++        (venus_smmu.scr0 & 1u) != 0 ||
++        (venus_smmu.scr0 & (1u << 1)) == 0 || gfsr != 0 ||
++        ((venus_smmu.scr0 >> 3) & 1u) !=
++        ((venus_smmu.idr0 >> 8) & 1u)) {
++        venus_log("unsupported SMMU policy scr0=0x%x gfrs=0x%x",
++            venus_smmu.scr0, gfsr);
++        return -1;
++    }
++    venus_smmu.page_bytes = (venus_smmu.idr1 & (1u << 31)) ? 0x10000u :
++        0x1000u;
++    venus_smmu.global_pages = 1u << (((venus_smmu.idr1 >> 28) & 7u) + 1u);
++    venus_smmu.banks = (venus_smmu.idr1 & 0xffu) < VENUS_SMMU_BANK_CAP ?
++        (venus_smmu.idr1 & 0xffu) : VENUS_SMMU_BANK_CAP;
++    venus_smmu.smr_slots = (venus_smmu.idr0 & 0xffu) < VENUS_SMMU_SMR_CAP ?
++        (venus_smmu.idr0 & 0xffu) : VENUS_SMMU_SMR_CAP;
++    venus_smmu.gr1 = venus_smmu.page_bytes;
++    venus_smmu.valid_smr = (venus_smmu.idr0 & (1u << 8)) ? 0u :
++        0x80000000u;
++    venus_smmu.valid_s2cr = (venus_smmu.idr0 & (1u << 8)) ? 0x400u : 0u;
++    venus_smmu_step("pick");
++    if (venus_smmu.page_bytes != 0x1000u || venus_smmu.banks < 2 ||
++        venus_smmu_pick_bank() || venus_smmu_pick_slots()) {
++        return -1;
++    }
++    venus_log("smmu: cb=%u slot=%u", venus_smmu.bank, venus_smmu.slot[0]);
++
++    venus_smmu_step("tables zero");
++    venus_mem_zero(venus_aux_va + VENUS_TABLE_OFFSET, VENUS_TABLE_SIZE);
++    venus_smmu.table_next = 4096; /* root page */
++    venus_smmu_step("fw map");
++    if (venus_pt_map_range(VENUS_FW_PA, VENUS_FW_PA, VENUS_FW_SIZE)) {
++        venus_log("smmu: fw map failed");
++        return -1;
++    }
++    venus_log("smmu: fw mapped, table_next=0x%x", venus_smmu.table_next);
++    venus_smmu_step("queue map");
++    if (venus_pt_map_range(VENUS_QUEUE_PA, VENUS_QUEUE_PA,
++        VENUS_QUEUE_UC_SIZE)) {
++        venus_log("smmu: queue map failed");
++        return -1;
++    }
++    venus_log("smmu: queue mapped, table_next=0x%x", venus_smmu.table_next);
++    if (venus_pt_map_range(VENUS_SFR_PA, VENUS_SFR_PA, 0x1000u)) {
++        venus_log("smmu: sfr map failed");
++        return -1;
++    }
++    venus_smmu_step("shadow");
++    if (venus_pt_shadow(VENUS_FW_PA, VENUS_FW_PA) ||
++        venus_pt_shadow(VENUS_FW_PA + VENUS_FW_SIZE - 4096,
++        VENUS_FW_PA + VENUS_FW_SIZE - 4096) ||
++        venus_pt_shadow(VENUS_QUEUE_PA, VENUS_QUEUE_PA) ||
++        venus_pt_shadow(VENUS_SFR_PA, VENUS_SFR_PA)) {
++        venus_log("smmu: table shadow failed");
++        return -1;
++    }
++    venus_smmu_step("flush");
++    flush_dcache64((addr64_t)(venus_aux_va + VENUS_TABLE_OFFSET),
++        VENUS_TABLE_SIZE, FALSE);
++    venus_smmu_step("cb regs");
++
++    ttbr0 = ((uint64_t)VENUS_SMMU_ASID << 48) |
++        (VENUS_AUX_PA + VENUS_TABLE_OFFSET);
++    ttbr1 = (uint64_t)VENUS_SMMU_ASID << 48;
++    venus_smmu.programmed = 1;
++    if (venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_SCTLR, 0) ||
++        venus_put32(venus_smmu.base, venus_smmu.gr1 +
++        VENUS_SMMU_CBA2R(venus_smmu.bank), VENUS_SMMU_CBA2R_VALUE) ||
++        venus_put32(venus_smmu.base, venus_smmu.gr1 +
++        VENUS_SMMU_CBAR(venus_smmu.bank), VENUS_SMMU_CBAR_VALUE) ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_ACTLR,
++        VENUS_SMMU_ACTLR_VALUE) ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_TCR2,
++        VENUS_SMMU_TCR2_VALUE) ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_TCR,
++        VENUS_SMMU_TCR_VALUE) ||
++        venus_smmu_wr64(venus_smmu.cb + VENUS_SMMU_CB_TTBR0, ttbr0) ||
++        venus_smmu_wr64(venus_smmu.cb + VENUS_SMMU_CB_TTBR1, ttbr1) ||
++        venus_smmu_rd64(venus_smmu.cb + VENUS_SMMU_CB_TTBR0,
++        &ttbr_readback) ||
++        ttbr_readback != ttbr0 ||
++        venus_smmu_rd64(venus_smmu.cb + VENUS_SMMU_CB_TTBR1,
++        &ttbr_readback) ||
++        ttbr_readback != ttbr1 ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_MAIR0,
++        VENUS_SMMU_MAIR0_VALUE) ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_MAIR1, 0) ||
++        venus_wr32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FSR,
++        VENUS_SMMU_FSR_FAULT) ||
++        venus_smmu_tlb_sync() ||
++        venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_SCTLR,
++        VENUS_SMMU_SCTLR_VALUE)) {
++        return -1;
++    }
++    venus_smmu_step("smr");
++    for (i = 0; i < 1; i++) {
++        uint32_t sid = VENUS_SMMU_SID0;
++        uint32_t smr = venus_smmu.valid_smr |
++            (VENUS_SMMU_SID_MASK << 16) | sid;
++        uint32_t route = venus_smmu.bank | venus_smmu.valid_s2cr;
++
++        venus_smmu.slots_touched = i + 1;
++        if (venus_put32(venus_smmu.base, VENUS_SMMU_S2CR(venus_smmu.slot[i]),
++            venus_smmu.bank) ||
++            venus_put32(venus_smmu.base, VENUS_SMMU_SMR(venus_smmu.slot[i]),
++            smr)) {
++            return -1;
++        }
++        if (venus_smmu.valid_s2cr != 0 &&
++            venus_put32(venus_smmu.base, VENUS_SMMU_S2CR(venus_smmu.slot[i]),
++            route)) {
++            return -1;
++        }
++        if (venus_rd32(venus_smmu.base, VENUS_SMMU_SMR(venus_smmu.slot[i]),
++            &got) || got != smr) {
++            return -1;
++        }
++    }
++    venus_smmu.attached = 1;
++    venus_log("smmu cb=%u asid=0x%x sid=0x2180 mask=0x400 table=0x%llx",
++        venus_smmu.bank, VENUS_SMMU_ASID,
++        (unsigned long long)(VENUS_AUX_PA + VENUS_TABLE_OFFSET));
++    return 0;
++}
++
++static void
++venus_smmu_teardown(void)
++{
++    int i;
++
++    if (venus_smmu.slots_touched != 0) {
++        for (i = 0; i < (int)venus_smmu.slots_touched; i++) {
++            if (venus_put32(venus_smmu.base,
++                VENUS_SMMU_S2CR(venus_smmu.slot[i]),
++                VENUS_SMMU_S2CR_FAULT | venus_smmu.valid_s2cr)) {
++                venus_log("SMMU teardown uncertain at slot %u",
++                    venus_smmu.slot[i]);
++                return;
++            }
++        }
++        venus_smmu.slots_touched = 0;
++        venus_smmu.attached = 0;
++    }
++    if (venus_smmu.programmed &&
++        (venus_put32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_SCTLR, 0) ||
++        venus_smmu_tlb_sync())) {
++        venus_log("SMMU bank teardown uncertain");
++        return;
++    }
++    venus_smmu.programmed = 0;
++}
++
++static void
++venus_smmu_fault_dump(void)
++{
++    uint32_t fsr, far_lo, far_hi, fsynr;
++
++    if (venus_smmu.base == 0 || (!venus_smmu.programmed &&
++        !venus_smmu.attached && venus_smmu.slots_touched == 0)) {
++        return;
++    }
++    if (venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FSR,
++        &fsr) == 0 && fsr != 0) {
++        (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FAR,
++            &far_lo);
++        (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FAR + 4,
++            &far_hi);
++        (void)venus_rd32(venus_smmu.base,
++            venus_smmu.cb + VENUS_SMMU_CB_FSYNR0, &fsynr);
++        venus_log("SMMU fault fsr=0x%x far=0x%llx fsynr=0x%x", fsr,
++            (unsigned long long)((uint64_t)far_lo |
++            ((uint64_t)far_hi << 32)), fsynr);
++    }
++}
++
++static int
++venus_fw_read(struct venus_fw_source *source, uint32_t offset, void *buffer,
++    uint32_t length)
++{
++    if (offset > source->size || length > source->size - offset) {
++        return -1;
++    }
++    return source->read(source->arg, offset, buffer, length);
++}
++
++static void
++venus_mem_protect(void)
++{
++    uint64_t args[4] = { 0, 0x25800000ULL, 0x01000000ULL, 0x24800000ULL };
++    uint64_t first = VENUS_SCM_MP_VIDEO_VAR, a6 = 0;
++    uint32_t busy = 0;
++    unsigned resumes;
++
++    for (resumes = 0; resumes < 10000; resumes++) {
++        register uint64_t r0 asm("x0") = first;
++        register uint64_t r1 asm("x1") = 4;
++        register uint64_t r2 asm("x2") = args[0];
++        register uint64_t r3 asm("x3") = args[1];
++        register uint64_t r4 asm("x4") = args[2];
++        register uint64_t r5 asm("x5") = args[3];
++        register uint64_t r6 asm("x6") = a6;
++        register uint64_t r7 asm("x7") = 0;
++
++        asm volatile("smc #0" : "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3),
++            "+r"(r4), "+r"(r5), "+r"(r6), "+r"(r7) ::
++            "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
++            "x16", "x17", "memory");
++        if (r0 == 1) {
++            first = 1;
++            a6 = r6;
++            continue;
++        }
++        if ((int64_t)r0 == -12 && busy++ < 20) {
++            first = VENUS_SCM_MP_VIDEO_VAR;
++            a6 = 0;
++            delay(30000);
++            continue;
++        }
++        venus_log("scm mem_protect -> transport=%lld result=%lld",
++            (long long)r0, (long long)r1);
++        return;
++    }
++    venus_log("scm mem_protect: resume limit");
++}
++
++static void
++venus_smmu_fault_report(const char *why)
++{
++    uint32_t gfsr = 0, syn0 = 0, syn1 = 0, syn2 = 0, gfar0 = 0, gfar1 = 0;
++    uint32_t fsr = 0, far0 = 0, far1 = 0, fsyn = 0, sctlr = 0, cbar = 0;
++    uint32_t s2cr = 0, scr0 = 0;
++
++    if (venus_smmu.base == 0) {
++        return;
++    }
++    (void)venus_rd32(venus_smmu.base, VENUS_SMMU_SCR0, &scr0);
++    (void)venus_rd32(venus_smmu.base, VENUS_SMMU_GFSR, &gfsr);
++    (void)venus_rd32(venus_smmu.base, 0x040u, &gfar0);
++    (void)venus_rd32(venus_smmu.base, 0x044u, &gfar1);
++    (void)venus_rd32(venus_smmu.base, 0x050u, &syn0);
++    (void)venus_rd32(venus_smmu.base, 0x054u, &syn1);
++    (void)venus_rd32(venus_smmu.base, 0x058u, &syn2);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FSR,
++        &fsr);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FAR,
++        &far0);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_FAR + 4u,
++        &far1);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.cb + 0x068u, &fsyn);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.cb + VENUS_SMMU_CB_SCTLR,
++        &sctlr);
++    (void)venus_rd32(venus_smmu.base, venus_smmu.gr1 +
++        VENUS_SMMU_CBAR(venus_smmu.bank), &cbar);
++    (void)venus_rd32(venus_smmu.base, VENUS_SMMU_S2CR(venus_smmu.slot[0]),
++        &s2cr);
++    venus_log("smmu %s: scr0=0x%x gfsr=0x%x gfar=0x%x%08x "
++        "syn0=0x%x syn1=0x%x syn2=0x%x", why, scr0, gfsr, gfar1,
++        gfar0, syn0, syn1, syn2);
++    venus_log("smmu %s: cb=%u fsr=0x%x far=0x%x%08x fsyn=0x%x "
++        "sctlr=0x%x cbar=0x%x s2cr=0x%x", why, venus_smmu.bank, fsr,
++        far1, far0, fsyn, sctlr, cbar, s2cr);
++}
++
++static int
++venus_pas_supported(void)
++{
++    uint64_t args[3] = { VENUS_PAS_ID, 0, 0 };
++    int32_t transport = -1;
++    int64_t result = 0;
++    int rc = mondrian_scm_call(VENUS_SCM_PIL_BASE | VENUS_SCM_PIL_SUPPORTED,
++        1, args, &transport, &result);
++
++    venus_log("pas supported(%u) -> rc=%d transport=%d result=%lld",
++        VENUS_PAS_ID, rc, transport, (long long)result);
++    return (rc == 0 && transport == 0 && result != 0) ? 0 : -1;
++}
++
++static int
++venus_pas_call(uint32_t command, uint32_t info, const uint64_t args[3],
++    const char *name)
++{
++    int32_t transport = -1;
++    int64_t result = -1;
++    int rc;
++
++    venus_log("pas %s enter arg0=0x%llx arg1=0x%llx info=0x%x", name,
++        (unsigned long long)args[0], (unsigned long long)args[1], info);
++    mondrian_log_flush_now();
++    rc = mondrian_scm_call(VENUS_SCM_PIL_BASE | command, info, args,
++        &transport, &result);
++
++    venus_log("pas %s(%u) -> rc=%d transport=%d result=%lld", name,
++        VENUS_PAS_ID, rc, transport, (long long)result);
++    return (rc == 0 && transport == 0 && result == 0) ? 0 : -1;
++}
++
++static int
++venus_fw_copy_segment(struct venus_fw_source *source, uint32_t source_offset,
++    vm_offset_t destination, uint32_t length)
++{
++    uint32_t done = 0;
++
++    while (done < length) {
++        uint32_t chunk = length - done;
++        uint32_t i;
++
++        if (chunk > sizeof(venus_fw_bounce)) {
++            chunk = sizeof(venus_fw_bounce);
++        }
++        if (venus_fw_read(source, source_offset + done, venus_fw_bounce,
++            chunk)) {
++            return -1;
++        }
++        for (i = 0; i < chunk; i++) {
++            *(volatile uint8_t *)(destination + done + i) =
++                venus_fw_bounce[i];
++        }
++        done += chunk;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    return 0;
++}
++
++static int
++venus_load_firmware(struct venus_fw_source *source)
++{
++    uint8_t elf[52];
++    struct venus_phdr phdr[20];
++    uint32_t phoff, phnum, phsize, ehsize;
++    uint32_t lo = ~0u, hi = 0, hash = ~0u, i, hdr_size;
++    uint64_t args[3];
++    int relocated = 1;
++
++    if (venus_fw_read(source, 0, elf, sizeof(elf)) ||
++        elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F' ||
++        elf[4] != 1 || elf[5] != 1 || elf[6] != 1 ||
++        venus_le16(elf + 16) != 2 || venus_le16(elf + 18) != 0x005e ||
++        venus_le16(elf + 40) != 52 || venus_le16(elf + 42) != 32) {
++        venus_log("firmware is not ELF32 little-endian AArch64");
++        return -1;
++    }
++    phoff = venus_le32(elf + 28);
++    phsize = venus_le16(elf + 42);
++    phnum = venus_le16(elf + 44);
++    if (phnum == 0 || phnum > 20 || phoff > source->size ||
++        phnum > (source->size - phoff) / phsize) {
++        return -1;
++    }
++    if (venus_fw_read(source, phoff, phdr, phnum * phsize)) {
++        return -1;
++    }
++    ehsize = phoff + phnum * phsize;
++    for (i = 0; i < phnum; i++) {
++        struct venus_phdr *p = &phdr[i];
++
++        p->type = venus_le32((const uint8_t *)&p->type);
++        p->offset = venus_le32((const uint8_t *)&p->offset);
++        p->vaddr = venus_le32((const uint8_t *)&p->vaddr);
++        p->paddr = venus_le32((const uint8_t *)&p->paddr);
++        p->filesz = venus_le32((const uint8_t *)&p->filesz);
++        p->memsz = venus_le32((const uint8_t *)&p->memsz);
++        p->flags = venus_le32((const uint8_t *)&p->flags);
++        p->align = venus_le32((const uint8_t *)&p->align);
++        if (((p->flags >> 24) & 7u) == 2u) {
++            hash = i;
++        }
++        if (p->type == 1u && p->memsz != 0) {
++            uint64_t end = (uint64_t)p->paddr + p->memsz;
++
++            if (end > 0xffffffffULL) {
++                return -1;
++            }
++            if ((p->flags & (1u << 27)) == 0) {
++                relocated = 0;
++            }
++            if (p->paddr < lo) {
++                lo = p->paddr;
++            }
++            if (end > hi) {
++                hi = (uint32_t)end;
++            }
++        }
++    }
++    hdr_size = phdr[0].filesz;
++    if (hash == ~0u || hdr_size > VENUS_META_SIZE ||
++        phdr[hash].filesz > VENUS_META_SIZE - hdr_size ||
++        hi <= lo || hi - lo > VENUS_FW_SIZE) {
++        return -1;
++    }
++    venus_log("fw linked 0x%x..0x%x reloc=%d span=0x%x metadata=%u "
++        "(hdr=%u hash=%u)", lo, hi, relocated, hi - lo,
++        hdr_size + phdr[hash].filesz, hdr_size, phdr[hash].filesz);
++
++    venus_mem_zero(venus_aux_va + VENUS_META_OFFSET, VENUS_META_SIZE);
++    if (venus_fw_copy_segment(source, 0, venus_aux_va + VENUS_META_OFFSET,
++        hdr_size) ||
++        venus_fw_copy_segment(source, phdr[hash].offset,
++        venus_aux_va + VENUS_META_OFFSET + hdr_size, phdr[hash].filesz)) {
++        return -1;
++    }
++    args[0] = VENUS_PAS_ID;
++    args[1] = 0;
++    args[2] = 0;
++    /* Informational only: pas supported is informational, the vendor
++     * loader never queries it and this TZ answers 0 for video. */
++    (void)venus_pas_supported();
++    args[1] = VENUS_AUX_PA + VENUS_META_OFFSET;
++    if (venus_pas_call(VENUS_SCM_PIL_INIT, 2u | (2u << 6), args,
++        "init_image")) {
++        return -1;
++    }
++    venus_pas_accepted = 1;
++    if (relocated) {
++        args[1] = VENUS_FW_PA;
++        args[2] = VENUS_FW_SIZE;
++        if (venus_pas_call(VENUS_SCM_PIL_MEM_SETUP, 3, args, "mem_setup")) {
++            return -1;
++        }
++    }
++    for (i = 0; i < phnum; i++) {
++        struct venus_phdr *p = &phdr[i];
++        vm_offset_t destination;
++        uint32_t zero;
++
++        if (p->type != 1u || p->memsz == 0) {
++            continue;
++        }
++        destination = venus_fw_va + (p->paddr - lo);
++        if (p->filesz != 0 &&
++            venus_fw_copy_segment(source, p->offset, destination,
++            p->filesz)) {
++            return -1;
++        }
++        for (zero = (p->filesz + 3u) & ~3u; zero < p->memsz; zero += 4u) {
++            venus_mem_wr32(destination + zero, 0);
++        }
++        venus_log("seg %u -> 0x%llx file=%u mem=%u", i,
++            (unsigned long long)(VENUS_FW_PA + (p->paddr - lo)),
++            p->filesz, p->memsz);
++    }
++    if (venus_power_check()) {
++        return -1;
++    }
++    args[1] = 0;
++    args[2] = 0;
++    if (venus_pas_call(VENUS_SCM_PIL_AUTH, 1, args, "auth_and_reset")) {
++        return -1;
++    }
++    if (!venus_skip_protect) {
++        venus_mem_protect();
++    }
++    /*
++     * no early mvs0 handoff: the donor port measured that setting mvs0
++     * HW_CONTROL before CTRL_INIT lets the GDSC collapse under a firmware
++     * that has not started (0 FBDs, e11), and it keeps the domain in SW
++     * mode by default. Without RPMh votes, the early handoff is what froze
++     * CTRL_STATUS at zero after mem_protect. Hand off only once the
++     * firmware has answered CTRL_INIT.
++     */
++    return 0;
++}
++
++static void
++venus_queue_init(void)
++{
++    vm_offset_t table = venus_queue_va;
++    unsigned i;
++
++    venus_mem_zero(venus_queue_va, VENUS_QUEUE_UC_SIZE);
++    venus_mem_wr32(table + 0x00, 0);                 /* qtbl_version */
++    venus_mem_wr32(table + 0x04, VENUS_QTABLE_SIZE);
++    venus_mem_wr32(table + 0x08, 0x120);             /* first qhdr */
++    venus_mem_wr32(table + 0x0c, VENUS_QHEADER_SIZE);
++    venus_mem_wr32(table + 0x10, 3);
++    venus_mem_wr32(table + 0x14, 3);
++    venus_mem_wr32(table + 0x18, (uint32_t)VENUS_QUEUE_PA);
++    for (i = 0; i < 14; i++) {
++        venus_mem_wr32(table + 0x20 + 4u * i,
++            (uint32_t)(uint8_t)"msm_v4l2_vidc"[i]);
++    }
++    for (i = 0; i < 3; i++) {
++        vm_offset_t h = table + 0x120 + i * VENUS_QHEADER_SIZE;
++
++        venus_mem_wr32(h + 0x00, 1);
++        venus_mem_wr32(h + 0x04, (uint32_t)(VENUS_QUEUE_PA +
++            VENUS_QTABLE_SIZE + i * VENUS_QUEUE_SIZE));
++        venus_mem_wr32(h + 0x08, 0x01010000u | i);
++        venus_mem_wr32(h + 0x0c, VENUS_QUEUE_WORDS);
++        venus_mem_wr32(h + 0x18, 1);                 /* rx_wm */
++        venus_mem_wr32(h + 0x1c, 1);                 /* tx_wm */
++        venus_mem_wr32(h + 0x20, i == 2 ? 0u : 1u);  /* rx_req */
++    }
++    venus_mem_wr32(venus_aux_va + (VENUS_SFR_PA - VENUS_AUX_PA), 4096);
++}
++
++static int
++venus_uc_setup(void)
++{
++    if (venus_wr32(venus_core, VENUS_UC_REGION_ADDR,
++        (uint32_t)VENUS_QUEUE_PA) ||
++        venus_wr32(venus_core, VENUS_UC_REGION_SIZE,
++        (uint32_t)VENUS_QUEUE_UC_SIZE) ||
++        venus_wr32(venus_core, VENUS_QTBL_ADDR, (uint32_t)VENUS_QUEUE_PA) ||
++        venus_wr32(venus_core, VENUS_QTBL_INFO, 1) ||
++        venus_wr32(venus_core, VENUS_SFR_ADDR,
++        (uint32_t)(VENUS_SFR_PA + 1))) {
++        return -1;
++    }
++    return 0;
++}
++
++static int
++venus_ctrl_init(void)
++{
++    uint32_t status, intr = 0, cpu;
++    unsigned i;
++
++    if (venus_wr32(venus_core, VENUS_CTRL_INIT, 1u)) {
++        return -1;
++    }
++    /*
++     * Vendor __boot_firmware_iris2 and mainline iris_vpu_boot_firmware both
++     * leave the loop on any non-zero status; only (status & 0xfe) == 0x4 is
++     * the invalid-UC error.      * invalid-UC error. PC_READY is bit 8, not bit 0. delay() takes
++     * microseconds: 1 ms per try, 1 s total, like the donor's loop
++     * (vendor sleeps 50-100 us per try for the same 1000 tries).
++     */
++    for (i = 0; i < 1000; i++) {
++        if (venus_rd32(venus_core, VENUS_CTRL_STATUS, &status)) {
++            return -1;
++        }
++        if ((status & VENUS_CTRL_ERROR) == VENUS_UC_INVALID) {
++            venus_log("CTRL_STATUS 0x%x error=0x%x (invalid UC_REGION)",
++                status, status & VENUS_CTRL_ERROR);
++            venus_smmu_fault_report("ctrl init");
++            return -1;
++        }
++        if (status != 0) {
++            break;
++        }
++        delay(1000);
++    }
++    if (i == 1000) {
++        uint32_t q0r, q0w, q1r, q1w, sfr, smr = 0;
++
++        venus_log("CTRL_STATUS stayed 0x%x after 1 s (ares_before=0x%x)",
++            status, venus_ares_before);
++        venus_smmu_fault_report("ctrl timeout");
++        if (venus_rd32(venus_smmu.base, VENUS_SMMU_SMR(venus_smmu.slot[0]),
++            &smr) == 0) {
++            venus_log("smmu smr[%u]=0x%x", venus_smmu.slot[0], smr);
++        }
++        intr = 0;
++        if (venus_rd32(venus_core, VENUS_WRAPPER_INTR, &intr) == 0) {
++            venus_log("wrapper intr=0x%x", intr);
++        }
++        cpu = 0;
++        if (venus_rd32(venus_core, VENUS_WRAPPER_TZ_CPU, &cpu) == 0) {
++            venus_log("wrapper tz cpu=0x%x", cpu);
++        }
++        q0r = venus_mem_rd32(venus_queue_va + 0x120 + 0x30);
++        q0w = venus_mem_rd32(venus_queue_va + 0x120 + 0x34);
++        q1r = venus_mem_rd32(venus_queue_va + 0x120 +
++            VENUS_QHEADER_SIZE + 0x30);
++        q1w = venus_mem_rd32(venus_queue_va + 0x120 +
++            VENUS_QHEADER_SIZE + 0x34);
++        sfr = venus_mem_rd32(venus_aux_va + (VENUS_SFR_PA - VENUS_AUX_PA));
++        venus_log("q0 r/w=%u/%u q1 r/w=%u/%u sfr=0x%x",
++            q0r, q0w, q1r, q1w, sfr);
++        return -1;
++    }
++    if (venus_wr32(venus_core, VENUS_H2XSOFTINTEN, 1) ||
++        venus_wr32(venus_core, VENUS_X2RPMH, 0)) {
++        return -1;
++    }
++    if (venus_rd32(venus_core, VENUS_WRAPPER_INTR, &intr) == 0 &&
++        (intr & VENUS_A2HWD) != 0) {
++        venus_log("firmware watchdog asserted intr=0x%x", intr);
++        return -1;
++    }
++    if (venus_rd32(venus_core, VENUS_WRAPPER_TZ_CPU, &cpu)) {
++        cpu = 0;
++    }
++    venus_log("CTRL_STATUS=0x%x wrapper=0x%x cpu=0x%x", status, intr, cpu);
++    return 0;
++}
++
++static int
++venus_queue_write(const uint32_t *packet, uint32_t words)
++{
++    vm_offset_t h = venus_queue_va + 0x120;
++    vm_offset_t data = venus_queue_va + VENUS_QTABLE_SIZE;
++    uint32_t read = venus_mem_rd32(h + 0x30);
++    uint32_t write = venus_mem_rd32(h + 0x34);
++    uint32_t space, i;
++
++    if (read >= VENUS_QUEUE_WORDS || write >= VENUS_QUEUE_WORDS) {
++        return -1;
++    }
++    space = write >= read ? VENUS_QUEUE_WORDS - (write - read) :
++        read - write;
++    if (space <= words) {
++        return -1;
++    }
++    for (i = 0; i < words; i++) {
++        venus_mem_wr32(data + 4u * ((write + i) % VENUS_QUEUE_WORDS),
++            packet[i]);
++    }
++    venus_mem_wr32(h + 0x34, (write + words) % VENUS_QUEUE_WORDS);
++    return venus_wr32(venus_core, VENUS_CPU_IC_SOFTINT, 1u);
++}
++
++static int
++venus_queue_read(uint32_t *packet, uint32_t *packet_words)
++{
++    vm_offset_t h = venus_queue_va + 0x120 + VENUS_QHEADER_SIZE;
++    vm_offset_t data = venus_queue_va + VENUS_QTABLE_SIZE + VENUS_QUEUE_SIZE;
++    uint32_t read = venus_mem_rd32(h + 0x30);
++    uint32_t write = venus_mem_rd32(h + 0x34);
++    uint32_t words, i;
++
++    if (read >= VENUS_QUEUE_WORDS || write >= VENUS_QUEUE_WORDS) {
++        venus_log("message queue index corrupt read=%u write=%u", read, write);
++        return -1;
++    }
++    if (read == write) {
++        venus_mem_wr32(h + 0x20, 1);
++        return 0;
++    }
++    words = venus_mem_rd32(data + 4u * read) / 4u;
++    if (words < VENUS_HFI_HEADER_WORDS + VENUS_HFI_PACKET_WORDS ||
++        words > VENUS_MAX_PACKET_SIZE / 4u) {
++        venus_log("bad HFI packet size %u at index %u", words * 4u, read);
++        return -1;
++    }
++    for (i = 0; i < words; i++) {
++        packet[i] = venus_mem_rd32(data +
++            4u * ((read + i) % VENUS_QUEUE_WORDS));
++    }
++    venus_mem_wr32(h + 0x30, (read + words) % VENUS_QUEUE_WORDS);
++    venus_mem_wr32(h + 0x20, 1);
++    if (venus_mem_rd32(h + 0x24) == 1) {
++        (void)venus_wr32(venus_core, VENUS_CPU_IC_SOFTINT, 1u);
++    }
++    *packet_words = words;
++    return 1;
++}
++
++static int
++venus_hfi_wait(uint32_t type, uint32_t *words)
++{
++    unsigned attempt;
++
++    for (attempt = 0; attempt < 2000; attempt++) {
++        uint32_t count = 0, packet_type, flags, session, packets, i;
++        int rc = venus_queue_read(venus_response, &count);
++
++        if (rc < 0) {
++            return -1;
++        }
++        if (rc == 0) {
++            delay(1);
++            continue;
++        }
++        session = venus_response[1];
++        packets = venus_response[7];
++        if (session != 0 || packets == 0 ||
++            count < VENUS_HFI_HEADER_WORDS) {
++            continue;
++        }
++        i = VENUS_HFI_HEADER_WORDS;
++        while (packets-- != 0 && i + VENUS_HFI_PACKET_WORDS <= count) {
++            uint32_t size = venus_response[i];
++
++            if (size < VENUS_HFI_PACKET_WORDS * 4u ||
++                i + size / 4u > count) {
++                return -1;
++            }
++            packet_type = venus_response[i + 1];
++            flags = venus_response[i + 2];
++            if ((flags & VENUS_HFI_FW_SYSERR) != 0) {
++                venus_log("HFI system error type=0x%x flags=0x%x",
++                    packet_type, flags);
++                return -1;
++            }
++            if (packet_type == type) {
++                *words = count;
++                return 1;
++            }
++            i += size / 4u;
++        }
++    }
++    return 0;
++}
++
++static int
++venus_hfi_sys_init(void)
++{
++    uint32_t packet[17];
++    uint32_t words = 0;
++    int rc;
++
++    bzero(packet, sizeof(packet));
++    packet[0] = sizeof(packet);
++    packet[2] = venus_header_id++;
++    packet[7] = 1;
++    packet[8] = 36;
++    packet[9] = VENUS_HFI_CMD_INIT;
++    packet[10] = VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP |
++        VENUS_HFI_HOST_NONDISC;
++    packet[11] = VENUS_HFI_PAYLOAD_U32;
++    packet[13] = venus_packet_id++;
++    packet[16] = VENUS_HFI_ARCH_LX;
++    if (venus_queue_write(packet, 17)) {
++        return -1;
++    }
++    rc = venus_hfi_wait(VENUS_HFI_CMD_INIT, &words);
++    if (rc != 1) {
++        venus_log("HFI INIT response %s", rc == 0 ? "timed out" : "failed");
++        return -1;
++    }
++    if ((venus_response[VENUS_HFI_HEADER_WORDS + 2] &
++        VENUS_HFI_FW_SUCCESS) == 0) {
++        venus_log("HFI INIT rejected flags=0x%x",
++            venus_response[VENUS_HFI_HEADER_WORDS + 2]);
++        return -1;
++    }
++    venus_log("HFI INIT success packets=%u bytes=%u", venus_response[7],
++        words * 4u);
++    return 0;
++}
++
++static int
++venus_hfi_image_version(void)
++{
++    uint32_t packet[16];
++    uint32_t words = 0, size, flags, payload_bytes, i;
++    char fw_version[VENUS_HFI_VERSION_BYTES + 1];
++    int rc;
++
++    bzero(packet, sizeof(packet));
++    packet[0] = sizeof(packet);
++    packet[2] = venus_header_id++;
++    packet[7] = 1;
++    packet[8] = 32;
++    packet[9] = VENUS_HFI_PROP_IMAGE;
++    packet[10] = VENUS_HFI_HOST_INTR | VENUS_HFI_HOST_RESP |
++        VENUS_HFI_HOST_GETPROP;
++    packet[13] = venus_packet_id++;
++    if (venus_queue_write(packet, 16)) {
++        return -1;
++    }
++    rc = venus_hfi_wait(VENUS_HFI_PROP_IMAGE, &words);
++    if (rc != 1) {
++        venus_log("HFI PROP response %s", rc == 0 ? "timed out" : "failed");
++        return -1;
++    }
++    size = venus_response[VENUS_HFI_HEADER_WORDS];
++    flags = venus_response[VENUS_HFI_HEADER_WORDS + 2];
++    if (size < 32u || VENUS_HFI_HEADER_WORDS + size / 4u > words) {
++        return -1;
++    }
++    payload_bytes = size - 32u;
++    if (payload_bytes < VENUS_HFI_VERSION_BYTES) {
++        venus_log("HFI PROP payload too short %u", payload_bytes);
++        return -1;
++    }
++    for (i = 0; i < VENUS_HFI_VERSION_BYTES; i++) {
++        const uint8_t *p = (const uint8_t *)&venus_response[
++            VENUS_HFI_HEADER_WORDS + VENUS_HFI_PACKET_WORDS];
++
++        fw_version[i] = p[i] >= 0x20 && p[i] <= 0x7e ? (char)p[i] : ' ';
++    }
++    fw_version[VENUS_HFI_VERSION_BYTES] = '\0';
++    venus_log("HFI PROP type=0x%x flags=0x%x payload=%u", VENUS_HFI_PROP_IMAGE,
++        flags, payload_bytes);
++    venus_log("fw version %s", fw_version);
++    return 0;
++}
++
++#define VENUS_FW_PATH "/private/var/vm/vpu20_4v.mbn"
++#define VENUS_FW_FILE_SIZE 2023560u
++
++static int venus_fw_last_read = -999;
++
++static int
++venus_file_read(void *arg, uint32_t offset, void *buffer, uint32_t length)
++{
++    const char *path = (const char *)arg;
++    int got = mondrian_root_read(path, buffer, length, (off_t)offset);
++
++    return got == (int)length ? 0 : -1;
++}
++
++int
++mondrian_venus_fw_source(struct venus_fw_source *source)
++{
++    static char path[] = VENUS_FW_PATH;
++    uint8_t elf[52];
++
++    /* The host verifies the stock-blob digest. Here require the ELF32 header
++     * and let the segment loader validate every extent it actually reads. */
++    venus_fw_last_read = mondrian_root_read(path, elf, sizeof(elf), 0);
++    if (venus_fw_last_read != (int)sizeof(elf) ||
++        elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F' ||
++        elf[4] != 1 || elf[5] != 1 || venus_le16(elf + 16) != 2 ||
++        venus_le16(elf + 18) != 0x005e) {
++        return -1;
++    }
++    source->size = VENUS_FW_FILE_SIZE;
++    source->read = venus_file_read;
++    source->arg = path;
++    venus_log("firmware provider %s size=%u sha256=532c97f749e83906", path,
++        source->size);
++    return 0;
++}
++
++static int
++venus_map_windows(void)
++{
++    venus_log("step: map core/videoCC");
++    mondrian_log_flush_now();
++    venus_core = ml_io_map(VENUS_CORE_PA, VENUS_CORE_SIZE);
++    venus_videocc = ml_io_map(VENUS_VIDEOCC_PA, VENUS_VIDEOCC_SIZE);
++    venus_log("step: core=0x%lx videocc=0x%lx",
++        (unsigned long)venus_core, (unsigned long)venus_videocc);
++    mondrian_log_flush_now();
++    venus_log("step: map low memory fw/queue/aux");
++    mondrian_log_flush_now();
++    venus_fw_va = ml_io_map_unmappable(VENUS_FW_PA, VENUS_FW_SIZE,
++        VM_WIMG_WCOMB);
++    venus_queue_va = ml_io_map_unmappable(VENUS_QUEUE_PA,
++        VENUS_QUEUE_UC_SIZE, VM_WIMG_WCOMB);
++    venus_aux_va = ml_io_map_unmappable(VENUS_AUX_PA, VENUS_AUX_SIZE,
++        VM_WIMG_WCOMB);
++    venus_log("step: low fw=0x%lx queue=0x%lx aux=0x%lx",
++        (unsigned long)venus_fw_va, (unsigned long)venus_queue_va,
++        (unsigned long)venus_aux_va);
++    mondrian_log_flush_now();
++    if (venus_core == 0 || venus_videocc == 0 || venus_fw_va == 0 ||
++        venus_queue_va == 0 || venus_aux_va == 0) {
++        venus_log("cannot map core/videoCC/low-memory windows");
++        return -1;
++    }
++    venus_log("step: low-memory canary");
++    mondrian_log_flush_now();
++    if (venus_mem_canary()) {
++        venus_log("low-memory canary failed; refusing DMA/PAS");
++        return -1;
++    }
++    venus_log("step: canary ok");
++    mondrian_log_flush_now();
++    return 0;
++}
++
++static int
++venus_bringup(void)
++{
++    struct venus_fw_source source;
++    uint64_t args[3];
++    unsigned int wait;
++    int rc = -1;
++
++    bzero(&source, sizeof(source));
++    /* /private/var/vm is volatile: wait for the host to upload the blob after
++     * this kernel is already running. No power or PAS access happens first. */
++    if (mondrian_venus_fw_source(&source) != 0) {
++        venus_log("first firmware probe read=%d", venus_fw_last_read);
++    } else {
++        venus_log("firmware present at start size=%u", source.size);
++    }
++    for (wait = 0; wait < 120; wait++) {
++        if (mondrian_venus_fw_source(&source) == 0 &&
++            source.read != NULL && source.size != 0) {
++            venus_log("firmware present after %u s", wait);
++            break;
++        }
++        if ((wait % 10) == 0) {
++            venus_log("firmware wait %u s read=%d", wait, venus_fw_last_read);
++        }
++        delay(1000000);
++    }
++    if (source.read == NULL || source.size == 0) {
++        venus_log("vpu20_4v.mbn provider unavailable after 120 s");
++        return -1;
++    }
++    if (venus_probe_only) {
++        venus_log("provider probe PASS; power/SMMU/PAS not started");
++        return 0;
++    }
++    if (venus_map_windows()) {
++        return -1;
++    }
++    venus_log("step: power on");
++    mondrian_log_flush_now();
++    if (venus_power_on()) {
++        goto out;
++    }
++    venus_log("step: power on ok");
++    mondrian_log_flush_now();
++    venus_log("step: program Venus SMMU");
++    mondrian_log_flush_now();
++    if (venus_smmu_program()) {
++        goto out;
++    }
++    venus_log("step: SMMU programmed; load firmware");
++    mondrian_log_flush_now();
++    if (venus_load_firmware(&source)) {
++        goto out;
++    }
++    venus_log("step: firmware loaded");
++    mondrian_log_flush_now();
++    venus_queue_init();
++    if (venus_uc_setup() || venus_ctrl_init() || venus_hfi_sys_init() ||
++        venus_hfi_image_version()) {
++        goto out;
++    }
++    venus_log("V1 PASS SYS_PROP; no session, encode, VT or IRQ");
++    rc = 0;
++
++out:
++    if (rc == 0 || venus_pas_accepted) {
++        args[0] = VENUS_PAS_ID;
++        args[1] = 0;
++        args[2] = 0;
++        if (venus_power_check() == 0 &&
++            venus_pas_call(VENUS_SCM_PIL_SHUTDOWN, 1, args, "shutdown") == 0) {
++            venus_smmu_teardown();
++        } else {
++            venus_log("PAS shutdown failed/uncertain; leave power and SMMU live");
++            rc = -1;
++        }
++    } else {
++        venus_smmu_teardown();
++    }
++    venus_smmu_fault_dump();
++    mondrian_log_flush_now();
++    return rc;
++}
++
++static void __dead2
++mondrian_venus_thread(__unused void *arg, __unused wait_result_t wr)
++{
++    /* Let the USB gadget and ring come up before touching a powered domain. */
++    venus_log("thread entry; holding 30 s");
++    delay(30 * 1000000);
++    venus_log("hold done; starting bringup");
++    (void)venus_bringup();
++    (void)thread_terminate(current_thread());
++    (void)thread_block(THREAD_CONTINUE_NULL);
++    __builtin_unreachable();
++}
++
++void
++mondrian_venus_start(void)
++{
++    static uint32_t started;
++    thread_t thread;
++    kern_return_t kr;
++    uint32_t enabled = 0;
++
++    if (PE_parse_boot_argn("mondrianvenusprobe", &enabled, sizeof(enabled)) &&
++        enabled == 1) {
++        venus_probe_only = 1;
++        enabled = 1;
++    } else if (!PE_parse_boot_argn("mondrianvenus", &enabled,
++        sizeof(enabled)) || enabled != 1) {
++        return;
++    }
++    if (PE_parse_boot_argn("mondrianvenusrails", &enabled, sizeof(enabled)) &&
++        enabled == 1) {
++        venus_vote_rails = 1;
++    }
++    if (PE_parse_boot_argn("mondrianvenusnopll", &enabled, sizeof(enabled)) &&
++        enabled == 1) {
++        venus_pll_cfg = 0;
++    }
++    if (PE_parse_boot_argn("mondrianvenusnoprotect", &enabled,
++        sizeof(enabled)) && enabled == 1) {
++        venus_skip_protect = 1;
++    }
++    if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL) != 0) {
++        return;
++    }
++    kr = kernel_thread_start(mondrian_venus_thread, NULL, &thread);
++    if (kr != KERN_SUCCESS) {
++        __atomic_store_n(&started, 0, __ATOMIC_RELEASE);
++        venus_log("worker allocation failed kr=0x%x", kr);
++        return;
++    }
++    thread_deallocate(thread);
++    venus_log("worker started; polled HFI, SPI %u unused", VENUS_DT_IRQ_SPI);
++}
++
++#else /* !MONDRIAN */
++
++void
++mondrian_venus_start(void)
++{
++}
++
++#endif /* MONDRIAN */
