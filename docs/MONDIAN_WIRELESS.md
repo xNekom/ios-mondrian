@@ -10,8 +10,8 @@ combo, whose two halves are separate buses and separate projects.
 
 `0415` adds the first Wi-Fi milestone behind `mondrianwifi=1`: PCIe0 cold link
 and QCA6490 config identity only, with bus mastering off and no SMMU, DMA, MSI,
-MHI or firmware. Measured 2026-11-25 on the `04:07:36` kernel with Bluetooth
-off: all eight WLAN/PCIe rails voted, the live 82-entry PHY table loaded, link
+MHI or firmware. Measured 2026-11-25 with Bluetooth off: all eight WLAN/PCIe
+rails voted, the live 82-entry PHY table loaded, link
 came up **Gen2 x1**, and config read `17cb:1103`, subsystem `17cb:0108`,
 revision `01`; bus mastering read back clear. The worker reuses touch's early
 GCC window because a second late `ml_io_map()` of the same block stalled. The default
@@ -19,14 +19,23 @@ boot (no `mondrianwifi`) emits no Wi‑Fi worker lines and `btuart` still reads 
 Bluetooth controller identity.
 
 `0417`/`0418` add W2 under the same gate: guarded apps-SMMU access, one wired
-canary, and readback of the SID `0x1c01` route. Measured 2026-11-25 on
-`05:19:47`: `IDR0=0x4c017e71`, `IDR1=0x6000004b`, `IDR2=0x5111` give native
+canary, and readback of the SID `0x1c01` route. Measured 2026-11-25:
+`IDR0=0x4c017e71`, `IDR1=0x6000004b`, `IDR2=0x5111` give native
 4K, 32-bit input, 36-bit output, 75 context banks and 120 SMR slots. The
 inherited `sCR0=0x280406` is preserved. Bank 74 programs `SCTLR=0x27` and
 `TTBR0=0x1c01000849ff0000`; slot 6 reads back `SMR=0x80001c01`, `S2CR=0x4a`.
 Bus mastering stays off and teardown completes. `ATOSNS=1` means `ATS1PR` is
 absent, so the result is **W2 PARTIAL**: context/route proof, not a hardware
 page walk or endpoint DMA.
+
+`0422` adds W3 under the same gate. It fixes the PCI command mask: bit 1 is
+memory space and bit 2 is bus master, so W1 had been disabling memory and never
+touching DMA. Measured 2026-11-25: the bootloader leaves BAR0 at
+`0x00000004/0x00000000` (address 0); writing `0x60200004` with memory off reads
+back `0x60200004`, and the bus-master bit sets (`command=0x0006`) and clears
+(`0x0002`). The first attempt also mapped the BAR and hung on the first read, so
+the MHI registers wait for the guarded accessor; no ring, DMA, MSI, firmware or
+network is started.
 
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
