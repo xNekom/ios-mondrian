@@ -1,0 +1,116 @@
+xnu 0422: prove the QCA6490 bus-master bit and the BAR0 write (mondrianwifi=1)
+
+W1 mislabelled PCI command bit 1 as bus master; bit 1 is memory space and the
+DMA enable is bit 2, so W1 disabled memory and never touched bus mastering.
+The first W3 attempt programmed BAR0 and mapped 0x60200000; the worker hung on
+the first BAR read. W3 now stays in config space: it records the inherited
+BAR0, writes 0x60200004 with memory space off, reads it back, and proves the
+real bus-master bit sets and clears with the 0418 SMMU context installed. No
+BAR access, DMA, firmware or network is started.
+
+Facts from mainline drivers/bus/mhi/core/internal.h (GPL-2.0, constants) and
+qiumochen/UniXNU-zizhan PongWifiPlatform.cpp (BSD-2-Clause-Patent).
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index a60550f..3de1fbe 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -115,6 +115,7 @@ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
+ #define WIFI_BAR_BASE		0x60200000UL
+ #define WIFI_BAR_END		0x63ffffffUL
+ #define WIFI_BAR_SIZE		0x04000000UL
++#define WIFI_BAR_MAP		0x00200000UL
+ 
+ /* /soc/qcom,gdsc@17b004 and its qcom,collapse-vote phandle. */
+ #define WIFI_GCC_PA		0x01000000UL
+@@ -163,7 +164,8 @@ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
+ #define WIFI_PCI_ID_QCA6490	0x110317cbU
+ #define WIFI_PCI_VENDOR_QCOM	0x17cbU
+ #define WIFI_PCI_DEVICE_QCA6490	0x1103U
+-#define WIFI_PCI_BUS_MASTER	(1u << 1)
++#define WIFI_PCI_MEMORY		(1u << 1)
++#define WIFI_PCI_BUS_MASTER	(1u << 2)
+ 
+ struct wifi_phy_entry {
+ 	uint16_t off;
+@@ -276,7 +278,7 @@ static const struct wifi_rail wifi_rails[] = {
+ };
+ 
+ static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,
+-    wifi_iatu, wifi_cfg;
++    wifi_iatu, wifi_cfg, wifi_bar;
+ static vm_offset_t wifi_wlan_en_page, wifi_bt_en_page, wifi_perst_page,
+     wifi_clkreq_page, wifi_wake_page, wifi_xo_page;
+ 
+@@ -921,6 +923,52 @@ wifi_bus_master_off(void)
+ 	wifi_write16(wifi_cfg, 4, command & ~WIFI_PCI_BUS_MASTER);
+ }
+ 
++/*
++ * W3: prove the real PCI bus-master bit and record the BAR0 the bootloader
++ * left. The first attempt also programmed BAR0 and mapped 0x60200000; the
++ * worker hung on the first BAR read (no W3 line, no final log), so that access
++ * needs a guarded reader. Config space is safe and still answers the two
++ * questions this boot can ask: is the BAR assigned, and does the DMA enable
++ * set and clear with the 0418 SMMU context installed.
++ *
++ * PCI command bit 1 is memory space and bit 2 is bus master. 0415 called bit 1
++ * "bus master", so it disabled memory and never touched the DMA enable.
++ */
++static int
++wifi_mhi_probe(uint16_t command)
++{
++	uint32_t bar0 = mondrian_tlmm_read(wifi_cfg, 0x10);
++	uint32_t bar1 = mondrian_tlmm_read(wifi_cfg, 0x14);
++	uint16_t cmd;
++
++	wifi_log("W3 inherited BAR0=0x%08x/0x%08x command=0x%04x",
++	    bar0, bar1, wifi_read16(wifi_cfg, 4));
++	/*
++	 * BARs are writable with memory space off, which is the inherited state.
++	 * The donor assigns 0x60200004 after enabling memory; the readback here
++	 * says whether this endpoint accepts the write before any BAR access,
++	 * the access that hung the previous boot.
++	 */
++	mondrian_tlmm_write(wifi_cfg, 0x10, WIFI_BAR_BASE | 0x4u);
++	mondrian_tlmm_write(wifi_cfg, 0x14, 0);
++	bar0 = mondrian_tlmm_read(wifi_cfg, 0x10);
++	bar1 = mondrian_tlmm_read(wifi_cfg, 0x14);
++	wifi_log("W3 BAR0 write=0x%08x/0x%08x", bar0, bar1);
++	cmd = (uint16_t)(command | WIFI_PCI_MEMORY | WIFI_PCI_BUS_MASTER);
++	mondrian_tlmm_write(wifi_cfg, 4, cmd);
++	cmd = wifi_read16(wifi_cfg, 4);
++	wifi_log("W3 bus master on command=0x%04x", cmd);
++	if ((cmd & WIFI_PCI_BUS_MASTER) == 0) {
++		wifi_bus_master_off();
++		return wifi_fail("W3 bus master did not set");
++	}
++	wifi_bus_master_off();
++	cmd = wifi_read16(wifi_cfg, 4);
++	wifi_log("W3 bus master off command=0x%04x", cmd);
++	return (cmd & WIFI_PCI_BUS_MASTER) != 0 ?
++	    wifi_fail("W3 bus master did not clear") : 0;
++}
++
+ static int
+ wifi_config_identity(void)
+ {
+@@ -992,6 +1040,9 @@ wifi_config_identity(void)
+ 	    revision);
+ 	wifi_log("bus master held off command=%04x aperture=%lx..%lx",
+ 	    command, (unsigned long)WIFI_BAR_BASE, (unsigned long)WIFI_BAR_END);
++	if (wifi_mhi_probe(command) != 0) {
++		wifi_log("W3 BAR0/MHI probe failed; W1/W2 remain valid");
++	}
+ 	return 0;
+ }
+ 
+@@ -1041,7 +1092,7 @@ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ 		    WIFI_TLMM_DRIVE_2MA, 1), 0);
+ 	}
+ 	wifi_log(ok ?
+-	    "W1 complete; no DMA, SMMU, MSI, MHI or firmware was started" :
++	    "W1/W2/W3 complete; config-space proof; no DMA, firmware or network was started" :
+ 	    "worker stopped after failure; normal iOS boot continues");
+ 	mondrian_log_flush_now();
+ 	(void)thread_terminate(current_thread());
