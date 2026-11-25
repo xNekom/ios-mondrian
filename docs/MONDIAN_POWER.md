@@ -329,11 +329,23 @@ that vote, `hapr 3 REG` reads the SDAM, and `haps` includes both pages. `0414`
 adds `hapv MV` so VMAX can be changed from the live ring without a rebuild;
 the command is capped at 2000 mV. The first boot must show `spmimap` PPID
 `0x09d` with owner 0 before `hapb` is used; a foreign owner closes this path
-without a store. Measured 2026-11-25 on the `01:34:05` kernel: APID 428 answers
-PPID `0x09d` with owner 0, and `hapb 1` changed `hbst-vreg` from `0x00` to
-`0x80`. The SDAM bytes read back as zero even though the trigger runs, so the
-boost status is the proof. Amplitudes 0x40/0xff at 1250 mV and 0xff at 1650 mV
-left impedance/`hpwr` at zero and the LRA did not move. **2700 mV is unsafe in
+without a store. Measured 2026-11-25: APID 428 answers PPID `0x09d` with
+owner 0. An off→on vote (`hapb 0`, then `hapb 1`) lifts `hbst-vreg` to `0x80`
+and `hbst-status4` to `0x01`; a `vib` votes it off again, so a zero read after
+a play only means the driver already dropped the boost. The SDAM bytes read
+back as zero even though the trigger runs, so the boost status is the proof.
+
+`0421` gives the drive its open-loop period: CFG 0x5c is the high nibble and
+0x5d the low byte (the two defines were swapped), and the play writes the DT's
+5882 us as `0x498`. It forces VREG-ready only while the boost is up; bit 1 of
+VSET belongs to HAP525_HV, which this part is not. The play clears the fault
+latch and disables auto-resonance, as the stock's `DIRECT_PLAY` path does.
+`impedance 0x00` is a closed-loop measurement and proves nothing in open loop,
+and `status 0x04` is the multiplexed `STATUS_DATA_MSB`, not a fault: fault
+reads 0. SDAM `0x46/0x47` returns `0x04/0x6E`, a measured count distinct from
+the open-loop `0x498`, so the block does see the LRA. Motion still needs a
+physical check; the next drive test is the stock PTN click pattern.
+**2700 mV is unsafe in
 this sequence:** the following readback returned corrupted CFG/TLRA/HBST values,
 `vbat 825 mV out of range` appeared, and SpringBoard stopped presenting
 (`fps 0`, `DL total 0/0`). Do not repeat it.

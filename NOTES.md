@@ -69,9 +69,9 @@ Current blockers, in order:
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics play is accepted; the boost is not.** `vib` rejects `ms > 2000`;
-   `vib 2000 0xff 1` writes VMAX/amp and returns `sent`, but the SDAM trigger
-   (`0x42`/`0xe5`) reads back zero and `hbst-vreg`/`hbst-status4` stay `0x00`.
+3. **Haptics: drive configured, motion unconfirmed.** `hapb 0` then `hapb 1`
+   lifts `hbst-vreg` to `0x80`/`status4 0x01`; the play clears the fault, disables
+   auto-resonance and sets `0x498`; SDAM `0x46` holds `0x046E`, a measured count.
 4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
    drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
 5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm
