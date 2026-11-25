@@ -11,18 +11,36 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+size_t native_bridge_metal_status(char *out, size_t size);
+uint64_t native_bridge_metal_first_problem(char *out, size_t size);
 
 #define TURNIP "/private/var/vm/libvulkan_freedreno.dylib"
 #define CACHE "/private/var/tmp/m2v"
+
+/* The kernel's 0385 gate injects this dylib; this second gate arms the test. */
+#define MONDRIAN_METAL_PROBE_FILE "/private/var/vm/mondrian-metal-probe"
+#define MONDRIAN_METAL_PROBE_SIDE 64u
+#define MONDRIAN_METAL_PROBE_PIXELS (MONDRIAN_METAL_PROBE_SIDE * MONDRIAN_METAL_PROBE_SIDE)
+#define MONDRIAN_METAL_PROBE_TIMEOUT 20
+
+static void mondrian_metal_probe_constructor(void);
 
 static pthread_once_t mondrian_metal_once = PTHREAD_ONCE_INIT;
 static id mondrian_metal_device;
@@ -41,6 +59,9 @@ mondrian_metal_say(const char *format, ...)
 	va_end(args);
 	if (n <= 0) {
 		return;
+	}
+	if (n > (int)sizeof(line) - 1) {
+		n = (int)sizeof(line) - 1;
 	}
 	/*
 	 * WebKit's GPU process is sandboxed and cannot open /dev/console; logd
@@ -74,6 +95,7 @@ static void
 mondrian_metal_loaded(void)
 {
 	mondrian_metal_say("mondrian-metal: loaded into %s\n", getprogname());
+	mondrian_metal_probe_constructor();
 }
 
 /*
@@ -220,3 +242,173 @@ static const struct {
 } mondrian_metal_interpose[] = {
 	{ (const void *)mondrian_metal_default_device, (const void *)MTLCreateSystemDefaultDevice },
 };
+
+/*
+ * File-gated WebKit GPU probe. The design follows iOSPlus10's NegroniMetal
+ * selftest (MIT) and this tree's m2v_test.m (MIT, HakiOS authors); this
+ * implementation is original. It deliberately calls the provider's own
+ * factory, the function installed in __DATA,__interpose, so the test does not
+ * depend on WebKit happening to ask Metal first.
+ */
+static void
+mondrian_metal_probe_status(const char *verdict)
+{
+	char status[512] = "", problem[256] = "";
+
+	(void)native_bridge_metal_status(status, sizeof(status));
+	if (native_bridge_metal_first_problem(problem, sizeof(problem)) != 0)
+		mondrian_metal_say("mondrian-metal-probe: %s | %s | %s\n",
+		    verdict, status, problem);
+	else
+		mondrian_metal_say("mondrian-metal-probe: %s | %s\n",
+		    verdict, status);
+}
+
+static void __attribute__((noreturn))
+mondrian_metal_probe_fail(const char *why)
+{
+	mondrian_metal_say("mondrian-metal-probe: FAIL %s\n", why);
+	mondrian_metal_probe_status("FAIL");
+	signal(SIGSEGV, SIG_DFL);
+	raise(SIGSEGV);
+	_exit(139);
+}
+
+static void *
+mondrian_metal_probe_watchdog(void *unused)
+{
+	struct timespec wait = { .tv_sec = MONDRIAN_METAL_PROBE_TIMEOUT,
+	    .tv_nsec = 0 };
+
+	(void)unused;
+	while (nanosleep(&wait, &wait) != 0 && errno == EINTR)
+		;
+	mondrian_metal_say("mondrian-metal-probe: TIMEOUT after %d s\n",
+	    MONDRIAN_METAL_PROBE_TIMEOUT);
+	_exit(124);
+	return NULL;
+}
+
+static void *
+mondrian_metal_probe_run(void *unused)
+{
+	(void)unused;
+	@autoreleasepool {
+		id<MTLDevice> device = mondrian_metal_default_device();
+
+		if (device == nil) {
+			mondrian_metal_probe_status("NO_DEVICE");
+			_exit(0);
+		}
+		mondrian_metal_say("mondrian-metal-probe: device \"%s\"\n",
+		    [[device name] UTF8String]);
+
+		id<MTLCommandQueue> queue = [device newCommandQueue];
+		if (queue == nil)
+			mondrian_metal_probe_fail("newCommandQueue nil");
+
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth: @(MONDRIAN_METAL_PROBE_SIDE),
+			(id)kIOSurfaceHeight: @(MONDRIAN_METAL_PROBE_SIDE),
+			(id)kIOSurfaceBytesPerElement: @4,
+			(id)kIOSurfacePixelFormat: @((uint32_t)'BGRA')
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		if (surface == NULL)
+			mondrian_metal_probe_fail("IOSurfaceCreate NULL");
+		mondrian_metal_say("mondrian-metal-probe: surface %u %ux%u row %zu\n",
+		    IOSurfaceGetID(surface), MONDRIAN_METAL_PROBE_SIDE,
+		    MONDRIAN_METAL_PROBE_SIDE, IOSurfaceGetBytesPerRow(surface));
+
+		MTLTextureDescriptor *td = [MTLTextureDescriptor
+		    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		    width:MONDRIAN_METAL_PROBE_SIDE height:MONDRIAN_METAL_PROBE_SIDE
+		    mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		td.storageMode = MTLStorageModeShared;
+		id<MTLTexture> texture = [device newTextureWithDescriptor:td
+		    iosurface:surface plane:0];
+		if (texture == nil)
+			mondrian_metal_probe_fail("IOSurface texture nil");
+
+		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor
+		    renderPassDescriptor];
+		pass.colorAttachments[0].texture = texture;
+		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+		pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		if (cb == nil)
+			mondrian_metal_probe_fail("commandBuffer nil");
+		id<MTLRenderCommandEncoder> encoder =
+		    [cb renderCommandEncoderWithDescriptor:pass];
+		if (encoder == nil)
+			mondrian_metal_probe_fail("renderCommandEncoder nil");
+		[encoder endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		if (cb.status != MTLCommandBufferStatusCompleted) {
+			const char *detail = cb.error.localizedDescription.UTF8String;
+
+			mondrian_metal_probe_fail(detail != NULL ? detail :
+			    "command buffer did not complete");
+		}
+
+		if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0)
+			mondrian_metal_probe_fail("IOSurfaceLock failed");
+		void *base = IOSurfaceGetBaseAddress(surface);
+		size_t row = IOSurfaceGetBytesPerRow(surface);
+		if (base == NULL || row < MONDRIAN_METAL_PROBE_SIDE * 4)
+			mondrian_metal_probe_fail("IOSurface mapping invalid");
+
+		NSUInteger good = 0;
+		uint32_t first = 0, last = 0;
+		for (NSUInteger y = 0; y < MONDRIAN_METAL_PROBE_SIDE; y++) {
+			const uint32_t *pixels = (const uint32_t *)((const uint8_t *)base +
+			    y * row);
+
+			for (NSUInteger x = 0; x < MONDRIAN_METAL_PROBE_SIDE; x++) {
+				uint32_t pixel = pixels[x];
+
+				if (x == 0 && y == 0)
+					first = pixel;
+				last = pixel;
+				good += pixel == 0xff0000ffu;
+			}
+		}
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+		CFRelease(surface);
+
+		mondrian_metal_say("mondrian-metal-probe: clear good %lu/%u "
+		    "first %#x last %#x status %ld\n",
+		    (unsigned long)good, MONDRIAN_METAL_PROBE_PIXELS, first, last,
+		    (long)cb.status);
+		if (good != MONDRIAN_METAL_PROBE_PIXELS)
+			mondrian_metal_probe_fail("pixel readback wrong");
+
+		mondrian_metal_probe_status("PASS");
+		signal(SIGABRT, SIG_DFL);
+		abort();
+		_exit(134);
+	}
+	return NULL;
+}
+
+static void
+mondrian_metal_probe_constructor(void)
+{
+	struct stat st;
+	pthread_t probe, watchdog;
+
+	if (strcmp(getprogname(), "com.apple.WebKit.GPU") != 0 ||
+	    stat(MONDRIAN_METAL_PROBE_FILE, &st) != 0 || !S_ISREG(st.st_mode))
+		return;
+	if (pthread_create(&watchdog, NULL, mondrian_metal_probe_watchdog,
+	    NULL) != 0)
+		_exit(125);
+	pthread_detach(watchdog);
+	if (pthread_create(&probe, NULL, mondrian_metal_probe_run, NULL) != 0)
+		_exit(126);
+	pthread_detach(probe);
+}
