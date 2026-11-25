@@ -1929,12 +1929,11 @@ Two traps around that injection, both measured 2026-11-19:
   `tools/usb-ring.py` now retries a large file nine times and reports an
   incomplete delivery as an error; treat any `INCOMPLETE` as "this experiment is
   void", not as a slow upload.
-- **The GPU process cannot log.** Its stderr goes nowhere, `/dev/console` is
-  refused by its sandbox and `NSLog` did not appear in the ring either, while
-  the UI hook's own lines do reach it from SpringBoard and backboardd. Assume
-  nothing about that process is observable from inside it: use a dylib whose
-  only job is to abort on load to prove the insertion, and read the surface
-  bytes for everything else.
+- **The GPU process can log on this port.** Measured 2026-11-25, the provider's
+  `NSLog`/stderr lines reached the console ring from `com.apple.WebKit.GPU`,
+  including the device name, surface geometry and pixel readback. The older
+  silent-GPU observation was specific to those probes; kernel crash/exit lines
+  remain the fallback verdict.
 
 The provider now prints a line when it is loaded, another when the device is
 made and counters for command buffers, commits, presents and waits. Whether
@@ -1957,7 +1956,13 @@ Measured 2026-11-19, two answers that settle what was open:
   the Metal provider.
 
 So the provider is the wrong lever for the black page until something asks it
-for a device.
+for a device. That capability is now measured directly: with
+`/private/var/vm/mondrian-probe` and `/private/var/vm/mondrian-metal-probe` armed,
+the provider created "Turnip Adreno (TM) 725" inside two fresh WebKit GPU
+processes, imported a 64x64 BGRA IOSurface, committed one clear and read back
+`4096/4096` pixels as `0xff0000ff`. Both gates were deleted immediately after
+PASS; the default GLES UI remained unchanged. Natural WebKit demand for Metal
+is still unproven, so this does not by itself fix Safari's black page.
 
 ### The page is drawn in the wrong process
 
