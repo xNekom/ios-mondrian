@@ -62,10 +62,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 
 Current blockers, in order:
 
-1. **Wi-Fi link, SMMU and MHI block proven; the radio stack is missing.** W1
-   reaches Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01`; W3 assigns
-   BAR0 and proves bus master; W4 reads the MHI block (`BHIOFF=0x100`). BHI/
-   firmware, QMI/ath11k, ADSP/codec/PCM and camera remain absent.
+1. **Wi-Fi link, SMMU, MHI and BHI proven; the firmware is next.** W1 reaches
+   Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01`; W3 assigns BAR0
+   and proves bus master; W4 reads MHI; W5 reads BHI 1.2 in PBL (`execenv=0`,
+   `segs=1`). The image load, QMI/ath11k, ADSP/codec/PCM and camera remain absent.
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.

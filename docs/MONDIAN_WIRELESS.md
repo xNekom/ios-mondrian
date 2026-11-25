@@ -40,8 +40,13 @@ network is started.
 `0423` reads the MHI block through a one-page BAR map. A 2 MiB `ml_io_map()`
 stalled the worker; one page holds MHI and BHI. Measured 2026-11-25:
 `MHIVER=0xdeadbeef`, `MHICFG=0x800080`, `MHISTATUS=0x0`, `BHIOFF=0x100`,
-`BHIEOFF=0x224`; the guarded read completes, so the BAR decodes. The BHI
-registers at `BHIOFF` are the next read.
+`BHIEOFF=0x224`; the guarded read completes, so the BAR decodes.
+
+`0424` reads the BHI block at `BHIOFF=0x100`. Measured 2026-11-25:
+`BHI ver=0x1.2`, `status=0x0` (reset), `execenv=0x0` (PBL), `serial=0x907d3a8b`,
+`anti=0x0`, `segs=1`, `hwid=0x1016d0e1`. The device is in the bootloader and
+ready for a BHI image; the next step is a DMA-mapped `amss.bin`/`m3.bin` load,
+not another register read.
 
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
