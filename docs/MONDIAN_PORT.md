@@ -137,10 +137,9 @@ Two rules cover the other failure mode, writing to the wrong place:
 The kernel gets `phys_base = 0x840000000`, `mem_size = 0x240000000`: the
 clean 9 GiB run of the live tree (its 3 GiB and 6 GiB `/memory` regions are
 adjacent, with no reservation inside). The phone's 12 GiB are six regions
-whose sum is 11.8 GiB; the rest is the low 1.66 GiB with the firmware
-carve-outs, 885 MiB behind a 139 MiB hole and 30 MiB loose, so one contiguous
-window cannot hold them all. The rules behind the window and the measured map
-are in `NOTES.md` ("The window of RAM" and "Measured hardware facts").
+summing 11.8 GiB, so one contiguous window cannot hold them all; the rules
+and the measured map are in `NOTES.md` ("The window of RAM", "Measured
+hardware facts").
 
 **Measured 2026-11-09**: iOS 16 boots to SpringBoard on the 9 GiB window, 208
 processes and 5.2 GiB free. The 864 MiB window had the page queues full (616
@@ -166,9 +165,8 @@ granule (`ID_AA64MMFR0_EL1.TGran16 = 1`, measured 2026-10-23). The shim, the
 payload and the kernel now all run 16 KiB, which removes those workarounds
 and lets launchd register the shared cache.
 
-ARMv9.0 is binary compatible with the ARMv8.5 baseline, so the kernel builds
-for `armv8.5-a` with plain `arm64` (the X2/A710/A510 have no pointer
-authentication).
+ARMv9.0 is binary compatible with the ARMv8.5 baseline: the kernel builds for
+`armv8.5-a` with plain `arm64` (no pointer authentication).
 
 ## Remaining work
 
@@ -203,14 +201,12 @@ The panel is command mode, not a scanout the ABL keeps running: it needs one
 swaps, so the lock screen and the home screen draw, and `0210` paints the
 kernel log and clears the boot splash. CoreAnimation needs
 `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`);
-`0351` stops the console at the first swap (an `IOMemoryDescriptor` there
-panics `pmap_remove_pv`, `0115`), and the dylib forces activation.
+`0351` stops the console at the first swap (`0115`), the dylib forces activation.
 
-120 Hz is reached: the interface completes +120 frames a second and the tick
-arms on a deadline chain. A list scroll shows 113-118 fps; the home screen 81-87,
-where backboardd's GL frame is 11.7-13.6 ms of CPU (700-800 calls, 129 draws,
-0.6 ms waiting). `mfs=4` (`0410`) scans the surface out and measures *slower*
-(68-71: the display holds a surface a period), so the copy stays the default.
+120 Hz is reached (+120 frames/s, deadline-chain tick); a list scroll shows
+113-118 fps and the home screen 81-87, where backboardd's GL frame is
+11.7-13.6 ms of CPU (`docs/UI_PERFORMANCE.md`). `mfs=4` (`0410`) scans the
+surface out and measures *slower* (68-71), so the copy stays the default.
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
@@ -247,9 +243,8 @@ the ADSP); the level is published and heat remains (`docs/MONDIAN_POWER.md`).
 Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
 `tools/usb-ring.py` (see `README.md`). `0335` carries a read-only disk over the
-GPT `userdata` partition but keeps it out of the descriptor: the core takes
-`DEPCFG` on 0x02/0x03/0x83 with status 0 and never completes a packet, even with
-`GRXFIFOSIZ` sized; `usb=1` probes.
+GPT `userdata` partition but keeps it out of the descriptor: `DEPCFG` on
+0x02/0x03/0x83 takes status 0 and never completes a packet; `usb=1` probes.
 
 ### 7. The apps
 
@@ -270,12 +265,17 @@ on the layer). The render server still receives the image with zero data
 that transfer is the open cause. `assetsd` still aborts in an uncaught C++
 exception and `PhotosFileProvider` in PlugInKit's container check; Phone still fails.
 
+### 8. Video and HEVC
+
+`0420` reaches HFI `SYS_PROP` on the stock `vpu20_4v.mbn` (PAS 9, SMMU, INIT and
+IMAGE_VERSION) behind `mondrianvenus=1`; next are an HFI session, the IRQ and
+the VideoToolbox encoder (`docs/REFERENCE_PORTS.md`).
+
 ## Getting the numbers off the device
 
 Boot the mutable shim (`BOARD=mondrian shim/build.sh`, `fastboot boot
-shim/out/shim-boot.img`); the panel prints `FACT` lines for the memory regions
-and the GIC/UFS nodes. Pass them to `mkadt.py --facts`; `tools/boards.py`
-fills the banks, the UFS host and the GIC from the same dump (`parse_facts`).
+shim/out/shim-boot.img`): the panel prints `FACT` lines, and `mkadt.py --facts`
+plus `tools/boards.py` (`parse_facts`) fill the banks, UFS host and GIC.
 
 ## Boot arguments
 

@@ -46,9 +46,14 @@ separates a device-verified result from code that was only read.
   and uses it in its realme 8i release (iOS 16.7.16). Our kernel still needs the
   `/dev` sink that drives the WCD938x and the AW882xx. The AW88261 identity
   probe now reads `0x2113` from both speaker amps on mondrian (`0416`).
-- **Video and HEVC.** `DenialOfGravity/ios-redfin`: `phone/video/vtvenc.c`
-  registers a VideoToolbox hardware encoder, and `venusd.c` plus `venus_*`
-  drive the Venus block. This is the native path; `akshaynexus/OneiOS`
+- **Video and HEVC.** `DenialOfGravity/ios-redfin`: `phone/video/venus_core.c`
+  is the whole sequence to copy before writing power or HFI code (PAS 9,
+  `init_image`/`mem_setup`/`auth_and_reset`, SMMU, HFI), and it records the two
+  traps that cost mondrian builds: a GDSC in `HW_CONTROL` ignores
+  `SW_COLLAPSE` until the domain is taken back to SW mode, and a CBCR reading
+  `0x0` has `CLK_OFF` clear, so it is running, not dead. `vtvenc.c` registers
+  the VideoToolbox hardware encoder and `venusd.c` plus `venus_*` drive the
+  block. This is the native path; `akshaynexus/OneiOS`
   (`kernel/patches/oneios-hosted/codec` and `runtime/bridges/encoder`) is the
   hosted MediaCodec alternative and the reference for iOS 27's tile session.
 - **Metal.** `akshaynexus/iOSPlus10` has the Adreno 730 Metal2Vulkan path

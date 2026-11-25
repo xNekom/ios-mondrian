@@ -44,8 +44,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   DWC3 reset (PHY powered, PIPE clock from UTMI) and `0313` votes the eUSB2
   repeater's rails; it answers nothing on i2c5 even when powered, and
   `mondrianusbfallback=N` returns to fastboot. This core has one RX FIFO per
-  OUT endpoint and the bootloader only sizes the ones it uses; depth 0 NAKs
-  every packet (`GRXFIFOSIZ`, `DEPCFG`).
+  OUT endpoint; depth 0 NAKs every packet (`GRXFIFOSIZ`, `DEPCFG`).
 - **Clock and zone.** The PMK8350 RTC (SPMI PPID `0x61`) belongs to another
   processor (owner 4), so a write is refused: `mondriantime=<seconds>` seeds the
   date and `rtc set SECONDS` moves the clock (`0315`); the hook repoints
@@ -59,6 +58,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
   FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
   place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
+- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9, programs the SMMU/queues and completes HFI `SYS_PROP` (`mondrianvenus=1`); sessions next.
 
 Current blockers, in order:
 
@@ -195,25 +195,27 @@ time:
 | no console at all after the shim | the granule is `BOARD_PG_SHIFT`: TCR TG0/TG1, 2048-entry tables, 32 MiB blocks | `shim/board.h`, `shim/mmu.c` |
 
 **QHEE owns the physical timer.** Writing `CNTP_CTL_EL0` from EL1 is an
-*undefined instruction* (EC 0, not the EC 0x18 a trapped sysreg gives), so
-`0061` drops the write; the virtual timer fires once the guest unmasks it for
-EL1 (`0069`), and `0173` programs `CNTV_TVAL` before clearing IMASK or the
-level-sensitive PPI storms.
-
-**Instructions the platform does not have.** With `-march=armv8.5-a+crypto` the
-kernel emitted 226 RCpc `ldapr`s; these cores have neither RCpc nor pointer
-authentication, so the phone faults where QEMU's `-cpu max` does not.
+*undefined instruction* (EC 0, not 0x18), so `0061` drops the write; the virtual
+timer fires once the guest unmasks it for EL1 (`0069`), and `0173` programs
+`CNTV_TVAL` before clearing IMASK or the level-sensitive PPI storms.
+`-march=armv8.5-a+crypto` also emits 226 RCpc `ldapr`s these cores lack (no PAC
+either), unlike QEMU's `-cpu max`: keep plain `arm64`.
 
 **`ml_io_map()` traps twice: it never unmaps, and an early mapping dies.** The
 I/O submap is 8 MiB, so re-mapping a 128 KiB touch DB per lookup, 4 MiB of SPMI
 channels for one byte, or a driver's windows on every command (BT mapped 480 KB
 per `btuart`) exhausts it: the first command after boot works, the next aborts.
+A request larger than the free hole blocks in `kmem_alloc(KMA_NOFAIL)` instead
+(Venus's 1 MiB SMMU map hung its worker: use `ml_io_map_unmappable`). The same
+window limit makes `flush_dcache64(pa, ..., TRUE)` spin on a low-bank PA; pass the VA.
 Map each window once and keep it (`0179`), and remember it belongs to one APID --
 the next peripheral re-maps or the byte lands in the previous page. A mapping
 taken before `STARTUP_SUB_KMEM` comes from `virtual_space_start`: once the VM
-owns that space the device is mapped nowhere and the next read is a bus abort
-(`fault_code=0x10`, `FSC_SYNC_EXT_ABORT`), which is why `0087` re-maps GICD/GICR
-after the VM is up and the early framebuffer survives only on `0062`'s alias.
+owns that space the next read is a bus abort (`fault_code=0x10`), which is why
+`0087` re-maps GICD/GICR after the VM is up and `0062` keeps the early framebuffer alias.
+
+**`delay()` takes microseconds.** Venus's "after 1 s" `CTRL_STATUS` poll was
+`delay(1)` (1 ms total); at 1 ms per try the same firmware answers `0x40000001`.
 
 **The HFS journal cannot be replayed, and a dirty volume hides as a dead kernel.**
 The `HFS_ENABLE_JOURNALING` sysctl creates one, and then every mount hangs *before*
@@ -298,22 +300,20 @@ back. `CTL_START` (`0x01c`) bit 0 clears on completion and stays 1 if it never d
 `0xc0` long form is dropped by the panel and the 120 Hz switch stays at 60 (`0408`).
 
 **The kick is the default.** `MondrianFramebuffer` writes the frame, `dsb sy`,
-`CTL_FLUSH` (pending `0xc00607ff`) then `CTL_START`, with Normal Non-cacheable
-stores. CTL0 is the active controller, INTF1 the interface; in command
-mode `INTF_TIMING_ENGINE_EN` and `INTF_DSI_CMD_MODE_TRIGGER_EN` are 0.
+`CTL_FLUSH` (`0xc00607ff`) then `CTL_START`, Normal Non-cacheable: CTL0 is the
+active controller, INTF1 the interface, and both timing-engine enables are 0.
 
 **Direct scanout is slower and strands the bootloader.** `mfs=4` (`0410`) holds
-the surface on the glass for a period: the home screen measures 68-71 fps against
-81-87 with the copy. Even `mfs=2` -- bank configured, translation off, `SRC0`
-still the carve-out -- leaves ABL with **no USB at all** on a warm reset, and
-restoring the bank's registers does not fix it. The copy path is the default.
+the surface on the glass for a period (68-71 fps against 81-87 with the copy);
+even `mfs=2` leaves ABL with **no USB at all** on a warm reset, and restoring the
+bank's registers does not fix it. The copy path is the default.
 
 **Brightness: one DMA path, one low page.** DCS `0x51` only reaches the panel
 through the embedded DMA (a FIFO send wedges the engine: `INT_CTRL` `0x500`,
 no `DMA_DONE`; reset the FIFO first), and `DSI_CTRL.CMD_MODE_EN` stops it
-reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits and the kernel window
-starts at `0x840000000`, so the last page of the splash carve-out, `0xbaaf0000`
-(`shim/board.h`), is the only low page this port owns. `mondrianbl=<DBV>`
+reporting completion. `DSI_DMA_CMD_OFFSET` is 32 bits while the window starts at
+`0x840000000`: the splash's last page, `0xbaaf0000` (`shim/board.h`), is the only
+low page this port owns. `mondrianbl=<DBV>`
 (0xfff full scale), `bl LEVEL [FMT [CMD]]` and `IOMobileFramebuffer` selector 100
 (`0314`) set the level, `mondrianblfmt` the byte order; `brightness-nits` 0 is
 "display asleep".
