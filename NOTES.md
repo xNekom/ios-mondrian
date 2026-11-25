@@ -58,7 +58,7 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
   FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
   place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
-- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9, programs the SMMU/queues and completes HFI `SYS_PROP` (`mondrianvenus=1`); sessions next.
+- **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9, programs the SMMU/queues, completes HFI `SYS_PROP` and opens a HEVC decode session (V2); buffers/IRQ next.
 
 Current blockers, in order:
 

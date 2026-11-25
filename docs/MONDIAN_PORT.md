@@ -267,9 +267,9 @@ exception and `PhotosFileProvider` in PlugInKit's container check; Phone still f
 
 ### 8. Video and HEVC
 
-`0420` reaches HFI `SYS_PROP` on the stock `vpu20_4v.mbn` (PAS 9, SMMU, INIT and
-IMAGE_VERSION) behind `mondrianvenus=1`; next are an HFI session, the IRQ and
-the VideoToolbox encoder (`docs/REFERENCE_PORTS.md`).
+`0420` reaches HFI `SYS_PROP` and opens a HEVC decode session on the stock
+`vpu20_4v.mbn` (PAS 9, SMMU, INIT, IMAGE_VERSION, OPEN/CODEC) behind
+`mondrianvenus=1`; next are buffers, the IRQ and VideoToolbox.
 
 ## Getting the numbers off the device
 
