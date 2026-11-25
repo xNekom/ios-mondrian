@@ -1,0 +1,76 @@
+xnu 0423: read the QCA6490 MHI registers through the guarded accessor
+
+W3 leaves BAR0 at 0x60200004 with config-space proof. W4 programs the second
+iATU aperture and maps the BAR; a 2 MiB ml_io_map() stalled the worker after
+"iATU region1 enabled", so the map is one page (MHI and BHI fit in 4 KiB) with
+a log before and after. MHIVER/MHICFG/MHICTRL/MHISTATUS/BHIOFF are read with
+mondrian_mmio_try_rd32 so a synchronous external abort is distinguished from a
+stall. No ring, DMA, MSI, firmware or network is started.
+
+Facts from mainline drivers/bus/mhi/core/internal.h (GPL-2.0, constants).
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 3de1fbe..f519675 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -72,6 +72,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <vm/vm_kern.h>
++#include "mondrian_mmio.h"
+ 
+ void mondrian_wifi_start(void);
+ 
+@@ -115,7 +116,7 @@ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
+ #define WIFI_BAR_BASE		0x60200000UL
+ #define WIFI_BAR_END		0x63ffffffUL
+ #define WIFI_BAR_SIZE		0x04000000UL
+-#define WIFI_BAR_MAP		0x00200000UL
++#define WIFI_BAR_MAP		0x00001000UL /* MHI and BHI fit one page */
+ 
+ /* /soc/qcom,gdsc@17b004 and its qcom,collapse-vote phandle. */
+ #define WIFI_GCC_PA		0x01000000UL
+@@ -965,6 +966,43 @@ wifi_mhi_probe(uint16_t command)
+ 	wifi_bus_master_off();
+ 	cmd = wifi_read16(wifi_cfg, 4);
+ 	wifi_log("W3 bus master off command=0x%04x", cmd);
++	if (bar0 == (WIFI_BAR_BASE | 0x4u)) {
++		uint32_t mhiver = 0, mhicfg = 0, mhictrl = 0;
++		uint32_t status = 0, bhioff = 0, bhieoff = 0;
++
++		wifi_log("W4 iATU region1 start");
++		mondrian_tlmm_write(wifi_iatu, 0x208, WIFI_BAR_BASE);
++		mondrian_tlmm_write(wifi_iatu, 0x20c, 0);
++		mondrian_tlmm_write(wifi_iatu, 0x210, WIFI_BAR_END);
++		mondrian_tlmm_write(wifi_iatu, 0x214, WIFI_BAR_BASE);
++		mondrian_tlmm_write(wifi_iatu, 0x218, 0);
++		mondrian_tlmm_write(wifi_iatu, 0x204, 0x80000000u);
++		if (wifi_wait(wifi_iatu, 0x204, 0x80000000u, 0x80000000u,
++		    20000) != 0) {
++			return wifi_fail("W4 BAR iATU enable timed out");
++		}
++		wifi_log("W4 iATU region1 enabled");
++		wifi_log("W4 BAR map start");
++		wifi_bar = wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
++		if (wifi_bar == 0) {
++			return wifi_fail("W4 cannot map BAR0");
++		}
++		wifi_log("W4 BAR map done va=0x%lx; MHIVER read",
++		    (unsigned long)wifi_bar);
++		if (mondrian_mmio_try_rd32(wifi_bar + 0x08, &mhiver) != 0) {
++			wifi_log("W4 MHIVER faulted; MHI deferred");
++		} else {
++			(void)mondrian_mmio_try_rd32(wifi_bar + 0x10, &mhicfg);
++			(void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &mhictrl);
++			(void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &status);
++			(void)mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff);
++			(void)mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhieoff);
++			wifi_log("W4 MHIVER=0x%x MHICFG=0x%x MHICTRL=0x%x MHISTATUS=0x%x BHIOFF=0x%x BHIEOFF=0x%x",
++			    mhiver, mhicfg, mhictrl, status, bhioff, bhieoff);
++		}
++	} else {
++		wifi_log("W4 BAR0 not assigned; MHI deferred");
++	}
+ 	return (cmd & WIFI_PCI_BUS_MASTER) != 0 ?
+ 	    wifi_fail("W3 bus master did not clear") : 0;
+ }
