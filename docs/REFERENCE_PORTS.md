@@ -44,7 +44,8 @@ separates a device-verified result from code that was only read.
   `AudioServerPlugIn` (MIT) that presents Speaker, Actuator and Codec, and
   `open-mapple/mapple_userland/audio` installs it beside `VirtualAudio.plugin`
   and uses it in its realme 8i release (iOS 16.7.16). Our kernel still needs the
-  `/dev` sink that drives the WCD938x and the AW882xx.
+  `/dev` sink that drives the WCD938x and the AW882xx. The AW88261 identity
+  probe now reads `0x2113` from both speaker amps on mondrian (`0416`).
 - **Video and HEVC.** `DenialOfGravity/ios-redfin`: `phone/video/vtvenc.c`
   registers a VideoToolbox hardware encoder, and `venusd.c` plus `venus_*`
   drive the Venus block. This is the native path; `akshaynexus/OneiOS`

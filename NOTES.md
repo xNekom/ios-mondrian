@@ -64,8 +64,8 @@ Current blockers, in order:
 
 1. **Wi-Fi PCIe is proven; the radio stack is missing.** `0415` reaches Gen2 x1
    and reads QCA6490 `17cb:1103` with bus mastering off; MHI/QMI/ath11k, firmware
-   and the interface are absent. Audio, camera and cellular are not implemented
-   (`docs/REFERENCE_PORTS.md`).
+   and the interface are absent. AW88261 IDs answer, but ADSP/codec/PCM, camera
+   and cellular are not implemented (`docs/REFERENCE_PORTS.md`).
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.

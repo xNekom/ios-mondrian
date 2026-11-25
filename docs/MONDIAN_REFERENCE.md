@@ -66,6 +66,10 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
   `tx_swr_ctrl`, `va_swr_ctrl`).
 - Two AW882xx speaker amps on I2C `2-0034`/`2-0035` with reset, irq and
   `spksw` GPIOs.
+- `0416` adds an opt-in, read-only AW88261 ID probe (`mondrianaudioprobe=1`):
+  TLMM bit-bang on SE15 reads register `0x00` at `0x34/0x35`; measured
+  2026-11-25 on `04:28:24`, both returned `0x2113`. It writes no amplifier data
+  register and starts no ADSP/PCM path.
 
 ## Camera
 
