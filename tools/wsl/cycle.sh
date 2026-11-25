@@ -5,6 +5,7 @@
 #   tools/wsl/cycle.sh haps "vib 150 64"
 #   tools/wsl/cycle.sh --no-build thermal
 #   EXTRA_ARGS=thermalthr=30 tools/wsl/cycle.sh thermal
+#   FASTBOOT_SERIAL=7e63c267 tools/wsl/cycle.sh thermal  # pin the phone
 #
 # The exit status is 0 only when the ring's Darwin banner is the kernel that was
 # just built. A RAM boot that dies falls back to boot_b and answers with the
@@ -48,7 +49,12 @@ case "${1:-}" in
 esac
 IFACE=${IFACE:-enx02005e77ee01}
 BUSID=${BUSID:-}
-FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
+FB_BIN=${FB:-/mnt/c/platform-tools/fastboot.exe}
+FB=("$FB_BIN")
+if [ -n "${FASTBOOT_SERIAL:-}" ]; then
+	FB+=(-s "$FASTBOOT_SERIAL")
+	export FASTBOOT_SERIAL
+fi
 K=xnu/out/kernel.development.mondrian
 LOG=${LOG:-/root/cycle}
 
@@ -93,11 +99,11 @@ attach() {
 	ip addr add 192.168.7.1/24 dev "$IFACE" 2>/dev/null
 }
 
-"$FB" devices 2>/dev/null | grep -q fastboot || {
+"${FB[@]}" devices 2>/dev/null | grep -q fastboot || {
 	echo "== asking the running kernel for fastboot"
 	bash tools/wsl/to-fastboot.sh || exit 1
 }
-"$FB" devices 2>/dev/null | grep -q fastboot || {
+"${FB[@]}" devices 2>/dev/null | grep -q fastboot || {
 	echo "== no fastboot: power + volume down, or check the cable"
 	exit 1
 }
@@ -123,14 +129,14 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
 	# "< waiting for any device >" (measured: the retry never reached a second
 	# `fastboot boot`, and the run was read as a hung boot). Ask the running
 	# kernel again instead of waiting on a device that is gone.
-	if ! "$FB" devices 2>/dev/null | grep -q fastboot; then
+	if ! "${FB[@]}" devices 2>/dev/null | grep -q fastboot; then
 		echo "== fastboot is gone; asking the running kernel again"
 		bash tools/wsl/to-fastboot.sh || { sleep 5; continue; }
 	fi
-	SLOT=$(timeout 30 "$FB" getvar current-slot 2>&1 | tr -d '\r' |
+	SLOT=$(timeout 30 "${FB[@]}" getvar current-slot 2>&1 | tr -d '\r' |
 		sed -n 's/^current-slot: *//p' | head -1)
 	if [ -n "$SLOT" ]; then
-		if timeout 60 "$FB" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1; then
+		if timeout 60 "${FB[@]}" --set-active="$SLOT" > "$LOG/set-active.log" 2>&1; then
 			echo "   slot $SLOT re-activated"
 		else
 			cat "$LOG/set-active.log"
@@ -138,7 +144,7 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
 			exit 1
 		fi
 	fi
-	timeout 60 "$FB" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
+	timeout 60 "${FB[@]}" boot "$WIMG" > "$LOG/fastboot.log" 2>&1
 	# "Sending 'boot.img' ... OKAY" is printed even when the boot itself fails,
 	# and a check that only looks for OKAY passes on it: the image was never
 	# loaded and the phone fell back to boot_b, which then looks like a kernel

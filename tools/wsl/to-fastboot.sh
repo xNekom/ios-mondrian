@@ -2,6 +2,7 @@
 # Get the phone into fastboot from whatever it is running.
 #
 #   tools/wsl/to-fastboot.sh
+#   FASTBOOT_SERIAL=7e63c267 tools/wsl/to-fastboot.sh  # pin the phone
 #
 # usbipd's binding is tied to the USB device, and the phone re-enumerates both
 # when it leaves iOS and when the bootloader takes over, so the attach has to be
@@ -15,7 +16,11 @@
 # mode (1209:0001 running, 18d1:d00d in fastboot).
 set -u
 cd "$(dirname "$0")/../.." || exit 1
-FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
+FB_BIN=${FB:-/mnt/c/platform-tools/fastboot.exe}
+FB=("$FB_BIN")
+if [ -n "${FASTBOOT_SERIAL:-}" ]; then
+	FB+=(-s "$FASTBOOT_SERIAL")
+fi
 IFACE=${IFACE:-enx02005e77ee01}
 
 busid() {
@@ -41,7 +46,7 @@ try_attach() {
 	done
 }
 
-"$FB" devices 2>/dev/null | grep -q fastboot && { echo "already in fastboot"; exit 0; }
+"${FB[@]}" devices 2>/dev/null | grep -q fastboot && { echo "already in fastboot"; exit 0; }
 
 try_attach
 if adb devices 2>/dev/null | grep -q -w device; then
@@ -67,9 +72,9 @@ for i in $(seq 1 40); do
 		usbipd.exe detach --busid "$b" > /dev/null 2>&1
 		sleep 1
 	fi
-	"$FB" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
+	"${FB[@]}" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
 	try_attach
-	"$FB" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
+	"${FB[@]}" devices 2>/dev/null | grep -q fastboot && { echo "fastboot after $((i * 4)) s"; exit 0; }
 done
 echo "no fastboot: power + volume down" >&2
 exit 1
