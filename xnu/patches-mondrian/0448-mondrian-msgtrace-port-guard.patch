@@ -1,0 +1,58 @@
+xnu 0448: guard the message trace against a port in transit
+
+Measured 2026-11-26 with 0447: about three minutes into the boot, while
+logd was sending a message, the kernel took a data abort at
+pc 0xfffffe000741b0e0 (task_pid+0x10), lr 0xfffffe000739e430
+(ipc_kmsg_send+0xc0), ESR 0x96000004 (level-0 translation fault) and
+FAR 0x019c0300003c8. The argument was 0x019c0300000000, a value read from
+port->ip_receiver + 0x28, so task_pid dereferenced a field of a port object
+as a task.
+
+ip_receiver is a union with ip_destination: a port that is not in a space
+(a send right in transit) leaves ip_destination there, and ip_in_a_space is
+false. Read the receiver through ip_get_receiver() and require is_active(),
+the same guards ipc_kmsg_trace_send already uses on the same field, and do
+the same in the sampler's mondrian_task_port_owner_pid. The trace is armed
+on every boot by msgtracename=logd, so the unguarded read ended boots that
+sent a right to an in-transit port.
+
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index f510bf1..8569006 100755
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -2932,9 +2932,17 @@ ipc_kmsg_send(
+ 	mondrian_dest_owner_pid = -1;
+ 	if (mondrian_msgtrace != 0 &&
+ 	    task_pid(current_task()) == mondrian_msgtrace) {
+-		ipc_space_t rcv = port->ip_receiver;
++		/*
++		 * ip_receiver is a union with ip_destination: on a port in transit
++		 * (not in a space) the field is the destination port, and reading it
++		 * as a space hands task_pid a pointer from a port object. Measured
++		 * 2026-11-26: msg from logd to an in-transit port, ESR 0x96000004
++		 * (level-0 translation fault) in task_pid. ip_get_receiver checks
++		 * ip_in_a_space, and a terminated space has is_table cleared.
++		 */
++		ipc_space_t rcv = ip_get_receiver(port);
+ 
+-		if (rcv != IPS_NULL && rcv->is_task != TASK_NULL) {
++		if (rcv != IPS_NULL && is_active(rcv) && rcv->is_task != TASK_NULL) {
+ 			mondrian_dest_owner_pid = task_pid(rcv->is_task);
+ 		}
+ 		mondrian_dest_id = (int)hdr->msgh_id;
+diff --git a/osfmk/ipc/ipc_port.c b/osfmk/ipc/ipc_port.c
+index 5cb0474..b7329a0 100755
+--- a/osfmk/ipc/ipc_port.c
++++ b/osfmk/ipc/ipc_port.c
+@@ -2972,8 +2972,9 @@ mondrian_task_port_owner_pid(task_t task, mach_port_name_t name)
+ 	 * this helper did (one boot, no ring, no panic). ip_mq_unlock is the
+ 	 * port unlock in this XNU; there is no ip_unlock.
+ 	 */
+-	rcv = port->ip_receiver;
+-	if (rcv != IPS_NULL && rcv->is_task != TASK_NULL) {
++	/* Same union trap as ipc_kmsg.c: only a port in a space has a receiver. */
++	rcv = ip_get_receiver(port);
++	if (rcv != IPS_NULL && is_active(rcv) && rcv->is_task != TASK_NULL) {
+ 		owner = task_pid(rcv->is_task);
+ 	}
+ 	ip_mq_unlock(port);
