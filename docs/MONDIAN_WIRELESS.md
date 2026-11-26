@@ -102,14 +102,40 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
 - `0451` reads the endpoint's PM capability: `PMCSR=0x8`, state 0, so the
   function is in D0 with bus mastering on (`command=0x6`); that is not the gate
   either.
+- `0454` dumps the BHI descriptors around the doorbell. Measured 2026-11-26:
+  `ver=1.2 arl=0 numseg=1 exec=0` before the host SOC reset and after it,
+  byte for byte the same, so the reset does not change the BHI block; the
+  doorbell written afterwards still reads `0x2a5a5a5a` at 1, 10 and 100 ms
+  and `BHI_STATUS` never leaves 0. A retained doorbell does not prove it was
+  ignored (0459).
+- `0456` is the A/B for the host reset: `mondrianwifinorsoc=1` skips the
+  `PCIE_SOC_GLOBAL_RESET` pulse and the `MHICTRL` reset, so the doorbell lands
+  in the ROM the cold power-up left running. Measured 2026-11-26: `W6 soc
+  reset skipped`, then the same `W9` values and `txdb=0x2a5a5a5a` at 1/10/100 ms
+  with `status=0`. The host reset is not the gate either.
 - The stock `image/qca6490` holds only `amss.bin` and `amss20.bin`, so the
   `0x400c1211` word's minor `0x11` (WCN6855 hw2.1 in ath11k) selects no third
   image.
 - The host side is complete: identity, link, SMMU, MHI context, BHI registers
   and MSI all read and write the way ath11k does, no SMMU fault is recorded, and
-  the doorbell is still never consumed. What is left is device-side, in the
-  WLAN SoC's own power/reset/clock state before the fetch (expected, not
-  measured).
+  `BHI_STATUS` never leaves 0. Reading `BHI_IMGTXDB` back does not tell whether
+  the doorbell was consumed: the PBL does not clear it (0459).
+- `0457` repeated the A/B on the rebuilt series with the same result (`soc
+  reset skipped`, `txdb=0x2a5a5a5a` at 1/10/100 ms, `status=0`).
+- `0458` reads the device side. Measured 2026-11-26: the five rail PPIDs
+  (`49e/1b9/1b6/29b/1bc`) are in the SPMI arbiter map but **owner 4**, the
+  secure world that also owns the RTC, so APPS cannot read a regulator back at
+  all; only the RPMh vote exists and it is acknowledged. GPIO82
+  (`qcom,sw-ctrl-gpio`) already reads high and no stage drives it. `MHICTRL`
+  written `0x2` reads `0x2` at once and `0x0` after 10 ms, so the MHI reset is
+  accepted, while BHI still reports `ver 1.2 serial 0x907d3a8b hwid 0x1016d0e1
+  exec 0`.
+- `0459` settles that last point the other way: with `BHI_IMGADDR` pointed at an
+  unmapped IOVA (`mondrianwifibad=1`, `0x0bad0000`), the SMMU reports
+  `fsr=0x402 far=0x0bad0000 gfsr=0`, so **the PBL does consume the doorbell and
+  start its fetch**; with the real image it reads through the wired window and
+  the SMMU records nothing. The doorbell is not the gate; the transfer or the
+  SBL start is (open).
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
