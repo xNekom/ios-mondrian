@@ -1,0 +1,29 @@
+xnu 0471: premap the config, dbi, elbi and iatu windows too
+
+Measured 2026-11-26: with 0470 the premap completes and the link comes up
+(`pcie0 link up gen=2 width=1`), then the worker stops before `qca6490 id`.
+Premap covered the BAR and the four AHB pages only; `wifi_config_identity()`
+still maps the config aperture itself and `wifi_link()` maps DBI, ELBI and
+iATU from the worker, so the worker still calls `ml_io_map()`.
+
+All seven windows are taken by `mondrian_wifi_premap()` on the boot thread, and
+the log prints the four new virtual addresses next to the BAR one.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 914815d..9248c33 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2272,7 +2272,13 @@ mondrian_wifi_premap(void)
+ 		return;
+ 	}
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
+-	wifi_log("W4 premap bar va=0x%lx", (unsigned long)wifi_bar);
++	(void)wifi_map_once(&wifi_dbi, WIFI_DBI_PA, WIFI_DBI_SIZE);
++	(void)wifi_map_once(&wifi_elbi, WIFI_ELBI_PA, WIFI_ELBI_SIZE);
++	(void)wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
++	(void)wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
++	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx",
++	    (unsigned long)wifi_bar, (unsigned long)wifi_cfg,
++	    (unsigned long)wifi_dbi, (unsigned long)wifi_iatu);
+ 	mondrian_log_flush_now();
+ 	for (i = 0; i < sizeof(ahb) / sizeof(ahb[0]); i++) {
+ 		vm_offset_t page = wifi_ahb_page(ahb[i]);

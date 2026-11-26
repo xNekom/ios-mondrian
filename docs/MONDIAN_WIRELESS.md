@@ -172,6 +172,12 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `wifi_w10_probe()`'s first line, so the first TLMM/config access after the
   endpoint idles does not return. `mondrianwifidelay=0` is the workaround until
   the link is kept awake across the delay.
+- `0469`-`0471` move every window the worker touches onto the boot thread,
+  because `ml_io_map()` is serialized and blocks behind any other mapper.
+  Measured 2026-11-26: the worker stopped at `W4 BAR map done` (0469), then at
+  `pcie0 link up` with `qca6490 id` absent once the BAR and the four AHB pages
+  were premapped (0470); the config aperture and DBI/ELBI/iATU were still mapped
+  from the worker, which `0471` removes.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
