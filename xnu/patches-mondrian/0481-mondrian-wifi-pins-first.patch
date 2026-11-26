@@ -1,0 +1,30 @@
+xnu 0481: premap the wifi pins before touch takes the tlmm block
+
+Measured 2026-11-26 (0480 boot): the probe block now completes (`eUSB2 done`,
+`probe done`, `MONDR USB: running`, `MONDRIAN BTTTY`) and the worker starts, but
+it stops right after `early GCC 0x62008` -- the next call is `wifi_map_pins()`,
+and touch has already mapped the TLMM block. A later `ml_io_map()` of a page
+that is already mapped hangs the mapper; the same seven pages mapped before
+touch (0475) complete.
+
+The pin premap returns to the top of `mondrian_wifi_premap()`, now that `0480`
+guards the eUSB2 PHY writes that used to make this ordering look unsafe. The
+worker keeps its late start, so nothing maps beside it.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index d300a39..869c718 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2313,6 +2313,13 @@ mondrian_wifi_premap(void)
+ 	    enabled != 1) {
+ 		return;
+ 	}
++	/*
++	 * The pin pages must be taken here, before touch maps the TLMM block:
++	 * a later ml_io_map() of a page that is already mapped hangs the
++	 * mapper (measured 2026-11-26: the worker stopped at `W4 premap pins`
++	 * and `early GCC` when it mapped them after the probe block).
++	 */
++	mondrian_wifi_premap_pins();
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
+ 	(void)wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
+ 	(void)wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
