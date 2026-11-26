@@ -1,0 +1,93 @@
+xnu 0468: map the spmi restart window at boot too
+
+Measured 2026-11-26: the reset still landed on the active slot with the wifi
+driver loaded, and the reason thread printed `start` with nothing after it.
+The IMEM word was already mapped at boot (0466); this is the other mapping in
+the same path -- `mondrian_spmi_set_restart_reason()` calls `ml_io_map()` for
+the SDAM channel window itself, which is the ~2 s the reset spent even with no
+wifi driver and which deadlocks behind a driver stuck in the map.
+
+The window is mapped once from `mondrian_spmi_probe()`, before the key thread
+and before any board worker, and the reset path only writes through it. An
+unprepared window skips the PMIC write and keeps the IMEM one.
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+index 9efc3ff..705ddce 100644
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -245,6 +245,7 @@ sp_adc_wr(uint16_t apid, uint32_t off, uint32_t val)
+  * HBST: reads of that page are what the vendor driver does on every play.
+  */
+ static uint32_t sp_apid_owner(uint16_t apid);	/* defined below */
++static int sp_ensure(void);			/* defined below */
+ 
+ static int
+ sp_apid_for(uint16_t ppid, uint16_t *apid)
+@@ -360,10 +361,46 @@ mondrian_spmi_reg_write(uint16_t ppid, uint8_t reg, uint8_t val)
+  * The window is mapped here instead of through sp_chan_window because the
+  * battery thread owns that cache and may be mid-conversion.
+  */
++static volatile uint32_t *sp_reason_win;
++static uint16_t sp_reason_apid = 0xffffu;
++
++/*
++ * The restart-reason channel window is mapped from the boot probe, not from
++ * the reset. ml_io_map() inside the reset costs about 2 s and deadlocks behind
++ * a driver already stuck in it, which cost three fastboot landings (measured
++ * 2026-11-26).
++ */
++void
++mondrian_spmi_restart_prepare(void)
++{
++	uint16_t apid;
++
++	if (sp_reason_win != NULL) {
++		return;
++	}
++	if (sp_core == NULL && !sp_ensure()) {
++		return;
++	}
++	apid = sp_find_apid(MONDRIAN_SPMI_SDAM_PPID);
++	if (apid == 0xffffu) {
++		printf("MONDRIAN SPMI: no apid for the restart reason\n");
++		return;
++	}
++	sp_reason_win = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++	    MONDRIAN_SPMI_CHNLS_SIZE);
++	if (sp_reason_win == NULL) {
++		printf("MONDRIAN SPMI: no restart window for apid %u\n", apid);
++		return;
++	}
++	sp_reason_apid = apid;
++	printf("MONDRIAN SPMI: restart window ready apid %u\n", apid);
++}
++
+ int
+ mondrian_spmi_set_restart_reason(uint8_t reason)
+ {
+-	uint16_t apid = sp_find_apid(MONDRIAN_SPMI_SDAM_PPID);
++	uint16_t apid = sp_reason_apid;
+ 	volatile uint32_t *q;
+ 	uint8_t cur = 0, val;
+ 	uint32_t st = 0, i;
+@@ -377,10 +414,9 @@ mondrian_spmi_set_restart_reason(uint8_t reason)
+ 		return 0;
+ 	}
+ 	val = (uint8_t)((cur & 0x01u) | (uint8_t)((reason & 0x7fu) << 1));
+-	q = (volatile uint32_t *)ml_io_map(
+-	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12), MONDRIAN_SPMI_CHNLS_SIZE);
++	q = sp_reason_win;
+ 	if (q == NULL) {
+-		printf("MONDRIAN SPMI: no window for apid %u\n", apid);
++		printf("MONDRIAN SPMI: restart window not prepared\n");
+ 		return 0;
+ 	}
+ 	q[0x10 / 4] = val;
+@@ -815,6 +851,7 @@ mondrian_spmi_probe(void)
+ 	int enable = 1;
+ 	thread_t thread;
+ 
++	mondrian_spmi_restart_prepare();
+ 	if (PE_parse_boot_argn("mondriankeys", &enable, sizeof(enable)) && enable == 0) {
+ 		printf("MONDRIAN SPMI: keys disabled by mondriankeys=0\n");
+ 		return;
