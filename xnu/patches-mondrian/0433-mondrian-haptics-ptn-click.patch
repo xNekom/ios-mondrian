@@ -1,0 +1,154 @@
+xnu 0433: play the stock PTN click from the live ring
+
+vib's constant tone is silent on this LRA. The live DT's effect_0..5 carry the
+vendor click: eight samples at 6667 us, amplitudes up to 0x17f, VMAX 3600 mV.
+`hapclick [mv]` writes the TLRA divisor (0x535), the 24 sample bytes at PTN
+0x34, votes the PMIC boost up first, forces VREG-ready and plays source
+PATTERN1, then logs play, impedance, status and the SDAM status pair.
+
+The order is deliberate: vib forced VSET before it voted the boost, while the
+vendor forces it after hbst-vreg reads 0x80. mv defaults to the effect's
+3600 mV and is capped there, so a live run can start at 1800 and step up.
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index b622a6c..fed4050 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -66,10 +66,15 @@ extern void delay(int us);
+ #define HAP_SDAM_PBS_TRIG	0xe5
+ #define HAP_PTN_REV		0x01
+ #define HAP_PTN_DIRECT		0x26
++#define HAP_PTN_TLRA_MSB	0x30
++#define HAP_PTN_TLRA_LSB	0x31
++#define HAP_PTN1_CFG		0x34
++#define HAP_CFG_BRAKE_CFG	0x50
+ 
+ #define HAP_EN_BIT		0x80
+ #define HAP_PLAY_EN		0x80
+ #define HAP_SRC_DIRECT		0x01
++#define HAP_SRC_PATTERN1	0x02
+ #define HAP_AUTORES_EN		0x80
+ #define HAP_SINE			0x01
+ #define HAP_FORCE_VREG_RDY	0x01
+@@ -78,6 +83,8 @@ extern void delay(int us);
+ #define HAP_VMAX_STEP_MV	50
+ #define HAP_LRA_PERIOD_US	5882	/* the live DT's qcom,lra-period-us */
+ #define HAP_TLRA_STEP_US	5
++#define HAP_CLICK_PERIOD_US	6667	/* the live DT's effect_0 play period */
++#define HAP_CLICK_VMAX_MV	3600	/* the live DT's effect_0 vmax-mv */
+ 
+ static unsigned int hap_vmax_mv = HAP_VMAX_MV;
+ 
+@@ -277,6 +284,76 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	return ok ? 0 : -1;
+ }
+ 
++/*
++ * The stock click, not a tone. The live DT's effect_0..5 all carry the same
++ * eight samples (amplitude 0x1f 0x3f 0x5f 0x7f 0x17f 0x15f 0x13f 0x11f, period
++ * T_LRA, f_lra_x2 clear) and qcom,wf-pattern-period-us 6667; the vendor writes
++ * them as three bytes per sample at PTN 0x34, sets PTN 0x30 to period/5 and
++ * plays with source PATTERN1. The order differs from vib on purpose: the boost
++ * is already up and forced VREG-ready before PLAY, which is the vendor's
++ * open-loop drive order, while vib forces VSET from a boost it has not voted
++ * yet. mv is the effect's 3600 mV by default and capped there; the first live
++ * test can start lower and step up without a rebuild.
++ */
++static const uint8_t hap_click_samples[24] = {
++	0x00, 0x00, 0x1f, 0x00, 0x00, 0x3f,
++	0x00, 0x00, 0x5f, 0x00, 0x00, 0x7f,
++	0x00, 0x01, 0x7f, 0x00, 0x01, 0x5f,
++	0x00, 0x01, 0x3f, 0x00, 0x01, 0x1f,
++};
++
++int
++mondrian_haptics_click(unsigned int mv)
++{
++	uint8_t st = 0, z = 0, play = 0, vreg = 0, sdam = 0, next = 0;
++	uint32_t t;
++	unsigned int i;
++	int ok = 1;
++
++	if (mv < 500 || mv > HAP_CLICK_VMAX_MV) {
++		return -1;
++	}
++	mv = (mv / HAP_VMAX_STEP_MV) * HAP_VMAX_STEP_MV;
++	t = HAP_CLICK_PERIOD_US / HAP_TLRA_STEP_US;
++	ok &= hap_w(1, HAP_PTN_TLRA_MSB, (uint8_t)((t >> 8) & 0x0fu));
++	ok &= hap_w(1, HAP_PTN_TLRA_LSB, (uint8_t)(t & 0xffu));
++	for (i = 0; i < sizeof(hap_click_samples); i++) {
++		ok &= hap_w(1, (uint8_t)(HAP_PTN1_CFG + i), hap_click_samples[i]);
++	}
++	ok &= hap_w(0, HAP_CFG_VMAX, (uint8_t)(mv / HAP_VMAX_STEP_MV));
++	ok &= hap_w(0, HAP_CFG_EN_CTL, HAP_EN_BIT);
++	ok &= hap_w(0, HAP_CFG_SINE, HAP_SINE);
++	(void)hap_r(0, HAP_CFG_AUTORES, &st);
++	ok &= hap_w(0, HAP_CFG_AUTORES, st & ~HAP_AUTORES_EN);
++	ok &= hap_w(0, HAP_CFG_FAULT_CLR, 0x07);
++	/* CL brake, sine, sine brake waveform: the DT's qcom,brake-mode 1. */
++	ok &= hap_w(0, HAP_CFG_BRAKE_CFG, 0x41);
++	/* Boost first, then force VREG-ready, then PLAY: the vendor's order. */
++	ok &= hap_boost(1);
++	(void)hap_boost_ready();
++	(void)hap_r(2, HAP_HBST_VREG, &vreg);
++	ok &= hap_w(0, HAP_CFG_VSET_CFG,
++	    (vreg & HAP_EN_BIT) != 0 ? HAP_FORCE_VREG_RDY : 0);
++	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_PATTERN1 | HAP_PLAY_EN);
++	/* Eight samples at 6667 us; the vendor's length counts the first seven. */
++	delay(60 * 1000);
++	(void)hap_r(0, HAP_CFG_PLAY, &play);
++	(void)hap_r(0, HAP_CFG_IMPEDANCE, &z);
++	(void)hap_r(0, HAP_CFG_STATUS_MSB, &st);
++	(void)hap_r(3, 0x46, &sdam);
++	(void)hap_r(3, 0x47, &next);
++	printf("MONDRIAN HAP: click %u mV t_lra 0x%03x play 0x%02x"
++	    " impedance 0x%02x status 0x%02x sdam 0x%02x%02x\n", mv, t, play,
++	    z, st, sdam, next);
++	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_PATTERN1);
++	/* Leave EN_CTL and VSET alone, as vib does; drop the boost after 2 s. */
++	delay(2000 * 1000);
++	ok &= hap_boost(0);
++	printf("MONDRIAN HAP: click %u mV %s\n", mv,
++	    ok ? "sent" : "with a failed write");
++	return ok ? 0 : -1;
++}
++
+ /*
+  * The whole block for one USB line, in the order that answers "is it there, is
+  * it alive, is it playing". The walk stops at the first register that does not
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 6793172..f49065c 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2150,6 +2150,7 @@ static void
+ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ {
+ 	extern int mondrian_haptics_dump(char *out, size_t len);
++	extern int mondrian_haptics_click(unsigned int mv);
+ 	extern int mondrian_haptics_buzz(unsigned int ms, unsigned int amp,
+ 	    unsigned int force);
+ 	extern int mondrian_haptics_boost(unsigned int on);
+@@ -2176,6 +2177,14 @@ ud_cmd_hap(socket_t so, struct sockaddr_in *to, const char *line)
+ 			n = snprintf(out, sizeof(out), "hapv %u %s\n", mv,
+ 			    mondrian_haptics_set_vmax(mv) == 0 ? "sent" : "failed");
+ 		}
++	} else if (line[3] == 'c') {	/* "hapclick [mv]" */
++		uint32_t mv = 3600;
++
++		if (ud_cmd_num(line + 8, &mv) == NULL) {
++			mv = 3600;
++		}
++		n = snprintf(out, sizeof(out), "hapclick %u %s\n", mv,
++		    mondrian_haptics_click(mv) == 0 ? "sent" : "failed");
+ 	} else {				/* "vib [ms [amp [force]]]" */
+ 		uint32_t ms = 0, amp = 0, force = 0;
+ 		const char *p = ud_cmd_num(line + 3, &ms);
+@@ -2809,6 +2818,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    strcmp(cmd, "hapb") == 0 ||
+ 			    strncmp(cmd, "hapb ", 5) == 0 ||
+ 			    strncmp(cmd, "hapv ", 5) == 0 ||
++			    strcmp(cmd, "hapclick") == 0 ||
++			    strncmp(cmd, "hapclick ", 9) == 0 ||
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);

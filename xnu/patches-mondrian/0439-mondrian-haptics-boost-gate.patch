@@ -1,0 +1,203 @@
+xnu 0439: fix the haptics boost gate and first-play order
+
+The 0433 click voted hBoost before PLAY and set VSET from HBST 0x46, which
+can read 0x80 while the rail is still starting; the first click then
+reported FAULT 0x01. The donor's direct play leaves VSET clear on the first
+play, writes PLAY, and raises the boost afterwards.
+
+Make the ready gate follow the vendor wait: 0x46 bit 7 set means the boost
+is on; otherwise HBST 0x0b bit 0 is busy, so ready means it is clear. Track
+the boost in software for VSET, read the real HBST 0x0b in the buzz log, and
+cache one SPMI channel window per APID so a click stops remapping four
+windows per pattern byte (the io_submap exhaustion behind the first wedge).
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index fed4050..00d43e6 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -87,6 +87,9 @@ extern void delay(int us);
+ #define HAP_CLICK_VMAX_MV	3600	/* the live DT's effect_0 vmax-mv */
+ 
+ static unsigned int hap_vmax_mv = HAP_VMAX_MV;
++/* The donor leaves VSET clear on the first play; only a boost already voted
++ * by an earlier play may force VREG-ready. */
++static int hap_hbst_on;
+ 
+ /*
+  * HBST is read-only on this board. A write there (the vendor's SW_CTRL_HBST
+@@ -136,6 +139,9 @@ hap_boost(unsigned int on)
+ 	printf("MONDRIAN HAP: hboost %s: sdam 0x42=0x%02x 0xe5=0x%02x"
+ 	    " ppid 0x09d %s\n", on ? "on" : "off", got_arg, got_trig,
+ 	    ok ? "sent" : "failed");
++	if (ok) {
++		hap_hbst_on = on ? 1 : 0;
++	}
+ 	return ok;
+ }
+ 
+@@ -150,7 +156,7 @@ hap_boost_ready(void)
+ 		    HAP_HBST_VREG, &vreg) &&
+ 		    mondrian_spmi_reg_read_raw(MONDRIAN_HAP_HBST,
+ 		    HAP_HBST_STATUS4, &status4) &&
+-		    ((vreg & HAP_EN_BIT) != 0 || (status4 & 1) != 0)) {
++		    ((vreg & HAP_EN_BIT) != 0 || (status4 & 1) == 0)) {
+ 			printf("MONDRIAN HAP: hboost ready: vreg 0x%02x"
+ 			    " status4 0x%02x\n", vreg, status4);
+ 			return 1;
+@@ -216,7 +222,7 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ {
+ 	uint8_t vmax = hap_vmax_mv / HAP_VMAX_STEP_MV;
+ 	uint8_t z = 0, st = 0, hpwr = 0, autores = 0, sine = 0;
+-	uint8_t th = 0, tl = 0, cal = 0, vreg = 0;
++	uint8_t th = 0, tl = 0, cal = 0;
+ 	uint32_t t;
+ 	int ok = 1;
+ 
+@@ -244,9 +250,8 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	}
+ 	ok &= hap_w(0, HAP_CFG_VMAX, vmax);
+ 	ok &= hap_w(0, HAP_CFG_EN_CTL, HAP_EN_BIT);
+-	(void)hap_r(2, HAP_HBST_VREG, &vreg);
+ 	ok &= hap_w(0, HAP_CFG_VSET_CFG,
+-	    (vreg & HAP_EN_BIT) != 0 ? HAP_FORCE_VREG_RDY : 0);
++	    hap_hbst_on ? HAP_FORCE_VREG_RDY : 0);
+ 	if (hap_r(0, HAP_CFG_SINE, &sine)) {
+ 		ok &= hap_w(0, HAP_CFG_SINE, (sine & ~0x3u) | HAP_SINE);
+ 	}
+@@ -273,8 +278,8 @@ mondrian_haptics_buzz(unsigned int ms, unsigned int amp, unsigned int force)
+ 	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_DIRECT);
+ 	/* Leave EN_CTL and VSET alone: clearing either re-votes the boost. */
+ 	if (hap_r(0, HAP_CFG_STATUS_MSB, &st) &&
+-	    hap_r(0, HAP_CFG_HPWR_INTF, &hpwr)) {
+-		printf("MONDRIAN HAP: stopped: status 0x%02x hpwr 0x%02x\n",
++	    hap_r(2, HAP_HBST_STATUS4, &hpwr)) {
++		printf("MONDRIAN HAP: stopped: status 0x%02x hbst-status4 0x%02x\n",
+ 		    st, hpwr);
+ 	}
+ 	delay(2000 * 1000);
+@@ -305,7 +310,7 @@ static const uint8_t hap_click_samples[24] = {
+ int
+ mondrian_haptics_click(unsigned int mv)
+ {
+-	uint8_t st = 0, z = 0, play = 0, vreg = 0, sdam = 0, next = 0;
++	uint8_t st = 0, z = 0, play = 0, sdam = 0, next = 0;
+ 	uint32_t t;
+ 	unsigned int i;
+ 	int ok = 1;
+@@ -328,13 +333,12 @@ mondrian_haptics_click(unsigned int mv)
+ 	ok &= hap_w(0, HAP_CFG_FAULT_CLR, 0x07);
+ 	/* CL brake, sine, sine brake waveform: the DT's qcom,brake-mode 1. */
+ 	ok &= hap_w(0, HAP_CFG_BRAKE_CFG, 0x41);
+-	/* Boost first, then force VREG-ready, then PLAY: the vendor's order. */
+-	ok &= hap_boost(1);
+-	(void)hap_boost_ready();
+-	(void)hap_r(2, HAP_HBST_VREG, &vreg);
++	/* First play leaves VSET clear, then PLAY, then raise hBoost. */
+ 	ok &= hap_w(0, HAP_CFG_VSET_CFG,
+-	    (vreg & HAP_EN_BIT) != 0 ? HAP_FORCE_VREG_RDY : 0);
++	    hap_hbst_on ? HAP_FORCE_VREG_RDY : 0);
+ 	ok &= hap_w(0, HAP_CFG_PLAY, HAP_SRC_PATTERN1 | HAP_PLAY_EN);
++	ok &= hap_boost(1);
++	(void)hap_boost_ready();
+ 	/* Eight samples at 6667 us; the vendor's length counts the first seven. */
+ 	delay(60 * 1000);
+ 	(void)hap_r(0, HAP_CFG_PLAY, &play);
+diff --git a/bsd/dev/mondrian_spmi.c b/bsd/dev/mondrian_spmi.c
+index ec326dd..9efc3ff 100644
+--- a/bsd/dev/mondrian_spmi.c
++++ b/bsd/dev/mondrian_spmi.c
+@@ -106,8 +106,13 @@ static uint16_t sp_pon = 0xffffu, sp_gpio = 0xffffu;
+ static int sp_disabled;
+ static bool sp_adc_reported;
+ int sp_adc_trace;		/* the ring's "sav" sets it for one call */
+-static volatile uint32_t *sp_chan;	/* the adc's channel window, cached */
+-static uint16_t sp_chan_apid;
++#define SP_WINDOW_CACHE	8
++
++static struct {
++	uint16_t apid;
++	volatile uint32_t *win;
++} sp_windows[SP_WINDOW_CACHE];
++static unsigned int sp_window_count;
+ 
+ static uint32_t
+ sp_rd(volatile uint32_t *base, uint32_t off)
+@@ -169,17 +174,29 @@ sp_find_apid(uint16_t ppid)
+ static volatile uint32_t *
+ sp_chan_window(uint16_t apid)
+ {
+-	if (sp_chan == NULL || sp_chan_apid != apid) {
+-		sp_chan = (volatile uint32_t *)ml_io_map(
+-		    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
+-		    MONDRIAN_SPMI_CHNLS_SIZE);
+-		if (sp_chan == NULL) {
+-			printf("MONDRIAN SPMI: no window for apid %u\n", apid);
+-			return NULL;
++	unsigned int i;
++	volatile uint32_t *win;
++
++	for (i = 0; i < sp_window_count; i++) {
++		if (sp_windows[i].apid == apid) {
++			return sp_windows[i].win;
+ 		}
+-		sp_chan_apid = apid;
+ 	}
+-	return sp_chan;
++	if (sp_window_count >= SP_WINDOW_CACHE) {
++		printf("MONDRIAN SPMI: window cache full for apid %u\n", apid);
++		return NULL;
++	}
++	win = (volatile uint32_t *)ml_io_map(
++	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
++	    MONDRIAN_SPMI_CHNLS_SIZE);
++	if (win == NULL) {
++		printf("MONDRIAN SPMI: no window for apid %u\n", apid);
++		return NULL;
++	}
++	sp_windows[sp_window_count].apid = apid;
++	sp_windows[sp_window_count].win = win;
++	sp_window_count++;
++	return win;
+ }
+ 
+ /* One configuration write; 1 = done, 0 = failed (the message is printed). */
+@@ -284,9 +301,7 @@ mondrian_spmi_reg_write_raw(uint16_t ppid, uint8_t reg, uint8_t val)
+ 	if (apid == 0xffffu) {
+ 		return 0;
+ 	}
+-	win = (volatile uint32_t *)ml_io_map(
+-	    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
+-	    MONDRIAN_SPMI_CHNLS_SIZE);
++	win = sp_chan_window(apid);
+ 	if (win == NULL) {
+ 		return 0;
+ 	}
+@@ -309,21 +324,15 @@ mondrian_spmi_reg_write_raw(uint16_t ppid, uint8_t reg, uint8_t val)
+ int
+ mondrian_spmi_reg_write(uint16_t ppid, uint8_t reg, uint8_t val)
+ {
+-	static uint16_t cached_ppid;
+-	static volatile uint32_t *win;
+ 	uint16_t apid;
++	volatile uint32_t *win;
+ 
+-	if (ppid != cached_ppid || win == NULL) {
+-		if (!sp_apid_for(ppid, &apid)) {
+-			return 0;
+-		}
+-		win = (volatile uint32_t *)ml_io_map(
+-		    MONDRIAN_SPMI_CHNLS + ((uint32_t)apid << 12),
+-		    MONDRIAN_SPMI_CHNLS_SIZE);
+-		if (win == NULL) {
+-			return 0;
+-		}
+-		cached_ppid = ppid;
++	if (!sp_apid_for(ppid, &apid)) {
++		return 0;
++	}
++	win = sp_chan_window(apid);
++	if (win == NULL) {
++		return 0;
+ 	}
+ 	win[0x10 / 4] = val;
+ 	__asm__ volatile("dsb osh" ::: "memory");

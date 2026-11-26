@@ -1,0 +1,71 @@
+xnu 0443: trigger the PM8350B PBS ISC event from the ring (pbs)
+
+Measured 2026-11-26: the haptics block is HAP520 (CFG revision 0x02 + PTN
+revision 0x02), so the HAP525_HV realtime impedance register does not exist
+and the vendor's HAP520 path is the PBS ISC configuration followed by a
+DIRECT_PLAY amplitude sweep that reads the SC flag.
+
+qpnp_pbs_trigger_single_event needs no bitmap: the simple PBS is hooked on
+SW_TRIGGER, bit 7 of TRIG_CTL, and is fire-and-forget. The PBS node
+(pm8350b qcom,pbs@1900) is PPID 0x319 in the live arbiter map, APID 454,
+owner 0, so this AP may write it.
+
+`pbs` writes 0x80 to TRIG_CTL, logs the readback and lets the sweep run with
+the 250 mA ISC the PBS sequence selects.
+
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index 00d43e6..ad30034 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -168,6 +168,31 @@ hap_boost_ready(void)
+ 	return 0;
+ }
+ 
++/*
++ * The ISC configuration for HAP520 is a simple PBS hooked on SW_TRIGGER, so
++ * it takes no SCRATCH1 bitmap and waits for no SCRATCH2 ack. The PBS page
++ * (pm8350b qcom,pbs@1900) is PPID 0x319 in the live map, APID 454, owner 0.
++ */
++#define MONDRIAN_PBS_PPID	0x0319u
++#define PBS_CLIENT_TRIG_CTL	0x42
++#define PBS_CLIENT_SW_TRIG_BIT	0x80
++
++int
++mondrian_haptics_pbs_event(void)
++{
++	uint8_t val = 0;
++
++	if (!mondrian_spmi_reg_write_raw(MONDRIAN_PBS_PPID,
++	    PBS_CLIENT_TRIG_CTL, PBS_CLIENT_SW_TRIG_BIT)) {
++		printf("MONDRIAN HAP: pbs trigger refused\n");
++		return -1;
++	}
++	(void)mondrian_spmi_reg_read_raw(MONDRIAN_PBS_PPID,
++	    PBS_CLIENT_TRIG_CTL, &val);
++	printf("MONDRIAN HAP: pbs trigger sent; trig_ctl 0x%02x\n", val);
++	return 0;
++}
++
+ int
+ mondrian_haptics_boost(unsigned int on)
+ {
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index f49065c..d346078 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2823,6 +2823,14 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);
++			} else if (strcmp(cmd, "pbs") == 0) {
++				extern int mondrian_haptics_pbs_event(void);
++				char pbs[48];
++				int n = snprintf(pbs, sizeof(pbs), "pbs %s\n",
++				    mondrian_haptics_pbs_event() == 0 ?
++				    "ok" : "failed");
++
++				ud_cmd_send(so, peer, pbs, (size_t)n);
+ 			} else if (strcmp(cmd, "wififw") == 0) {
+ 				extern int mondrian_wifi_load_amss(void);
+ 				char out[48];
