@@ -1,0 +1,37 @@
+xnu 0485: premap the sw_ctrl pin page the w10 probe maps
+
+Measured 2026-11-26 (0484 boot): `wifistage 14` -- the worker completed the cold
+link and identity, logged `W6 auto load start`, TCSR, the AMSS read, the SMMU
+map, the PCI PM state and `W6 bus master command=0x6`, then stopped with no
+`W6 reset start`. The next call is `wifi_w10_probe()`, whose first statement maps
+the SW_CTRL page (GPIO 82) -- the only pin page the premap did not cover.
+
+It is mapped with the other pins on the boot thread, before touch takes the
+TLMM block, and the premap line now prints its address.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 3b3d290..72d05f1 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2351,10 +2351,20 @@ void
+ mondrian_wifi_premap_pins(void)
+ {
+ 	(void)wifi_map_pins();
+-	wifi_log("W4 premap pins wlan=0x%lx perst=0x%lx bt=0x%lx",
++	/*
++	 * wifi_w10_probe() maps the SW_CTRL page (GPIO 82) on its first
++	 * statement; taken from the worker it hangs, like every other late
++	 * map. Map it here with the rest (measured 2026-11-26: stage 14, no
++	 * `W10 pads` line).
++	 */
++	(void)wifi_map_once(&wifi_sw_ctrl_page,
++	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_SW_CTRL,
++	    WIFI_TLMM_PAGE_SIZE);
++	wifi_log("W4 premap pins wlan=0x%lx perst=0x%lx bt=0x%lx sw=0x%lx",
+ 	    (unsigned long)wifi_wlan_en_page,
+ 	    (unsigned long)wifi_perst_page,
+-	    (unsigned long)wifi_bt_en_page);
++	    (unsigned long)wifi_bt_en_page,
++	    (unsigned long)wifi_sw_ctrl_page);
+ 	mondrian_log_flush_now();
+ }
+ 
