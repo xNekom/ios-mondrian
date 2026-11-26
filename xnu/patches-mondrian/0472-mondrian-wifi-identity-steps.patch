@@ -1,0 +1,64 @@
+xnu 0472: name the identity step that does not return
+
+Measured 2026-11-26: with 0471 every window the worker touches is premapped
+(`W4 premap bar ... cfg=... dbi=... iatu=...` plus the four AHB pages), the
+link comes up, and the worker still stops without reaching `qca6490 id`. No
+mapping is left in that path, so the block is a plain MMIO access.
+
+`wifi_config_identity()` now prints `start`, `refgen done`, `aperture done`,
+`iatu done`, `cfg read` and `cfg answered id=...`, each followed by a flush. A
+hang is bounded by `wifi_wait()` and logs `wifi_fail`, so the last line names
+the exact access instead of the function.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 9248c33..2629ba8 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2142,6 +2142,14 @@ wifi_config_identity(void)
+ 	uint32_t id, subsystem, command;
+ 	uint8_t revision;
+ 
++	/*
++	 * 0471 premapped every window and the worker still stops after the link
++	 * comes up, so the block is a plain MMIO access, not a mapping. Print
++	 * each step: the last line then names the access that does not return.
++	 */
++	wifi_log("W4 identity start");
++	mondrian_log_flush_now();
++
+ 	/* After a real Gen1/Gen2 link, scale refgen to the DT's 19.2 MHz entry. */
+ 	if (negotiated == 1 || negotiated == 2) {
+ 		mondrian_tlmm_write(wifi_gcc, 0x7b04c,
+@@ -2152,9 +2160,13 @@ wifi_config_identity(void)
+ 			return wifi_fail("PCIe negotiated refgen update timed out");
+ 		}
+ 	}
++	wifi_log("W4 identity refgen done");
++	mondrian_log_flush_now();
+ 
+ 	/* Donor's type-1 memory aperture for 0x60200000..0x63ffffff. */
+ 	mondrian_tlmm_write(wifi_dbi, 0x20, 0x63f06020);
++	wifi_log("W4 identity aperture done");
++	mondrian_log_flush_now();
+ 
+ 	/* DesignWare unrolled outbound region0: CFG0 to endpoint BDF 01:00.0. */
+ 	mondrian_tlmm_write(wifi_iatu, 0, 4);
+@@ -2168,13 +2180,19 @@ wifi_config_identity(void)
+ 		return wifi_fail("PCIe config iATU enable timed out");
+ 	}
+ 	wifi_cfg = wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
++	wifi_log("W4 identity iatu done cfg=0x%lx", (unsigned long)wifi_cfg);
++	mondrian_log_flush_now();
+ 	if (wifi_cfg == 0) {
+ 		return wifi_fail("cannot map the PCIe config aperture");
+ 	}
+ 
+ 	/* Safety first: no isolation exists yet, so clear any inherited DMA bit. */
++	wifi_log("W4 identity cfg read");
++	mondrian_log_flush_now();
+ 	wifi_bus_master_off();
+ 	id = mondrian_tlmm_read(wifi_cfg, 0);
++	wifi_log("W4 identity cfg answered id=0x%08x", id);
++	mondrian_log_flush_now();
+ 	if (id != WIFI_PCI_ID_QCA6490) {
+ 		wifi_log("endpoint identity mismatch got 0x%08x want 0x%08x", id,
+ 		    WIFI_PCI_ID_QCA6490);
