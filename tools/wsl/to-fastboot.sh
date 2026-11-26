@@ -63,7 +63,7 @@ ring_command_capture() {
 	bash tools/wsl/attach.sh > /dev/null 2>&1 || { echo "   attach failed"; return 1; }
 	timeout 20 python3 tools/usb-ring.py pos > /dev/null 2>&1 || { echo "   ring silent"; return 1; }
 	rm -f "$log"
-	python3 tools/wsl/log-listen.py 10 "$log" > /dev/null 2>&1 &
+	python3 tools/wsl/log-listen.py 25 "$log" > /dev/null 2>&1 &
 	lp=$!
 	sleep 2
 	timeout 25 python3 tools/usb-ring.py "$1" > /dev/null 2>&1

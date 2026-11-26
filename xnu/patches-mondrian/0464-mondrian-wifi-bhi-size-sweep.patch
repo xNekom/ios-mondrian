@@ -1,0 +1,60 @@
+xnu 0464: ring the doorbell at three sizes
+
+Measured 2026-11-26: the PBL consumes the doorbell and reads inside the 512 KiB
+it is told about, yet BHI_STATUS never leaves 0, the fetched image writes no
+warm entry, and lowering the max read request size to 128 bytes changes
+nothing.
+
+mondrianwifisizes=1 rings the same IOVA at 4 KiB, 64 KiB and 512 KiB with a
+distinct session id each, reading BHI_STATUS and BHI_ERRCODE 500 ms after every
+ring. Success for the small sizes and silence for the large one names a
+size-dependent transfer; silence for all three names an ack that waits on
+something other than the DMA.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 16bb8db..bd6e70c 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1810,6 +1810,42 @@ mondrian_wifi_load_amss(void)
+                 mondrian_log_flush_now();
+             }
+         }
++        {
++            int sizes = 0;
++
++            /*
++             * W14: ring the same image at three advertised sizes. A success
++             * for the small one and silence for the 512 KiB one names a
++             * size-dependent transfer; silence for all three names an ack that
++             * waits on something other than the DMA.
++             */
++            if (PE_parse_boot_argn("mondrianwifisizes", &sizes,
++                sizeof(sizes)) && sizes != 0) {
++                static const uint32_t probe[] = { 0x1000, 0x10000, 0x80000 };
++                unsigned n;
++
++                for (n = 0; n < sizeof(probe) / sizeof(probe[0]); n++) {
++                    uint32_t st = 0, er = 0;
++
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
++                        (uint32_t)(iova >> 32));
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08,
++                        (uint32_t)iova);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10,
++                        probe[n]);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18,
++                        0x2a5a5a5au + n);
++                    delay(500000);
++                    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &st);
++                    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x30, &er);
++                    wifi_log("W14 size=0x%x status=0x%x err=0x%x", probe[n], st,
++                        er);
++                    mondrian_log_flush_now();
++                }
++            }
++        }
+         rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,

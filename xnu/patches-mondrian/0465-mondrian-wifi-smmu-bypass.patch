@@ -1,0 +1,160 @@
+xnu 0465: route the wlan sid around the smmu, and time the reason write
+
+Two questions from the 2026-11-26 measurements.
+
+The PBL consumes the doorbell, reads inside the 512 KiB it is told about and yet
+never acks, at 4 KiB, 64 KiB or 512 KiB, with max read request size 128 or 512.
+Every host register matches the donor's working boot, so the last unverified
+link is the stage-2 table itself: this SoC reports no ATS, so W2 could never
+prove a translation and a table pointing at the wrong pages would read garbage
+without a fault. mondrianwifibypass=1 switches this SID to bypass and rings a
+64 KiB copy of the image from the ABL's contiguous framebuffer at 0xb8000000: an
+ack here and silence through translation names the table.
+
+Separately, the reset without the wifi driver reaches fastboot and spends 2000 ms
+in the PMIC restart reason, while with the wifi driver it does not finish inside
+the 5 s the worker allows. mondrianreasonms=<ms> makes that bound a boot argument
+so the real cost can be measured instead of guessed.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 2cf4945..2c415c0 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1710,9 +1710,22 @@ mondrian_reset_to_bootloader(int recovery)
+ 		 * boots in a row). Five seconds still cannot strand the port,
+ 		 * and the elapsed time names the real cost.
+ 		 */
+-		for (i = 0; i < 5000 && !mondrian_reason_done; i++) {
+-			delay(1000);
+-			waited = i;
++		{
++			int ms = 0;
++
++			/*
++			 * Measured 2026-11-26: 2000 ms without the wifi driver and more
++			 * than 5000 ms with it, so the wait is a boot argument while the
++			 * cost is being found.
++			 */
++			if (!PE_parse_boot_argn("mondrianreasonms", &ms, sizeof(ms)) ||
++			    ms < 100 || ms > 60000) {
++				ms = 5000;
++			}
++			for (i = 0; i < ms && !mondrian_reason_done; i++) {
++				delay(1000);
++				waited = i;
++			}
+ 		}
+ 		wrote = mondrian_reason_done;
+ 	}
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index bd6e70c..0aad156 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1410,6 +1410,7 @@ wifi_w10_probe(void)
+  */
+ extern int mondrian_root_read(const char *, void *, unsigned, off_t);
+ extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
++extern int mondrian_wifi_smmu_bypass(int on);
+ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+     uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
+@@ -1846,6 +1847,50 @@ mondrian_wifi_load_amss(void)
+                 }
+             }
+         }
++        {
++            int bp = 0;
++
++            /*
++             * W15: one 64 KiB transfer with the SID routed around the tables,
++             * from the ABL's contiguous splash framebuffer at 0xb8000000. With
++             * bypass the device reads host physical memory directly, so an ack
++             * here and silence through translation names the table.
++             */
++            if (PE_parse_boot_argn("mondrianwifibypass", &bp,
++                sizeof(bp)) && bp != 0) {
++                vm_offset_t fb = ml_io_map(0xb8000000UL, 0x10000);
++
++                if (fb == 0) {
++                    wifi_log("W15 no window for the framebuffer");
++                } else {
++                    uint32_t st = 0, er = 0;
++                    int rc2;
++
++                    memcpy((void *)fb, (const void *)buf, 0x10000);
++                    flush_dcache64((addr64_t)fb, 0x10000, 0);
++                    rc2 = mondrian_wifi_smmu_bypass(1);
++                    wifi_log("W15 bypass rc=%d pa=0xb8000000", rc2);
++                    mondrian_log_flush_now();
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08,
++                        0xb8000000u);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10,
++                        0x10000);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18,
++                        0x2a5a5b5au);
++                    delay(1000000);
++                    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c,
++                        &st);
++                    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x30,
++                        &er);
++                    wifi_log("W15 bypass status=0x%x err=0x%x", st, er);
++                    mondrian_log_flush_now();
++                    (void)mondrian_wifi_smmu_bypass(0);
++                }
++            }
++        }
+         rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index dbfbb9c..add6761 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -81,6 +81,7 @@ extern void mondrian_log_flush_now(void);
+ #define W2_MAIR0_VALUE      0x0000ff44u
+ #define W2_SCTLR_VALUE      0x00000027u
+ #define W2_S2CR_FAULT       0x00020000u
++#define W2_S2CR_BYPASS      0x00010000u
+ 
+ struct w2_mem {
+     vm_offset_t raw;
+@@ -814,6 +815,36 @@ mondrian_wifi_smmu_map_va(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
+  * with a matching FAR means the BHI read reached the SMMU and the page table
+  * is wrong; a clean FSR with a stuck doorbell means the device never fetched.
+  */
++/*
++ * W15: route this stream around the tables for one experiment. With bypass the
++ * device reads host physical memory directly, so a transfer that completes
++ * with bypass and stalls with translation names the table as the fault.
++ */
++int
++mondrian_wifi_smmu_bypass(int on)
++{
++    if (w2.smmu == 0 || !w2.sid_attached) {
++        return -1;
++    }
++    if (on) {
++        if (w2_put32(W2_S2CR(w2.slot), W2_S2CR_BYPASS | w2.valid_s2cr)) {
++            return -1;
++        }
++        if (w2.slot2_touched &&
++            w2_put32(W2_S2CR(w2.slot2), W2_S2CR_BYPASS | w2.valid_s2cr)) {
++            return -1;
++        }
++        return 0;
++    }
++    if (w2_put32(W2_S2CR(w2.slot), w2.route_s2cr)) {
++        return -1;
++    }
++    if (w2.slot2_touched && w2_put32(W2_S2CR(w2.slot2), w2.route_s2cr2)) {
++        return -1;
++    }
++    return 0;
++}
++
+ int
+ mondrian_wifi_smmu_fault(uint32_t *sctlr, uint32_t *fsr, uint32_t *far,
+     uint32_t *fsynr, uint32_t *gfsr, uint32_t *s2cr, uint32_t *s2cr2)
