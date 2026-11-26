@@ -312,9 +312,10 @@ state the bootloader left: `cfg-rev 0x00 ptn-rev 0x02 status 0x04 hpwr 0x00
 fault 0x00 vmax 0x1c amp 0xff play 0x01` — the block answers, no fault, PTN
 revision 2 (the vendor's own log agrees), the direct-play source selected and
 idle, VMAX at 1.4 V, and `hpwr` at 0, which the vendor's masks read as
-`HPWR_DISABLED`: the PMIC's boost is not up. The one number that disagrees with
-the vendor is `cfg-rev`: its two-byte read at 0x00 returns 0x0002 where our
-single byte returns 0, so that byte alone does not identify the revision.
+`HPWR_DISABLED`: the PMIC's boost is not up. The vendor reads two bytes from
+0x00 and takes the second, so its CFG revision is register 0x01, not 0x00:
+measured 0x02, and PTN 0x01 is 0x02 too. That pair is the vendor's **HAP520**
+(cfg V2 + ptn V2, PM8350B), not HAP525_HV.
 
 **Measured: the AP can configure the block, but a direct HBST write is
 forbidden.** The vendor kernel reports `HAP_HBST 0x1` and the live map puts that
@@ -340,12 +341,12 @@ back as zero even though the trigger runs, so the boost status is the proof.
 5882 us as `0x498`. It forces VREG-ready only while the boost is up; bit 1 of
 VSET belongs to HAP525_HV, which this part is not. The play clears the fault
 latch and disables auto-resonance, as the stock's `DIRECT_PLAY` path does.
-`impedance 0x00` is a closed-loop measurement and proves nothing in open loop,
-and `status 0x04` is the multiplexed `STATUS_DATA_MSB`, not a fault: fault
-reads 0. SDAM `0x46/0x47` returns `0x04/0x6E`, a measured count distinct from
+`impedance 0x00` is not a measurement on this part: register 0x0e exists only
+on HAP525_HV, and `status 0x04` is the multiplexed `STATUS_DATA_MSB`, not a
+fault: fault reads 0. SDAM `0x46/0x47` returns `0x04/0x6E`, a measured count distinct from
 the open-loop `0x498`, so the block does see the LRA. Measured: two 2 s tones
 at `0xff` produced no motion (felt), so direct play is silent on this LRA; the
-next drive test is the stock PTN click pattern.
+stock PTN click is the next drive, and its first attempt is the trap below.
 **2700 mV is unsafe in
 this sequence:** the following readback returned corrupted CFG/TLRA/HBST values,
 `vbat 825 mV out of range` appeared, and SpringBoard stopped presenting
@@ -360,6 +361,43 @@ a click waveform, not filler: eight samples of (amplitude, period, f_lra_x2) =
 (0x1f,0,0) (0x3f,0,0) (0x5f,0,0) (0x7f,0,0) (0x17f,0,0) (0x15f,0,0)
 (0x13f,0,0) (0x11f,0,0), written as 24 bytes at PTN 0x34 with TLRA 0x30 =
 period/5 and the source field set to PATTERN1.
+
+`0433` implements that click as `hapclick [mv]` (default 3600 mV, the effect's
+VMAX) and votes the boost up before forcing VREG-ready, which is the vendor's
+order rather than `vib`'s. Measured 2026-11-26: the first live `hapclick 1800`
+never answered and took the ring command thread with it; ICMP to 192.168.7.2
+still answered, so the kernel itself stayed up and one SPMI transaction is the
+suspect. The PTN block had never been written past 0x26 before this test.
+Replaying all 24 bytes in one command hides which register did it: stage the
+sequence with one `hapw 1 REG VAL` per line, first PTN 0x30/0x31, then each
+0x34.. byte, with `haps` between groups. The cycle log names the last command
+that ran, so the register that wedges is the one after the last entry that
+answered.
+
+The walk settled the block itself: all 24 bytes at PTN 0x34, TLRA
+0x30/0x31 = 0x535, VMAX 0x48 and a PATTERN1 play complete and answer on a live
+boot; the block does not wedge on the pattern or the play. The first click's
+`fault 0x01` is `HPWR_RDY_FAULT`: it played without the boost. `hapb 1` after
+`0x66=0x07` raises `hbst-vreg` to `0x80` and `hapb 0` drops it to `0x00`;
+`hbst-status4` bit 0 is already 1 with the boost off, so it is not proof of the
+rail. Gate the play on `hbst-vreg == 0x80` and keep `hpwr 0x0b` (READY is 3)
+as the in-play check.
+
+Measured during the 53 ms PATTERN1 play: CFG 0x4c reads 0x82 (engine active),
+fault stays 0, and HPWR 0x0b stays 0 in every sample; the vendor treats
+HPWR_DISABLED as a valid terminal state, so that alone does not prove the rail
+is down. `hbst-follow` reads 0xe0 (hardware follow), the SDAM status pair
+0x46/0x47 stays 0x0470 before and during drive, and impedance 0x0e stays 0
+because the register is HAP525_HV-only. Motion is still unproven by registers,
+so the next evidence has to be mechanical (feel, or a current/accelerometer
+trace).
+
+The HAP520 impedance path is the vendor's `haptics_detect_lra_impedance`:
+square drive, 10 V VMAX, no headroom, a DIRECT_PLAY amplitude sweep, and the SC
+flag at 0x0c brackets the LRA. Measured 2026-11-26 with amplitudes 0x10 to
+0xff: SC stayed 0 at every step. That zero is not conclusive, because the
+HAP520 branch first triggers the PBS ISC event (250 mA), this port cannot
+trigger PBS events yet, and the default SC threshold is unmeasured.
 
 ## Measuring it
 
