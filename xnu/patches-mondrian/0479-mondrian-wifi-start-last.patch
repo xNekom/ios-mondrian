@@ -1,0 +1,70 @@
+xnu 0479: start the wifi worker after the whole probe block
+
+Measured 2026-11-26 across five boots: any `ml_io_map()` taken while another
+boot probe is mapping wedges that thread. The wifi pin premap stops the block at
+the eUSB2 map when it runs at the top (0475, 0476, 0478) and stops itself when
+it runs inside `usb_probe()` (0477), while `0474` -- no boot-time pin premap --
+prints `probe done`. The worker itself stops at `early GCC` when it starts
+inside `usb_probe()` and maps the pins while the block is still mapping (0474).
+
+The pin premap leaves the boot block, and the worker starts as the last
+statement of the block, after the BT registration. Its first act is then
+`wifi_map_pins()` with no other mapper running, and it still finds the BAR,
+config, DBI, ELBI, iATU, PARF/PHY, AHB and SMMU windows premapped.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index fe2fb0f..5379e5e 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2402,6 +2402,7 @@ mondrian_log_start(void)
+ 		extern void mondrian_spmi_probe(void);
+ 		extern void mondrian_reset_reason_init(void);
+ 		extern void mondrian_wifi_premap(void);
++		extern void mondrian_wifi_start(void);
+ 
+ 		/*
+ 		 * The premap takes every window the wifi worker touches before
+@@ -2420,6 +2421,14 @@ mondrian_log_start(void)
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
++		/*
++		 * Last, with the whole probe block done: the worker maps the
++		 * TLMM pin pages itself, and mapping them at the top of the
++		 * block or beside a probe that is still mapping wedges the
++		 * mapper (measured 2026-11-26, five boots stopped at a
++		 * different point each time).
++		 */
++		mondrian_wifi_start();
+ 	}
+ }
+ 
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 3ffb73c..46cb5ee 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -286,12 +286,7 @@ mondrian_usb_probe(void)
+ 	 * resets the phone, the SMR/S2CR work is the one in anonbeat1's
+ 	 * 0091-sweet-spacewar-usb-net-smmu.patch (reuse ABL's SMR for the SID).
+ 	 */
+-	{
+-		extern void mondrian_wifi_start(void);
+-
+-		mondrian_wifi_start();
+-		printf("MONDR USB: probe done\n");
+-	}
++	printf("MONDR USB: probe done\n");
+ }
+ 
+ /*
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 53dee92..d300a39 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2313,7 +2313,6 @@ mondrian_wifi_premap(void)
+ 	    enabled != 1) {
+ 		return;
+ 	}
+-	mondrian_wifi_premap_pins();
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
+ 	(void)wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
+ 	(void)wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
