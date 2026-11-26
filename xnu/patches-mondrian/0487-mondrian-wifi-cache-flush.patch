@@ -1,0 +1,196 @@
+xnu 0487: clean the wifi image and SMMU tables before the PBL reads them
+
+Measured 2026-11-27: this kernel defines __ARM_COHERENT_IO__, so
+flush_dcache64() is a bare dsb (osfmk/arm/caches.c:383) and the wifi driver's
+"flushes" never clean anything. The SMMU page tables, the firmware image, the
+MHI context page and the MSI page stay dirty while the endpoint reads DRAM;
+0459's FSR=0x402 (level-2 translation fault, root entry zero) is a walk over a
+table the SMMU never saw.
+
+Use 0227's mondrian_dcache_flush_pa() (dc civac + dsb) for the contiguous SMMU
+tables and a page-by-page VA helper for the physically scattered image. Clear
+the sticky context FSR before the BHI doorbell so the post-doorbell dump shows
+whether the fetch itself faulted.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -75,6 +75,7 @@
+ #include <vm/pmap.h>
+ #include <arm/caches_internal.h>
+ #include "mondrian_mmio.h"
++#include "mondrian_gpu_api.h"
+ 
+ void mondrian_wifi_start(void);
+ 
+@@ -83,6 +84,8 @@
+ /* osfmk/arm/machine_routines.h is not exported to the BSD layer. */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern void mondrian_log_flush_now(void);
++/* Present in the kernel, but not declared by the BSD-visible pmap header. */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* Present in XNU, but not declared by the BSD-visible thread header. */
+ extern kern_return_t thread_terminate(thread_t thread);
+ 
+@@ -1028,6 +1031,27 @@
+ }
+ 
+ /*
++ * flush_dcache64() is a bare dsb in this kernel (__ARM_COHERENT_IO__), so a
++ * device-visible range written through the cache is not in DRAM when the
++ * endpoint reads it. The image is virtually contiguous and physically
++ * scattered, so clean it page by page.
++ */
++static void
++wifi_flush_va(vm_offset_t va, vm_size_t bytes)
++{
++	vm_offset_t end = va + bytes;
++	vm_offset_t page;
++
++	for (page = va & ~(vm_offset_t)0xfff; page < end; page += 0x1000) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)page);
++
++		if (pn != 0) {
++			mondrian_dcache_flush_pa(ptoa_64(pn), 0x1000);
++		}
++	}
++}
++
++/*
+  * W3: prove the real PCI bus-master bit and record the BAR0 the bootloader
+  * left. The first attempt also programmed BAR0 and mapped 0x60200000; the
+  * worker hung on the first BAR read (no W3 line, no final log), so that access
+@@ -1464,6 +1488,7 @@
+ extern void mondrian_wifi_smmu_premap(void);
+ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+     uint32_t *, uint32_t *, uint32_t *, uint32_t *);
++extern int mondrian_wifi_smmu_clear_fault(void);
+ 
+ #define W6_MSI_OFF	0x5fe000u
+ 
+@@ -1678,7 +1703,7 @@
+     if (got <= 0) {
+         return -1;
+     }
+-    flush_dcache64((addr64_t)buf, (unsigned)got, 0);
++    wifi_flush_va(buf, (vm_size_t)got);
+     {
+         int maparg = 0;
+ 
+@@ -1725,7 +1750,7 @@
+      * the AMSS, and mapped by the same W2 context as the image.
+      */
+     memset((void *)(buf + W6_MSI_OFF), 0, 0x1000);
+-    flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++    wifi_flush_va(buf + W6_MSI_OFF, 0x1000);
+     if (wifi_msi_enable(iova + W6_MSI_OFF) == 0) {
+         wifi_log("W6 MSI armed at 0x%llx",
+             (unsigned long long)(iova + W6_MSI_OFF));
+@@ -1779,7 +1804,7 @@
+         (void)mondrian_mmio_try_rd32(wifi_bar + 0x20, &erdb);
+         (void)mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhie_off);
+         memset((void *)(buf + W8_CTX_OFF), 0, 0x1000);
+-        flush_dcache64((addr64_t)(buf + W8_CTX_OFF), 0x1000, 0);
++        wifi_flush_va(buf + W8_CTX_OFF, 0x1000);
+         rc = wifi_mhi_context(ctx, iova, limit);
+         ner = (mhicfg >> 16) & 0xffu;
+         nhwer = (mhicfg >> 24) & 0xffu;
+@@ -1804,7 +1829,7 @@
+         (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
+         (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x20, &intvec);
+         (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &pre_status);
+-        flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++        wifi_flush_va(buf + W6_MSI_OFF, 0x1000);
+         msi_page = *(volatile uint32_t *)(buf + W6_MSI_OFF);
+         wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x"
+             " msi=0x%x", execenv, intvec, pre_status, msi_page);
+@@ -1929,7 +1954,7 @@
+                     int rc2;
+ 
+                     memcpy((void *)mem, (const void *)buf, 0x10000);
+-                    flush_dcache64((addr64_t)mem, 0x10000, 0);
++                    wifi_flush_va(mem, 0x10000);
+                     wifi_log("W15 buffer pa=0x%llx",
+                         (unsigned long long)pa);
+                     mondrian_log_flush_now();
+@@ -1968,6 +1993,17 @@
+         wifi_log("W11 bhi addr=0x%llx size=0x%x bad=%d",
+             (unsigned long long)bhi_iova, image_size, bad);
+     }
++    {
++        int fsr_rc = mondrian_wifi_smmu_clear_fault();
++
++        /*
++         * The SOC reset releases the PBL, which walks the context before the
++         * doorbell. Clear the sticky fault so the dump after the doorbell
++         * answers whether this fetch faulted, not the reset's walk.
++         */
++        wifi_log("W11 fsr clear rc=%d", fsr_rc);
++        mondrian_log_flush_now();
++    }
+     /* BHI_IMGTXDB is a 30-bit sequence, not a boolean. */
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5au);
+     WIFI_STAGE(17);
+@@ -2043,7 +2079,7 @@
+         (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x3c, &d3);
+         wifi_log("W6 BHI errdbg=0x%x/0x%x/0x%x", d1, d2, d3);
+     }
+-    flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++    wifi_flush_va(buf + W6_MSI_OFF, 0x1000);
+     wifi_log("W6 MSI page=0x%x",
+         *(volatile uint32_t *)(buf + W6_MSI_OFF));
+     mondrian_log_flush_now();
+@@ -2117,7 +2153,7 @@
+                 wifi_log("W7 remainder did not fit entries=%u", entries);
+                 return -1;
+             }
+-            flush_dcache64((addr64_t)(buf + 0x5ff000), 0x1000, 0);
++            wifi_flush_va(buf + 0x5ff000, 0x1000);
+             rc = mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x30,
+                 (uint32_t)(vt_iova >> 32));
+             rc |= mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x2c,
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -24,6 +24,7 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+ #include "mondrian_mmio.h"
++#include "mondrian_gpu_api.h"
+ 
+ #if defined(MONDRIAN)
+ 
+@@ -269,8 +270,31 @@
+ static void
+ w2_flush_pa(uint64_t pa, vm_size_t bytes)
+ {
+-    flush_dcache64((addr64_t)pa, (unsigned)bytes, TRUE);
+-    __asm__ volatile("dsb sy" ::: "memory");
++    /*
++     * __ARM_COHERENT_IO__ turns flush_dcache64() into a bare dsb, so the
++     * tables stayed dirty while the SMMU walked stale DRAM (0459's FSR=0x402
++     * is that walk). Clean the physical range for real.
++     */
++    mondrian_dcache_flush_pa(pa, bytes);
++}
++
++/*
++ * Clear the sticky context fault bits before the BHI doorbell, so a fault
++ * reported afterwards belongs to the fetch the doorbell started.
++ */
++int
++mondrian_wifi_smmu_clear_fault(void)
++{
++    uint32_t got = 0;
++
++    if (w2.smmu == 0 || w2.cb == 0) {
++        return -1;
++    }
++    if (w2_wr32(w2.cb + W2_CB_FSR, W2_FSR_FAULT) ||
++        w2_rd32(w2.cb + W2_CB_FSR, &got)) {
++        return -1;
++    }
++    return (got & W2_FSR_FAULT) != 0 ? -1 : 0;
+ }
+ 
+ static int
