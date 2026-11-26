@@ -1,0 +1,58 @@
+xnu 0460: how far does the bhi fetch read
+
+Measured 2026-11-26 by 0459: pointing BHI_IMGADDR at an unmapped IOVA makes the
+SMMU report FAR=0x0bad0000, so the PBL does consume the doorbell and start its
+fetch. With the real image the SMMU records nothing, but the whole 6 MiB buffer
+is mapped, so reads past the 512 KiB BHI was told about are invisible.
+
+mondrianwifimap=<bytes> maps only that much of the image, so the SMMU reports the
+first read outside it: an ELF-loading PBL reads to the end of the segments
+(0x50d000), a blob copier stays inside 0x80000. Either answer names the next
+fix.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index e45be0a..8e358cd 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -290,6 +290,7 @@ static const struct wifi_rail wifi_rails[] = {
+ static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,
+     wifi_iatu, wifi_cfg, wifi_bar;
+ static uint32_t wifi_sbl_size = 0x80000;
++static uint32_t wifi_map_bytes = 0x600000;
+ static vm_offset_t wifi_wlan_en_page, wifi_bt_en_page, wifi_perst_page,
+     wifi_clkreq_page, wifi_wake_page, wifi_xo_page, wifi_sw_ctrl_page;
+ 
+@@ -1611,12 +1612,28 @@ mondrian_wifi_load_amss(void)
+         return -1;
+     }
+     flush_dcache64((addr64_t)buf, (unsigned)got, 0);
+-    if (mondrian_wifi_smmu_map_va(buf, 0x600000, &iova)) {
+-        wifi_log("W6 SMMU map failed");
+-        return -1;
++    {
++        int maparg = 0;
++
++        /*
++         * W12: map exactly what BHI advertises and the SMMU reports the first
++         * read outside it. A PBL that parses the ELF and loads every segment
++         * reads to the end of the file; one that copies the 512 KiB blob and
++         * jumps stays inside it. Reads past the map fault with FAR = the
++         * address they reached.
++         */
++        if (PE_parse_boot_argn("mondrianwifimap", &maparg,
++            sizeof(maparg)) && maparg >= 0x1000 &&
++            maparg <= 0x600000) {
++            wifi_map_bytes = (uint32_t)maparg;
++        }
++        if (mondrian_wifi_smmu_map_va(buf, wifi_map_bytes, &iova)) {
++            wifi_log("W6 SMMU map failed");
++            return -1;
++        }
++        wifi_log("W6 SMMU map iova=0x%llx bytes=0x%x",
++            (unsigned long long)iova, wifi_map_bytes);
+     }
+-    wifi_log("W6 SMMU map iova=0x%llx",
+-        (unsigned long long)iova);
+     mondrian_log_flush_now();
+     /*
+      * W3 leaves bus mastering off on purpose. pci_set_master runs before

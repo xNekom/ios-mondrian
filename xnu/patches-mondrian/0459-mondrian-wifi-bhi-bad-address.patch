@@ -1,0 +1,110 @@
+xnu 0459: does the pbl read the bhi doorbell at all
+
+Measured 2026-11-26: the chip's BHI block is initialized (version 1.2, serial,
+hwid, exec_env 0) and the MHI reset bit is accepted and cleared, so the boot
+ROM executes, but the doorbell written afterwards is never consumed and
+BHI_STATUS stays 0. Every host register matches the donor's working SM8475
+port, so the question is now whether the ROM starts the fetch at all.
+
+Point the BHI image address at 0x0bad0000, outside the wired SMMU window but
+inside this SID's stage-2 translation, and sample CB_FSR/FAR/GFSR around the
+doorbell. A translation fault with FAR=0xbad0000 proves the ROM consumed the
+doorbell and its fetch reached the SMMU; an unchanged fault record proves the
+fetch never started. The same dump reads the PCIe capability's Device Control,
+which the donor programs to 0x0810 and this port never touches.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 748ed21..e45be0a 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1365,9 +1365,26 @@ wifi_w10_probe(void)
+ 	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_CFG),
+ 	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_IN_OUT));
+ 	mondrian_log_flush_now();
+-	wifi_log("W10 pci devctl=0x%x linkctl=0x%x linksta=0x%x linkcap=0x%x",
+-	    wifi_read16(wifi_cfg, 0x08), wifi_read16(wifi_cfg, 0x10),
+-	    wifi_read16(wifi_cfg, 0x12), wifi_read16(wifi_cfg, 0x0c));
++	{
++		uint8_t cap = (uint8_t)(wifi_read8(wifi_cfg, 0x34) & ~3u);
++		int n;
++
++		for (n = 0; n < 32 && cap >= 0x40; n++) {
++			if (wifi_read8(wifi_cfg, cap) == 0x10) {
++				wifi_log("W10 pcie cap=0x%x devctl=0x%x"
++				    " linkctl=0x%x linksta=0x%x linkcap=0x%x",
++				    cap, wifi_read16(wifi_cfg, cap + 0x08),
++				    wifi_read16(wifi_cfg, cap + 0x10),
++				    wifi_read16(wifi_cfg, cap + 0x12),
++				    wifi_read16(wifi_cfg, cap + 0x0c));
++				break;
++			}
++			cap = (uint8_t)(wifi_read8(wifi_cfg, cap + 1) & ~3u);
++		}
++		if (n == 32 || cap < 0x40) {
++			wifi_log("W10 pcie capability not found");
++		}
++	}
+ 	mondrian_log_flush_now();
+ 	for (i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+ 		type = sub = status = enable = lo = hi = 0;
+@@ -1723,12 +1740,37 @@ mondrian_wifi_load_amss(void)
+      */
+     image_size = (uint32_t)got > wifi_sbl_size ?
+         wifi_sbl_size : (uint32_t)got;
+-    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
+-        (uint32_t)(iova >> 32));
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08, (uint32_t)iova);
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10, image_size);
++    {
++        uint64_t bhi_iova = iova;
++        int bad = 0;
++        uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
++        uint32_t s2cr = 0, s2cr2 = 0;
++
++        if (mondrian_wifi_smmu_fault(&sctlr, &fsr, &far, &fsynr, &gfsr,
++            &s2cr, &s2cr2) == 0) {
++            wifi_log("W11 smmu pre fsr=0x%x far=0x%x gfsr=0x%x fsynr=0x%x",
++                fsr, far, gfsr, fsynr);
++        }
++        if (PE_parse_boot_argn("mondrianwifibad", &bad, sizeof(bad)) &&
++            bad != 0) {
++            /*
++             * Outside the wired 0xa1000000..0xa15fffff window and inside the
++             * SID's stage-2 translation: if the PBL consumes the doorbell, its
++             * fetch must fault here and CB_FSR reports FAR=0xbad0000.
++             */
++            bhi_iova = 0x0bad0000ull;
++            image_size = 0x1000;
++        }
++        rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++        rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++        rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
++            (uint32_t)(bhi_iova >> 32));
++        rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08,
++            (uint32_t)bhi_iova);
++        rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10, image_size);
++        wifi_log("W11 bhi addr=0x%llx size=0x%x bad=%d",
++            (unsigned long long)bhi_iova, image_size, bad);
++    }
+     /* BHI_IMGTXDB is a 30-bit sequence, not a boolean. */
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5au);
+     wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x intvec=0x%x rc=0x%x",
+@@ -1743,6 +1785,16 @@ mondrian_wifi_load_amss(void)
+     wifi_bhi_dump("db+10ms", bhioff);
+     delay(90000);
+     wifi_bhi_dump("db+100ms", bhioff);
++    {
++        uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
++        uint32_t s2cr = 0, s2cr2 = 0;
++
++        if (mondrian_wifi_smmu_fault(&sctlr, &fsr, &far, &fsynr, &gfsr,
++            &s2cr, &s2cr2) == 0) {
++            wifi_log("W11 smmu db+100ms fsr=0x%x far=0x%x gfsr=0x%x"
++                " fsynr=0x%x", fsr, far, gfsr, fsynr);
++        }
++    }
+     mondrian_log_flush_now();
+     for (i = 0; i < 10000; i++) {
+         delay(1000);

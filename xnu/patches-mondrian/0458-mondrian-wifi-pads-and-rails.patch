@@ -1,0 +1,135 @@
+xnu 0458: read the pads and the pmic rails the wlan chip boots on
+
+Every host register the QCA6490 sees now matches the donor's working SM8475
+port, and two A/Bs (0454, 0456) leave the BHI doorbell unconsumed with
+BHI_STATUS 0. What has never been read is the device side: GPIO82
+(qcom,sw-ctrl-gpio) is in the CNSS node and no stage drives it, and the RPMh
+votes only acknowledge a request, never that the rail came up.
+
+W10 logs the pad configuration and level for all seven CNSS/PCIe pads, the
+endpoint's device/link control, and the five PMIC rails read back over SPMI
+the way the donor's railReady does. The donor's working device reads
+type/subtype, status 0x8f/0x97/0x9f and enable 0x80 on PPID 49e/1b9/1b6/29b/1bc,
+so the same reading here separates "the core is unpowered" from every host
+explanation. The MHI reset bit is also read back immediately after the write:
+a value that lands and is then cleared is the device acknowledging it.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 19deb1e..748ed21 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -152,6 +152,7 @@ extern int mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data);
+ #define WIFI_GPIO_CLKREQ	95
+ #define WIFI_GPIO_WAKE		96
+ #define WIFI_GPIO_XO		204
++#define WIFI_GPIO_SW_CTRL	82
+ 
+ /* qcom,phy-status-*, qcom,phy-power-down-offset and qcom,aux-clk-freq. */
+ #define WIFI_PHY_STATUS_OFF	0x214
+@@ -290,7 +291,7 @@ static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,
+     wifi_iatu, wifi_cfg, wifi_bar;
+ static uint32_t wifi_sbl_size = 0x80000;
+ static vm_offset_t wifi_wlan_en_page, wifi_bt_en_page, wifi_perst_page,
+-    wifi_clkreq_page, wifi_wake_page, wifi_xo_page;
++    wifi_clkreq_page, wifi_wake_page, wifi_xo_page, wifi_sw_ctrl_page;
+ 
+ static void wifi_log(const char *fmt, ...) __printflike(1, 2);
+ 
+@@ -1273,6 +1274,14 @@ wifi_soc_reset(void)
+ 	wifi_log("W6 soc reset qfprom=0x%x ctrl=0x%x", qfprom, val);
+ 	mondrian_log_flush_now();
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x38, 2);
++	/*
++	 * Linux waits for the device to clear this bit (mhi_reset). Read it back
++	 * before the delay: a write that lands and is then cleared is the
++	 * device acknowledging the reset, a read that is zero at once is a
++	 * register nothing is running behind.
++	 */
++	(void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &val);
++	wifi_log("W6 mhictrl immediate=0x%x", val);
+ 	delay(10000);
+ 	(void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &val);
+ 	wifi_log("W6 soc reset mhictrl=0x%x", val);
+@@ -1308,6 +1317,74 @@ wifi_bhi_dump(const char *tag, uint32_t bhioff)
+         status, err, txdb, addr, size);
+ }
+ 
++extern int mondrian_spmi_reg_read(uint16_t ppid, uint8_t reg, uint8_t *out);
++
++/*
++ * W10: the device-side state the BAR cannot show. The pads decide what the
++ * chip's ROM sees (GPIO82 is qcom,sw-ctrl-gpio in the CNSS node and no stage
++ * drives it), and the RPMh writes only acknowledge a request: read the PMIC
++ * back over SPMI the way the donor's railReady does. The donor's working
++ * QCA6490 reads type/subtype, status 0x8f/0x97/0x9f and enable 0x80 on these
++ * five PPIDs (zizhan evidence 2026-11-03).
++ */
++static void
++wifi_w10_probe(void)
++{
++	static const struct {
++		const char *name;
++		uint16_t ppid;
++	} rails[] = {
++		{ "smpe2", 0x49e }, { "smpb11", 0x1b9 }, { "smpb10", 0x1b6 },
++		{ "smpc1", 0x29b }, { "smpb12", 0x1bc },
++	};
++	uint8_t type, sub, status, enable, lo, hi;
++	size_t i;
++	int e;
++
++	if (wifi_sw_ctrl_page == 0) {
++		wifi_sw_ctrl_page = wifi_map_once(&wifi_sw_ctrl_page,
++		    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_SW_CTRL,
++		    WIFI_TLMM_PAGE_SIZE);
++	}
++	wifi_log("W10 pads wlan=%x/%x sw=%x/%x perst=%x/%x clkreq=%x/%x"
++	    " wake=%x/%x xo=%x/%x bt=%x/%x",
++	    mondrian_tlmm_read(wifi_wlan_en_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_wlan_en_page, WIFI_TLMM_IN_OUT),
++	    wifi_sw_ctrl_page ? mondrian_tlmm_read(wifi_sw_ctrl_page,
++	    WIFI_TLMM_CFG) : 0,
++	    wifi_sw_ctrl_page ? mondrian_tlmm_read(wifi_sw_ctrl_page,
++	    WIFI_TLMM_IN_OUT) : 0,
++	    mondrian_tlmm_read(wifi_perst_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_perst_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_clkreq_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_wake_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_wake_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_xo_page, WIFI_TLMM_IN_OUT),
++	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_CFG),
++	    mondrian_tlmm_read(wifi_bt_en_page, WIFI_TLMM_IN_OUT));
++	mondrian_log_flush_now();
++	wifi_log("W10 pci devctl=0x%x linkctl=0x%x linksta=0x%x linkcap=0x%x",
++	    wifi_read16(wifi_cfg, 0x08), wifi_read16(wifi_cfg, 0x10),
++	    wifi_read16(wifi_cfg, 0x12), wifi_read16(wifi_cfg, 0x0c));
++	mondrian_log_flush_now();
++	for (i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		type = sub = status = enable = lo = hi = 0;
++		e = 0;
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 4, &type);
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 5, &sub);
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 8, &status);
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 0x46, &enable);
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 0x40, &lo);
++		e |= mondrian_spmi_reg_read(rails[i].ppid, 0x41, &hi);
++		wifi_log("W10 rail %s ppid=%x id=%x/%x status=%x enable=%x"
++		    " mv=%u err=%d", rails[i].name, rails[i].ppid, type, sub,
++		    status, enable, (unsigned)lo | ((unsigned)hi << 8), e);
++		mondrian_log_flush_now();
++	}
++}
++
+ /*
+  * W6: read the AMSS image from the iOS root, map it through the W2 SMMU
+  * context and hand it to BHI. The host uploads the blob after boot, so this
+@@ -1540,6 +1617,7 @@ mondrian_wifi_load_amss(void)
+     if ((command & WIFI_PCI_BUS_MASTER) == 0) {
+         return -1;
+     }
++    wifi_w10_probe();
+     /*
+      * The PBL's BHI interrupt is the endpoint's MSI, so the landing page must
+      * exist before the reset. The page is inside the wired image buffer, past

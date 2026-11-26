@@ -14,11 +14,13 @@
 # is looked up by USB id instead, every time, because the id changes with the
 # mode (1209:0001 running, 18d1:d00d in fastboot).
 #
-# A reset the kernel asks for can stall on a step (0453). The phone then still
-# answers a ping and keeps logging, so "no fastboot" is not "dead": the loop
-# reads the live console first -- the last MONDRIAN REBOOT line names the step
-# -- and then asks for `hardreset`, which is PSCI alone and cannot reach the
-# stalled step. Only when that fails too is a key press the answer.
+# A reset the kernel asks for can stall or lose its restart reason, and the
+# phone then comes back on the disk slot instead of the bootloader. The live
+# console is captured *during* the attempt, not after it: the next kernel
+# re-initialises the ring, so the MONDRIAN RESET lines that name the step are
+# gone by the time a failure is visible (measured 2026-11-26, a reset that
+# landed on boot_b left no trace in the new ring). Only when every host step
+# fails is a key press the answer.
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 FB=${FB:-/mnt/c/platform-tools/fastboot.exe}
@@ -55,6 +57,25 @@ ring_command() {
 	timeout 25 python3 tools/usb-ring.py "$1" > /dev/null 2>&1
 }
 
+ring_command_capture() {
+	local log=/root/reset-console.log lp
+
+	bash tools/wsl/attach.sh > /dev/null 2>&1 || { echo "   attach failed"; return 1; }
+	timeout 20 python3 tools/usb-ring.py pos > /dev/null 2>&1 || { echo "   ring silent"; return 1; }
+	rm -f "$log"
+	python3 tools/wsl/log-listen.py 10 "$log" > /dev/null 2>&1 &
+	lp=$!
+	sleep 2
+	timeout 25 python3 tools/usb-ring.py "$1" > /dev/null 2>&1
+	wait "$lp" 2>/dev/null
+	# The reset path prints the step it reached before the last flush.
+	if [ -s "$log" ]; then
+		grep -a -e 'MONDR USB: reboot' -e 'MONDR USB: hard' \
+		    -e 'MONDR USB: bcb' -e 'MONDRIAN REBOOT' -e 'MONDRIAN RESET' \
+		    -e 'MONDRIAN HARD RESET' "$log" | tail -8
+	fi
+}
+
 wait_fastboot() {
 	local rounds=${1:-40} i b
 
@@ -78,30 +99,25 @@ try_attach
 if adb devices 2>/dev/null | grep -q -w device; then
 	echo "== recovery: adb reboot bootloader"
 	adb reboot bootloader > /dev/null 2>&1
-else
-	echo "== asking the running kernel for fastboot"
-	ring_command reboot || true
+	wait_fastboot 15 && exit 0
 fi
 
+echo "== asking the running kernel for fastboot"
+ring_command_capture reboot || true
 wait_fastboot 15 && exit 0
 
-# The reset did not arrive. The kernel is probably still up with its reset
-# thread stuck: read the step it stopped at from the live console, then try
-# the bare PSCI path, which writes the restart reason again (0455) -- a stale
-# one from the failed attempt lands the boot on the active slot instead.
-echo "== no fastboot; reading the live console"
-bash tools/wsl/attach.sh > /dev/null 2>&1
-python3 tools/wsl/log-listen.py 12 /root/reset-hang.log || true
+# The ring reboot did not arrive. `hardreset` is the same BCB, restart reason
+# and PSCI without the HFS sync, and its reason write is bounded, so it cannot
+# strand the command port (0457).
 echo "== hard reset"
-ring_command hardreset || true
+ring_command_capture hardreset || true
 wait_fastboot 15 && exit 0
 
-# Last host-side resort: point the boot control block at the bootloader and
-# reset again. The reason above is what this bootloader reads; the BCB is the
-# second hint for a revision that prefers it.
+# Last host-side resort: write the boot control block explicitly and reset
+# again. ABL reads the restart reason first, the BCB is the second hint.
 echo "== bcb bootloader + hard reset"
-ring_command "bcb bootloader" || true
-ring_command hardreset || true
+ring_command_capture "bcb bootloader" || true
+ring_command_capture hardreset || true
 wait_fastboot 15 && exit 0
 
 echo "no fastboot: power + volume down" >&2
