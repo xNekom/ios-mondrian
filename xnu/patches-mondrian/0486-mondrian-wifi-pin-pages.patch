@@ -1,0 +1,139 @@
+xnu 0486: share the wifi pin pages and derive sw_ctrl from them
+
+Measured 2026-11-26: a wifi boot with 0485 panics in io_map()'s KMA_NOFAIL
+kmem_alloc (map=io_submap, size=0x4000, flags KMA_NOFAIL|KMA_PAGEABLE|
+KMA_PERMANENT). The only mapping 0485 adds is the sw_ctrl page, a seventh
+ml_io_map() in the premap, and `io_map()` is the one KMA_NOFAIL kmem_alloc the
+boot takes after startup. The pin registers are 0x1000 apart while ml_io_map()
+maps a whole 16 KiB kernel page, so wlan_en (GPIO 80), bt_en (81) and sw_ctrl
+(82) already share one mapping; one map per pin spends the 8 MiB io_submap --
+shared with every driver in the kernel -- on windows that overlap.
+
+The premap maps each distinct 16 KiB TLMM window once (four instead of seven)
+and derives every pin from it, sw_ctrl included. wifi_w10_probe() no longer
+maps its own page: a late ml_io_map() from the worker hangs.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 72d05f1..815c22b 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -338,6 +338,55 @@ wifi_map_once(vm_offset_t *slot, vm_offset_t pa, vm_size_t size)
+ 	return *slot;
+ }
+ 
++/*
++ * ml_io_map() maps a whole kernel page (16 KiB), and the TLMM registers are
++ * 0x1000 apart, so four consecutive GPIOs share one mapping. One map per pin
++ * spends the io_submap -- 8 MiB for every driver in the kernel -- on windows
++ * that overlap, and a seventh map in the premap panicked in io_map()'s
++ * KMA_NOFAIL kmem_alloc (measured 2026-11-26: map=io_submap, size=0x4000,
++ * KMA_NOFAIL|KMA_PAGEABLE|KMA_PERMANENT). Map each 16 KiB window once and
++ * derive every pin from it; GPIO 82 (sw_ctrl) shares GPIO 80's window.
++ */
++#define WIFI_PIN_PAGES	4
++static vm_offset_t wifi_pin_page[WIFI_PIN_PAGES];
++static const unsigned int wifi_pin_first[WIFI_PIN_PAGES] = {
++	WIFI_GPIO_WLAN_EN,	/* 80..83: wlan_en, bt_en, sw_ctrl */
++	92,			/* 92..95: perst, clkreq */
++	WIFI_GPIO_WAKE,		/* 96..99 */
++	WIFI_GPIO_XO,		/* 204..207 */
++};
++
++_Static_assert(WIFI_GPIO_WLAN_EN / (PAGE_SIZE / WIFI_TLMM_PAGE_SIZE) ==
++    WIFI_GPIO_SW_CTRL / (PAGE_SIZE / WIFI_TLMM_PAGE_SIZE),
++    "sw_ctrl must share wlan_en's kernel page");
++
++static vm_offset_t
++wifi_pin(unsigned int gpio)
++{
++	const unsigned int per_page = PAGE_SIZE / WIFI_TLMM_PAGE_SIZE;
++	const unsigned int first = gpio - gpio % per_page;
++	unsigned int i;
++
++	for (i = 0; i < WIFI_PIN_PAGES; i++) {
++		if (wifi_pin_first[i] == first) {
++			break;
++		}
++	}
++	if (i == WIFI_PIN_PAGES) {
++		wifi_log("W4 gpio %u is outside the premapped TLMM windows", gpio);
++		return 0;
++	}
++	if (wifi_pin_page[i] == 0) {
++		wifi_pin_page[i] = ml_io_map(WIFI_TLMM_BASE +
++		    (vm_offset_t)WIFI_TLMM_PAGE_SIZE * first, PAGE_SIZE);
++	}
++	if (wifi_pin_page[i] == 0) {
++		return 0;
++	}
++	return wifi_pin_page[i] +
++	    (vm_offset_t)WIFI_TLMM_PAGE_SIZE * (gpio - first);
++}
++
+ static int
+ wifi_wait(vm_offset_t page, uint32_t off, uint32_t mask, uint32_t value,
+     unsigned us)
+@@ -430,24 +479,12 @@ static int
+ wifi_map_pins(void)
+ {
+ 
+-	wifi_wlan_en_page = wifi_map_once(&wifi_wlan_en_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_WLAN_EN,
+-	    WIFI_TLMM_PAGE_SIZE);
+-	wifi_bt_en_page = wifi_map_once(&wifi_bt_en_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_BT_EN,
+-	    WIFI_TLMM_PAGE_SIZE);
+-	wifi_perst_page = wifi_map_once(&wifi_perst_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_PERST,
+-	    WIFI_TLMM_PAGE_SIZE);
+-	wifi_clkreq_page = wifi_map_once(&wifi_clkreq_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_CLKREQ,
+-	    WIFI_TLMM_PAGE_SIZE);
+-	wifi_wake_page = wifi_map_once(&wifi_wake_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_WAKE,
+-	    WIFI_TLMM_PAGE_SIZE);
+-	wifi_xo_page = wifi_map_once(&wifi_xo_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_XO,
+-	    WIFI_TLMM_PAGE_SIZE);
++	wifi_wlan_en_page = wifi_pin(WIFI_GPIO_WLAN_EN);
++	wifi_bt_en_page = wifi_pin(WIFI_GPIO_BT_EN);
++	wifi_perst_page = wifi_pin(WIFI_GPIO_PERST);
++	wifi_clkreq_page = wifi_pin(WIFI_GPIO_CLKREQ);
++	wifi_wake_page = wifi_pin(WIFI_GPIO_WAKE);
++	wifi_xo_page = wifi_pin(WIFI_GPIO_XO);
+ 	if (wifi_wlan_en_page == 0 || wifi_bt_en_page == 0 ||
+ 	    wifi_perst_page == 0 || wifi_clkreq_page == 0 ||
+ 	    wifi_wake_page == 0 || wifi_xo_page == 0) {
+@@ -1355,9 +1392,9 @@ wifi_w10_probe(void)
+ 	int e;
+ 
+ 	if (wifi_sw_ctrl_page == 0) {
+-		wifi_sw_ctrl_page = wifi_map_once(&wifi_sw_ctrl_page,
+-		    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_SW_CTRL,
+-		    WIFI_TLMM_PAGE_SIZE);
++		/* The premap derives it from GPIO 80's window: a late
++		 * ml_io_map() from this worker hangs. */
++		wifi_log("W10 no premapped sw_ctrl page");
+ 	}
+ 	wifi_log("W10 pads wlan=%x/%x sw=%x/%x perst=%x/%x clkreq=%x/%x"
+ 	    " wake=%x/%x xo=%x/%x bt=%x/%x",
+@@ -2352,14 +2389,13 @@ mondrian_wifi_premap_pins(void)
+ {
+ 	(void)wifi_map_pins();
+ 	/*
+-	 * wifi_w10_probe() maps the SW_CTRL page (GPIO 82) on its first
+-	 * statement; taken from the worker it hangs, like every other late
+-	 * map. Map it here with the rest (measured 2026-11-26: stage 14, no
+-	 * `W10 pads` line).
++	 * wifi_w10_probe() needs the SW_CTRL pin (GPIO 82), and it shares
++	 * GPIO 80's 16 KiB TLMM window, which wifi_map_pins() has just
++	 * mapped: derive it instead of mapping a page of its own. A
++	 * separate ml_io_map() here is what panicked in 0485 (a seventh
++	 * mapping; see wifi_pin()), and one taken from the worker hangs.
+ 	 */
+-	(void)wifi_map_once(&wifi_sw_ctrl_page,
+-	    WIFI_TLMM_BASE + WIFI_TLMM_PAGE_SIZE * WIFI_GPIO_SW_CTRL,
+-	    WIFI_TLMM_PAGE_SIZE);
++	wifi_sw_ctrl_page = wifi_pin(WIFI_GPIO_SW_CTRL);
+ 	wifi_log("W4 premap pins wlan=0x%lx perst=0x%lx bt=0x%lx sw=0x%lx",
+ 	    (unsigned long)wifi_wlan_en_page,
+ 	    (unsigned long)wifi_perst_page,
