@@ -1,0 +1,126 @@
+xnu 0489: read the QCA6490 PBL stage after the BHI poll
+
+Measured 2026-11-27: the pre-doorbell PBL telemetry read hangs the worker at
+stage 16, before the doorbell. The 7a port reports the same pre-BHI window
+hang and reads the registers after the stall. Move the read after the 10 s
+poll, gate it behind mondrianwifipbl=1, and log each register with a flush so
+a hung window names itself. The WLAON pair goes first because the reset path
+already reads that page; TCSR_PBL_LOGGING is the decisive stage code.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1263,39 +1263,53 @@
+  * WLAN_SECURE_BOOTN (0x01e22b24) and TLMM_OD_EN (0x01910020) are the
+  * addresses the 7a stock port read in the same windows. All are read-only.
+  *
+- * The PBL log SRAM is read only after the doorbell: reading it while the ROM
+- * is still running is the read that can hang the window.
++ * Read only after the BHI poll: the same windowed read before the doorbell
++ * hung the worker at stage 16 (measured 2026-11-27), as the 7a's pre-BHI
++ * reads do. The WLAON pair is already read by the reset path and goes first;
++ * TCSR_PBL_LOGGING is the decisive stage code. Log every register before the
++ * next read so a hung window names itself.
+  */
+ static void
+ wifi_pbl_dump(const char *tag, int sram)
+ {
+-	uint32_t v[8] = { 0 };
+-	uint32_t wl_pwr = 0;
+-	int rc = 0;
++	static const struct {
++		const char *name;
++		uint32_t off;
++	} regs[] = {
++		{ "soc_pwr", 0x1f80000 },
++		{ "wl_pwr", 0x1f8002c },
++		{ "pbl", 0x1b000f8 },
++		{ "secure", 0x1e22b24 },
++		{ "boot_cfg", 0x1e22b34 },
++		{ "bootstrap", 0x1910008 },
++		{ "od_en", 0x1910020 },
++		{ "errdbg2", 0x1e0e238 },
++		{ "errdbg3", 0x1e0e23c },
++	};
+ 	unsigned i;
+ 
+-	rc |= wifi_ahb_read32(0x1b000f8, &v[0]);
+-	rc |= wifi_ahb_read32(0x1e22b34, &v[1]);
+-	rc |= wifi_ahb_read32(0x1910008, &v[2]);
+-	rc |= wifi_ahb_read32(0x1e0e238, &v[3]);
+-	rc |= wifi_ahb_read32(0x1e0e23c, &v[4]);
+-	rc |= wifi_ahb_read32(0x1e22b24, &v[5]);
+-	rc |= wifi_ahb_read32(0x1910020, &v[6]);
+-	rc |= wifi_ahb_read32(0x1f80000, &v[7]);
+-	(void)wifi_ahb_read32(0x1f8002c, &wl_pwr);
+-	wifi_log("W16 %s pbl=0x%x boot_cfg=0x%x bootstrap=0x%x"
+-	    " errdbg2=0x%x errdbg3=0x%x secure=0x%x od_en=0x%x"
+-	    " soc_pwr=0x%x wl_pwr=0x%x rc=0x%x", tag, v[0], v[1], v[2], v[3],
+-	    v[4], v[5], v[6], v[7], wl_pwr, rc);
++	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint32_t v = 0;
++		int rc = wifi_ahb_read32(regs[i].off, &v);
++
++		wifi_log("W16 %s %s=0x%x rc=%d", tag, regs[i].name, v, rc);
++		mondrian_log_flush_now();
++		if (rc != 0) {
++			break;
++		}
++	}
+ 	if (sram != 0) {
+-		for (i = 0; i < 10; i++) {
+-			if (wifi_ahb_read32(0x1403d58 + i * 4, &v[0]) != 0) {
++		for (i = 0; i < 24; i++) {
++			uint32_t v = 0;
++			int rc = wifi_ahb_read32(0x1403d58 + i * 4, &v);
++
++			wifi_log("W16 %s sram[%u]=0x%x rc=%d", tag, i, v, rc);
++			mondrian_log_flush_now();
++			if (rc != 0) {
+ 				break;
+ 			}
+-			wifi_log("W16 %s sram[%u]=0x%x", tag, i, v[0]);
+ 		}
+ 	}
+-	mondrian_log_flush_now();
+ }
+ 
+ /*
+@@ -1685,6 +1699,7 @@
+     uint16_t command;
+     unsigned i;
+     int got, rc;
++    int pbl = 0;
+ 
+     /*
+      * The worker maps the config in W1 and the BAR in W4; a command can arrive
+@@ -1699,6 +1714,10 @@
+         wifi_log("W6 BAR or config not mapped after 60 s");
+         return -1;
+     }
++    if (PE_parse_boot_argn("mondrianwifipbl", &pbl, sizeof(pbl)) &&
++        pbl != 0) {
++        wifi_log("W16 PBL telemetry enabled");
++    }
+     kr = kmem_alloc(kernel_map, &buf, 0x600000, KMA_DATA,
+         VM_KERN_MEMORY_IOKIT);
+     if (kr != KERN_SUCCESS) {
+@@ -1899,7 +1918,6 @@
+     if ((command & WIFI_PCI_BUS_MASTER) == 0) {
+         return -1;
+     }
+-    wifi_pbl_dump("pre", 0);
+     /*
+      * ath11k loads only the first 512 KiB (sbl_size) through BHI; the SBL
+      * fetches the AMSS remainder through BHIE. A larger size never started.
+@@ -2115,7 +2133,9 @@
+     wifi_seen_status = status;
+     wifi_seen_errcode = errcode;
+     WIFI_STAGE(18);
+-    wifi_pbl_dump("post", 1);
++    if (pbl != 0) {
++        wifi_pbl_dump("post", 1);
++    }
+     {
+         uint32_t cookie = 0, warm = 0, cause = 0;
+ 
