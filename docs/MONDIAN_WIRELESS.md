@@ -204,10 +204,14 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   without `NOFAIL`, 0x7fff). `0485` had added a seventh `ml_io_map()` to the
   premap. `0486` maps one 16 KiB TLMM window per four pins and derives GPIO 82
   (sw_ctrl) from GPIO 80's window, so the premap takes four mappings and none
-  of its own. Measured 2026-11-27: that boot reaches userland and logs `W10
-  pads ... sw=1/1`, then dies right after `W15 bypass rc=-1` (the diagnostic
-  gated by `mondrianwifibypass=1`), so the premap panic is gone and the W15
-  test is the next failure.
+  of its own. Measured 2026-11-27: that boot answers the ring and reaches
+  `wifistage 18`; the worker logs `W10 pads ... sw=1/1` and `W6 BHI trigger
+  iova=0xa1000000 sbl=0x80000 image=0x50d000 rc=0x0`, and `IMGTXDB` still
+  holds `0x2a5a5a5a` at 1, 10 and 100 ms with `BHI_STATUS=0` after 10000
+  polls. With `mondrianwifibypass=1` the same boot dies right after `W15
+  bypass rc=-1`, so that diagnostic stays off until its path is fixed. The
+  doorbell being retained and `status=0` is the PBL-never-fetched symptom to
+  confirm with `MHISTATUS` (`wifistat` prints it).
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
