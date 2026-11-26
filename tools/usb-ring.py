@@ -46,10 +46,23 @@ MAGIC = b"RLG1"
 END = 0xFFFFFFFF
 
 
-def open_socket(timeout=2.0):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(HOST)
+def open_socket(timeout=2.0, wait=20.0):
+    # WSL re-creates the 192.168.7.1 address on every attach; a dump sent while
+    # the netdev is still coming up fails with EADDRNOTAVAIL and the ring is
+    # lost, because the boot ends in fastboot (measured 2026-11-26). Retry only
+    # that error, so a real bind failure still fails at once.
+    deadline = time.monotonic() + wait
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(HOST)
+            break
+        except OSError as e:
+            s.close()
+            if e.errno != errno.EADDRNOTAVAIL or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
     s.settimeout(timeout)
     return s
 
