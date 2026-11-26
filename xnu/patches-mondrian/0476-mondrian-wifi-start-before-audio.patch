@@ -1,0 +1,62 @@
+xnu 0476: start the wifi worker before the rest of the probe block
+
+Measured 2026-11-26 (0475 boot): `MONDR USB: probe done` is in the ring and the
+block then ends -- no `worker started`, no Venus, no audio. `0475` had moved
+`mondrian_wifi_start()` to the end of the block, so it was never reached: the
+block stops between `mondrian_usb_probe()` and that call. The audio and Venus
+entries return at once (their boot arguments are absent), which leaves the BT
+tty/control registration, and this boot does not name it.
+
+That also explains the four earlier stops: the worker used to start inside
+`mondrian_usb_probe()`, and the block then blocked while holding the
+`ml_io_map()` lock, so the worker blocked at whichever window it mapped next
+(`W4 BAR map done`, `pcie0 link up`, `pcie0 gdsc up`, `early GCC 0x62008`).
+
+The worker now starts right after `mondrian_usb_probe()` and before the rest of
+the block; every window it touches is premapped, so it takes no map of its own.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index c56f199..ad468b3 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2405,11 +2405,11 @@ mondrian_log_start(void)
+ 		extern void mondrian_wifi_start(void);
+ 
+ 		/*
+-		 * Both map MMIO and must run before any worker that maps: the
+-		 * wifi thread starts inside mondrian_usb_probe(), and a second
+-		 * ml_io_map() racing it wedges both (measured 2026-11-26, the
+-		 * worker stopped at `W4 BAR map done`). The key thread the SPMI
+-		 * probe starts only reads windows these calls mapped.
++		 * The premap takes every window the wifi worker touches before
++		 * its thread exists: ml_io_map() is serialized and a second
++		 * mapper wedges both (measured 2026-11-26, the stop moved to a
++		 * different worker window on every boot). The key thread the
++		 * SPMI probe starts only reads windows these calls mapped.
+ 		 */
+ 		mondrian_reset_reason_init();
+ 		mondrian_wifi_premap();
+@@ -2417,17 +2417,17 @@ mondrian_log_start(void)
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
++		/*
++		 * Before the audio probe, which hangs before its first log
++		 * (measured 2026-11-26) and with it the whole block: every window
++		 * the worker touches is premapped above, so it cannot race the
++		 * audio probe's own ml_io_map() either.
++		 */
++		mondrian_wifi_start();
+ 		mondrian_audio_probe_start();
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
+-		/*
+-		 * Last, so the worker starts after every other probe has taken
+-		 * its mappings: an ml_io_map() in the worker racing one of them
+-		 * blocks for good (measured 2026-11-26, four boots stopped at a
+-		 * different worker window each time).
+-		 */
+-		mondrian_wifi_start();
+ 	}
+ }
+ 
