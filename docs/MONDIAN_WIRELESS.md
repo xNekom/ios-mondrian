@@ -136,6 +136,13 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   start its fetch**; with the real image it reads through the wired window and
   the SMMU records nothing. The doorbell is not the gate; the transfer or the
   SBL start is (open).
+- `0460` shrinks the SMMU window to the 512 KiB BHI advertises
+  (`mondrianwifimap=524288`). Measured 2026-11-26: no fault appears — the record
+  is `fsr=0x400 far=0x4021404` before and after the doorbell — so the PBL makes
+  one sequential transfer inside the advertised size and does not load ELF
+  segments by file offset (segment 8 starts inside it and ends at `0x151000`,
+  which would have faulted). The image is fetched as a blob; whether the code at
+  its entry point runs is a separate question.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
