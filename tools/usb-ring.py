@@ -537,12 +537,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command",
-                        choices=("dump", "prev", "wfile", "pos", "reboot", "respring", "poweroff", "mem", "tap", "swipe",
+                        choices=("dump", "prev", "wfile", "pos", "reboot", "hardreset", "respring", "poweroff", "mem", "tap", "swipe",
                                  "key", "screen", "bl", "dcs", "rd", "rr", "ww", "sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "bcb", "blob", "rtc",
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
-                                 "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapr", "hapw", "spmimap",
-                                 "btuart",
-                                 "rf", "kill", "say", "fps", "del", "deltree", "ls", "wait"))
+                                 "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapclick", "hapr", "hapw", "spmimap",
+                                 "btuart", "wififw", "wifibhi", "wifistat",
+                                 "rf", "kill", "say", "fps", "del", "deltree", "ls", "wait", "pbs"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the dump (default 60)")
@@ -627,9 +627,14 @@ def main():
         return 0
     if args.command in ("sr", "sw", "si", "sf", "smw", "sa", "sav", "keys", "blob",
                         "rtc", "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
-                        "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapr", "hapw",
-                        "spmimap", "kill", "say", "btuart"):
-        answer = simple(" ".join([args.command] + list(args.args)))
+                        "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapclick", "hapr", "hapw",
+                        "spmimap", "kill", "say", "btuart", "wififw", "wifibhi", "wifistat",
+                        "pbs"):
+        # wififw reads and uploads the AMSS image, so it answers after seconds.
+        timeout = 60.0 if args.command == "wififw" else 2.0
+        if args.command in ("wifibhi", "hapclick"):
+            timeout = 120.0 if args.command == "wifibhi" else 6.0
+        answer = simple(" ".join([args.command] + list(args.args)), timeout)
         print(answer.decode(errors="replace").strip() if answer else "no answer")
         return 0
     if args.command == "wait":
@@ -675,6 +680,12 @@ def main():
     if args.command == "poweroff":
         simple("poweroff", 5.0)
         print("poweroff sent")
+        return 0
+    if args.command == "hardreset":
+        # PSCI alone: the way out when the reset thread stopped on a step that
+        # waits (the BCB is normally already written by then).
+        simple("hardreset", 5.0)
+        print("hardreset sent")
         return 0
     if args.command == "respring":
         return respring()

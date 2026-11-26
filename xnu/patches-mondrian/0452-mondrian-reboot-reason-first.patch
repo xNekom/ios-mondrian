@@ -1,0 +1,91 @@
+xnu 0452: write the reboot reason before tearing the ring down
+
+Measured 2026-11-26: six reboots asked from the ring ended in a black
+panel with no USB. mondrian_reboot_to_fastboot stops the framebuffer and
+the gadget before writing the BCB, the ring and the PMIC restart reason;
+any of those three can hang (the SPMI arbiter is already known to wedge
+on the haptics boost), and after the stop there is no channel left.
+
+Move the BCB, the ring flush and the restart reason ahead of the display
+and gadget shutdown, flush a line before each step, and let
+mondrian_reset_to_bootloader reuse the reason already written. A failed
+reboot then keeps the ring readable and its last line names the step.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 1f8930e..12e8c9f 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1627,11 +1627,25 @@ mondrian_poweroff(void)
+ 	}
+ }
+ 
++static int mondrian_reset_reason_set;
++
++/*
++ * The restart reason goes to the PMIC over SPMI, and that arbiter has
++ * already been measured to wedge (the haptics boost). Set it while the
++ * gadget is still up: a hang here then leaves the ring readable instead
++ * of a black panel with no USB.
++ */
+ static void
+-mondrian_reset_to_bootloader(int recovery)
++mondrian_set_reset_reason(int recovery)
+ {
+ 	extern int mondrian_spmi_set_restart_reason(uint8_t reason);
+-	vm_offset_t imem = ml_io_map(0x146aa000, 0x1000);
++	vm_offset_t imem;
++
++	if (mondrian_reset_reason_set != 0) {
++		return;
++	}
++	mondrian_reset_reason_set = 1;
++	imem = ml_io_map(0x146aa000, 0x1000);
+ 
+ 	/*
+ 	 * The PMIC's restart reason is what the bootloader reads (0309):
+@@ -1646,6 +1660,12 @@ mondrian_reset_to_bootloader(int recovery)
+ 		__builtin_arm_dsb(0xf);
+ 	}
+ 	(void)mondrian_spmi_set_restart_reason(recovery ? 1 : 2);
++}
++
++static void
++mondrian_reset_to_bootloader(int recovery)
++{
++	mondrian_set_reset_reason(recovery);
+ 	printf("MONDRIAN RESET: PSCI system reset to %s\n",
+ 	    recovery ? "recovery" : "fastboot");
+ 	(void)mondrian_smc(0x84000009ull);      /* PSCI_SYSTEM_RESET */
+@@ -1664,6 +1684,21 @@ mondrian_reboot_to_fastboot(void)
+ 	extern void mondrian_fb_shutdown(void);
+ 
+ 	mondrian_sync_before_reset("the reset to fastboot");
++	/*
++	 * Every step that can hang comes before the panel and the gadget are
++	 * torn down, and each one is on the disk first: a failed reboot then
++	 * leaves the ring readable (and its last line names the step) instead
++	 * of a black phone with no USB. "bootloader", not "boot-fastboot": the
++	 * latter is fastbootd, which does not accept "fastboot boot".
++	 */
++	printf("MONDRIAN REBOOT: bcb\n");
++	mondrian_log_flush_now();
++	(void)mondrian_ufs_bcb_set("bootloader");
++	mondrian_log_flush_now();
++	printf("MONDRIAN REBOOT: restart reason\n");
++	mondrian_log_flush_now();
++	mondrian_set_reset_reason(0);
++	printf("MONDRIAN REBOOT: display and gadget down\n");
+ 	mondrian_log_flush_now();
+ 	/*
+ 	 * The interface must not still be fetching from an IOVA when the SoC
+@@ -1674,10 +1709,6 @@ mondrian_reboot_to_fastboot(void)
+ 	mondrian_fb_shutdown();
+ 	/* The gadget must be idle before the SoC reset (0307). */
+ 	mondrian_usb_stop();
+-	/* "bootloader", not "boot-fastboot": the latter is fastbootd, which
+-	 * does not accept "fastboot boot". */
+-	(void)mondrian_ufs_bcb_set("bootloader");
+-	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader(0);
+ }
+ 

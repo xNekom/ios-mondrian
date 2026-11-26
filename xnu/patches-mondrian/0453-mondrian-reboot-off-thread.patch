@@ -1,0 +1,179 @@
+xnu 0453: run the reboot to fastboot off the command thread
+
+Measured 2026-11-26 with 0452: the ring reboot left the phone reachable --
+the kernel answered ICMP and kept writing the log stream, SpringBoard still
+in its run loop -- but the ring command port never answered again and the
+SoC never reset. The handler runs mondrian_reboot_to_fastboot inline, so the
+first step that waits kills the only channel that could ask for anything
+else.
+
+The timed reset thread (mondrianreset) has never had that problem: flush,
+the boot control block, the restart reason, PSCI, and no panel or gadget
+teardown. Take its order for the ring reboot too, keep the writable mounts
+to a bounded wait in their own thread (MNT_WAIT on a live volume can wait
+forever), start the whole thing on a worker thread, and add hardreset so a
+step that hangs can be skipped from the host instead of a key press. If PSCI
+returns, drop PS_HOLD, which is the cold start a key press produces.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 12e8c9f..7717f78 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1669,27 +1669,65 @@ mondrian_reset_to_bootloader(int recovery)
+ 	printf("MONDRIAN RESET: PSCI system reset to %s\n",
+ 	    recovery ? "recovery" : "fastboot");
+ 	(void)mondrian_smc(0x84000009ull);      /* PSCI_SYSTEM_RESET */
++	/*
++	 * PSCI returned, so no reset happened. Dropping PS_HOLD collapses the
++	 * rails through the PMIC, which is the cold start a key press does:
++	 * the only interface left once the monitor refuses to restart.
++	 */
++	{
++		vm_offset_t pshold = ml_io_map(0x0c264000, 0x1000);
++
++		if (pshold != 0) {
++			*(volatile uint32_t *)pshold = 0;
++			__builtin_arm_dsb(0xf);
++		}
++		printf("MONDRIAN RESET: PSCI returned, PS_HOLD dropped (%s)\n",
++		    pshold != 0 ? "written" : "no window");
++	}
++}
++
++static int mondrian_sync_done;
++
++static void
++mondrian_sync_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	mondrian_sync_before_reset("the reset to fastboot");
++	mondrian_sync_done = 1;
+ }
+ 
+ /*
+- * Public entry for the USB control channel: what the timed reset thread does
+- * once its deadline expires, without waiting for it. The ring is on the disk
+- * before the BCB changes, so the next boot (recovery or fastboot) still has
+- * the lines describing why the reboot was asked for.
++ * The steps the timed reset thread has always used, in its order: the ring,
++ * the boot control block, the restart reason, PSCI. Nothing here tears the
++ * panel or the gadget down first -- a hang in any of those left the phone
++ * running with a dead command thread and no way back but a key press
++ * (measured 2026-11-26: the kernel still answered a ping and kept logging
++ * while the reset thread never printed its next line).
++ *
++ * The writable filesystems are still asked to write back, but from their own
++ * thread and only for a bounded time: MNT_WAIT on a volume userland is still
++ * writing can wait forever, and a reset that never comes is worse than the
++ * repair a dirty volume costs.
+  */
+-void
+-mondrian_reboot_to_fastboot(void)
++static void
++mondrian_reboot_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	extern void mondrian_usb_stop(void);
+-	extern void mondrian_fb_shutdown(void);
++	thread_t t;
+ 
+-	mondrian_sync_before_reset("the reset to fastboot");
++	printf("MONDRIAN REBOOT: sync\n");
++	mondrian_log_flush_now();
++	if (kernel_thread_start((thread_continue_t)mondrian_sync_thread, NULL, &t) ==
++	    KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++	/* delay(1000) is a millisecond in this tree: eight seconds at most. */
++	for (int i = 0; i < 8000 && !mondrian_sync_done; i++) {
++		delay(1000);
++	}
++	printf("MONDRIAN REBOOT: sync %s\n", mondrian_sync_done ? "done" : "gave up");
++	mondrian_log_flush_now();
+ 	/*
+-	 * Every step that can hang comes before the panel and the gadget are
+-	 * torn down, and each one is on the disk first: a failed reboot then
+-	 * leaves the ring readable (and its last line names the step) instead
+-	 * of a black phone with no USB. "bootloader", not "boot-fastboot": the
+-	 * latter is fastbootd, which does not accept "fastboot boot".
++	 * "bootloader", not "boot-fastboot": the latter is fastbootd, which
++	 * does not accept "fastboot boot".
+ 	 */
+ 	printf("MONDRIAN REBOOT: bcb\n");
+ 	mondrian_log_flush_now();
+@@ -1698,18 +1736,52 @@ mondrian_reboot_to_fastboot(void)
+ 	printf("MONDRIAN REBOOT: restart reason\n");
+ 	mondrian_log_flush_now();
+ 	mondrian_set_reset_reason(0);
+-	printf("MONDRIAN REBOOT: display and gadget down\n");
++	printf("MONDRIAN REBOOT: reset\n");
++	mondrian_log_flush_now();
++	mondrian_reset_to_bootloader(0);
++	printf("MONDRIAN REBOOT: PSCI returned, hanging\n");
++	(void)ml_set_interrupts_enabled(FALSE);
++	for (;;) {
++		;
++	}
++}
++
++/*
++ * Public entry for the USB control channel: start the reset on its own thread
++ * and return, so the command port keeps answering while the reset runs and a
++ * step that hangs can be skipped with "hardreset" instead of a key press.
++ * The ring is on the disk before the BCB changes, so the next boot still has
++ * the lines describing why the reboot was asked for.
++ */
++void
++mondrian_reboot_to_fastboot(void)
++{
++	thread_t t;
++	static int started;
++
++	if (started != 0) {
++		return;
++	}
++	started = 1;
++	printf("MONDRIAN REBOOT: thread start\n");
++	mondrian_log_flush_now();
++	if (kernel_thread_start((thread_continue_t)mondrian_reboot_thread, NULL,
++	    &t) != KERN_SUCCESS) {
++		printf("MONDRIAN REBOOT: no thread, running inline\n");
++		mondrian_reboot_thread(NULL, 0);
++		return;
++	}
++	thread_deallocate(t);
++}
++
++/* "hardreset": the way out of a reboot thread that hung on a step. */
++void
++mondrian_hard_reset(void)
++{
++	printf("MONDRIAN HARD RESET: skipping the sync and the bcb\n");
+ 	mondrian_log_flush_now();
+-	/*
+-	 * The interface must not still be fetching from an IOVA when the SoC
+-	 * goes down: a warm reset from the direct-scanout path leaves the
+-	 * bootloader with no USB at all, while the copy path resets cleanly.
+-	 * Put SRC0 back on the carve-out and leave the bank bypassing first.
+-	 */
+-	mondrian_fb_shutdown();
+-	/* The gadget must be idle before the SoC reset (0307). */
+-	mondrian_usb_stop();
+ 	mondrian_reset_to_bootloader(0);
++	printf("MONDRIAN HARD RESET: returned\n");
+ }
+ 
+ /*
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index d346078..46ea7a0 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2899,6 +2899,11 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ 				printf("MONDR USB: reboot requested by the host\n");
+ 				mondrian_reboot_to_fastboot();
++			} else if (strcmp(cmd, "hardreset") == 0) {
++				extern void mondrian_hard_reset(void);
++
++				printf("MONDR USB: hard reset requested by the host\n");
++				mondrian_hard_reset();
+ 			} else if (strcmp(cmd, "poweroff") == 0) {
+ 				extern void mondrian_poweroff(void);
+ 
