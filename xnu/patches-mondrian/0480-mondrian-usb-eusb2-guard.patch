@@ -1,0 +1,54 @@
+xnu 0480: do not write the eusb2 phy while it is unclocked
+
+Measured 2026-11-26: the boot probe block stops after
+`QSCRATCH HS_PHY_CTRL ... GENERAL_CFG` and before `eusb2 after init`, whose next
+statement is `eusb2_init(phy, 0)` -- a sequence of read-modify-writes on the
+eUSB2 PHY. The same call completed in `0474`, so the PHY is clocked in some
+boots and not in others, and writing it unclocked hangs the AHB; with the block
+stuck inside `mondrian_usb_gadget_start()`, the kernel command thread is never
+created and `wifistat` gets no answer.
+
+Both `eusb2_init()` call sites now read `EUSB2_HS_PHY_COMMON0` first and skip
+the writes when it reads the unclocked pattern (`0x09090909`/`0xffffffff`).
+Reads are safe there; ABL owns the PHY initialization on a fastboot boot. A new
+`eusb2 init probe 0x...` line names which branch ran.
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 46cb5ee..088c6e8 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -3395,7 +3395,22 @@ mondrian_usb_gadget_start(vm_offset_t dwc)
+ 		 * 0x00820001) because nothing asserts the pull-up on D+.
+ 		 */
+ 		if (phy != 0) {
+-			eusb2_init(phy, 0);
++			/*
++			 * The block answers 0x09090909 until APB access is opened;
++			 * a write there on a cold boot hangs the AHB (measured
++			 * 2026-11-26, the boot probe block stopped at this call
++			 * and no kernel command thread was ever created). Read
++			 * first and skip the writes when the PHY is unclocked --
++			 * ABL has already initialized it in the fastboot case.
++			 */
++			uint32_t common0 = usb_rd(phy, EUSB2_HS_PHY_COMMON0);
++
++			printf("MONDR USB: eusb2 init probe 0x%08x%s\n", common0,
++			    (common0 == 0x09090909u || common0 == 0xffffffffu) ?
++			    " (unclocked, writes skipped)" : "");
++			if (common0 != 0x09090909u && common0 != 0xffffffffu) {
++				eusb2_init(phy, 0);
++			}
+ 			printf("MONDR USB: eusb2 after init 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x\n",
+ 			    usb_rd(phy, EUSB2_HS_PHY_COMMON0),
+ 			    usb_rd(phy, EUSB2_CFG_CTRL_2), usb_rd(phy, EUSB2_CFG_CTRL_3));
+@@ -3442,7 +3457,10 @@ mondrian_usb_gadget_start(vm_offset_t dwc)
+ 			printf("MONDR USB: QUSB2PHY_PRIM_BCR 0x%08x after release\n",
+ 			    usb_rd(qb, 0));
+ 		}
+-		eusb2_init(phy, 0);
++		if (usb_rd(phy, EUSB2_HS_PHY_COMMON0) != 0x09090909u &&
++		    usb_rd(phy, EUSB2_HS_PHY_COMMON0) != 0xffffffffu) {
++			eusb2_init(phy, 0);
++		}
+ 		printf("MONDR USB: eusb2 after init 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x 0xb8 0x%08x\n",
+ 		    usb_rd(phy, EUSB2_HS_PHY_COMMON0), usb_rd(phy, EUSB2_CFG_CTRL_2),
+ 		    usb_rd(phy, EUSB2_CFG_CTRL_3), usb_rd(phy, EUSB2_FSEL_SEL));
