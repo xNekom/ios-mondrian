@@ -1,0 +1,104 @@
+xnu 0457: the reset must not wait on the pmic
+
+Measured 2026-11-26: two reboots died with the SPMI restart reason as the
+last thing the reset path did. In 0452 the ring's last line was the BCB and
+the command thread never came back; in the 0456 session the kernel still
+answered ICMP and kept logging while the port answered nothing, and the
+"hardreset" escape had run exactly one blocking call: the PMIC write.
+
+The SPMI arbiter stalling a transaction is already in the traps. Put the
+write on its own thread with a 500 ms bound and reset regardless -- the boot
+control block, written by raw blocks and unable to wait on anything, is the
+interface the bootloader reads first. Every reset path now gets both: the
+ring reboot, the timed reset and "hardreset", which also stops being able to
+strand the port.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index c5a26a5..977063b 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1662,12 +1662,45 @@ mondrian_set_reset_reason(int recovery)
+ 	(void)mondrian_spmi_set_restart_reason(recovery ? 1 : 2);
+ }
+ 
++static int mondrian_reason_done;
++
++static void
++mondrian_reason_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	mondrian_reset_reason_set = 0;      /* force it, even after a failed try */
++	mondrian_set_reset_reason(0);
++	mondrian_reason_done = 1;
++}
++
++/*
++ * Every reset lands here, so the two interfaces the bootloader reads are
++ * written here: the boot control block through raw blocks, which cannot wait
++ * on anything, and the PMIC restart reason, which can -- the SPMI arbiter has
++ * been measured to stall a transaction for good, and with the write on the
++ * caller the reset never happened and the command port died with it
++ * (2026-11-26). Bound it to half a second and reset anyway; the BCB is the
++ * interface the bootloader reads first.
++ */
+ static void
+ mondrian_reset_to_bootloader(int recovery)
+ {
+-	mondrian_set_reset_reason(recovery);
+-	printf("MONDRIAN RESET: PSCI system reset to %s\n",
+-	    recovery ? "recovery" : "fastboot");
++	thread_t t;
++	int i, wrote = 0;
++
++	printf("MONDRIAN RESET: bcb %s\n", recovery ? "boot-recovery" : "bootloader");
++	mondrian_log_flush_now();
++	(void)mondrian_ufs_bcb_set(recovery ? "boot-recovery" : "bootloader");
++	mondrian_log_flush_now();
++	if (kernel_thread_start((thread_continue_t)mondrian_reason_thread, NULL,
++	    &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++		for (i = 0; i < 500 && !mondrian_reason_done; i++) {
++			delay(1000);
++		}
++		wrote = mondrian_reason_done;
++	}
++	printf("MONDRIAN RESET: PSCI system reset to %s, reason %s\n",
++	    recovery ? "recovery" : "fastboot", wrote ? "written" : "gave up");
+ 	/*
+ 	 * Flush here: this is the last line before the monitor. Everything the
+ 	 * reset path prints after it stays in memory, and a reset the monitor
+@@ -1733,17 +1766,9 @@ mondrian_reboot_thread(__unused void *arg, __unused wait_result_t wr)
+ 	mondrian_log_flush_now();
+ 	/*
+ 	 * "bootloader", not "boot-fastboot": the latter is fastbootd, which
+-	 * does not accept "fastboot boot".
++	 * does not accept "fastboot boot". The BCB and the bounded reason are
++	 * inside the reset so every caller gets both.
+ 	 */
+-	printf("MONDRIAN REBOOT: bcb\n");
+-	mondrian_log_flush_now();
+-	(void)mondrian_ufs_bcb_set("bootloader");
+-	mondrian_log_flush_now();
+-	printf("MONDRIAN REBOOT: restart reason\n");
+-	mondrian_log_flush_now();
+-	mondrian_set_reset_reason(0);
+-	printf("MONDRIAN REBOOT: reset\n");
+-	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader(0);
+ 	printf("MONDRIAN REBOOT: PSCI returned, hanging\n");
+ 	(void)ml_set_interrupts_enabled(FALSE);
+@@ -1784,14 +1809,7 @@ mondrian_reboot_to_fastboot(void)
+ void
+ mondrian_hard_reset(void)
+ {
+-	/*
+-	 * The restart reason is what the bootloader actually reads: a BCB alone
+-	 * boots the active slot (measured 2026-11-26, a hard reset after a failed
+-	 * reboot landed on boot_b). Force the write -- a reboot thread that hung
+-	 * after setting the flag would otherwise leave a stale reason behind.
+-	 */
+-	mondrian_reset_reason_set = 0;
+-	printf("MONDRIAN HARD RESET: reason and PSCI only\n");
++	printf("MONDRIAN HARD RESET: bcb, bounded reason and PSCI\n");
+ 	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader(0);
+ 	printf("MONDRIAN HARD RESET: returned\n");

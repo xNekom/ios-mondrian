@@ -27,6 +27,16 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 CM=$(python3 -c "from tools.boards import BOARDS; print(BOARDS['mondrian'].cmdline)")
+# CMDLINE_REPLACE swaps the whole line. The board's line plus EXTRA_ARGS has a
+# hard 607-byte ceiling (userland reads kern.bootargs into 608 and watchdogd
+# aborts past it), and a boot that needs three Wi-Fi switches does not fit next
+# to the default set; the caller drops an optional argument and passes the
+# result here. The payload still carries `usb=2`, and mkpayload still refuses a
+# mondrian image without it.
+if [ -n "${CMDLINE_REPLACE:-}" ]; then
+	CM="$CMDLINE_REPLACE"
+	echo "cmdline: replaced by CMDLINE_REPLACE"
+fi
 if [ -z "${PREV_ARGS+x}" ]; then
 	PREV="mondrianprevlines=200"
 else
