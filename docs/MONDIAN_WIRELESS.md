@@ -204,7 +204,11 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `0x2054`) must route it to the same SID (`0x1c01`) the SMMU context covers;
   the iATU is host->BAR only. ath11k keeps the coherent mask at 32 bits, so
   the image must sit below 4 GiB. `m3.bin` is not part of BHI; it arrives over
-  QMI after `FW_MEM_READY`.
+  QMI after `FW_MEM_READY`. When `BHI_STATUS` never reaches 2, read
+  `MHISTATUS` (`BAR0+0x48`) bit 0 after the attempt: `1` means the SBL is
+  running and the gap is BHIe, `0` means the PBL never handed over and the
+  image/address/session is the gap. `wifistat` reports it once the worker has
+  mapped the host windows.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
