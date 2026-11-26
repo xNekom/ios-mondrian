@@ -190,11 +190,18 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
     BT registration (`0479`, `0481`).
 - The driver-side ring is the XNU `msgbuf`: it is circular, mixes late
   SpringBoard lines with the banner, and its length varies with the boot, so a
-  missing worker line does not prove the worker did not run. `wifistat` over
+  missing worker line does not prove the worker did not run. `wifistage` over
   the USB command channel is the state query, and `wifibhi <size>` drives
   `mondrian_wifi_load_amss()` from the command thread. Do not send `wifistat`
   before the worker has voted the rails: reading `BAR0+0x28` on a collapsed
   device hangs the command thread.
+- Measured 2026-11-26: with the whole cold link and identity up (`wifistage
+  14`), the worker panics in the SMMU proof's 16 KiB contiguous kernel
+  allocation (`kmem_alloc` with `KMA_NOFAIL`, `vm_kern.c:177`). The same kernel
+  without `mondrianwifi` boots to SpringBoard and resets cleanly, so the panic
+  is in the worker path, not the boot. The allocation belongs in the boot
+  premap (`mondrian_wifi_smmu_premap`), not in the worker; until it moves,
+  Wi-Fi experiments need a boot that can afford to panic.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only

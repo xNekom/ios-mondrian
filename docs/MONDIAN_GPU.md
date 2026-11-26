@@ -1459,8 +1459,12 @@ drawing, so the wait it removed from the renderer reappears on the glass.
 
 ### Running the GPU test from the UI hook
 
-The UI hook dlopens it in every daemon the kernel injects it into, so there is
-no new boot argument; the ring log then holds a `MONDRIAN GPU TEST:` verdict.
+The hook loads it only when the payload carries `gltest=1` (the same gate as
+the Mesa test in `mondrian-ui-hook.m`); without the argument it returns before
+the `access()`. Measured 2026-11-26 on mondrian with `gltest=1` and the dylib
+delivered over `wfile` (no flash): `connected`, `chip id 0x7030002`, a 64 KiB
+buffer at iova `0x10c24000`, `fence 1`, `canary 0x600df00d fence 0x600df00e`,
+`MONDRIAN GPU TEST: PASSED`.
 
 ```sh
 tools/build-mondrian-gpu-test.sh /tmp/mondrian-gpu-test.dylib

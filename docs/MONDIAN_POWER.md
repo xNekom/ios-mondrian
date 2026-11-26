@@ -335,6 +335,10 @@ owner 0. An off→on vote (`hapb 0`, then `hapb 1`) lifts `hbst-vreg` to `0x80`
 and `hbst-status4` to `0x01`; a `vib` votes it off again, so a zero read after
 a play only means the driver already dropped the boost. The SDAM bytes read
 back as zero even though the trigger runs, so the boost status is the proof.
+Measured again 2026-11-26: `hapb 0`, `hapb 1`, `haps` read `hbst-vreg 0x80`,
+then `vib 120 64` logged `playing amp 0x40`, `stopped` and `buzz 120 ms ...
+sent`; the ring holds the verdict even when the host's two-second command
+timeout expires first.
 
 `0421` gives the drive its open-loop period: CFG 0x5c is the high nibble and
 0x5d the low byte (the two defines were swapped), and the play writes the DT's
