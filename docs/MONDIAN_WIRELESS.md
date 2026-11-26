@@ -195,13 +195,19 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `mondrian_wifi_load_amss()` from the command thread. Do not send `wifistat`
   before the worker has voted the rails: reading `BAR0+0x28` on a collapsed
   device hangs the command thread.
-- Measured 2026-11-26: with the whole cold link and identity up (`wifistage
-  14`), the worker panics in the SMMU proof's 16 KiB contiguous kernel
-  allocation (`kmem_alloc` with `KMA_NOFAIL`, `vm_kern.c:177`). The same kernel
-  without `mondrianwifi` boots to SpringBoard and resets cleanly, so the panic
-  is in the worker path, not the boot. The allocation belongs in the boot
-  premap (`mondrian_wifi_smmu_premap`), not in the worker; until it moves,
-  Wi-Fi experiments need a boot that can afford to panic.
+- Measured 2026-11-26: a Wi-Fi boot with `0485` panics with
+  `kmem_%s(...): failed with %d` (`__kmem_failed_panic`, `vm_kern.c:177`) on a
+  `0x4000` allocation. After startup `io_map()` is the only `kmem_alloc` with
+  `KMA_NOFAIL`, and it allocates from the 8 MiB `io_submap` with
+  `KMA_NOFAIL|KMA_PAGEABLE|KMA_PERMANENT`; the panic's map is that submap, not
+  `kernel_map`, and the SMMU tables are not it either (`kmem_alloc_contig`
+  without `NOFAIL`, 0x7fff). `0485` had added a seventh `ml_io_map()` to the
+  premap. `0486` maps one 16 KiB TLMM window per four pins and derives GPIO 82
+  (sw_ctrl) from GPIO 80's window, so the premap takes four mappings and none
+  of its own. Measured 2026-11-27: that boot reaches userland and logs `W10
+  pads ... sw=1/1`, then dies right after `W15 bypass rc=-1` (the diagnostic
+  gated by `mondrianwifibypass=1`), so the premap panic is gone and the W15
+  test is the next failure.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
