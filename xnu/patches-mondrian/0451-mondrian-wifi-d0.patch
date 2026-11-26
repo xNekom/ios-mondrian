@@ -1,0 +1,75 @@
+xnu 0451: move the wifi endpoint to D0 before the reset
+
+Measured 2026-11-26 with 0450: the PARF requester table is programmed
+(crc 0x15, entry 0x01000100, 0x2c00 bit 0 clear), the MHI context reads
+back, and the doorbell is still not consumed: BHI_STATUS 0x0 and MSI
+page 0x0.
+
+ath11k calls pci_enable_device before the power-on sequence, and that
+puts the function in D0. This driver never did. A function the previous
+OS left in D3hot answers config space and BAR reads while its firmware
+(the PBL included) is off, which is exactly a doorbell nobody consumes.
+
+Walk the capability list for the PM capability, log the PMCSR and its
+power state, and write D0 when it is not.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 2e7b824..8abc031 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1358,6 +1358,47 @@ wifi_mhi_context(uint64_t ctx, uint64_t base, uint64_t limit)
+     return rc;
+ }
+ 
++/*
++ * ath11k's pci_enable_device moves the function to D0 before the power-on
++ * sequence; this driver never did. A function the previous OS left in
++ * D3hot still answers config space and BAR reads, but its firmware (the
++ * PBL included) is off, which is what a doorbell nobody consumes looks
++ * like.
++ */
++static int
++wifi_pci_set_d0(void)
++{
++	uint8_t cap = (uint8_t)(wifi_read8(wifi_cfg, 0x34) & ~3u);
++	int i;
++
++	for (i = 0; i < 16; i++) {
++		uint8_t id;
++
++		if (cap < 0x40 || cap > 0xfc) {
++			break;
++		}
++		id = wifi_read8(wifi_cfg, cap);
++		if (id == 0x01) {
++			uint16_t pmcsr = wifi_read16(wifi_cfg, cap + 4);
++
++			wifi_log("W6 pci pm cap=0x%x pmcsr=0x%x state=%u", cap,
++			    pmcsr, pmcsr & 3u);
++			if ((pmcsr & 3u) != 0) {
++				wifi_write16(wifi_cfg, cap + 4,
++				    (uint16_t)(pmcsr & ~3u));
++				delay(10000);
++				pmcsr = wifi_read16(wifi_cfg, cap + 4);
++				wifi_log("W6 pci pm state now=%u pmcsr=0x%x",
++				    pmcsr & 3u, pmcsr);
++			}
++			return 0;
++		}
++		cap = (uint8_t)(wifi_read8(wifi_cfg, cap + 1) & ~3u);
++	}
++	wifi_log("W6 pci pm capability not found");
++	return -1;
++}
++
+ int
+ mondrian_wifi_load_amss(void)
+ {
+@@ -1444,6 +1485,7 @@ mondrian_wifi_load_amss(void)
+      * soon as the SOC reset releases it, so enable the master before the
+      * reset rather than just before the doorbell.
+      */
++    (void)wifi_pci_set_d0();
+     command = wifi_read16(wifi_cfg, 4);
+     wifi_write16(wifi_cfg, 4,
+         command | WIFI_PCI_MEMORY | WIFI_PCI_BUS_MASTER);

@@ -1,0 +1,101 @@
+xnu 0449: program the MHI context before the BHI load
+
+Measured 2026-11-26 with 0447/0448: the SOC reset, the LTSSM and hot-reset
+sequence, BHI_INTVEC=0, the 512 KiB image at IOVA 0xa1000000 and the
+BHI_IMGTXDB sequence all match ath11k, and the doorbell is still not
+consumed. The device answers BHI 1.2, EXECENV=0 and STATUS=0x0, and the
+SMMU records no architectural fault, so the PBL never reads the image.
+
+ath11k writes the MHI context in mhi_init_mmio before mhi_async_power_up
+rings the doorbell: CCABAP/ECABAP/CRCBAP, the control and data base and
+limit, and the NER/NHWER counts on MHICFG. W6 rang the doorbell with none
+of them. Program them from a zeroed page in the last 4 KiB of the wired
+buffer (mapped by the same W2 context), read MHICFG/MHISTATUS/CHDBOFF/
+ERDBOFF/BHIEOFF back, and log both before the existing doorbell. The
+arrays are deliberately empty: the question this boot answers is whether
+a configured MHI is what the PBL waits for.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index f98b22f..44741fb 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1294,6 +1294,35 @@ wifi_msi_enable(uint64_t page_iova)
+     return 0;
+ }
+ 
++/*
++ * W8: mhi_init_mmio is the one host step ath11k takes before the BHI load
++ * that W6 skipped. The device reads these arrays through the same W2
++ * context as the image; the last page of the wired buffer holds them.
++ */
++#define W8_CTX_OFF	0x5ff000u
++
++static int
++wifi_mhi_context(uint64_t ctx, uint64_t base, uint64_t limit)
++{
++    int rc = 0;
++
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x5c, (uint32_t)(ctx >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x58, (uint32_t)ctx);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x64, (uint32_t)(ctx >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x60, (uint32_t)ctx);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x6c, (uint32_t)(ctx >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x68, (uint32_t)ctx);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x84, (uint32_t)(base >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x80, (uint32_t)base);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x8c, (uint32_t)(limit >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x88, (uint32_t)limit);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x9c, (uint32_t)(base >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0x98, (uint32_t)base);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0xa4, (uint32_t)(limit >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + 0xa0, (uint32_t)limit);
++    return rc;
++}
++
+ int
+ mondrian_wifi_load_amss(void)
+ {
+@@ -1421,6 +1450,43 @@ mondrian_wifi_load_amss(void)
+      * Re-arm both here, then read the landing page before the doorbell.
+      */
+     (void)wifi_msi_enable(iova + W6_MSI_OFF);
++    {
++        uint32_t mhicfg = 0, mhistatus = 0, chdb = 0, erdb = 0;
++        uint32_t bhie_off = 0, cfg_after = 0, ccabap = 0, ner, nhwer;
++        uint64_t ctx = iova + W8_CTX_OFF;
++        uint64_t limit = iova + 0x600000 - 1;
++
++        /*
++         * ath11k programs the MHI context in mhi_init_mmio before
++         * mhi_async_power_up rings the doorbell; six boots have rung it
++         * without the context. The arrays are zero on purpose: this boot
++         * asks whether a configured MHI is what the PBL waits for, not
++         * whether the SBL can start from them.
++         */
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x10, &mhicfg);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x18, &chdb);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x20, &erdb);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhie_off);
++        memset((void *)(buf + W8_CTX_OFF), 0, 0x1000);
++        flush_dcache64((addr64_t)(buf + W8_CTX_OFF), 0x1000, 0);
++        rc = wifi_mhi_context(ctx, iova, limit);
++        ner = (mhicfg >> 16) & 0xffu;
++        nhwer = (mhicfg >> 24) & 0xffu;
++        if (ner != 0) {
++            (void)mondrian_mmio_try_wr32(wifi_bar + 0x10,
++                (mhicfg & ~0xffff0000u) | (ner << 16) | (nhwer << 24));
++        }
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x10, &cfg_after);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x58, &ccabap);
++        wifi_log("W8 mhi ctx=0x%llx base=0x%llx limit=0x%llx rc=0x%x",
++            (unsigned long long)ctx, (unsigned long long)iova,
++            (unsigned long long)limit, rc);
++        wifi_log("W8 mhi cfg=0x%x/0x%x status=0x%x chdb=0x%x erdb=0x%x"
++            " bhie=0x%x ccabap=0x%x", mhicfg, cfg_after, mhistatus, chdb,
++            erdb, bhie_off, ccabap);
++        mondrian_log_flush_now();
++    }
+     {
+         uint32_t execenv = 0, pre_status = 0, msi_page = 0;
+ 
