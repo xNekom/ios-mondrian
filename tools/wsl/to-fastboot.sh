@@ -46,8 +46,12 @@ try_attach() {
 
 ring_command() {
 	# attach.sh, not try_attach: the ring needs the cdc_ether netdev and the
-	# 192.168.7.1 address, and it waits for both.
-	bash tools/wsl/attach.sh > /dev/null 2>&1 || return 1
+	# 192.168.7.1 address, and it waits for both. Ask "pos" first and require
+	# an answer: a command sent into a channel that is not up is dropped
+	# silently, and the tool still prints "reboot sent" (measured 2026-11-26,
+	# a reboot that was never sent read exactly like one the kernel ignored).
+	bash tools/wsl/attach.sh > /dev/null 2>&1 || { echo "   attach failed"; return 1; }
+	timeout 20 python3 tools/usb-ring.py pos > /dev/null 2>&1 || { echo "   ring silent"; return 1; }
 	timeout 25 python3 tools/usb-ring.py "$1" > /dev/null 2>&1
 }
 
@@ -83,11 +87,20 @@ wait_fastboot 15 && exit 0
 
 # The reset did not arrive. The kernel is probably still up with its reset
 # thread stuck: read the step it stopped at from the live console, then try
-# the bare PSCI reset.
+# the bare PSCI path, which writes the restart reason again (0455) -- a stale
+# one from the failed attempt lands the boot on the active slot instead.
 echo "== no fastboot; reading the live console"
 bash tools/wsl/attach.sh > /dev/null 2>&1
 python3 tools/wsl/log-listen.py 12 /root/reset-hang.log || true
 echo "== hard reset"
+ring_command hardreset || true
+wait_fastboot 15 && exit 0
+
+# Last host-side resort: point the boot control block at the bootloader and
+# reset again. The reason above is what this bootloader reads; the BCB is the
+# second hint for a revision that prefers it.
+echo "== bcb bootloader + hard reset"
+ring_command "bcb bootloader" || true
 ring_command hardreset || true
 wait_fastboot 15 && exit 0
 

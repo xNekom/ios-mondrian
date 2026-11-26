@@ -1,0 +1,43 @@
+xnu 0456: let mondrianwifinorsoc skip the host reset
+
+Measured 2026-11-26 with 0454: the BHI descriptors read the same before and
+after the host's SOC reset (ver 1.2, arl 0, numseg 1, exec 0), the doorbell
+written afterwards stays in BHI_IMGTXDB at 1, 10 and 100 ms, and BHI_STATUS
+never leaves 0. The BHI block itself is stable, so the descriptor dump did
+not separate a dead boot ROM from a live one.
+
+A QCA6490 that has just been powered is already sitting in its boot ROM when
+the link trains; the host SOC reset exists for a device another OS has
+booted. mondrianwifinorsoc=1 skips the PCIE_SOC_GLOBAL_RESET pulse and the
+MHICTRL reset so the doorbell lands in the ROM the power-on left running,
+while everything else in the load path stays the same. It is an A/B switch,
+not the new default.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 28d367d..19deb1e 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1243,6 +1243,23 @@ wifi_soc_reset(void)
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x394, 0);
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x39c, 0);
+ 	mondrian_log_flush_now();
++	/*
++	 * A cold QCA6490 is already sitting in its boot ROM when the link
++	 * trains. The host reset below is what ath11k sends to a device another
++	 * OS has booted; on a fresh chip it may be the one thing that stops the
++	 * PBL. mondrianwifinorsoc=1 skips the pulse and the MHI reset so the
++	 * doorbell lands in the ROM the power-on left running (0455).
++	 */
++	{
++		int skip = 0;
++
++		if (PE_parse_boot_argn("mondrianwifinorsoc", &skip,
++		    sizeof(skip)) && skip != 0) {
++			wifi_log("W6 soc reset skipped (mondrianwifinorsoc)");
++			mondrian_log_flush_now();
++			return 0;
++		}
++	}
+ 	if (wifi_ahb_read32(0x3008, &val) != 0) {
+ 		wifi_log("W6 global reset unreadable");
+ 		mondrian_log_flush_now();

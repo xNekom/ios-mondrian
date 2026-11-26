@@ -1,0 +1,76 @@
+xnu 0455: keep the reboot reason and the last line before the reset
+
+Measured 2026-11-26: after a boot whose ring stopped at a failed reboot, a
+"hardreset" from the host reset the SoC but landed on boot_b, not in
+fastboot. Two causes, both in the escape path:
+
+- hardreset reused mondrian_set_reset_reason, whose one-shot flag an earlier
+  attempt had already set, so the PMIC restart reason -- the only interface
+  this bootloader reads, a BCB alone boots the active slot -- was never
+  written. Force it.
+- The "PSCI system reset to fastboot" line is printed before the SMC and was
+  never flushed, so a reset the monitor refuses reads as a boot that stopped
+  at the previous step. Flush before the call.
+
+The control channel also answers "bcb <command>" now, so a host can point
+the boot control block at the bootloader without resetting anything; the
+usb-ring tool has been sending that command to a kernel that ignored it.
+
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 7717f78..c5a26a5 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1516,7 +1516,7 @@ mondrian_log_flush_now(void)
+  * Only the command field of the BCB is touched; the A/B metadata lives in the
+  * rest of the block.
+  */
+-static int
++int
+ mondrian_ufs_bcb_set(const char *command)
+ {
+ 	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+@@ -1668,6 +1668,12 @@ mondrian_reset_to_bootloader(int recovery)
+ 	mondrian_set_reset_reason(recovery);
+ 	printf("MONDRIAN RESET: PSCI system reset to %s\n",
+ 	    recovery ? "recovery" : "fastboot");
++	/*
++	 * Flush here: this is the last line before the monitor. Everything the
++	 * reset path prints after it stays in memory, and a reset the monitor
++	 * refuses then reads as a boot that stopped at the previous step.
++	 */
++	mondrian_log_flush_now();
+ 	(void)mondrian_smc(0x84000009ull);      /* PSCI_SYSTEM_RESET */
+ 	/*
+ 	 * PSCI returned, so no reset happened. Dropping PS_HOLD collapses the
+@@ -1778,7 +1784,14 @@ mondrian_reboot_to_fastboot(void)
+ void
+ mondrian_hard_reset(void)
+ {
+-	printf("MONDRIAN HARD RESET: skipping the sync and the bcb\n");
++	/*
++	 * The restart reason is what the bootloader actually reads: a BCB alone
++	 * boots the active slot (measured 2026-11-26, a hard reset after a failed
++	 * reboot landed on boot_b). Force the write -- a reboot thread that hung
++	 * after setting the flag would otherwise leave a stale reason behind.
++	 */
++	mondrian_reset_reason_set = 0;
++	printf("MONDRIAN HARD RESET: reason and PSCI only\n");
+ 	mondrian_log_flush_now();
+ 	mondrian_reset_to_bootloader(0);
+ 	printf("MONDRIAN HARD RESET: returned\n");
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 46ea7a0..bbb731b 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2899,6 +2899,11 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 
+ 				printf("MONDR USB: reboot requested by the host\n");
+ 				mondrian_reboot_to_fastboot();
++			} else if (strncmp(cmd, "bcb ", 4) == 0) {
++				extern int mondrian_ufs_bcb_set(const char *);
++
++				printf("MONDR USB: bcb \"%s\" seen\n", cmd + 4);
++				(void)mondrian_ufs_bcb_set(cmd + 4);
+ 			} else if (strcmp(cmd, "hardreset") == 0) {
+ 				extern void mondrian_hard_reset(void);
+ 

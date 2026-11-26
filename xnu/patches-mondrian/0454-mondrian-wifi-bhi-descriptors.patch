@@ -1,0 +1,93 @@
+xnu 0454: dump the bhi descriptors before and after the doorbell
+
+Measured 2026-11-26: the host side of the MHI/BHI load matches ath11k
+register for register (0449-0451), the SMMU records no fault, and the
+doorbell is still not consumed. The K60 research in this repository
+(research/unixnu-mondrian/docs/research/wifi/SBL-DIRECT.md) shows the same
+device does consume the image with the stock host, so the missing piece is
+still on this side.
+
+The BHI block carries values the boot ROM writes: BHI_SBLANTIROLLVER and
+BHI_NUMSEG. Read them before the SOC reset, after it, and at 1, 10 and 100 ms
+after the doorbell, together with the doorbell register itself. A consumed
+session id does not stay in BHI_IMGTXDB, and a zero anti-rollback version
+after the reset says the drawing board: the PBL never started, so the gate is
+the device's power/clock, not the transfer.
+
+Instrumentation only: no register the load path writes changes.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 8abc031..28d367d 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1263,6 +1263,34 @@ wifi_soc_reset(void)
+ 	return 0;
+ }
+ 
++/*
++ * W9: the BHI descriptor registers say whether the boot ROM ever ran. The
++ * anti-rollback version and the segment count are written by the PBL, so a
++ * zero there separates "the PBL ignores the doorbell" from "the PBL never
++ * started". The doorbell itself is read back: a consumed session id does not
++ * stay in BHI_IMGTXDB.
++ */
++static void
++wifi_bhi_dump(const char *tag, uint32_t bhioff)
++{
++    uint32_t major = 0, minor = 0, exec = 0, status = 0, err = 0;
++    uint32_t arl = 0, numseg = 0, txdb = 0, addr = 0, size = 0;
++
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x00, &minor);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x04, &major);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x08, &addr);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x10, &size);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x18, &txdb);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &exec);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &status);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x30, &err);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x44, &arl);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x48, &numseg);
++    wifi_log("W9 %s ver=%u.%u arl=%x numseg=%x exec=%x status=%x err=%x"
++        " txdb=%x addr=%x size=%x", tag, major, minor, arl, numseg, exec,
++        status, err, txdb, addr, size);
++}
++
+ /*
+  * W6: read the AMSS image from the iOS root, map it through the W2 SMMU
+  * context and hand it to BHI. The host uploads the blob after boot, so this
+@@ -1507,6 +1535,14 @@ mondrian_wifi_load_amss(void)
+             (unsigned long long)(iova + W6_MSI_OFF));
+     }
+     mondrian_log_flush_now();
++    {
++        uint32_t off = 0;
++
++        if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &off) == 0 && off != 0) {
++            wifi_bhi_dump("pre-reset", off);
++            mondrian_log_flush_now();
++        }
++    }
+     if (wifi_soc_reset() != 0) {
+         wifi_log("W6 SOC reset failed");
+         return -1;
+@@ -1575,6 +1611,7 @@ mondrian_wifi_load_amss(void)
+         msi_page = *(volatile uint32_t *)(buf + W6_MSI_OFF);
+         wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x"
+             " msi=0x%x", execenv, intvec, pre_status, msi_page);
++        wifi_bhi_dump("post-reset", bhioff);
+     }
+     command = wifi_read16(wifi_cfg, 4);
+     wifi_write16(wifi_cfg, 4,
+@@ -1605,6 +1642,13 @@ mondrian_wifi_load_amss(void)
+     if (rc != 0) {
+         return -1;
+     }
++    delay(1000);
++    wifi_bhi_dump("db+1ms", bhioff);
++    delay(9000);
++    wifi_bhi_dump("db+10ms", bhioff);
++    delay(90000);
++    wifi_bhi_dump("db+100ms", bhioff);
++    mondrian_log_flush_now();
+     for (i = 0; i < 10000; i++) {
+         delay(1000);
+         if (mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c,
