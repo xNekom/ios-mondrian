@@ -21,11 +21,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   ABL spends one retry per boot, so after seven the slot reads
   `slot-unbootable:b:yes` and refuses every image; `fastboot set_active b`
   resets flag and budget without writing a partition (AGENTS.md has the symptom).
-  From a running iOS the ring's `reboot` is the way in with no buttons: it writes
-  the PMK8350 restart reason over SPMI (`0309`) and fastboot answers about 2 s
-  later. A boot that falls back to `boot_b` answers with the previous kernel, and
-  that one's shutdown marks the volume inconsistent (`hfs_mark_inconsistent`,
-  2026-11-18), so a failed boot costs a repair, not just a retry.
+  From a running iOS the ring's `reboot` writes the BCB, the PMK8350 restart
+  reason over SPMI (`0309`) and calls PSCI from its own thread (`0453`): a step
+  that waits leaves the SoC alive and the port silent, so `hardreset` is PSCI
+  alone. A boot that falls back to `boot_b` answers with the previous kernel and
+  costs an HFS repair (`hfs_mark_inconsistent`, 2026-11-18).
   **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
   OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
 - **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the

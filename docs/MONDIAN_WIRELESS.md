@@ -89,6 +89,27 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   is not what the PBL waits for. `wififw` is one-shot per boot: a second load
   selects the new file but W2 refuses the re-route (`sid2 0x1c00 conflicts
   slot 7`), so a firmware change needs a reboot.
+- `0449` programs the MHI context the PBL reads (`CCABAP`/`ECABAP`/`CRCBAP`,
+  control and data base+limit, `MHICFG` NER/NHWER) from a zeroed page at
+  `0xa15ff000` before the doorbell. Measured 2026-11-26: `MHICFG` reads
+  `0x800080`/`0x800080`, `CHDBOFF=0x300`, `ERDBOFF=0x700`, `BHIEOFF=0x224`,
+  `CCABAP` reads back, `MHISTATUS=0x0`, and `BHI_STATUS` is still `0x0` after
+  10000 polls.
+- `0450` programs the PARF requester table (`0x2000`, 256 entries) with this
+  endpoint's BDF at the CRC8 index (`crc=0x15`, entry `0x01000100`) and clears
+  `0x2c00` bit 0, as the donor's `coldLink` does, so the endpoint's DMA cannot
+  reach the SMMU as an unmatched stream. No change: the PBL still does not fetch.
+- `0451` reads the endpoint's PM capability: `PMCSR=0x8`, state 0, so the
+  function is in D0 with bus mastering on (`command=0x6`); that is not the gate
+  either.
+- The stock `image/qca6490` holds only `amss.bin` and `amss20.bin`, so the
+  `0x400c1211` word's minor `0x11` (WCN6855 hw2.1 in ath11k) selects no third
+  image.
+- The host side is complete: identity, link, SMMU, MHI context, BHI registers
+  and MSI all read and write the way ath11k does, no SMMU fault is recorded, and
+  the doorbell is still never consumed. What is left is device-side, in the
+  WLAN SoC's own power/reset/clock state before the fetch (expected, not
+  measured).
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
