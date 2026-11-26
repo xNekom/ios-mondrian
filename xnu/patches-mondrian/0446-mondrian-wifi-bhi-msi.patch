@@ -1,0 +1,213 @@
+xnu 0446: give the endpoint's BHI interrupt a DMA landing page
+
+Measured 2026-11-26 with 0445: the ROM leaves BHI_INTVEC at 0xffffffff,
+preserving it changes nothing, and BHI_STATUS stays 0x0 for 10000 polls. The
+doorbell register keeps the sequence, so the PBL never consumes it.
+
+The QCA6490 donor runs on a kernel with no GIC/ITS path either: it points the
+endpoint's MSI capability at a retained landing page in the SMMU-mapped DMA
+arena (Iova+0x40) and polls. This driver never programmed the endpoint's MSI,
+so the PBL's BHI interrupt had no landing page. Program it to a page inside
+the wired image buffer, enable bus mastering before the SOC reset
+(pci_set_master precedes ath11k_pci_power_up in Linux), re-arm the MSI after
+the reset and log the page around the doorbell. Restore mhi_async_power_up's
+BHI_INTVEC=0 write.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 3ea801a..86edda0 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1238,6 +1238,62 @@ extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
+ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+     uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
++#define W6_MSI_OFF	0x5fe000u
++
++/*
++ * W6 MSI: the endpoint raises its MHI interrupt through the standard MSI
++ * capability, and this driver has no GIC/ITS path. Point it at a page inside
++ * the wired image buffer, mapped by the same W2 context, so the interrupt is
++ * an ordinary DMA write this kernel can poll and log. The donor retains the
++ * same kind of landing page for the QCA6490 (Iova+0x40 there).
++ */
++static int
++wifi_msi_enable(uint64_t page_iova)
++{
++    uint8_t cap;
++    uint16_t mc;
++    uint32_t lo = (uint32_t)page_iova;
++    uint32_t hi = (uint32_t)(page_iova >> 32);
++    int i, is64;
++
++    cap = (uint8_t)(wifi_read8(wifi_cfg, 0x34) & ~3u);
++    for (i = 0; i < 16; i++) {
++        uint8_t id;
++
++        if (cap < 0x40 || cap > 0xfc) {
++            break;
++        }
++        id = wifi_read8(wifi_cfg, cap);
++        if (id == 0x05) {
++            break;
++        }
++        cap = (uint8_t)(wifi_read8(wifi_cfg, cap + 1) & ~3u);
++    }
++    if (i >= 16 || cap < 0x40 || cap > 0xfc) {
++        wifi_log("W6 MSI capability not found");
++        return -1;
++    }
++    mc = wifi_read16(wifi_cfg, cap + 2);
++    is64 = (mc & 0x80) != 0;
++    wifi_log("W6 MSI cap=0x%x ctrl=0x%x addr=0x%x%08x data=0x%x",
++        cap, mc, hi, lo,
++        wifi_read16(wifi_cfg, cap + (is64 ? 0x0c : 0x08)));
++    mondrian_tlmm_write(wifi_cfg, cap + 4, lo);
++    if (is64) {
++        mondrian_tlmm_write(wifi_cfg, cap + 8, hi);
++    }
++    wifi_write16(wifi_cfg, cap + (is64 ? 0x0c : 0x08), 0);
++    if ((mc & 0x100u) != 0) {
++        /* Per-vector masking capable: an all-ones mask blocks the write. */
++        mondrian_tlmm_write(wifi_cfg, cap + (is64 ? 0x10 : 0x0c), 0);
++    }
++    wifi_write16(wifi_cfg, cap + 2, (uint16_t)((mc & ~0x100u) | 0x1u));
++    /* PCI 3.0: INTx must be disabled before MSI is enabled. */
++    mc = wifi_read16(wifi_cfg, 4);
++    wifi_write16(wifi_cfg, 4, (uint16_t)(mc | 0x400u));
++    return 0;
++}
++
+ int
+ mondrian_wifi_load_amss(void)
+ {
+@@ -1264,36 +1320,6 @@ mondrian_wifi_load_amss(void)
+         wifi_log("W6 BAR or config not mapped after 60 s");
+         return -1;
+     }
+-    if (wifi_soc_reset() != 0) {
+-        wifi_log("W6 SOC reset failed");
+-        return -1;
+-    }
+-    wifi_log("W6 reset done");
+-    mondrian_log_flush_now();
+-    if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
+-        bhioff == 0) {
+-        wifi_log("W6 BHIOFF unreadable");
+-        return -1;
+-    }
+-    wifi_log("W6 BHIOFF=0x%x", bhioff);
+-    /*
+-     * ath11k_pci_clear_all_intrs runs before the SOC reset, but the reset
+-     * clears the block and the PBL raises its ready interrupt right after.
+-     * No MSI is enabled here, so clear the status again before asking for
+-     * the image; the PBL waits in that interrupt otherwise.
+-     */
+-    (void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
+-    {
+-        uint32_t execenv = 0, pre_status = 0;
+-
+-        /* mhi_intvec_handler reads EXECENV to decode the PBL transition. */
+-        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
+-        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x20, &intvec);
+-        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &pre_status);
+-        wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x",
+-            execenv, intvec, pre_status);
+-    }
+-    mondrian_log_flush_now();
+     kr = kmem_alloc(kernel_map, &buf, 0x600000, KMA_DATA,
+         VM_KERN_MEMORY_IOKIT);
+     if (kr != KERN_SUCCESS) {
+@@ -1325,9 +1351,10 @@ mondrian_wifi_load_amss(void)
+         (unsigned long long)iova);
+     mondrian_log_flush_now();
+     /*
+-     * W3 leaves bus mastering off on purpose. BHI reads the image from host
+-     * memory, so memory space and bus master must both be on for the load and
+-     * stay on while the SBL fetches the rest of the image.
++     * W3 leaves bus mastering off on purpose. pci_set_master runs before
++     * ath11k_pci_power_up in Linux, and the PBL raises its BHI interrupt as
++     * soon as the SOC reset releases it, so enable the master before the
++     * reset rather than just before the doorbell.
+      */
+     command = wifi_read16(wifi_cfg, 4);
+     wifi_write16(wifi_cfg, 4,
+@@ -1338,13 +1365,67 @@ mondrian_wifi_load_amss(void)
+     if ((command & WIFI_PCI_BUS_MASTER) == 0) {
+         return -1;
+     }
++    /*
++     * The PBL's BHI interrupt is the endpoint's MSI, so the landing page must
++     * exist before the reset. The page is inside the wired image buffer, past
++     * the AMSS, and mapped by the same W2 context as the image.
++     */
++    memset((void *)(buf + W6_MSI_OFF), 0, 0x1000);
++    flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++    if (wifi_msi_enable(iova + W6_MSI_OFF) == 0) {
++        wifi_log("W6 MSI armed at 0x%llx",
++            (unsigned long long)(iova + W6_MSI_OFF));
++    }
++    mondrian_log_flush_now();
++    if (wifi_soc_reset() != 0) {
++        wifi_log("W6 SOC reset failed");
++        return -1;
++    }
++    wifi_log("W6 reset done");
++    mondrian_log_flush_now();
++    if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
++        bhioff == 0) {
++        wifi_log("W6 BHIOFF unreadable");
++        return -1;
++    }
++    wifi_log("W6 BHIOFF=0x%x", bhioff);
++    /* mhi_async_power_up writes this before it reads EXECENV. */
++    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++    /*
++     * A hot reset can reset the endpoint's MSI capability, and the donor
++     * writes the address before the reset and only enables MSI after it.
++     * Re-arm both here, then read the landing page before the doorbell.
++     */
++    (void)wifi_msi_enable(iova + W6_MSI_OFF);
++    {
++        uint32_t execenv = 0, pre_status = 0, msi_page = 0;
++
++        /* mhi_intvec_handler reads EXECENV to decode the PBL transition. */
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x20, &intvec);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &pre_status);
++        flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++        msi_page = *(volatile uint32_t *)(buf + W6_MSI_OFF);
++        wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x"
++            " msi=0x%x", execenv, intvec, pre_status, msi_page);
++    }
++    command = wifi_read16(wifi_cfg, 4);
++    wifi_write16(wifi_cfg, 4,
++        command | WIFI_PCI_MEMORY | WIFI_PCI_BUS_MASTER);
++    command = wifi_read16(wifi_cfg, 4);
++    wifi_log("W6 post-reset command=0x%x", command);
++    mondrian_log_flush_now();
++    if ((command & WIFI_PCI_BUS_MASTER) == 0) {
++        return -1;
++    }
+     /*
+      * ath11k loads only the first 512 KiB (sbl_size) through BHI; the SBL
+      * fetches the AMSS remainder through BHIE. A larger size never started.
+      */
+     image_size = (uint32_t)got > wifi_sbl_size ?
+         wifi_sbl_size : (uint32_t)got;
+-    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
+         (uint32_t)(iova >> 32));
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08, (uint32_t)iova);
+@@ -1372,6 +1453,9 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
++    wifi_log("W6 MSI page=0x%x",
++        *(volatile uint32_t *)(buf + W6_MSI_OFF));
+     mondrian_log_flush_now();
+     {
+         uint32_t addr_lo = 0, addr_hi = 0, size = 0, doorbell = 0;

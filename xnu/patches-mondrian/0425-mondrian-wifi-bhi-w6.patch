@@ -1,0 +1,299 @@
+xnu 0425: load the QCA6490 SBL through BHI (mondrianwifi=1)
+
+W5 reads BHI 1.2 in PBL with one segment. W6 adds the load path: `wififw`
+reads /private/var/vm/amss.bin from the iOS root, maps the wired buffer page
+by page through the W2 SMMU context at 0xa1000000, and writes BHI_IMGADDR,
+BHI_IMGSIZE and BHI_IMGTXDB. The first attempt left bus mastering off, which
+W3 clears on purpose, so the device could not read the image; W6 now sets the
+PCI memory and bus-master bits before the load. It also writes BHI_INTVEC and
+passes only the first 512 KiB: ath11k treats amss.bin as an SBL plus AMSS
+image (`sbl_size` 512 KiB) and the SBL fetches the remainder through BHIE.
+The command polls BHI_STATUS for success or error and then waits for
+MHISTATUS.READY, so one boot proves the transfer and whether the SBL started.
+
+The USB command races the WiFi worker on a cold boot: the rail votes can take
+a minute, so the command waits for the BAR and, behind `mondrianwififw=1`, the
+worker calls the same load as soon as W4 has mapped it. The image read retries
+until the root is mounted.
+
+Facts from mainline drivers/bus/mhi/host/boot.c, pm.c and common.h
+(GPL-2.0, constants only).
+
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index bf6e72e..3d372e3 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2812,6 +2812,13 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 			    strcmp(cmd, "vib") == 0 ||
+ 			    strncmp(cmd, "vib ", 4) == 0) {
+ 				ud_cmd_hap(so, peer, cmd);
++			} else if (strcmp(cmd, "wififw") == 0) {
++				extern int mondrian_wifi_load_amss(void);
++				char out[48];
++				int n = snprintf(out, sizeof(out), "wififw %s\n",
++				    mondrian_wifi_load_amss() == 0 ? "ok" : "failed");
++
++				ud_cmd_send(so, peer, out, (size_t)n);
+ 			} else if (strcmp(cmd, "btuart") == 0 ||
+ 			    strncmp(cmd, "btuart ", 7) == 0) {
+ 				ud_cmd_btuart(so, peer, cmd);
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index c3df3c3..49bfada 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -72,6 +72,8 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <arm/caches_internal.h>
+ #include "mondrian_mmio.h"
+ 
+ void mondrian_wifi_start(void);
+@@ -1027,6 +1029,131 @@ wifi_mhi_probe(uint16_t command)
+ 	    wifi_fail("W3 bus master did not clear") : 0;
+ }
+ 
++/*
++ * W6: read the AMSS image from the iOS root, map it through the W2 SMMU
++ * context and hand it to BHI. The host uploads the blob after boot, so this
++ * runs from the "wififw" command, not from the boot worker.
++ */
++extern int mondrian_root_read(const char *, void *, unsigned, off_t);
++extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
++
++int
++mondrian_wifi_load_amss(void)
++{
++    vm_offset_t buf;
++    kern_return_t kr;
++    uint64_t iova = 0;
++    uint32_t bhioff = 0, status = 0, errcode = 0, image_size, ready = 0;
++    uint16_t command;
++    unsigned i;
++    int got, rc;
++
++    /*
++     * The worker maps the config in W1 and the BAR in W4; a command can arrive
++     * before it finishes, so wait for both instead of failing on the first
++     * read. The 60 s ceiling is longer than the slow rail votes measured on a
++     * cold boot.
++     */
++    for (i = 0; i < 60000 && (wifi_bar == 0 || wifi_cfg == 0); i++) {
++        delay(1000);
++    }
++    if (wifi_bar == 0 || wifi_cfg == 0) {
++        wifi_log("W6 BAR or config not mapped after 60 s");
++        return -1;
++    }
++    if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
++        bhioff == 0) {
++        wifi_log("W6 BHIOFF unreadable");
++        return -1;
++    }
++    kr = kmem_alloc(kernel_map, &buf, 0x600000, KMA_DATA,
++        VM_KERN_MEMORY_IOKIT);
++    if (kr != KERN_SUCCESS) {
++        wifi_log("W6 firmware buffer allocation failed kr=0x%x", kr);
++        return -1;
++    }
++    /* The auto load can run before the root is mounted; retry for a minute. */
++    for (i = 0; i < 60000; i++) {
++        got = mondrian_root_read("/private/var/vm/amss.bin", (void *)buf,
++            0x600000, 0);
++        if (got > 0) {
++            break;
++        }
++        delay(1000);
++    }
++    wifi_log("W6 amss read=%d magic=%02x%02x%02x%02x", got,
++        ((const uint8_t *)buf)[0], ((const uint8_t *)buf)[1],
++        ((const uint8_t *)buf)[2], ((const uint8_t *)buf)[3]);
++    if (got <= 0) {
++        return -1;
++    }
++    flush_dcache64((addr64_t)buf, (unsigned)got, 0);
++    if (mondrian_wifi_smmu_map_va(buf, (vm_size_t)got, &iova)) {
++        wifi_log("W6 SMMU map failed");
++        return -1;
++    }
++    /*
++     * W3 leaves bus mastering off on purpose. BHI reads the image from host
++     * memory, so memory space and bus master must both be on for the load and
++     * stay on while the SBL fetches the rest of the image.
++     */
++    command = wifi_read16(wifi_cfg, 4);
++    wifi_write16(wifi_cfg, 4,
++        command | WIFI_PCI_MEMORY | WIFI_PCI_BUS_MASTER);
++    command = wifi_read16(wifi_cfg, 4);
++    wifi_log("W6 bus master command=0x%x", command);
++    if ((command & WIFI_PCI_BUS_MASTER) == 0) {
++        return -1;
++    }
++    /*
++     * ath11k loads only the first 512 KiB (sbl_size) through BHI; the SBL
++     * fetches the AMSS remainder through BHIE. A larger size never started.
++     */
++    image_size = got > 0x80000 ? 0x80000 : (uint32_t)got;
++    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
++        (uint32_t)(iova >> 32));
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08, (uint32_t)iova);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10, image_size);
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 1);
++    wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x rc=0x%x",
++        iova, image_size, got, rc);
++    if (rc != 0) {
++        return -1;
++    }
++    for (i = 0; i < 10000; i++) {
++        delay(1000);
++        if (mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c,
++            &status) != 0) {
++            continue;
++        }
++        if ((status >> 30) == 2 || (status >> 30) == 3) {
++            break;
++        }
++    }
++    if (mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x30, &errcode) != 0) {
++        errcode = 0;
++    }
++    wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
++        i);
++    if ((status >> 30) == 2) {
++        uint32_t execenv = 0, mhistatus = 0;
++
++        for (ready = 0; ready < 5000; ready++) {
++            if (mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus) == 0 &&
++                (mhistatus & 1u) != 0) {
++                break;
++            }
++            delay(1000);
++        }
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++        wifi_log("W6 post execenv=0x%x mhistatus=0x%x ready_polls=%u",
++            execenv, mhistatus, ready);
++    }
++    return (status >> 30) == 2 ? 0 : -1;
++}
++
+ static int
+ wifi_config_identity(void)
+ {
+@@ -1143,15 +1270,31 @@ static void __dead2
+ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	int ok = wifi_cold_link() == 0;
++	int autoload = 0;
+ 
++	/*
++	 * W6: the USB command races the worker, and on a cold boot the rail
++	 * votes can take a minute. With mondrianwififw=1 the load runs here, at
++	 * the moment W4 has mapped the BAR, so the experiment does not depend on
++	 * host timing.
++	 */
++	if (ok && PE_parse_boot_argn("mondrianwififw", &autoload,
++	    sizeof(autoload)) && autoload != 0) {
++		wifi_log("W6 auto load start");
++		(void)mondrian_wifi_load_amss();
++	}
+ 	if (!ok && wifi_perst_page != 0) {
+ 		wifi_pin_set(wifi_perst_page, mondrian_tlmm_cfg(
+ 		    WIFI_TLMM_FUNC_GPIO, WIFI_TLMM_PULL_DOWN,
+ 		    WIFI_TLMM_DRIVE_2MA, 1), 0);
+ 	}
+-	wifi_log(ok ?
+-	    "W4/W5 complete; MHI and BHI read; no DMA, firmware or network was started" :
+-	    "worker stopped after failure; normal iOS boot continues");
++	if (ok && autoload != 0) {
++		wifi_log("W4/W5 complete; W6 firmware load attempted");
++	} else {
++		wifi_log(ok ?
++		    "W4/W5 complete; MHI and BHI read; no DMA, firmware or network was started" :
++		    "worker stopped after failure; normal iOS boot continues");
++	}
+ 	mondrian_log_flush_now();
+ 	(void)thread_terminate(current_thread());
+ 	(void)thread_block(THREAD_CONTINUE_NULL);
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index 3166415..a643545 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -634,6 +634,75 @@ w2_teardown(void)
+         "UNCERTAIN" : "complete");
+ }
+ 
++/*
++ * W6: map a wired kernel range at 0xa1000000 and enable the context. The
++ * firmware buffer need not be physically contiguous: each page is resolved
++ * with pmap_find_phys. The W2 proof tore the context and SID route down, so
++ * both are installed again; the tables are fresh and the old canary tables
++ * stay retained.
++ */
++int
++mondrian_wifi_smmu_map_va(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
++{
++    struct w2_mem tables;
++    uint64_t iova = W2_IOVA_BASE + 0x01000000ULL;
++    uint64_t *root, *l2, *l3;
++    vm_size_t off, chunk;
++    uint32_t i1, i2, i3, l3i = 0;
++    ppnum_t pn;
++
++    if (w2.smmu == 0 || w2.cb == 0 || w2.bank == 0 || va == 0 ||
++        bytes == 0 || iova_out == 0) {
++        return -1;
++    }
++    bytes = (bytes + 0xfff) & ~(vm_size_t)0xfff;
++    if (bytes > 0x600000) {
++        bytes = 0x600000;
++    }
++    if (w2_alloc_mem(&tables, 0x6000)) {
++        return -1;
++    }
++    root = (uint64_t *)tables.va;
++    l2 = root + 512;
++    l3 = l2 + 512;
++    bzero((void *)tables.va, tables.bytes);
++    i1 = (uint32_t)((iova >> 30) & 3u);
++    root[i1] = (tables.pa + 0x1000) | 3u;
++    for (off = 0; off < bytes; off += 0x200000) {
++        uint64_t base = iova + off;
++
++        i2 = (uint32_t)((base >> 21) & 0x1ffu);
++        l2[i2] = (tables.pa + 0x2000 + (uint64_t)l3i * 0x1000) | 3u;
++        for (chunk = 0; chunk < 0x200000 && off + chunk < bytes;
++            chunk += 0x1000) {
++            pn = pmap_find_phys(kernel_pmap,
++                (addr64_t)(va + off + chunk));
++            if (pn == 0) {
++                w2_log("W6 no page va=0x%lx",
++                    (unsigned long)(va + off + chunk));
++                return -1;
++            }
++            i3 = (uint32_t)(((base + chunk) >> 12) & 0x1ffu);
++            l3[(uint64_t)l3i * 512 + i3] = ptoa_64(pn) | W2_PTE_ATTR;
++        }
++        l3i++;
++        if (l3i >= 3) {
++            break;
++        }
++    }
++    w2_flush_pa(tables.pa, tables.bytes);
++    w2.tables = tables;
++    w2.context_programmed = 0;
++    if (w2_program_context() || w2_attach_sid()) {
++        return -1;
++    }
++    *iova_out = iova;
++    w2_log("W6 mapped va=0x%lx bytes=0x%lx iova=0x%llx",
++        (unsigned long)va, (unsigned long)bytes,
++        (unsigned long long)iova);
++    return 0;
++}
++
+ int
+ mondrian_wifi_smmu_prove(uint16_t pci_command)
+ {

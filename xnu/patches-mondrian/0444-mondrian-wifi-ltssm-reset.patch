@@ -1,0 +1,92 @@
+xnu 0444: run ath11k's full power-on reset before the BHI load
+
+Measured 2026-11-26 with 0442: wifibhi no longer wedges the command thread.
+The W6 trace reaches the BHI trigger: SOC reset (qfprom 0x62, ctrl 0x4,
+MHICTRL 0x2), AMSS ELF read of 5,470,128 bytes, SMMU iova 0xa1000000, bus
+master 0x6, address/size/doorbell written, then BHI status stays 0x0 for
+10000 polls with gfsr 0 and s2cr 0x4a/0x4a. The PBL never polls the doorbell.
+
+The 0438 reset carried only the second half of ath11k_pci_sw_reset(power_on):
+it skips ath11k_pci_enable_ltssm and the GCC_PCIE_HOT_RST pulse that run
+before the SoC global reset, and it skips ath11k_mhi_clear_vector. Add the
+full order and pre-map the GCC page (0x1e402bc) in W4 so the command thread
+never calls ml_io_map at runtime.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 3208706..9d83d45 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1014,7 +1014,8 @@ wifi_mhi_probe(uint16_t command)
+ 		 * thread is the W1 trap, and the reset is the next user.
+ 		 */
+ 		(void)wifi_ahb_page(0x1f8031c);	/* qfprom, warm, cause */
+-		(void)wifi_ahb_page(0x1e08228);	/* interrupt clear */
++		(void)wifi_ahb_page(0x1e08228);	/* int clear, PARF LTSSM */
++		(void)wifi_ahb_page(0x1e402bc);	/* GCC PCIe hot reset */
+ 		(void)wifi_ahb_page(0x3008);	/* global reset */
+ 		wifi_log("W4 AHB reset pages mapped");
+ 		if (mondrian_mmio_try_rd32(wifi_bar + 0x08, &mhiver) != 0) {
+@@ -1162,18 +1163,50 @@ extern void mondrian_log_flush_now(void);
+ static int
+ wifi_soc_reset(void)
+ {
+-	uint32_t qfprom = 0, warm = 0, cause = 0, val = 0;
++	uint32_t qfprom = 0, warm = 0, cause = 0, cookie = 0, val = 0;
++	unsigned int i;
+ 
++	/*
++	 * ath11k_pci_sw_reset(power_on=true), in its order. The LTSSM enable and
++	 * the hot-reset pulse come first: without them the SoC global reset
++	 * leaves the endpoint's PBL unclocked, which is the state 0442 measured
++	 * (doorbell 0x1, BHI status 0x0 for 10 s, clean SMMU FSR).
++	 */
+ 	wifi_log("W6 reset start");
+ 	mondrian_log_flush_now();
++	(void)wifi_ahb_read32(0x1e081b0, &val);
++	for (i = 0; val != 0x111u && i < 5; i++) {
++		(void)wifi_ahb_write32(0x1e081b0, 0x111u);
++		(void)wifi_ahb_read32(0x1e081b0, &val);
++	}
++	wifi_log("W6 ltssm 0x%x polls %u", val, i);
++	mondrian_log_flush_now();
++	(void)wifi_ahb_read32(0x1e402bc, &val);
++	(void)wifi_ahb_write32(0x1e402bc, val | 0x10u);
++	(void)wifi_ahb_read32(0x1e402bc, &val);
++	wifi_log("W6 pcie hot rst 0x%x", val);
++	delay(5000);
++	mondrian_log_flush_now();
++	(void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
++	mondrian_log_flush_now();
+ 	(void)wifi_ahb_read32(0x1f8031c, &qfprom);
+ 	(void)wifi_ahb_write32(0x1f8031c, qfprom & ~0x4u);
+ 	wifi_log("W6 qfprom 0x%x", qfprom);
+ 	mondrian_log_flush_now();
+-	(void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
++	(void)wifi_ahb_read32(0x1f80500, &cookie);
+ 	(void)wifi_ahb_read32(0x1f80504, &warm);
++	delay(10000);
+ 	(void)wifi_ahb_write32(0x1f80504, 0);
++	delay(10000);
++	(void)wifi_ahb_read32(0x1f80504, &warm);
+ 	(void)wifi_ahb_read32(0x1f8060c, &cause);
++	wifi_log("W6 dbg cookie=0x%x warm=0x%x cause=0x%x", cookie, warm, cause);
++	mondrian_log_flush_now();
++	/* ath11k_mhi_clear_vector: stale MHI vectors before the SBL runs. */
++	(void)mondrian_mmio_try_wr32(wifi_bar + 0x360, 0);
++	(void)mondrian_mmio_try_wr32(wifi_bar + 0x368, 0);
++	(void)mondrian_mmio_try_wr32(wifi_bar + 0x394, 0);
++	(void)mondrian_mmio_try_wr32(wifi_bar + 0x39c, 0);
+ 	mondrian_log_flush_now();
+ 	if (wifi_ahb_read32(0x3008, &val) != 0) {
+ 		wifi_log("W6 global reset unreadable");
+@@ -1185,8 +1218,7 @@ wifi_soc_reset(void)
+ 	(void)wifi_ahb_write32(0x3008, val & ~1u);
+ 	delay(10000);
+ 	(void)wifi_ahb_read32(0x3008, &val);
+-	wifi_log("W6 soc reset qfprom=0x%x warm=0x%x cause=0x%x ctrl=0x%x",
+-	    qfprom, warm, cause, val);
++	wifi_log("W6 soc reset qfprom=0x%x ctrl=0x%x", qfprom, val);
+ 	mondrian_log_flush_now();
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x38, 2);
+ 	delay(10000);

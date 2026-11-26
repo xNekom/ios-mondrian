@@ -1,0 +1,43 @@
+xnu 0427: skip the shared PCIe NoC SN7 vote in the WiFi sequence
+
+Measured 2026-11-25: after the LDOs are left to the loader the worker reaches
+xo.lvl and then wedges in the SN7 vote; the log never appears and the worker
+never reaches "supplies complete". Earlier boots had voted SN7, so the direct
+RSC access is contended or owned elsewhere, and the read does not return.
+
+SN7 is the PCIe NoC bandwidth vote, not a power rail. The link trained with the
+bootloader's NoC configuration, so keep that and skip the vote until there is
+an owner-safe path through the AOP. The function stays for that work.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 1a032c9..2fb984e 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -575,7 +575,7 @@ wifi_vote_xo(void)
+ 	return 0;
+ }
+ 
+-static int
++static int __unused
+ wifi_vote_sn7(void)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr("SN7");
+@@ -626,9 +626,17 @@ wifi_supplies(void)
+ 	/* qcom,vdd-wlan-ipa-config has enable=0 on this phone. */
+ 	wifi_log("ipa rail smpe3 has DT enable=0; not voted");
+ 	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0 ||
+-	    wifi_vote_xo() != 0 || wifi_vote_sn7() != 0) {
++	    wifi_vote_xo() != 0) {
+ 		return -1;
+ 	}
++	/*
++	 * SN7 is the PCIe NoC bandwidth vote. Measured 2026-11-25: the direct RSC
++	 * write wedges after xo.lvl and never returns, while earlier boots had
++	 * voted it. It is a bandwidth setting, not a power rail; the bootloader's
++	 * NoC configuration is what the link trained with. Skip it until the
++	 * owner-safe AOP path exists.
++	 */
++	wifi_log("noc SN7 vote skipped; loader NoC configuration retained");
+ 	delay(20000);
+ 	wifi_log("supplies complete; enabling WLAN");
+ 	return 0;

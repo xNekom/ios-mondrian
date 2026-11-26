@@ -1,0 +1,35 @@
+xnu 0426: skip the shared PMR735A LDOs in the WiFi power sequence
+
+The WiFi rail table also voted ldoe7 (PMR735A L7, the BT node's vdd-asd),
+ldoc10 and ldob5. They are not in the WiFi DT supplies and their RPMh resource
+can belong to another processor: measured 2026-11-25, the worker logged smpb12
+and then never logged ldoe7 and never reached W1, across warm resets and with
+Bluetooth off, while earlier boots had voted all eight. The RSC access wedges
+rather than returning.
+
+Keep the five PM8350/PM8350C SMPS, which are the WiFi rails, and leave the
+shared LDOs to the bootloader. If the link fails without them, the next step is
+an owner-safe vote through the AOP, not another direct TCS write.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 49bfada..1a032c9 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -275,9 +275,14 @@ static const struct wifi_rail wifi_rails[] = {
+ 	{ "smpb10", 1800 },
+ 	{ "smpc1", 1900 },
+ 	{ "smpb12", 1350 },
+-	{ "ldoe7", 2800 },
+-	{ "ldoc10", 1200 },
+-	{ "ldob5", 880 },
++	/*
++	 * ldoe7 is the PMR735A L7 that the BT node calls vdd-asd; ldoc10 and ldob5
++	 * are shared LDOs too. They are not in the WiFi DT supplies. Measured
++	 * 2026-11-25: after smpb12 the worker never logged ldoe7 and never reached
++	 * W1, across warm resets and with Bluetooth off; earlier boots had voted
++	 * them, so the RSC resource is contended or owned elsewhere. The five SMPS
++	 * above are the WiFi rails; the loader leaves the LDOs on.
++	 */
+ };
+ 
+ static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,

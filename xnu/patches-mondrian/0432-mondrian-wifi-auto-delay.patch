@@ -1,0 +1,37 @@
+xnu 0432: delay the automatic W6 load so the USB ring is up
+
+The automatic W6 load runs at W4. On the skip-all builds W4 happens before the
+USB control channel serves the ring, so a crash inside the load leaves no
+ring to read. `mondrianwifidelay=<ms>` delays the load (default 20000 ms); the
+ring then carries the W6 lines and a panic can be read with `prev`.
+
+The delay is bounded to 60 s and applies only to the automatic load; `wififw`
+and `wifibhi` stay immediate.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 5fd40ea..25d5e6e 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1401,6 +1401,7 @@ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	int ok = wifi_cold_link() == 0;
+ 	int autoload = 0;
++	int delay_ms = 20000;
+ 
+ 	/*
+ 	 * W6: the USB command races the worker, and on a cold boot the rail
+@@ -1410,6 +1411,14 @@ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ 	 */
+ 	if (ok && PE_parse_boot_argn("mondrianwififw", &autoload,
+ 	    sizeof(autoload)) && autoload != 0) {
++		if (!PE_parse_boot_argn("mondrianwifidelay", &delay_ms,
++		    sizeof(delay_ms))) {
++			delay_ms = 20000;
++		}
++		if (delay_ms > 0 && delay_ms < 60000) {
++			wifi_log("W6 auto load delay %d ms", delay_ms);
++			delay(delay_ms * 1000);
++		}
+ 		wifi_log("W6 auto load start");
+ 		(void)mondrian_wifi_load_amss();
+ 	}

@@ -1,0 +1,164 @@
+xnu 0434: route the second PCIe SID to the WiFi SMMU context
+
+The live DT's iommu-map is <0 &apps_smmu 0x1c00 1>, <0x100 &apps_smmu
+0x1c01 1>: RID 0 (the WLAN function) maps to SID 0x1c00 and RID 0x100 to
+0x1c01. W2 and W6 installed only 0x1c01, so the first BHI read from the WLAN
+function matched no SMR. The NoC took the resulting fault as fatal and reset
+the SoC at the trigger, before a W6 line could reach the ring.
+
+Attach both SIDs to the same context/bank with the same SMR/S2CR order, keep
+the second slot out of the first route's way, and poison both in teardown. The
+log grows a sid2 line so one boot proves both routes before the load runs.
+
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index a643545..0e55a81 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -34,6 +34,9 @@ extern void mondrian_log_flush_now(void);
+ #define W2_SMMU_PA          0x15000000UL
+ #define W2_SMMU_SIZE        0x00100000UL
+ #define W2_SID              0x1c01u
++/* The live DT's iommu-map routes RID 0 to SID 0x1c00 and RID 0x100 to
++ * 0x1c01; the WLAN function's first DMA uses the former. */
++#define W2_SID2             0x1c00u
+ #define W2_ASID             0x1c01u
+ #define W2_IOVA_BASE        0xa0000000ULL
+ #define W2_IOVA_CANARY      (W2_IOVA_BASE + 0x1000ULL)
+@@ -92,12 +95,15 @@ struct w2_state {
+     uint32_t scr0, idr0, idr1, idr2;
+     uint32_t page_bytes, global_pages, banks, smr_slots;
+     uint32_t bank, slot, cb, gr1;
++    uint32_t slot2;
+     uint32_t old_smr, old_s2cr;
+     uint32_t route_smr, route_s2cr;
++    uint32_t route_smr2, route_s2cr2;
+     uint32_t valid_smr, valid_s2cr;
+     struct w2_mem tables, canary;
+     int bank_touched;
+     int slot_touched;
++    int slot2_touched;
+     int context_programmed;
+     int sid_attached;
+     int poisoned;
+@@ -608,6 +614,81 @@ w2_attach_sid(void)
+     return 0;
+ }
+ 
++/*
++ * The second PCIe RID maps to SID 0x1c00 and points at the same context: the
++ * QCA6490's first BHI read arrives on the WLAN function, not on the MHI one.
++ * Without this route the stream does not match an SMR and the NoC takes the
++ * resulting fault as a fatal access.
++ */
++static int
++w2_attach_sid2(void)
++{
++    uint32_t n, smr, s2cr, route = w2.bank | w2.valid_s2cr;
++    uint32_t free_slot = ~0u, exact_slot = ~0u;
++    uint32_t sid_mask = (w2.idr0 & (1u << 8)) ? 0xffffu :
++        (1u << ((w2.idr0 >> 9) & 15u)) - 1u;
++
++    for (n = 0; n < w2.smr_slots; n++) {
++        int valid;
++        uint32_t mask, id;
++
++        if (n == w2.slot) {
++            continue;
++        }
++        if (w2_rd32(W2_SMR(n), &smr) || w2_rd32(W2_S2CR(n), &s2cr)) {
++            return -1;
++        }
++        valid = (w2.idr0 & (1u << 8)) ? !!(s2cr & 0x400u) :
++            !!(smr & 0x80000000u);
++        if (!valid) {
++            if (free_slot == ~0u) {
++                free_slot = n;
++            }
++            continue;
++        }
++        id = smr & 0xffffu;
++        mask = (smr >> 16) & ((w2.idr0 & (1u << 8)) ? 0xffffu : 0x7fffu);
++        if (((W2_SID2 ^ id) & ~mask & sid_mask) == 0) {
++            if (mask != 0 || ((s2cr >> 16) & 3u) != 0) {
++                w2_log("sid2 0x%x conflicts slot %u smr=0x%x s2cr=0x%x",
++                    W2_SID2, n, smr, s2cr);
++                return -1;
++            }
++            if (exact_slot != ~0u) {
++                w2_log("sid2 0x%x duplicate exact matches", W2_SID2);
++                return -1;
++            }
++            exact_slot = n;
++        }
++    }
++    if (exact_slot != ~0u) {
++        n = exact_slot;
++        w2_log("sid2 0x%x exact non-translating SID reused slot=%u",
++            W2_SID2, n);
++    } else if (free_slot != ~0u) {
++        n = free_slot;
++    } else {
++        w2_log("sid2 0x%x no free SMR slot", W2_SID2);
++        return -1;
++    }
++    w2.slot2 = n;
++    w2.slot2_touched = 1;
++    if (w2_put32(W2_S2CR(n), w2.bank) ||
++        w2_put32(W2_SMR(n), w2.valid_smr | W2_SID2) ||
++        (w2.valid_s2cr != 0 && w2_put32(W2_S2CR(n), route))) {
++        return -1;
++    }
++    if (w2_rd32(W2_SMR(n), &w2.route_smr2) ||
++        w2_rd32(W2_S2CR(n), &w2.route_s2cr2) ||
++        w2.route_smr2 != (w2.valid_smr | W2_SID2) ||
++        w2.route_s2cr2 != route) {
++        return -1;
++    }
++    w2_log("sid2 0x%x slot=%u smr=0x%x s2cr=0x%x", W2_SID2, n,
++        w2.route_smr2, w2.route_s2cr2);
++    return 0;
++}
++
+ static void
+ w2_teardown(void)
+ {
+@@ -620,6 +701,12 @@ w2_teardown(void)
+         w2.slot_touched = 0;
+         w2.sid_attached = 0;
+     }
++    if (w2.slot2_touched) {
++        if (w2_put32(W2_S2CR(w2.slot2), W2_S2CR_FAULT | w2.valid_s2cr)) {
++            w2.poisoned = 1;
++        }
++        w2.slot2_touched = 0;
++    }
+     if (w2.bank_touched) {
+         if (w2_put32(w2.cb + W2_CB_SCTLR, 0) || w2_tlb_sync()) {
+             w2.poisoned = 1;
+@@ -693,7 +780,7 @@ mondrian_wifi_smmu_map_va(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
+     w2_flush_pa(tables.pa, tables.bytes);
+     w2.tables = tables;
+     w2.context_programmed = 0;
+-    if (w2_program_context() || w2_attach_sid()) {
++    if (w2_program_context() || w2_attach_sid() || w2_attach_sid2()) {
+         return -1;
+     }
+     *iova_out = iova;
+@@ -736,7 +823,7 @@ mondrian_wifi_smmu_prove(uint16_t pci_command)
+         goto out;
+     }
+     if (!w2.atos_supported) {
+-        if (w2_attach_sid()) {
++        if (w2_attach_sid() || w2_attach_sid2()) {
+             goto out;
+         }
+         w2_log("pci command=0x%x bus master off", pci_command);
+@@ -762,7 +849,7 @@ mondrian_wifi_smmu_prove(uint16_t pci_command)
+     w2_log("ats fault iova=0x%llx par=0x%llx expected PAR.F",
+         (unsigned long long)W2_IOVA_MISS, (unsigned long long)par);
+ 
+-    if (w2_attach_sid()) {
++    if (w2_attach_sid() || w2_attach_sid2()) {
+         goto out;
+     }
+     w2_log("pci command=0x%x bus master off", pci_command);

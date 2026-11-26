@@ -1,0 +1,74 @@
+xnu 0445: acknowledge the PBL BHI interrupt before the doorbell
+
+Measured 2026-11-26 with the boot-time auto-load (mondrianwififw=1,
+mondrianwifidelay=0): the 0444 reset and the BHI trigger run seconds after W1
+releases PERST, and BHI_STATUS still reads 0x0 after 10000 polls. The PBL
+never fetches, so the trigger itself is not reaching it.
+
+Three differences from mhi_fw_load_bhi remain. It never writes BHI_INTVEC, it
+rings BHI_IMGTXDB with a 30-bit sequence number, and the MHI interrupt handler
+reads BHI_EXECENV after the reset to decode and acknowledge the PBL
+transition. Preserve INTVEC, log it, read EXECENV before the doorbell, and use
+0x2a5a5a5a instead of 1. The existing interrupt clear runs before the SOC
+reset; the reset clears the block and the PBL raises its ready interrupt
+afterwards, so clear the endpoint's interrupt status again before asking for
+the image.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 9d83d45..3ea801a 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1245,6 +1245,7 @@ mondrian_wifi_load_amss(void)
+     kern_return_t kr;
+     uint64_t iova = 0;
+     uint32_t bhioff = 0, bhieoff = 0, status = 0, errcode = 0;
++    uint32_t intvec = 0;
+     uint32_t image_size, ready = 0, entries = 0, bhie_status = 0;
+     uint16_t command;
+     unsigned i;
+@@ -1275,6 +1276,23 @@ mondrian_wifi_load_amss(void)
+         return -1;
+     }
+     wifi_log("W6 BHIOFF=0x%x", bhioff);
++    /*
++     * ath11k_pci_clear_all_intrs runs before the SOC reset, but the reset
++     * clears the block and the PBL raises its ready interrupt right after.
++     * No MSI is enabled here, so clear the status again before asking for
++     * the image; the PBL waits in that interrupt otherwise.
++     */
++    (void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
++    {
++        uint32_t execenv = 0, pre_status = 0;
++
++        /* mhi_intvec_handler reads EXECENV to decode the PBL transition. */
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x20, &intvec);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &pre_status);
++        wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x",
++            execenv, intvec, pre_status);
++    }
+     mondrian_log_flush_now();
+     kr = kmem_alloc(kernel_map, &buf, 0x600000, KMA_DATA,
+         VM_KERN_MEMORY_IOKIT);
+@@ -1326,15 +1344,15 @@ mondrian_wifi_load_amss(void)
+      */
+     image_size = (uint32_t)got > wifi_sbl_size ?
+         wifi_sbl_size : (uint32_t)got;
+-    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
++    rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
+         (uint32_t)(iova >> 32));
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08, (uint32_t)iova);
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10, image_size);
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 1);
+-    wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x rc=0x%x",
+-        iova, image_size, got, rc);
++    /* BHI_IMGTXDB is a 30-bit sequence, not a boolean. */
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5au);
++    wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x intvec=0x%x rc=0x%x",
++        iova, image_size, got, intvec, rc);
+     mondrian_log_flush_now();
+     if (rc != 0) {
+         return -1;

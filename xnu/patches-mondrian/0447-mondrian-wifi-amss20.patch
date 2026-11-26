@@ -1,0 +1,86 @@
+xnu 0447: select the WCN6855 image by TCSR HW major
+
+Measured 2026-11-26 with 0446: the endpoint's MSI is programmed (cap 0x50,
+64-bit, per-vector masking) at a page inside the wired buffer, bus mastering
+is on before the reset, and the PBL still ignores the doorbell: BHI_STATUS
+stays 0x0 and the landing page stays 0x0 for 10000 polls.
+
+The donor's working QCA6490 path selects the vendor image from
+TCSR_SOC_HW_VERSION 0x224: major 2 uses amss20.bin (5,296,128 B), not
+amss.bin (5,470,128 B, the file this port has been loading). Read 0x224
+through the BAR, log it and the major, prefer /private/var/vm/amss20.bin when
+major is 2, fall back to amss.bin, and log the chosen name, size and magic.
+Also log BHI_ERRDBG1..3 when the device reports an image error.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 86edda0..f98b22f 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1326,18 +1326,42 @@ mondrian_wifi_load_amss(void)
+         wifi_log("W6 firmware buffer allocation failed kr=0x%x", kr);
+         return -1;
+     }
+-    /* The auto load can run before the root is mounted; retry for a minute. */
+-    for (i = 0; i < 60000; i++) {
+-        got = mondrian_root_read("/private/var/vm/amss.bin", (void *)buf,
+-            0x600000, 0);
++    {
++        const char *image = "/private/var/vm/amss.bin";
++        uint32_t socver = 0;
++        int pref = 0;
++
++        /*
++         * The donor's working QCA6490 path selects the vendor image from
++         * TCSR_SOC_HW_VERSION 0x224: major 2 uses amss20.bin, the hw2.0
++         * image, not amss.bin. The BAR read is the same one the donor uses;
++         * the AHB window page is not pre-mapped, so do not map it here.
++         */
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x224, &socver);
++        wifi_log("W6 TCSR 0x224=0x%x hw_major=%u", socver,
++            (socver >> 8) & 15u);
++        if (((socver >> 8) & 15u) == 2) {
++            image = "/private/var/vm/amss20.bin";
++            pref = 1;
++        }
++        got = mondrian_root_read(image, (void *)buf, 0x600000, 0);
++        if (got <= 0 && pref) {
++            wifi_log("W6 amss20 read=%d; falling back to amss.bin", got);
++            image = "/private/var/vm/amss.bin";
++        }
++        /* The auto load can run before the root is mounted; retry a minute. */
++        for (i = 0; i < 60000 && got <= 0; i++) {
++            delay(1000);
++            got = mondrian_root_read(image, (void *)buf, 0x600000, 0);
++        }
+         if (got > 0) {
+-            break;
++            wifi_log("W6 image=%s read=%d magic=%02x%02x%02x%02x", image,
++                got, ((const uint8_t *)buf)[0], ((const uint8_t *)buf)[1],
++                ((const uint8_t *)buf)[2], ((const uint8_t *)buf)[3]);
++        } else {
++            wifi_log("W6 image=%s read=%d", image, got);
+         }
+-        delay(1000);
+     }
+-    wifi_log("W6 amss read=%d magic=%02x%02x%02x%02x", got,
+-        ((const uint8_t *)buf)[0], ((const uint8_t *)buf)[1],
+-        ((const uint8_t *)buf)[2], ((const uint8_t *)buf)[3]);
+     mondrian_log_flush_now();
+     if (got <= 0) {
+         return -1;
+@@ -1453,6 +1477,14 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    if ((status >> 30) == 3) {
++        uint32_t d1 = 0, d2 = 0, d3 = 0;
++
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x34, &d1);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x38, &d2);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x3c, &d3);
++        wifi_log("W6 BHI errdbg=0x%x/0x%x/0x%x", d1, d2, d3);
++    }
+     flush_dcache64((addr64_t)(buf + W6_MSI_OFF), 0x1000, 0);
+     wifi_log("W6 MSI page=0x%x",
+         *(volatile uint32_t *)(buf + W6_MSI_OFF));

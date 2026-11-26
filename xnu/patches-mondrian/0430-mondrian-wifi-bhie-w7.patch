@@ -1,0 +1,117 @@
+xnu 0430: download the AMSS remainder through BHIE after the SBL starts
+
+W6 loads the first 512 KiB (sbl_size) of amss.bin through BHI. Once the device
+sets MHISTATUS.READY, the SBL expects the rest of the ELF through BHIE. W7
+builds the vector table in the last page of the same 6 MiB SMMU mapping (ten
+512 KiB segments, each pointing at its IOVA), programs BHIE_TXVECADDR_LOW/HIGH,
+TXVECSIZE and TXVECDB at BHIEOFF, and polls TXVECSTATUS for transfer complete
+or error. It then reads EXECENV and MHISTATUS once more.
+
+The map is the full 6 MiB, not just the file, so the vector table page is
+device-visible. No MHI rings, MSI or network are started; this is still the
+firmware-load path only.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 265775b..1a7b1ee 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1061,7 +1061,8 @@ mondrian_wifi_load_amss(void)
+     vm_offset_t buf;
+     kern_return_t kr;
+     uint64_t iova = 0;
+-    uint32_t bhioff = 0, status = 0, errcode = 0, image_size, ready = 0;
++    uint32_t bhioff = 0, bhieoff = 0, status = 0, errcode = 0;
++    uint32_t image_size, ready = 0, entries = 0, bhie_status = 0;
+     uint16_t command;
+     unsigned i;
+     int got, rc;
+@@ -1106,7 +1107,7 @@ mondrian_wifi_load_amss(void)
+         return -1;
+     }
+     flush_dcache64((addr64_t)buf, (unsigned)got, 0);
+-    if (mondrian_wifi_smmu_map_va(buf, (vm_size_t)got, &iova)) {
++    if (mondrian_wifi_smmu_map_va(buf, 0x600000, &iova)) {
+         wifi_log("W6 SMMU map failed");
+         return -1;
+     }
+@@ -1168,6 +1169,80 @@ mondrian_wifi_load_amss(void)
+         (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
+         wifi_log("W6 post execenv=0x%x mhistatus=0x%x ready_polls=%u",
+             execenv, mhistatus, ready);
++        if ((mhistatus & 1u) == 0 || got <= 0x80000) {
++            return -1;
++        }
++        /*
++         * W7: the SBL is running and the device is READY. The rest of the
++         * ELF is fetched through BHIE: one 512 KiB vector per segment, with
++         * the vector table in the last mapped page.
++         */
++        if (mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhieoff) != 0 ||
++            bhieoff == 0 || bhieoff > WIFI_BAR_MAP - 0x80) {
++            wifi_log("W7 BHIEOFF unusable 0x%x", bhieoff);
++            return -1;
++        }
++        {
++            struct bhi_vec {
++                uint64_t addr;
++                uint64_t size;
++            };
++            struct bhi_vec *vt =
++                (struct bhi_vec *)(buf + 0x5ff000);
++            uint64_t voff = 0x80000;
++            uint64_t vt_iova = iova + 0x5ff000;
++
++            while (voff < (uint64_t)got && entries < 10) {
++                uint64_t len = (uint64_t)got - voff;
++
++                if (len > 0x80000) {
++                    len = 0x80000;
++                }
++                vt[entries].addr = iova + voff;
++                vt[entries].size = len;
++                entries++;
++                voff += len;
++            }
++            if (voff != (uint64_t)got) {
++                wifi_log("W7 remainder did not fit entries=%u", entries);
++                return -1;
++            }
++            flush_dcache64((addr64_t)(buf + 0x5ff000), 0x1000, 0);
++            rc = mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x30,
++                (uint32_t)(vt_iova >> 32));
++            rc |= mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x2c,
++                (uint32_t)vt_iova);
++            rc |= mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x34,
++                entries * 16u);
++            rc |= mondrian_mmio_try_wr32(wifi_bar + bhieoff + 0x3c, 1);
++            wifi_log("W7 BHIE entries=%u size=0x%x iova=0x%llx rc=0x%x",
++                entries, entries * 16u, (unsigned long long)vt_iova, rc);
++            if (rc != 0) {
++                return -1;
++            }
++            for (i = 0; i < 10000; i++) {
++                delay(1000);
++                if (mondrian_mmio_try_rd32(wifi_bar + bhieoff + 0x44,
++                    &bhie_status) != 0) {
++                    continue;
++                }
++                if ((bhie_status >> 30) == 2 ||
++                    (bhie_status >> 30) == 3) {
++                    break;
++                }
++            }
++            wifi_log("W7 BHIE status=0x%x polls=%u", bhie_status, i);
++            if ((bhie_status >> 30) != 2) {
++                return -1;
++            }
++        }
++        delay(100000);
++        execenv = 0;
++        mhistatus = 0;
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus);
++        wifi_log("W7 post execenv=0x%x mhistatus=0x%x", execenv,
++            mhistatus);
+     }
+     return (status >> 30) == 2 ? 0 : -1;
+ }

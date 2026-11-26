@@ -1,0 +1,45 @@
+xnu 0428: skip the AOP-owned xo.lvl vote in the WiFi sequence
+
+Measured 2026-11-25 and again on 2026-11-26 after a cold power cycle: the
+worker votes the five SMPS and both ARC corners, then logs cx.lvl, and the
+next vote (xo.lvl) never returns. The RSC access is owned by the AOP and the
+bootloader's XO configuration is what the PCIe link uses. Skip the vote and
+keep the loader state; the SN7 NoC vote is already skipped for the same
+reason.
+
+The two ARC votes stay: they complete and are AP-owned. If the link needs the
+XO vote, W1 reports the link failure and the next step is the AOP path.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 2fb984e..fed4ea4 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -560,7 +560,7 @@ wifi_vote_arc(const char *name)
+ 	return 0;
+ }
+ 
+-static int
++static int __unused
+ wifi_vote_xo(void)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr("xo.lvl");
+@@ -625,10 +625,17 @@ wifi_supplies(void)
+ 	}
+ 	/* qcom,vdd-wlan-ipa-config has enable=0 on this phone. */
+ 	wifi_log("ipa rail smpe3 has DT enable=0; not voted");
+-	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0 ||
+-	    wifi_vote_xo() != 0) {
++	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0) {
+ 		return -1;
+ 	}
++	/*
++	 * xo.lvl is the RPMh XO clock resource. Measured 2026-11-25 and again
++	 * after a cold power cycle on 2026-11-26: the worker logs cx.lvl and then
++	 * the next vote never returns, so the RSC access is owned by the AOP and
++	 * the bootloader's XO configuration is what the link uses. Skip the vote
++	 * until the AOP path exists.
++	 */
++	wifi_log("xo.lvl vote skipped; loader XO configuration retained");
+ 	/*
+ 	 * SN7 is the PCIe NoC bandwidth vote. Measured 2026-11-25: the direct RSC
+ 	 * write wedges after xo.lvl and never returns, while earlier boots had

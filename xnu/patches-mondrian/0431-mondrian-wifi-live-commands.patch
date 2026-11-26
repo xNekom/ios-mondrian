@@ -1,0 +1,130 @@
+xnu 0431: add live wifibhi and wifistat commands
+
+The WiFi load path is now a register experiment, and a kernel rebuild per size
+is the wrong unit. `wifibhi <hex>` sets the BHI image size (default 512 KiB)
+and runs the load through the same SMMU/BHI path; `wifistat` reads MHICTRL,
+MHISTATUS, BHI_STATUS and BHI_EXECENV. Both answer on the existing USB control
+channel and log to the ring, so a size or state question costs one command, not
+one boot.
+
+The SBL size is checked between 4 KiB and 6 MiB, the mapped buffer size.
+
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 3d372e3..6793172 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2819,6 +2819,50 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    mondrian_wifi_load_amss() == 0 ? "ok" : "failed");
+ 
+ 				ud_cmd_send(so, peer, out, (size_t)n);
++			} else if (strcmp(cmd, "wifistat") == 0) {
++				extern int mondrian_wifi_stat(void);
++				char out[32];
++				int n = snprintf(out, sizeof(out), "wifistat %s\n",
++				    mondrian_wifi_stat() == 0 ? "ok" : "failed");
++
++				ud_cmd_send(so, peer, out, (size_t)n);
++			} else if (strncmp(cmd, "wifibhi ", 8) == 0) {
++				extern int mondrian_wifi_set_sbl(uint32_t);
++				const char *p = cmd + 8;
++				uint32_t size = 0;
++				char out[48];
++				int bad = 0, n;
++
++				while (*p == ' ') {
++					p++;
++				}
++				while (*p != '\0') {
++					int d;
++
++					if (*p >= '0' && *p <= '9') {
++						d = *p - '0';
++					} else if (*p >= 'a' && *p <= 'f') {
++						d = *p - 'a' + 10;
++					} else if (*p >= 'A' && *p <= 'F') {
++						d = *p - 'A' + 10;
++					} else if (*p == 'x' || *p == 'X') {
++						p++;
++						continue;
++					} else {
++						bad = 1;
++						break;
++					}
++					size = (size << 4) | (uint32_t)d;
++					p++;
++				}
++				if (bad || size == 0) {
++					bad = 1;
++				} else {
++					bad = mondrian_wifi_set_sbl(size) != 0;
++				}
++				n = snprintf(out, sizeof(out), "wifibhi 0x%x %s\n",
++				    size, bad ? "failed" : "ok");
++				ud_cmd_send(so, peer, out, (size_t)n);
+ 			} else if (strcmp(cmd, "btuart") == 0 ||
+ 			    strncmp(cmd, "btuart ", 7) == 0) {
+ 				ud_cmd_btuart(so, peer, cmd);
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 1a7b1ee..5fd40ea 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -287,6 +287,7 @@ static const struct wifi_rail wifi_rails[] = {
+ 
+ static vm_offset_t wifi_gcc, wifi_parf, wifi_phy, wifi_dbi, wifi_elbi,
+     wifi_iatu, wifi_cfg, wifi_bar;
++static uint32_t wifi_sbl_size = 0x80000;
+ static vm_offset_t wifi_wlan_en_page, wifi_bt_en_page, wifi_perst_page,
+     wifi_clkreq_page, wifi_wake_page, wifi_xo_page;
+ 
+@@ -1128,7 +1129,8 @@ mondrian_wifi_load_amss(void)
+      * ath11k loads only the first 512 KiB (sbl_size) through BHI; the SBL
+      * fetches the AMSS remainder through BHIE. A larger size never started.
+      */
+-    image_size = got > 0x80000 ? 0x80000 : (uint32_t)got;
++    image_size = (uint32_t)got > wifi_sbl_size ?
++        wifi_sbl_size : (uint32_t)got;
+     rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
+@@ -1247,6 +1249,41 @@ mondrian_wifi_load_amss(void)
+     return (status >> 30) == 2 ? 0 : -1;
+ }
+ 
++int
++mondrian_wifi_set_sbl(uint32_t size)
++{
++    if (size < 0x1000 || size > 0x600000) {
++        wifi_log("W7 bad sbl size 0x%x", size);
++        return -1;
++    }
++    wifi_sbl_size = size;
++    wifi_log("W7 sbl size set to 0x%x", size);
++    return mondrian_wifi_load_amss();
++}
++
++int
++mondrian_wifi_stat(void)
++{
++    uint32_t bhioff = 0, status = 0, execenv = 0, mhistatus = 0;
++    uint32_t mhictrl = 0;
++
++    if (wifi_bar == 0) {
++        wifi_log("W7 stat BAR not mapped");
++        return -1;
++    }
++    (void)mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff);
++    (void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &mhictrl);
++    (void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus);
++    if (bhioff != 0) {
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &status);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++    }
++    wifi_log("W7 stat sbl=0x%x mhictrl=0x%x mhistatus=0x%x "
++        "bhi_status=0x%x execenv=0x%x", wifi_sbl_size, mhictrl,
++        mhistatus, status, execenv);
++    return 0;
++}
++
+ static int
+ wifi_config_identity(void)
+ {

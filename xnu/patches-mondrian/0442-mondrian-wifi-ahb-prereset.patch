@@ -1,0 +1,161 @@
+xnu 0442: pre-map the WCN6855 AHB reset pages and flush each reset step
+
+Measured 2026-11-26 with 0441: W4 completes (BAR map done, MHIVER and BHI
+read) and wifistat answers, but `wifibhi 0x80000` stops the USB command
+thread for good. The device stays enumerated, so the thread is wedged inside
+mondrian_wifi_load_amss, not the kernel.
+
+The first thing that function does is wifi_soc_reset(), whose AHB helper
+calls ml_io_map() from the command thread. A second late ml_io_map() already
+stalled this port in W1, and the reset pages had never been mapped in the
+worker. Map the three pages the reset touches (0x1f8031c/0x1f80504/0x1f8060c,
+0x1e08228, 0x3008) right after the W4 BAR map, and drop the runtime mapping.
+
+Flush the ring to the last KiB of the partition after every reset and load
+step. A wedged command thread cannot serve a dump, but the disk copy is what
+the next boot's mondrianprevlines replays; this makes each wedge name the
+last completed step instead of costing a blind boot.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 4ad0175..3208706 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -952,6 +952,8 @@ wifi_bus_master_off(void)
+  * PCI command bit 1 is memory space and bit 2 is bus master. 0415 called bit 1
+  * "bus master", so it disabled memory and never touched the DMA enable.
+  */
++static vm_offset_t wifi_ahb_page(uint32_t off);
++
+ static int
+ wifi_mhi_probe(uint16_t command)
+ {
+@@ -1006,6 +1008,15 @@ wifi_mhi_probe(uint16_t command)
+ 		}
+ 		wifi_log("W4 BAR map done va=0x%lx; MHIVER read",
+ 		    (unsigned long)wifi_bar);
++		/*
++		 * Map the AHB pages the pre-load reset touches while the
++		 * worker is the caller: a late ml_io_map from the command
++		 * thread is the W1 trap, and the reset is the next user.
++		 */
++		(void)wifi_ahb_page(0x1f8031c);	/* qfprom, warm, cause */
++		(void)wifi_ahb_page(0x1e08228);	/* interrupt clear */
++		(void)wifi_ahb_page(0x3008);	/* global reset */
++		wifi_log("W4 AHB reset pages mapped");
+ 		if (mondrian_mmio_try_rd32(wifi_bar + 0x08, &mhiver) != 0) {
+ 			wifi_log("W4 MHIVER faulted; MHI deferred");
+ 		} else {
+@@ -1140,18 +1151,33 @@ wifi_ahb_read32(uint32_t off, uint32_t *value)
+  * that follows that warm path never polls the BHI doorbell, which is what
+  * the 0436 readback measured (doorbell 0x1, status 0x0, clean SMMU FSR).
+  */
++extern void mondrian_log_flush_now(void);
++
++/*
++ * W6 pre-load reset, from ath11k_pci_sw_reset. The AHB pages are already
++ * mapped by W4: mapping them here stalls a second late ml_io_map. Every step
++ * is flushed, so a wedged access leaves the last completed step on disk for
++ * the next boot's mondrianprevlines replay.
++ */
+ static int
+ wifi_soc_reset(void)
+ {
+ 	uint32_t qfprom = 0, warm = 0, cause = 0, val = 0;
+ 
++	wifi_log("W6 reset start");
++	mondrian_log_flush_now();
+ 	(void)wifi_ahb_read32(0x1f8031c, &qfprom);
+ 	(void)wifi_ahb_write32(0x1f8031c, qfprom & ~0x4u);
++	wifi_log("W6 qfprom 0x%x", qfprom);
++	mondrian_log_flush_now();
+ 	(void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
+ 	(void)wifi_ahb_read32(0x1f80504, &warm);
+ 	(void)wifi_ahb_write32(0x1f80504, 0);
+ 	(void)wifi_ahb_read32(0x1f8060c, &cause);
++	mondrian_log_flush_now();
+ 	if (wifi_ahb_read32(0x3008, &val) != 0) {
++		wifi_log("W6 global reset unreadable");
++		mondrian_log_flush_now();
+ 		return -1;
+ 	}
+ 	(void)wifi_ahb_write32(0x3008, val | 1u);
+@@ -1161,10 +1187,12 @@ wifi_soc_reset(void)
+ 	(void)wifi_ahb_read32(0x3008, &val);
+ 	wifi_log("W6 soc reset qfprom=0x%x warm=0x%x cause=0x%x ctrl=0x%x",
+ 	    qfprom, warm, cause, val);
++	mondrian_log_flush_now();
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x38, 2);
+ 	delay(10000);
+ 	(void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &val);
+ 	wifi_log("W6 soc reset mhictrl=0x%x", val);
++	mondrian_log_flush_now();
+ 	return 0;
+ }
+ 
+@@ -1207,11 +1235,15 @@ mondrian_wifi_load_amss(void)
+         wifi_log("W6 SOC reset failed");
+         return -1;
+     }
++    wifi_log("W6 reset done");
++    mondrian_log_flush_now();
+     if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
+         bhioff == 0) {
+         wifi_log("W6 BHIOFF unreadable");
+         return -1;
+     }
++    wifi_log("W6 BHIOFF=0x%x", bhioff);
++    mondrian_log_flush_now();
+     kr = kmem_alloc(kernel_map, &buf, 0x600000, KMA_DATA,
+         VM_KERN_MEMORY_IOKIT);
+     if (kr != KERN_SUCCESS) {
+@@ -1230,6 +1262,7 @@ mondrian_wifi_load_amss(void)
+     wifi_log("W6 amss read=%d magic=%02x%02x%02x%02x", got,
+         ((const uint8_t *)buf)[0], ((const uint8_t *)buf)[1],
+         ((const uint8_t *)buf)[2], ((const uint8_t *)buf)[3]);
++    mondrian_log_flush_now();
+     if (got <= 0) {
+         return -1;
+     }
+@@ -1238,6 +1271,9 @@ mondrian_wifi_load_amss(void)
+         wifi_log("W6 SMMU map failed");
+         return -1;
+     }
++    wifi_log("W6 SMMU map iova=0x%llx",
++        (unsigned long long)iova);
++    mondrian_log_flush_now();
+     /*
+      * W3 leaves bus mastering off on purpose. BHI reads the image from host
+      * memory, so memory space and bus master must both be on for the load and
+@@ -1248,6 +1284,7 @@ mondrian_wifi_load_amss(void)
+         command | WIFI_PCI_MEMORY | WIFI_PCI_BUS_MASTER);
+     command = wifi_read16(wifi_cfg, 4);
+     wifi_log("W6 bus master command=0x%x", command);
++    mondrian_log_flush_now();
+     if ((command & WIFI_PCI_BUS_MASTER) == 0) {
+         return -1;
+     }
+@@ -1266,6 +1303,7 @@ mondrian_wifi_load_amss(void)
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 1);
+     wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x rc=0x%x",
+         iova, image_size, got, rc);
++    mondrian_log_flush_now();
+     if (rc != 0) {
+         return -1;
+     }
+@@ -1284,6 +1322,7 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    mondrian_log_flush_now();
+     {
+         uint32_t addr_lo = 0, addr_hi = 0, size = 0, doorbell = 0;
+         uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
+@@ -1301,6 +1340,7 @@ mondrian_wifi_load_amss(void)
+                 " gfsr=0x%x s2cr=0x%x/0x%x", sctlr, fsr, far, fsynr,
+                 gfsr, s2cr, s2cr2);
+         }
++        mondrian_log_flush_now();
+     }
+     if ((status >> 30) == 2) {
+         uint32_t execenv = 0, mhistatus = 0;

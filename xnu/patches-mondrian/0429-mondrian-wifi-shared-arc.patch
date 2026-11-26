@@ -1,0 +1,50 @@
+xnu 0429: keep only the AP-owned SMPS votes in the WiFi sequence
+
+Measured 2026-11-25 and 2026-11-26, including a cold power cycle: the worker
+completes the five PM8350/PM8350C SMPS votes, then hangs on whichever shared
+RSC resource it reaches first. The failing vote moved between mx.lvl, cx.lvl,
+xo.lvl and SN7 across builds; skipping one only moved the hang to the next.
+
+Keep the AP-owned SMPS (the WiFi rails) and skip the four shared ARC/XO/NoC
+votes. They are performance levels, not power rails, and the bootloader's
+values are what the link trained with. If W1 reports a link failure, the next
+step is an AOP-owned vote, not another direct TCS write.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index fed4ea4..265775b 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -532,7 +532,7 @@ wifi_vote_rail(const struct wifi_rail *rail)
+ 	return 0;
+ }
+ 
+-static int
++static int __unused
+ wifi_vote_arc(const char *name)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr(name);
+@@ -625,17 +625,15 @@ wifi_supplies(void)
+ 	}
+ 	/* qcom,vdd-wlan-ipa-config has enable=0 on this phone. */
+ 	wifi_log("ipa rail smpe3 has DT enable=0; not voted");
+-	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0) {
+-		return -1;
+-	}
+ 	/*
+-	 * xo.lvl is the RPMh XO clock resource. Measured 2026-11-25 and again
+-	 * after a cold power cycle on 2026-11-26: the worker logs cx.lvl and then
+-	 * the next vote never returns, so the RSC access is owned by the AOP and
+-	 * the bootloader's XO configuration is what the link uses. Skip the vote
+-	 * until the AOP path exists.
++	 * mx.lvl, cx.lvl, xo.lvl and SN7 are not AP-owned. Measured 2026-11-25
++	 * and 2026-11-26 across warm and cold boots: the worker completes the five
++	 * PM8350/PM8350C SMPS votes, then hangs on whichever of these four it
++	 * reaches first (mx, cx, xo or SN7 in different builds). The direct RSC
++	 * access wedges; the loader's levels are what the link trained with. Keep
++	 * the AP-owned SMPS and skip the shared votes until the AOP path exists.
+ 	 */
+-	wifi_log("xo.lvl vote skipped; loader XO configuration retained");
++	wifi_log("ARC/XO/NoC votes skipped; loader levels retained");
+ 	/*
+ 	 * SN7 is the PCIe NoC bandwidth vote. Measured 2026-11-25: the direct RSC
+ 	 * write wedges after xo.lvl and never returns, while earlier boots had

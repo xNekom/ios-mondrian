@@ -1,0 +1,86 @@
+xnu 0435: take over the fault route for PCIe SID 0x1c00
+
+The bootloader leaves SMR slot 7 valid for SID 0x1c00 with S2CR type 2
+(translation fault in SMMU-v2), so W6's second-SID attach refused the route and
+the load failed cleanly instead of resetting. Type 0 is another translating
+context and stays a conflict; type 1/2 is bypass/fault and belongs to the WLAN
+function. Repoint those to the same bank, save the old SMR/S2CR, and restore
+them in teardown.
+
+Measured before this change: sid2 0x1c00 conflicts slot 7 smr=0x80001c00
+s2cr=0x20000, then W6 SMMU map failed; the 4 KiB BHI load returned failed
+instead of resetting the SoC.
+
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index 0e55a81..ec0c06f 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -97,6 +97,7 @@ struct w2_state {
+     uint32_t bank, slot, cb, gr1;
+     uint32_t slot2;
+     uint32_t old_smr, old_s2cr;
++    uint32_t old_smr2, old_s2cr2;
+     uint32_t route_smr, route_s2cr;
+     uint32_t route_smr2, route_s2cr2;
+     uint32_t valid_smr, valid_s2cr;
+@@ -104,6 +105,7 @@ struct w2_state {
+     int bank_touched;
+     int slot_touched;
+     int slot2_touched;
++    int slot2_restore;
+     int context_programmed;
+     int sid_attached;
+     int poisoned;
+@@ -649,7 +651,9 @@ w2_attach_sid2(void)
+         id = smr & 0xffffu;
+         mask = (smr >> 16) & ((w2.idr0 & (1u << 8)) ? 0xffffu : 0x7fffu);
+         if (((W2_SID2 ^ id) & ~mask & sid_mask) == 0) {
+-            if (mask != 0 || ((s2cr >> 16) & 3u) != 0) {
++            uint32_t type = (s2cr >> 16) & 3u;
++
++            if (mask != 0 || type == 0) {
+                 w2_log("sid2 0x%x conflicts slot %u smr=0x%x s2cr=0x%x",
+                     W2_SID2, n, smr, s2cr);
+                 return -1;
+@@ -659,13 +663,17 @@ w2_attach_sid2(void)
+                 return -1;
+             }
+             exact_slot = n;
++            w2.old_smr2 = smr;
++            w2.old_s2cr2 = s2cr;
++            w2.slot2_restore = 1;
++            w2_log("sid2 0x%x slot %u type %u taken over"
++                " old smr=0x%x s2cr=0x%x", W2_SID2, n, type, smr, s2cr);
+         }
+     }
+     if (exact_slot != ~0u) {
+         n = exact_slot;
+-        w2_log("sid2 0x%x exact non-translating SID reused slot=%u",
+-            W2_SID2, n);
+     } else if (free_slot != ~0u) {
++        w2.slot2_restore = 0;
+         n = free_slot;
+     } else {
+         w2_log("sid2 0x%x no free SMR slot", W2_SID2);
+@@ -702,10 +710,20 @@ w2_teardown(void)
+         w2.sid_attached = 0;
+     }
+     if (w2.slot2_touched) {
+-        if (w2_put32(W2_S2CR(w2.slot2), W2_S2CR_FAULT | w2.valid_s2cr)) {
++        int ok;
++
++        if (w2.slot2_restore) {
++            ok = !w2_put32(W2_SMR(w2.slot2), w2.old_smr2) &&
++                !w2_put32(W2_S2CR(w2.slot2), w2.old_s2cr2);
++        } else {
++            ok = !w2_put32(W2_S2CR(w2.slot2),
++                W2_S2CR_FAULT | w2.valid_s2cr);
++        }
++        if (!ok) {
+             w2.poisoned = 1;
+         }
+         w2.slot2_touched = 0;
++        w2.slot2_restore = 0;
+     }
+     if (w2.bank_touched) {
+         if (w2_put32(w2.cb + W2_CB_SCTLR, 0) || w2_tlb_sync()) {

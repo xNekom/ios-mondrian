@@ -1,0 +1,118 @@
+xnu 0438: reset the WLAN SOC before the BHI load
+
+The 0436 readback proved the BHI image registers and doorbell stick, the
+WLAN SMMU FSR stays clean and the doorbell is never consumed. ath11k's
+QCN6855 power-up resets the WLAN SOC and clears WLAON_WARM_SW_ENTRY before
+MHI starts; our path trained the link but left the PBL in whatever warm
+state the previous boot left in the always-on domain.
+
+Map 1 MiB of BAR0, add the static-window access at BAR+0x310c/0x80000, and
+run ath11k_pci_sw_reset's register steps from wifibhi before the load:
+clear VDD4BLOW, clear the PCIe interrupts, zero the warm entry, toggle
+PCIE_SOC_GLOBAL_RESET, then pulse MHICTRL.RESET.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 0a04435..f966957 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -119,7 +119,7 @@ extern int mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data);
+ #define WIFI_BAR_BASE		0x60200000UL
+ #define WIFI_BAR_END		0x63ffffffUL
+ #define WIFI_BAR_SIZE		0x04000000UL
+-#define WIFI_BAR_MAP		0x00001000UL /* MHI and BHI fit one page */
++#define WIFI_BAR_MAP		0x00100000UL /* MHI/BHI plus the AHB window */
+ 
+ /* /soc/qcom,gdsc@17b004 and its qcom,collapse-vote phandle. */
+ #define WIFI_GCC_PA		0x01000000UL
+@@ -1044,6 +1044,80 @@ wifi_mhi_probe(uint16_t command)
+ 	    wifi_fail("W3 bus master did not clear") : 0;
+ }
+ 
++/*
++ * WCN6855 static window: writing the 6-bit page to BAR+0x310c makes the
++ * device's AHB page readable at BAR+0x80000. ath11k uses the same mechanism
++ * for the reset registers, which are not in the first BAR page.
++ */
++#define WIFI_AHB_WINDOW_REG	0x310c
++#define WIFI_AHB_WINDOW_BASE	0x80000
++#define WIFI_AHB_WINDOW_ENABLE	0x40000000u
++#define WIFI_AHB_RANGE		0x7ffffu
++
++static int
++wifi_ahb_write32(uint32_t off, uint32_t value)
++{
++	uint32_t window = (off >> 19) & 0x3fu;
++	uint32_t flush;
++	int rc;
++
++	rc = mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_REG,
++	    WIFI_AHB_WINDOW_ENABLE | window);
++	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_REG, &flush);
++	rc |= mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_BASE +
++	    (off & WIFI_AHB_RANGE), value);
++	return rc;
++}
++
++static int
++wifi_ahb_read32(uint32_t off, uint32_t *value)
++{
++	uint32_t window = (off >> 19) & 0x3fu;
++	uint32_t flush;
++	int rc;
++
++	rc = mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_REG,
++	    WIFI_AHB_WINDOW_ENABLE | window);
++	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_REG, &flush);
++	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_BASE +
++	    (off & WIFI_AHB_RANGE), value);
++	return rc;
++}
++
++/*
++ * W6 pre-load reset, from ath11k_pci_sw_reset for WCN6855. The WLAN
++ * always-on domain keeps WLAON_WARM_SW_ENTRY across a phone reboot; a PBL
++ * that follows that warm path never polls the BHI doorbell, which is what
++ * the 0436 readback measured (doorbell 0x1, status 0x0, clean SMMU FSR).
++ */
++static int
++wifi_soc_reset(void)
++{
++	uint32_t qfprom = 0, warm = 0, cause = 0, val = 0;
++
++	(void)wifi_ahb_read32(0x1f8031c, &qfprom);
++	(void)wifi_ahb_write32(0x1f8031c, qfprom & ~0x4u);
++	(void)wifi_ahb_write32(0x1e08228, 0xffffffffu);
++	(void)wifi_ahb_read32(0x1f80504, &warm);
++	(void)wifi_ahb_write32(0x1f80504, 0);
++	(void)wifi_ahb_read32(0x1f8060c, &cause);
++	if (wifi_ahb_read32(0x3008, &val) != 0) {
++		return -1;
++	}
++	(void)wifi_ahb_write32(0x3008, val | 1u);
++	delay(10000);
++	(void)wifi_ahb_write32(0x3008, val & ~1u);
++	delay(10000);
++	(void)wifi_ahb_read32(0x3008, &val);
++	wifi_log("W6 soc reset qfprom=0x%x warm=0x%x cause=0x%x ctrl=0x%x",
++	    qfprom, warm, cause, val);
++	(void)mondrian_mmio_try_wr32(wifi_bar + 0x38, 2);
++	delay(10000);
++	(void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &val);
++	wifi_log("W6 soc reset mhictrl=0x%x", val);
++	return 0;
++}
++
+ /*
+  * W6: read the AMSS image from the iOS root, map it through the W2 SMMU
+  * context and hand it to BHI. The host uploads the blob after boot, so this
+@@ -1079,6 +1153,10 @@ mondrian_wifi_load_amss(void)
+         wifi_log("W6 BAR or config not mapped after 60 s");
+         return -1;
+     }
++    if (wifi_soc_reset() != 0) {
++        wifi_log("W6 SOC reset failed");
++        return -1;
++    }
+     if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
+         bhioff == 0) {
+         wifi_log("W6 BHIOFF unreadable");

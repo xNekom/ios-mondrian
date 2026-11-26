@@ -1,0 +1,43 @@
+xnu 0440: read the RPMh TCS idle bit with the right polarity
+
+Measured 2026-11-26: the Wi-Fi worker stopped at the first rail with
+`TCS4 available version=0x2 caps=0x800c8104 status=0x1`. That status bit is
+the good state: RPMh's RSC_DRV_STATUS is zero while a TCS is busy and
+nonzero when it is idle (mainline `find_free_tcs()` waits for nonzero,
+`print_tcs_info()` prints `sts ? "IDLE" : "BUSY"`).
+
+Our port inverted both places: the gate refused a nonzero status and the
+completion wait treated a zero status as idle. Accept a nonzero status at
+the gate, require a zero status before completion, and keep the donor's
+TCS3 conflict scan unchanged.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+index f17cff2..76b327e 100644
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -666,9 +666,10 @@ mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data)
+ 	version = (mondrian_tlmm_read(rsc, 0) >> 16) & 0xff;
+ 	caps = mondrian_tlmm_read(rsc, 0x0c);
+ 	status = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS);
++	/* RSC_DRV_STATUS is zero while the TCS is busy, nonzero when idle. */
+ 	if (version >= 3 || ((caps >> 12) & 63) < 8 ||
+-	    ((caps >> 27) & 31) < 1 || status != 0) {
+-		printf("MONDRIAN RPMH: TCS4 unavailable version=0x%x caps=0x%x"
++	    ((caps >> 27) & 31) < 1 || status == 0) {
++		printf("MONDRIAN RPMH: TCS4 busy version=0x%x caps=0x%x"
+ 		    " status=0x%x\n", version, caps, status);
+ 		return -1;
+ 	}
+@@ -717,10 +718,10 @@ mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data)
+ 	for (i = 0; i < 10000; i++) {
+ 		st = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS);
+ 		idle = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS);
+-		if ((st & 0x10100) != 0x10100 || idle != 0) {
++		if ((st & 0x10100) != 0x10100 || idle == 0) {
+ 			progressed = 1;
+ 		}
+-		if ((st & 0x10100) == 0x10100 && idle == 0 &&
++		if ((st & 0x10100) == 0x10100 && idle != 0 &&
+ 		    (progressed || (mondrian_tlmm_read(rsc,
+ 		    MONDRIAN_RSC_IRQ_STATUS) & (1u << 4)))) {
+ 			break;

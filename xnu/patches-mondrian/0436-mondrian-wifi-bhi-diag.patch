@@ -1,0 +1,96 @@
+xnu 0436: read back the BHI doorbell and the WLAN SMMU fault state
+
+The 4 KiB and 512 KiB loads now fail cleanly with BHI_STATUS still 0x0 after
+ten seconds, and no line says whether the device fetched the image. Add one
+diagnostic read after the wait: image address, size, doorbell and status, plus
+the context SCTLR/FSR/FAR/FSYNR0, the global FSR and both S2CR routes.
+
+A translation fault with a matching FAR proves the BHI read reached the SMMU
+and the page table is wrong; a clean FSR with a stuck doorbell proves the
+device never started the transfer. The register offsets match mainline MHI
+(BHI_IMGADDR 0x08/0x0c, IMGSIZE 0x10, IMGTXDB 0x18, STATUS 0x2c).
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 25d5e6e..2f4ffb6 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1055,6 +1055,8 @@ wifi_mhi_probe(uint16_t command)
+  */
+ extern int mondrian_root_read(const char *, void *, unsigned, off_t);
+ extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
++extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
++    uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
+ int
+ mondrian_wifi_load_amss(void)
+@@ -1158,6 +1160,24 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    {
++        uint32_t addr_lo = 0, addr_hi = 0, size = 0, doorbell = 0;
++        uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
++        uint32_t s2cr = 0, s2cr2 = 0;
++
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x08, &addr_lo);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x0c, &addr_hi);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x10, &size);
++        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x18, &doorbell);
++        wifi_log("W6 BHI regs addr=0x%x%08x size=0x%x doorbell=0x%x",
++            addr_hi, addr_lo, size, doorbell);
++        if (mondrian_wifi_smmu_fault(&sctlr, &fsr, &far, &fsynr, &gfsr,
++            &s2cr, &s2cr2) == 0) {
++            wifi_log("W6 SMMU sctlr=0x%x fsr=0x%x far=0x%x fsynr=0x%x"
++                " gfsr=0x%x s2cr=0x%x/0x%x", sctlr, fsr, far, fsynr,
++                gfsr, s2cr, s2cr2);
++        }
++    }
+     if ((status >> 30) == 2) {
+         uint32_t execenv = 0, mhistatus = 0;
+ 
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index ec0c06f..dbfbb9c 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -808,6 +808,41 @@ mondrian_wifi_smmu_map_va(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
+     return 0;
+ }
+ 
++/*
++ * W6 diagnostic: the load leaves the ring silent when the doorbell does not
++ * start, so read the context state after the wait. A translation fault in FSR
++ * with a matching FAR means the BHI read reached the SMMU and the page table
++ * is wrong; a clean FSR with a stuck doorbell means the device never fetched.
++ */
++int
++mondrian_wifi_smmu_fault(uint32_t *sctlr, uint32_t *fsr, uint32_t *far,
++    uint32_t *fsynr, uint32_t *gfsr, uint32_t *s2cr, uint32_t *s2cr2)
++{
++    uint32_t v;
++
++    if (w2.smmu == 0 || w2.cb == 0 || sctlr == NULL || fsr == NULL ||
++        far == NULL || fsynr == NULL || gfsr == NULL || s2cr == NULL ||
++        s2cr2 == NULL) {
++        return -1;
++    }
++    if (w2_rd32(w2.cb + W2_CB_SCTLR, sctlr) ||
++        w2_rd32(w2.cb + W2_CB_FSR, fsr) ||
++        w2_rd32(w2.cb + W2_CB_FAR, far) ||
++        w2_rd32(w2.cb + W2_CB_FSYNR0, fsynr) ||
++        w2_rd32(W2_GFSR, gfsr) ||
++        w2_rd32(W2_S2CR(w2.slot), s2cr)) {
++        return -1;
++    }
++    *s2cr2 = 0;
++    if (w2.slot2_touched) {
++        if (w2_rd32(W2_S2CR(w2.slot2), &v)) {
++            return -1;
++        }
++        *s2cr2 = v;
++    }
++    return 0;
++}
++
+ int
+ mondrian_wifi_smmu_prove(uint16_t pci_command)
+ {

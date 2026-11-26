@@ -1,0 +1,105 @@
+xnu 0441: map only the BAR pages the WiFi reset needs
+
+Measured 2026-11-26 with the corrected TCS4 votes: mx.lvl index 8, cx.lvl
+index 9, xo.lvl 3 and SN7 all completed, W1/W2/W3 reached W4, and the worker
+then stopped at "W4 BAR map start". Mapping 1 MiB of BAR0 asks io_submap for
+256 pages; the ring never saw "W4 BAR map done" and wifistat stayed "BAR not
+mapped" for the 60 s load wait.
+
+Map four pages (the MHI/BHI block plus the AHB window register at 0x310c) and
+map each AHB data page once, cached. The SOC reset touches three pages
+(0x80000, 0x83000, 0x88000), so four cache entries cover it without a 1 MiB
+allocation.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index f966957..4ad0175 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -119,7 +119,7 @@ extern int mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data);
+ #define WIFI_BAR_BASE		0x60200000UL
+ #define WIFI_BAR_END		0x63ffffffUL
+ #define WIFI_BAR_SIZE		0x04000000UL
+-#define WIFI_BAR_MAP		0x00100000UL /* MHI/BHI plus the AHB window */
++#define WIFI_BAR_MAP		0x00004000UL /* MHI/BHI plus the AHB window reg */
+ 
+ /* /soc/qcom,gdsc@17b004 and its qcom,collapse-vote phandle. */
+ #define WIFI_GCC_PA		0x01000000UL
+@@ -1053,6 +1053,44 @@ wifi_mhi_probe(uint16_t command)
+ #define WIFI_AHB_WINDOW_BASE	0x80000
+ #define WIFI_AHB_WINDOW_ENABLE	0x40000000u
+ #define WIFI_AHB_RANGE		0x7ffffu
++#define WIFI_AHB_PAGES		4
++
++static vm_offset_t wifi_ahb_maps[WIFI_AHB_PAGES];
++static uint32_t wifi_ahb_offs[WIFI_AHB_PAGES];
++static unsigned int wifi_ahb_count;
++
++/*
++ * The AHB page lives at BAR+0x80000+offset. Mapping the whole 1 MiB BAR
++ * consumed 256 io_submap pages and left the worker at "W4 BAR map start";
++ * map each page once and keep the few the reset sequence touches.
++ */
++static vm_offset_t
++wifi_ahb_page(uint32_t off)
++{
++	uint32_t base = (WIFI_AHB_WINDOW_BASE + (off & WIFI_AHB_RANGE)) &
++	    ~0xfffu;
++	unsigned int i;
++	vm_offset_t page;
++
++	for (i = 0; i < wifi_ahb_count; i++) {
++		if (wifi_ahb_offs[i] == base) {
++			return wifi_ahb_maps[i];
++		}
++	}
++	if (wifi_ahb_count >= WIFI_AHB_PAGES) {
++		wifi_log("W6 AHB page cache full for 0x%x", base);
++		return 0;
++	}
++	page = ml_io_map(WIFI_BAR_BASE + base, 0x1000);
++	if (page == 0) {
++		wifi_log("W6 AHB page map failed 0x%x", base);
++		return 0;
++	}
++	wifi_ahb_maps[wifi_ahb_count] = page;
++	wifi_ahb_offs[wifi_ahb_count] = base;
++	wifi_ahb_count++;
++	return page;
++}
+ 
+ static int
+ wifi_ahb_write32(uint32_t off, uint32_t value)
+@@ -1064,8 +1102,14 @@ wifi_ahb_write32(uint32_t off, uint32_t value)
+ 	rc = mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_REG,
+ 	    WIFI_AHB_WINDOW_ENABLE | window);
+ 	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_REG, &flush);
+-	rc |= mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_BASE +
+-	    (off & WIFI_AHB_RANGE), value);
++	if (rc == 0) {
++		vm_offset_t page = wifi_ahb_page(off);
++
++		if (page == 0) {
++			return -1;
++		}
++		rc = mondrian_mmio_try_wr32(page + (off & 0xfffu), value);
++	}
+ 	return rc;
+ }
+ 
+@@ -1079,8 +1123,14 @@ wifi_ahb_read32(uint32_t off, uint32_t *value)
+ 	rc = mondrian_mmio_try_wr32(wifi_bar + WIFI_AHB_WINDOW_REG,
+ 	    WIFI_AHB_WINDOW_ENABLE | window);
+ 	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_REG, &flush);
+-	rc |= mondrian_mmio_try_rd32(wifi_bar + WIFI_AHB_WINDOW_BASE +
+-	    (off & WIFI_AHB_RANGE), value);
++	if (rc == 0) {
++		vm_offset_t page = wifi_ahb_page(off);
++
++		if (page == 0) {
++			return -1;
++		}
++		rc = mondrian_mmio_try_rd32(page + (off & 0xfffu), value);
++	}
+ 	return rc;
+ }
+ 

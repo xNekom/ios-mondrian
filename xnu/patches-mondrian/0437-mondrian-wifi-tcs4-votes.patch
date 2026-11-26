@@ -1,0 +1,263 @@
+xnu 0437: vote Wi-Fi shared parents on ACTIVE TCS4
+
+The donor's APSS DRV2 map is SLEEP0-2, ACTIVE3-4, WAKE5-6 and the GPU
+leases TCS3; our shared votes used TCS3, which is why each attempt wedged on
+a different rail. Port the donor's TCS4 transaction: check that TCS4 exists
+and is idle, refuse an address TCS3 already holds, clear the response IRQ,
+send message 0x10108, and wait for status 0x10100 plus an idle TCS.
+
+Also vote the ARC index of the highest level instead of the level value, and
+re-enable mx.lvl, cx.lvl, xo.lvl and SN7. The dedicated WLAN rails move to
+the same TCS4 path, matching the donor.
+
+Measured before this change: the worker completed the five PM8350 SMPS votes
+and then hung on whichever shared vote it reached first. The 5.4 MB load
+returned status 0x0, not a reset, once both PCIe SIDs were routed.
+
+diff --git a/bsd/dev/mondrian_touch.c b/bsd/dev/mondrian_touch.c
+index 360a8ba..f17cff2 100644
+--- a/bsd/dev/mondrian_touch.c
++++ b/bsd/dev/mondrian_touch.c
+@@ -185,6 +185,14 @@ extern void mondrian_log_flush_now(void);
+ #define MONDRIAN_TCS_AMC_ENABLE	(1u << 16)
+ #define MONDRIAN_TCS_AMC_TRIGGER	(1u << 24)
+ 
++/* APSS DRV2: SLEEP0-2, ACTIVE3-4, WAKE5-6. The GPU leases TCS3; Wi-Fi uses
++ * TCS4 so a shared vote cannot race the GPU's transaction. */
++#define MONDRIAN_RSC_TCS3_BASE		(MONDRIAN_RSC_TCS_OFF + 3 * MONDRIAN_RSC_TCS_STRIDE)
++#define MONDRIAN_RSC_TCS4_BASE		(MONDRIAN_RSC_TCS_OFF + 4 * MONDRIAN_RSC_TCS_STRIDE)
++#define MONDRIAN_RSC_IRQ_STATUS	0xd04
++#define MONDRIAN_RSC_IRQ_CLEAR	0xd08
++#define MONDRIAN_RSC_TCS_CFG	0x10
++
+ #define MONDRIAN_CMD_MSGID_LEN	8u
+ #define MONDRIAN_CMD_MSGID_WRITE	(1u << 16)
+ #define MONDRIAN_CMD_MSGID_RESP	(1u << 8)
+@@ -636,6 +644,102 @@ mondrian_rpmh_write_one(uint32_t addr, uint32_t data)
+ 	return 0;
+ }
+ 
++/*
++ * One command on ACTIVE TCS4. The donor sequence for the same SM8475: check
++ * that TCS4 exists and is idle, refuse a command TCS3 already holds for the
++ * same address, clear the AMC trigger and the response IRQ, write message
++ * 0x10108, then wait for the status bits 0x10100 and an idle TCS. The GPU
++ * leases TCS3, so the TCS3 path used by the other drivers races it.
++ */
++int
++mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data)
++{
++	vm_offset_t rsc = mondrian_rsc_map();
++	uint32_t base = MONDRIAN_RSC_TCS4_BASE;
++	uint32_t peer = MONDRIAN_RSC_TCS3_BASE;
++	uint32_t version, caps, status, mask, i, st, idle;
++	int progressed = 0;
++
++	if (rsc == 0 || addr == 0) {
++		return -1;
++	}
++	version = (mondrian_tlmm_read(rsc, 0) >> 16) & 0xff;
++	caps = mondrian_tlmm_read(rsc, 0x0c);
++	status = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS);
++	if (version >= 3 || ((caps >> 12) & 63) < 8 ||
++	    ((caps >> 27) & 31) < 1 || status != 0) {
++		printf("MONDRIAN RPMH: TCS4 unavailable version=0x%x caps=0x%x"
++		    " status=0x%x\n", version, caps, status);
++		return -1;
++	}
++	if (mondrian_tlmm_read(rsc, peer + MONDRIAN_RSC_STATUS) == 0) {
++		mask = mondrian_tlmm_read(rsc, peer + MONDRIAN_RSC_CMD_ENABLE);
++		for (i = 0; i < 16; i++) {
++			if ((mask & (1u << i)) != 0 &&
++			    mondrian_tlmm_read(rsc, peer + MONDRIAN_RSC_CMD_ADDR +
++			    20 * i) == addr) {
++				printf("MONDRIAN RPMH: TCS4 conflicts with TCS3"
++				    " addr 0x%x\n", addr);
++				return -1;
++			}
++		}
++	}
++	mondrian_tlmm_write(rsc, MONDRIAN_RSC_TCS_OFF,
++	    mondrian_tlmm_read(rsc, MONDRIAN_RSC_TCS_OFF) & ~(1u << 4));
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL) &
++	    ~(MONDRIAN_TCS_AMC_ENABLE | MONDRIAN_TCS_AMC_TRIGGER));
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0);
++	mondrian_tlmm_write(rsc, MONDRIAN_RSC_IRQ_CLEAR, 1u << 4);
++	for (i = 0; i < 1000; i++) {
++		if ((mondrian_tlmm_read(rsc, MONDRIAN_RSC_IRQ_STATUS) &
++		    (1u << 4)) == 0) {
++			break;
++		}
++		delay(10);
++	}
++	if ((mondrian_tlmm_read(rsc, MONDRIAN_RSC_IRQ_STATUS) & (1u << 4)) != 0) {
++		printf("MONDRIAN RPMH: TCS4 IRQ did not clear\n");
++		return -1;
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_MSGID,
++	    MONDRIAN_CMD_MSGID_LEN | MONDRIAN_CMD_MSGID_WRITE |
++	    MONDRIAN_CMD_MSGID_RESP);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ADDR, addr);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_DATA, data);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_TCS_CFG, 1);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 1);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    MONDRIAN_TCS_AMC_ENABLE);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    MONDRIAN_TCS_AMC_ENABLE | MONDRIAN_TCS_AMC_TRIGGER);
++	__builtin_arm_dsb(0xf);
++	for (i = 0; i < 10000; i++) {
++		st = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CMD_STATUS);
++		idle = mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_STATUS);
++		if ((st & 0x10100) != 0x10100 || idle != 0) {
++			progressed = 1;
++		}
++		if ((st & 0x10100) == 0x10100 && idle == 0 &&
++		    (progressed || (mondrian_tlmm_read(rsc,
++		    MONDRIAN_RSC_IRQ_STATUS) & (1u << 4)))) {
++			break;
++		}
++		delay(10);
++	}
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CMD_ENABLE, 0);
++	mondrian_tlmm_write(rsc, MONDRIAN_RSC_IRQ_CLEAR, 1u << 4);
++	mondrian_tlmm_write(rsc, base + MONDRIAN_RSC_CONTROL,
++	    mondrian_tlmm_read(rsc, base + MONDRIAN_RSC_CONTROL) &
++	    ~MONDRIAN_TCS_AMC_TRIGGER);
++	if (i == 10000) {
++		printf("MONDRIAN RPMH: TCS4 response timeout addr 0x%x"
++		    " status=0x%x idle=0x%x\n", addr, st, idle);
++		return -1;
++	}
++	return 0;
++}
++
+ /*
+  * Several single-word commands in one TCS trigger. The GPU's gfx/cx/mx ARC
+  * votes are sent as a batch by the vendor (rpmh_write_batch), and the RSC
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 2f4ffb6..0a04435 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -101,6 +101,7 @@ extern void mondrian_tlmm_output(vm_offset_t page, uint32_t function,
+ extern uint32_t mondrian_cmd_db_addr(const char *id);
+ extern const void *mondrian_cmd_db_data(const char *id, uint32_t *len);
+ extern int mondrian_rpmh_write_one(uint32_t addr, uint32_t data);
++extern int mondrian_rpmh_write_tcs4(uint32_t addr, uint32_t data);
+ 
+ /* dtb/mondrian-live.dtb: /soc/qcom,pcie@1c00000/reg and reg-names. */
+ #define WIFI_PARF_PA		0x1c00000UL
+@@ -522,9 +523,9 @@ wifi_vote_rail(const struct wifi_rail *rail)
+ 		return -1;
+ 	}
+ 	/* VRM mode, voltage, enable; the donor sends three single-word votes. */
+-	if (mondrian_rpmh_write_one(addr + 8, 7) != 0 ||
+-	    mondrian_rpmh_write_one(addr, rail->mv) != 0 ||
+-	    mondrian_rpmh_write_one(addr + 4, 1) != 0) {
++	if (mondrian_rpmh_write_tcs4(addr + 8, 7) != 0 ||
++	    mondrian_rpmh_write_tcs4(addr, rail->mv) != 0 ||
++	    mondrian_rpmh_write_tcs4(addr + 4, 1) != 0) {
+ 		wifi_log("rail %s RPMh transaction failed", rail->name);
+ 		return -1;
+ 	}
+@@ -533,35 +534,38 @@ wifi_vote_rail(const struct wifi_rail *rail)
+ 	return 0;
+ }
+ 
+-static int __unused
++static int
+ wifi_vote_arc(const char *name)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr(name);
+ 	uint32_t len = 0;
+ 	const uint8_t *table = mondrian_cmd_db_data(name, &len);
+ 	uint16_t maximum = 0;
+-	uint32_t i;
++	uint32_t index = 0, i;
+ 
+ 	if (addr == 0 || table == NULL || len < 2 || (len & 1u) != 0) {
+ 		wifi_log("ARC resource %s missing or malformed", name);
+ 		return -1;
+ 	}
++	/* RPMh takes the index of the highest allowed level, not its value. */
+ 	for (i = 0; i < len; i += 2) {
+ 		uint16_t value = wifi_le16(table + i);
+ 
+ 		if (value > maximum) {
+ 			maximum = value;
++			index = i / 2;
+ 		}
+ 	}
+-	if (mondrian_rpmh_write_one(addr, maximum) != 0) {
++	if (mondrian_rpmh_write_tcs4(addr, index) != 0) {
+ 		wifi_log("ARC resource %s vote failed", name);
+ 		return -1;
+ 	}
+-	wifi_log("arc %s addr 0x%x requested level 0x%x", name, addr, maximum);
++	wifi_log("arc %s addr 0x%x index %u level 0x%x", name, addr, index,
++	    maximum);
+ 	return 0;
+ }
+ 
+-static int __unused
++static int
+ wifi_vote_xo(void)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr("xo.lvl");
+@@ -569,14 +573,14 @@ wifi_vote_xo(void)
+ 	if (addr == 0) {
+ 		return wifi_fail("xo.lvl missing from cmd-db");
+ 	}
+-	if (mondrian_rpmh_write_one(addr, 3) != 0) {
++	if (mondrian_rpmh_write_tcs4(addr, 3) != 0) {
+ 		return wifi_fail("xo.lvl RPMh vote failed");
+ 	}
+ 	wifi_log("xo.lvl addr 0x%x requested level 3", addr);
+ 	return 0;
+ }
+ 
+-static int __unused
++static int
+ wifi_vote_sn7(void)
+ {
+ 	uint32_t addr = mondrian_cmd_db_addr("SN7");
+@@ -606,7 +610,7 @@ wifi_vote_sn7(void)
+ 	}
+ 	value = (1u << 30) | (1u << 29) | ((uint32_t)vote << 14) |
+ 	    (uint32_t)vote;
+-	if (mondrian_rpmh_write_one(addr, value) != 0) {
++	if (mondrian_rpmh_write_tcs4(addr, value) != 0) {
+ 		return wifi_fail("PCIe NoC SN7 RPMh vote failed");
+ 	}
+ 	wifi_log("noc SN7 addr 0x%x unit %u width %u requested 0x%x", addr,
+@@ -627,22 +631,14 @@ wifi_supplies(void)
+ 	/* qcom,vdd-wlan-ipa-config has enable=0 on this phone. */
+ 	wifi_log("ipa rail smpe3 has DT enable=0; not voted");
+ 	/*
+-	 * mx.lvl, cx.lvl, xo.lvl and SN7 are not AP-owned. Measured 2026-11-25
+-	 * and 2026-11-26 across warm and cold boots: the worker completes the five
+-	 * PM8350/PM8350C SMPS votes, then hangs on whichever of these four it
+-	 * reaches first (mx, cx, xo or SN7 in different builds). The direct RSC
+-	 * access wedges; the loader's levels are what the link trained with. Keep
+-	 * the AP-owned SMPS and skip the shared votes until the AOP path exists.
++	 * The shared parents are voted on ACTIVE TCS4, the TCS the GPU does not
++	 * lease; the earlier TCS3 writes wedged on whichever parent they reached
++	 * first. ARC commands carry the index of the highest level, not the value.
+ 	 */
+-	wifi_log("ARC/XO/NoC votes skipped; loader levels retained");
+-	/*
+-	 * SN7 is the PCIe NoC bandwidth vote. Measured 2026-11-25: the direct RSC
+-	 * write wedges after xo.lvl and never returns, while earlier boots had
+-	 * voted it. It is a bandwidth setting, not a power rail; the bootloader's
+-	 * NoC configuration is what the link trained with. Skip it until the
+-	 * owner-safe AOP path exists.
+-	 */
+-	wifi_log("noc SN7 vote skipped; loader NoC configuration retained");
++	if (wifi_vote_arc("mx.lvl") != 0 || wifi_vote_arc("cx.lvl") != 0 ||
++	    wifi_vote_xo() != 0 || wifi_vote_sn7() != 0) {
++		return -1;
++	}
+ 	delay(20000);
+ 	wifi_log("supplies complete; enabling WLAN");
+ 	return 0;
