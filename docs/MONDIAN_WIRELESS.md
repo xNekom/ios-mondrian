@@ -64,13 +64,17 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
 - `0438` runs ath11k's pre-load SOC reset (clear `WLAON_WARM_SW_ENTRY`,
   `PCIE_SOC_GLOBAL_RESET`, `MHICTRL.RESET`) from `wifibhi`.
 - A 1 MiB BAR map stopped the worker at `W4 BAR map start` (256 io_submap
-  pages). `0441` maps the MHI/BHI page plus the AHB window register and caches
-  the three AHB pages the reset touches.
+  pages). `0441` maps four BAR pages (MHI/BHI plus the AHB window register)
+  and maps each AHB data page once.
+- Measured 2026-11-26 with `0441`: W4 completes, W4/W5 read `MHIVER=0xdeadbeef`
+  and `BHI ver 1.2 status 0x0`, and `wifistat` answers. `wifibhi 0x80000` then
+  stops the command thread: the ring never answers again while the USB device
+  stays enumerated, so the wedge is inside the load thread.
 
-The load is still unproven: the next boot must show W4 completing and the SOC
-reset/BHI trigger lines. Save a ring dump before the load, because a wedged
-load takes the dump with it. `0430`/`0431` carry the BHIE stage and the live
-`wifibhi`/`wifistat` commands.
+The load thread runs the pre-load SOC reset, the 6 MiB AMSS read, the SMMU map
+and the BHI writes in sequence. The next experiment pre-maps the AHB pages in
+the worker and separates the reset from the trigger; `0430`/`0431` carry the
+BHIE stage and the live `wifibhi`/`wifistat` commands.
 
 The shim unpacks the payload in place: a kernel carrying the 4.87 MB UI/GL
 `glblob` produced a 16.8 MB payload and never reached XNU, while 15.7 MB boots.
