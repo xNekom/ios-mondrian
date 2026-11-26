@@ -110,11 +110,11 @@ The shim takes the framebuffer and the UFS host from the device tree, and
   with the port: look it up by USB id
   (`usbipd list | grep -E '1209:0001|18d1:d00d'`), never trust a hardcoded
   `enx...`, and wait for `cdc_ether` to create the netdev instead of sleeping.
-- **Search before experimenting blind.** When a register value, a sequence or a
-  fault does not match the references, read mainline (`drm/msm` a6xx/a7xx,
-  Mesa freedreno), the vendor kernel and the XNU drivers in the local research
-  trees, and search the web, before changing a driver again. The GPU bring-up
-  traps were all solved already in a patch or a driver that shipped.
+- **Unknown means donor first, not a guess.** When a register value, a sequence
+  or a fault does not match, read the donor in `docs/REFERENCE_PORTS.md`
+  implementation against implementation, not just its constants, then mainline,
+  the vendor kernel, the local research trees and the web. An assumption that
+  contradicts a donor is a bug in the assumption, not in the donor.
 - **Ask the vendor before writing a driver.** The live device tree and the
   vendor source answer in minutes what a boot cannot.
   `raw.githubusercontent.com` rate-limits (429), so
