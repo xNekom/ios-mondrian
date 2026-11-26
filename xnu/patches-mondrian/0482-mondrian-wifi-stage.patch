@@ -1,0 +1,246 @@
+xnu 0482: report the wifi stage without touching mmio
+
+The ring is not a reliable transcript (it drops lines out of order, measured
+2026-11-26), and `wifistat` reads `BAR0+0x28`, which wedges the AHB and the
+command thread when the worker has not voted the rails -- that boot could not be
+reset to fastboot.
+
+A stage counter records how far the worker got (`2` thread entry, `4` pins
+mapped, `6` supplies, `7` WLAN enabled, `8` GCC power, `9` host windows, `10`
+PHY table, `12` link up, `13` identity, `15` SOC reset, `16` EXECENV read, `17`
+doorbell, `18` status polled). `wifistage` returns it with the cached
+`EXECENV`/`BHI_STATUS`/`ERRCODE` and never touches MMIO. `wifistat` also stops
+reading the BAR below stage 9.
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 088c6e8..332b2fb 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2852,6 +2852,19 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				    mondrian_wifi_load_amss() == 0 ? "ok" : "failed");
+ 
+ 				ud_cmd_send(so, peer, out, (size_t)n);
++			} else if (strcmp(cmd, "wifistage") == 0) {
++				extern int mondrian_wifi_stage(uint32_t *, uint32_t *,
++				    uint32_t *, uint32_t *);
++				uint32_t stage = 0, status = 0, execenv = 0, err = 0;
++				char out[80];
++				int n;
++
++				(void)mondrian_wifi_stage(&stage, &status, &execenv,
++				    &err);
++				n = snprintf(out, sizeof(out),
++				    "wifistage %u status=0x%x execenv=0x%x err=0x%x\n",
++				    stage, status, execenv, err);
++				ud_cmd_send(so, peer, out, (size_t)n);
+ 			} else if (strcmp(cmd, "wifistat") == 0) {
+ 				extern int mondrian_wifi_stat(void);
+ 				char out[32];
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 869c718..3b3d290 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -316,6 +316,18 @@ wifi_fail(const char *message)
+ 	return -1;
+ }
+ 
++/*
++ * The stage counter is the one Wi-Fi state that can be read without touching
++ * MMIO: the ring loses lines and a BAR read on a collapsed device hangs the
++ * command thread (measured 2026-11-26). `wifistage` reports it over USB.
++ */
++static volatile uint32_t wifi_stage;
++static volatile uint32_t wifi_seen_status;
++static volatile uint32_t wifi_seen_errcode;
++static volatile uint32_t wifi_seen_execenv;
++
++#define WIFI_STAGE(n)	do { wifi_stage = (n); } while (0)
++
+ static vm_offset_t
+ wifi_map_once(vm_offset_t *slot, vm_offset_t pa, vm_size_t size)
+ {
+@@ -1695,6 +1707,7 @@ mondrian_wifi_load_amss(void)
+         return -1;
+     }
+     wifi_log("W6 reset done");
++    WIFI_STAGE(15);
+     mondrian_log_flush_now();
+     if (mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff) != 0 ||
+         bhioff == 0) {
+@@ -1758,6 +1771,8 @@ mondrian_wifi_load_amss(void)
+         msi_page = *(volatile uint32_t *)(buf + W6_MSI_OFF);
+         wifi_log("W6 post-reset execenv=0x%x intvec=0x%x status=0x%x"
+             " msi=0x%x", execenv, intvec, pre_status, msi_page);
++        wifi_seen_execenv = execenv;
++        WIFI_STAGE(16);
+         wifi_bhi_dump("post-reset", bhioff);
+     }
+     command = wifi_read16(wifi_cfg, 4);
+@@ -1918,6 +1933,7 @@ mondrian_wifi_load_amss(void)
+     }
+     /* BHI_IMGTXDB is a 30-bit sequence, not a boolean. */
+     rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5au);
++    WIFI_STAGE(17);
+     wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x intvec=0x%x rc=0x%x",
+         iova, image_size, got, intvec, rc);
+     mondrian_log_flush_now();
+@@ -1969,6 +1985,9 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    wifi_seen_status = status;
++    wifi_seen_errcode = errcode;
++    WIFI_STAGE(18);
+     {
+         uint32_t cookie = 0, warm = 0, cause = 0;
+ 
+@@ -2116,23 +2135,50 @@ mondrian_wifi_set_sbl(uint32_t size)
+ int
+ mondrian_wifi_stat(void)
+ {
+-    uint32_t bhioff = 0, status = 0, execenv = 0, mhistatus = 0;
+-    uint32_t mhictrl = 0;
++    uint32_t bhioff = 0, status = wifi_seen_status;
++    uint32_t execenv = wifi_seen_execenv, mhistatus = 0, mhictrl = 0;
+ 
+-    if (wifi_bar == 0) {
+-        wifi_log("W7 stat BAR not mapped");
++    /*
++     * Reading BAR0+0x28 with the link down or the rails off wedges the AHB
++     * and, with it, the command thread (measured 2026-11-26: `wifistat` got no
++     * answer and the following reset could not reach fastboot). Only touch
++     * MMIO once the worker has mapped the host windows (stage 9).
++     */
++    if (wifi_bar != 0 && wifi_stage >= 9) {
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &mhictrl);
++        (void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus);
++        if (bhioff != 0 && bhioff <= WIFI_BAR_MAP - 0x50) {
++            (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &status);
++            (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++            wifi_seen_status = status;
++            wifi_seen_execenv = execenv;
++        }
++    }
++    wifi_log("W7 stat stage=%u sbl=0x%x mhictrl=0x%x mhistatus=0x%x "
++        "bhi_status=0x%x execenv=0x%x", wifi_stage, wifi_sbl_size, mhictrl,
++        mhistatus, status, execenv);
++    return 0;
++}
++
++int
++mondrian_wifi_stage(uint32_t *stage, uint32_t *status, uint32_t *execenv,
++    uint32_t *errcode)
++{
++
++    if (stage == NULL) {
+         return -1;
+     }
+-    (void)mondrian_mmio_try_rd32(wifi_bar + 0x28, &bhioff);
+-    (void)mondrian_mmio_try_rd32(wifi_bar + 0x38, &mhictrl);
+-    (void)mondrian_mmio_try_rd32(wifi_bar + 0x48, &mhistatus);
+-    if (bhioff != 0) {
+-        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &status);
+-        (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &execenv);
++    *stage = wifi_stage;
++    if (status != NULL) {
++        *status = wifi_seen_status;
++    }
++    if (execenv != NULL) {
++        *execenv = wifi_seen_execenv;
++    }
++    if (errcode != NULL) {
++        *errcode = wifi_seen_errcode;
+     }
+-    wifi_log("W7 stat sbl=0x%x mhictrl=0x%x mhistatus=0x%x "
+-        "bhi_status=0x%x execenv=0x%x", wifi_sbl_size, mhictrl,
+-        mhistatus, status, execenv);
+     return 0;
+ }
+ 
+@@ -2241,6 +2287,7 @@ static int
+ wifi_cold_link(void)
+ {
+ 
++	WIFI_STAGE(2);
+ 	wifi_log("cold start; pins and supplies precede host MMIO");
+ 	wifi_gcc = mondrian_gcc_map();
+ 	if (wifi_gcc == 0) {
+@@ -2251,24 +2298,46 @@ wifi_cold_link(void)
+ 
+ 		wifi_log("early GCC 0x62008 read 0x%x", early);
+ 	}
+-	if (wifi_map_pins() != 0 || wifi_pins_hold_reset() != 0 ||
+-	    wifi_supplies() != 0) {
++	WIFI_STAGE(3);
++	if (wifi_map_pins() != 0) {
++		return -1;
++	}
++	WIFI_STAGE(4);
++	if (wifi_pins_hold_reset() != 0) {
+ 		return -1;
+ 	}
++	WIFI_STAGE(5);
++	if (wifi_supplies() != 0) {
++		return -1;
++	}
++	WIFI_STAGE(6);
+ 	wifi_enable_wlan();
+-	if (wifi_gcc_power() != 0 || wifi_map_host() != 0) {
++	WIFI_STAGE(7);
++	if (wifi_gcc_power() != 0) {
++		return -1;
++	}
++	WIFI_STAGE(8);
++	if (wifi_map_host() != 0) {
+ 		return -1;
+ 	}
++	WIFI_STAGE(9);
+ 	mondrian_tlmm_write(wifi_parf, 0x1b0,
+ 	    mondrian_tlmm_read(wifi_parf, 0x1b0) & ~(1u << 8));
+ 	wifi_parf_setup();
+ 	if (wifi_phy_load_table() != 0) {
+ 		return -1;
+ 	}
++	WIFI_STAGE(10);
+ 	wifi_dbi_setup();
+-	if (wifi_link() != 0 || wifi_config_identity() != 0) {
++	WIFI_STAGE(11);
++	if (wifi_link() != 0) {
+ 		return -1;
+ 	}
++	WIFI_STAGE(12);
++	if (wifi_config_identity() != 0) {
++		return -1;
++	}
++	WIFI_STAGE(13);
+ 	return 0;
+ }
+ 
+@@ -2328,6 +2397,7 @@ mondrian_wifi_premap(void)
+ 	(void)wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
+ 	(void)wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
+ 	mondrian_wifi_smmu_premap();
++	WIFI_STAGE(1);
+ 	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx"
+ 	    " parf=0x%lx phy=0x%lx",
+ 	    (unsigned long)wifi_bar, (unsigned long)wifi_cfg,
+@@ -2346,7 +2416,10 @@ mondrian_wifi_premap(void)
+ static void __dead2
+ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	int ok = wifi_cold_link() == 0;
++	int ok;
++
++	WIFI_STAGE(2);
++	ok = wifi_cold_link() == 0;
+ 	int autoload = 0;
+ 	int delay_ms = 20000;
+ 
+@@ -2366,6 +2439,7 @@ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ 			wifi_log("W6 auto load delay %d ms", delay_ms);
+ 			delay(delay_ms * 1000);
+ 		}
++		WIFI_STAGE(14);
+ 		wifi_log("W6 auto load start");
+ 		(void)mondrian_wifi_load_amss();
+ 	}
