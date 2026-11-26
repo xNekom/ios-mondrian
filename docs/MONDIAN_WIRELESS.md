@@ -172,14 +172,31 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `wifi_w10_probe()`'s first line, so the first TLMM/config access after the
   endpoint idles does not return. `mondrianwifidelay=0` is the workaround until
   the link is kept awake across the delay.
-- `0469`-`0475` move every window the worker touches onto the boot thread and
-  start the worker after the probe block, because `ml_io_map()` is serialized
-  and blocks behind any other mapper. Measured 2026-11-26: the stop moved with
-  each premap -- `W4 BAR map done` (0469), `pcie0 link up` with `qca6490 id`
-  absent (0470), `pcie0 gdsc up` inside `wifi_map_host()` (0473) and
-  `early GCC 0x62008` inside `wifi_map_pins()` (0474) -- so the window was never
-  the fault: the worker ran while the audio, Venus and BT probes still mapped.
-  `0475` premaps the TLMM pin pages and starts the worker last.
+- `0469`-`0479` move every window the worker touches onto the boot thread,
+  because `ml_io_map()` is serialized and blocks behind any other mapper.
+  Measured 2026-11-26: the stop moved with each premap -- `W4 BAR map done`
+  (0469), `pcie0 link up` with `qca6490 id` absent (0470), `pcie0 gdsc up`
+  inside `wifi_map_host()` (0473) and `early GCC 0x62008` inside
+  `wifi_map_pins()` (0474) -- so the window was never the fault. Two traps came
+  out of the ladder: `EUSB2_PA` was mapped in three places and now has one
+  shared page (`0478`), and the TLMM pin premap wedges whatever mapping runs
+  next, so it leaves the boot block and the worker maps the pins itself as its
+  last start, after the BT registration (`0479`).
+- The driver-side ring is the XNU `msgbuf`: a boot dump carries at most about
+  200 KB and mixes late SpringBoard lines with the banner, so a missing worker
+  line does not prove the worker did not run. `wifistat` over the USB command
+  channel is the state query, and `wifibhi <size>` drives
+  `mondrian_wifi_load_amss()` from the command thread.
+- BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
+  `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
+  doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
+  runs when `EXECENV == 0` (PBL); `IMGTXDB` is a non-zero 30-bit session id and
+  Linux polls for up to 20 s. The PBL reads the image with the function's
+  requester ID, so the **PARF BDF->SID table** (`PARF 0x2c00` bypass bit,
+  `0x2054`) must route it to the same SID (`0x1c01`) the SMMU context covers;
+  the iATU is host->BAR only. ath11k keeps the coherent mask at 32 bits, so
+  the image must sit below 4 GiB. `m3.bin` is not part of BHI; it arrives over
+  QMI after `FW_MEM_READY`.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
