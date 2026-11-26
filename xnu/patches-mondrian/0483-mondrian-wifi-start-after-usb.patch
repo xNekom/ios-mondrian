@@ -1,0 +1,43 @@
+xnu 0483: start the wifi worker right after the usb probe
+
+Measured 2026-11-26 with the stage counter: `wifistage 1` on 0481/0482 -- the
+boot premap ran, the worker never reached stage 2. The worker start is the last
+statement of the probe block, and the block stops in the audio/Venus/BT tail
+when the pin premap runs first. `0480` reached `worker started` with the start
+inside `mondrian_usb_probe()`, and `0481` mapped the pins before touch.
+
+Both proven halves are combined: the pins stay premapped at the top, and the
+worker starts right after `mondrian_usb_probe()`. It takes no `ml_io_map()` of
+its own, so it cannot race the tail that follows.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 5379e5e..4c8bd7a 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2417,18 +2417,19 @@ mondrian_log_start(void)
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
++		/*
++		 * Start here, before the audio/Venus/BT tail: the block has been
++		 * measured to stop in that tail when the pin premap runs first
++		 * (0481/0482: `wifistage 1`, the worker never reached stage 2),
++		 * while starting inside `usb_probe` reached `worker started`
++		 * (0480). Every window the worker uses is premapped above, so it
++		 * takes no ml_io_map() and cannot race the tail.
++		 */
++		mondrian_wifi_start();
+ 		mondrian_audio_probe_start();
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
+-		/*
+-		 * Last, with the whole probe block done: the worker maps the
+-		 * TLMM pin pages itself, and mapping them at the top of the
+-		 * block or beside a probe that is still mapping wedges the
+-		 * mapper (measured 2026-11-26, five boots stopped at a
+-		 * different point each time).
+-		 */
+-		mondrian_wifi_start();
+ 	}
+ }
+ 
