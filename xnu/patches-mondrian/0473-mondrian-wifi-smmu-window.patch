@@ -1,0 +1,92 @@
+xnu 0473: premap the apps smmu window and name the config reads
+
+Measured 2026-11-26: with the premap in (0471) and the identity steps logged
+(0472), the worker gets past `pcie0 link up`, `W4 identity iatu done`, and
+reads the config ID (`id=0x110317cb`). The next access does not return and no
+`W2` line appears, which is where `mondrian_wifi_smmu_prove()` maps the APPS
+SMMU window from the worker -- the last `ml_io_map()` in that path.
+
+`mondrian_wifi_smmu_premap()` maps the window on the boot thread into a static
+of its own (the proof zeroes `w2` on every run), and the proof reuses it. The
+three remaining config reads are logged, so the next boot either reaches `W2`
+or names subsystem/revision/command.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 2629ba8..afd6ea8 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1412,6 +1412,7 @@ extern int mondrian_root_read(const char *, void *, unsigned, off_t);
+ extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
+ extern int mondrian_wifi_smmu_bypass(int on);
+ extern vm_offset_t mondrian_wifi_smmu_contig(vm_size_t, uint64_t *);
++extern void mondrian_wifi_smmu_premap(void);
+ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+     uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
+@@ -2199,9 +2200,15 @@ wifi_config_identity(void)
+ 		return -1;
+ 	}
+ 	subsystem = mondrian_tlmm_read(wifi_cfg, 0x2c);
++	wifi_log("W4 identity subsystem done");
++	mondrian_log_flush_now();
+ 	revision = wifi_read8(wifi_cfg, 8);
++	wifi_log("W4 identity revision done");
++	mondrian_log_flush_now();
+ 	wifi_bus_master_off();
+ 	command = wifi_read16(wifi_cfg, 4);
++	wifi_log("W4 identity command done");
++	mondrian_log_flush_now();
+ 	if ((command & WIFI_PCI_BUS_MASTER) != 0) {
+ 		return wifi_fail("endpoint bus master did not clear");
+ 	}
+@@ -2294,6 +2301,7 @@ mondrian_wifi_premap(void)
+ 	(void)wifi_map_once(&wifi_elbi, WIFI_ELBI_PA, WIFI_ELBI_SIZE);
+ 	(void)wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
+ 	(void)wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
++	mondrian_wifi_smmu_premap();
+ 	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx",
+ 	    (unsigned long)wifi_bar, (unsigned long)wifi_cfg,
+ 	    (unsigned long)wifi_dbi, (unsigned long)wifi_iatu);
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index ff9f9ec..3f3e092 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -114,6 +114,30 @@ struct w2_state {
+ };
+ 
+ static struct w2_state w2;
++static vm_offset_t w2_window;
++
++/*
++ * The APPS SMMU window is mapped on the boot thread: mapping it inside the
++ * proof means an ml_io_map() in the worker, which is what stopped every boot
++ * since 0468 (measured 2026-11-26). `w2` is zeroed per proof, so the window
++ * lives in its own static.
++ */
++void
++mondrian_wifi_smmu_premap(void)
++{
++    if (w2_window == 0) {
++        w2_window = ml_io_map(W2_SMMU_PA, W2_SMMU_SIZE);
++    }
++}
++
++static vm_offset_t
++w2_window_va(void)
++{
++    if (w2_window == 0) {
++        mondrian_wifi_smmu_premap();
++    }
++    return w2_window;
++}
+ 
+ static void
+ w2_log(const char *fmt, ...) __printflike(1, 2);
+@@ -920,7 +944,7 @@ mondrian_wifi_smmu_prove(uint16_t pci_command)
+         return -1;
+     }
+     bzero(&w2, sizeof(w2));
+-    w2.smmu = ml_io_map(W2_SMMU_PA, W2_SMMU_SIZE);
++    w2.smmu = w2_window_va();
+     if (w2.smmu == 0 || w2_read_ids() || w2_pick_bank() ||
+         w2_pick_slot()) {
+         goto out;

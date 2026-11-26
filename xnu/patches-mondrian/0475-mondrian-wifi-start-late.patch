@@ -1,0 +1,82 @@
+xnu 0475: start the wifi worker after every probe, and premap the pins
+
+Measured 2026-11-26: each boot stops at a different `ml_io_map()` inside the
+wifi worker -- `W4 BAR map done` (0469), `pcie0 link up` (0470), `pcie0 gdsc up`
+(0473, `wifi_map_host`), and `early GCC 0x62008` (0474, `wifi_map_pins`). The
+window moves with the premap, so the window is not the fault: the worker runs
+while the boot probe block still maps its own windows (audio, Venus, BT all
+follow `mondrian_usb_probe()`, which started the worker), and `ml_io_map()` is
+serialized.
+
+Two changes. The seven TLMM pin pages join the premap, so the worker's cold
+link has no mapping left at all. And `mondrian_wifi_start()` moves out of
+`mondrian_usb_probe()` to the end of the boot probe block, so no other probe is
+still mapping when the worker begins.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 97bebd9..c56f199 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2402,6 +2402,7 @@ mondrian_log_start(void)
+ 		extern void mondrian_spmi_probe(void);
+ 		extern void mondrian_reset_reason_init(void);
+ 		extern void mondrian_wifi_premap(void);
++		extern void mondrian_wifi_start(void);
+ 
+ 		/*
+ 		 * Both map MMIO and must run before any worker that maps: the
+@@ -2420,6 +2421,13 @@ mondrian_log_start(void)
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
++		/*
++		 * Last, so the worker starts after every other probe has taken
++		 * its mappings: an ml_io_map() in the worker racing one of them
++		 * blocks for good (measured 2026-11-26, four boots stopped at a
++		 * different worker window each time).
++		 */
++		mondrian_wifi_start();
+ 	}
+ }
+ 
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index bbb731b..d4915cf 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -265,13 +265,6 @@ mondrian_usb_probe(void)
+ 	 * resets the phone, the SMR/S2CR work is the one in anonbeat1's
+ 	 * 0091-sweet-spacewar-usb-net-smmu.patch (reuse ABL's SMR for the SID).
+ 	 */
+-	{
+-		extern void mondrian_wifi_start(void);
+-
+-		if (usb >= 2) {
+-			mondrian_wifi_start();
+-		}
+-	}
+ 	printf("MONDR USB: probe done\n");
+ }
+ 
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 712ac0d..7cd44f5 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2296,6 +2296,7 @@ mondrian_wifi_premap(void)
+ 	    enabled != 1) {
+ 		return;
+ 	}
++	(void)wifi_map_pins();
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
+ 	(void)wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
+ 	(void)wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
+@@ -2304,6 +2305,11 @@ mondrian_wifi_premap(void)
+ 	(void)wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
+ 	(void)wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
+ 	mondrian_wifi_smmu_premap();
++	wifi_log("W4 premap pins wlan=0x%lx perst=0x%lx bt=0x%lx",
++	    (unsigned long)wifi_wlan_en_page,
++	    (unsigned long)wifi_perst_page,
++	    (unsigned long)wifi_bt_en_page);
++	mondrian_log_flush_now();
+ 	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx"
+ 	    " parf=0x%lx phy=0x%lx",
+ 	    (unsigned long)wifi_bar, (unsigned long)wifi_cfg,

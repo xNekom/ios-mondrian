@@ -1,0 +1,34 @@
+xnu 0474: premap parf and phy, the last maps in the cold link
+
+Measured 2026-11-26 (0473 boot): the worker prints `pcie0 gdsc up` and stops.
+The next statement is `wifi_map_host()`, which maps PARF and PHY -- the only two
+windows the premap did not cover -- so this is the same class of stall as
+0469/0471: an `ml_io_map()` taken from the worker.
+
+Both are mapped on the boot thread with the rest, and the premap line prints
+their virtual addresses too.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index afd6ea8..712ac0d 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2297,14 +2297,18 @@ mondrian_wifi_premap(void)
+ 		return;
+ 	}
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
++	(void)wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
++	(void)wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
+ 	(void)wifi_map_once(&wifi_dbi, WIFI_DBI_PA, WIFI_DBI_SIZE);
+ 	(void)wifi_map_once(&wifi_elbi, WIFI_ELBI_PA, WIFI_ELBI_SIZE);
+ 	(void)wifi_map_once(&wifi_iatu, WIFI_IATU_PA, WIFI_IATU_SIZE);
+ 	(void)wifi_map_once(&wifi_cfg, WIFI_CFG_PA, WIFI_CFG_SIZE);
+ 	mondrian_wifi_smmu_premap();
+-	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx",
++	wifi_log("W4 premap bar va=0x%lx cfg=0x%lx dbi=0x%lx iatu=0x%lx"
++	    " parf=0x%lx phy=0x%lx",
+ 	    (unsigned long)wifi_bar, (unsigned long)wifi_cfg,
+-	    (unsigned long)wifi_dbi, (unsigned long)wifi_iatu);
++	    (unsigned long)wifi_dbi, (unsigned long)wifi_iatu,
++	    (unsigned long)wifi_parf, (unsigned long)wifi_phy);
+ 	mondrian_log_flush_now();
+ 	for (i = 0; i < sizeof(ahb) / sizeof(ahb[0]); i++) {
+ 		vm_offset_t page = wifi_ahb_page(ahb[i]);
