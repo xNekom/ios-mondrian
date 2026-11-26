@@ -555,6 +555,7 @@ def main():
                                  "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                                  "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapclick", "hapr", "hapw", "spmimap",
                                  "btuart", "wififw", "wifibhi", "wifistat",
+                                 "wifistage",
                                  "rf", "kill", "say", "fps", "del", "deltree", "ls", "wait", "pbs"))
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=60.0,
@@ -642,6 +643,7 @@ def main():
                         "rtc", "execdeny", "gpukeep", "gpustat", "gpuperf", "temp", "tsens",
                         "thermal", "burn", "haps", "vib", "hapb", "hapv", "hapclick", "hapr", "hapw",
                         "spmimap", "kill", "say", "btuart", "wififw", "wifibhi", "wifistat",
+                        "wifistage",
                         "pbs"):
         # wififw reads and uploads the AMSS image, so it answers after seconds.
         timeout = 60.0 if args.command == "wififw" else 2.0
