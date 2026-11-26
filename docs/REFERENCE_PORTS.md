@@ -13,7 +13,7 @@ separates a device-verified result from code that was only read.
 | [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) | the GLES/GPU path, the Mesa patches, the userland dylibs and the virtual audio HAL plug-in | its phones; the reference behind `docs/MONDIAN_GPU.md` | APSL 2.0 kernel, MIT userland (per its README) |
 | [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) | `SweetSurface`, the `IOMobileFramebuffer`/`AppleCLCD` presenter and the EAGL/OSMesa path | read; `docs/MONDIAN_GPU.md` | no root licence declared; read, do not copy |
 | [akshaynexus/OneiOS](https://github.com/akshaynexus/OneiOS) | the VideoToolbox paravirtualization service, the HEVC tile session and the Rust runtime tools | its README marks the iOS 27 tile session host-tested, not booted | no licence file: all rights reserved; read, do not copy |
-| [akshaynexus/iOSPlus10](https://github.com/akshaynexus/iOSPlus10) | QCA6490 Wi-Fi, PM8350B hBoost/PBS haptics, WCD938x/LPASS audio and Adreno 730 Metal2Vulkan | the repo's plans report built stages; its Wi-Fi audit says the host side has not run on the chip; the haptics PBS sequence raised `hbst-vreg` on mondrian (`0413`), motion pending | MIT |
+| [akshaynexus/iOSPlus10](https://github.com/akshaynexus/iOSPlus10) | QCA6490 Wi-Fi, PM8350B hBoost/PBS haptics and Adreno 730 Metal2Vulkan | the repo's plans report built stages; its Wi-Fi audit says the host side has not run on the chip; the haptics PBS sequence raised `hbst-vreg` on mondrian (`0413`), motion pending; its audio path never played and never started the WCD938x | MIT |
 | [UniXNU/Adreno740](https://github.com/UniXNU/Adreno740), [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) | the a7xx GPU driver and the Metal-to-Vulkan frontend | device-verified on the Pad 6S Pro | MIT |
 | [qiumochen/UniXNU-zizhan](https://github.com/qiumochen/UniXNU-zizhan) | `PongWifi`: QCA6490 PCIe/MHI/ath11k and Apple80211 on the same SM8475 | network device-verified: WPA2 join, DHCP/HTTPS and roaming; its PCIe cold-link sequence also reached Gen2 x1 and endpoint `17cb:1103` on mondrian (`0415`) | BSD-2-Clause-Patent; `PongAth11k.c` derives from Linux ath11k (GPL-2.0), check before mixing |
 | [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (`freedreno`, `turnip`) | the GLES driver on the Adreno and the Vulkan driver behind Metal2Vulkan | `FD725` GLES and `Turnip Adreno (TM) 725` measured on the phone | MIT |
@@ -35,11 +35,16 @@ separates a device-verified result from code that was only read.
   `0302` and `0303`, `bsd/dev/negroni_haptic.c` and `docs/haptics-plan.md`. It
   is the same PM8350B block and it supplies the PBS/SDAM hBoost vote that our
   `docs/MONDIAN_POWER.md` names as missing.
-- **Audio.** `akshaynexus/iOSPlus10`: `patches/xnu/0243..0249` and `0400`,
-  `bsd/dev/negroni_adsp.c`, `negroni_audio.c` and
-  `userland/audio/NegroniAudio.c`. Our codec is the same WCD938x, but our
-  speaker amps are AW882xx, not the TFA9874 of the OnePlus, so the amp driver
-  is the part to replace. The HAL side has a working reference:
+- **Audio.** Start the ADSP/graph path from `qiumochen/UniXNU-zizhan`:
+  `drivers/PongPower/PongAudio.cpp`, `ShengAudioReach.c`, `QcomGlink.c`,
+  `QcomSmp2p.c` and the live DT's `remoteproc-adsp`. Its ADSP/PRM/AudioReach
+  ladder is device-verified on the same SM8475, though its README still calls
+  the speaker path silent data awaiting listening. `akshaynexus/iOSPlus10` is
+  not a WCD938x donor: its own `docs/audio-plan.md` calls the codec "nothing,
+  weeks", its amp is a TFA9874 and its audio never played. For the AW88261,
+  take the protocol facts from mainline `aw88261.c` (GPL, facts only) and the
+  stock vendor `aw882xx` driver; the ACF profile is mandatory and the live DT
+  has no `firmware-name`. The HAL side has a working reference:
   `oosexgang/hakios-xnu-kernel`'s `userland/src/audio_plugin.c` is a virtual
   `AudioServerPlugIn` (MIT) that presents Speaker, Actuator and Codec, and
   `open-mapple/mapple_userland/audio` installs it beside `VirtualAudio.plugin`
