@@ -125,7 +125,9 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
 - `0458` reads the device side. Measured 2026-11-26: the five rail PPIDs
   (`49e/1b9/1b6/29b/1bc`) are in the SPMI arbiter map but **owner 4**, the
   secure world that also owns the RTC, so APPS cannot read a regulator back at
-  all; only the RPMh vote exists and it is acknowledged. GPIO82
+  all (the helper refuses a non-AP-owned PPID before issuing a transaction,
+  which is why the answer is zero and not a fault); only the RPMh vote exists
+  and it is acknowledged. GPIO82
   (`qcom,sw-ctrl-gpio`) already reads high and no stage drives it. `MHICTRL`
   written `0x2` reads `0x2` at once and `0x0` after 10 ms, so the MHI reset is
   accepted, while BHI still reports `ver 1.2 serial 0x907d3a8b hwid 0x1016d0e1
@@ -143,6 +145,19 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   segments by file offset (segment 8 starts inside it and ends at `0x151000`,
   which would have faulted). The image is fetched as a blob; whether the code at
   its entry point runs is a separate question.
+- `0462` lowers the endpoint's max read request size to 128 B
+  (`mondrianwifimrrs=1`, device control `0x2810` to `0x810`, the value the
+  donor's working boot writes) and reads the warm entry after the doorbell:
+  no change, `status=0`, `cookie=0`.
+- `0464` rings 4 KiB, 64 KiB and 512 KiB with distinct sessions and reads
+  `BHI_STATUS` 500 ms after each: all `0`. The ack is not size-dependent; the
+  PBL issues the reads and never reports one.
+- `0447`'s image choice is confirmed by the donor: its QMI on the same chip
+  returns `soc_id 0x400c1211`, `board_id 0xff` and loads `amss20.bin`, the same
+  value `TCSR 0x224` reads here. Its working SMMU context is also the state
+  `0418` already programs (`SCTLR=0x27`, `TCR2=0x38071`, ASID `0x1c01` in
+  TTBR0), so the context is not what differs; the donor's ladder and the Linux
+  MHI reference are in `docs/REFERENCE_PORTS.md`.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live

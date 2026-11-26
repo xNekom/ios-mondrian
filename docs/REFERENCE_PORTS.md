@@ -16,6 +16,8 @@ separates a device-verified result from code that was only read.
 | [akshaynexus/iOSPlus10](https://github.com/akshaynexus/iOSPlus10) | QCA6490 Wi-Fi, PM8350B hBoost/PBS haptics and Adreno 730 Metal2Vulkan | the repo's plans report built stages; its Wi-Fi audit says the host side has not run on the chip; the haptics PBS sequence raised `hbst-vreg` on mondrian (`0413`), motion pending; its audio path never played and never started the WCD938x | MIT |
 | [UniXNU/Adreno740](https://github.com/UniXNU/Adreno740), [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) | the a7xx GPU driver and the Metal-to-Vulkan frontend | device-verified on the Pad 6S Pro | MIT |
 | [qiumochen/UniXNU-zizhan](https://github.com/qiumochen/UniXNU-zizhan) | `PongWifi`: QCA6490 PCIe/MHI/ath11k and Apple80211 on the same SM8475 | network device-verified: WPA2 join, DHCP/HTTPS and roaming; its PCIe cold-link sequence also reached Gen2 x1 and endpoint `17cb:1103` on mondrian (`0415`) | BSD-2-Clause-Patent; `PongAth11k.c` derives from Linux ath11k (GPL-2.0), check before mixing |
+| [Chengdong-Yu/pong-wifi](https://github.com/Chengdong-Yu/pong-wifi) | the QCA6490 transport `UniXNU-zizhan` vendors, standalone: the SMMU takeover in `PongWifiPlatform.cpp` and the host `tests/mhi_host_test.c` | read; Pong (Nothing Phone 2) is the same SM8475 and QCA6490, and this is the upstream of the zizhan result above | BSD-2-Clause-Patent |
+| [Denis0x00/UniXNU-j716f](https://github.com/Denis0x00/UniXNU-j716f) | a QCA6390 (same ath11k/MHI/BHI family) taken to `en0`, `wifid` and a host `wpa_supplicant` | listed device-verified on the tracker (`unixnu.com/devices/j716f`, iPadOS 17.7.11); code not read here | not checked |
 | [Mesa](https://gitlab.freedesktop.org/mesa/mesa) (`freedreno`, `turnip`) | the GLES driver on the Adreno and the Vulkan driver behind Metal2Vulkan | `FD725` GLES and `Turnip Adreno (TM) 725` measured on the phone | MIT |
 | [DenialOfGravity/ios-redfin](https://github.com/DenialOfGravity/ios-redfin) | native `HakiosMetal`, the Venus video encoder/decoder, MPSS/IPA/QRTR, camera and sensor services | device-verified on the Pixel 5 | MIT |
 | [Emilelu/UniXNU-mondrian](https://github.com/Emilelu/UniXNU-mondrian) | a sibling port for the same phone: boot args, IOSurface pitch, PMIC-GLINK battery | read 2026-11-20; facts only, no code imported | BSD-2-Clause-Patent |
@@ -28,9 +30,23 @@ separates a device-verified result from code that was only read.
   (`PongWifiPlatform.cpp` for PCIe0/PHY/rails/MSI, `ath11k/PongAth11k.c` for
   the real ath11k PCI/MHI/QMI and `PongWifiNet.cpp` for the ifnet/Apple80211
   side), `configs/zizhan-wifi-sm8475.json` for the board facts, and
-  `docs/progress/2026-11-05-wifi-lifecycle.md` for the device evidence. The
-  SoC and the QCA6490 are the same as ours; the board constants still come
-  from our live DT.
+  `docs/progress/2026-11-03-wifi-bringup.md` plus `2026-11-05-wifi-lifecycle.md`
+  for the device evidence. The SoC and the QCA6490 are the same as ours; the
+  board constants still come from our live DT.
+- **The donor's Wi-Fi ladder is the same wall.** g272 stopped on
+  `ArmSmmu4KStateMismatch` with `SCTLR=0` until the context used the shared ASID
+  (`0x1c01` in TTBR0), a low-32-bit TBI policy and a lease against UFS, and
+  wrote TCR2/TCR before TTBR0 (`SCTLR=0x27`, `TCR2=0x38071` once working); g274
+  then reached QCN6855 hw2.1 and QMI, g275 scanned. Its WMI stall was a
+  `wait_event_timeout` whose condition sent twice. Two limits: its RX is
+  polled rather than a real GIC MSI, and native Settings joins took two more
+  days of `wifid` work.
+- **BHI is not hand-written there.** The donor compiles Linux v7.0.14
+  `drivers/bus/mhi/host/boot.c`, so that file is the authority for the split we
+  implement: the first `min(sbl_size, file)` bytes over BHI, the remaining
+  segments over BHIe, `BHI_STATUS` cleared before the doorbell, a random
+  non-zero 30-bit session id, success at the top two bits `0x2`, and a 50 s
+  timeout.
 - **Haptics.** `akshaynexus/iOSPlus10`: `patches/xnu/0300-negroni-haptic-direct-play.patch`,
   `0302` and `0303`, `bsd/dev/negroni_haptic.c` and `docs/haptics-plan.md`. It
   is the same PM8350B block and it supplies the PBS/SDAM hBoost vote that our

@@ -21,10 +21,10 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   ABL spends one retry per boot: after seven `slot-unbootable:b:yes` refuses
   every image, and `fastboot set_active b` resets flag and budget (AGENTS.md).
   From iOS the ring's `reboot` writes the BCB with raw blocks, then the PMK8350
-  restart reason on a 500 ms-bounded thread (`0453`, `0457`), then PSCI: the
-  SPMI arbiter can stall for good and the port died with it. `hardreset` is
-  that path minus the HFS sync; ABL reads the reason, a BCB alone boots the
-  active slot, and a `boot_b` fallback costs an HFS repair.
+  restart reason on its own thread, then PSCI. ABL reads the reason, so a BCB
+  alone boots the active slot; the write takes about 2 s here and the old 500 ms
+  bound was too short, which is why resets landed on `boot_b` (`mondrianreasonms`
+  sets the bound). `hardreset` is that path minus the HFS sync.
 
   **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
   OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
