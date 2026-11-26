@@ -1,0 +1,89 @@
+xnu 0470: map the worker's windows on the boot thread
+
+Measured 2026-11-26: with 0468/0469 in, the wifi worker stops at
+`W4 BAR map done` on every boot, inside the first `wifi_ahb_page()` -- an
+`ml_io_map()` -- while `wifistat` reads the same BAR from the command thread
+without trouble. `ml_io_map()` is serialized, so a worker that maps while the
+battery thread or the boot block maps blocks in it.
+
+The BAR and the four AHB pages are now mapped by `mondrian_wifi_premap()` from
+the boot probe block, before the SPMI key thread and before the worker exists;
+`wifi_map_once()` and `wifi_ahb_page()` then return the cached windows inside
+the worker. Each step logs its virtual address, so a block names the page.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index bb4cfcb..97bebd9 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2401,6 +2401,7 @@ mondrian_log_start(void)
+ 		extern void mondrian_bt_ctl_init(void);
+ 		extern void mondrian_spmi_probe(void);
+ 		extern void mondrian_reset_reason_init(void);
++		extern void mondrian_wifi_premap(void);
+ 
+ 		/*
+ 		 * Both map MMIO and must run before any worker that maps: the
+@@ -2410,6 +2411,7 @@ mondrian_log_start(void)
+ 		 * probe starts only reads windows these calls mapped.
+ 		 */
+ 		mondrian_reset_reason_init();
++		mondrian_wifi_premap();
+ 		mondrian_spmi_probe();
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 5d11a3c..914815d 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2247,6 +2247,42 @@ wifi_cold_link(void)
+ 	return 0;
+ }
+ 
++/*
++ * Every window the worker touches is mapped here, on the boot thread, before
++ * the worker and the SPMI key thread exist: ml_io_map() is serialized and a
++ * worker that maps while another thread maps blocks in it for good (measured
++ * 2026-11-26: the worker stopped at `W4 BAR map done`, while `wifistat` read
++ * the same BAR from the command thread). Each step logs, because a block here
++ * names the page instead of the whole stage.
++ */
++void
++mondrian_wifi_premap(void)
++{
++	static const uint32_t ahb[] = {
++		0x1f8031c,	/* qfprom, warm, cause */
++		0x1e08228,	/* int clear, PARF LTSSM */
++		0x1e402bc,	/* GCC PCIe hot reset */
++		0x3008,		/* global reset */
++	};
++	uint32_t enabled = 0;
++	unsigned int i;
++
++	if (!PE_parse_boot_argn("mondrianwifi", &enabled, sizeof(enabled)) ||
++	    enabled != 1) {
++		return;
++	}
++	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
++	wifi_log("W4 premap bar va=0x%lx", (unsigned long)wifi_bar);
++	mondrian_log_flush_now();
++	for (i = 0; i < sizeof(ahb) / sizeof(ahb[0]); i++) {
++		vm_offset_t page = wifi_ahb_page(ahb[i]);
++
++		wifi_log("W4 premap ahb 0x%x va=0x%lx", ahb[i],
++		    (unsigned long)page);
++		mondrian_log_flush_now();
++	}
++}
++
+ static void __dead2
+ mondrian_wifi_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -2324,4 +2360,9 @@ mondrian_wifi_start(void)
+ {
+ }
+ 
++void
++mondrian_wifi_premap(void)
++{
++}
++
+ #endif /* MONDRIAN */
