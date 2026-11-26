@@ -64,18 +64,18 @@ Current blockers, in order:
 
 1. **Wi-Fi link, SMMU, MHI and BHI proven; the firmware is next.** W1 reaches
    Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01`; W3 assigns BAR0
-   and proves bus master; W4 reads MHI; W5 reads BHI 1.2 in PBL (`execenv=0`,
-   `segs=1`). The image load, QMI/ath11k, ADSP/codec/PCM and camera remain absent.
+   and proves bus master; W4/W5 read MHI and BHI 1.2. Skipping the shared
+   ARC/XO/NoC votes leaves the worker up for minutes, so the BHI image load is
+   the open question; QMI/ath11k, ADSP/codec/PCM and camera remain absent.
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics: direct play is silent.** `hapb 0` then `hapb 1` lifts the boost
-   (`0x80`/`0x01`), fault is 0 and `0x498` is programmed, but two 2 s tones at
-   `0xff` moved nothing (felt). Next: the stock PTN click pattern.
-4. **Brightness.** The panel takes the DCS write (`0305`), but iOS does not
-   drive it: the Display & Brightness slider moves nothing (`docs/MONDIAN_POWER.md`).
-5. **Stability.** A failed boot leaves the HFS volume to repair, and a warm
-   reboot can leave the boot core unstarted (`docs/MONDIAN_GPU.md`).
+3. **Haptics: direct play is silent.** `hapb 0` then `hapb 1` lifts the boost,
+   fault is 0 and `0x498` is programmed, but two 2 s tones at `0xff` moved
+   nothing (felt). `hapclick` stages the DT's PTN click; its first live run
+   wedged the ring thread on one SPMI transaction (ping still answers).
+4. **Brightness.** The panel takes the DCS write (`0305`); the iOS slider moves nothing (`docs/MONDIAN_POWER.md`).
+5. **Stability.** A failed boot leaves the HFS volume to repair; a warm reboot can leave the boot core unstarted (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 

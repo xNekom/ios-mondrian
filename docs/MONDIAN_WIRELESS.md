@@ -78,6 +78,17 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `gfsr=0` and `s2cr=0x4a/0x4a`. The PBL never polls.
 - `0444` adds the first half of ath11k's power-on reset (`LTSSM 0x111`,
   `GCC_PCIE_HOT_RST`) and `ath11k_mhi_clear_vector`, which `0438` skipped.
+- `0445`/`0446` test the endpoint interrupt: preserving the ROM's
+  `BHI_INTVEC=0xffffffff` changes nothing, and arming the endpoint's MSI
+  (capability `0x50`, 64-bit) on a page inside the wired buffer with bus
+  mastering before the reset still leaves `BHI_STATUS=0x0` and the doorbell
+  retained for 10000 polls. The PBL has not fetched. `0447` reads
+  `TCSR 0x224=0x400c1211` (`hw_major=2`) and selects the donor's hw2.0 image
+  `amss20.bin` (5,296,128 B); the boot that loads it (`image=0x50d000`) reports
+  the same `BHI_STATUS=0x0`, `BHI_ERRCODE=0x0` and `MSI page=0x0`, so the image
+  is not what the PBL waits for. `wififw` is one-shot per boot: a second load
+  selects the new file but W2 refuses the re-route (`sid2 0x1c00 conflicts
+  slot 7`), so a firmware change needs a reboot.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
