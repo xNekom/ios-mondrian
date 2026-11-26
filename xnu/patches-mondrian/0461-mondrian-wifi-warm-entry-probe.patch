@@ -1,0 +1,63 @@
+xnu 0461: does the fetched image execute
+
+Measured 2026-11-26: with the SMMU map cut to the 512 KiB BHI advertises, no
+read faults, so the PBL performs one sequential transfer and does not load ELF
+segments by offset. The image therefore lands in SRAM as a blob; whether the
+code at the entry point runs is a separate question from whether the doorbell
+was consumed.
+
+The WLAON cookie and warm entry are cleared before the doorbell and written by
+the firmware that starts afterwards. Reading them at +100 ms and after the 10 s
+poll separates "the blob was fetched and executed" from "the blob was fetched
+and never ran", which is the difference between a broken BHIe handoff and a
+blob the ROM cannot enter.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 8e358cd..87775fd 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1804,13 +1804,26 @@ mondrian_wifi_load_amss(void)
+     wifi_bhi_dump("db+100ms", bhioff);
+     {
+         uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
+-        uint32_t s2cr = 0, s2cr2 = 0;
++        uint32_t s2cr = 0, s2cr2 = 0, cookie = 0, warm = 0, cause = 0;
++        uint32_t qfprom = 0;
+ 
+         if (mondrian_wifi_smmu_fault(&sctlr, &fsr, &far, &fsynr, &gfsr,
+             &s2cr, &s2cr2) == 0) {
+             wifi_log("W11 smmu db+100ms fsr=0x%x far=0x%x gfsr=0x%x"
+                 " fsynr=0x%x", fsr, far, gfsr, fsynr);
+         }
++        /*
++         * W12: the PBL leaves the warm entry alone; the image that follows
++         * writes the cookie and the warm entry when it starts. Zero here after
++         * the doorbell is a fetched image that never executed, whatever
++         * BHI_STATUS says.
++         */
++        (void)wifi_ahb_read32(0x1f80500, &cookie);
++        (void)wifi_ahb_read32(0x1f80504, &warm);
++        (void)wifi_ahb_read32(0x1f8060c, &cause);
++        (void)wifi_ahb_read32(0x1f8031c, &qfprom);
++        wifi_log("W12 db+100ms cookie=0x%x warm=0x%x cause=0x%x qfprom=0x%x",
++            cookie, warm, cause, qfprom);
+     }
+     mondrian_log_flush_now();
+     for (i = 0; i < 10000; i++) {
+@@ -1828,6 +1841,16 @@ mondrian_wifi_load_amss(void)
+     }
+     wifi_log("W6 BHI status=0x%x errcode=0x%x polls=%u", status, errcode,
+         i);
++    {
++        uint32_t cookie = 0, warm = 0, cause = 0;
++
++        (void)wifi_ahb_read32(0x1f80500, &cookie);
++        (void)wifi_ahb_read32(0x1f80504, &warm);
++        (void)wifi_ahb_read32(0x1f8060c, &cause);
++        wifi_log("W12 db+10s cookie=0x%x warm=0x%x cause=0x%x", cookie,
++            warm, cause);
++        mondrian_log_flush_now();
++    }
+     if ((status >> 30) == 3) {
+         uint32_t d1 = 0, d2 = 0, d3 = 0;
+ 

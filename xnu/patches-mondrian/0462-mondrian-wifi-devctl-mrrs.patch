@@ -1,0 +1,63 @@
+xnu 0462: match the donor max read request size
+
+The donor's working SM8475 boot writes the endpoint's PCIe device control to
+0x0810 before the load (relaxed ordering, no snoop, max read request size 128
+bytes) and logs the 0x2810 it replaced. This port never touches the register,
+so the endpoint issues 512-byte reads throughout the BHI transfer.
+
+Measured 2026-11-26: the PBL consumes the doorbell and reads inside the 512 KiB
+it was told about, yet BHI_STATUS never leaves 0 and the fetched image writes no
+warm-entry cookie. A transfer that is answered but never completes is what a
+device-side read engine mishandling the completion split looks like, so this
+boot sets the same 0x0810 when mondrianwifimrrs=1 and logs the before/after.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 87775fd..16bb8db 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1422,6 +1422,21 @@ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+  * an ordinary DMA write this kernel can poll and log. The donor retains the
+  * same kind of landing page for the QCA6490 (Iova+0x40 there).
+  */
++static uint8_t
++wifi_pcie_cap(void)
++{
++	uint8_t cap = (uint8_t)(wifi_read8(wifi_cfg, 0x34) & ~3u);
++	int i;
++
++	for (i = 0; i < 32 && cap >= 0x40; i++) {
++		if (wifi_read8(wifi_cfg, cap) == 0x10) {
++			return cap;
++		}
++		cap = (uint8_t)(wifi_read8(wifi_cfg, cap + 1) & ~3u);
++	}
++	return 0;
++}
++
+ static int
+ wifi_msi_enable(uint64_t page_iova)
+ {
+@@ -1778,6 +1793,23 @@ mondrian_wifi_load_amss(void)
+             bhi_iova = 0x0bad0000ull;
+             image_size = 0x1000;
+         }
++        {
++            int mrrs = 0;
++
++            if (PE_parse_boot_argn("mondrianwifimrrs", &mrrs,
++                sizeof(mrrs)) && mrrs != 0) {
++                uint8_t cap = wifi_pcie_cap();
++                uint16_t old = 0, new = 0;
++
++                if (cap != 0) {
++                    old = wifi_read16(wifi_cfg, cap + 0x08);
++                    wifi_write16(wifi_cfg, cap + 0x08, 0x0810);
++                    new = wifi_read16(wifi_cfg, cap + 0x08);
++                }
++                wifi_log("W13 devctl cap=0x%x 0x%x -> 0x%x", cap, old, new);
++                mondrian_log_flush_now();
++            }
++        }
+         rc = mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+         rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
