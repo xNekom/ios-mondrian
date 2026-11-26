@@ -1,0 +1,99 @@
+xnu 0478: map the eusb2 page once and keep the pin premap early
+
+Measured 2026-11-26: `0477` prints `MONDR USB: eUSB2 map start` and `eUSB2 done`
+but never `W4 premap pins`, so mapping the pin pages inside `usb_probe()` blocks.
+`0475`/`0476` had the pins mapped at the top of the block and then stopped at the
+eUSB2 map. The common fault is one page mapped twice: `mondrian_usb_probe()`
+maps `EUSB2_PA` in `mondrian_usb_gadget_start()` and again in its own eUSB2
+block, and the duplicate `ml_io_map()` is the call that wedges.
+
+`usb_eusb2_page()` maps it once and all three readers share it. The pin premap
+returns to the top of `mondrian_wifi_premap()`, where it completes, and the
+worker still starts inside `mondrian_usb_probe()` with every window premapped;
+the late `premap_pins` call is gone.
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 3add013..3ffb73c 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -83,6 +83,25 @@ static void mondrian_usb_gadget_start(vm_offset_t dwc);
+ #define QSCRATCH_PAGE_PA	(DWC3_PA + 0x000f8000UL)	/* QSCRATCH_PA rounded down */
+ #define QSCRATCH_OFF		(QSCRATCH_PA - QSCRATCH_PAGE_PA)
+ #define EUSB2_PA		0x088e3000UL
++
++/*
++ * The eUSB2 PHY page is mapped once: the probe maps it, then
++ * mondrian_usb_gadget_start() and the power-down path read it. A second
++ * ml_io_map() of the same page is the class of call that wedges the mapper
++ * (measured 2026-11-26: the probe's eUSB2 block ran in some boots and not in
++ * others with no code change).
++ */
++static vm_offset_t usb_eusb2_phy;
++
++static vm_offset_t
++usb_eusb2_page(void)
++{
++
++	if (usb_eusb2_phy == 0) {
++		usb_eusb2_phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++	}
++	return usb_eusb2_phy;
++}
+ #define GCC_QUSB2_PHY_PA	0x00122000UL	/* GCC_QUSB2PHY_PRIM_BCR (reset 21) */
+ 
+ /* GCC, SM8450 layout (Linux gcc-sm8450.c), offsets from the pages above. */
+@@ -240,7 +259,7 @@ mondrian_usb_probe(void)
+ 
+ 	printf("MONDR USB: eUSB2 map start\n");
+ 	{
+-		vm_offset_t phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++		vm_offset_t phy = usb_eusb2_page();
+ 
+ 		if (phy == 0) {
+ 			printf("MONDR USB: eUSB2 PHY map failed\n");
+@@ -267,16 +286,9 @@ mondrian_usb_probe(void)
+ 	 * resets the phone, the SMR/S2CR work is the one in anonbeat1's
+ 	 * 0091-sweet-spacewar-usb-net-smmu.patch (reuse ABL's SMR for the SID).
+ 	 */
+-	/*
+-	 * Every wifi window is premapped by now; the pin pages are mapped here
+-	 * because mapping them at the top of the boot probe block stops the
+-	 * block at the eUSB2 map (measured 2026-11-26).
+-	 */
+ 	{
+-		extern void mondrian_wifi_premap_pins(void);
+ 		extern void mondrian_wifi_start(void);
+ 
+-		mondrian_wifi_premap_pins();
+ 		mondrian_wifi_start();
+ 		printf("MONDR USB: probe done\n");
+ 	}
+@@ -3333,7 +3345,7 @@ mondrian_usb_gadget_start(vm_offset_t dwc)
+ 	 * point). Its registers answer 0x09090909 until APB access is opened
+ 	 * by whoever initializes it, which is ABL in the fastboot case.
+ 	 */
+-	vm_offset_t phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++	vm_offset_t phy = usb_eusb2_page();
+ 
+ 	if (phy != 0) {
+ 		printf("MONDR USB: eusb2 0x54 0x%08x 0x5c 0x%08x 0x60 0x%08x 0xb8 0x%08x 0x130 0x%08x\n",
+@@ -3597,7 +3609,7 @@ mondrian_usb_stop(void)
+ 	 * what an unclocked block reads back as.
+ 	 */
+ 	{
+-		vm_offset_t phy = ml_io_map(EUSB2_PA, PAGE_SIZE_4K);
++		vm_offset_t phy = usb_eusb2_page();
+ 
+ 		if (phy != 0 && usb_rd(phy, EUSB2_HS_PHY_COMMON0) != 0x09090909u) {
+ 			/* PHY_ENABLE|RETENABLEN off */
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index d300a39..53dee92 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2313,6 +2313,7 @@ mondrian_wifi_premap(void)
+ 	    enabled != 1) {
+ 		return;
+ 	}
++	mondrian_wifi_premap_pins();
+ 	(void)wifi_map_once(&wifi_bar, WIFI_BAR_BASE, WIFI_BAR_MAP);
+ 	(void)wifi_map_once(&wifi_parf, WIFI_PARF_PA, WIFI_PARF_SIZE);
+ 	(void)wifi_map_once(&wifi_phy, WIFI_PHY_PA, WIFI_PHY_SIZE);
