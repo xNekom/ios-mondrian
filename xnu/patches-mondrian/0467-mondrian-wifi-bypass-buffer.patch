@@ -1,0 +1,129 @@
+xnu 0467: read the bypass image from kernel memory, not a guessed framebuffer
+
+Measured 2026-11-26: `W15` stopped at `W6 bus master command=0x6` because its
+first statement, `ml_io_map(0xb8000000)`, is the zizhan splash framebuffer and
+not this board's. The mapping wedged the worker, and the reset with it.
+
+The bypass probe now takes 64 KiB of contiguous kernel memory, rejects a
+physical page outside the SMMU's 36-bit output and programs both halves of
+`BHI_IMGADDR`. `W15 start` is logged before the allocation and the buffer's
+physical address after it, so the next hang names its step.
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 0aad156..5d11a3c 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1411,6 +1411,7 @@ wifi_w10_probe(void)
+ extern int mondrian_root_read(const char *, void *, unsigned, off_t);
+ extern int mondrian_wifi_smmu_map_va(vm_offset_t, vm_size_t, uint64_t *);
+ extern int mondrian_wifi_smmu_bypass(int on);
++extern vm_offset_t mondrian_wifi_smmu_contig(vm_size_t, uint64_t *);
+ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+     uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+ 
+@@ -1852,30 +1853,42 @@ mondrian_wifi_load_amss(void)
+ 
+             /*
+              * W15: one 64 KiB transfer with the SID routed around the tables,
+-             * from the ABL's contiguous splash framebuffer at 0xb8000000. With
+-             * bypass the device reads host physical memory directly, so an ack
+-             * here and silence through translation names the table.
++             * from a buffer the kernel allocated and mapped. With bypass the
++             * device reads host physical memory directly, so an ack here and
++             * silence through translation names the table. The first version
++             * used the ABL framebuffer at 0xb8000000, a zizhan address that is
++             * not this board's: ml_io_map() of it wedged the worker and the
++             * reset with it (measured 2026-11-26).
+              */
+             if (PE_parse_boot_argn("mondrianwifibypass", &bp,
+                 sizeof(bp)) && bp != 0) {
+-                vm_offset_t fb = ml_io_map(0xb8000000UL, 0x10000);
++                uint64_t pa = 0;
++                vm_offset_t mem;
+ 
+-                if (fb == 0) {
+-                    wifi_log("W15 no window for the framebuffer");
++                wifi_log("W15 start");
++                mondrian_log_flush_now();
++                mem = mondrian_wifi_smmu_contig(0x10000, &pa);
++                if (mem == 0) {
++                    wifi_log("W15 no contiguous 64 KiB buffer");
++                    mondrian_log_flush_now();
+                 } else {
+                     uint32_t st = 0, er = 0;
+                     int rc2;
+ 
+-                    memcpy((void *)fb, (const void *)buf, 0x10000);
+-                    flush_dcache64((addr64_t)fb, 0x10000, 0);
++                    memcpy((void *)mem, (const void *)buf, 0x10000);
++                    flush_dcache64((addr64_t)mem, 0x10000, 0);
++                    wifi_log("W15 buffer pa=0x%llx",
++                        (unsigned long long)pa);
++                    mondrian_log_flush_now();
+                     rc2 = mondrian_wifi_smmu_bypass(1);
+-                    wifi_log("W15 bypass rc=%d pa=0xb8000000", rc2);
++                    wifi_log("W15 bypass rc=%d", rc2);
+                     mondrian_log_flush_now();
+                     (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x20, 0);
+                     (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x2c, 0);
+-                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c, 0);
++                    (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x0c,
++                        (uint32_t)(pa >> 32));
+                     (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x08,
+-                        0xb8000000u);
++                        (uint32_t)pa);
+                     (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x10,
+                         0x10000);
+                     (void)mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18,
+@@ -1888,6 +1901,7 @@ mondrian_wifi_load_amss(void)
+                     wifi_log("W15 bypass status=0x%x err=0x%x", st, er);
+                     mondrian_log_flush_now();
+                     (void)mondrian_wifi_smmu_bypass(0);
++                    kmem_free(kernel_map, mem, 0x10000);
+                 }
+             }
+         }
+diff --git a/bsd/dev/mondrian_wifi_smmu.c b/bsd/dev/mondrian_wifi_smmu.c
+index add6761..ff9f9ec 100644
+--- a/bsd/dev/mondrian_wifi_smmu.c
++++ b/bsd/dev/mondrian_wifi_smmu.c
+@@ -815,6 +815,40 @@ mondrian_wifi_smmu_map_va(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
+  * with a matching FAR means the BHI read reached the SMMU and the page table
+  * is wrong; a clean FSR with a stuck doorbell means the device never fetched.
+  */
++/*
++ * W15: a physically contiguous buffer the endpoint can read with the SID in
++ * bypass. ml_io_map() of a guessed physical address wedged the worker and, in
++ * the same boot, the reset path with it (measured 2026-11-26), so the bypass
++ * image comes from memory the kernel owns and has already mapped.
++ */
++vm_offset_t
++mondrian_wifi_smmu_contig(vm_size_t bytes, uint64_t *pa)
++{
++    vm_offset_t va = 0;
++    ppnum_t pn;
++    uint64_t phys;
++
++    if (kmem_alloc_contig(kernel_map, &va, bytes, 0x3fff, 0, 3,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) !=
++        KERN_SUCCESS) {
++        return 0;
++    }
++    pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++    if (pn == 0) {
++        kmem_free(kernel_map, va, bytes);
++        return 0;
++    }
++    phys = ptoa_64(pn);
++    if (phys >= W2_PHYS_LIMIT || bytes > W2_PHYS_LIMIT - phys) {
++        kmem_free(kernel_map, va, bytes);
++        return 0;
++    }
++    if (pa != 0) {
++        *pa = phys;
++    }
++    return va;
++}
++
+ /*
+  * W15: route this stream around the tables for one experiment. With bypass the
+  * device reads host physical memory directly, so a transfer that completes

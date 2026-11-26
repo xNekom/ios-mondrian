@@ -1,0 +1,81 @@
+xnu 0466: map the restart reason once, from the boot path
+
+Measured 2026-11-26: with the wifi worker wedged inside `ml_io_map()`, the
+reset thread printed `reason thread start` and never reached SPMI, the 30 s
+bound expired without the reason and ABL booted the active slot. The IMEM
+mapping was taken inside the reset path, so a driver holding the map lock
+costs the fastboot landing.
+
+The IMEM word is mapped once in the boot probe block and reused; the PMIC
+write, which is what this bootloader reads, runs either way. A reset can no
+longer deadlock behind another `ml_io_map()`.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 2c415c0..ae96660 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -1635,27 +1635,43 @@ static int mondrian_reset_reason_set;
+  * gadget is still up: a hang here then leaves the ring readable instead
+  * of a black panel with no USB.
+  */
++static vm_offset_t mondrian_imem_va;
++
++/*
++ * Map the IMEM restart-reason word once, from the boot path. Doing it inside
++ * the reset path deadlocks: a driver already stuck in ml_io_map holds the map
++ * lock, so the reason thread never reaches SPMI, the wait expires without the
++ * reason and ABL boots the active slot instead of fastboot (measured
++ * 2026-11-26: a wedged Wi-Fi worker cost three resets).
++ */
++void
++mondrian_reset_reason_init(void)
++{
++	if (mondrian_imem_va == 0) {
++		mondrian_imem_va = ml_io_map(0x146aa000, 0x1000);
++	}
++}
++
+ static void
+ mondrian_set_reset_reason(int recovery)
+ {
+ 	extern int mondrian_spmi_set_restart_reason(uint8_t reason);
+-	vm_offset_t imem;
+ 
+ 	if (mondrian_reset_reason_set != 0) {
+ 		return;
+ 	}
+ 	mondrian_reset_reason_set = 1;
+-	imem = ml_io_map(0x146aa000, 0x1000);
+ 
+ 	/*
+ 	 * The PMIC's restart reason is what the bootloader reads (0309):
+ 	 * 2 sends it to fastboot, 1 to recovery. The IMEM word is the older
+ 	 * interface -- 0x77665500 fastboot, 0x77665502 recovery -- and it is
+-	 * kept because a bootloader revision that predates the SDAM cell may
+-	 * still look there.
++	 * kept, from the mapping prepared at boot, because a bootloader
++	 * revision that predates the SDAM cell may still look there. A reset
++	 * with no prepared mapping still writes the PMIC reason.
+ 	 */
+-	if (imem != 0) {
+-		*(volatile uint32_t *)(imem + 0x65c) =
++	if (mondrian_imem_va != 0) {
++		*(volatile uint32_t *)(mondrian_imem_va + 0x65c) =
+ 		    recovery ? 0x77665502u : 0x77665500u;
+ 		__builtin_arm_dsb(0xf);
+ 	}
+@@ -2384,6 +2400,7 @@ mondrian_log_start(void)
+ 		extern void mondrian_bt_tty_init(void);
+ 		extern void mondrian_bt_ctl_init(void);
+ 		extern void mondrian_spmi_probe(void);
++		extern void mondrian_reset_reason_init(void);
+ 
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+@@ -2392,6 +2409,7 @@ mondrian_log_start(void)
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
++		mondrian_reset_reason_init();
+ 		mondrian_spmi_probe();
+ 	}
+ }
