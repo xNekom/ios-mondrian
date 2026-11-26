@@ -1,0 +1,40 @@
+xnu 0469: map the boot windows before any worker that maps
+
+Measured 2026-11-26: with 0468 in, the wifi worker stopped at
+`W4 BAR map done` instead of reaching the firmware load. `mondrian_wifi_start()`
+is called inside `mondrian_usb_probe()`, so the worker runs while the boot
+probe block still maps the restart-reason IMEM and the SPMI SDAM window; a
+second `ml_io_map()` racing a worker that maps wedges both (the same trap that
+stalls a late 1 MiB BAR map).
+
+The two mappings now happen before `mondrian_gpu_probe()` and the USB probe, so
+every boot-time window is in place before any thread starts.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index ae96660..bb4cfcb 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2402,6 +2402,15 @@ mondrian_log_start(void)
+ 		extern void mondrian_spmi_probe(void);
+ 		extern void mondrian_reset_reason_init(void);
+ 
++		/*
++		 * Both map MMIO and must run before any worker that maps: the
++		 * wifi thread starts inside mondrian_usb_probe(), and a second
++		 * ml_io_map() racing it wedges both (measured 2026-11-26, the
++		 * worker stopped at `W4 BAR map done`). The key thread the SPMI
++		 * probe starts only reads windows these calls mapped.
++		 */
++		mondrian_reset_reason_init();
++		mondrian_spmi_probe();
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
+@@ -2409,8 +2418,6 @@ mondrian_log_start(void)
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
+-		mondrian_reset_reason_init();
+-		mondrian_spmi_probe();
+ 	}
+ }
+ 

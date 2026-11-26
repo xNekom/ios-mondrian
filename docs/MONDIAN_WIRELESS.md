@@ -158,6 +158,20 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `0418` already programs (`SCTLR=0x27`, `TCR2=0x38071`, ASID `0x1c01` in
   TTBR0), so the context is not what differs; the donor's ladder and the Linux
   MHI reference are in `docs/REFERENCE_PORTS.md`.
+- `0465`'s bypass probe used the zizhan splash address (`0xb8000000`, not this
+  board's): measured 2026-11-26, `ml_io_map()` of it wedged the worker at its
+  first statement and the reset's own mapping with it, so the reset lost the
+  reason and landed on `boot_b`. `0467` takes the image from 64 KiB of
+  contiguous kernel memory and programs both halves of `BHI_IMGADDR`.
+- The reset's two mappings -- the IMEM word and the SPMI SDAM window -- are now
+  taken in the boot probe block, before any worker (`0466`, `0468`, `0469`),
+  because a second `ml_io_map()` racing a worker that maps wedges both.
+  Measured 2026-11-26: `restart window ready apid 412`, and the ring's `reboot`
+  with the Wi-Fi driver loaded lands in fastboot in 4 s.
+- Expected, not proven: with the 20 s auto-load delay the worker stops before
+  `wifi_w10_probe()`'s first line, so the first TLMM/config access after the
+  endpoint idles does not return. `mondrianwifidelay=0` is the workaround until
+  the link is kept awake across the delay.
 
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live

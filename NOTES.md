@@ -18,13 +18,13 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   (1440x3200, stride 5760). Build with `SMALL_SHIM=1`; why is in the shim trap.
 - **Fastboot, and the only way back to it.** `fastboot devices` answers in the
   bootloader's fastboot (power + volume down); fastbootd refuses `fastboot boot`.
-  ABL spends one retry per boot: after seven `slot-unbootable:b:yes` refuses
-  every image, and `fastboot set_active b` resets flag and budget (AGENTS.md).
+  ABL allows seven `slot-unbootable:b:yes`; `fastboot set_active b` resets them.
   From iOS the ring's `reboot` writes the BCB with raw blocks, then the PMK8350
-  restart reason on its own thread, then PSCI. ABL reads the reason, so a BCB
-  alone boots the active slot; the write takes about 2 s here and the old 500 ms
-  bound was too short, which is why resets landed on `boot_b` (`mondrianreasonms`
-  sets the bound). `hardreset` is that path minus the HFS sync.
+  restart reason on its own thread, then PSCI; `hardreset` is that minus the
+  HFS sync. ABL reads the reason, so a BCB alone boots the active slot, and a
+  reset whose reason write stalls lands on `boot_b`. Both mappings that write
+  needs -- IMEM and the PMIC SDAM window -- are taken at boot (`0466`, `0468`);
+  doing either inside the reset cost 2 s and deadlocked behind a wedged driver.
 
   **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
   OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
