@@ -1,0 +1,64 @@
+xnu 0484: start the wifi worker when the gadget threads exist
+
+Measured 2026-11-26: `wifistage 1` on 0481-0483 while `wifistage` itself
+answered. The command thread is created inside `mondrian_usb_gadget_start()`,
+so a live command channel with a missing worker means `mondrian_usb_probe()`
+never returns -- it stops in the eUSB2 read block that follows the gadget
+start, and the block-level `mondrian_wifi_start()` is never reached.
+
+The worker now starts immediately after `mondrian_usb_gadget_start()`, before
+the eUSB2 block. Every window it uses is premapped by `mondrian_wifi_premap()`
+on the boot thread, and the remaining probe code only reads pages that are
+already mapped.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 4c8bd7a..fe2fb0f 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2402,7 +2402,6 @@ mondrian_log_start(void)
+ 		extern void mondrian_spmi_probe(void);
+ 		extern void mondrian_reset_reason_init(void);
+ 		extern void mondrian_wifi_premap(void);
+-		extern void mondrian_wifi_start(void);
+ 
+ 		/*
+ 		 * The premap takes every window the wifi worker touches before
+@@ -2417,15 +2416,6 @@ mondrian_log_start(void)
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
+-		/*
+-		 * Start here, before the audio/Venus/BT tail: the block has been
+-		 * measured to stop in that tail when the pin premap runs first
+-		 * (0481/0482: `wifistage 1`, the worker never reached stage 2),
+-		 * while starting inside `usb_probe` reached `worker started`
+-		 * (0480). Every window the worker uses is premapped above, so it
+-		 * takes no ml_io_map() and cannot race the tail.
+-		 */
+-		mondrian_wifi_start();
+ 		mondrian_audio_probe_start();
+ 		mondrian_venus_start();
+ 		mondrian_bt_tty_init();
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 332b2fb..702775b 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -243,6 +243,19 @@ mondrian_usb_probe(void)
+ 		    usb_rd(dwc, DWC3_GUCTL), usb_rd(dwc, DWC3_GUCTL1));
+ 		if (usb >= 2) {
+ 			mondrian_usb_gadget_start(dwc);
++			/*
++			 * The gadget threads (events, log, commands) exist from here
++			 * on, and the rest of this probe only reads windows that are
++			 * already mapped. The block that follows this function has
++			 * been measured to stop before its `mondrian_wifi_start()`
++			 * call (0481-0483: `wifistage 1` while `wifistage` answered),
++			 * so the worker starts here, before the eUSB2 read block.
++			 */
++			{
++				extern void mondrian_wifi_start(void);
++
++				mondrian_wifi_start();
++			}
+ 		}
+ 	}
+ 
