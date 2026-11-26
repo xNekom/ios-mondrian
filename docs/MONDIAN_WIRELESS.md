@@ -172,21 +172,29 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `wifi_w10_probe()`'s first line, so the first TLMM/config access after the
   endpoint idles does not return. `mondrianwifidelay=0` is the workaround until
   the link is kept awake across the delay.
-- `0469`-`0479` move every window the worker touches onto the boot thread,
+- `0469`-`0481` move every window the worker touches onto the boot thread,
   because `ml_io_map()` is serialized and blocks behind any other mapper.
   Measured 2026-11-26: the stop moved with each premap -- `W4 BAR map done`
   (0469), `pcie0 link up` with `qca6490 id` absent (0470), `pcie0 gdsc up`
   inside `wifi_map_host()` (0473) and `early GCC 0x62008` inside
-  `wifi_map_pins()` (0474) -- so the window was never the fault. Two traps came
-  out of the ladder: `EUSB2_PA` was mapped in three places and now has one
-  shared page (`0478`), and the TLMM pin premap wedges whatever mapping runs
-  next, so it leaves the boot block and the worker maps the pins itself as its
-  last start, after the BT registration (`0479`).
-- The driver-side ring is the XNU `msgbuf`: a boot dump carries at most about
-  200 KB and mixes late SpringBoard lines with the banner, so a missing worker
-  line does not prove the worker did not run. `wifistat` over the USB command
-  channel is the state query, and `wifibhi <size>` drives
-  `mondrian_wifi_load_amss()` from the command thread.
+  `wifi_map_pins()` (0474) -- so the window was never the fault. Three traps
+  came out of the ladder:
+  - `EUSB2_PA` was mapped in three places; one shared page (`0478`).
+  - Writing the eUSB2 PHY while it is unclocked hangs the AHB, and with it
+    `gadget_start` and the kernel command thread (`0477`: `wifistat` no answer,
+    no `probe done`). Both `eusb2_init()` sites read first and skip the writes
+    on `0x09090909`/`0xffffffff` (`0480`).
+  - The TLMM pin pages must be mapped **before touch takes the TLMM block**;
+    a later `ml_io_map()` of an already-mapped page hangs. The premap runs at
+    the top of `mondrian_wifi_premap()`, and the worker starts last, after the
+    BT registration (`0479`, `0481`).
+- The driver-side ring is the XNU `msgbuf`: it is circular, mixes late
+  SpringBoard lines with the banner, and its length varies with the boot, so a
+  missing worker line does not prove the worker did not run. `wifistat` over
+  the USB command channel is the state query, and `wifibhi <size>` drives
+  `mondrian_wifi_load_amss()` from the command thread. Do not send `wifistat`
+  before the worker has voted the rails: reading `BAR0+0x28` on a collapsed
+  device hangs the command thread.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
