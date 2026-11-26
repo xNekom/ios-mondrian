@@ -48,6 +48,35 @@ stalled the worker; one page holds MHI and BHI. Measured 2026-11-25:
 ready for a BHI image; the next step is a DMA-mapped `amss.bin`/`m3.bin` load,
 not another register read.
 
+`0425` adds that load path: `wififw` reads `/private/var/vm/amss.bin`, maps the
+wired buffer through the W2 SMMU context, enables PCI bus mastering and passes
+the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
+
+- The five PM8350/PM8350C SMPS and all four shared resources complete when
+  voted on **ACTIVE TCS4** (`mx.lvl` index 8, `cx.lvl` index 9, `xo.lvl` 3,
+  `SN7`); the earlier wedge was TCS3, which the GPU leases.
+- `RSC_DRV_STATUS` is zero while a TCS is busy and nonzero when idle; reading
+  it inverted stalled every vote at the first rail.
+- After both PCIe SIDs are routed (RID 0 → `0x1c00`, RID `0x100` → `0x1c01`),
+  the load no longer resets the SoC. The BHI image address, size and doorbell
+  read back, the WLAN SMMU FSR stays clean and `BHI_STATUS` stays `0x0`: the
+  PBL never consumes the doorbell.
+- `0438` runs ath11k's pre-load SOC reset (clear `WLAON_WARM_SW_ENTRY`,
+  `PCIE_SOC_GLOBAL_RESET`, `MHICTRL.RESET`) from `wifibhi`.
+- A 1 MiB BAR map stopped the worker at `W4 BAR map start` (256 io_submap
+  pages). `0441` maps the MHI/BHI page plus the AHB window register and caches
+  the three AHB pages the reset touches.
+
+The load is still unproven: the next boot must show W4 completing and the SOC
+reset/BHI trigger lines. Save a ring dump before the load, because a wedged
+load takes the dump with it. `0430`/`0431` carry the BHIE stage and the live
+`wifibhi`/`wifistat` commands.
+
+The shim unpacks the payload in place: a kernel carrying the 4.87 MB UI/GL
+`glblob` produced a 16.8 MB payload and never reached XNU, while 15.7 MB boots.
+Build WiFi images without the UI/GL dylibs until the payload fits the shim
+window; the `glblob` boot argument has nothing to write in that build.
+
 This document records the hardware, what the iOS userland expects, what the
 existing ports teach, and what is left.
 
