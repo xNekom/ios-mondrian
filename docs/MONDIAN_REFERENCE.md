@@ -94,7 +94,10 @@ The PON also owns the reset reasons (`pmic_pon_log`) and the power-off path.
   backed; the kernel exposes no per-sensor sysfs.
 - Thermal: 60+ zones (`pa`, `cpuss-*`, `gpuss-*`, `cpu-*`, `aoss-*`), values
   in millidegrees.
-- RTC: `rtc-pm8xxx` on the PMK8350 (`rtc@6100`), `/dev/rtc0`.
+- RTC: `rtc-pm8xxx` on the PMK8350 (`rtc@6100`), `/dev/rtc0`. The PMIC RTC
+  belongs to processor 4, so APPS can read but not set it; the port takes the
+  date from `mondriantime=<seconds>` in the boot arguments instead (stamped by
+  `tools/wsl/image.sh`, refreshed by `tools/wsl/cycle.sh`).
 
 ## Where the raw data is
 
