@@ -1,0 +1,861 @@
+xnu 0505: map the adsp pcm buffer through the audio smmu
+
+The APM accepts both graphs and all three formats, but the PCM map was
+refused because the buffer landed above 4 GiB and the map command carries
+its address as `DDR tag | low 32 bits`. The live DT routes the ADSP audio
+master through apps-SMMU stream 0x1801 (qcom,msm-audio-ion) and gives the
+vendor's 0x10000000 IOVA pool, so the buffer can stay a high DDR
+allocation: mondrian_audio_smmu.c programs a stage-1 context for SID
+0x1801 with the context image and leaf attributes the Wi-Fi W2 proof
+already exercised on this unit's apps-SMMU, maps the 16 KiB PCM buffer at
+IOVA 0x10000000 and leaves the context enabled after the probe. The
+worker maps and writes the period with the tagged IOVA and logs the
+context FSR/GFSR after the DSP's write completion.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9ea8229..f7e2186 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/mondrian_wifi.c		standard
+ bsd/dev/mondrian_wifi_smmu.c		standard
+ bsd/dev/mondrian_audio_probe.c		standard
+ bsd/dev/mondrian_adsp.c		standard
++bsd/dev/mondrian_audio_smmu.c		standard
+ bsd/dev/mondrian_glink.c		standard
+ bsd/dev/mondrian_gpr.c		standard
+ bsd/dev/mondrian_audioreach.c		standard
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index b0f8bdc..716d9ba 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -43,6 +43,7 @@ extern kern_return_t thread_terminate(thread_t);
+ #include "mondrian_glink.h"
+ #include "mondrian_gpr.h"
+ #include "mondrian_audioreach.h"
++#include "mondrian_audio_smmu.h"
+ 
+ #define ADSP_FW_PATH		"/private/var/vm/adsp.mbn"
+ #define ADSP_PAS_ID		1u
+@@ -701,6 +702,7 @@ adsp_apm_probe(void)
+ 	uint32_t length, token, handle = 0, write_token;
+ 	kern_return_t kr;
+ 	ppnum_t pn;
++	uint64_t pcm_iova = 0;
+ 	int device_open = 0, stream_open = 0, mapped = 0, started = 0;
+ 
+ 	token = ++adsp_ar_token;
+@@ -746,16 +748,14 @@ adsp_apm_probe(void)
+ 	}
+ 
+ 	/*
+-	 * The map address is `physical | (1 << 32)` and its upper word must be
+-	 * exactly 1, so the buffer has to sit in 32-bit memory. The DSP has no
+-	 * free DRAM page below 4 GiB on this unit (measured 2026-11-27:
+-	 * kmem_alloc_contig scans the page lists and finds 0), so this step is
+-	 * the one that still fails: the buffer must go through the apps-SMMU
+-	 * SID 0x1801 like the donor, which the port does not program yet.
++	 * The map command's address is `DDR tag | low 32 bits`, and the ADSP
++	 * only uses the low word. The buffer is an ordinary high DDR
++	 * allocation; the apps-SMMU maps it at the vendor audio-ion IOVA
++	 * (0x10000000) and the ADSP's audio DMA works in that 32-bit space.
++	 * No low physical page is needed.
+ 	 */
+ 	kr = kmem_alloc_contig(kernel_map, &adsp_pcm_va, ADSP_PCM_BYTES,
+-	    PAGE_SIZE - 1, (ppnum_t)0x3ffff, 0, KMA_DATA | KMA_ZERO,
+-	    VM_KERN_MEMORY_IOKIT);
++	    0x3fff, 0, 3, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
+ 	if (kr != KERN_SUCCESS) {
+ 		adsp_log("pcm allocation failed kr=0x%x", kr);
+ 		goto out;
+@@ -766,19 +766,19 @@ adsp_apm_probe(void)
+ 		goto out;
+ 	}
+ 	adsp_pcm_pa = (uint64_t)ptoa_64(pn);
+-	if (adsp_pcm_pa + ADSP_PCM_BYTES > 0x100000000ull) {
+-		adsp_log("pcm pa=0x%llx above 4 GiB",
+-		    (unsigned long long)adsp_pcm_pa);
++	adsp_pcm_fill();
++	if (mondrian_audio_smmu_map(adsp_pcm_va, ADSP_PCM_BYTES,
++	    &pcm_iova) != 0) {
++		adsp_log("audio smmu map failed");
+ 		goto out;
+ 	}
+-	adsp_pcm_fill();
+-	adsp_log("pcm va=0x%lx pa=0x%llx bytes=%u",
++	adsp_log("pcm va=0x%lx pa=0x%llx iova=0x%llx bytes=%u",
+ 	    (unsigned long)adsp_pcm_va, (unsigned long long)adsp_pcm_pa,
+-	    ADSP_PCM_BYTES);
++	    (unsigned long long)pcm_iova, ADSP_PCM_BYTES);
+ 
+ 	token = ++adsp_ar_token;
+ 	length = ar_map(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
+-	    token, adsp_pcm_pa | (1ull << 32), ADSP_PCM_BYTES);
++	    token, pcm_iova | (1ull << 32), ADSP_PCM_BYTES);
+ 	if (length == 0 || adsp_apm_map(packet, length, token, &answer) != 0) {
+ 		goto out;
+ 	}
+@@ -820,12 +820,13 @@ adsp_apm_probe(void)
+ 
+ 	write_token = 0x10000000u | (++adsp_ar_write & 0x0fffffffu);
+ 	length = ar_write(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
+-	    write_token, adsp_pcm_pa | (1ull << 32), handle, ADSP_PCM_PERIOD);
++	    write_token, pcm_iova | (1ull << 32), handle, ADSP_PCM_PERIOD);
+ 	if (length != 0 &&
+ 	    adsp_apm_write(packet, length, write_token, &answer) == 0) {
+ 		adsp_log("apm write done address=0x%llx status=%u",
+ 		    (unsigned long long)answer.address, answer.status);
+ 	}
++	mondrian_audio_smmu_report("after write");
+ 
+ out:
+ 	if (started) {
+diff --git a/bsd/dev/mondrian_audio_smmu.c b/bsd/dev/mondrian_audio_smmu.c
+new file mode 100644
+index 0000000..04fecf5
+--- /dev/null
++++ b/bsd/dev/mondrian_audio_smmu.c
+@@ -0,0 +1,717 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * MONDRIAN AUDIO SMMU: map a wired PCM buffer into the ADSP's 32-bit
++ * address space through apps-SMMU stream 0x1801.
++ *
++ * The live DT's qcom,msm-audio-ion node names <&apps_smmu 0x1801 0> and the
++ * LPASS TBU covers 0x1800-0x1bff, so 0x1801 is the ADSP audio DMA master.
++ * The apps-SMMU is the qsmmu-v500 at 0x15000000 that mondrian_wifi_smmu.c
++ * already programmed on this unit (IDR1 reports 75 banks, 128 global pages,
++ * context bank 74 at 0xca000). This file copies that programming sequence
++ * without touching the Wi-Fi state: 32-bit input / 36-bit output native 4K
++ * stage-1 context, ASID 0x1801, SMR 0x80001801, S2CR = bank.
++ *
++ * The context image is the donor's ArmSmmu4K profile (qiumochen/UniXNU-zizhan,
++ * MIT): CBAR 0x1f300, CBA2R 1, TCR 0x80803520, TCR2 0x38071, MAIR0 0xff44,
++ * SCTLR 0x27. The leaf attributes are the donor's audio range as built by
++ * ArmSmmu4KLive.c descriptor(): Normal non-cacheable, outer shareable,
++ * read/write, AF, PXN/UXN. Register facts: ARM IHI 0062D.c.
++ *
++ * The DSP never sees the DDR physical address: the map command carries
++ * `DDR tag | low32`, and the vendor's own qcom,msm-audio-ion uses the
++ * 0x10000000 IOVA pool. Passing an IOVA lets the buffer live above 4 GiB,
++ * where this unit's free contiguous pages actually are. The SMMU walks the
++ * tables we build here and returns the high physical pages.
++ *
++ * The context stays enabled for the rest of the boot. The APM graphs are
++ * closed after the probe; tearing the stream down while the DSP might still
++ * hold a reference would turn a clean test into a translation fault.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdarg.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++#include "mondrian_mmio.h"
++#include "mondrian_gpu_api.h"
++#include "mondrian_audio_smmu.h"
++
++#if defined(MONDRIAN)
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern void mondrian_log_flush_now(void);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/* dtb/mondrian-live.dtb: apps-smmu@15000000, reg base 0x100000. */
++#define AS_SMMU_PA		0x15000000UL
++#define AS_SMMU_SIZE		0x00100000UL
++#define AS_SID			0x1801u
++#define AS_ASID			0x1801u
++/* qcom,msm-audio-ion: qcom,iommu-dma-addr-pool = <0x10000000 0x10000000>. */
++#define AS_IOVA			0x10000000ULL
++#define AS_BANK_CAP		78u
++#define AS_SMR_CAP		120u
++#define AS_PHYS_LIMIT		(1ULL << 36)
++#define AS_MAX_BYTES		0x00200000u
++
++/*
++ * ArmSmmu4KLive.c descriptor() for the donor's audio range
++ * { ..., ArmSmmu4KRead | ArmSmmu4KWrite, writeback = 0, shareability = 2 }:
++ * nG | AF | page | SH outer | AP[2] (not privileged) | PXN | UXN.
++ */
++#define AS_PTE_ATTR		0x0060000000000e43ULL
++
++#define AS_SCR0			0x000u
++#define AS_IDR0			0x020u
++#define AS_IDR1			0x024u
++#define AS_IDR2			0x028u
++#define AS_GFSR			0x048u
++#define AS_SMR(n)		(0x800u + 4u * (n))
++#define AS_S2CR(n)		(0xc00u + 4u * (n))
++#define AS_CBAR(n)		(4u * (n))
++#define AS_CBA2R(n)		(0x800u + 4u * (n))
++
++#define AS_CB_SCTLR		0x000u
++#define AS_CB_TCR2		0x010u
++#define AS_CB_TTBR0		0x020u
++#define AS_CB_TTBR1		0x028u
++#define AS_CB_TCR		0x030u
++#define AS_CB_MAIR0		0x038u
++#define AS_CB_MAIR1		0x03cu
++#define AS_CB_FSR		0x058u
++#define AS_CB_FAR		0x060u
++#define AS_CB_FSYNR0		0x068u
++#define AS_CB_TLBIASID		0x610u
++#define AS_CB_TLBSYNC		0x7f0u
++#define AS_CB_TLBSTATUS		0x7f4u
++
++#define AS_FSR_FAULT		0xc00001feu
++#define AS_CBAR_VALUE		0x0001f300u
++#define AS_CBA2R_VALUE		0x00000001u
++#define AS_TCR2_VALUE		0x00038071u
++#define AS_TCR_VALUE		0x80803520u
++#define AS_MAIR0_VALUE		0x0000ff44u
++#define AS_SCTLR_VALUE		0x00000027u
++
++struct as_mem {
++	vm_offset_t raw;
++	vm_size_t raw_bytes;
++	vm_offset_t va;
++	vm_size_t bytes;
++	uint64_t pa;
++};
++
++struct as_state {
++	vm_offset_t smmu;
++	uint32_t scr0, idr0, idr1, idr2;
++	uint32_t page_bytes, global_pages, banks, smr_slots, gr1;
++	uint32_t bank, slot, cb;
++	uint32_t valid_smr, valid_s2cr;
++	uint32_t old_smr, old_s2cr;
++	int slot_reused, slot_touched, bank_touched, installed;
++	struct as_mem tables;
++	uint64_t iova;
++	vm_offset_t buffer_va;
++	vm_size_t buffer_bytes;
++	uint64_t buffer_pa;
++};
++
++static struct as_state as;
++
++static void
++as_log(const char *fmt, ...) __printflike(1, 2);
++
++static void
++as_log(const char *fmt, ...)
++{
++	char line[256];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(line, sizeof(line), fmt, ap);
++	va_end(ap);
++	printf("MONDRIAN AUDIO SMMU: %s\n", line);
++}
++
++static int
++as_rd32(uint32_t off, uint32_t *value)
++{
++	if (off > AS_SMMU_SIZE - 4 || value == NULL) {
++		return -1;
++	}
++	return mondrian_mmio_try_rd32(as.smmu + off, value);
++}
++
++static int
++as_wr32(uint32_t off, uint32_t value)
++{
++	if (off > AS_SMMU_SIZE - 4) {
++		return -1;
++	}
++	return mondrian_mmio_try_wr32(as.smmu + off, value);
++}
++
++static int
++as_rd64(uint32_t off, uint64_t *value)
++{
++	uint32_t lo, hi;
++
++	if (off > AS_SMMU_SIZE - 8 || value == NULL) {
++		return -1;
++	}
++	if (as_rd32(off, &lo) || as_rd32(off + 4, &hi)) {
++		return -1;
++	}
++	*value = (uint64_t)lo | ((uint64_t)hi << 32);
++	return 0;
++}
++
++/* TTBR is programmed as two single-register accesses, the form the Wi-Fi
++ * proof used on this unit; the high word carries the ASID. */
++static int
++as_wr64(uint32_t off, uint64_t value)
++{
++	if (off > AS_SMMU_SIZE - 8) {
++		return -1;
++	}
++	if (as_wr32(off, (uint32_t)value) ||
++	    as_wr32(off + 4, (uint32_t)(value >> 32))) {
++		return -1;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
++static int
++as_put32(uint32_t off, uint32_t want)
++{
++	uint32_t got;
++
++	if (as_wr32(off, want)) {
++		as_log("write refused off=0x%x want=0x%x", off, want);
++		return -1;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (as_rd32(off, &got) || got != want) {
++		as_log("readback mismatch off=0x%x want=0x%x got=0x%x",
++		    off, want, got);
++		return -1;
++	}
++	return 0;
++}
++
++static int
++as_check64(uint32_t off, uint64_t want)
++{
++	uint64_t got;
++
++	if (as_rd64(off, &got) || got != want) {
++		as_log("64-bit readback mismatch off=0x%x want=0x%llx "
++		    "got=0x%llx", off, (unsigned long long)want,
++		    (unsigned long long)got);
++		return -1;
++	}
++	return 0;
++}
++
++static void
++as_flush_pa(uint64_t pa, vm_size_t bytes)
++{
++	mondrian_dcache_flush_pa(pa, bytes);
++}
++
++static int
++as_alloc(struct as_mem *m, vm_size_t bytes)
++{
++	kern_return_t kr;
++	ppnum_t pn;
++
++	bzero(m, sizeof(*m));
++	m->raw_bytes = bytes + 0x3fff;
++	kr = kmem_alloc_contig(kernel_map, &m->raw, m->raw_bytes, 0x3fff,
++	    0, 3, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		as_log("table allocation failed kr=0x%x", kr);
++		return -1;
++	}
++	m->va = (m->raw + 0x3fff) & ~(vm_offset_t)0x3fff;
++	m->bytes = bytes;
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)m->va);
++	if (pn == 0) {
++		as_log("no physical address for tables va=0x%lx",
++		    (unsigned long)m->va);
++		return -1;
++	}
++	m->pa = ptoa_64(pn);
++	if ((m->pa & 0xfff) != 0 || m->pa >= AS_PHYS_LIMIT ||
++	    m->bytes > AS_PHYS_LIMIT - m->pa) {
++		as_log("tables outside 36-bit output pa=0x%llx",
++		    (unsigned long long)m->pa);
++		return -1;
++	}
++	return 0;
++}
++
++static int
++as_read_ids(void)
++{
++	uint32_t gfsr, id7;
++
++	if (as_rd32(AS_SCR0, &as.scr0) || as_rd32(AS_IDR0, &as.idr0) ||
++	    as_rd32(AS_IDR1, &as.idr1) || as_rd32(AS_IDR2, &as.idr2) ||
++	    as_rd32(0x3c, &id7) || as_rd32(AS_GFSR, &gfsr)) {
++		as_log("identification read refused");
++		return -1;
++	}
++	if ((as.idr0 & (1u << 30)) == 0 ||
++	    (as.idr0 & (1u << 27)) == 0 ||
++	    (as.idr2 & (1u << 12)) == 0 ||
++	    ((as.idr2 >> 4) & 15u) < 1u ||
++	    ((as.idr2 >> 4) & 15u) > 5u ||
++	    ((as.idr2 >> 3) & 15u) > 5u ||
++	    ((id7 >> 4) & 15u) != 2u) {
++		as_log("unsupported ids idr0=0x%x idr1=0x%x idr2=0x%x "
++		    "id7=0x%x", as.idr0, as.idr1, as.idr2, id7);
++		return -1;
++	}
++	if ((as.scr0 & 1u) != 0 || (as.scr0 & (1u << 1)) == 0 ||
++	    gfsr != 0) {
++		as_log("global policy/fault refused scr0=0x%x gfsr=0x%x",
++		    as.scr0, gfsr);
++		return -1;
++	}
++	as.page_bytes = (as.idr1 & (1u << 31)) ? 0x10000u : 0x1000u;
++	as.global_pages = 1u << (((as.idr1 >> 28) & 7u) + 1u);
++	as.banks = (as.idr1 & 0xffu) < AS_BANK_CAP ?
++	    (as.idr1 & 0xffu) : AS_BANK_CAP;
++	as.smr_slots = (as.idr0 & 0xffu) < AS_SMR_CAP ?
++	    (as.idr0 & 0xffu) : AS_SMR_CAP;
++	as.gr1 = as.page_bytes;
++	as.valid_smr = (as.idr0 & (1u << 8)) ? 0u : 0x80000000u;
++	as.valid_s2cr = (as.idr0 & (1u << 8)) ? 0x400u : 0u;
++	if (as.page_bytes != 0x1000u || as.banks < 2 ||
++	    as.smr_slots == 0 ||
++	    (uint64_t)(as.global_pages + as.banks) * as.page_bytes >
++	    AS_SMMU_SIZE) {
++		as_log("unsupported geometry pages=%u stride=0x%x banks=%u "
++		    "smrs=%u", as.global_pages, as.page_bytes, as.banks,
++		    as.smr_slots);
++		return -1;
++	}
++	as_log("ids scr0=0x%x idr0=0x%x idr1=0x%x idr2=0x%x exids=%u "
++	    "pages=%u banks=%u smrs=%u", as.scr0, as.idr0, as.idr1, as.idr2,
++	    !!(as.idr0 & (1u << 8)), as.global_pages, as.banks,
++	    as.smr_slots);
++	return 0;
++}
++
++static int
++as_asid_conflict(uint32_t candidate)
++{
++	uint32_t bank, sctlr, cbar;
++	uint64_t ttbr0, ttbr1;
++
++	for (bank = 0; bank < as.banks; bank++) {
++		if (bank == candidate) {
++			continue;
++		}
++		if (as_rd32((as.global_pages + bank) * as.page_bytes +
++		    AS_CB_SCTLR, &sctlr) ||
++		    as_rd32(as.gr1 + AS_CBAR(bank), &cbar)) {
++			return -1;
++		}
++		if ((sctlr & 1u) == 0 || ((cbar >> 16) & 3u) == 0) {
++			continue;
++		}
++		if (as_rd64((as.global_pages + bank) * as.page_bytes +
++		    AS_CB_TTBR0, &ttbr0) ||
++		    as_rd64((as.global_pages + bank) * as.page_bytes +
++		    AS_CB_TTBR1, &ttbr1)) {
++			return -1;
++		}
++		if ((ttbr0 >> 48) == AS_ASID || (ttbr1 >> 48) == AS_ASID) {
++			as_log("ASID conflict bank=%u", bank);
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static int
++as_pick_bank(void)
++{
++	uint32_t candidate, tries, n, sctlr, status, s2cr;
++	uint32_t s2cb = (as.idr1 >> 16) & 0xffu;
++
++	for (candidate = as.banks - 1, tries = 0;
++	    candidate >= s2cb && candidate > 0 && tries < 8;
++	    candidate--, tries++) {
++		int used = 0;
++
++		as.cb = (as.global_pages + candidate) * as.page_bytes;
++		if (as_rd32(as.cb + AS_CB_SCTLR, &sctlr) ||
++		    as_rd32(as.cb + AS_CB_TLBSTATUS, &status)) {
++			continue;
++		}
++		if ((sctlr & 1u) != 0 || (status & 1u) != 0) {
++			continue;
++		}
++		for (n = 0; n < as.smr_slots; n++) {
++			if (as_rd32(AS_S2CR(n), &s2cr)) {
++				used = 1;
++				break;
++			}
++			if (((s2cr >> 16) & 3u) == 0 &&
++			    (s2cr & 0xffu) == candidate) {
++				used = 1;
++				break;
++			}
++		}
++		if (used || as_asid_conflict(candidate)) {
++			continue;
++		}
++		as.bank = candidate;
++		as_log("bank=%u cb=0x%x asid=0x%x", as.bank, as.cb,
++		    AS_ASID);
++		return 0;
++	}
++	as_log("no free context bank");
++	return -1;
++}
++
++static int
++as_pick_slot(void)
++{
++	uint32_t n, smr, s2cr, free_slot = ~0u, exact_slot = ~0u;
++	uint32_t exact_count = 0;
++	uint32_t sid_mask = (as.idr0 & (1u << 8)) ? 0xffffu :
++	    (1u << ((as.idr0 >> 9) & 15u)) - 1u;
++
++	for (n = 0; n < as.smr_slots; n++) {
++		int valid;
++		uint32_t mask, id;
++
++		if (as_rd32(AS_SMR(n), &smr) ||
++		    as_rd32(AS_S2CR(n), &s2cr)) {
++			return -1;
++		}
++		valid = (as.idr0 & (1u << 8)) ? !!(s2cr & 0x400u) :
++		    !!(smr & 0x80000000u);
++		id = smr & 0xffffu;
++		mask = (smr >> 16) &
++		    ((as.idr0 & (1u << 8)) ? 0xffffu : 0x7fffu);
++		if (!valid) {
++			if (free_slot == ~0u) {
++				free_slot = n;
++			}
++			continue;
++		}
++		if (((AS_SID ^ id) & ~mask & sid_mask) == 0) {
++			if (mask != 0 || ((s2cr >> 16) & 3u) == 0) {
++				as_log("SID slot %u conflicts smr=0x%x "
++				    "s2cr=0x%x", n, smr, s2cr);
++				return -1;
++			}
++			exact_slot = n;
++			exact_count++;
++		}
++	}
++	if (exact_count > 1) {
++		as_log("duplicate exact SID matches=%u", exact_count);
++		return -1;
++	}
++	if (exact_count == 1) {
++		as.slot = exact_slot;
++		if (as_rd32(AS_SMR(as.slot), &as.old_smr) ||
++		    as_rd32(AS_S2CR(as.slot), &as.old_s2cr)) {
++			return -1;
++		}
++		as.slot_reused = 1;
++		as_log("slot=%u exact non-translating SID reused "
++		    "smr=0x%x s2cr=0x%x", as.slot, as.old_smr,
++		    as.old_s2cr);
++		return 0;
++	}
++	if (free_slot == ~0u) {
++		as_log("no free SMR slot");
++		return -1;
++	}
++	as.slot = free_slot;
++	as_log("slot=%u free", as.slot);
++	return 0;
++}
++
++static int
++as_tlb_sync(void)
++{
++	uint32_t status = 0;
++	unsigned i;
++
++	if (as_wr32(as.cb + AS_CB_TLBIASID, AS_ASID) ||
++	    as_wr32(as.cb + AS_CB_TLBSYNC, 0xffffffffu)) {
++		return -1;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (i = 0; i < 500; i++) {
++		if (as_rd32(as.cb + AS_CB_TLBSTATUS, &status)) {
++			return -1;
++		}
++		if ((status & 1u) == 0) {
++			return 0;
++		}
++		delay(1);
++	}
++	as_log("TLB sync timeout status=0x%x", status);
++	return -1;
++}
++
++static int
++as_program_context(void)
++{
++	uint64_t ttbr0 = ((uint64_t)AS_ASID << 48) | as.tables.pa;
++	uint64_t ttbr1 = (uint64_t)AS_ASID << 48;
++	uint32_t got;
++
++	as.bank_touched = 1;
++	if (as_put32(as.cb + AS_CB_SCTLR, 0)) {
++		return -1;
++	}
++	if (as_put32(as.gr1 + AS_CBA2R(as.bank), AS_CBA2R_VALUE) ||
++	    as_put32(as.gr1 + AS_CBAR(as.bank), AS_CBAR_VALUE) ||
++	    as_put32(as.cb + AS_CB_TCR2, AS_TCR2_VALUE) ||
++	    as_put32(as.cb + AS_CB_TCR, AS_TCR_VALUE) ||
++	    as_wr64(as.cb + AS_CB_TTBR0, ttbr0) ||
++	    as_wr64(as.cb + AS_CB_TTBR1, ttbr1) ||
++	    as_check64(as.cb + AS_CB_TTBR0, ttbr0) ||
++	    as_check64(as.cb + AS_CB_TTBR1, ttbr1) ||
++	    as_put32(as.cb + AS_CB_MAIR0, AS_MAIR0_VALUE) ||
++	    as_put32(as.cb + AS_CB_MAIR1, 0)) {
++		return -1;
++	}
++	if (as_wr32(as.cb + AS_CB_FSR, AS_FSR_FAULT)) {
++		as_log("FSR clear write refused");
++		return -1;
++	}
++	if (as_rd32(as.cb + AS_CB_FSR, &got)) {
++		as_log("FSR clear read refused");
++		return -1;
++	}
++	if ((got & AS_FSR_FAULT) != 0) {
++		as_log("FSR fault bits did not clear got=0x%x", got);
++		return -1;
++	}
++	if (as_tlb_sync() ||
++	    as_put32(as.cb + AS_CB_SCTLR, AS_SCTLR_VALUE)) {
++		return -1;
++	}
++	if (as_rd32(as.cb + AS_CB_FSR, &got) ||
++	    (got & AS_FSR_FAULT) != 0) {
++		as_log("context fault after enable fsr=0x%x", got);
++		return -1;
++	}
++	as_log("context cb=0x%x ttbr0=0x%llx sctlr=0x%x fsr=0",
++	    as.cb, (unsigned long long)ttbr0, AS_SCTLR_VALUE);
++	return 0;
++}
++
++static int
++as_attach_sid(void)
++{
++	uint32_t route = as.bank | as.valid_s2cr;
++	uint32_t smr = as.valid_smr | AS_SID;
++	uint32_t got_smr, got_s2cr;
++
++	as.slot_touched = 1;
++	if (as_put32(AS_S2CR(as.slot), as.bank) ||
++	    as_put32(AS_SMR(as.slot), smr) ||
++	    (as.valid_s2cr != 0 &&
++	    as_put32(AS_S2CR(as.slot), route))) {
++		return -1;
++	}
++	if (as_rd32(AS_SMR(as.slot), &got_smr) ||
++	    as_rd32(AS_S2CR(as.slot), &got_s2cr) ||
++	    got_smr != smr || got_s2cr != route) {
++		as_log("SID readback mismatch smr=0x%x/0x%x s2cr=0x%x/0x%x",
++		    got_smr, smr, got_s2cr, route);
++		return -1;
++	}
++	as_log("sid 0x%x slot=%u smr=0x%x s2cr=0x%x", AS_SID, as.slot,
++	    got_smr, got_s2cr);
++	return 0;
++}
++
++static int
++as_build_tables(vm_offset_t va, vm_size_t bytes, uint64_t *pa_out)
++{
++	uint64_t *root = (uint64_t *)as.tables.va;
++	uint64_t *l2 = (uint64_t *)(as.tables.va + 0x1000);
++	uint64_t *l3 = (uint64_t *)(as.tables.va + 0x2000);
++	unsigned i1 = (unsigned)((AS_IOVA >> 30) & 3u);
++	unsigned i2 = (unsigned)((AS_IOVA >> 21) & 0x1ffu);
++	unsigned i3 = (unsigned)((AS_IOVA >> 12) & 0x1ffu);
++	unsigned pages = (unsigned)((bytes + 0xfff) / 0x1000);
++	unsigned i;
++	ppnum_t pn;
++
++	if (i3 + pages > 512) {
++		as_log("iova crosses an L3 table");
++		return -1;
++	}
++	bzero((void *)as.tables.va, as.tables.bytes);
++	root[i1] = (as.tables.pa + 0x1000) | 3u;
++	l2[i2] = (as.tables.pa + 0x2000) | 3u;
++	for (i = 0; i < pages; i++) {
++		uint64_t pa;
++
++		pn = pmap_find_phys(kernel_pmap,
++		    (addr64_t)(va + (vm_size_t)i * 0x1000));
++		if (pn == 0) {
++			as_log("no page va=0x%lx",
++			    (unsigned long)(va + (vm_size_t)i * 0x1000));
++			return -1;
++		}
++		pa = ptoa_64(pn);
++		if (pa >= AS_PHYS_LIMIT) {
++			as_log("page outside 36-bit output pa=0x%llx",
++			    (unsigned long long)pa);
++			return -1;
++		}
++		if (i == 0) {
++			*pa_out = pa;
++		}
++		l3[i3 + i] = pa | AS_PTE_ATTR;
++	}
++	as_flush_pa(as.tables.pa, as.tables.bytes);
++	as_log("tables pa=0x%llx mapped va=0x%lx bytes=0x%lx pa=0x%llx "
++	    "iova=0x%llx", (unsigned long long)as.tables.pa,
++	    (unsigned long)va, (unsigned long)bytes,
++	    (unsigned long long)*pa_out, (unsigned long long)AS_IOVA);
++	return 0;
++}
++
++static void
++as_disable(void)
++{
++	if (as.slot_touched) {
++		if (as.slot_reused) {
++			(void)as_wr32(AS_SMR(as.slot), as.old_smr);
++			(void)as_wr32(AS_S2CR(as.slot), as.old_s2cr);
++		} else {
++			(void)as_wr32(AS_SMR(as.slot), 0);
++			(void)as_wr32(AS_S2CR(as.slot), 0);
++		}
++		as.slot_touched = 0;
++	}
++	if (as.bank_touched) {
++		(void)as_wr32(as.cb + AS_CB_SCTLR, 0);
++		(void)as_tlb_sync();
++		as.bank_touched = 0;
++	}
++}
++
++int
++mondrian_audio_smmu_map(vm_offset_t va, vm_size_t bytes, uint64_t *iova_out)
++{
++	if (iova_out == NULL) {
++		return -1;
++	}
++	if (as.installed) {
++		if (va == as.buffer_va && bytes == as.buffer_bytes) {
++			*iova_out = as.iova;
++			return 0;
++		}
++		as_log("one buffer already mapped");
++		return -1;
++	}
++	if (va == 0 || (va & 0xfff) != 0 || bytes == 0 ||
++	    bytes > AS_MAX_BYTES) {
++		as_log("bad range va=0x%lx bytes=0x%lx", (unsigned long)va,
++		    (unsigned long)bytes);
++		return -1;
++	}
++	bytes = (bytes + 0xfff) & ~(vm_size_t)0xfff;
++	if (as.smmu == 0) {
++		as.smmu = ml_io_map_unmappable(AS_SMMU_PA, AS_SMMU_SIZE,
++		    VM_WIMG_IO);
++		as_log("window 0x%llx+0x%x -> 0x%lx",
++		    (unsigned long long)AS_SMMU_PA, (uint32_t)AS_SMMU_SIZE,
++		    (unsigned long)as.smmu);
++		if (as.smmu == 0) {
++			return -1;
++		}
++	}
++	if (as_read_ids() || as_pick_bank() || as_pick_slot()) {
++		goto fail;
++	}
++	if (as_alloc(&as.tables, 0x4000)) {
++		goto fail;
++	}
++	if (as_build_tables(va, bytes, &as.buffer_pa)) {
++		goto fail;
++	}
++	if (as_program_context()) {
++		goto fail;
++	}
++	if (as_attach_sid()) {
++		goto fail;
++	}
++	as.buffer_va = va;
++	as.buffer_bytes = bytes;
++	as.iova = AS_IOVA;
++	as.installed = 1;
++	*iova_out = as.iova;
++	as_log("PASS va=0x%lx bytes=0x%lx pa=0x%llx iova=0x%llx bank=%u "
++	    "slot=%u", (unsigned long)va, (unsigned long)bytes,
++	    (unsigned long long)as.buffer_pa,
++	    (unsigned long long)as.iova, as.bank, as.slot);
++	mondrian_log_flush_now();
++	return 0;
++
++fail:
++	as_log("FAIL");
++	as_disable();
++	mondrian_log_flush_now();
++	return -1;
++}
++
++void
++mondrian_audio_smmu_report(const char *where)
++{
++	uint32_t sctlr = 0, fsr = 0, far = 0, fsynr = 0, gfsr = 0;
++	uint32_t smr = 0, s2cr = 0;
++
++	if (as.smmu == 0 || as.cb == 0) {
++		as_log("%s: no context", where != NULL ? where : "state");
++		return;
++	}
++	(void)as_rd32(as.cb + AS_CB_SCTLR, &sctlr);
++	(void)as_rd32(as.cb + AS_CB_FSR, &fsr);
++	(void)as_rd32(as.cb + AS_CB_FAR, &far);
++	(void)as_rd32(as.cb + AS_CB_FSYNR0, &fsynr);
++	(void)as_rd32(AS_GFSR, &gfsr);
++	(void)as_rd32(AS_SMR(as.slot), &smr);
++	(void)as_rd32(AS_S2CR(as.slot), &s2cr);
++	as_log("%s sctlr=0x%x fsr=0x%x far=0x%x fsynr=0x%x gfsr=0x%x "
++	    "smr=0x%x s2cr=0x%x", where != NULL ? where : "state", sctlr,
++	    fsr, far, fsynr, gfsr, smr, s2cr);
++	mondrian_log_flush_now();
++}
++
++#else /* !MONDRIAN */
++
++int
++mondrian_audio_smmu_map(vm_offset_t va __unused, vm_size_t bytes __unused,
++    uint64_t *iova_out __unused)
++{
++	return -1;
++}
++
++void
++mondrian_audio_smmu_report(const char *where __unused)
++{
++}
++
++#endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_audio_smmu.h b/bsd/dev/mondrian_audio_smmu.h
+new file mode 100644
+index 0000000..775222c
+--- /dev/null
++++ b/bsd/dev/mondrian_audio_smmu.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * MONDRIAN AUDIO SMMU: the ADSP's audio stream (SID 0x1801) seen through the
++ * apps-SMMU. The live DT's qcom,msm-audio-ion node names <&apps_smmu 0x1801>
++ * and gives the vendor's 0x10000000 IOVA pool; the DSP never sees the DDR
++ * physical address. One buffer is mapped per boot.
++ */
++#ifndef _MONDRIAN_AUDIO_SMMU_H_
++#define _MONDRIAN_AUDIO_SMMU_H_
++
++#include <mach/vm_types.h>
++
++/* Map a wired kernel range into the DSP's 32-bit space and return the IOVA
++ * (the caller adds the 0x1_00000000 DDR tag). The range must be page aligned
++ * and at most 2 MiB; the port maps one 16 KiB PCM buffer. */
++int mondrian_audio_smmu_map(vm_offset_t va, vm_size_t bytes,
++    uint64_t *iova_out);
++
++/* Log the context and global fault state after the DSP has used the buffer. */
++void mondrian_audio_smmu_report(const char *where);
++
++#endif /* _MONDRIAN_AUDIO_SMMU_H_ */
