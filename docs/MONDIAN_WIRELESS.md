@@ -237,10 +237,22 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   words the Pixel 7a reads at its authentication stop, so the ROM fails in
   common code, not in the host DMA path. `WLAN_SECURE_BOOTN` reads 0 three
   times and `0x01e22b2c`/`0x01e22b3c` read `0x800000`/`0x1016d0e1` (the
-  JTAG id), so the strap is not the difference the 7a saw. The BHI doorbell
-  session is the next suspect: every proven load (mayfly, 7a, donor) uses an
-  odd session, ours was `0x2a5a5a5a` (`0492`). The PBL bootstrap/OD and the
-  TCSR BHI_ERRDBG reads hang the AHB window and stay out.
+  JTAG id). That is the value the 7a reads only once its **AoC** has
+  bootstrapped the chip before `WLAN_EN`; without the AoC its PBL stops at
+  the same `pbl_auth.c` site with `SECURE_BOOTN=0x11111111`, and the fix was
+  loading `aoc.bin` before power, not a host change. So the strap is a
+  platform input, not the register alone, and stock also never loads the
+  first `WLAN_EN` cycle: it powers and enumerates once, drops `WLAN_EN` with
+  the buck held, and loads on the second rise. On mondrian the strap is
+  settled the other way (`0x0`), so the missing input is not the same one.
+  `0492`'s odd doorbell session, `0493`'s skipped reset, `0494`'s removed
+  pre-BHI MHI context and `0495`'s idle first `WLAN_EN` cycle all leave the
+  stage at `0xef0a0111` and `BHI_STATUS=0`; `PBL_WLAN_BOOT_CFG` reads `0x1`
+  against stock's `0x0` before a good load and `0x200` after one, and the
+  bootstrap/OD/SVS reads hang after the stall, so they stay out. The next
+  host-side divergence from the working SM8475 driver is its MSI: it lands
+  a visible `0xa500` word inside the mapped pool, ours points at an
+  unmapped page with data `0`.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
