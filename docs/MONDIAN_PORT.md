@@ -226,39 +226,28 @@ tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 
 ### 5. The buttons and the battery
 
-The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`); `0301`
-adds the kernel half (`bsd/dev/mondrian_spmi.c`): a thread polls the PMK8350
-PON and PM8350 GPIO6 and publishes both edges through `MondrianHIDButtons`.
-`0304` publishes the pack level as an `IOPMPowerSource`, and `0305` sends the
-panel brightness (`bl LEVEL` over USB) as a DCS long write. The AP cannot
-control charging (the SMB5 is behind the ADSP); the level is published and
-heat remains (`docs/MONDIAN_POWER.md`).
+The shim reads the keys over SPMI; `0301` polls PMK8350 PON and PM8350
+GPIO6 in the kernel and publishes both edges through `MondrianHIDButtons`.
+`0304` publishes the pack level as an `IOPMPowerSource`; `0305` sends panel
+brightness as a DCS long write. Charging is out of the AP's hands (SMB5 is
+behind the ADSP); see `docs/MONDIAN_POWER.md`.
 
 ### 6. USB
 
 Done. The DWC3 gadget (`bsd/dev/mondrian_usb.c`, `usb=2`) enumerates as an ECM
 Ethernet device at 192.168.7.2; udp/5141 drives the debug loop from
-`tools/usb-ring.py` (see `README.md`). `0335` carries a read-only disk over the
-GPT `userdata` partition but keeps it out of the descriptor: `DEPCFG` on
-0x02/0x03/0x83 takes status 0 and never completes a packet; `usb=1` probes.
+`tools/usb-ring.py` (see `README.md`). `0335` carries a read-only disk over `userdata` but keeps it out of
+the descriptor (`DEPCFG` on 0x02/0x03/0x83 stalls); `usb=1` probes.
 
 ### 7. The apps
 
-Settings, Messages and Safari launch and draw real content (a settings list, an
-onboarding page, the Safari start page), so LaunchServices, the icon model and
-the compositor are whole. Safari's page content is black: the WebKit GPU
-process's `w30r` surfaces stay zero (`0379`/`0380`), because it renders through
-Metal. Metal on Vulkan runs now (`docs/MONDIAN_GPU.md`): a device in 125 ms, a
-4 MB blit fill in 2.13 ms, a 1080x2400 clear in 1.76 ms, and host memory too
-(`0384`, a GPU buffer of the process's own pages), so m2v_test passes end to
-end; the WebKit GPU process is what is left.
-Photos completes its first-run flow, its import answers **`shared success 1`**,
-and the viewer opens in colour (the app needs `enableMultiLibraryMode` for its
-Syndication library; the hook's CGImage-to-surface bridge puts the picture on
-the layer). The render server still receives the image with zero data
-(`retain_iosurface` creates a surface, `copy_cgimage` only wraps the pointer).
-`assetsd` aborts in an uncaught C++ exception, `PhotosFileProvider` in
-PlugInKit's container check, and Phone still fails.
+Settings, Messages, Safari and Photos launch and draw real content. Safari's
+page content is black: WebKit asks for `w30r` surfaces and the GPU process draws
+nothing (`0379`/`0380`; see `docs/REFERENCE_FINDINGS.md` for the 8-bit fix).
+Metal on Vulkan works (`docs/MONDIAN_GPU.md`): device in 125 ms, clear 1.76 ms;
+only the WebKit GPU process is missing. Photos imports and its viewer opens in
+colour, but the render server gets zero pixel data. `assetsd`,
+`PhotosFileProvider` and Phone still fail.
 
 ### 8. Video, HEVC and audio
 
@@ -269,7 +258,18 @@ with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 The ADSP runs through PAS1 (`mondrianadsp=1`): both subgraphs start and PCM
 ring slots complete through apps-SMMU SID 0x1801. `0506` unmutes the pair and
 `0507` drives the TDM sink (`0x0700100E`) from shared memory: a four-slot frame
-makes it **play a 1 kHz tone audibly** (two slots drive nothing).
+makes it **play a 1 kHz tone audibly** (two slots drive nothing). `0510` fixes
+the SMMU driver to remap the PCM buffer when a client re-runs the worker.
+
+**Kernel side is complete, iOS side is not.** The HAL plug-in loads and opens
+`/dev/mondrian-audio`, and the APM graph starts with `status=0`, but the ring
+never shows a single `audio node: PCM` frame: CoreAudio does not write into the
+node. With `VirtualAudio.plugin` active, ANY plug-in that initialises makes
+`mediaserverd` crash in `HALS_System::DeviceManagerCreated` (CoreFoundation
+`+0x7ab64`, NULL C-string), so the root tweak disables it. See
+`docs/REFERENCE_FINDINGS.md` for the controlled A/B table and the exhausted
+hypotheses; do not re-test UID, BundleID, ResourceBundle, open timing, the
+Bluetooth plug-in or `/product/audio`.
 
 ## Getting the numbers off the device
 

@@ -1,0 +1,53 @@
+# 0512 - inject a CoreAudio crash guard into mediaserverd
+#
+# Dedicated env hook keyed on mondrianmsguard=1 and the presence of
+# /private/var/vm/mondrian-msg-guard.dylib, modelled on 0389 (bluetoothd).
+--- a/bsd/kern/kern_exec.c	2026-11-28 00:09:15.732799232 +0100
++++ b/bsd/kern/kern_exec.c	2026-11-28 00:09:15.733544596 +0100
+@@ -5869,6 +5869,36 @@
+  * two processes, launchd never printing its UUID (measured 2026-11-20, twice,
+  * on both kernels - the table is load-bearing for early boot).
+  */
++/* Mondrian audio crash guard (patch 0511). */
++static bool
++mondrian_msg_guard_env(struct image_params *imgp, char *env, size_t size)
++{
++	int enabled = 0;
++	const char *name;
++	const char inject[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-msg-guard.dylib";
++	const char inject_path[] = "/private/var/vm/mondrian-msg-guard.dylib";
++
++	if (!PE_parse_boot_argn("mondrianmsguard", &enabled, sizeof(enabled)) ||
++	    !enabled || imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	if (name == NULL || sizeof(inject) > size) {
++		return false;
++	}
++	if (!mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "mediaserverd") &&
++	    !mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "xpcproxy")) {
++		return false;
++	}
++	if (!mondrian_dylib_in_vm(inject_path)) {
++		return false;
++	}
++	strlcpy(env, inject, size);
++	return true;
++}
++
+ static bool
+ mondrian_bt_env(struct image_params *imgp, char *env, size_t size)
+ {
+@@ -6482,7 +6512,8 @@
+ 			injected = "UI hook";
+ 		} else if (mondrian_probe_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "probe";
+-		} else if (mondrian_bt_env(imgp, inject_env, sizeof(inject_env))) {
++		} else if (mondrian_msg_guard_env(imgp, inject_env, sizeof(inject_env)) ||
++	    mondrian_bt_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "bluetooth transport";
+ 		} else if (mondrian_safari_env(imgp, inject_env, sizeof(inject_env))) {
+ 			injected = "safari dom flag";
