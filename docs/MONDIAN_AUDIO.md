@@ -43,13 +43,14 @@ stream as one graph.
 
 The graph ids are **client-owned** values in the public APM ranges, not board
 resources; the hardware facts come from the live tree. Its active pad group is
-`tert_tdm_pinctrl` (`status = "ok"`): sck gpio121, ws gpio123 and dout
-**gpio124** (function `mi2s2_data1`), 8 mA with a pull-down on dout.
-`tert_mi2s_pinctrl` with gpio122 (`mi2s2_data0`) is `status = "disabled"`;
-gpio122 is the TDM din/capture line. `pinctrl-sm8450.c` puts `mi2s2_data1` at
-register mux value 1 on gpio124. The two `aw882xx_smartpa` nodes (i2c bus 2,
-0x34 and 0x35, reset gpios 1 and 3, irq gpios 88 and 63) are
-`sound-channel` 0 and 1 on that one dout line.
+`tert_tdm_pinctrl` (`status = "ok"`): sck gpio121, ws gpio123, din gpio122
+(function `mi2s2_data0`) and dout gpio124 (function `mi2s2_data1`), 8 mA with
+a pull-down on the data pads. Those names are the *codec's* directions, not
+the AP's: the pair hears the line the AP drives, which is gpio122 - the live
+`tdm_tert_tx` node asks for `qcom,msm-cpudai-tdm-data-out = 0`.
+`pinctrl-sm8450.c` puts both data functions at register mux value 1. The two
+`aw882xx_smartpa` nodes (i2c bus 2, 0x34 and 0x35, reset gpios 1 and 3, irq
+gpios 88 and 63) are `sound-channel` 0 and 1 on that one data line.
 
 ## The playback path
 
@@ -62,17 +63,17 @@ status 0; the map and the write are the 0505 step below.
 
 Patch 0507 feeds the sink from the shared-memory endpoint through the donor's
 chain (`WR_SHARED_MEM_EP -> PCM decoder -> PCM converter`). The sink is the
-AudioReach TDM module (`0x0700100E`) on the tertiary interface, lane 1
-(`0x0800106A` mask 2, gpio124), with one BCLK of data delay. The device graph
-holds only the endpoint; the stream graph's last connection names it, and both
-graphs are open before the link is resolved. `PREPARE`, `START`, `STOP` and
-`CLOSE` go out once per subgraph: a command carrying both ids is accepted, so
-a list that only applied its first entry would leave the endpoint clocking
-while the stream idles. The I2S module (`0x0700100A`, SD1) also clocked the
-pads but never drove data1. Neither module is evidence of a working chain on
-its own: the donor's TDM code is marked unvalidated, and the only extracted
-ACDB speaker graph of this generation (a sibling platform) uses `I2S_SINK`
-with `SAL` in front and no TDM sink at all.
+AudioReach TDM module (`0x0700100E`) on the tertiary interface, lane mask 2
+(`0x0800106A`), with one BCLK of data delay. The device graph holds only the
+endpoint; the stream graph's last connection names it, and both graphs are open
+before the link is resolved. `PREPARE`, `START`, `STOP` and `CLOSE` go out once
+per subgraph: a command carrying both ids is accepted, so a list that only
+applied its first entry would leave the endpoint clocking while the stream
+idles. The I2S module (`0x0700100A`, SD1) also clocked the pads and never drove
+a data line. Neither module is evidence of a working chain on its own: the
+donor's TDM code is marked unvalidated, and the only extracted ACDB speaker
+graph of this generation (a sibling platform) uses `I2S_SINK` with `SAL` in
+front and no TDM sink at all.
 
 The worker allocates eight periods (30720 bytes, a whole number of 3840-byte
 periods) with `kmem_alloc_contig()`, maps the ring into the ADSP's 32-bit
@@ -80,8 +81,8 @@ space, prepares and starts both subgraphs, then queues every slot with its own
 offset. The endpoint renders only from a lead of queued periods: a 16 KiB
 ring is not a whole number of periods, and one write after the start is
 consumed before the sink starts. It logs each write-done address and status,
-reads SYSST after the ring is queued, and samples the SCK, WS, DATA1 and
-spksw pads through their TLMM input bits.
+reads SYSST after the ring is queued, and samples the SCK, WS, both data pads
+and spksw through their TLMM input bits after a GPIO self-test of each pad.
 
 Patch 0505 adds `mondrian_audio_smmu.c`. The live tree routes the ADSP audio
 master through apps-SMMU stream `0x1801` (`qcom,msm-audio-ion`) and gives the
@@ -107,40 +108,57 @@ path the GLINK FIFOs use.
 
 Patch 0506 programs the AW88261 pair over bit-banged I2C: fuses, soft reset,
 the stock `aw882xx_acf.bin` Music profile, the fuse-derived `0x50`
-calibration, the parked mute state and the data1 pad function (gpio124). The
-worker waits for the prepare, clears power-down, waits for the PLL, enables the
-power stage, releases both mutes at the profile volume and powers the pair down
-after the periods. Measured 2026-11-27: both parts answer `0x2113`, both
-57-register profiles read back (`0x04=0x73c3`, `0x08=0x00f6/0x00f7`), the
-fuses gave icalk 992/1001 against vcalk 992/994, both PLLs lock to the bit
-clock (`SYSST 0x0011`), and the PCM write completes with status 0. VBAT reads
-3598 mV and PVDD tracks it.
+calibration, the parked mute state and both mi2s2 data pads (gpio122 and
+gpio124, function 1, with a pull-down). The worker waits for the prepare,
+clears power-down, waits for the PLL, enables the power stage, releases both
+mutes at the profile volume and powers the pair down after the periods.
+Measured 2026-11-27: both parts answer `0x2113`, both 57-register profiles read
+back (`0x04=0x73c3`, `0x08=0x00f6/0x00f7`), the fuses gave icalk 992/1001
+against vcalk 992/994, both PLLs lock to the bit clock, and the PCM write
+completes with status 0. Once the frame is four slots wide the pair reports
+`SYSST 0x0311` (class-D switching) and the boost comes up; before that it stays
+at `0x0011`.
 
-The pads answer for themselves, and the instrument now proves itself too: with
+The pads answer for themselves, and the instrument proves itself too: with
 each pin temporarily muxed as a plain GPIO and driven low then high, sck, ws,
 data0 and data1 all read 0 then 1. Measured 2026-11-27 with that check in
-place: SCK and WS sit at 50 % while **both** data lines stay flat through eight
-periods (data1 1104 of 321478 samples with 60 edges, data0 0 of 321478 with no
-edge), so the sink emits no frame at all rather than a frame on the wrong
-lane. The TLMM output-enable bit, the TDM `ctrl_data_out_enable` value (1 and
-0) and `PARAM_ID_HW_INTF_CLK_CFG` (`0x0800113C`, the clock defaults the donor's
-tertiary set carries) each changed nothing. The one-LSB sign square
-(`0x00000001`/`0xffffffff`) makes the fill visible at any width and stays
-inaudible; with data on the wire it reads about 52 % high, so 0.4 % is an
-absence of data, not a bad pattern.
+place: with a **two-slot** frame SCK and WS run at 50 % and neither data line
+moves, while with a **four-slot** frame the sink starts driving DATA0 (gpio122)
+at once - one slot of the four carries the samples (12.6 % high, the share a
+square that occupies 52 % of one slot of four must have) - and both amplifiers
+go from `SYSST 0x0011` to `0x0311` (class-D switching) with the boost up. The
+frame width was the gate, and the stock ACF explains why: it runs the pair in
+four-slot TDM (`SLOT_NUM = TDM4S` in `I2SCTRL2` 0x07 bits 14:12, `I2SFS` 32
+bits, `I2SBCK` 64 fs), and the vendor driver never rewrites those registers,
+so four slots is what the phone's amplifier actually runs.
 
 ## Traps
 
-- **The speaker data line is data1/gpio124, not data0/gpio122.** The live
-  tree's active `tert_tdm_pinctrl` (`status = "ok"`) is sck gpio121, ws gpio123
-  and dout gpio124 (`mi2s2_data1`), 8 mA with a pull-down on dout. The
-  `tert_mi2s_pinctrl` block with gpio122 (`mi2s2_data0`) is `status =
-  "disabled"`; gpio122 is the TDM din/capture line. `pinctrl-sm8450.c` maps
-  register mux value 1 to `mi2s2_data1` on gpio124, so the raw TLMM write is
-  `(1 << 2) | pull | (drive << 6) | (1 << 9)`. Sampling gpio122 with the pair
-  on gpio124 read 0.45 % with hundreds of edges, and since then it has been
-  read 0 of 321478 with no edge, so it is not a hidden speaker line. Both
-  `aw882xx_smartpa` nodes are `sound-channel` 0 and 1 on the single dout line.
+- **The speaker pair listens on data0/gpio122; the pinctrl names are the
+  codec's.** `qcom,msm-cpudai-tdm-data-out = <0>` on the live `tdm_tert_tx`
+  node picks data line 0, and that is the line the DSP drives: with a
+  four-slot frame gpio122 (`mi2s2_data0`) carries the samples (12.6 % high,
+  48 k frames/s) while gpio124 (`mi2s2_data1`) stays flat. Read
+  `tert_tdm_din` (gpio122) and `tert_tdm_dout` (gpio124) as the *codec's*
+  directions, not the AP's: the amplifier pair hears the line the AP drives.
+  `tert_tdm_pinctrl` is `status = "ok"` and muxes clk gpio121, ws gpio123,
+  din gpio122 and dout gpio124; `pinctrl-sm8450.c` maps register mux value 1
+  to both data functions, so the raw TLMM write is
+  `(1 << 2) | pull | (drive << 6) | (1 << 9)` for either pad. Both
+  `aw882xx_smartpa` nodes are `sound-channel` 0 and 1 with `sync-flag = 1`,
+  and their stock profile gives the left part slot 1 and the right part
+  slot 0.
+- **A two-slot frame is accepted and never drives a data line.** With
+  `nslots_per_frame 2` every command still answers status 0, SCK and WS run at
+  50 %, the amplifiers lock their PLL - and no data pad moves. Only
+  `nslots_per_frame 4` starts the sink driving DATA0 (measured 2026-11-27).
+  A graph that "runs" is therefore not evidence of a data path; check a data
+  pad, not just the clocks.
+- **The pad sampler resolves 48 kHz, not the bit clock.** Each loop iteration
+  reads five TLMM pages and runs at about 0.7 M samples/s (measured 2026-11-27:
+  315566 reads over the window), so counting SCK edges per WS period returns
+  nonsense (6 "bits per frame"). The WS *frequency* and the high-time *ratios*
+  are trustworthy; a bit count is not.
 - **Tell the two data-out enables apart before blaming either.** The TDM
   interface parameter (`0x0800101B`) is, in order, `lpaif_type`, `intf_idx`,
   `sync_src`, `ctrl_data_out_enable`, `slot_mask`, `nslots_per_frame`,
