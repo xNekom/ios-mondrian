@@ -1,0 +1,38 @@
+xnu 0496: give the wifi MSI a visible data word
+
+The PBL raises its BHI interrupt through the endpoint MSI, and the boot
+that maps only the ELF header (mondrianwifimap=8192) leaves the landing
+page at iova+0x5fe000 unmapped; a zero data word would also make a write
+to a mapped page look like untouched memory. Program the data word the
+working SM8475 driver uses (0xa500) so the next boot, with the whole
+6 MiB image buffer mapped, can tell whether the PBL raised the interrupt
+before it stopped in authentication.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+index 06aa7c6..6b6cf78 100644
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1580,6 +1580,14 @@ extern int mondrian_wifi_smmu_fault(uint32_t *, uint32_t *, uint32_t *,
+ extern int mondrian_wifi_smmu_clear_fault(void);
+ 
+ #define W6_MSI_OFF	0x5fe000u
++/*
++ * The working SM8475 driver gives the endpoint a nonzero MSI data word
++ * (0xa500) and lands it inside its mapped pool. A zero data word makes the
++ * landing page indistinguishable from untouched memory, so the boot that
++ * maps the whole image buffer can see whether the PBL raised the interrupt
++ * before the auth stop.
++ */
++#define W6_MSI_DATA	0xa500u
+ 
+ /*
+  * W6 MSI: the endpoint raises its MHI interrupt through the standard MSI
+@@ -1638,7 +1646,7 @@ wifi_msi_enable(uint64_t page_iova)
+     if (is64) {
+         mondrian_tlmm_write(wifi_cfg, cap + 8, hi);
+     }
+-    wifi_write16(wifi_cfg, cap + (is64 ? 0x0c : 0x08), 0);
++    wifi_write16(wifi_cfg, cap + (is64 ? 0x0c : 0x08), W6_MSI_DATA);
+     if ((mc & 0x100u) != 0) {
+         /* Per-vector masking capable: an all-ones mask blocks the write. */
+         mondrian_tlmm_write(wifi_cfg, cap + (is64 ? 0x10 : 0x0c), 0);
