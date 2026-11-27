@@ -112,7 +112,13 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `PCIE_SOC_GLOBAL_RESET` pulse and the `MHICTRL` reset, so the doorbell lands
   in the ROM the cold power-up left running. Measured 2026-11-26: `W6 soc
   reset skipped`, then the same `W9` values and `txdb=0x2a5a5a5a` at 1/10/100 ms
-  with `status=0`. The host reset is not the gate either.
+  with `status=0`. `0493` moves the skip to the top of `wifi_soc_reset`, so
+  it also skips the LTSSM/hot reset, the QFPROM bit and the warm-entry
+  clear; measured 2026-11-27 the stage is still `0xef0a0111` with `status=0`.
+  No host reset is the gate, so `0456`'s partial A/B and `0493`'s full one
+  agree. The pre-BHI MHI context (`W8`) is the next host step to take out:
+  mainline, the working SM8475 driver and the donor all program it after the
+  SBL, and the 8 KiB map leaves its page unreachable.
 - The stock `image/qca6490` holds only `amss.bin` and `amss20.bin`, so the
   `0x400c1211` word's minor `0x11` (WCN6855 hw2.1 in ath11k) selects no third
   image.
