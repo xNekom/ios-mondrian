@@ -267,14 +267,52 @@ what the phone's amplifier actually runs.
   before the mute release and treat SWS/BSTS as information.
 - The firmware must be pushed to `/private/var/vm/adsp.mbn`; the worker waits
   up to 60 s for it and logs every segment it copies.
+- **A restarted `mediaserverd` segfaults, and the dead audio server freezes the
+  whole UI.** Measured 2026-11-27: after `killname mediaserverd`, every fresh
+  instance dies at startup in CoreFoundation (`pc` `CoreFoundation+0x7ab64`,
+  `far 0`, `sig 11`, unslid the same on every boot) and launchd respawns it
+  every 5 s. SpringBoard's main thread then waits on the audio server, its
+  runloop stops ticking (`MONDRIAN UI: ca ... loop 0 in 1 s`, the hook's own
+  `lock step stuck; reposting`) and the panel keeps the last frame: the screen
+  looks frozen while the kernel and the ring are fine. Do not restart the daemon
+  to reload a HAL plug-in - it is scanned at boot, so a plug-in change is a
+  reboot. `tools/dsc-va.py CACHE --slide 0x... ADDR` plus `tools/dsc-sym.py`
+  name the frames (`HALS_System::DeviceManagerCreated` -> a CoreFoundation
+  string compare reaches a NULL). The crash survives removing every plug-in
+  (`/System/Library/Audio/Plug-Ins/HAL` empty, no `VirtualAudio`), deleting the
+  CoreAudio preferences and the Bluetooth transport, so it is the root volume,
+  not a device: reflashing `backup/ios-root.simg` is the repair.
+
+- **`VirtualAudio` crashes `mediaserverd` on this port, with or without our HAL.**
+  Measured 2026-11-27 on a freshly flashed root: loading it from
+  `/Library/Audio/Plug-Ins/HAL` gives `crash=20`, five respawns and a frozen UI
+  (`loop 0`); without it `crash=0`. Its bundle is complete and its
+  `CFBundleIdentifier` is present, so the NULL belongs to a device manager
+  Apple creates without a bundle-id. REA/Rizin on `VirtualAudio` (Mach-O arm64)
+  and on the reconstructed `CoreAudio.va` shows the `cbz x0` that leaves the
+  string NULL before the `objc_msgSend`. This is why `tools/ios-root-tweaks.py`
+  moves the plug-in to `HAL.disabled`: do not re-enable it for routing. Copying
+  it back with `wfile` also re-damages the HFS volume, so a reflash is needed
+  to recover.
+- **The SMMU driver allowed only one PCM buffer.** With `mondrianadsp=1` the
+  boot worker mapped the buffer once; a HAL client's second run allocated a
+  different VA and `mondrian_audio_smmu_map()` refused it (`one buffer already
+  mapped`), tearing down the graph. Patch `0510` releases the old translation
+  before installing the new one. Put local source changes in a patch under
+  `xnu/patches-mondrian/` before a build: `build-kernel.sh` resets the tree
+  from the series and silently compiles the old source otherwise.
 
 ## What is next
 
-The speaker path is proven end to end, so the next step is userland: wire a
-virtual audio HAL to this graph (open on demand, write the ring from `coreaudiod`
-instead of the one-shot probe) and keep `mondrianadsp=1` for it. The boot probe
-plays a gated 150 ms 1 kHz beep at -24 dBFS; raise `mondrianadsp` with the
-argument rather than the code when a louder test is wanted.
+The kernel side is complete: the ADSP graph starts with `status=0`, the HAL
+loads and opens `/dev/mondrian-audio` (`opened=1`), and the SMMU map no longer
+fails. The remaining gap is userland routing: **iOS never writes samples**
+(`audio node: PCM` stays 0 when a tone is played). `VirtualAudio.plugin` is the
+routing layer that would select our `Speaker`, but it crashes mediaserverd here
+and the root tweak disables it. Work out a route to the HAL device that does
+not depend on that plug-in - either make `Speaker` the default output from our
+own plug-in, or fix the NULL bundle-id in CoreAudio's device manager. Keep
+`mondrianadsp=1` for every audio boot.
 
 The WCD938x is the headphone and mic path: a SoundWire codec that needs the
 LPASS SWR master and its own probe. The donor ladder and the register
