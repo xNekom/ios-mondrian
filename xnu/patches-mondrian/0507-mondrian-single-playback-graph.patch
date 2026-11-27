@@ -313,19 +313,20 @@ index c3c9319..07aed4c 100755
  	}
  	if (mapped) {
 diff --git a/bsd/dev/mondrian_audioreach.c b/bsd/dev/mondrian_audioreach.c
-index 8735958..9c60f84 100644
+index 8735958..9fb3f24 100644
 --- a/bsd/dev/mondrian_audioreach.c
 +++ b/bsd/dev/mondrian_audioreach.c
-@@ -20,6 +20,8 @@
+@@ -20,6 +20,9 @@
  #define PARAM_HW_EP_MF 0x08001017u
  #define PARAM_FRAME_SIZE_FACTOR 0x08001018u
  #define PARAM_I2S_INTF 0x08001019u
 +#define PARAM_TDM_INTF 0x0800101Bu
 +#define PARAM_TDM_LANE 0x0800106Au
++#define PARAM_HW_INTF_CLK 0x0800113Cu
  #define MEDIA_PCM 0x09001000u
  #define PROP_SG_PERF 0x0800100Eu
  #define PROP_SG_DIRECTION 0x0800100Fu
-@@ -77,9 +79,16 @@ typedef struct {uint32_t id, position;} Container;
+@@ -77,9 +80,16 @@ typedef struct {uint32_t id, position;} Container;
  typedef struct {uint32_t module, iid, inputs, outputs;} Module;
  typedef struct {uint32_t from, to;} Link;
  
@@ -345,7 +346,7 @@ index 8735958..9c60f84 100644
  {
      W w;
      begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_GRAPH_OPEN);
-@@ -102,41 +111,60 @@ static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint3
+@@ -102,41 +112,60 @@ static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint3
      at = param_begin(&w, AR_APM_IID, PARAM_MODULE_LIST);
      put32(&w, 1);
      put32(&w, sg->id); put32(&w, c->id); put32(&w, modules);
@@ -421,21 +422,27 @@ index 8735958..9c60f84 100644
  }
  
  static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)
-@@ -151,8 +179,21 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
+@@ -151,13 +180,42 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
      W w;
      begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
      const uint32_t cmd = cmd_payload_start(&w);
 -    const uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_I2S_INTF);
 -    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY); put16(&w, AR_I2S_SD0); put16(&w, AR_WS_INTERNAL);
 +    /*
-+     * The live tree's tert_tdm_rx node asks for internal sync (sync-src 1),
++     * The live tree's tert tdm TX node asks for internal sync (sync-src 1),
 +     * long sync (sync-mode 1), inverted sync (invert-sync 1), one BCLK of
 +     * data delay and 32-bit slots. The pair is stereo on one dout line, so
 +     * two slots (mask 3) and lane 1 (mask 2, gpio124) are active.
++     *
++     * ctrl-data-out-enable is the one field whose name misleads: 1 means
++     * "share data-out with other masters", so the TDM block releases the
++     * pin and the amp sees a flat line while SCK and WS run (measured
++     * 2026-11-27). The live tree's qcom,msm-cpudai-tdm-data-out is 0 and
++     * keeps this block driving.
 +     */
 +    uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_TDM_INTF);
 +    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY);
-+    put16(&w, 1); put16(&w, 1);
++    put16(&w, 1); put16(&w, 0);
 +    put32(&w, 3);
 +    put16(&w, 2); put16(&w, 32);
 +    put16(&w, 1); put16(&w, 1); put16(&w, 1); put16(&w, 0);
@@ -445,7 +452,22 @@ index 8735958..9c60f84 100644
      param_end(&w, at);
      hw_ep_mf(&w, AR_IID_SPEAKER_I2S, f);
      const uint32_t fs = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_FRAME_SIZE_FACTOR);
-@@ -203,13 +244,16 @@ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port
+     put32(&w, 1);
+     param_end(&w, fs);
++    /*
++     * The interface clock, as the donor's tertiary TDM set sends it: the
++     * four fields are clock id, frequency, attribute and root, all at their
++     * defaults with CLOCK_ATTRIBUTE_INVERT_COUPLE_NO (4). The endpoint was
++     * clocking SCK and WS without it, so this is the last configuration
++     * difference against the donor before the sink is suspected.
++     */
++    at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_HW_INTF_CLK);
++    put32(&w, 0); put32(&w, 0); put32(&w, 4); put32(&w, 0);
++    param_end(&w, at);
+     cmd_payload_end(&w, cmd);
+     return finish(&w);
+ }
+@@ -203,13 +261,16 @@ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port
      return finish(&w);
  }
  
