@@ -1,0 +1,146 @@
+xnu 0498: map the adsp carveout in 2 MiB chunks
+
+The first 0497 boot panicked in kmem_alloc before USB came up: the 51 MiB
+ml_io_map_unmappable() is one kmem_alloc in kernel_map, and the map has no
+free block that size by the time mondrian_log_start runs. Map the carveout
+as 25 2 MiB unmappable pieces and address each piece from the segment copy
+and the zero tail; every copy is clipped at a piece boundary.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index dce0e17..0663862 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -71,6 +71,12 @@ extern kern_return_t thread_terminate(thread_t);
+ 
+ #define ADSP_MAX_PHDRS		32u
+ #define ADSP_BOUNCE_BYTES	(64u * 1024u)
++/* The 51 MiB carve-out cannot be one kmem_alloc: the kernel map has no
++ * free block that size by the time the root is up. Map it in 2 MiB
++ * pieces; each copy stays inside one piece. */
++#define ADSP_MAP_CHUNK		0x00200000ULL
++#define ADSP_MAP_CHUNKS		((uint32_t)((ADSP_CARVEOUT_SIZE + \
++    ADSP_MAP_CHUNK - 1) / ADSP_MAP_CHUNK))
+ 
+ struct adsp_phdr {
+ 	uint32_t type;
+@@ -83,7 +89,7 @@ struct adsp_phdr {
+ 	uint32_t align;
+ };
+ 
+-static vm_offset_t adsp_carveout;
++static vm_offset_t adsp_carveout_chunk[ADSP_MAP_CHUNKS];
+ static vm_offset_t adsp_smem;
+ static vm_offset_t adsp_ipcc;
+ static vm_offset_t adsp_mutex;
+@@ -131,6 +137,13 @@ adsp_wr32(vm_offset_t base, uint32_t off, uint32_t value)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++static vm_offset_t
++adsp_carveout_va(uint32_t off)
++{
++	return adsp_carveout_chunk[off / (uint32_t)ADSP_MAP_CHUNK] +
++	    (off % (uint32_t)ADSP_MAP_CHUNK);
++}
++
+ static int
+ adsp_fw_read(uint64_t offset, void *to, uint32_t length)
+ {
+@@ -576,34 +589,40 @@ adsp_run(void)
+ 	for (i = 0; i < ADSP_MAX_PHDRS; i++) {
+ 		struct adsp_phdr *p = &adsp_phdr[i];
+ 		vm_offset_t dest;
+-		uint32_t done, zero;
++		uint32_t at, done, zero;
+ 
+ 		if (p->type != 1u || p->memsz == 0) {
+ 			continue;
+ 		}
+-		dest = adsp_carveout + (p->paddr - lo);
++		at = p->paddr - lo;
+ 		for (done = 0; done < p->filesz; ) {
+ 			uint32_t chunk = p->filesz - done;
++			uint32_t room = (uint32_t)ADSP_MAP_CHUNK -
++			    ((at + done) % (uint32_t)ADSP_MAP_CHUNK);
+ 
+ 			if (chunk > ADSP_BOUNCE_BYTES) {
+ 				chunk = ADSP_BOUNCE_BYTES;
+ 			}
++			if (chunk > room) {
++				chunk = room;
++			}
+ 			if (adsp_fw_read(p->offset + done, adsp_bounce,
+ 			    chunk) != 0) {
+ 				adsp_log("segment %u read failed at 0x%x", i,
+ 				    p->offset + done);
+ 				return;
+ 			}
+-			memcpy((void *)(dest + done), adsp_bounce, chunk);
++			dest = adsp_carveout_va(at + done);
++			memcpy((void *)dest, adsp_bounce, chunk);
+ 			done += chunk;
+ 		}
+ 		for (zero = (p->filesz + 3u) & ~3u; zero < p->memsz;
+ 		    zero += 4) {
+-			*(volatile uint32_t *)(dest + zero) = 0;
++			*(volatile uint32_t *)adsp_carveout_va(at + zero) = 0;
+ 		}
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		adsp_log("seg %u -> carveout+0x%x file=%u mem=%u", i,
+-		    p->paddr - lo, p->filesz, p->memsz);
++		    at, p->filesz, p->memsz);
+ 	}
+ 
+ 	args[0] = ADSP_PAS_ID;
+@@ -636,30 +655,43 @@ adsp_thread(void *arg)
+ void
+ mondrian_adsp_premap(void)
+ {
+-	uint32_t enabled = 0;
++	uint32_t enabled = 0, i;
+ 
+ 	if (!PE_parse_boot_argn("mondrianadsp", &enabled, sizeof(enabled)) ||
+ 	    enabled != 1) {
+ 		return;
+ 	}
+-	adsp_carveout = ml_io_map_unmappable(ADSP_CARVEOUT_BASE,
+-	    ADSP_CARVEOUT_SIZE, VM_WIMG_WCOMB);
++	for (i = 0; i < ADSP_MAP_CHUNKS; i++) {
++		uint64_t base = ADSP_CARVEOUT_BASE +
++		    (uint64_t)i * ADSP_MAP_CHUNK;
++		uint32_t left = (uint32_t)(ADSP_CARVEOUT_SIZE -
++		    (uint64_t)i * ADSP_MAP_CHUNK);
++		uint32_t bytes = left > (uint32_t)ADSP_MAP_CHUNK ?
++		    (uint32_t)ADSP_MAP_CHUNK : left;
++
++		adsp_carveout_chunk[i] = ml_io_map_unmappable(base, bytes,
++		    VM_WIMG_WCOMB);
++		if (adsp_carveout_chunk[i] == 0) {
++			break;
++		}
++	}
+ 	adsp_smem = ml_io_map(ADSP_SMEM_BASE, ADSP_SMEM_SIZE);
+ 	adsp_ipcc = ml_io_map(ADSP_IPCC_BASE, 0x1000);
+ 	adsp_mutex = ml_io_map(ADSP_MUTEX_BASE, 0x1000);
+ 	adsp_aoss = ml_io_map(ADSP_AOSS_BASE, 0x1000);
+-	if (adsp_carveout == 0 || adsp_smem == 0 || adsp_ipcc == 0 ||
++	if (i != ADSP_MAP_CHUNKS || adsp_smem == 0 || adsp_ipcc == 0 ||
+ 	    adsp_mutex == 0 || adsp_aoss == 0) {
+-		printf("MONDRIAN ADSP: premap failed carveout=0x%lx smem=0x%lx "
+-		    "ipcc=0x%lx mutex=0x%lx aoss=0x%lx\n",
+-		    (unsigned long)adsp_carveout, (unsigned long)adsp_smem,
++		printf("MONDRIAN ADSP: premap failed chunks=%u/%u smem=0x%lx "
++		    "ipcc=0x%lx mutex=0x%lx aoss=0x%lx\n", i,
++		    ADSP_MAP_CHUNKS, (unsigned long)adsp_smem,
+ 		    (unsigned long)adsp_ipcc, (unsigned long)adsp_mutex,
+ 		    (unsigned long)adsp_aoss);
+ 		return;
+ 	}
+ 	adsp_mapped = 1;
+-	printf("MONDRIAN ADSP: premap carveout=0x%lx smem=0x%lx\n",
+-	    (unsigned long)adsp_carveout, (unsigned long)adsp_smem);
++	printf("MONDRIAN ADSP: premap chunks=%u first=0x%lx smem=0x%lx\n",
++	    ADSP_MAP_CHUNKS, (unsigned long)adsp_carveout_chunk[0],
++	    (unsigned long)adsp_smem);
+ }
+ 
+ void
