@@ -1,0 +1,44 @@
+xnu 0495: run the first wlan_en cycle without a load
+
+Measured 2026-11-27: `0494` removes the pre-BHI MHI context and the PBL still
+stops at `0xef0a0111` with `BHI_STATUS=0`. The 7a port's resolved wall is the
+chip's own boot state: its PBL leaves `pbl_auth.c` only when the AoC has
+bootstrapped the chip before `WLAN_EN` rises. Stock never loads on the first
+`WLAN_EN` cycle either: cnss2 powers and enumerates once, drops `WLAN_EN` with
+the buck held, and loads on the second rise, state the WLAON domain keeps
+across the cycle. Every load here has been the first one. Pulse `WLAN_EN` and
+drop it before the link trains, so the doorbell lands in a PBL that has
+already run once.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -548,6 +548,28 @@
+ 	delay(1000);
+ 	delay(3000);
+ 	wifi_xo_set(0);
++	/*
++	 * Stock never loads the first WLAN_EN cycle. cnss2 powers the chip,
++	 * enumerates it, drops WLAN_EN with the buck held, and does the real
++	 * BHI load on the second rise; the WLAON domain keeps state across
++	 * that cycle. Every load here has been the first one since power-on,
++	 * which is the state the 7a port found on the wrong side of
++	 * pbl_auth.c until its AoC was up. Run the same idle first cycle
++	 * before the link trains: one pulse to let the PBL run and latch,
++	 * a low gap, then the pulse that will get the doorbell.
++	 */
++	delay(50000);
++	wifi_pin_set(wifi_wlan_en_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_DOWN, WIFI_TLMM_DRIVE_2MA, 1), 0);
++	delay(100000);
++	wifi_log("WLAN pre-cycle rise/fall/rise");
++	wifi_xo_set(1);
++	delay(200);
++	wifi_pin_set(wifi_wlan_en_page, mondrian_tlmm_cfg(WIFI_TLMM_FUNC_GPIO,
++	    WIFI_TLMM_PULL_UP, WIFI_TLMM_DRIVE_16MA, 1), 1);
++	delay(1000);
++	delay(3000);
++	wifi_xo_set(0);
+ 	delay(60000);
+ 	wifi_log("WLAN enable complete");
+ }
