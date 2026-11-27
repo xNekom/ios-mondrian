@@ -267,9 +267,9 @@ and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
 with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 
 The ADSP runs through PAS1 (`mondrianadsp=1`): `init_image`, `mem_setup` and
-`auth_and_reset` return 0, SMP2P reports READY | HANDOVER after 2 ms, and the
-APM accepts the speaker and playback graphs; the PCM buffer needs the
-apps-SMMU SID 0x1801, then the AW88261 and WCD938x (`docs/MONDIAN_AUDIO.md`).
+`auth_and_reset` return 0, SMP2P reports READY | HANDOVER after 2 ms, the APM
+accepts both graphs, and one PCM period completes through apps-SMMU SID
+0x1801 with write-done status 0; AW88261 and WCD938x are next (`docs/MONDIAN_AUDIO.md`).
 
 ## Getting the numbers off the device
 

@@ -49,38 +49,61 @@ PCM decoder, converter, linked to the device graph's `0x6051`), the PCM and
 shared-memory media formats, the native map, the buffer write and the
 prepare/start/stop/close commands. Measured 2026-11-27: device open, speaker
 config, stream open, stream config and shared-memory config all answer status
-0. The map is refused with status 1 when the buffer lands above 4 GiB
-(`pa=0x84a200000`), which is the trap below; the worker then stops and closes
-only what it opened.
+0; the map and the write are the 0505 step below.
 
-The worker allocates 16 KiB with `kmem_alloc_contig()`, maps it with the
-donor's DSP address form (`physical | (1 << 32)`), prepares the device graph
-and then the stream, starts both, sends one 10 ms period (480 frames of
-32-bit stereo, a 1 kHz square) and logs the write-done address and status.
-Only the graph half is proven: the allocation lands above 4 GiB
-(`pa=0x84a200000`), the map's upper word stops being 1 and the map answers
-status 1, so the write does not run. A buffer in an SMEM item was tried as a
-low alternative and is not usable: with the PCM item added the RAM boot never
-answered (12 attempts fell back to `boot_b`) while the same image with
-`mondrianadsp=0` booted, so the DSP's audio DMA does not take the SMEM path
-the GLINK FIFOs use. The apps-SMMU SID `0x1801`, as the donor installs it, is
-the next milestone. The AW88261 amplifiers are not programmed either, so
+The worker allocates 16 KiB with `kmem_alloc_contig()`, maps it into the
+ADSP's 32-bit space, prepares the device graph and then the stream, starts
+both, sends one 10 ms period (480 frames of 32-bit stereo, a 1 kHz square) and
+logs the write-done address and status.
+
+Patch 0505 adds `mondrian_audio_smmu.c`. The live tree routes the ADSP audio
+master through apps-SMMU stream `0x1801` (`qcom,msm-audio-ion`) and gives the
+vendor's 0x10000000 IOVA pool, so the buffer stays a high DDR allocation and
+the DSP only sees IOVA `0x10000000`. The context is the donor's native 4K
+stage-1 profile (CBAR `0x1f300`, TCR `0x80803520`, TCR2 `0x38071`, MAIR
+`0xff44`, SCTLR `0x27`, ASID `0x1801`); its leaf is Normal non-cacheable,
+outer shareable, read/write, from the donor's `ArmSmmu4KLive.c` audio range.
+
+Measured 2026-11-27: the context takes the top free bank (74, `cb=0xca000`)
+and a free SMR slot, the APM map returns a nonzero handle, and the write
+completes with `address=0x1_10000000 status=0`, so the DSP read the 16 KiB
+period through the SMMU. The context FSR reads `0x400` (bit 10, outside the
+donor's `0xc00001fe` fault mask) with GFSR 0, so it is not a translation
+fault; the FAR/FSYNR are stale from the previous user of the bank. The context
+stays enabled: the graphs close, and tearing it down while the DSP might
+still hold a reference would turn a clean test into a fault.
+
+A buffer in an SMEM item remains unusable: with the PCM item added the RAM
+boot never answered (12 attempts fell back to `boot_b`) while the same image
+with `mondrianadsp=0` booted, so the DSP's audio DMA does not take the SMEM
+path the GLINK FIFOs use. The AW88261 amplifiers are not programmed yet, so
 nothing is audible.
 
 ## Traps
 
-- **The map address is `physical | (1 << 32)`, and the upper word must be
-  exactly 1.** A PCM buffer above 4 GiB (`pa=0x84a200000`) is refused with
-  status 1 (measured 2026-11-27), and so is anything whose PA does not fit in
-  the low word; the donor checks `(tagged >> 32) == 1` before it maps.
-- **The PCM buffer cannot be an SMEM item.** This unit has no free DRAM page
-  below 4 GiB (`kmem_alloc_contig()` finds 0, measured 2026-11-27), and SMEM is
-  the obvious low memory, but a PCM item there makes the RAM boot die before
-  USB answers: 12 attempts fell back to `boot_b`, while the same image with
-  `mondrianadsp=0` reached SpringBoard. The DSP's audio DMA does not take the
-  SMEM path the GLINK FIFOs use. A DDR buffer has to be translated into the
-  DSP's 32-bit space by the apps-SMMU SID `0x1801`, which is what the donor's
-  `ZizhanAudioDmaMap` installs; that is the remaining porting job.
+- **The map address is `DDR tag | low 32 bits`, and the upper word must be
+  exactly 1.** The low word is the address the DSP's DMA emits, not necessarily
+  the physical address. A physical address above 4 GiB cannot be used directly:
+  `pa=0x84a200000` was refused with status 1 (measured 2026-11-27). The vendor
+  maps an IOVA from the audio-ion pool (`0x10000000`) through apps-SMMU SID
+  `0x1801`; 0505 does the same, so the buffer can stay high.
+- **The PCM buffer cannot be an SMEM item.** SMEM is low and contiguous, but a
+  PCM item there makes the RAM boot die before USB answers: 12 attempts fell
+  back to `boot_b`, while the same image with `mondrianadsp=0` reached
+  SpringBoard. The DSP's audio DMA does not take the SMEM path the GLINK FIFOs
+  use. The earlier "no free DRAM below 4 GiB" reading came from
+  `kmem_alloc_contig(max_pnum=0x3ffff)`, which searches below 1 GiB; this SoC's
+  DRAM starts at 2 GiB, so that call could never find a page. The IOVA path
+  makes the search unnecessary.
+- **The apps-SMMU is `qsmmu-v500` at `0x15000000` and its context banks are
+  not at 0x1000.** IDR1 reports 75 banks and 128 global pages; bank n lives at
+  `(128 + n) * 4 KiB` (bank 74 at `0xca000`), with SMR/S2CR at `0x800`/`0xc00`
+  plus 4n. `mondrian_wifi_smmu.c` is the in-tree reference that measured this
+  geometry on the unit.
+- **The context FSR is not a boolean.** Bit 10 (`0x400`) is outside the
+  donor's `0xc00001fe` fault mask; an FSR of `0x400` with FSC 0 and GFSR 0 is
+  not a translation fault. The FAR/FSYNR are not cleared by the FSR
+  write-one-to-clear, so they can describe an earlier user of the bank.
 - **Graph management answers are basic results.** `GRAPH_OPEN`, `SET_CFG`,
   `PREPARE`, `START`, `STOP` and `CLOSE` complete with
   `GPR_IBASIC_RSP_RESULT` (`0x02001005`, payload `{command, status}`), not with
@@ -107,13 +130,11 @@ nothing is audible.
 
 ## What is next
 
-First the PCM buffer: program the apps-SMMU context for SID `0x1801` (the
-donor's `PongAudio`/`ZizhanAudioDmaMap` with `ArmSmmu4K`) and map a DDR buffer
-to a 32-bit DSP address, so the write and its completion can run. Then the
-loudspeaker amplifier: the AW88261 pair on i2c bus 2 (addresses 0x34/0x35)
-needs its reset sequence, the I2C register profile and the unmute, after which
-the already-running I2S endpoint is audible. The WCD938x is a SoundWire codec
-and needs the LPASS SWR master and its own probe; it is the headphone path, not
-this one. The donor ladder and the register references are in
-`docs/REFERENCE_PORTS.md`; the `master-kernel`/`slave-kernel` SMP2P names and
-the ready bits come from the zizhan ADSP worker.
+The PCM path is proven at the APM level. Next is the loudspeaker amplifier:
+the AW88261 pair on i2c bus 2 (addresses 0x34/0x35) needs its reset sequence,
+the I2C register profile and the unmute, after which the already-running I2S
+endpoint is audible. The WCD938x is a SoundWire codec and needs the LPASS SWR
+master and its own probe; it is the headphone path, not this one. The donor
+ladder and the register references are in `docs/REFERENCE_PORTS.md`; the
+`master-kernel`/`slave-kernel` SMP2P names and the ready bits come from the
+zizhan ADSP worker.
