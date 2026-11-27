@@ -55,7 +55,10 @@ separates a device-verified result from code that was only read.
   `drivers/PongPower/PongAudio.cpp`, `ShengAudioReach.c`, `QcomGlink.c`,
   `QcomSmp2p.c` and the live DT's `remoteproc-adsp`. Its ADSP/PRM/AudioReach
   ladder is device-verified on the same SM8475, though its README still calls
-  the speaker path silent data awaiting listening. `akshaynexus/iOSPlus10` is
+  the speaker path silent data awaiting listening. Measured on mondrian
+  2026-11-27: PAS1 `init_image`, `mem_setup` and `auth_and_reset` return 0 and
+  the ADSP reports READY | HANDOVER without the donor's QMP load-state or
+  `lcx`/`lmx` votes. `akshaynexus/iOSPlus10` is
   not a WCD938x donor: its own `docs/audio-plan.md` calls the codec "nothing,
   weeks", its amp is a TFA9874 and its audio never played. For the AW88261,
   take the protocol facts from mainline `aw88261.c` (GPL, facts only) and the

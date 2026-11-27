@@ -165,8 +165,7 @@ granule (`ID_AA64MMFR0_EL1.TGran16 = 1`, measured 2026-10-23). The shim, the
 payload and the kernel now all run 16 KiB, which removes those workarounds
 and lets launchd register the shared cache.
 
-ARMv9.0 is binary compatible with the ARMv8.5 baseline: the kernel builds for
-`armv8.5-a` with plain `arm64` (no pointer authentication).
+ARMv9.0 is binary compatible with the ARMv8.5 baseline; the kernel builds plain `arm64`.
 
 ## Remaining work
 
@@ -177,15 +176,13 @@ Reads and writes work end to end (UFS → GPT → `userdata` → HFS). With the 
 and flashed with `tools/flash-root.sh`, the lock screen comes up; a rebuilt
 `mondrian-ui-hook.dylib` goes into the image with `tools/install-ui-hook.sh`.
 One HFS+ volume holds what iOS splits into System, Data and Preboot; the pieces
-launchd looks for come from `tools/ios-root-tweaks.py`: `/private/preboot/
-<boot-manifest-hash>/usr/standalone/firmware`, the containers tree and
-`/private/var/vm`, so a missing volume is not what breaks a service (traps: `NOTES.md`).
+launchd looks for come from `tools/ios-root-tweaks.py` (`/private/preboot/
+<boot-manifest-hash>/usr/standalone/firmware`, containers, `/private/var/vm`).
 
 The persistent console log is `0096`; `0174` arms its writer at the end of the
 UFS probe, before the root mount, so a failed mount still flushes its error. Read
 a prior boot over USB with `tools/usb-ring.py prev` (`0329`), or on the panel
-with a dump kernel (`mondriandump=1`). `ls`/`deltree` list and empty the root
-from the kernel (`0390`: HFS+ packs a 12-byte header; `statfs` clamps f_bfree).
+with a dump kernel (`mondriandump=1`). `ls`/`deltree` (`0390`) list and empty the root from the kernel.
 
 ### 2. The UFS root device
 
@@ -203,10 +200,9 @@ kernel log and clears the boot splash. CoreAnimation needs
 `TimingElements`/`ColorElements` and an `IOAcceleratorES` service (`0114`);
 `0351` stops the console at the first swap (`0115`), the dylib forces activation.
 
-120 Hz is reached (+120 frames/s, deadline-chain tick); a list scroll shows
-113-118 fps and the home screen 81-87, where backboardd's GL frame is
-11.7-13.6 ms of CPU (`docs/UI_PERFORMANCE.md`). `mfs=4` (`0410`) scans the
-surface out and measures *slower* (68-71), so the copy stays the default.
+120 Hz is reached; a list scroll shows 113-118 fps and the home screen 81-87
+(`docs/UI_PERFORMANCE.md`). `mfs=4` (`0410`) scans out and measures *slower*
+(68-71), so the copy stays the default.
 `0302`/`0303` blank the panel on the power key and idle sleep, `0342` switches
 it off with DCS `0x28`: iOS stops presenting when it sleeps, so a key or touch
 un-blanks and the tick sends `0x29`. The fallback timer (`mondrianfb_blank`) is
@@ -230,13 +226,13 @@ tick still loses its down event (`docs/MONDIAN_TOUCH.md`).
 
 ### 5. The buttons and the battery
 
-The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`);
-`0301` adds the kernel half (`bsd/dev/mondrian_spmi.c`): a
-thread polls the PMK8350 PON and PM8350 GPIO6 and publishes both edges through
-`MondrianHIDButtons`. `0304` publishes the pack level as an `IOPMPowerSource`
-from its own thread, and `0305` sends the panel brightness (`bl LEVEL` over
-USB) as a DCS long write. The AP cannot control charging (the SMB5 is behind
-the ADSP); the level is published and heat remains (`docs/MONDIAN_POWER.md`).
+The shim reads the keys over SPMI (arbiter v7 layout in `NOTES.md`); `0301`
+adds the kernel half (`bsd/dev/mondrian_spmi.c`): a thread polls the PMK8350
+PON and PM8350 GPIO6 and publishes both edges through `MondrianHIDButtons`.
+`0304` publishes the pack level as an `IOPMPowerSource`, and `0305` sends the
+panel brightness (`bl LEVEL` over USB) as a DCS long write. The AP cannot
+control charging (the SMB5 is behind the ADSP); the level is published and
+heat remains (`docs/MONDIAN_POWER.md`).
 
 ### 6. USB
 
@@ -256,20 +252,24 @@ Metal. Metal on Vulkan runs now (`docs/MONDIAN_GPU.md`): a device in 125 ms, a
 4 MB blit fill in 2.13 ms, a 1080x2400 clear in 1.76 ms, and host memory too
 (`0384`, a GPU buffer of the process's own pages), so m2v_test passes end to
 end; the WebKit GPU process is what is left.
-Photos completes its first-run flow and its import answers **`shared success 1`**;
-the Library draws the tile and the viewer opens with the picture in colour (a
-default boot draws both - the app needs `enableMultiLibraryMode` for its
-Syndication library, and the hook's CGImage-to-surface bridge puts the picture
-on the layer). The render server still receives the image with zero data
-(`retain_iosurface` creates a surface, `copy_cgimage` only wraps the pointer);
-that transfer is the open cause. `assetsd` still aborts in an uncaught C++
-exception and `PhotosFileProvider` in PlugInKit's container check; Phone still fails.
+Photos completes its first-run flow, its import answers **`shared success 1`**,
+and the viewer opens in colour (the app needs `enableMultiLibraryMode` for its
+Syndication library; the hook's CGImage-to-surface bridge puts the picture on
+the layer). The render server still receives the image with zero data
+(`retain_iosurface` creates a surface, `copy_cgimage` only wraps the pointer).
+`assetsd` aborts in an uncaught C++ exception, `PhotosFileProvider` in
+PlugInKit's container check, and Phone still fails.
 
-### 8. Video and HEVC
+### 8. Video, HEVC and audio
 
 `0420` accepts the iris2 path on `vpu20_4v.mbn`: `START` succeeds on both ports
 and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
 with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
+
+The ADSP runs through PAS1 (`mondrianadsp=1`): the joined `adsp.mbn` passes
+`init_image`, `mem_setup` and `auth_and_reset`, and the `slave-kernel` SMP2P
+entry reports READY | HANDOVER 2 ms after the reset. GLINK/GPR, WCD938x and
+the two AW88261 amplifiers are next (`docs/MONDIAN_AUDIO.md`).
 
 ## Getting the numbers off the device
 
