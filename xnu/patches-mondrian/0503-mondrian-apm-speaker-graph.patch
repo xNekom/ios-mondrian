@@ -1,0 +1,468 @@
+xnu 0503: open the speaker device graph on the adsp apm
+
+Port the zizhan AudioReach graph builders (BSD-2-Clause-Patent,
+ShengAudioReach.c and ShengAudioReach.h) into mondrian_audioreach.c and
+mondrian_audioreach.h: the subgraph, container, module and parameter
+encoding, the speaker device graph (subgraph 0x4005 with one I2S sink,
+instance 0x6051) and the answer parser. When the APM reports the SPF
+ready the worker opens that graph, configures the endpoint for 48 kHz
+32-bit stereo on the tertiary MI2S SD0 with the internal word select
+(the live device tree muxes only that data line, and the two AW88261
+amplifiers share it as a stereo pair), logs both statuses and closes
+the graph again. No clock, data line or amplifier is started.
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 92edc8f..9ea8229 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/mondrian_audio_probe.c		standard
+ bsd/dev/mondrian_adsp.c		standard
+ bsd/dev/mondrian_glink.c		standard
+ bsd/dev/mondrian_gpr.c		standard
++bsd/dev/mondrian_audioreach.c		standard
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index d2415f4..0b6098e 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -42,6 +42,7 @@ extern kern_return_t thread_terminate(thread_t);
+ #include "mondrian_scm.h"
+ #include "mondrian_glink.h"
+ #include "mondrian_gpr.h"
++#include "mondrian_audioreach.h"
+ 
+ #define ADSP_FW_PATH		"/private/var/vm/adsp.mbn"
+ #define ADSP_PAS_ID		1u
+@@ -462,6 +463,10 @@ static uint8_t adsp_glink_intent[ADSP_GLINK_INTENTS * ADSP_GLINK_INTENT_BYTES];
+ static uint8_t adsp_glink_pkt[GPR_HEADER_BYTES];
+ static uint32_t adsp_glink_pkt_len;
+ static uint64_t adsp_glink_pkt_at;
++static ArAnswer adsp_ar_answer;
++static uint32_t adsp_ar_wait;
++static uint32_t adsp_ar_ready;
++static uint32_t adsp_ar_token = 0x1000u;
+ 
+ static uint64_t
+ adsp_now_ms(void)
+@@ -490,14 +495,20 @@ static void
+ adsp_glink_receive(void *context, QcomGlinkChannel *channel,
+     const uint8_t *data, uint32_t length)
+ {
+-	int rc;
++	ArAnswer answer;
++	int rc, kind;
+ 
+ 	(void)context;
+ 	(void)channel;
+ 	rc = gpr_spf_receive(&adsp_spf, data, length);
+-	adsp_log("gpr rx %u -> rc=%d state=%u status=%u opcode=0x%x",
+-	    length, rc, adsp_spf.state, adsp_spf.last_status,
+-	    adsp_spf.last_opcode);
++	kind = ar_parse(data, length, &answer);
++	if (kind > 0 && adsp_ar_wait != 0 && answer.token == adsp_ar_wait) {
++		adsp_ar_answer = answer;
++		adsp_ar_ready = 1;
++	}
++	adsp_log("gpr rx %u -> rc=%d kind=%d token=%u state=%u status=%u "
++	    "opcode=0x%x", length, rc, kind, answer.token, adsp_spf.state,
++	    adsp_spf.last_status, adsp_spf.last_opcode);
+ }
+ 
+ static int
+@@ -544,6 +555,94 @@ adsp_glink_start(void)
+ 	return 0;
+ }
+ 
++static int
++adsp_apm_send(const uint8_t *packet, uint32_t length, uint32_t ms)
++{
++	uint64_t end = adsp_now_ms() + ms;
++
++	do {
++		if (qcom_glink_send(&adsp_glink, adsp_glink_ch, packet,
++		    length) == QcomGlinkOk) {
++			return 0;
++		}
++		(void)qcom_glink_poll(&adsp_glink);
++		delay(1000);
++	} while (adsp_now_ms() < end);
++	return -1;
++}
++
++static int
++adsp_apm_wait(uint32_t token, ArAnswer *answer, uint32_t ms)
++{
++	uint64_t end = adsp_now_ms() + ms;
++
++	while (adsp_now_ms() < end) {
++		(void)qcom_glink_poll(&adsp_glink);
++		if (adsp_ar_ready != 0 && adsp_ar_answer.token == token) {
++			*answer = adsp_ar_answer;
++			adsp_ar_wait = 0;
++			return 0;
++		}
++		delay(1000);
++	}
++	adsp_ar_wait = 0;
++	return -1;
++}
++
++static int
++adsp_apm_exchange(uint8_t *packet, uint32_t length, uint32_t token,
++    ArAnswer *answer, const char *what)
++{
++	adsp_ar_wait = token;
++	adsp_ar_ready = 0;
++	if (adsp_apm_send(packet, length, 2000) != 0) {
++		adsp_ar_wait = 0;
++		adsp_log("apm %s send failed", what);
++		return -1;
++	}
++	if (adsp_apm_wait(token, answer, 2000) != 0) {
++		adsp_log("apm %s timeout", what);
++		return -1;
++	}
++	adsp_log("apm %s opcode=0x%x status=%u", what, answer->result_opcode,
++	    answer->status);
++	return answer->status == 0 ? 0 : -1;
++}
++
++/* Open the speaker device graph, configure the tertiary MI2S endpoint and
++ * close it again: no clock or data leaves the DSP, the answers say whether
++ * the APM accepts the topology and the endpoint parameters. */
++static void
++adsp_apm_probe(void)
++{
++	static const ArFormat format = { 48000, 32, 2 };
++	uint8_t packet[GPR_MAX_PACKET];
++	ArAnswer answer;
++	uint32_t length, token;
++
++	token = ++adsp_ar_token;
++	length = ar_open_speaker_device(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
++	    token);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "graph open") != 0) {
++		return;
++	}
++	token = ++adsp_ar_token;
++	length = ar_config_speaker_device(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
++	    token, &format);
++	if (length != 0) {
++		(void)adsp_apm_exchange(packet, length, token, &answer,
++		    "speaker config");
++	}
++	token = ++adsp_ar_token;
++	length = ar_graph_command(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT, token,
++	    AR_OP_GRAPH_CLOSE, AR_SG_SPEAKER);
++	if (length != 0) {
++		(void)adsp_apm_exchange(packet, length, token, &answer,
++		    "graph close");
++	}
++}
++
+ static void
+ adsp_glink_run(void)
+ {
+@@ -588,6 +687,7 @@ adsp_glink_run(void)
+ 				adsp_glink_pkt_len = 0;
+ 			}
+ 			if (adsp_spf.state == SpfReady) {
++				adsp_apm_probe();
+ 				break;
+ 			}
+ 		}
+diff --git a/bsd/dev/mondrian_audioreach.c b/bsd/dev/mondrian_audioreach.c
+new file mode 100644
+index 0000000..783549d
+--- /dev/null
++++ b/bsd/dev/mondrian_audioreach.c
+@@ -0,0 +1,194 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Ported from qiumochen/UniXNU-zizhan drivers/PongPower/ShengAudioReach.c
++ * (BSD-2-Clause-Patent); see docs/REFERENCE_PORTS.md. */
++/* The APM's graph manager commands. A graph open names one subgraph, one
++ * container and its modules; the speaker device graph is one I2S sink in the
++ * DSP domain. The parameters use the donor's wire encoding, which the
++ * waipio-family ADSP accepts. */
++#include "mondrian_audioreach.h"
++
++#define PARAM_HEADER 16u
++#define CMD_HEADER 16u
++#define PARAM_SG_CONFIG 0x08001001u
++#define PARAM_CONTAINER_CONFIG 0x08001000u
++#define PARAM_MODULE_LIST 0x08001002u
++#define PARAM_MODULE_PROP 0x08001003u
++#define PARAM_MODULE_CONN 0x08001004u
++#define PARAM_SG_LIST 0x08001005u
++#define PARAM_HW_EP_MF 0x08001017u
++#define PARAM_FRAME_SIZE_FACTOR 0x08001018u
++#define PARAM_I2S_INTF 0x08001019u
++#define PROP_SG_PERF 0x0800100Eu
++#define PROP_SG_DIRECTION 0x0800100Fu
++#define PROP_SG_SCENARIO 0x08001010u
++#define PROP_CONT_CAPS 0x08001011u
++#define PROP_CONT_POS 0x08001012u
++#define PROP_CONT_STACK 0x08001013u
++#define PROP_CONT_DOMAIN 0x08001014u
++#define PROP_PORT_INFO 0x08001015u
++#define CONTAINER_GC 0x0B001001u
++#define PERF_LOW_LATENCY 2u
++#define DIR_TX 1u
++#define SCENARIO_PLAYBACK 1u
++#define POS_STREAM 1u
++#define DOMAIN_ADSP 2u
++#define STACK 8192u
++#define OUT_PORT 1u
++#define IN_PORT 2u
++
++typedef struct {uint8_t *p; uint32_t n, cap; int bad;} W;
++
++static void put8(W *w, uint32_t v) {if (w->n + 1 > w->cap) {w->bad = 1; return;} w->p[w->n++] = (uint8_t)v;}
++static void put16(W *w, uint32_t v) {put8(w, v); put8(w, v >> 8);}
++static void put32(W *w, uint32_t v) {put16(w, v); put16(w, v >> 16);}
++static void pad_to(W *w, uint32_t end) {while (!w->bad && w->n < end) put8(w, 0);}
++static uint32_t align8(uint32_t v) {return (v + 7u) & ~7u;}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
++static void set32(W *w, uint32_t at, uint32_t v) {if (at + 4 <= w->n) {w->p[at] = (uint8_t)v; w->p[at + 1] = (uint8_t)(v >> 8); w->p[at + 2] = (uint8_t)(v >> 16); w->p[at + 3] = (uint8_t)(v >> 24);}}
++
++/* GPR header with the packet size patched in at the end (finish). */
++static void begin(W *w, uint8_t *out, uint32_t capacity, uint32_t port, uint32_t dst, uint32_t token, uint32_t opcode)
++{
++    w->p = out; w->n = 0; w->cap = capacity < GPR_MAX_PACKET ? capacity : GPR_MAX_PACKET; w->bad = 0;
++    put32(w, 0); put32(w, GPR_DOMAIN_ADSP | GPR_DOMAIN_APPS << 8); put32(w, port); put32(w, dst); put32(w, token); put32(w, opcode);
++}
++static uint32_t finish(W *w)
++{
++    if (w->bad) return 0;
++    set32(w, 0, (GPR_VERSION & 0xfu) | (GPR_HEADER_BYTES / 4) << 4 | w->n << 8);
++    return w->n;
++}
++/* The APM command header: in-band payload of the given size follows. */
++static void cmd_header(W *w, uint32_t payload) {put32(w, 0); put32(w, 0); put32(w, 0); put32(w, payload);}
++static uint32_t cmd_payload_start(W *w) {uint32_t at = w->n; cmd_header(w, 0); return at;}
++static void cmd_payload_end(W *w, uint32_t at) {set32(w, at + 12, w->n - at - CMD_HEADER);}
++/* One parameter block: header, body written by the caller, then padding to 8 bytes; param_size counts body and padding. */
++static uint32_t param_begin(W *w, uint32_t iid, uint32_t id) {uint32_t at = w->n; put32(w, iid); put32(w, id); put32(w, 0); put32(w, 0); return at;}
++static void param_end(W *w, uint32_t at) {pad_to(w, at + align8(w->n - at)); set32(w, at + 8, w->n - at - PARAM_HEADER);}
++
++typedef struct {uint32_t id, perf, direction, scenario;} Sg;
++typedef struct {uint32_t id, position;} Container;
++typedef struct {uint32_t module, iid, inputs, outputs;} Module;
++typedef struct {uint32_t from, to;} Link;
++
++/* One subgraph with one container (all the board topology uses). */
++static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const Sg *sg, const Container *c,
++                           const Module *m, unsigned modules, const Link *l, unsigned links)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_GRAPH_OPEN);
++    const uint32_t cmd = cmd_payload_start(&w);
++    uint32_t at = param_begin(&w, AR_APM_IID, PARAM_SG_CONFIG);
++    put32(&w, 1);
++    put32(&w, sg->id); put32(&w, 3);
++    put32(&w, PROP_SG_PERF); put32(&w, 4); put32(&w, sg->perf);
++    put32(&w, PROP_SG_DIRECTION); put32(&w, 4); put32(&w, sg->direction);
++    put32(&w, PROP_SG_SCENARIO); put32(&w, 4); put32(&w, sg->scenario);
++    param_end(&w, at);
++    at = param_begin(&w, AR_APM_IID, PARAM_CONTAINER_CONFIG);
++    put32(&w, 1);
++    put32(&w, c->id); put32(&w, 4);
++    put32(&w, PROP_CONT_CAPS); put32(&w, 8); put32(&w, 1); put32(&w, CONTAINER_GC);
++    put32(&w, PROP_CONT_POS); put32(&w, 4); put32(&w, c->position);
++    put32(&w, PROP_CONT_STACK); put32(&w, 4); put32(&w, STACK);
++    put32(&w, PROP_CONT_DOMAIN); put32(&w, 4); put32(&w, DOMAIN_ADSP);
++    param_end(&w, at);
++    at = param_begin(&w, AR_APM_IID, PARAM_MODULE_LIST);
++    put32(&w, 1);
++    put32(&w, sg->id); put32(&w, c->id); put32(&w, modules);
++    for (unsigned i = 0; i < modules; ++i) {put32(&w, m[i].module); put32(&w, m[i].iid);}
++    param_end(&w, at);
++    at = param_begin(&w, AR_APM_IID, PARAM_MODULE_PROP);
++    put32(&w, modules);
++    for (unsigned i = 0; i < modules; ++i) {
++        put32(&w, m[i].iid); put32(&w, 1); put32(&w, PROP_PORT_INFO); put32(&w, 8); put32(&w, m[i].inputs); put32(&w, m[i].outputs);
++    }
++    param_end(&w, at);
++    at = param_begin(&w, AR_APM_IID, PARAM_MODULE_CONN);
++    put32(&w, links);
++    for (unsigned i = 0; i < links; ++i) {put32(&w, l[i].from); put32(&w, OUT_PORT); put32(&w, l[i].to); put32(&w, IN_PORT);}
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK};
++    static const Container c = {AR_SG_SPEAKER, POS_STREAM};
++    static const Module m[] = {{AR_MOD_I2S_SINK, AR_IID_SPEAKER_I2S, 1, 0}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
++}
++
++static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)
++{
++    const uint32_t at = param_begin(w, iid, PARAM_HW_EP_MF);
++    put32(w, f->rate); put16(w, f->bits); put16(w, f->channels); put32(w, 1);
++    param_end(w, at);
++}
++
++uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const ArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_I2S_INTF);
++    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY); put16(&w, AR_I2S_SD0); put16(&w, AR_WS_INTERNAL);
++    param_end(&w, at);
++    hw_ep_mf(&w, AR_IID_SPEAKER_I2S, f);
++    const uint32_t fs = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_FRAME_SIZE_FACTOR);
++    put32(&w, 1);
++    param_end(&w, fs);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, uint32_t sg)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, opcode);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, AR_APM_IID, PARAM_SG_LIST);
++    put32(&w, 1); put32(&w, sg);
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a)
++{
++    GprPacket p;
++    for (unsigned i = 0; i < sizeof *a; ++i) ((uint8_t *)a)[i] = 0;
++    if (gpr_decode(in, length, &p) != GprOk) return ArBad;
++    a->opcode = p.opcode; a->token = p.token; a->src_port = p.src_port;
++    const uint8_t *d = p.payload;
++    switch (p.opcode) {
++    case GPR_OP_BASIC_RESULT:
++        if (p.payload_bytes < 8) return ArBad;
++        a->result_opcode = le32(d); a->status = le32(d + 4);
++        return ArBasicResult;
++    case AR_OP_PRM_REQUEST_DONE:
++    case AR_OP_PRM_RELEASE_DONE:
++        if (p.payload_bytes < 4) return ArBad;
++        a->status = le32(d + (p.payload_bytes >= 8 ? 4 : 0));
++        return ArPrmDone;
++    case GPR_OP_APM_SPF_STATE:
++        if (p.payload_bytes < 4) return ArBad;
++        a->status = le32(d);
++        return ArFrameworkState;
++    case AR_OP_MEM_MAP_DONE:
++        if (p.payload_bytes < 4) return ArBad;
++        a->handle = le32(d);
++        return ArMapped;
++    case AR_OP_WRITE_DONE:
++        if (p.payload_bytes < 16) return ArBad;
++        a->address = le32(d) | (uint64_t)le32(d + 4) << 32; a->handle = le32(d + 8); a->status = le32(d + 12);
++        return ArWriteDone;
++    case AR_OP_READ_DONE:
++        if (p.payload_bytes < 20) return ArBad;
++        a->status = le32(d); a->address = le32(d + 4) | (uint64_t)le32(d + 8) << 32; a->handle = le32(d + 12); a->data_bytes = le32(d + 16);
++        return ArReadDone;
++    default:
++        return ArUnknown;
++    }
++}
+diff --git a/bsd/dev/mondrian_audioreach.h b/bsd/dev/mondrian_audioreach.h
+new file mode 100644
+index 0000000..314b5cd
+--- /dev/null
++++ b/bsd/dev/mondrian_audioreach.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Ported from qiumochen/UniXNU-zizhan drivers/PongPower/ShengAudioReach.h
++ * (BSD-2-Clause-Patent); see docs/REFERENCE_PORTS.md. */
++/* The audio DSP's graph manager (APM) commands as GPR packets: the subgraph,
++ * container, module and parameter encoding, the speaker device graph and the
++ * answer parser. No I/O and no waits: the owner sends the bytes and feeds the
++ * answers back. */
++#ifndef MONDRIAN_AUDIOREACH_H
++#define MONDRIAN_AUDIOREACH_H
++#include <stdint.h>
++#include "mondrian_gpr.h"
++
++#define AR_APM_IID 1u
++#define AR_OP_GRAPH_OPEN 0x01001000u
++#define AR_OP_GRAPH_PREPARE 0x01001001u
++#define AR_OP_GRAPH_START 0x01001002u
++#define AR_OP_GRAPH_STOP 0x01001003u
++#define AR_OP_GRAPH_CLOSE 0x01001004u
++#define AR_OP_SET_CFG 0x01001006u
++#define AR_OP_MEM_MAP 0x0100100Cu
++#define AR_OP_MEM_UNMAP 0x0100100Du
++#define AR_OP_MEM_MAP_DONE 0x02001001u
++#define AR_OP_PRM_REQUEST_DONE 0x02001002u
++#define AR_OP_PRM_RELEASE_DONE 0x02001003u
++#define AR_OP_WRITE 0x0400100Au
++#define AR_OP_WRITE_DONE 0x05001004u
++#define AR_OP_READ 0x0400100Bu
++#define AR_OP_READ_DONE 0x05001005u
++#define AR_OP_EOS_RENDERED 0x05001001u
++
++/* Module ids and the instance ids the board topology gives them. */
++#define AR_MOD_WR_SHMEM 0x07001000u
++#define AR_MOD_RD_SHMEM 0x07001001u
++#define AR_MOD_PCM_CNV 0x07001003u
++#define AR_MOD_PCM_ENC 0x07001004u
++#define AR_MOD_PCM_DEC 0x07001005u
++#define AR_MOD_I2S_SINK 0x0700100Au
++#define AR_MOD_CODEC_DMA_SOURCE 0x07001024u
++
++#define AR_SG_PLAY 0x4001u
++#define AR_SG_SPEAKER 0x4005u
++#define AR_SG_CAPTURE 0x4003u
++#define AR_SG_MIC 0x4007u
++#define AR_IID_PLAY_SHMEM 0x6001u
++#define AR_IID_PLAY_DEC 0x6002u
++#define AR_IID_PLAY_CNV 0x6003u
++#define AR_IID_SPEAKER_I2S 0x6051u
++#define AR_IID_MIC_DMA 0x6070u
++#define AR_IID_CAP_CNV 0x6022u
++#define AR_IID_CAP_ENC 0x6023u
++#define AR_IID_CAP_SHMEM 0x6024u
++
++/* The hardware endpoint: mondrian drives both AW88261 amplifiers from the
++ * tertiary MI2S on SD0 (live device tree pinctrl), so the lane mask is SD0. */
++#define AR_LPAIF 0u
++#define AR_I2S_TERTIARY 2u
++#define AR_I2S_SD0 1u
++#define AR_WS_INTERNAL 1u
++
++typedef struct {
++	uint32_t rate;
++	uint16_t bits;
++	uint16_t channels;
++} ArFormat;
++
++typedef struct {
++	uint32_t opcode, token, src_port;
++	uint32_t result_opcode, status;
++	uint32_t handle;
++	uint64_t address;
++	uint32_t data_bytes;
++} ArAnswer;
++
++enum {
++	ArUnknown = 0, ArBasicResult = 1, ArMapped = 2, ArWriteDone = 3,
++	ArReadDone = 4, ArFrameworkState = 5, ArPrmDone = 6, ArBad = -1
++};
++
++uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token);
++uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token, const ArFormat *format);
++uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token, uint32_t opcode, uint32_t sg);
++int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *answer);
++
++#endif
