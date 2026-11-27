@@ -210,12 +210,21 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   holds `0x2a5a5a5a` at 1, 10 and 100 ms with `BHI_STATUS=0` after 10000
   polls. With `mondrianwifibypass=1` the same boot dies right after `W15
   bypass rc=-1`, so that diagnostic stays off until its path is fixed. The
-  doorbell being retained and `status=0` is the PBL-never-fetched symptom;
-  measured 2026-11-27, `wifistat` reads `mhistatus=0x0`, so the PBL never
-  fetched and the image address or the route to the SMMU is the next suspect,
-  not BHIe. The host sequence matches Linux `mhi_fw_load_bhi` (clear
-  `BHI_STATUS`, write `IMGADDR` high/low and `IMGSIZE`, ring `IMGTXDB` with a
-  non-zero 30-bit session).
+  doorbell being retained and `status=0` is not a host-sequence gap: the host
+  matches Linux `mhi_fw_load_bhi` (clear `BHI_STATUS`, write `IMGADDR`
+  high/low and `IMGSIZE`, ring `IMGTXDB` with a non-zero 30-bit session).
+  `0487` replaces the no-op `flush_dcache64()` calls (the kernel is
+  `__ARM_COHERENT_IO__`, so they were a bare `dsb`) with a real dcache clean;
+  the boot still reports `status=0`. With only 8 KiB mapped
+  (`mondrianwifimap=8192`) the SMMU sees no read past `0xa1002000`, so the
+  PBL reads only the ELF header and hash segment and stops. `0489` reads the
+  boot-ROM telemetry after the poll: `TCSR_PBL_LOGGING=0xef0a0111` (stage
+  `0x0a`, authentication), `WLAN_SECURE_BOOTN=0x0`, `PBL_WLAN_BOOT_CFG=0x1`,
+  `WLAON_SOC_POWER_CTRL=0x8020397` and `WL_PWR_STATUS=0xd`. The secure and
+  WLAON state matches stock, so the doorbell, SMMU and power rails are not
+  the gap; the first-512 KiB image sum is `0x163c3337` where the donor's is
+  `0x57da4435`, and the signed image or the bootstrap strap is the next
+  suspect. The PBL bootstrap/OD reads hang the AHB window and stay out.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
