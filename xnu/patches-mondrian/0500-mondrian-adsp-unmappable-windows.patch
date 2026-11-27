@@ -1,0 +1,53 @@
+xnu 0500: map the adsp windows outside the io_submap
+
+The 0499 boot mapped all 25 carveout chunks and then stopped dead on the
+2 MiB SMEM map: ml_io_map allocates from the fixed 8 MiB io_submap with
+KMA_NOFAIL, and that submap is what killed the 0497/0498 premap in the
+same call. Map SMEM and the three MMIO windows through kernel_map with
+ml_io_map_unmappable and the attributes ml_io_map passed for them
+(VM_WIMG_IO), so the ADSP driver never allocates from io_submap.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index dff88cb..501e0c9 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -702,18 +702,28 @@ adsp_map_all(void)
+ 			return -1;
+ 		}
+ 	}
+-	adsp_smem = ml_io_map(ADSP_SMEM_BASE, ADSP_SMEM_SIZE);
+-	adsp_log("map smem 0x%llx+0x%x -> 0x%lx", ADSP_SMEM_BASE,
+-	    (uint32_t)ADSP_SMEM_SIZE, (unsigned long)adsp_smem);
+-	adsp_ipcc = ml_io_map(ADSP_IPCC_BASE, 0x1000);
+-	adsp_log("map ipcc 0x%llx -> 0x%lx", ADSP_IPCC_BASE,
+-	    (unsigned long)adsp_ipcc);
+-	adsp_mutex = ml_io_map(ADSP_MUTEX_BASE, 0x1000);
+-	adsp_log("map mutex 0x%llx -> 0x%lx", ADSP_MUTEX_BASE,
+-	    (unsigned long)adsp_mutex);
+-	adsp_aoss = ml_io_map(ADSP_AOSS_BASE, 0x1000);
+-	adsp_log("map aoss 0x%llx -> 0x%lx", ADSP_AOSS_BASE,
+-	    (unsigned long)adsp_aoss);
++	/*
++	 * ml_io_map() allocates from the fixed 8 MiB io_submap with
++	 * KMA_NOFAIL. Measured 2026-11-27: the 25 carveout chunks map through
++	 * kernel_map and then the worker stops dead on the 2 MiB SMEM map, the
++	 * same call that killed the 0497/0498 premap. Map the four windows
++	 * through kernel_map as well; the attributes are the ones ml_io_map()
++	 * passed for them (VM_WIMG_IO).
++	 */
++	adsp_log("map smem 0x%llx+0x%x", ADSP_SMEM_BASE,
++	    (uint32_t)ADSP_SMEM_SIZE);
++	adsp_smem = ml_io_map_unmappable(ADSP_SMEM_BASE, ADSP_SMEM_SIZE,
++	    VM_WIMG_IO);
++	adsp_log("smem -> 0x%lx", (unsigned long)adsp_smem);
++	adsp_log("map ipcc 0x%llx", ADSP_IPCC_BASE);
++	adsp_ipcc = ml_io_map_unmappable(ADSP_IPCC_BASE, 0x1000, VM_WIMG_IO);
++	adsp_log("ipcc -> 0x%lx", (unsigned long)adsp_ipcc);
++	adsp_log("map mutex 0x%llx", ADSP_MUTEX_BASE);
++	adsp_mutex = ml_io_map_unmappable(ADSP_MUTEX_BASE, 0x1000, VM_WIMG_IO);
++	adsp_log("mutex -> 0x%lx", (unsigned long)adsp_mutex);
++	adsp_log("map aoss 0x%llx", ADSP_AOSS_BASE);
++	adsp_aoss = ml_io_map_unmappable(ADSP_AOSS_BASE, 0x1000, VM_WIMG_IO);
++	adsp_log("aoss -> 0x%lx", (unsigned long)adsp_aoss);
+ 	if (adsp_smem == 0 || adsp_ipcc == 0 || adsp_mutex == 0 ||
+ 	    adsp_aoss == 0) {
+ 		return -1;
