@@ -1,0 +1,62 @@
+xnu 0493: let mondrianwifinorsoc skip the whole host reset
+
+Measured 2026-11-27: the odd BHI session changes nothing (`0xef0a0111`,
+`status=0`). The working SM8475 QCA6490 driver powers the chip, trains the
+link and loads the firmware without any hot reset, LTSSM pulse, QFPROM
+write, warm-entry clear or SOC global reset. The old `mondrianwifinorsoc`
+returned after all of those, so its A/B never tested the cold chip. Return
+at the top of `wifi_soc_reset` instead; the boot argument now selects the
+whole no-reset path.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1339,6 +1339,24 @@
+ 	unsigned int i;
+ 
+ 	/*
++	 * A cold QCA6490 is already sitting in its boot ROM when the link
++	 * trains. The writes below are what ath11k sends to a device another
++	 * OS has booted, and the working SM8475 driver does none of them before
++	 * the BHI load. `mondrianwifinorsoc=1` skips the whole block so the
++	 * doorbell lands in the ROM the power-on left running.
++	 */
++	{
++		int skip = 0;
++
++		if (PE_parse_boot_argn("mondrianwifinorsoc", &skip,
++		    sizeof(skip)) && skip != 0) {
++			wifi_log("W6 reset skipped (mondrianwifinorsoc)");
++			mondrian_log_flush_now();
++			return 0;
++		}
++	}
++
++	/*
+ 	 * ath11k_pci_sw_reset(power_on=true), in its order. The LTSSM enable and
+ 	 * the hot-reset pulse come first: without them the SoC global reset
+ 	 * leaves the endpoint's PBL unclocked, which is the state 0442 measured
+@@ -1380,23 +1398,6 @@
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x394, 0);
+ 	(void)mondrian_mmio_try_wr32(wifi_bar + 0x39c, 0);
+ 	mondrian_log_flush_now();
+-	/*
+-	 * A cold QCA6490 is already sitting in its boot ROM when the link
+-	 * trains. The host reset below is what ath11k sends to a device another
+-	 * OS has booted; on a fresh chip it may be the one thing that stops the
+-	 * PBL. mondrianwifinorsoc=1 skips the pulse and the MHI reset so the
+-	 * doorbell lands in the ROM the power-on left running (0455).
+-	 */
+-	{
+-		int skip = 0;
+-
+-		if (PE_parse_boot_argn("mondrianwifinorsoc", &skip,
+-		    sizeof(skip)) && skip != 0) {
+-			wifi_log("W6 soc reset skipped (mondrianwifinorsoc)");
+-			mondrian_log_flush_now();
+-			return 0;
+-		}
+-	}
+ 	if (wifi_ahb_read32(0x3008, &val) != 0) {
+ 		wifi_log("W6 global reset unreadable");
+ 		mondrian_log_flush_now();
