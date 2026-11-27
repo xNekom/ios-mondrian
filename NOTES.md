@@ -66,7 +66,7 @@ Current blockers, in order:
    Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01`; W3 assigns BAR0
    and proves bus master; W4/W5 read MHI and BHI 1.2. Skipping the shared
    ARC/XO/NoC votes leaves the worker up for minutes, so the BHI image load is
-   the open question; QMI/ath11k, ADSP/codec/PCM and camera remain absent.
+   the open question; QMI/ath11k and camera remain absent.
 2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
    tests, but no iOS process asks for it: Safari's page stays black and the live
    wallpaper poster has no renderer. The UI itself composites through Mesa GLES.

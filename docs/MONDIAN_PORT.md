@@ -266,10 +266,10 @@ PlugInKit's container check, and Phone still fails.
 and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
 with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 
-The ADSP runs through PAS1 (`mondrianadsp=1`): `init_image`, `mem_setup` and
-`auth_and_reset` return 0, SMP2P reports READY | HANDOVER after 2 ms, the APM
-accepts both graphs, and one PCM period completes through apps-SMMU SID
-0x1801 with write-done status 0; AW88261 and WCD938x are next (`docs/MONDIAN_AUDIO.md`).
+The ADSP runs through PAS1 (`mondrianadsp=1`): both subgraphs start and PCM
+ring slots complete through apps-SMMU SID 0x1801. `0506` unmutes the AW88261
+pair on the live TDM line (sck 121, ws 123, dout 124/data1); `0507` drives the
+TDM sink (`0x0700100E`, lane 1) from the shared-memory chain; data1 is still silent.
 
 ## Getting the numbers off the device
 
