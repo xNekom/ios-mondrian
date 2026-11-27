@@ -226,11 +226,15 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `amss20.bin` from `modem.img` (sha256 `903c378a…`), and its ELF header
   reads `e_entry=0x1436500` with 17 program headers, the same as the donor,
   so the image is correct and the earlier `0x57da4435` comparison was wrong. The QCA6490 PBL
-  log is 10 words at `0x01403da0`, not the QCA6390 base: `0491` reads it,
-  plus the three `WLAN_SECURE_BOOTN` reads and the
-  `0x01e22b2c`/`0x01e22b3c` root-certificate selects that the 7a's ROM
-  disassembly places in `pbl_auth.c`. The PBL bootstrap/OD and the TCSR
-  BHI_ERRDBG reads hang the AHB window and stay out.
+  log is 10 words at `0x01403da0`, not the QCA6390 base: measured
+  2026-11-27 it ends `42100000 2 80f7d0 b2 ef000008`, the same last five
+  words the Pixel 7a reads at its authentication stop, so the ROM fails in
+  common code, not in the host DMA path. `WLAN_SECURE_BOOTN` reads 0 three
+  times and `0x01e22b2c`/`0x01e22b3c` read `0x800000`/`0x1016d0e1` (the
+  JTAG id), so the strap is not the difference the 7a saw. The BHI doorbell
+  session is the next suspect: every proven load (mayfly, 7a, donor) uses an
+  odd session, ours was `0x2a5a5a5a` (`0492`). The PBL bootstrap/OD and the
+  TCSR BHI_ERRDBG reads hang the AHB window and stay out.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
