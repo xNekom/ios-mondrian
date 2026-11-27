@@ -1,0 +1,124 @@
+# 0511 - /dev/mondrian-haptic for the HAL Actuator device
+#
+# MondrianAudio.driver writes S16 mono haptic frames to /dev/mondrian-haptic
+# but the kernel never created that node. Coalesce a burst into one PM8350B
+# buzz on close so the HAL writer never blocks on the boost wait.
+--- a/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382183532 +0100
++++ b/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382334932 +0100
+@@ -24,6 +24,9 @@
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/devfs.h>
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(MONDRIAN)
+@@ -437,3 +440,95 @@
+ 	return snprintf(out, len, "%s", line);
+ }
+ #endif /* MONDRIAN */
++
++
++/* ---- /dev/mondrian-haptic: the HAL's Actuator device ---------------------
++ *
++ * MondrianAudio.driver writes S16 mono haptic frames here. Coalesce a burst
++ * into one PM8350B buzz on close so the HAL's writer thread never blocks on
++ * the 2 s boost wait.
++ */
++static int mh_major = -1;
++static uint32_t mh_peak, mh_frames;
++
++extern int mondrian_haptics_buzz(unsigned int ms, unsigned int amp,
++    unsigned int force);
++
++static int
++mh_open(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	mh_peak = 0;
++	mh_frames = 0;
++	printf("MONDRIAN HAPTIC: actuator node opened\n");
++	return 0;
++}
++
++static int
++mh_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	unsigned int ms = (mh_frames * 1000u) / 48000u;
++	uint32_t amp = mh_peak;
++
++	if (amp > 0 && ms > 0) {
++		amp = amp * 0xffu / 0x7fffu;
++		if (amp == 0) amp = 1;
++		printf("MONDRIAN HAPTIC: actuator %u frames -> %u ms amp 0x%02x\n",
++		    mh_frames, ms, amp);
++		(void)mondrian_haptics_buzz(ms, amp, 0);
++	} else {
++		printf("MONDRIAN HAPTIC: actuator closed with no samples\n");
++	}
++	return 0;
++}
++
++static int
++mh_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t buf[1024];
++	size_t n;
++	int error = 0;
++
++	while (uio->uio_resid > 0) {
++		n = min(sizeof(buf), (size_t)uio->uio_resid);
++		error = uiomove(buf, n, uio);
++		if (error != 0) break;
++		for (size_t i = 0; i + 1 < n; i += 2) {
++			int16_t s;
++			uint32_t a;
++			memcpy(&s, buf + i, sizeof(s));
++			a = s < 0 ? (uint32_t)(-(int32_t)s) : (uint32_t)s;
++			if (a > mh_peak) mh_peak = a;
++		}
++		mh_frames += (uint32_t)(n / 2);
++	}
++	return error;
++}
++
++static const struct cdevsw mh_cdevsw = {
++	.d_open = mh_open, .d_close = mh_close,
++	.d_read = eno_rdwrt, .d_write = mh_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset,
++	.d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_type = 0,
++};
++
++void
++mondrian_haptics_dev_init(void)
++{
++	void *node;
++
++	if (mh_major >= 0) return;
++	mh_major = cdevsw_add(-1, &mh_cdevsw);
++	if (mh_major < 0) {
++		printf("MONDRIAN HAPTIC: cdevsw_add failed %d\n", mh_major);
++		mh_major = -1;
++		return;
++	}
++	node = devfs_make_node(makedev(mh_major, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_WHEEL, 0666, "/dev/mondrian-haptic");
++	printf("MONDRIAN HAPTIC: /dev/mondrian-haptic major %d node %s\n",
++	    mh_major, node != NULL ? "ok" : "FAILED");
++}
++
+# The haptic cdev is created with the audio node, before userland starts.
+--- a/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199449776 +0100
++++ b/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199770888 +0100
+@@ -1860,6 +1860,7 @@
+ 	}
+ 	thread_deallocate(thread);
+ 	mondrian_audio_dev_init();
++	mondrian_haptics_dev_init();
+ 	adsp_log("worker started");
+ }
+ 

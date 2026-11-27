@@ -114,6 +114,18 @@ host: no `hfsplus` kernel module, `7z u` fails, `hfsutils` cannot mount HFS+)
 or accept VirtualAudio disabled and route from our plug-in without it. The
 other ports' fallback is exactly that: "no route, all clients see Null_Device".
 
+## The in-process CoreAudio guard is not a fix (2026-11-28)
+
+Patch 0512 injects `MondrianNullGuard.dylib` into mediaserverd when
+`mondrianmsguard=1` and a dylib is present in `/private/var/vm`. The guard
+uses `vm_protect` (kr=0) to patch the observed `ldr x8,[x0,#0x10]` at
+CoreFoundation `__TEXT+0x7ab64` into `mov x8,#0`. Result: the original crash
+site is avoided but mediaserverd crash-loops elsewhere (**93 corpses in one
+boot**) because the same CF routine is used by many other paths. Do not ship
+this guard; boot with `mondrianmsguard` absent. The NULL string needs a fix at
+the caller in CoreAudio's DeviceManagerCreated, not a blanket instruction
+replacement.
+
 ## Safari / WKWebView blank — `Lakr233/vphone-cli` issue #756 and `AdyaGMD/ios-spes/NOTES.md`
 
 WebKit asks for `w30r`/`b3a8` (extended-colour, 10-bit) IOSurfaces. When the
