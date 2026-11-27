@@ -754,10 +754,12 @@ boot each, so the three columns differ only in what changed:
   frames, updated when the minute changes. Armed by
   `/private/var/vm/mondrian-lockscreen-clock`; the ring answers
   `MONDRIAN CLOCK: '7:51' 'Sunday, November 22' host SBCoverSheetWindow`, and a
-  power-wake capture shows the date over the clock. The phone boots at the
-  epoch, and the PMK8350 RTC is owned by processor 4, so `rtc set` moves the
-  running clock only: `tools/wsl/cycle.sh` sets it from the host after every
-  proven boot, or the date reads 1970.
+  power-wake capture shows the date over the clock. The PMK8350 RTC is owned by
+  processor 4, so it cannot be set from APPS and every boot starts from the
+  image instead: `tools/wsl/image.sh` stamps the host's time into the boot
+  arguments (`mondriantime`, read by `bsd/dev/mondrian_clock.c`) and
+  `tools/wsl/cycle.sh` refreshes the running clock from the host after every
+  proven boot, because the image may be older than the boot.
 - **The Control Center capsules draw and take a drag, not a tap (2026-11-22).**
   The brightness capsule's fill is its own thumb: a light band from the bottom
   whose rounded top edge is the level, and it moves with the panel brightness
