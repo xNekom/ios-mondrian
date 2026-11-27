@@ -1,0 +1,50 @@
+xnu 0494: keep the pre-bhi MHI context off
+
+Measured 2026-11-27: the whole host reset is not the gate (`0493` skips it
+and the PBL still stops at `0xef0a0111`). `0449` programs the MHI context
+before the BHI on the premise that the PBL waits for it; mainline, the
+working SM8475 driver and the donor program it after the SBL, and the 8 KiB
+map leaves `CCABAP` at `0xa15ff000` unreachable. Skip the context and the
+`MHICFG` rewrite unless `mondrianwifimhi=1` asks for the old experiment.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1901,6 +1901,7 @@
+     {
+         uint32_t mhicfg = 0, mhistatus = 0, chdb = 0, erdb = 0;
+         uint32_t bhie_off = 0, cfg_after = 0, ccabap = 0, ner, nhwer;
++        int mhi = 0;
+         uint64_t ctx = iova + W8_CTX_OFF;
+         uint64_t limit = iova + 0x600000 - 1;
+ 
+@@ -1918,12 +1919,23 @@
+         (void)mondrian_mmio_try_rd32(wifi_bar + 0x2c, &bhie_off);
+         memset((void *)(buf + W8_CTX_OFF), 0, 0x1000);
+         wifi_flush_va(buf + W8_CTX_OFF, 0x1000);
+-        rc = wifi_mhi_context(ctx, iova, limit);
+-        ner = (mhicfg >> 16) & 0xffu;
+-        nhwer = (mhicfg >> 24) & 0xffu;
+-        if (ner != 0) {
+-            (void)mondrian_mmio_try_wr32(wifi_bar + 0x10,
+-                (mhicfg & ~0xffff0000u) | (ner << 16) | (nhwer << 24));
++        /*
++         * mainline, the working SM8475 driver and the donor program the MHI
++         * context after the SBL; 0449 put it before the BHI on the premise
++         * that the PBL waits for it, which the auth stop disproves.
++         * mondrianwifimhi=1 restores that experiment.
++         */
++        rc = 0;
++        if (PE_parse_boot_argn("mondrianwifimhi", &mhi, sizeof(mhi)) &&
++            mhi != 0) {
++            rc = wifi_mhi_context(ctx, iova, limit);
++            ner = (mhicfg >> 16) & 0xffu;
++            nhwer = (mhicfg >> 24) & 0xffu;
++            if (ner != 0) {
++                (void)mondrian_mmio_try_wr32(wifi_bar + 0x10,
++                    (mhicfg & ~0xffff0000u) | (ner << 16) |
++                    (nhwer << 24));
++            }
+         }
+         (void)mondrian_mmio_try_rd32(wifi_bar + 0x10, &cfg_after);
+         (void)mondrian_mmio_try_rd32(wifi_bar + 0x58, &ccabap);
