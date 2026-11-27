@@ -1,0 +1,87 @@
+xnu 0491: read the qca6490 pbl auth inputs
+
+Measured 2026-11-27: the iOS root image matches the phone's stock `modem.img`
+`amss20.bin` byte for byte in the first 512 KiB (`0x163c3337`), so the image
+is not the gap and the audit's donor sum was wrong. The QCA6490 PBL log
+starts at `0x01403da0` and is 10 words, not the QCA6390 base 0489 read.
+`pbl_auth.c` reads `WLAN_SECURE_BOOTN` twice back to back and selects a root
+certificate from `0x01e22b2c`/`0x01e22b3c`; read those, the full log, the
+WLAON stack canary and memory-SVS register, and the BHI error-debug words.
+The TCSR error-debug reads hang this worker and stay out.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1264,12 +1264,14 @@
+  * addresses the 7a stock port read in the same windows. All are read-only.
+  *
+  * Read only after the BHI poll: the same windowed read before the doorbell
+- * hung the worker at stage 16 (measured 2026-11-27). The PBL log SRAM goes
+- * first: it is the ROM's own trace of a failed authentication, and the read
+- * that 0489 never reached. PBL_BOOTSTRAP_STATUS and TLMM_OD_EN are left out
+- * because that window hangs the worker (measured 2026-11-27); the remaining
+- * AHB reads are the ones 0489 completed, plus the two error-debug words the
+- * hang had kept out. Log every word before the next read.
++ * hung the worker at stage 16 (measured 2026-11-27). The QCA6490 PBL log
++ * lives at 0x01403da0 and is 10 words (`reg.h`); 0489 read the QCA6390 base,
++ * so words 6..9 were missed. The authentication step in `pbl_auth.c` reads
++ * `WLAN_SECURE_BOOTN` twice back to back and selects a root certificate from
++ * 0x01e22b2c/0x01e22b3c, so those are read here too, plus the WLAON stack
++ * canary and memory-SVS register. PBL_BOOTSTRAP_STATUS, TLMM_OD_EN and the
++ * TCSR BHI_ERRDBG2/3 reads hang this worker (measured 2026-11-27). Log every
++ * word before the next read.
+  */
+ static void
+ wifi_pbl_dump(const char *tag, int sram)
+@@ -1281,17 +1283,21 @@
+ 		{ "soc_pwr", 0x1f80000 },
+ 		{ "wl_pwr", 0x1f8002c },
+ 		{ "pbl", 0x1b000f8 },
+-		{ "secure", 0x1e22b24 },
++		{ "secure0", 0x1e22b24 },
++		{ "secure1", 0x1e22b24 },
++		{ "secure2", 0x1e22b24 },
++		{ "cert_sel2c", 0x1e22b2c },
++		{ "cert_sel3c", 0x1e22b3c },
+ 		{ "boot_cfg", 0x1e22b34 },
+-		{ "errdbg2", 0x1e0e238 },
+-		{ "errdbg3", 0x1e0e23c },
++		{ "canary", 0x1f80614 },
++		{ "svs", 0x1f806d4 },
+ 	};
+ 	unsigned i;
+ 
+ 	if (sram != 0) {
+-		for (i = 0; i < 24; i++) {
++		for (i = 0; i < 10; i++) {
+ 			uint32_t v = 0;
+-			int rc = wifi_ahb_read32(0x1403d58 + i * 4, &v);
++			int rc = wifi_ahb_read32(0x1403da0 + i * 4, &v);
+ 
+ 			wifi_log("W16 %s sram[%u]=0x%x rc=%d", tag, i, v, rc);
+ 			mondrian_log_flush_now();
+@@ -1431,6 +1437,7 @@
+ {
+     uint32_t major = 0, minor = 0, exec = 0, status = 0, err = 0;
+     uint32_t arl = 0, numseg = 0, txdb = 0, addr = 0, size = 0;
++    uint32_t dbg1 = 0, dbg2 = 0, dbg3 = 0;
+ 
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x00, &minor);
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x04, &major);
+@@ -1440,11 +1447,14 @@
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x28, &exec);
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x2c, &status);
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x30, &err);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x34, &dbg1);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x38, &dbg2);
++    (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x3c, &dbg3);
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x44, &arl);
+     (void)mondrian_mmio_try_rd32(wifi_bar + bhioff + 0x48, &numseg);
+     wifi_log("W9 %s ver=%u.%u arl=%x numseg=%x exec=%x status=%x err=%x"
+-        " txdb=%x addr=%x size=%x", tag, major, minor, arl, numseg, exec,
+-        status, err, txdb, addr, size);
++        " txdb=%x addr=%x size=%x dbg=%x/%x/%x", tag, major, minor, arl,
++        numseg, exec, status, err, txdb, addr, size, dbg1, dbg2, dbg3);
+ }
+ 
+ extern int mondrian_spmi_reg_read(uint16_t ppid, uint8_t reg, uint8_t *out);
