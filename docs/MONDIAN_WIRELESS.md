@@ -222,9 +222,15 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   `0x0a`, authentication), `WLAN_SECURE_BOOTN=0x0`, `PBL_WLAN_BOOT_CFG=0x1`,
   `WLAON_SOC_POWER_CTRL=0x8020397` and `WL_PWR_STATUS=0xd`. The secure and
   WLAON state matches stock, so the doorbell, SMMU and power rails are not
-  the gap; the first-512 KiB image sum is `0x163c3337` where the donor's is
-  `0x57da4435`, and the signed image or the bootstrap strap is the next
-  suspect. The PBL bootstrap/OD reads hang the AHB window and stay out.
+  the gap. The first-512 KiB image sum `0x163c3337` is the phone's own stock
+  `amss20.bin` from `modem.img` (sha256 `903c378a…`), and its ELF header
+  reads `e_entry=0x1436500` with 17 program headers, the same as the donor,
+  so the image is correct and the earlier `0x57da4435` comparison was wrong. The QCA6490 PBL
+  log is 10 words at `0x01403da0`, not the QCA6390 base: `0491` reads it,
+  plus the three `WLAN_SECURE_BOOTN` reads and the
+  `0x01e22b2c`/`0x01e22b3c` root-certificate selects that the 7a's ROM
+  disassembly places in `pbl_auth.c`. The PBL bootstrap/OD and the TCSR
+  BHI_ERRDBG reads hang the AHB window and stay out.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
