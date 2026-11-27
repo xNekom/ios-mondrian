@@ -43,6 +43,19 @@ else
 	PREV="$PREV_ARGS"
 fi
 CM="${PREFIX_ARGS:+$PREFIX_ARGS }$CM $PREV ${EXTRA_ARGS:-}"
+# The PMK8350 RTC has never been set and the port has no RTC driver, so the
+# kernel gets its date from `mondriantime=<seconds since 1970>`
+# (xnu/patches-mondrian/0118). tools/phone-deploy.sh stamps it on the flash
+# path; the image and cycle builds come through here, and without the stamp
+# the kernel boots at the epoch. Keep the 607-byte userland ceiling.
+if [ "${CM#*mondriantime=}" = "$CM" ]; then
+	STAMP="mondriantime=$(date +%s)"
+	if [ $((${#CM} + ${#STAMP} + 1)) -le 607 ]; then
+		CM="$CM $STAMP"
+	else
+		echo "cmdline: no room for $STAMP"
+	fi
+fi
 echo "cmdline: ${#CM} bytes: $CM"
 python3 tools/mkpayload.py xnu/out/kernel.development.mondrian \
 	shim/out/mondrian.adt shim/out/payload.bin --board mondrian \
