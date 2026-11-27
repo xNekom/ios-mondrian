@@ -9,6 +9,12 @@ SMP2P entry answers `0x6` (READY | HANDOVER, the donor's bits 1 and 2) two
 milliseconds after the reset. The `master-kernel` outbound SMP2P item and its
 LPASS doorbell go in before the load, because the ADSP looks for it at boot.
 
+The standard `tools/boards.py` line has no `mondrianadsp` and only eight bytes
+of headroom. The audio test boots with a trimmed override: drop `battfix=`,
+`wlan.debug.generate-mac` and the `mondrianwifi*` arguments, add
+`mondrianadsp=1`, and let `image.sh` stamp `mondriantime` (558 bytes). Without
+the argument the image reaches SpringBoard and runs no ADSP worker.
+
 The QMP `load_state` vote and the RPMh `lcx`/`lmx` votes are **not** needed for
 this step on mondrian: the ADSP answers with the AOSS mailbox still closed.
 They stay the fallback for a service that needs the rails.
