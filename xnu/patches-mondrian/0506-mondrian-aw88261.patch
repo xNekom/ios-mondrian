@@ -1,0 +1,1277 @@
+xnu 0506: prepare and start the aw88261 speaker amplifiers
+
+The pair answered its ID in the 0505 boots. This adds the register path:
+each part's fuses, a soft reset, the stock aw882xx_acf.bin Music profile
+(device 0 at 0x34, device 1 at 0x35), the fuse-derived 0x50 calibration and
+the parked, muted state; the TDM pin function on GPIO121/123/124
+(sck/ws/data1) and spksw GPIO52 low.
+
+The live device tree is the authority for the data line. Its
+tert_tdm_pinctrl (status ok) is sck GPIO121, ws GPIO123 and dout GPIO124
+(function mi2s2_data1); tert_mi2s_pinctrl with GPIO122/mi2s2_data0 is
+disabled. The two aw882xx_smartpa nodes are sound-channel 0 and 1 on that
+shared dout line. The pad takes the vendor's 8 mA drive and pull-down.
+
+The adsp worker calls mondrian_audio_amp_start() only after the graphs are
+started, when the bit clock runs: the pair clears power-down, waits for the
+PLL to lock, enables the power stage, restores the feedback enable and
+unmutes at the profile's volume. The worker then sends the PCM periods and
+powers both down with mondrian_audio_amp_stop().
+
+The 57 register/value pairs of each profile are configuration data read from
+the phone's stock firmware file; no vendor driver code is copied.
+
+Measured 2026-11-27: both parts answered 0x2113, both 57-register profiles
+read back (0x04=0x73c3 parked, 0x08=0x00f6/0x00f7), and the fuses gave icalk
+992/1001 against vcalk 992/994. Both PLLs lock (SYSST 0x0011), both mutes
+release at the profile volume (0x1800/0x0800), the PCM write completes with
+status 0, VBAT is 3598 mV and PVDD tracks it.
+
+The start's second SYSST check wanted SWS and BSTS; the part reported 0x0011
+while still muted and the check aborted. Upstream aw88261 fixed the same
+false failure in 2026 ("check sysst fail, reg_val=0x0011"): only PLLS and
+CLKS are required before the mute release. This does that, then looks for
+SWS|BSTS after the release and logs VBAT and PVDD.
+
+The first data pad was GPIO122 (mi2s2_data0), first tri-stated and then
+driven, and it never showed the fill (0.05-0.45 % high over the periods).
+That pin is the disabled I2S group's sd0/capture line; the pair listens on
+GPIO124 (mi2s2_data1). The mux now uses GPIO124 and the sampler reads it.
+The fill is a one-LSB sign square (+1/0xffffffff): inaudible, but the
+negative half sets every bit, so the line shows it whatever width the
+interface transmits. spksw is sampled as a known-high control.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index 716d9ba..c3c9319 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -45,6 +45,12 @@ extern kern_return_t thread_terminate(thread_t);
+ #include "mondrian_audioreach.h"
+ #include "mondrian_audio_smmu.h"
+ 
++/* mondrian_audio_probe.c: prepared at boot, started once the graph clocks MI2S2. */
++extern int mondrian_audio_amp_start(void);
++extern void mondrian_audio_amp_stop(void);
++extern void mondrian_audio_amp_report(const char *when);
++extern void mondrian_audio_sample_pads(const char *when);
++
+ #define ADSP_FW_PATH		"/private/var/vm/adsp.mbn"
+ #define ADSP_PAS_ID		1u
+ #define ADSP_SCM_PIL_BASE	0x42000200u
+@@ -672,7 +678,13 @@ adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
+ #define ADSP_PCM_BYTES		0x4000u
+ #define ADSP_PCM_PERIOD		3840u
+ 
+-/* 1 kHz square at -18 dBFS: (i / 2) is the frame, 48 frames per period. */
++/*
++ * 1 kHz sign square at one LSB: (i / 2) is the frame, 48 frames per period.
++ * +1 is 0x00000001 and -1 is 0xffffffff, so the negative half sets every bit.
++ * That makes the pattern visible on DATA0 whatever width or alignment the
++ * LPAIF transmits (a -18 dBFS square only sets bit 28 and vanishes if the
++ * interface sends the low 24 bits), and one LSB is inaudible on the speaker.
++ */
+ static void
+ adsp_pcm_fill(void)
+ {
+@@ -681,7 +693,7 @@ adsp_pcm_fill(void)
+ 	vm_offset_t at;
+ 
+ 	for (i = 0; i < ADSP_PCM_PERIOD / 4; i++) {
+-		pcm[i] = (((i / 2) % 48) < 24) ? 0x10000000 : -0x10000000;
++		pcm[i] = (((i / 2) % 48) < 24) ? 1 : -1;
+ 	}
+ 	for (at = adsp_pcm_va; at < adsp_pcm_va + ADSP_PCM_BYTES;
+ 	    at += 64) {
+@@ -699,11 +711,12 @@ adsp_apm_probe(void)
+ 	static const ArFormat format = { 48000, 32, 2 };
+ 	uint8_t packet[GPR_MAX_PACKET];
+ 	ArAnswer answer;
+-	uint32_t length, token, handle = 0, write_token;
++	uint32_t length, token, handle = 0, write_token, round;
+ 	kern_return_t kr;
+ 	ppnum_t pn;
+ 	uint64_t pcm_iova = 0;
+ 	int device_open = 0, stream_open = 0, mapped = 0, started = 0;
++	int amps = 0, amp_error;
+ 
+ 	token = ++adsp_ar_token;
+ 	length = ar_open_speaker_device(packet, (uint32_t)sizeof packet,
+@@ -818,17 +831,73 @@ adsp_apm_probe(void)
+ 	}
+ 	started = 1;
+ 
+-	write_token = 0x10000000u | (++adsp_ar_write & 0x0fffffffu);
+-	length = ar_write(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
+-	    write_token, pcm_iova | (1ull << 32), handle, ADSP_PCM_PERIOD);
+-	if (length != 0 &&
+-	    adsp_apm_write(packet, length, write_token, &answer) == 0) {
+-		adsp_log("apm write done address=0x%llx status=%u",
+-		    (unsigned long long)answer.address, answer.status);
++	/*
++	 * The graphs are started, so the MI2S2 bit clock runs. Power the pair
++	 * up and unmute it before the period is handed to the DSP; a failure
++	 * here leaves both parts powered down and is not fatal to the write.
++	 */
++	amp_error = mondrian_audio_amp_start();
++	if (amp_error == 0) {
++		amps = 1;
++		adsp_log("aw88261 pair running; sending eight periods");
++	} else if (amp_error != ENOENT) {
++		adsp_log("aw88261 pair did not start (%d); the periods go to a "
++		    "muted path", amp_error);
++	}
++
++	/*
++	 * Eight 10 ms periods, not one: the class-D only reports SWS/BSTS
++	 * once it has real audio to switch, and the last period is still
++	 * playing while the report below reads the status.
++	 */
++	for (round = 0; round < 8; round++) {
++		write_token = 0x10000000u |
++		    (++adsp_ar_write & 0x0fffffffu);
++		length = ar_write(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, write_token, pcm_iova | (1ull << 32),
++		    handle, ADSP_PCM_PERIOD);
++		if (length == 0) {
++			adsp_log("apm write %u could not be built", round);
++			break;
++		}
++		/*
++		 * The first period is measured while it renders: the write is
++		 * sent, the pads and SYSST are read during the period, and only
++		 * then is the write-done answer collected.
++		 */
++		if (round == 0) {
++			if (adsp_apm_send_token(packet, length, write_token,
++			    "write") != 0) {
++				adsp_log("apm write 0 send failed");
++				break;
++			}
++			mondrian_audio_sample_pads("first period");
++			mondrian_audio_amp_report("first period");
++			if (adsp_apm_await(write_token, ArWriteDone, &answer,
++			    "write") != 0) {
++				adsp_log("apm write 0 failed");
++				break;
++			}
++			adsp_log("apm write done address=0x%llx status=%u",
++			    (unsigned long long)answer.address,
++			    answer.status);
++		} else if (adsp_apm_write(packet, length, write_token,
++		    &answer) != 0) {
++			adsp_log("apm write %u failed", round);
++			break;
++		}
++	}
++	if (amps) {
++		mondrian_audio_amp_report("after periods");
++		delay(20000);
+ 	}
+ 	mondrian_audio_smmu_report("after write");
+ 
+ out:
++	if (amps) {
++		mondrian_audio_amp_stop();
++		amps = 0;
++	}
+ 	if (started) {
+ 		token = ++adsp_ar_token;
+ 		length = ar_graph_command(packet, (uint32_t)sizeof packet,
+diff --git a/bsd/dev/mondrian_audio_probe.c b/bsd/dev/mondrian_audio_probe.c
+index d882076..5337add 100644
+--- a/bsd/dev/mondrian_audio_probe.c
++++ b/bsd/dev/mondrian_audio_probe.c
+@@ -1,16 +1,23 @@
+ /* SPDX-License-Identifier: APSL-2.0 */
+ /*
+- * MONDRIAN AUDIO PROBE: AW88261 identity over the SE15 I2C pads.
++ * MONDRIAN AUDIO PROBE: the AW88261 pair on the SE15 I2C pads.
+  *
+- * This is an original, opt-in identity probe. The register number, expected
+- * value and 8-bit-register/16-bit-big-endian wire format are protocol facts
+- * from mainline Linux sound/soc/codecs/aw88261.{c,h} (GPL-2.0-only). No Linux
+- * or vendor driver code is copied here.
++ * Two opt-in modes:
+  *
+- * The worker only maps TLMM pages, pulses the two active-low shutdown lines,
+- * bit-bangs the two open-drain I2C pads and reads register 0x00 at 0x34/0x35.
+- * It does not map or clock the QUP, vote a rail, touch GPIO52, start the ADSP,
+- * write an amplifier data register or open a PCM path.
++ *   1  identity: pulse the two shutdown lines and read register 0x00 at
++ *      0x34 and 0x35 over the bit-banged I2C pads.
++ *   2  prepare:  the identity read, then each part's fuses, a soft reset,
++ *      the stock Music profile, the MI2S2 pin function and spksw low. The
++ *      ADSP worker calls mondrian_audio_amp_start() once it has started the
++ *      speaker graph: that powers the pair up, waits for the PLL to lock to
++ *      the bit clock and unmutes at the profile's volume. After the PCM
++ *      period mondrian_audio_amp_stop() powers both down again.
++ *
++ * Register numbers, bit positions and the volume encoding are protocol facts
++ * from mainline Linux sound/soc/codecs/aw88261.{c,h} (GPL-2.0-only). The 57
++ * register/value pairs of each Music profile are configuration data from the
++ * phone's stock firmware (aw882xx_acf.bin, devices 0 and 1, profile 6). No
++ * Linux or vendor driver code is copied here.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -22,6 +29,10 @@
+ #include <vm/vm_kern.h>
+ 
+ void mondrian_audio_probe_start(void);
++int mondrian_audio_amp_start(void);
++void mondrian_audio_amp_stop(void);
++void mondrian_audio_amp_report(const char *when);
++void mondrian_audio_sample_pads(const char *when);
+ 
+ #if defined(MONDRIAN)
+ 
+@@ -47,33 +58,153 @@ extern uint32_t mondrian_tlmm_cfg(uint32_t function, uint32_t pull,
+ #define AUDIO_AMP0_RESET_GPIO		1
+ #define AUDIO_AMP1_RESET_GPIO		3
+ #define AUDIO_SPKSW_GPIO		52
++#define AUDIO_MI2S2_SCK_GPIO		121
++#define AUDIO_MI2S2_DATA1_GPIO		124
++#define AUDIO_MI2S2_WS_GPIO		123
+ 
+-/* Mainline aw88261.h: AW88261_ID_REG and enum aw88261_id. */
++/* Mainline aw88261.h: the registers, bits and volume encoding used below. */
+ #define AUDIO_AW88261_ID_REG		0x00
+ #define AUDIO_AW88261_ID			0x2113U
++#define AUDIO_AW88261_SOFT_RESET		0x55aaU
++#define AUDIO_AW88261_SYSST		0x01
++#define AUDIO_AW88261_SYSINT		0x02
++#define AUDIO_AW88261_SYSINTM		0x03
++#define AUDIO_AW88261_SYSCTRL		0x04
++#define AUDIO_AW88261_SYSCTRL2		0x05
++#define AUDIO_AW88261_I2SCTRL3		0x08
++#define AUDIO_AW88261_DBGCTRL		0x14
++#define AUDIO_AW88261_VBAT		0x21
++#define AUDIO_AW88261_PVDD		0x23
++#define AUDIO_AW88261_VSNTM1		0x50
++#define AUDIO_AW88261_EFRH4		0x78
++#define AUDIO_AW88261_EFRH3		0x79
++#define AUDIO_AW88261_EFRL4		0x7c
++#define AUDIO_AW88261_EFRL3		0x7d
++
++#define AUDIO_AW_PWDN			(1U << 0)
++#define AUDIO_AW_AMPPD			(1U << 1)
++#define AUDIO_AW_HMUTE			(1U << 8)
++#define AUDIO_AW_ULS_HMUTE		(1U << 14)
++#define AUDIO_AW_TXEN			(1U << 6)
++#define AUDIO_AW_EF_OR			(1U << 3)
++
++#define AUDIO_AW_SYSST_PLLS		(1U << 0)
++#define AUDIO_AW_SYSST_CLKS		(1U << 4)
++#define AUDIO_AW_SYSST_PLL_CHECK	(AUDIO_AW_SYSST_PLLS | AUDIO_AW_SYSST_CLKS)
++#define AUDIO_AW_SYSST_BSTS		(1U << 9)
++#define AUDIO_AW_SYSST_SWS		(1U << 8)
++#define AUDIO_AW_SYSST_SWITCHING	(AUDIO_AW_SYSST_BSTS | AUDIO_AW_SYSST_SWS)
++#define AUDIO_AW_SYSST_FAULTS		0xc86aU
++
++/* aw88261.h: AW88261_MUTE_VOL (90 dB) and the 6 dB / eighths-of-a-dB step. */
++#define AUDIO_AW_VOLUME_MUTE		(90U * 8U)
++#define AUDIO_AW_VOLUME_STEP		(6U * 8U)
++#define AUDIO_AW_PLL_TRIES		20
++#define AUDIO_AW_STATUS_TRIES		10
+ 
+ /* TLMM pin block and encoding already measured by the touch driver. */
+ #define AUDIO_TLMM_BASE			0x0f100000UL
+ #define AUDIO_TLMM_PAGE_SIZE		0x1000
+ #define AUDIO_TLMM_CFG			0x0
+ #define AUDIO_TLMM_IN_OUT		0x4
++#define AUDIO_TLMM_PULL_NONE		0
++#define AUDIO_TLMM_PULL_DOWN		1
+ #define AUDIO_TLMM_PULL_UP		3
+ #define AUDIO_TLMM_DRIVE_2MA		0
++#define AUDIO_TLMM_DRIVE_8MA		3
+ #define AUDIO_TLMM_DRIVE_16MA		7
+ #define AUDIO_TLMM_FUNC_GPIO		0
++/* pinctrl-cape's PINGROUP(121, mi2s2_sck, ...): the first alternate. */
++#define AUDIO_MI2S2_FUNC		1
+ 
+ #define AUDIO_BIT_NS			5000
+ #define AUDIO_SCL_STRETCH_POLLS		1000
+ #define AUDIO_RESET_LOW_MS		10
+ #define AUDIO_RESET_HIGH_MS		10
+ 
++#define AUDIO_MODE_IDENTITY		1
++#define AUDIO_MODE_PREPARE		2
++
++#define AUDIO_ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
++
+ struct audio_pins {
+ 	vm_offset_t sda;
+ 	vm_offset_t scl;
+ 	vm_offset_t reset0;
+ 	vm_offset_t reset1;
++	vm_offset_t spksw;
++	vm_offset_t sck;
++	vm_offset_t ws;
++	vm_offset_t data1;
++};
++
++struct audio_reg {
++	uint8_t reg;
++	uint16_t value;
+ };
+ 
++struct audio_amp {
++	uint8_t addr;
++	const char *where;
++	const struct audio_reg *profile;
++	unsigned profile_count;
++	uint16_t sysctrl;
++	uint16_t i2sctrl3;
++	uint16_t volume_high;
++	uint16_t volume_at;
++	uint16_t vcalb;
++};
++
++/* Device 0 (0x34, sound-channel 0): aw882xx_acf.bin, profile 6. */
++static const struct audio_reg audio_profile0[] = {
++	{ 0x03, 0xffff }, { 0x04, 0x32c0 }, { 0x05, 0x1800 }, { 0x06, 0x34e8 },
++	{ 0x07, 0x3020 }, { 0x08, 0x00f6 }, { 0x09, 0x7380 }, { 0x0a, 0x0964 },
++	{ 0x0b, 0x2590 }, { 0x0c, 0x1c64 }, { 0x0d, 0x005b }, { 0x0e, 0x4a9b },
++	{ 0x0f, 0x5064 }, { 0x10, 0x5008 }, { 0x11, 0xcb08 }, { 0x12, 0x002b },
++	{ 0x13, 0x2102 }, { 0x14, 0xc003 }, { 0x15, 0x0643 }, { 0x16, 0x000a },
++	{ 0x30, 0x6b1d }, { 0x31, 0x4119 }, { 0x32, 0xd841 }, { 0x33, 0x6ca6 },
++	{ 0x34, 0x1d65 }, { 0x35, 0xc25c }, { 0x36, 0x7841 }, { 0x37, 0xf189 },
++	{ 0x38, 0x0400 }, { 0x3a, 0x8884 }, { 0x3b, 0x0666 }, { 0x3c, 0x0ed2 },
++	{ 0x3d, 0x0663 }, { 0x3e, 0x01ae }, { 0x3f, 0x0505 }, { 0x40, 0xffa0 },
++	{ 0x51, 0x00f3 }, { 0x52, 0x3ee8 }, { 0x53, 0x8005 }, { 0x54, 0x1748 },
++	{ 0x55, 0x0202 }, { 0x56, 0x3800 }, { 0x57, 0x8489 }, { 0x58, 0x51d6 },
++	{ 0x59, 0x0000 }, { 0x5a, 0x0000 }, { 0x5b, 0x01c0 }, { 0x5c, 0x0049 },
++	{ 0x60, 0x0f0d }, { 0x61, 0x996c }, { 0x62, 0x4a40 }, { 0x63, 0x6077 },
++	{ 0x64, 0x0053 }, { 0x65, 0x5ca1 }, { 0x66, 0x40f9 }, { 0x67, 0x508e },
++	{ 0x68, 0x0048 },
++};
++
++/* Device 1 (0x35, sound-channel 1): the same file and profile. */
++static const struct audio_reg audio_profile1[] = {
++	{ 0x03, 0xffff }, { 0x04, 0x32c0 }, { 0x05, 0x0800 }, { 0x06, 0x38e8 },
++	{ 0x07, 0x3111 }, { 0x08, 0x00f7 }, { 0x09, 0x7380 }, { 0x0a, 0x0964 },
++	{ 0x0b, 0x2590 }, { 0x0c, 0x1c64 }, { 0x0d, 0x005b }, { 0x0e, 0x4a9b },
++	{ 0x0f, 0x5064 }, { 0x10, 0x5008 }, { 0x11, 0xcb08 }, { 0x12, 0x002b },
++	{ 0x13, 0x2102 }, { 0x14, 0xc003 }, { 0x15, 0x0643 }, { 0x16, 0x000a },
++	{ 0x30, 0x6b1d }, { 0x31, 0x4119 }, { 0x32, 0xd841 }, { 0x33, 0x6ca6 },
++	{ 0x34, 0x1d65 }, { 0x35, 0xc25c }, { 0x36, 0x7841 }, { 0x37, 0xf189 },
++	{ 0x38, 0x0400 }, { 0x3a, 0x8884 }, { 0x3b, 0x0666 }, { 0x3c, 0x0ed2 },
++	{ 0x3d, 0x0663 }, { 0x3e, 0x01ae }, { 0x3f, 0x0505 }, { 0x40, 0xffa0 },
++	{ 0x51, 0x00f3 }, { 0x52, 0x3ee8 }, { 0x53, 0x8005 }, { 0x54, 0x1748 },
++	{ 0x55, 0x0202 }, { 0x56, 0x3800 }, { 0x57, 0x8489 }, { 0x58, 0x51d6 },
++	{ 0x59, 0x0000 }, { 0x5a, 0x0000 }, { 0x5b, 0x01c0 }, { 0x5c, 0x0049 },
++	{ 0x60, 0x0f0d }, { 0x61, 0x996c }, { 0x62, 0x4a40 }, { 0x63, 0x6077 },
++	{ 0x64, 0x0053 }, { 0x65, 0x5ca1 }, { 0x66, 0x40f9 }, { 0x67, 0x508e },
++	{ 0x68, 0x0048 },
++};
++
++static struct audio_amp audio_amps[] = {
++	{ .addr = AUDIO_AMP0_ADDR, .where = "0x34",
++	  .profile = audio_profile0, .profile_count = AUDIO_ARRAY_SIZE(audio_profile0) },
++	{ .addr = AUDIO_AMP1_ADDR, .where = "0x35",
++	  .profile = audio_profile1, .profile_count = AUDIO_ARRAY_SIZE(audio_profile1) },
++};
++
++static struct audio_pins audio_bus;
++static uint32_t audio_probe_mode;
++static uint32_t audio_amps_prepared;
++static uint32_t audio_amps_done;
++static uint32_t audio_amps_running;
+ static uint64_t audio_timebase_hz;
+ 
+ static void
+@@ -139,17 +270,20 @@ audio_reset_level(vm_offset_t page, int high)
+ }
+ 
+ static int
+-audio_map_pins(struct audio_pins *pins)
++audio_map_pins(struct audio_pins *pins, int prepare)
+ {
++	memset(pins, 0, sizeof(*pins));
+ 	audio_log("SE15 0x%lx is documentary only; GPIO SDA=%u SCL=%u, "
+-	    "amps 0x34/0x35, reset GPIO1/3, spksw GPIO%u untouched",
++	    "amps 0x34/0x35, reset GPIO1/3, spksw GPIO%u%s",
+ 	    (unsigned long)AUDIO_I2C_SE15_PA, AUDIO_I2C_SDA_GPIO,
+-	    AUDIO_I2C_SCL_GPIO, AUDIO_SPKSW_GPIO);
++	    AUDIO_I2C_SCL_GPIO, AUDIO_SPKSW_GPIO,
++	    prepare ? "" : " untouched");
+ 
+-	audio_log("mapping TLMM 0x%lx pages for GPIO%u/%u/%u/%u",
++	audio_log("mapping TLMM 0x%lx pages for GPIO%u/%u/%u/%u%s",
+ 	    (unsigned long)AUDIO_TLMM_BASE, AUDIO_I2C_SDA_GPIO,
+ 	    AUDIO_I2C_SCL_GPIO, AUDIO_AMP0_RESET_GPIO,
+-	    AUDIO_AMP1_RESET_GPIO);
++	    AUDIO_AMP1_RESET_GPIO,
++	    prepare ? " and mi2s2/spksw" : "");
+ 	pins->sda = ml_io_map(AUDIO_TLMM_BASE +
+ 	    0x1000UL * AUDIO_I2C_SDA_GPIO, AUDIO_TLMM_PAGE_SIZE);
+ 	pins->scl = ml_io_map(AUDIO_TLMM_BASE +
+@@ -160,7 +294,23 @@ audio_map_pins(struct audio_pins *pins)
+ 	    0x1000UL * AUDIO_AMP1_RESET_GPIO, AUDIO_TLMM_PAGE_SIZE);
+ 	if (pins->sda == 0 || pins->scl == 0 || pins->reset0 == 0 ||
+ 	    pins->reset1 == 0) {
+-		audio_log("cannot map all four TLMM pages; no pad was driven");
++		audio_log("cannot map the I2C and reset TLMM pages; no pad was driven");
++		return ENOMEM;
++	}
++	if (!prepare) {
++		return 0;
++	}
++	pins->spksw = ml_io_map(AUDIO_TLMM_BASE +
++	    0x1000UL * AUDIO_SPKSW_GPIO, AUDIO_TLMM_PAGE_SIZE);
++	pins->sck = ml_io_map(AUDIO_TLMM_BASE +
++	    0x1000UL * AUDIO_MI2S2_SCK_GPIO, AUDIO_TLMM_PAGE_SIZE);
++	pins->ws = ml_io_map(AUDIO_TLMM_BASE +
++	    0x1000UL * AUDIO_MI2S2_WS_GPIO, AUDIO_TLMM_PAGE_SIZE);
++	pins->data1 = ml_io_map(AUDIO_TLMM_BASE +
++	    0x1000UL * AUDIO_MI2S2_DATA1_GPIO, AUDIO_TLMM_PAGE_SIZE);
++	if (pins->spksw == 0 || pins->sck == 0 || pins->ws == 0 ||
++	    pins->data1 == 0) {
++		audio_log("cannot map the mi2s2/spksw TLMM pages; no pad was driven");
+ 		return ENOMEM;
+ 	}
+ 	return 0;
+@@ -316,59 +466,99 @@ audio_i2c_read_byte(struct audio_pins *pins, uint8_t *byte, int ack)
+ 	return 0;
+ }
+ 
++/* One address/data byte: 0 for ACK, EIO for NACK, ETIMEDOUT on stretch. */
+ static int
+-audio_read_id(struct audio_pins *pins, uint8_t addr, uint16_t *id,
+-    const char **why)
++audio_i2c_put(struct audio_pins *pins, uint8_t byte)
+ {
+-	uint8_t high, low;
+-	int rc, error;
++	int rc = audio_i2c_write_byte(pins, byte);
++
++	if (rc < 0) {
++		return ETIMEDOUT;
++	}
++	return rc == 0 ? 0 : EIO;
++}
++
++static int
++audio_write_reg(struct audio_pins *pins, uint8_t addr, uint8_t reg,
++    uint16_t value, const char **why)
++{
++	int error;
+ 
+ 	*why = "bus not idle";
+ 	error = audio_i2c_start(pins);
+-	if (error == ETIMEDOUT) {
+-		*why = "clock stretch timeout";
+-	} else if (error != 0) {
+-		*why = "bus not idle";
+-	}
+ 	if (error != 0) {
++		*why = (error == ETIMEDOUT) ? "clock stretch timeout" :
++		    "bus not idle";
+ 		(void)audio_i2c_stop(pins);
+ 		return error;
+ 	}
+ 	*why = "write-address NACK";
+-	rc = audio_i2c_write_byte(pins, (uint8_t)(addr << 1));
+-	if (rc < 0) {
+-		*why = "clock stretch timeout";
+-		goto failed;
++	error = audio_i2c_put(pins, (uint8_t)(addr << 1));
++	if (error == 0) {
++		*why = "register NACK";
++		error = audio_i2c_put(pins, reg);
+ 	}
+-	if (rc != 0) {
+-		goto failed;
++	if (error == 0) {
++		*why = "value high NACK";
++		error = audio_i2c_put(pins, (uint8_t)(value >> 8));
+ 	}
++	if (error == 0) {
++		*why = "value low NACK";
++		error = audio_i2c_put(pins, (uint8_t)value);
++	}
++	if (error != 0) {
++		if (error == ETIMEDOUT) {
++			*why = "clock stretch timeout";
++		}
++		(void)audio_i2c_stop(pins);
++		return error;
++	}
++	*why = "STOP/bus release failed";
++	if (audio_i2c_stop(pins) != 0) {
++		return EIO;
++	}
++	return 0;
++}
+ 
+-	/* This is the one-byte register pointer, not a control-register write. */
+-	*why = "register-pointer NACK";
+-	rc = audio_i2c_write_byte(pins, AUDIO_AW88261_ID_REG);
+-	if (rc < 0) {
+-		*why = "clock stretch timeout";
+-		goto failed;
++static int
++audio_read_reg(struct audio_pins *pins, uint8_t addr, uint8_t reg,
++    uint16_t *value, const char **why)
++{
++	uint8_t high, low;
++	int error;
++
++	*why = "bus not idle";
++	error = audio_i2c_start(pins);
++	if (error != 0) {
++		*why = (error == ETIMEDOUT) ? "clock stretch timeout" :
++		    "bus not idle";
++		(void)audio_i2c_stop(pins);
++		return error;
++	}
++	*why = "write-address NACK";
++	error = audio_i2c_put(pins, (uint8_t)(addr << 1));
++	if (error == 0) {
++		*why = "register NACK";
++		error = audio_i2c_put(pins, reg);
+ 	}
+-	if (rc != 0) {
++	if (error != 0) {
++		if (error == ETIMEDOUT) {
++			*why = "clock stretch timeout";
++		}
+ 		goto failed;
+ 	}
+-
+ 	*why = "repeated start failed";
+ 	if (audio_i2c_repeated_start(pins) != 0) {
+ 		goto failed;
+ 	}
+ 	*why = "read-address NACK";
+-	rc = audio_i2c_write_byte(pins, (uint8_t)((addr << 1) | 1U));
+-	if (rc < 0) {
+-		*why = "clock stretch timeout";
+-		goto failed;
+-	}
+-	if (rc != 0) {
++	error = audio_i2c_put(pins, (uint8_t)((addr << 1) | 1U));
++	if (error != 0) {
++		if (error == ETIMEDOUT) {
++			*why = "clock stretch timeout";
++		}
+ 		goto failed;
+ 	}
+-
+ 	*why = "first data byte failed";
+ 	if (audio_i2c_read_byte(pins, &high, 1) != 0) {
+ 		goto failed;
+@@ -381,7 +571,7 @@ audio_read_id(struct audio_pins *pins, uint8_t addr, uint16_t *id,
+ 	if (audio_i2c_stop(pins) != 0) {
+ 		goto failed;
+ 	}
+-	*id = (uint16_t)(((uint16_t)high << 8) | low);
++	*value = (uint16_t)(((uint16_t)high << 8) | low);
+ 	return 0;
+ 
+ failed:
+@@ -389,39 +579,579 @@ failed:
+ 	return EIO;
+ }
+ 
++static int
++audio_read_id(struct audio_pins *pins, uint8_t addr, uint16_t *id,
++    const char **why)
++{
++	return audio_read_reg(pins, addr, AUDIO_AW88261_ID_REG, id, why);
++}
++
++static void
++audio_spksw(struct audio_pins *pins, int on)
++{
++	mondrian_tlmm_write(pins->spksw, AUDIO_TLMM_IN_OUT, on ? 2 : 0);
++	mondrian_tlmm_write(pins->spksw, AUDIO_TLMM_CFG,
++	    mondrian_tlmm_cfg(AUDIO_TLMM_FUNC_GPIO, AUDIO_TLMM_PULL_NONE,
++	    AUDIO_TLMM_DRIVE_2MA, 1));
++}
++
++/*
++ * The live device tree's tert_tdm_pinctrl (status ok) is sck GPIO121,
++ * ws GPIO123 and dout GPIO124 (function mi2s2_data1); the tert_mi2s
++ * group with GPIO122/mi2s2_data0 is disabled. The speaker pair sits on
++ * the TDM dout line, so data1 is the pad to mux, drive and sample.
++ */
++static void
++audio_mi2s2_pins(struct audio_pins *pins)
++{
++	mondrian_tlmm_write(pins->sck, AUDIO_TLMM_IN_OUT, 2);
++	mondrian_tlmm_write(pins->sck, AUDIO_TLMM_CFG,
++	    mondrian_tlmm_cfg(AUDIO_MI2S2_FUNC, AUDIO_TLMM_PULL_NONE,
++	    AUDIO_TLMM_DRIVE_8MA, 1));
++	mondrian_tlmm_write(pins->ws, AUDIO_TLMM_IN_OUT, 2);
++	mondrian_tlmm_write(pins->ws, AUDIO_TLMM_CFG,
++	    mondrian_tlmm_cfg(AUDIO_MI2S2_FUNC, AUDIO_TLMM_PULL_NONE,
++	    AUDIO_TLMM_DRIVE_8MA, 1));
++	/*
++	 * The data line must carry the pad's output enable too: with OE clear
++	 * the peripheral function still selects the I2S input, but the pad is
++	 * tri-stated and the amplifier sees no data at all (measured
++	 * 2026-11-27: SYSST stayed 0x0011 for 80 ms of periods).
++	 */
++	mondrian_tlmm_write(pins->data1, AUDIO_TLMM_IN_OUT, 0);
++	mondrian_tlmm_write(pins->data1, AUDIO_TLMM_CFG,
++	    mondrian_tlmm_cfg(AUDIO_MI2S2_FUNC, AUDIO_TLMM_PULL_DOWN,
++	    AUDIO_TLMM_DRIVE_8MA, 1));
++	audio_log("muxed GPIO%u/%u/%u to mi2s2 (function %u), 8 mA, no pull",
++	    AUDIO_MI2S2_SCK_GPIO, AUDIO_MI2S2_WS_GPIO,
++	    AUDIO_MI2S2_DATA1_GPIO, AUDIO_MI2S2_FUNC);
++}
++
++static int
++audio_amp_read(struct audio_pins *pins, struct audio_amp *a, uint8_t reg,
++    uint16_t *value, const char **why)
++{
++	int error = audio_read_reg(pins, a->addr, reg, value, why);
++
++	if (error != 0) {
++		audio_log("%s: register 0x%02x read failed: %s", a->where,
++		    reg, *why);
++	}
++	return error;
++}
++
++/* Write one register and insist it reads back; false stops the preparation. */
++static int
++audio_amp_write(struct audio_pins *pins, struct audio_amp *a, uint8_t reg,
++    uint16_t value, const char **why)
++{
++	uint16_t after = 0;
++	int error;
++
++	error = audio_write_reg(pins, a->addr, reg, value, why);
++	if (error != 0) {
++		audio_log("%s: 0x%02x <- 0x%04x not acknowledged: %s",
++		    a->where, reg, value, *why);
++		return error;
++	}
++	error = audio_read_reg(pins, a->addr, reg, &after, why);
++	if (error != 0) {
++		audio_log("%s: 0x%02x <- 0x%04x, readback failed: %s",
++		    a->where, reg, value, *why);
++		return error;
++	}
++	if (after != value) {
++		audio_log("%s: 0x%02x <- 0x%04x, reads 0x%04x", a->where, reg,
++		    value, after);
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * Android's driver sequence: read the fuses, soft reset, write the Music
++ * profile, calibrate 0x50 from the fuses and park the part muted at the
++ * lowest volume. The power and mute bits in 0x04 stay as the reset left them.
++ */
++static int
++audio_amp_prepare(struct audio_pins *pins, struct audio_amp *a)
++{
++	const char *why = "";
++	uint16_t id = 0, now = 0, status = 0;
++	uint16_t h4 = 0, h3 = 0, l4 = 0, l3 = 0;
++	uint16_t icalk_bits, vcalk_bits, value;
++	uint32_t icalk, vcalk, ms;
++	uint64_t started = mach_absolute_time();
++	unsigned i, written = 0;
++
++	if (audio_amp_read(pins, a, AUDIO_AW88261_ID_REG, &id, &why) != 0 ||
++	    id != AUDIO_AW88261_ID) {
++		audio_log("%s: id 0x%04x is not an AW88261", a->where, id);
++		return EIO;
++	}
++
++	/* The fuses are read before the soft reset, as Android's driver does. */
++	if (audio_amp_read(pins, a, AUDIO_AW88261_EFRH4, &h4, &why) != 0 ||
++	    audio_amp_read(pins, a, AUDIO_AW88261_EFRH3, &h3, &why) != 0 ||
++	    audio_amp_read(pins, a, AUDIO_AW88261_EFRL4, &l4, &why) != 0 ||
++	    audio_amp_read(pins, a, AUDIO_AW88261_EFRL3, &l3, &why) != 0) {
++		return EIO;
++	}
++	value = 0;
++	for (i = 0; i < a->profile_count; i++) {
++		if (a->profile[i].reg == AUDIO_AW88261_DBGCTRL) {
++			value = a->profile[i].value & AUDIO_AW_EF_OR;
++		}
++	}
++	icalk_bits = value ? ((h4 & 0x3ff) | (l4 & 0x3ff)) :
++	    ((h4 & 0x3ff) & (l4 & 0x3ff));
++	vcalk_bits = value ? ((h3 & 0x3ff) | (l3 & 0x3ff)) :
++	    ((h3 & 0x3ff) & (l3 & 0x3ff));
++	icalk = 1000 + ((icalk_bits & 0x200) ? (int)icalk_bits - 0x400 :
++	    (int)icalk_bits);
++	vcalk = 1000 + ((vcalk_bits & 0x200) ? (int)vcalk_bits - 0x400 :
++	    (int)vcalk_bits);
++	if (icalk == 0 || vcalk == 0) {
++		audio_log("%s: fuses 0x%04x 0x%04x 0x%04x 0x%04x make no sense",
++		    a->where, h4, h3, l4, l3);
++		return EIO;
++	}
++	a->vcalb = (uint16_t)(8192 * icalk / vcalk);
++	audio_log("%s: fuses 0x%04x 0x%04x 0x%04x 0x%04x: icalk %u, "
++	    "vcalk %u, 0x%02x <- 0x%04x", a->where, h4, h3, l4, l3, icalk,
++	    vcalk, AUDIO_AW88261_VSNTM1, a->vcalb);
++
++	if (audio_write_reg(pins, a->addr, AUDIO_AW88261_ID_REG,
++	    AUDIO_AW88261_SOFT_RESET, &why) != 0) {
++		audio_log("%s: soft reset not acknowledged: %s", a->where, why);
++		return EIO;
++	}
++	delay(2000);
++
++	for (i = 0; i < a->profile_count; i++) {
++		uint8_t reg = a->profile[i].reg;
++
++		value = a->profile[i].value;
++		switch (reg) {
++		case AUDIO_AW88261_SYSINTM:
++			value = 0xffff;
++			break;
++		case AUDIO_AW88261_SYSCTRL:
++			if (audio_amp_read(pins, a, reg, &now, &why) != 0) {
++				return EIO;
++			}
++			value = (uint16_t)((value & ~(AUDIO_AW_PWDN |
++			    AUDIO_AW_AMPPD | AUDIO_AW_HMUTE)) |
++			    (now & (AUDIO_AW_PWDN | AUDIO_AW_AMPPD |
++			    AUDIO_AW_HMUTE)) | AUDIO_AW_ULS_HMUTE);
++			a->sysctrl = value;
++			break;
++		case AUDIO_AW88261_SYSCTRL2:
++			a->volume_high = a->profile[i].value & 0xfc00;
++			a->volume_at = (uint16_t)(((a->profile[i].value &
++			    0x3ff) >> 6) * AUDIO_AW_VOLUME_STEP +
++			    (a->profile[i].value & 0x3f));
++			break;
++		case AUDIO_AW88261_I2SCTRL3:
++			a->i2sctrl3 = a->profile[i].value;
++			value &= (uint16_t)~AUDIO_AW_TXEN;
++			break;
++		case AUDIO_AW88261_VSNTM1:
++			continue;
++		}
++		if (audio_amp_write(pins, a, reg, value, &why) != 0) {
++			return EIO;
++		}
++		written++;
++	}
++
++	if (audio_amp_write(pins, a, AUDIO_AW88261_VSNTM1, a->vcalb,
++	    &why) != 0) {
++		return EIO;
++	}
++	value = (uint16_t)(a->volume_high |
++	    (AUDIO_AW_VOLUME_MUTE / AUDIO_AW_VOLUME_STEP) << 6 |
++	    AUDIO_AW_VOLUME_MUTE % AUDIO_AW_VOLUME_STEP);
++	if (audio_amp_write(pins, a, AUDIO_AW88261_SYSCTRL2, value,
++	    &why) != 0) {
++		return EIO;
++	}
++
++	/* Park it explicitly, as mainline's dev_init does, whatever reset left. */
++	if (audio_amp_read(pins, a, AUDIO_AW88261_SYSCTRL, &now, &why) != 0) {
++		return EIO;
++	}
++	now |= AUDIO_AW_PWDN | AUDIO_AW_AMPPD | AUDIO_AW_HMUTE;
++	if (audio_amp_write(pins, a, AUDIO_AW88261_SYSCTRL, now, &why) != 0) {
++		return EIO;
++	}
++	a->sysctrl = now;
++	if (audio_amp_read(pins, a, AUDIO_AW88261_SYSST, &status,
++	    &why) != 0) {
++		return EIO;
++	}
++	ms = (uint32_t)((mach_absolute_time() - started) * 1000 /
++	    audio_timebase_hz);
++	audio_log("%s: prepared in %u ms, %u registers read back, muted at "
++	    "0x%04x (0x04=0x%04x 0x08=0x%04x), status 0x%04x", a->where, ms,
++	    written, value, a->sysctrl, a->i2sctrl3, status);
++	return 0;
++}
++
++static int
++audio_amp_sysctrl(struct audio_amp *a, uint16_t bits, int set,
++    const char **why)
++{
++	uint16_t value = 0;
++
++	if (audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSCTRL, &value,
++	    why) != 0) {
++		return EIO;
++	}
++	value = set ? (uint16_t)(value | bits) : (uint16_t)(value & ~bits);
++	return audio_amp_write(&audio_bus, a, AUDIO_AW88261_SYSCTRL, value,
++	    why);
++}
++
++/* The donor's start: PLL first, then the power stage, then the unmute. */
++static int
++audio_amp_start_one(struct audio_amp *a)
++{
++	const char *why = "";
++	uint16_t status = 0, value, vbat = 0, pvdd = 0;
++	unsigned tries;
++
++	audio_log("%s: power-down off", a->where);
++	if (audio_amp_sysctrl(a, AUDIO_AW_PWDN, 0, &why) != 0) {
++		return EIO;
++	}
++	delay(2000);
++	for (tries = 0; tries < AUDIO_AW_PLL_TRIES; tries++) {
++		if (audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSST,
++		    &status, &why) != 0) {
++			return EIO;
++		}
++		if ((status & AUDIO_AW_SYSST_PLL_CHECK) ==
++		    AUDIO_AW_SYSST_PLL_CHECK) {
++			break;
++		}
++		delay(2000);
++	}
++	audio_log("%s: status 0x%04x, PLL %s", a->where, status,
++	    tries < AUDIO_AW_PLL_TRIES ? "locked to the bit clock" :
++	    "did not lock: no bit clock?");
++	if (tries == AUDIO_AW_PLL_TRIES) {
++		return ETIMEDOUT;
++	}
++
++	audio_log("%s: amplifier power-down off", a->where);
++	if (audio_amp_sysctrl(a, AUDIO_AW_AMPPD, 0, &why) != 0) {
++		return EIO;
++	}
++	delay(1000);
++	/*
++	 * SWS and BSTS cannot set while the part is still muted: this is the
++	 * upstream aw88261 "check sysst fail, reg_val=0x0011" fix (2026-07),
++	 * and the vendor driver checks only PLL and clocks here. The switching
++	 * bits are looked at after the mute release below.
++	 */
++	for (tries = 0; tries < AUDIO_AW_STATUS_TRIES; tries++) {
++		if (audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSST,
++		    &status, &why) != 0) {
++			return EIO;
++		}
++		if ((status & AUDIO_AW_SYSST_FAULTS) != 0) {
++			break;
++		}
++		if ((status & AUDIO_AW_SYSST_PLL_CHECK) ==
++		    AUDIO_AW_SYSST_PLL_CHECK) {
++			break;
++		}
++		delay(2000);
++	}
++	audio_log("%s: status 0x%04x after amplifier on", a->where, status);
++	if ((status & AUDIO_AW_SYSST_FAULTS) != 0 ||
++	    (status & AUDIO_AW_SYSST_PLL_CHECK) !=
++	    AUDIO_AW_SYSST_PLL_CHECK) {
++		audio_log("%s: %s", a->where,
++		    (status & AUDIO_AW_SYSST_FAULTS) != 0 ? "reports a fault" :
++		    "has no stable clock");
++		return EIO;
++	}
++
++	if (audio_amp_write(&audio_bus, a, AUDIO_AW88261_I2SCTRL3,
++	    a->i2sctrl3, &why) != 0 ||
++	    audio_amp_sysctrl(a, AUDIO_AW_ULS_HMUTE, 0, &why) != 0 ||
++	    audio_amp_sysctrl(a, AUDIO_AW_HMUTE, 0, &why) != 0) {
++		return EIO;
++	}
++	/* Read the interrupt once to clear it, then mask it as Android does. */
++	(void)audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSINT, &status,
++	    &why);
++	(void)audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSINT, &status,
++	    &why);
++	if (audio_amp_write(&audio_bus, a, AUDIO_AW88261_SYSINTM, 0xffff,
++	    &why) != 0) {
++		return EIO;
++	}
++
++	value = (uint16_t)(a->volume_high |
++	    (a->volume_at / AUDIO_AW_VOLUME_STEP) << 6 |
++	    a->volume_at % AUDIO_AW_VOLUME_STEP);
++	if (audio_amp_write(&audio_bus, a, AUDIO_AW88261_SYSCTRL2, value,
++	    &why) != 0) {
++		return EIO;
++	}
++	for (tries = 0; tries < AUDIO_AW_STATUS_TRIES; tries++) {
++		if (audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSST,
++		    &status, &why) != 0) {
++			return EIO;
++		}
++		if ((status & AUDIO_AW_SYSST_FAULTS) != 0) {
++			break;
++		}
++		if ((status & AUDIO_AW_SYSST_SWITCHING) ==
++		    AUDIO_AW_SYSST_SWITCHING) {
++			break;
++		}
++		delay(2000);
++	}
++	if ((status & AUDIO_AW_SYSST_FAULTS) != 0) {
++		audio_log("%s: reports a fault after unmute: 0x%04x", a->where,
++		    status);
++		return EIO;
++	}
++	(void)audio_read_reg(&audio_bus, a->addr, AUDIO_AW88261_VBAT, &vbat,
++	    &why);
++	(void)audio_read_reg(&audio_bus, a->addr, AUDIO_AW88261_PVDD, &pvdd,
++	    &why);
++	audio_log("%s: unmuted at the profile volume 0x%04x (-%u.%03u dB), "
++	    "status 0x%04x (%s), vbat 0x%03x (%u mV), pvdd 0x%03x", a->where,
++	    value, a->volume_at / 8, a->volume_at % 8 * 125, status,
++	    (status & AUDIO_AW_SYSST_SWITCHING) == AUDIO_AW_SYSST_SWITCHING ?
++	    "amplifier switching" : "switching bits not set", vbat,
++	    vbat * 6025 / 1023, pvdd);
++	return 0;
++}
++
++static void
++audio_amp_power_down(struct audio_amp *a)
++{
++	const char *why = "";
++	uint16_t value = a->sysctrl;
++
++	if (audio_amp_read(&audio_bus, a, AUDIO_AW88261_SYSCTRL, &value,
++	    &why) != 0) {
++		value = a->sysctrl;
++	}
++	value |= AUDIO_AW_PWDN | AUDIO_AW_AMPPD | AUDIO_AW_HMUTE;
++	if (audio_amp_write(&audio_bus, a, AUDIO_AW88261_SYSCTRL, value,
++	    &why) != 0) {
++		audio_log("%s: power-down write failed: %s", a->where, why);
++		return;
++	}
++	audio_log("%s: powered down (0x04=0x%04x)", a->where, value);
++}
++
++/*
++ * Called by the ADSP worker once both graphs have started, so the MI2S2 bit
++ * clock the PLL locks to is already running. Returns EAGAIN when the probe is
++ * still preparing or failed: the graph then runs into muted parts.
++ */
++int
++mondrian_audio_amp_start(void)
++{
++	unsigned i, started = 0;
++	int wait;
++
++	if (audio_probe_mode < AUDIO_MODE_PREPARE) {
++		return ENOENT;
++	}
++	/*
++	 * The bit-banged register path takes seconds, and the graph is already
++	 * started (the I2S clock keeps running), so wait for the probe thread
++	 * to finish rather than giving up on the first 2 s.
++	 */
++	for (wait = 0; wait < 30000; wait += 10) {
++		if (__atomic_load_n(&audio_amps_done, __ATOMIC_ACQUIRE)) {
++			break;
++		}
++		delay(10000);
++	}
++	if (!__atomic_load_n(&audio_amps_prepared, __ATOMIC_ACQUIRE)) {
++		audio_log("start: the amplifiers are %s; leaving them muted",
++		    __atomic_load_n(&audio_amps_done, __ATOMIC_ACQUIRE) ?
++		    "not prepared" : "still preparing after 30 s");
++		return EAGAIN;
++	}
++	if (__atomic_exchange_n(&audio_amps_running, 1, __ATOMIC_ACQ_REL) !=
++	    0) {
++		return 0;
++	}
++
++	audio_log("start: the graph has started mi2s2; spksw GPIO%u on",
++	    AUDIO_SPKSW_GPIO);
++	audio_spksw(&audio_bus, 1);
++	delay(1000);
++	for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++		if (audio_amp_start_one(&audio_amps[i]) == 0) {
++			started++;
++		}
++	}
++	if (started != AUDIO_ARRAY_SIZE(audio_amps)) {
++		audio_log("start: %u/2 amplifiers running; powering both down",
++		    started);
++		for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++			audio_amp_power_down(&audio_amps[i]);
++		}
++		audio_spksw(&audio_bus, 0);
++		__atomic_store_n(&audio_amps_running, 0, __ATOMIC_RELEASE);
++		mondrian_log_flush_now();
++		return EIO;
++	}
++	mondrian_log_flush_now();
++	return 0;
++}
++
++void
++mondrian_audio_amp_stop(void)
++{
++	unsigned i;
++
++	if (!__atomic_load_n(&audio_amps_running, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++		audio_amp_power_down(&audio_amps[i]);
++	}
++	audio_spksw(&audio_bus, 0);
++	__atomic_store_n(&audio_amps_running, 0, __ATOMIC_RELEASE);
++	audio_log("stop: both amplifiers powered down, spksw GPIO%u low",
++	    AUDIO_SPKSW_GPIO);
++	mondrian_log_flush_now();
++}
++
++/*
++ * Called while the PCM period is being played: SWS/BSTS only follow real
++ * audio through the power stage, so this is the point where they mean
++ * something. Reads the supply rails too; 0x21 is VBAT in 6025/1023 mV.
++ */
++void
++mondrian_audio_amp_report(const char *when)
++{
++	const char *why = "";
++	uint16_t status = 0, vbat = 0, pvdd = 0;
++	unsigned i, tries;
++	int switching;
++
++	if (!__atomic_load_n(&audio_amps_running, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++		struct audio_amp *a = &audio_amps[i];
++
++		switching = 0;
++		for (tries = 0; tries < 20; tries++) {
++			if (audio_read_reg(&audio_bus, a->addr,
++			    AUDIO_AW88261_SYSST, &status, &why) != 0) {
++				break;
++			}
++			if ((status & AUDIO_AW_SYSST_SWITCHING) ==
++			    AUDIO_AW_SYSST_SWITCHING) {
++				switching = 1;
++				break;
++			}
++			delay(1000);
++		}
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_VBAT, &vbat, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_PVDD, &pvdd, &why);
++		audio_log("%s: %s status 0x%04x (%s), vbat 0x%03x (%u mV), "
++		    "pvdd 0x%03x", when, a->where, status,
++		    switching ? "amplifier switching" :
++		    "switching bits not set", vbat, vbat * 6025 / 1023, pvdd);
++	}
++	mondrian_log_flush_now();
++}
++
++/*
++ * The pads answer for themselves: a pin muxed to a peripheral function still
++ * reports its level in the TLMM input bit, so this reads SCK, WS and DATA0
++ * while the DSP renders a period. Data that never leaves the SoC shows up as
++ * a constant DATA0 with no edges even though SCK and WS run.
++ */
++void
++mondrian_audio_sample_pads(const char *when)
++{
++	uint32_t sck_high = 0, ws_high = 0, data_high = 0, edges = 0;
++	uint32_t spksw_high = 0;
++	uint32_t reads = 0;
++	uint64_t ticks, start;
++	int last = -1;
++
++	if (!__atomic_load_n(&audio_amps_running, __ATOMIC_ACQUIRE) ||
++	    audio_timebase_hz == 0) {
++		return;
++	}
++	ticks = (audio_timebase_hz / 1000) * 8;
++	start = mach_absolute_time();
++	while (mach_absolute_time() - start < ticks && reads < 2000000) {
++		int sck = audio_pin_level(audio_bus.sck);
++		int ws = audio_pin_level(audio_bus.ws);
++		int data = audio_pin_level(audio_bus.data1);
++
++		sck_high += (uint32_t)sck;
++		ws_high += (uint32_t)ws;
++		data_high += (uint32_t)data;
++		spksw_high += (uint32_t)audio_pin_level(audio_bus.spksw);
++		if (last >= 0 && data != last) {
++			edges++;
++		}
++		last = data;
++		reads++;
++	}
++	audio_log("%s: pads over %u reads: sck high %u, ws high %u, "
++	    "data1 high %u, data1 edges %u, spksw high %u", when, reads,
++	    sck_high, ws_high, data_high, edges, spksw_high);
++	mondrian_log_flush_now();
++}
++
+ static void __dead2
+ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	struct audio_pins pins;
++	struct audio_pins *pins = &audio_bus;
+ 	uint16_t id;
+ 	const char *why;
+-	uint32_t answered = 0, matched = 0;
++	uint32_t answered = 0, matched = 0, prepared = 0;
++	uint32_t mode = audio_probe_mode;
+ 	int error;
++	unsigned i;
+ 
+ 	audio_timebase_hz = ml_get_timebase();
+ 	if (audio_timebase_hz == 0) {
+ 		audio_timebase_hz = 19200000;
+ 	}
+-	if (audio_map_pins(&pins) != 0) {
++	if (audio_map_pins(pins, mode >= AUDIO_MODE_PREPARE) != 0) {
+ 		goto done;
+ 	}
+ 
+ 	/* Park the bus before changing either shutdown line. */
+-	audio_pin_release(pins.sda);
+-	audio_pin_release(pins.scl);
++	audio_pin_release(pins->sda);
++	audio_pin_release(pins->scl);
+ 
+ 	/* DT active states are output-high: low is shutdown, high is run. */
+-	audio_reset_level(pins.reset0, 0);
+-	audio_reset_level(pins.reset1, 0);
++	audio_reset_level(pins->reset0, 0);
++	audio_reset_level(pins->reset1, 0);
+ 	delay(AUDIO_RESET_LOW_MS * 1000);
+-	audio_reset_level(pins.reset0, 1);
+-	audio_reset_level(pins.reset1, 1);
++	audio_reset_level(pins->reset0, 1);
++	audio_reset_level(pins->reset1, 1);
+ 	delay(AUDIO_RESET_HIGH_MS * 1000);
+ 	audio_log("reset GPIO1/3 low %u ms, high %u ms; reading ID register 0x%02x",
+ 	    AUDIO_RESET_LOW_MS, AUDIO_RESET_HIGH_MS, AUDIO_AW88261_ID_REG);
+ 
+ 	why = "bus not idle";
+-	error = audio_read_id(&pins, AUDIO_AMP0_ADDR, &id, &why);
++	error = audio_read_id(pins, AUDIO_AMP0_ADDR, &id, &why);
+ 	if (error == 0) {
+ 		answered++;
+ 		if (id == AUDIO_AW88261_ID) {
+@@ -434,7 +1164,7 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 
+ 	why = "bus not idle";
+-	error = audio_read_id(&pins, AUDIO_AMP1_ADDR, &id, &why);
++	error = audio_read_id(pins, AUDIO_AMP1_ADDR, &id, &why);
+ 	if (error == 0) {
+ 		answered++;
+ 		if (id == AUDIO_AW88261_ID) {
+@@ -446,14 +1176,42 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
+ 		audio_log("0x35 read failed: %s", why);
+ 	}
+ 
+-	/* Leave both parts in shutdown; GPIO52 and the IRQ pads stay untouched. */
+-	audio_reset_level(pins.reset0, 0);
+-	audio_reset_level(pins.reset1, 0);
+-	audio_pin_release(pins.sda);
+-	audio_pin_release(pins.scl);
+-	audio_log("done: answered %u/2, AW88261 %u/2; reset GPIO1/3 parked low, "
+-	    "bus SDA=%d SCL=%d; no amp data register written",
+-	    answered, matched, audio_pin_level(pins.sda), audio_pin_level(pins.scl));
++	if (mode < AUDIO_MODE_PREPARE) {
++		/* Identity only: leave both parts in shutdown, GPIO52 untouched. */
++		audio_reset_level(pins->reset0, 0);
++		audio_reset_level(pins->reset1, 0);
++		audio_pin_release(pins->sda);
++		audio_pin_release(pins->scl);
++		audio_log("done: answered %u/2, AW88261 %u/2; reset GPIO1/3 "
++		    "parked low, bus SDA=%d SCL=%d; no amp data register written",
++		    answered, matched, audio_pin_level(pins->sda),
++		    audio_pin_level(pins->scl));
++		goto done;
++	}
++
++	audio_mi2s2_pins(pins);
++	audio_spksw(pins, 0);
++	for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++		if (audio_amp_prepare(pins, &audio_amps[i]) == 0) {
++			prepared++;
++		}
++	}
++	audio_pin_release(pins->sda);
++	audio_pin_release(pins->scl);
++	if (prepared == AUDIO_ARRAY_SIZE(audio_amps)) {
++		__atomic_store_n(&audio_amps_prepared, 1, __ATOMIC_RELEASE);
++	}
++	audio_log("done: answered %u/2, AW88261 %u/2, prepared %u/2%s",
++	    answered, matched, prepared,
++	    prepared == AUDIO_ARRAY_SIZE(audio_amps) ?
++	    "; reset GPIO1/3 stay high, the adsp worker unmutes it" :
++	    "; the adsp worker leaves both muted");
++	mondrian_log_flush_now();
++	/*
++	 * The flag is released last: the adsp worker wakes only after the
++	 * whole preparation is on the ring, whether it succeeded or not.
++	 */
++	__atomic_store_n(&audio_amps_done, 1, __ATOMIC_RELEASE);
+ 
+ done:
+ 	mondrian_log_flush_now();
+@@ -470,22 +1228,24 @@ mondrian_audio_probe_start(void)
+ 	kern_return_t kr;
+ 	uint32_t enabled = 0;
+ 
+-	/* Absent, 0, or any value other than exactly 1 touches no audio hardware. */
++	/* 1 identifies only; 2 also prepares the pair for the ADSP worker. */
+ 	if (!PE_parse_boot_argn("mondrianaudioprobe", &enabled, sizeof(enabled)) ||
+-	    enabled != 1) {
++	    (enabled != AUDIO_MODE_IDENTITY && enabled != AUDIO_MODE_PREPARE)) {
+ 		return;
+ 	}
+ 	if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL) != 0) {
+ 		return;
+ 	}
++	audio_probe_mode = enabled;
+ 	kr = kernel_thread_start(mondrian_audio_probe_thread, NULL, &thread);
+ 	if (kr != KERN_SUCCESS) {
++		audio_probe_mode = 0;
+ 		__atomic_store_n(&started, 0, __ATOMIC_RELEASE);
+ 		audio_log("worker allocation failed kr=0x%x", kr);
+ 		return;
+ 	}
+ 	thread_deallocate(thread);
+-	audio_log("worker started");
++	audio_log("worker started, mode %u", enabled);
+ }
+ 
+ #else /* !MONDRIAN */
+@@ -495,4 +1255,27 @@ mondrian_audio_probe_start(void)
+ {
+ }
+ 
++int
++mondrian_audio_amp_start(void)
++{
++	return 0;
++}
++
++void
++mondrian_audio_amp_stop(void)
++{
++}
++
++void
++mondrian_audio_amp_report(const char *when)
++{
++	(void)when;
++}
++
++void
++mondrian_audio_sample_pads(const char *when)
++{
++	(void)when;
++}
++
+ #endif /* MONDRIAN */
