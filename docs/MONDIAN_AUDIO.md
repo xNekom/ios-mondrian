@@ -1,5 +1,10 @@
 # Audio on mondrian
 
+The speaker path is proven end to end: the ADSP graph drives the AW88261 pair
+on the live TDM line and the pair plays a 1 kHz tone (measured 2026-11-27, heard
+on the speaker). Everything below is how that path is built, what each stage
+needs and which measurements it answers to.
+
 The ADSP is up through PAS1. `mondrianadsp=1` starts a worker that reads the
 joined `/private/var/vm/adsp.mbn` (`tools/adsp-image.py` joins the stock
 `adsp.mdt` and `adsp.bNN`), maps the APPS-ADSP windows, and calls PAS1:
@@ -63,26 +68,32 @@ status 0; the map and the write are the 0505 step below.
 
 Patch 0507 feeds the sink from the shared-memory endpoint through the donor's
 chain (`WR_SHARED_MEM_EP -> PCM decoder -> PCM converter`). The sink is the
-AudioReach TDM module (`0x0700100E`) on the tertiary interface, lane mask 2
-(`0x0800106A`), with one BCLK of data delay. The device graph holds only the
-endpoint; the stream graph's last connection names it, and both graphs are open
-before the link is resolved. `PREPARE`, `START`, `STOP` and `CLOSE` go out once
-per subgraph: a command carrying both ids is accepted, so a list that only
-applied its first entry would leave the endpoint clocking while the stream
-idles. The I2S module (`0x0700100A`, SD1) also clocked the pads and never drove
-a data line. Neither module is evidence of a working chain on its own: the
-donor's TDM code is marked unvalidated, and the only extracted ACDB speaker
-graph of this generation (a sibling platform) uses `I2S_SINK` with `SAL` in
-front and no TDM sink at all.
+AudioReach TDM module (`0x0700100E`) on the tertiary interface, configured as
+**four slots of 32 bits** with `slot_mask 3` (the two channels), lane mask 2
+(`0x0800106A`), a one-slot sync pulse (`sync_mode 2`, not inverted) and one
+BCLK of data delay. The device graph holds only the endpoint; the stream
+graph's last connection names it, and both graphs are open before the link is
+resolved. `PREPARE`, `START`, `STOP` and `CLOSE` go out once per subgraph: a
+command carrying both ids is accepted, so a list that only applied its first
+entry would leave the endpoint clocking while the stream idles.
+
+Measured 2026-11-27: with a **two-slot** frame every command answered status 0
+and SCK/WS ran at 50 % while no data pad moved, so an accepted graph is not
+evidence of a data path. At four slots the sink drives DATA0 and the pair plays
+- a 1 kHz square at -6 dBFS is loud enough to startle, which is the milestone
+- and the same boot reports `SYSST 0x0311` (class-D switching) with the boost
+up, against `0x0011` before.
 
 The worker allocates eight periods (30720 bytes, a whole number of 3840-byte
 periods) with `kmem_alloc_contig()`, maps the ring into the ADSP's 32-bit
-space, prepares and starts both subgraphs, then queues every slot with its own
-offset. The endpoint renders only from a lead of queued periods: a 16 KiB
-ring is not a whole number of periods, and one write after the start is
-consumed before the sink starts. It logs each write-done address and status,
-reads SYSST after the ring is queued, and samples the SCK, WS, both data pads
-and spksw through their TLMM input bits after a GPIO self-test of each pad.
+space, prepares and starts both subgraphs, then queues slots with their own
+offsets. The endpoint renders only from a lead of queued periods: a 16 KiB ring
+is not a whole number of periods, and one write after the start is consumed
+before the sink starts. It writes one silent pass first and then twelve passes
+of a gated 150 ms beep, rewriting a slot only after the endpoint has answered
+for all eight periods. It logs each write-done address and status, reads SYSST
+after the ring is queued, and samples the SCK, WS, both data pads and spksw
+through their TLMM input bits after a GPIO self-test of each pad.
 
 Patch 0505 adds `mondrian_audio_smmu.c`. The live tree routes the ADSP audio
 master through apps-SMMU stream `0x1801` (`qcom,msm-audio-ion`) and gives the
@@ -123,14 +134,15 @@ The pads answer for themselves, and the instrument proves itself too: with
 each pin temporarily muxed as a plain GPIO and driven low then high, sck, ws,
 data0 and data1 all read 0 then 1. Measured 2026-11-27 with that check in
 place: with a **two-slot** frame SCK and WS run at 50 % and neither data line
-moves, while with a **four-slot** frame the sink starts driving DATA0 (gpio122)
-at once - one slot of the four carries the samples (12.6 % high, the share a
-square that occupies 52 % of one slot of four must have) - and both amplifiers
-go from `SYSST 0x0011` to `0x0311` (class-D switching) with the boost up. The
-frame width was the gate, and the stock ACF explains why: it runs the pair in
-four-slot TDM (`SLOT_NUM = TDM4S` in `I2SCTRL2` 0x07 bits 14:12, `I2SFS` 32
-bits, `I2SBCK` 64 fs), and the vendor driver never rewrites those registers,
-so four slots is what the phone's amplifier actually runs.
+moves, while with a **four-slot** frame the sink drives DATA0 (gpio122) at
+once. The high share of the pad follows the slots that carry samples - about
+13 % of the frame with one slot filled and about 25 % with the converter
+sending both channels interleaved - and both amplifiers go from `SYSST 0x0011`
+to `0x0311` (class-D switching) with the boost up. The frame width was the
+gate, and the stock ACF explains why: it runs the pair in four-slot TDM
+(`SLOT_NUM = TDM4S` in `I2SCTRL2` 0x07 bits 14:12, `I2SFS` 32 bits, `I2SBCK`
+64 fs), and the vendor driver never rewrites those registers, so four slots is
+what the phone's amplifier actually runs.
 
 ## Traps
 
@@ -154,6 +166,15 @@ so four slots is what the phone's amplifier actually runs.
   `nslots_per_frame 4` starts the sink driving DATA0 (measured 2026-11-27).
   A graph that "runs" is therefore not evidence of a data path; check a data
   pad, not just the clocks.
+- **The codec, not the pad, says whether frames arrive.** `I2SINT` (0x26)
+  reads `0x0005` with the bit clock running and no buffer queued, and drops to
+  `0x0000` as soon as one period is written, so it is the quickest witness that
+  the serializer is receiving framed data. `I2SCAPCNT` (0x27) sits saturated
+  at `0x1fff` either way. `ISNDAT` (0x24) and `VSNDAT` (0x25) read about zero
+  even while the pair switches and the tone is audible, because the stock ACF
+  leaves the sense path off: they cannot witness the analog side, and neither
+  can `SYSST` alone - a part that renders and a part that only runs its
+  modulator both report `0x0311`.
 - **The pad sampler resolves 48 kHz, not the bit clock.** Each loop iteration
   reads five TLMM pages and runs at about 0.7 M samples/s (measured 2026-11-27:
   315566 reads over the window), so counting SCK edges per WS period returns
@@ -232,16 +253,14 @@ so four slots is what the phone's amplifier actually runs.
   kills the boot before USB answers and leaves no ring on disk, so the failure
   is silent. The worker starts after the probes and `adsp_log()` flushes after
   every line.
-- **A pin muxed to a peripheral function needs its TLMM output enable.** The
-  MI2S2 mux set OE for SCK and WS but left it clear on GPIO122, so
-  `mi2s2_data0` selected the I2S function with the pad tri-stated. The pair
-  locked its PLL to the running bit clock and reported `SYSST 0x0011` for
-  80 ms of periods with SWS/BSTS never set, because it was decoding a silent
-  line. `mondrian_tlmm_cfg()`'s last argument is the pad output enable, not a
-  spare; the three MI2S2 pins are all outputs from the SoC's side. After the
-  fix SCK and WS read 50 % high while DATA0 still read 0.05 %, so data that
-  only occupies high bits is not proof: the sampler has to see the actual
-  sample pattern.
+- **A pad muxed to a peripheral function takes its direction from the block,
+  not from the GPIO output-enable bit.** The MI2S2 mux sets the TLMM
+  `GPIO_IN_OUT` bit for SCK and WS; the same bit on the data pads changed
+  nothing (DATA1 read flat with it clear and set: 0.4 %, about 90 noise edges
+  either way). What decides whether the data pads carry a frame is the
+  AudioReach endpoint's own configuration - the four-slot frame is the one that
+  drives them (measured 2026-11-27) - so a flat data pad with running clocks
+  means the endpoint is not transmitting, not that the pad is tri-stated.
 - **SWS/BSTS are not a usable ready gate.** Upstream `aw88261` stopped
   requiring them in 2026 ("check sysst fail, reg_val=0x0011"): a part that is
   still muted legitimately reports only PLLS|CLKS. Require PLLS and CLKS
@@ -251,16 +270,13 @@ so four slots is what the phone's amplifier actually runs.
 
 ## What is next
 
-The one-graph open is the open measurement: with the sink connected, DATA0
-must answer the one-LSB sign square at roughly 50 % high (it was 0.45 % with
-the split graph) and the amplifier should then have real samples. If DATA0
-moves but SWS/BSTS stay 0, the bits are informational and the next step is an
-audible-level pattern at the observed width. If DATA0 stays silent, the next
-suspect is the per-module format negotiation, not the amplifier.
+The speaker path is proven end to end, so the next step is userland: wire a
+virtual audio HAL to this graph (open on demand, write the ring from `coreaudiod`
+instead of the one-shot probe) and keep `mondrianadsp=1` for it. The boot probe
+plays a gated 150 ms 1 kHz beep at -24 dBFS; raise `mondrianadsp` with the
+argument rather than the code when a louder test is wanted.
 
-After that, audible output from the userland needs the virtual audio HAL wired
-to this graph instead of the one-shot probe. The WCD938x is a SoundWire codec
-and needs the LPASS SWR master and its own probe; it is the headphone path, not
-this one. The donor ladder and the register references are in
-`docs/REFERENCE_PORTS.md`; the `master-kernel`/`slave-kernel` SMP2P names and
-the ready bits come from the zizhan ADSP worker.
+The WCD938x is the headphone and mic path: a SoundWire codec that needs the
+LPASS SWR master and its own probe. The donor ladder and the register
+references are in `docs/REFERENCE_PORTS.md`; the `master-kernel`/`slave-kernel`
+SMP2P names and the ready bits come from the zizhan ADSP worker.

@@ -267,9 +267,9 @@ and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
 with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 
 The ADSP runs through PAS1 (`mondrianadsp=1`): both subgraphs start and PCM
-ring slots complete through apps-SMMU SID 0x1801. `0506` unmutes the AW88261
-pair on the live TDM line; `0507` drives the TDM sink (`0x0700100E`, lane 1)
-from the shared-memory chain, and the sink still emits no frame.
+ring slots complete through apps-SMMU SID 0x1801. `0506` unmutes the pair and
+`0507` drives the TDM sink (`0x0700100E`) from shared memory: a four-slot frame
+makes it **play a 1 kHz tone audibly** (two slots drive nothing).
 
 ## Getting the numbers off the device
 
