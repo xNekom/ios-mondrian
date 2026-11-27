@@ -1,0 +1,109 @@
+xnu 0499: map the adsp windows in the worker
+
+The 0497 and 0498 boots died in kmem_alloc inside mondrian_adsp_premap
+before the ring on disk had a single MONDRIAN ADSP line, so a premap
+fault is a silent boot death. The premap now only arms the worker; the
+worker maps the carveout chunks and the SMEM/IPCC/mutex/AOSS windows one
+adsp_log() at a time, after the USB probe and the probes' premaps, and a
+failure names the window in the ring.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index 0663862..dff88cb 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -440,6 +440,8 @@ adsp_ready_value(uint32_t *value)
+ 	return -1;
+ }
+ 
++static int adsp_map_all(void);
++
+ static uint32_t
+ adsp_wait_ready(void)
+ {
+@@ -512,6 +514,10 @@ adsp_run(void)
+ 		adsp_log("image is not relocatable; refusing to place it");
+ 		return;
+ 	}
++	if (adsp_map_all() != 0) {
++		adsp_log("window mapping failed; no ADSP load");
++		return;
++	}
+ 
+ 	adsp_log("aoss magic=0x%x link=0x%x ack=0x%x ch=0x%x ack2=0x%x",
+ 	    adsp_rd32(adsp_aoss, 0), adsp_rd32(adsp_aoss, 0xc),
+@@ -655,12 +661,30 @@ adsp_thread(void *arg)
+ void
+ mondrian_adsp_premap(void)
+ {
+-	uint32_t enabled = 0, i;
++	uint32_t enabled = 0;
+ 
+ 	if (!PE_parse_boot_argn("mondrianadsp", &enabled, sizeof(enabled)) ||
+ 	    enabled != 1) {
+ 		return;
+ 	}
++	/*
++	 * Only arm the worker here. The premap runs in bsd_init, before the
++	 * USB probe has answered and before the ring's writer has flushed
++	 * anything, so a fault in a mapping here takes the whole boot down
++	 * with no report: measured 2026-11-27, both the 51 MiB map and the
++	 * chunked version died in kmem_alloc with an empty ring on disk. The
++	 * worker runs after every probe premap and is the only mapper when it
++	 * starts, and adsp_log() flushes each step to the ring.
++	 */
++	adsp_mapped = 1;
++	adsp_log("armed; the worker maps the windows");
++}
++
++static int
++adsp_map_all(void)
++{
++	uint32_t i;
++
+ 	for (i = 0; i < ADSP_MAP_CHUNKS; i++) {
+ 		uint64_t base = ADSP_CARVEOUT_BASE +
+ 		    (uint64_t)i * ADSP_MAP_CHUNK;
+@@ -671,27 +695,30 @@ mondrian_adsp_premap(void)
+ 
+ 		adsp_carveout_chunk[i] = ml_io_map_unmappable(base, bytes,
+ 		    VM_WIMG_WCOMB);
++		adsp_log("map carveout %u/%u 0x%llx+0x%x -> 0x%lx",
++		    i + 1, ADSP_MAP_CHUNKS, (unsigned long long)base, bytes,
++		    (unsigned long)adsp_carveout_chunk[i]);
+ 		if (adsp_carveout_chunk[i] == 0) {
+-			break;
++			return -1;
+ 		}
+ 	}
+ 	adsp_smem = ml_io_map(ADSP_SMEM_BASE, ADSP_SMEM_SIZE);
++	adsp_log("map smem 0x%llx+0x%x -> 0x%lx", ADSP_SMEM_BASE,
++	    (uint32_t)ADSP_SMEM_SIZE, (unsigned long)adsp_smem);
+ 	adsp_ipcc = ml_io_map(ADSP_IPCC_BASE, 0x1000);
++	adsp_log("map ipcc 0x%llx -> 0x%lx", ADSP_IPCC_BASE,
++	    (unsigned long)adsp_ipcc);
+ 	adsp_mutex = ml_io_map(ADSP_MUTEX_BASE, 0x1000);
++	adsp_log("map mutex 0x%llx -> 0x%lx", ADSP_MUTEX_BASE,
++	    (unsigned long)adsp_mutex);
+ 	adsp_aoss = ml_io_map(ADSP_AOSS_BASE, 0x1000);
+-	if (i != ADSP_MAP_CHUNKS || adsp_smem == 0 || adsp_ipcc == 0 ||
+-	    adsp_mutex == 0 || adsp_aoss == 0) {
+-		printf("MONDRIAN ADSP: premap failed chunks=%u/%u smem=0x%lx "
+-		    "ipcc=0x%lx mutex=0x%lx aoss=0x%lx\n", i,
+-		    ADSP_MAP_CHUNKS, (unsigned long)adsp_smem,
+-		    (unsigned long)adsp_ipcc, (unsigned long)adsp_mutex,
+-		    (unsigned long)adsp_aoss);
+-		return;
++	adsp_log("map aoss 0x%llx -> 0x%lx", ADSP_AOSS_BASE,
++	    (unsigned long)adsp_aoss);
++	if (adsp_smem == 0 || adsp_ipcc == 0 || adsp_mutex == 0 ||
++	    adsp_aoss == 0) {
++		return -1;
+ 	}
+-	adsp_mapped = 1;
+-	printf("MONDRIAN ADSP: premap chunks=%u first=0x%lx smem=0x%lx\n",
+-	    ADSP_MAP_CHUNKS, (unsigned long)adsp_carveout_chunk[0],
+-	    (unsigned long)adsp_smem);
++	return 0;
+ }
+ 
+ void
