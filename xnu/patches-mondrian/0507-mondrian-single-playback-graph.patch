@@ -37,10 +37,18 @@ command carrying both ids is accepted, so a list that only applied its first
 entry would leave exactly this symptom: the endpoint clocks while the stream
 idles.
 diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
-index c3c9319..07aed4c 100755
+index c3c9319..e29f652 100755
 --- a/bsd/dev/mondrian_adsp.c
 +++ b/bsd/dev/mondrian_adsp.c
-@@ -673,15 +673,18 @@ adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
+@@ -49,6 +49,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern int mondrian_audio_amp_start(void);
+ extern void mondrian_audio_amp_stop(void);
+ extern void mondrian_audio_amp_report(const char *when);
++extern void mondrian_audio_amp_diag(const char *when);
+ extern void mondrian_audio_sample_pads(const char *when);
+ 
+ #define ADSP_FW_PATH		"/private/var/vm/adsp.mbn"
+@@ -673,27 +674,44 @@ adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
  	return 0;
  }
  
@@ -56,23 +64,47 @@ index c3c9319..07aed4c 100755
 +#define ADSP_PCM_BYTES		(ADSP_PCM_PERIOD * 8u)
  
  /*
-  * 1 kHz sign square at one LSB: (i / 2) is the frame, 48 frames per period.
-  * +1 is 0x00000001 and -1 is 0xffffffff, so the negative half sets every bit.
+- * 1 kHz sign square at one LSB: (i / 2) is the frame, 48 frames per period.
+- * +1 is 0x00000001 and -1 is 0xffffffff, so the negative half sets every bit.
 - * That makes the pattern visible on DATA0 whatever width or alignment the
-+ * That makes the pattern visible on DATA1 whatever width or alignment the
-  * LPAIF transmits (a -18 dBFS square only sets bit 28 and vanishes if the
-  * interface sends the low 24 bits), and one LSB is inaudible on the speaker.
+- * LPAIF transmits (a -18 dBFS square only sets bit 28 and vanishes if the
+- * interface sends the low 24 bits), and one LSB is inaudible on the speaker.
++ * A 1 kHz square at -24 dBFS, gated into 150 ms beeps with 350 ms of silence
++ * between them: clearly audible at close range, and gated so that "the
++ * amplifier switches" cannot be mistaken for "a tone plays". 0x08000000 and
++ * 0xf8000000 keep the top five bits as the only ones set, so the pad still
++ * shows the waveform through any word width the interface transmits. A silent
++ * pass is written first: a part that renders samples and a part that only runs
++ * its modulator look the same in the status bits.
   */
-@@ -692,7 +695,7 @@ adsp_pcm_fill(void)
++#define ADSP_BEEP_ON_FRAMES	7200u	/* 150 ms at 48 kHz */
++#define ADSP_BEEP_PERIOD_FRAMES	24000u	/* 150 ms on, then 350 ms off */
++#define ADSP_RING_FRAMES	(ADSP_PCM_BYTES / 8u)
++
+ static void
+-adsp_pcm_fill(void)
++adsp_pcm_fill(uint32_t first_frame, int audio)
+ {
+ 	int32_t *pcm = (int32_t *)adsp_pcm_va;
  	uint32_t i;
  	vm_offset_t at;
  
 -	for (i = 0; i < ADSP_PCM_PERIOD / 4; i++) {
+-		pcm[i] = (((i / 2) % 48) < 24) ? 1 : -1;
 +	for (i = 0; i < ADSP_PCM_BYTES / 4; i++) {
- 		pcm[i] = (((i / 2) % 48) < 24) ? 1 : -1;
++		uint32_t frame = first_frame + i / 2;
++		int32_t v = 0;
++
++		if (audio != 0 &&
++		    (frame % ADSP_BEEP_PERIOD_FRAMES) < ADSP_BEEP_ON_FRAMES) {
++			v = ((frame % 48) < 24) ? 0x08000000 :
++			    (int32_t)0xf8000000;
++		}
++		pcm[i] = v;
  	}
  	for (at = adsp_pcm_va; at < adsp_pcm_va + ADSP_PCM_BYTES;
-@@ -703,29 +706,41 @@ adsp_pcm_fill(void)
+ 	    at += 64) {
+@@ -703,29 +721,70 @@ adsp_pcm_fill(void)
  }
  
  /* Run the whole playback path once: open and configure the device and stream
@@ -81,6 +113,35 @@ index c3c9319..07aed4c 100755
 + * graphs, map the PCM ring, prepare and start both graphs, fill every ring
 + * slot and report the DSP's write completions. Cleanup releases what was
 + * taken. */
++/* Queue every period of the ring once, naming its own offset in each write. */
++static int
++adsp_queue_ring(uint8_t *packet, uint32_t handle, uint64_t pcm_iova,
++    const char *phase, int verbose, ArAnswer *answer)
++{
++	uint32_t round, write_token, length;
++
++	for (round = 0; round < ADSP_PCM_BYTES / ADSP_PCM_PERIOD; round++) {
++		write_token = 0x10000000u | (++adsp_ar_write & 0x0fffffffu);
++		length = ar_write(packet, GPR_MAX_PACKET, ADSP_GLINK_PORT,
++		    write_token, (pcm_iova | (1ull << 32)) +
++		    (uint64_t)round * ADSP_PCM_PERIOD, handle, ADSP_PCM_PERIOD);
++		if (length == 0) {
++			adsp_log("%s write %u could not be built", phase, round);
++			return -1;
++		}
++		if (adsp_apm_write(packet, length, write_token, answer) != 0) {
++			adsp_log("%s write %u failed", phase, round);
++			return -1;
++		}
++		if (verbose != 0) {
++			adsp_log("%s write %u done address=0x%llx status=%u",
++			    phase, round, (unsigned long long)answer->address,
++			    answer->status);
++		}
++	}
++	return 0;
++}
++
  static void
  adsp_apm_probe(void)
  {
@@ -89,7 +150,8 @@ index c3c9319..07aed4c 100755
 +	const unsigned graph_sg_count = 2;
  	uint8_t packet[GPR_MAX_PACKET];
  	ArAnswer answer;
- 	uint32_t length, token, handle = 0, write_token, round;
+-	uint32_t length, token, handle = 0, write_token, round;
++	uint32_t length, token, handle = 0, pass;
  	kern_return_t kr;
  	ppnum_t pn;
  	uint64_t pcm_iova = 0;
@@ -120,7 +182,7 @@ index c3c9319..07aed4c 100755
  
  	token = ++adsp_ar_token;
  	length = ar_config_speaker_device(packet, (uint32_t)sizeof packet,
-@@ -738,11 +753,14 @@ adsp_apm_probe(void)
+@@ -738,11 +797,14 @@ adsp_apm_probe(void)
  	token = ++adsp_ar_token;
  	length = ar_open_playback_stream(packet, (uint32_t)sizeof packet,
  	    ADSP_GLINK_PORT, token);
@@ -137,7 +199,16 @@ index c3c9319..07aed4c 100755
  
  	token = ++adsp_ar_token;
  	length = ar_config_playback_stream(packet, (uint32_t)sizeof packet,
-@@ -798,36 +816,26 @@ adsp_apm_probe(void)
+@@ -779,7 +841,7 @@ adsp_apm_probe(void)
+ 		goto out;
+ 	}
+ 	adsp_pcm_pa = (uint64_t)ptoa_64(pn);
+-	adsp_pcm_fill();
++	adsp_pcm_fill(0, 0);
+ 	if (mondrian_audio_smmu_map(adsp_pcm_va, ADSP_PCM_BYTES,
+ 	    &pcm_iova) != 0) {
+ 		adsp_log("audio smmu map failed");
+@@ -798,36 +860,29 @@ adsp_apm_probe(void)
  	handle = answer.handle;
  	mapped = 1;
  
@@ -148,7 +219,9 @@ index c3c9319..07aed4c 100755
 -	    "prepare speaker") != 0) {
 -		goto out;
 -	}
--
++	/* The pair is prepared but no bit clock exists yet. */
++	mondrian_audio_amp_diag("no clocks");
+ 
 -	token = ++adsp_ar_token;
 -	length = ar_graph_command(packet, (uint32_t)sizeof packet,
 -	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE, AR_SG_PLAY);
@@ -192,33 +265,31 @@ index c3c9319..07aed4c 100755
  	}
  	started = 1;
  
-@@ -846,46 +854,33 @@ adsp_apm_probe(void)
+@@ -844,49 +899,37 @@ adsp_apm_probe(void)
+ 		adsp_log("aw88261 pair did not start (%d); the periods go to a "
+ 		    "muted path", amp_error);
  	}
++	mondrian_audio_amp_diag("clocks only");
  
  	/*
 -	 * Eight 10 ms periods, not one: the class-D only reports SWS/BSTS
 -	 * once it has real audio to switch, and the last period is still
 -	 * playing while the report below reads the status.
-+	 * Fill the whole ring, one period per slot, before listening. The
-+	 * shared-memory endpoint only starts rendering once it holds a lead of
-+	 * real periods; a single 10 ms write after the start is consumed and
-+	 * the sink runs dry before the pads are read. Every write names its
-+	 * own offset, so the completion addresses must differ per slot.
++	 * Queue the whole ring twice: silence first, then the tone. Every write
++	 * names its own offset, so the completion addresses must differ per
++	 * slot, and each answer arrives only after the endpoint has taken that
++	 * period, which keeps the second pass from overrunning the first.
  	 */
 -	for (round = 0; round < 8; round++) {
-+	for (round = 0; round < ADSP_PCM_BYTES / ADSP_PCM_PERIOD; round++) {
- 		write_token = 0x10000000u |
- 		    (++adsp_ar_write & 0x0fffffffu);
- 		length = ar_write(packet, (uint32_t)sizeof packet,
+-		write_token = 0x10000000u |
+-		    (++adsp_ar_write & 0x0fffffffu);
+-		length = ar_write(packet, (uint32_t)sizeof packet,
 -		    ADSP_GLINK_PORT, write_token, pcm_iova | (1ull << 32),
 -		    handle, ADSP_PCM_PERIOD);
-+		    ADSP_GLINK_PORT, write_token, (pcm_iova | (1ull << 32)) +
-+		    (uint64_t)round * ADSP_PCM_PERIOD, handle,
-+		    ADSP_PCM_PERIOD);
- 		if (length == 0) {
- 			adsp_log("apm write %u could not be built", round);
- 			break;
- 		}
+-		if (length == 0) {
+-			adsp_log("apm write %u could not be built", round);
+-			break;
+-		}
 -		/*
 -		 * The first period is measured while it renders: the write is
 -		 * sent, the pads and SYSST are read during the period, and only
@@ -242,20 +313,35 @@ index c3c9319..07aed4c 100755
 -			    answer.status);
 -		} else if (adsp_apm_write(packet, length, write_token,
 -		    &answer) != 0) {
-+		if (adsp_apm_write(packet, length, write_token, &answer) != 0) {
- 			adsp_log("apm write %u failed", round);
- 			break;
- 		}
-+		adsp_log("apm write %u done address=0x%llx status=%u", round,
-+		    (unsigned long long)answer.address, answer.status);
+-			adsp_log("apm write %u failed", round);
+-			break;
++	if (adsp_queue_ring(packet, handle, pcm_iova, "silence", 1,
++	    &answer) != 0) {
++		goto out;
 +	}
-+	if (round == ADSP_PCM_BYTES / ADSP_PCM_PERIOD) {
-+		mondrian_audio_sample_pads("ring playing");
-+		mondrian_audio_amp_report("ring playing");
++	mondrian_audio_amp_report("silence");
++	mondrian_audio_amp_diag("silence");
++	/*
++	 * Twelve passes of the gated beep: one ring is 80 ms, so the speaker
++	 * gets about a second of 250 ms on / 250 ms off. The pattern index
++	 * continues across passes, and each pass is rewritten only after the
++	 * endpoint has answered for all eight of its periods.
++	 */
++	adsp_log("beeps: twelve passes of %u ms", ADSP_RING_FRAMES / 48);
++	for (pass = 0; pass < 12; pass++) {
++		adsp_pcm_fill(pass * ADSP_RING_FRAMES, 1);
++		if (adsp_queue_ring(packet, handle, pcm_iova, "beep",
++		    pass == 0 || pass == 11, &answer) != 0) {
++			goto out;
+ 		}
  	}
++	mondrian_audio_sample_pads("ring playing");
++	mondrian_audio_amp_report("beep last");
++	mondrian_audio_amp_diag("beep last");
  	if (amps) {
  		mondrian_audio_amp_report("after periods");
-@@ -899,37 +894,27 @@ out:
+ 		delay(20000);
+@@ -899,37 +942,27 @@ out:
  		amps = 0;
  	}
  	if (started) {
@@ -313,7 +399,7 @@ index c3c9319..07aed4c 100755
  	}
  	if (mapped) {
 diff --git a/bsd/dev/mondrian_audioreach.c b/bsd/dev/mondrian_audioreach.c
-index 8735958..9fb3f24 100644
+index 8735958..31282ab 100644
 --- a/bsd/dev/mondrian_audioreach.c
 +++ b/bsd/dev/mondrian_audioreach.c
 @@ -20,6 +20,9 @@
@@ -422,7 +508,7 @@ index 8735958..9fb3f24 100644
  }
  
  static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)
-@@ -151,13 +180,42 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
+@@ -151,13 +180,49 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
      W w;
      begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
      const uint32_t cmd = cmd_payload_start(&w);
@@ -432,20 +518,27 @@ index 8735958..9fb3f24 100644
 +     * The live tree's tert tdm TX node asks for internal sync (sync-src 1),
 +     * long sync (sync-mode 1), inverted sync (invert-sync 1), one BCLK of
 +     * data delay and 32-bit slots. The pair is stereo on one dout line, so
-+     * two slots (mask 3) and lane 1 (mask 2, gpio124) are active.
++     * two slots (mask 3) carry the channels and lane 1 (mask 2, gpio124) is
++     * the active one.
 +     *
-+     * ctrl-data-out-enable is the one field whose name misleads: 1 means
-+     * "share data-out with other masters", so the TDM block releases the
-+     * pin and the amp sees a flat line while SCK and WS run (measured
-+     * 2026-11-27). The live tree's qcom,msm-cpudai-tdm-data-out is 0 and
-+     * keeps this block driving.
++     * The frame is four slots wide, which is also the probe: with a one-slot
++     * long sync the WS duty is 25 % of the frame, so a reading of 25 % on
++     * gpio123 proves this parameter reached the interface, while 50 % (the
++     * two-slot frame) means the endpoint is still running its defaults and
++     * the whole config command is being ignored.
 +     */
 +    uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_TDM_INTF);
 +    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY);
 +    put16(&w, 1); put16(&w, 0);
 +    put32(&w, 3);
-+    put16(&w, 2); put16(&w, 32);
-+    put16(&w, 1); put16(&w, 1); put16(&w, 1); put16(&w, 0);
++    put16(&w, 4); put16(&w, 32);
++    /*
++     * One-slot sync pulse, not inverted. The duty of WS is then exactly
++     * 1/nslots, which is the only frame-width measurement this sampler can
++     * resolve: 25 % proves four slots reached the interface, 50 % means the
++     * endpoint kept a two-slot frame and split it into quarters itself.
++     */
++    put16(&w, 2); put16(&w, 0); put16(&w, 1); put16(&w, 0);
 +    param_end(&w, at);
 +    at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_TDM_LANE);
 +    put16(&w, 2); put16(&w, 0);
@@ -467,7 +560,22 @@ index 8735958..9fb3f24 100644
      cmd_payload_end(&w, cmd);
      return finish(&w);
  }
-@@ -203,13 +261,16 @@ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port
+@@ -181,7 +246,13 @@ uint32_t ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t por
+     begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
+     const uint32_t cmd = cmd_payload_start(&w);
+     pcm_output(&w, AR_IID_PLAY_DEC, f, INTERLEAVED);
+-    pcm_output(&w, AR_IID_PLAY_CNV, f, DEINTERLEAVED_UNPACKED);
++    /*
++     * The converter hands the sink one interleaved buffer, not one buffer per
++     * channel: the stock ACF puts the pair in four-slot TDM with one slot
++     * each, and a deinterleaved output let the sink fill only slot 0
++     * (measured 2026-11-27: DATA0 carried one slot of four, 13.4 % high).
++     */
++    pcm_output(&w, AR_IID_PLAY_CNV, f, INTERLEAVED);
+     cmd_payload_end(&w, cmd);
+     return finish(&w);
+ }
+@@ -203,13 +274,16 @@ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port
      return finish(&w);
  }
  

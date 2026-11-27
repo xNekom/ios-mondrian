@@ -177,7 +177,7 @@ index 716d9ba..c3c9319 100755
  		token = ++adsp_ar_token;
  		length = ar_graph_command(packet, (uint32_t)sizeof packet,
 diff --git a/bsd/dev/mondrian_audio_probe.c b/bsd/dev/mondrian_audio_probe.c
-index d882076..0c0b513 100644
+index d882076..067c255 100644
 --- a/bsd/dev/mondrian_audio_probe.c
 +++ b/bsd/dev/mondrian_audio_probe.c
 @@ -1,16 +1,23 @@
@@ -213,18 +213,19 @@ index d882076..0c0b513 100644
   */
  #include <sys/param.h>
  #include <sys/systm.h>
-@@ -22,6 +29,10 @@
+@@ -22,6 +29,11 @@
  #include <vm/vm_kern.h>
  
  void mondrian_audio_probe_start(void);
 +int mondrian_audio_amp_start(void);
 +void mondrian_audio_amp_stop(void);
 +void mondrian_audio_amp_report(const char *when);
++void mondrian_audio_amp_diag(const char *when);
 +void mondrian_audio_sample_pads(const char *when);
  
  #if defined(MONDRIAN)
  
-@@ -47,33 +58,155 @@ extern uint32_t mondrian_tlmm_cfg(uint32_t function, uint32_t pull,
+@@ -47,33 +59,165 @@ extern uint32_t mondrian_tlmm_cfg(uint32_t function, uint32_t pull,
  #define AUDIO_AMP0_RESET_GPIO		1
  #define AUDIO_AMP1_RESET_GPIO		3
  #define AUDIO_SPKSW_GPIO		52
@@ -244,9 +245,19 @@ index d882076..0c0b513 100644
 +#define AUDIO_AW88261_SYSCTRL		0x04
 +#define AUDIO_AW88261_SYSCTRL2		0x05
 +#define AUDIO_AW88261_I2SCTRL3		0x08
++#define AUDIO_AW88261_DACST		0x20
 +#define AUDIO_AW88261_DBGCTRL		0x14
 +#define AUDIO_AW88261_VBAT		0x21
++#define AUDIO_AW88261_TEMP		0x22
 +#define AUDIO_AW88261_PVDD		0x23
++#define AUDIO_AW88261_ISNDAT		0x24
++#define AUDIO_AW88261_VSNDAT		0x25
++#define AUDIO_AW88261_I2SINT		0x26
++#define AUDIO_AW88261_I2SCAPCNT		0x27
++#define AUDIO_AW88261_ANASTA1		0x28
++#define AUDIO_AW88261_ANASTA2		0x29
++#define AUDIO_AW88261_ANASTA3		0x2a
++#define AUDIO_AW88261_TESTDET		0x2b
 +#define AUDIO_AW88261_VSNTM1		0x50
 +#define AUDIO_AW88261_EFRH4		0x78
 +#define AUDIO_AW88261_EFRH3		0x79
@@ -326,8 +337,8 @@ index d882076..0c0b513 100644
 +	uint16_t volume_high;
 +	uint16_t volume_at;
 +	uint16_t vcalb;
-+};
-+
+ };
+ 
 +/* Device 0 (0x34, sound-channel 0): aw882xx_acf.bin, profile 6. */
 +static const struct audio_reg audio_profile0[] = {
 +	{ 0x03, 0xffff }, { 0x04, 0x32c0 }, { 0x05, 0x1800 }, { 0x06, 0x34e8 },
@@ -364,8 +375,8 @@ index d882076..0c0b513 100644
 +	{ 0x60, 0x0f0d }, { 0x61, 0x996c }, { 0x62, 0x4a40 }, { 0x63, 0x6077 },
 +	{ 0x64, 0x0053 }, { 0x65, 0x5ca1 }, { 0x66, 0x40f9 }, { 0x67, 0x508e },
 +	{ 0x68, 0x0048 },
- };
- 
++};
++
 +static struct audio_amp audio_amps[] = {
 +	{ .addr = AUDIO_AMP0_ADDR, .where = "0x34",
 +	  .profile = audio_profile0, .profile_count = AUDIO_ARRAY_SIZE(audio_profile0) },
@@ -381,7 +392,7 @@ index d882076..0c0b513 100644
  static uint64_t audio_timebase_hz;
  
  static void
-@@ -139,17 +272,20 @@ audio_reset_level(vm_offset_t page, int high)
+@@ -139,17 +283,20 @@ audio_reset_level(vm_offset_t page, int high)
  }
  
  static int
@@ -407,7 +418,7 @@ index d882076..0c0b513 100644
  	pins->sda = ml_io_map(AUDIO_TLMM_BASE +
  	    0x1000UL * AUDIO_I2C_SDA_GPIO, AUDIO_TLMM_PAGE_SIZE);
  	pins->scl = ml_io_map(AUDIO_TLMM_BASE +
-@@ -160,7 +296,25 @@ audio_map_pins(struct audio_pins *pins)
+@@ -160,7 +307,25 @@ audio_map_pins(struct audio_pins *pins)
  	    0x1000UL * AUDIO_AMP1_RESET_GPIO, AUDIO_TLMM_PAGE_SIZE);
  	if (pins->sda == 0 || pins->scl == 0 || pins->reset0 == 0 ||
  	    pins->reset1 == 0) {
@@ -434,7 +445,7 @@ index d882076..0c0b513 100644
  		return ENOMEM;
  	}
  	return 0;
-@@ -316,59 +470,99 @@ audio_i2c_read_byte(struct audio_pins *pins, uint8_t *byte, int ack)
+@@ -316,59 +481,99 @@ audio_i2c_read_byte(struct audio_pins *pins, uint8_t *byte, int ack)
  	return 0;
  }
  
@@ -488,7 +499,7 @@ index d882076..0c0b513 100644
 +	if (error == 0) {
 +		*why = "value high NACK";
 +		error = audio_i2c_put(pins, (uint8_t)(value >> 8));
-+	}
+ 	}
 +	if (error == 0) {
 +		*why = "value low NACK";
 +		error = audio_i2c_put(pins, (uint8_t)value);
@@ -499,7 +510,7 @@ index d882076..0c0b513 100644
 +		}
 +		(void)audio_i2c_stop(pins);
 +		return error;
- 	}
++	}
 +	*why = "STOP/bus release failed";
 +	if (audio_i2c_stop(pins) != 0) {
 +		return EIO;
@@ -527,14 +538,14 @@ index d882076..0c0b513 100644
 +		    "bus not idle";
 +		(void)audio_i2c_stop(pins);
 +		return error;
- 	}
--	if (rc != 0) {
++	}
 +	*why = "write-address NACK";
 +	error = audio_i2c_put(pins, (uint8_t)(addr << 1));
 +	if (error == 0) {
 +		*why = "register NACK";
 +		error = audio_i2c_put(pins, reg);
-+	}
+ 	}
+-	if (rc != 0) {
 +	if (error != 0) {
 +		if (error == ETIMEDOUT) {
 +			*why = "clock stretch timeout";
@@ -564,7 +575,7 @@ index d882076..0c0b513 100644
  	*why = "first data byte failed";
  	if (audio_i2c_read_byte(pins, &high, 1) != 0) {
  		goto failed;
-@@ -381,7 +575,7 @@ audio_read_id(struct audio_pins *pins, uint8_t addr, uint16_t *id,
+@@ -381,7 +586,7 @@ audio_read_id(struct audio_pins *pins, uint8_t addr, uint16_t *id,
  	if (audio_i2c_stop(pins) != 0) {
  		goto failed;
  	}
@@ -573,7 +584,7 @@ index d882076..0c0b513 100644
  	return 0;
  
  failed:
-@@ -389,39 +583,633 @@ failed:
+@@ -389,39 +594,709 @@ failed:
  	return EIO;
  }
  
@@ -1084,7 +1095,8 @@ index d882076..0c0b513 100644
 +mondrian_audio_amp_report(const char *when)
 +{
 +	const char *why = "";
-+	uint16_t status = 0, vbat = 0, pvdd = 0;
++	uint16_t status = 0, vbat = 0, pvdd = 0, isndat = 0, vsndat = 0;
++	uint16_t caps = 0;
 +	unsigned i, tries;
 +	int switching;
 +
@@ -1111,10 +1123,71 @@ index d882076..0c0b513 100644
 +		    AUDIO_AW88261_VBAT, &vbat, &why);
 +		(void)audio_read_reg(&audio_bus, a->addr,
 +		    AUDIO_AW88261_PVDD, &pvdd, &why);
++		/*
++		 * Current and voltage sense, plus the received-frame counter:
++		 * a part that renders our samples pulls a different ISNDAT than
++		 * one that only runs its modulator, and a counter that moves
++		 * proves the serializer is receiving frames at all.
++		 */
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_ISNDAT, &isndat, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_VSNDAT, &vsndat, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_I2SCAPCNT, &caps, &why);
 +		audio_log("%s: %s status 0x%04x (%s), vbat 0x%03x (%u mV), "
-+		    "pvdd 0x%03x", when, a->where, status,
++		    "pvdd 0x%03x, isndat 0x%04x, vsndat 0x%04x, "
++		    "i2scapcnt 0x%04x", when, a->where, status,
 +		    switching ? "amplifier switching" :
-+		    "switching bits not set", vbat, vbat * 6025 / 1023, pvdd);
++		    "switching bits not set", vbat, vbat * 6025 / 1023, pvdd,
++		    isndat, vsndat, caps);
++	}
++	mondrian_log_flush_now();
++}
++
++/*
++ * The part's own view of the serial line: I2SINT reports the interface
++ * interrupts (a lost frame or word clock is one of them), DACST and the analog
++ * status words report the modulator state, and I2SCAPCNT counts received
++ * frames. Reading them with the bit clock stopped and again while the graph
++ * runs separates "the part hears frames" from "the part only runs".
++ */
++void
++mondrian_audio_amp_diag(const char *when)
++{
++	const char *why = "";
++	uint16_t sysst = 0, ctrl3 = 0, dacst = 0, i2sint = 0, caps = 0;
++	uint16_t a1 = 0, a2 = 0, a3 = 0, det = 0;
++	unsigned i;
++
++	if (!__atomic_load_n(&audio_amps_prepared, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	for (i = 0; i < AUDIO_ARRAY_SIZE(audio_amps); i++) {
++		struct audio_amp *a = &audio_amps[i];
++
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_SYSST, &sysst, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_I2SCTRL3, &ctrl3, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_DACST, &dacst, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_I2SINT, &i2sint, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_I2SCAPCNT, &caps, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_ANASTA1, &a1, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_ANASTA2, &a2, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_ANASTA3, &a3, &why);
++		(void)audio_read_reg(&audio_bus, a->addr,
++		    AUDIO_AW88261_TESTDET, &det, &why);
++		audio_log("%s: %s sysst 0x%04x i2sctrl3 0x%04x dacst 0x%04x "
++		    "i2sint 0x%04x i2scapcnt 0x%04x anasta "
++		    "0x%04x/0x%04x/0x%04x testdet 0x%04x", when, a->where,
++		    sysst, ctrl3, dacst, i2sint, caps, a1, a2, a3, det);
 +	}
 +	mondrian_log_flush_now();
 +}
@@ -1123,7 +1196,10 @@ index d882076..0c0b513 100644
 + * The pads answer for themselves: a pin muxed to a peripheral function still
 + * reports its level in the TLMM input bit, so this reads SCK, WS and both
 + * DATA lines while the DSP renders periods. Data that never leaves the SoC
-+ * shows up as a constant pad with no edges even though SCK and WS run.
++ * shows up as a constant pad with no edges even though SCK and WS run. The
++ * SCK edges counted between two WS rising edges give the frame width the
++ * interface really emits, which is the only way to tell an applied slot count
++ * from a default one.
 + */
 +void
 +mondrian_audio_sample_pads(const char *when)
@@ -1131,9 +1207,9 @@ index d882076..0c0b513 100644
 +	uint32_t sck_high = 0, ws_high = 0, data_high = 0, edges = 0;
 +	uint32_t data0_high = 0, data0_edges = 0;
 +	uint32_t spksw_high = 0;
-+	uint32_t reads = 0;
++	uint32_t reads = 0, sck_edges = 0, frame_edges = 0, frames = 0;
 +	uint64_t ticks, start;
-+	int last = -1, last0 = -1;
++	int last = -1, last0 = -1, last_ws = -1, last_sck = -1;
 +
 +	if (!__atomic_load_n(&audio_amps_running, __ATOMIC_ACQUIRE) ||
 +	    audio_timebase_hz == 0) {
@@ -1158,14 +1234,25 @@ index d882076..0c0b513 100644
 +		if (last0 >= 0 && data0 != last0) {
 +			data0_edges++;
 +		}
++		if (last_sck >= 0 && sck != last_sck) {
++			sck_edges++;
++		}
++		if (last_ws >= 0 && ws != 0 && last_ws == 0) {
++			frames++;
++			frame_edges += sck_edges;
++			sck_edges = 0;
++		}
 +		last = data;
 +		last0 = data0;
++		last_ws = ws;
++		last_sck = sck;
 +		reads++;
 +	}
 +	audio_log("%s: pads over %u reads: sck high %u, ws high %u, "
 +	    "data1 high %u, data1 edges %u, data0 high %u, data0 edges %u, "
-+	    "spksw high %u", when, reads, sck_high, ws_high, data_high,
-+	    edges, data0_high, data0_edges, spksw_high);
++	    "spksw high %u, bits per frame %u over %u frames", when, reads,
++	    sck_high, ws_high, data_high, edges, data0_high, data0_edges,
++	    spksw_high, frames ? (frame_edges / 2) / frames : 0, frames);
 +	mondrian_log_flush_now();
 +}
 +
@@ -1217,7 +1304,7 @@ index d882076..0c0b513 100644
  	if (error == 0) {
  		answered++;
  		if (id == AUDIO_AW88261_ID) {
-@@ -434,7 +1222,7 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -434,7 +1309,7 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
  	}
  
  	why = "bus not idle";
@@ -1226,7 +1313,7 @@ index d882076..0c0b513 100644
  	if (error == 0) {
  		answered++;
  		if (id == AUDIO_AW88261_ID) {
-@@ -446,14 +1234,42 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -446,14 +1321,42 @@ mondrian_audio_probe_thread(__unused void *arg, __unused wait_result_t wr)
  		audio_log("0x35 read failed: %s", why);
  	}
  
@@ -1277,7 +1364,7 @@ index d882076..0c0b513 100644
  
  done:
  	mondrian_log_flush_now();
-@@ -470,22 +1286,24 @@ mondrian_audio_probe_start(void)
+@@ -470,22 +1373,24 @@ mondrian_audio_probe_start(void)
  	kern_return_t kr;
  	uint32_t enabled = 0;
  
@@ -1305,7 +1392,7 @@ index d882076..0c0b513 100644
  }
  
  #else /* !MONDRIAN */
-@@ -495,4 +1313,27 @@ mondrian_audio_probe_start(void)
+@@ -495,4 +1400,27 @@ mondrian_audio_probe_start(void)
  {
  }
  
