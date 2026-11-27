@@ -1,0 +1,35 @@
+xnu 0501: hand pas the real metadata physical address
+
+pmap_find_phys() returns a ppnum in PAGE_SIZE units (16 KiB here), and
+the ADSP worker shifted it by 12 as if it were a 4 KiB page number, so
+TZ read a buffer 4x below the one holding the ELF header and hash and
+answered init_image with transport 0xffcffff6. Use ptoa_64(), as the GPU
+path does, and clean the whole 16 KiB allocation before the call.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index 501e0c9..86bf9a0 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -564,7 +564,7 @@ adsp_run(void)
+ 	{
+ 		vm_offset_t at;
+ 
+-		for (at = meta_va; at < meta_va + 0x2000; at += 64) {
++		for (at = meta_va; at < meta_va + PAGE_SIZE; at += 64) {
+ 			__asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
+ 		}
+ 		__asm__ volatile("dsb sy" ::: "memory");
+@@ -574,7 +574,13 @@ adsp_run(void)
+ 		adsp_log("metadata has no physical address");
+ 		return;
+ 	}
+-	meta_pa = (uint64_t)pn << 12;
++	/*
++	 * pmap_find_phys() returns a ppnum in PAGE_SIZE (16 KiB) units, not a
++	 * 4 KiB page number: << 12 sends TZ to a different buffer and
++	 * init_image answers with a transport error (measured 2026-11-27,
++	 * 0xffcffff6). ptoa_64() is the conversion the GPU path uses.
++	 */
++	meta_pa = (uint64_t)ptoa_64(pn);
+ 	adsp_log("metadata va=0x%lx pa=0x%llx bytes=%u", (unsigned long)meta_va,
+ 	    (unsigned long long)meta_pa, hdr_size + adsp_phdr[hash].filesz);
+ 
