@@ -25,10 +25,10 @@ index 9b81a3f..e700277 100755
  bsd/dev/mondrian_thermal.c		standard
 diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
 new file mode 100755
-index 0000000..b5604be
+index 0000000..dce0e17
 --- /dev/null
 +++ b/bsd/dev/mondrian_adsp.c
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,698 @@
 +/* SPDX-License-Identifier: APSL-2.0 */
 +/*
 + * MONDRIAN ADSP: boot the phone's adsp.mdt image through PAS1 and read the
@@ -63,6 +63,7 @@ index 0000000..b5604be
 +/* Not exported to the BSD layer. */
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +extern uint64_t ml_get_timebase(void);
 +extern void mondrian_log_flush_now(void);
 +extern int mondrian_root_read(const char *, void *, unsigned, off_t);
