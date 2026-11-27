@@ -1,0 +1,109 @@
+xnu 0490: read the QCA6490 PBL log before the BHI windows
+
+Measured 2026-11-27: 0489 reaches the boot-ROM authentication stage
+(`TCSR_PBL_LOGGING=0xef0a0111`) and the `PBL_BOOTSTRAP_STATUS` read then
+hangs the AHB window before the PBL log SRAM is read. Read the log first,
+drop the two registers that hang, and add the two error-debug words the hang
+had kept out. The same boot dumps the image's ELF header, program headers
+and hash-segment words from host memory, so a wrong or corrupted file names
+itself: the donor `amss20.bin` has `e_entry=0x1436500`, `e_phoff=0x34`,
+`e_phentsize=32` and 17 program headers.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -1264,10 +1264,12 @@
+  * addresses the 7a stock port read in the same windows. All are read-only.
+  *
+  * Read only after the BHI poll: the same windowed read before the doorbell
+- * hung the worker at stage 16 (measured 2026-11-27), as the 7a's pre-BHI
+- * reads do. The WLAON pair is already read by the reset path and goes first;
+- * TCSR_PBL_LOGGING is the decisive stage code. Log every register before the
+- * next read so a hung window names itself.
++ * hung the worker at stage 16 (measured 2026-11-27). The PBL log SRAM goes
++ * first: it is the ROM's own trace of a failed authentication, and the read
++ * that 0489 never reached. PBL_BOOTSTRAP_STATUS and TLMM_OD_EN are left out
++ * because that window hangs the worker (measured 2026-11-27); the remaining
++ * AHB reads are the ones 0489 completed, plus the two error-debug words the
++ * hang had kept out. Log every word before the next read.
+  */
+ static void
+ wifi_pbl_dump(const char *tag, int sram)
+@@ -1281,23 +1283,11 @@
+ 		{ "pbl", 0x1b000f8 },
+ 		{ "secure", 0x1e22b24 },
+ 		{ "boot_cfg", 0x1e22b34 },
+-		{ "bootstrap", 0x1910008 },
+-		{ "od_en", 0x1910020 },
+ 		{ "errdbg2", 0x1e0e238 },
+ 		{ "errdbg3", 0x1e0e23c },
+ 	};
+ 	unsigned i;
+ 
+-	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+-		uint32_t v = 0;
+-		int rc = wifi_ahb_read32(regs[i].off, &v);
+-
+-		wifi_log("W16 %s %s=0x%x rc=%d", tag, regs[i].name, v, rc);
+-		mondrian_log_flush_now();
+-		if (rc != 0) {
+-			break;
+-		}
+-	}
+ 	if (sram != 0) {
+ 		for (i = 0; i < 24; i++) {
+ 			uint32_t v = 0;
+@@ -1310,6 +1300,16 @@
+ 			}
+ 		}
+ 	}
++	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint32_t v = 0;
++		int rc = wifi_ahb_read32(regs[i].off, &v);
++
++		wifi_log("W16 %s %s=0x%x rc=%d", tag, regs[i].name, v, rc);
++		mondrian_log_flush_now();
++		if (rc != 0) {
++			break;
++		}
++	}
+ }
+ 
+ /*
+@@ -1775,6 +1775,36 @@
+         }
+         wifi_log("W6 image sum=0x%x bytes=0x%x", sum, bytes);
+     }
++    if (got > 0x1248) {
++        const uint32_t *img = (const uint32_t *)buf;
++        uint32_t phoff = img[7];
++        uint32_t phentsize = img[10] >> 16;
++        uint32_t phnum = img[11] & 0xffffu;
++        unsigned i;
++
++        wifi_log("W17 elf class=%u data=%u entry=0x%x phoff=0x%x"
++            " phentsize=%u phnum=%u", ((const uint8_t *)buf)[4],
++            ((const uint8_t *)buf)[5], img[6], phoff, phentsize, phnum);
++        if (phentsize >= 32 && phnum != 0 && phnum <= 24 &&
++            phoff >= 0x34 && phoff + phnum * phentsize <= (uint32_t)got) {
++            for (i = 0; i < phnum; i++) {
++                const uint32_t *ph = (const uint32_t *)
++                    ((const uint8_t *)buf + phoff + i * phentsize);
++
++                wifi_log("W17 ph[%u] type=0x%x off=0x%x va=0x%x"
++                    " pa=0x%x filesz=0x%x memsz=0x%x", i, ph[0], ph[1],
++                    ph[2], ph[3], ph[4], ph[5]);
++            }
++        } else {
++            wifi_log("W17 elf header rejected");
++        }
++        wifi_log("W17 hash 0x1000: %08x %08x %08x %08x %08x %08x %08x %08x",
++            img[0x400], img[0x401], img[0x402], img[0x403], img[0x404],
++            img[0x405], img[0x406], img[0x407]);
++        wifi_log("W17 hash 0x1238: %08x %08x %08x %08x", img[0x48e],
++            img[0x48f], img[0x490], img[0x491]);
++        mondrian_log_flush_now();
++    }
+     wifi_flush_va(buf, (vm_size_t)got);
+     {
+         int maparg = 0;
