@@ -1,0 +1,539 @@
+xnu 0504: play one pcm period through the adsp
+
+Port the rest of the zizhan AudioReach builders (BSD-2-Clause-Patent,
+ShengAudioReach.c) into mondrian_audioreach.c and its header: the
+playback stream graph (shared-memory endpoint, decoder and converter,
+linked to the device graph's I2S instance), the PCM output and
+shared-memory media formats, the native memory map and the buffer
+write. The worker then opens and configures both graphs, allocates
+16 KiB of physically contiguous memory, maps it with the donor's
+address form (physical | bit 32), prepares and starts the device graph
+and the stream, and sends one 10 ms period (480 frames of 32-bit
+stereo). It logs the map handle and the write-done address and status,
+stops and closes both graphs and unmaps the buffer.
+
+Measured 2026-11-27: both graphs and all three formats answer status 0,
+but the allocation lands above 4 GiB (pa=0x84a200000), where the map's
+upper word is no longer 1, so the map answers status 1 and the write
+does not run. This unit has no free DRAM page below 4 GiB; the donor
+reaches a high buffer through the apps-SMMU SID 0x1801, which this
+port does not program yet. The AW88261 amplifiers are not programmed
+either, so nothing is audible.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index 0b6098e..b0f8bdc 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -464,9 +464,13 @@ static uint8_t adsp_glink_pkt[GPR_HEADER_BYTES];
+ static uint32_t adsp_glink_pkt_len;
+ static uint64_t adsp_glink_pkt_at;
+ static ArAnswer adsp_ar_answer;
++static int adsp_ar_kind;
+ static uint32_t adsp_ar_wait;
+ static uint32_t adsp_ar_ready;
+ static uint32_t adsp_ar_token = 0x1000u;
++static uint32_t adsp_ar_write;
++static vm_offset_t adsp_pcm_va;
++static uint64_t adsp_pcm_pa;
+ 
+ static uint64_t
+ adsp_now_ms(void)
+@@ -504,6 +508,7 @@ adsp_glink_receive(void *context, QcomGlinkChannel *channel,
+ 	kind = ar_parse(data, length, &answer);
+ 	if (kind > 0 && adsp_ar_wait != 0 && answer.token == adsp_ar_wait) {
+ 		adsp_ar_answer = answer;
++		adsp_ar_kind = kind;
+ 		adsp_ar_ready = 1;
+ 	}
+ 	adsp_log("gpr rx %u -> rc=%d kind=%d token=%u state=%u status=%u "
+@@ -571,37 +576,66 @@ adsp_apm_send(const uint8_t *packet, uint32_t length, uint32_t ms)
+ 	return -1;
+ }
+ 
++static void
++adsp_apm_begin(uint32_t token)
++{
++	adsp_ar_wait = token;
++	adsp_ar_ready = 0;
++	adsp_ar_kind = ArUnknown;
++}
++
++/* Wait for one answer of the given kind. A basic result that refuses the
++ * command fails the wait at once; the donor's map reply is a basic result
++ * first and the handle after, so it cannot be the wanted kind. */
+ static int
+-adsp_apm_wait(uint32_t token, ArAnswer *answer, uint32_t ms)
++adsp_apm_await(uint32_t token, int want, ArAnswer *answer, const char *what)
+ {
+-	uint64_t end = adsp_now_ms() + ms;
++	uint64_t end = adsp_now_ms() + 2000;
+ 
+ 	while (adsp_now_ms() < end) {
+ 		(void)qcom_glink_poll(&adsp_glink);
+ 		if (adsp_ar_ready != 0 && adsp_ar_answer.token == token) {
+-			*answer = adsp_ar_answer;
+-			adsp_ar_wait = 0;
+-			return 0;
++			adsp_ar_ready = 0;
++			if (adsp_ar_kind == want) {
++				*answer = adsp_ar_answer;
++				adsp_ar_wait = 0;
++				return 0;
++			}
++			if (adsp_ar_kind == ArBasicResult &&
++			    adsp_ar_answer.status != 0) {
++				adsp_log("apm %s refused opcode=0x%x status=%u",
++				    what, adsp_ar_answer.result_opcode,
++				    adsp_ar_answer.status);
++				adsp_ar_wait = 0;
++				return -1;
++			}
+ 		}
+ 		delay(1000);
+ 	}
+ 	adsp_ar_wait = 0;
++	adsp_log("apm %s timeout", what);
+ 	return -1;
+ }
+ 
+ static int
+-adsp_apm_exchange(uint8_t *packet, uint32_t length, uint32_t token,
+-    ArAnswer *answer, const char *what)
++adsp_apm_send_token(uint8_t *packet, uint32_t length, uint32_t token,
++    const char *what)
+ {
+-	adsp_ar_wait = token;
+-	adsp_ar_ready = 0;
++	adsp_apm_begin(token);
+ 	if (adsp_apm_send(packet, length, 2000) != 0) {
+ 		adsp_ar_wait = 0;
+ 		adsp_log("apm %s send failed", what);
+ 		return -1;
+ 	}
+-	if (adsp_apm_wait(token, answer, 2000) != 0) {
+-		adsp_log("apm %s timeout", what);
++	return 0;
++}
++
++static int
++adsp_apm_exchange(uint8_t *packet, uint32_t length, uint32_t token,
++    ArAnswer *answer, const char *what)
++{
++	if (adsp_apm_send_token(packet, length, token, what) != 0 ||
++	    adsp_apm_await(token, ArBasicResult, answer, what) != 0) {
+ 		return -1;
+ 	}
+ 	adsp_log("apm %s opcode=0x%x status=%u", what, answer->result_opcode,
+@@ -609,37 +643,233 @@ adsp_apm_exchange(uint8_t *packet, uint32_t length, uint32_t token,
+ 	return answer->status == 0 ? 0 : -1;
+ }
+ 
+-/* Open the speaker device graph, configure the tertiary MI2S endpoint and
+- * close it again: no clock or data leaves the DSP, the answers say whether
+- * the APM accepts the topology and the endpoint parameters. */
++static int
++adsp_apm_map(uint8_t *packet, uint32_t length, uint32_t token,
++    ArAnswer *answer)
++{
++	if (adsp_apm_send_token(packet, length, token, "map") != 0 ||
++	    adsp_apm_await(token, ArMapped, answer, "map") != 0) {
++		return -1;
++	}
++	adsp_log("apm map handle=0x%x", answer->handle);
++	return answer->handle != 0 ? 0 : -1;
++}
++
++static int
++adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
++    ArAnswer *answer)
++{
++	if (adsp_apm_send_token(packet, length, token, "write") != 0 ||
++	    adsp_apm_await(token, ArWriteDone, answer, "write") != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++/* The PCM buffer: 16 KiB of physically contiguous memory, one period is 480
++ * frames of 32-bit stereo (10 ms at 48 kHz). */
++#define ADSP_PCM_BYTES		0x4000u
++#define ADSP_PCM_PERIOD		3840u
++
++/* 1 kHz square at -18 dBFS: (i / 2) is the frame, 48 frames per period. */
++static void
++adsp_pcm_fill(void)
++{
++	int32_t *pcm = (int32_t *)adsp_pcm_va;
++	uint32_t i;
++	vm_offset_t at;
++
++	for (i = 0; i < ADSP_PCM_PERIOD / 4; i++) {
++		pcm[i] = (((i / 2) % 48) < 24) ? 0x10000000 : -0x10000000;
++	}
++	for (at = adsp_pcm_va; at < adsp_pcm_va + ADSP_PCM_BYTES;
++	    at += 64) {
++		__asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Run the whole playback path once: open and configure the device and stream
++ * graphs, map the PCM buffer, prepare and start both graphs, send one period
++ * and report the DSP's write completion. Cleanup releases what was taken. */
+ static void
+ adsp_apm_probe(void)
+ {
+ 	static const ArFormat format = { 48000, 32, 2 };
+ 	uint8_t packet[GPR_MAX_PACKET];
+ 	ArAnswer answer;
+-	uint32_t length, token;
++	uint32_t length, token, handle = 0, write_token;
++	kern_return_t kr;
++	ppnum_t pn;
++	int device_open = 0, stream_open = 0, mapped = 0, started = 0;
+ 
+ 	token = ++adsp_ar_token;
+-	length = ar_open_speaker_device(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
+-	    token);
++	length = ar_open_speaker_device(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token);
+ 	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+ 	    "graph open") != 0) {
+-		return;
++		goto out;
+ 	}
++	device_open = 1;
++
+ 	token = ++adsp_ar_token;
+-	length = ar_config_speaker_device(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
+-	    token, &format);
+-	if (length != 0) {
+-		(void)adsp_apm_exchange(packet, length, token, &answer,
+-		    "speaker config");
++	length = ar_config_speaker_device(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, &format);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "speaker config") != 0) {
++		goto out;
+ 	}
++
++	token = ++adsp_ar_token;
++	length = ar_open_playback_stream(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "stream open") != 0) {
++		goto out;
++	}
++	stream_open = 1;
++
++	token = ++adsp_ar_token;
++	length = ar_config_playback_stream(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, &format);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "stream config") != 0) {
++		goto out;
++	}
++
++	token = ++adsp_ar_token;
++	length = ar_config_playback_shmem(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, &format);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "shmem config") != 0) {
++		goto out;
++	}
++
++	/*
++	 * The map address is `physical | (1 << 32)` and its upper word must be
++	 * exactly 1, so the buffer has to sit in 32-bit memory. The DSP has no
++	 * free DRAM page below 4 GiB on this unit (measured 2026-11-27:
++	 * kmem_alloc_contig scans the page lists and finds 0), so this step is
++	 * the one that still fails: the buffer must go through the apps-SMMU
++	 * SID 0x1801 like the donor, which the port does not program yet.
++	 */
++	kr = kmem_alloc_contig(kernel_map, &adsp_pcm_va, ADSP_PCM_BYTES,
++	    PAGE_SIZE - 1, (ppnum_t)0x3ffff, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		adsp_log("pcm allocation failed kr=0x%x", kr);
++		goto out;
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)adsp_pcm_va);
++	if (pn == 0) {
++		adsp_log("pcm has no physical address");
++		goto out;
++	}
++	adsp_pcm_pa = (uint64_t)ptoa_64(pn);
++	if (adsp_pcm_pa + ADSP_PCM_BYTES > 0x100000000ull) {
++		adsp_log("pcm pa=0x%llx above 4 GiB",
++		    (unsigned long long)adsp_pcm_pa);
++		goto out;
++	}
++	adsp_pcm_fill();
++	adsp_log("pcm va=0x%lx pa=0x%llx bytes=%u",
++	    (unsigned long)adsp_pcm_va, (unsigned long long)adsp_pcm_pa,
++	    ADSP_PCM_BYTES);
++
++	token = ++adsp_ar_token;
++	length = ar_map(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
++	    token, adsp_pcm_pa | (1ull << 32), ADSP_PCM_BYTES);
++	if (length == 0 || adsp_apm_map(packet, length, token, &answer) != 0) {
++		goto out;
++	}
++	handle = answer.handle;
++	mapped = 1;
++
+ 	token = ++adsp_ar_token;
+-	length = ar_graph_command(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT, token,
+-	    AR_OP_GRAPH_CLOSE, AR_SG_SPEAKER);
+-	if (length != 0) {
+-		(void)adsp_apm_exchange(packet, length, token, &answer,
+-		    "graph close");
++	length = ar_graph_command(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE, AR_SG_SPEAKER);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "prepare speaker") != 0) {
++		goto out;
++	}
++
++	token = ++adsp_ar_token;
++	length = ar_graph_command(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE, AR_SG_PLAY);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "prepare play") != 0) {
++		goto out;
++	}
++
++	token = ++adsp_ar_token;
++	length = ar_graph_command(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_START, AR_SG_SPEAKER);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "start speaker") != 0) {
++		goto out;
++	}
++
++	token = ++adsp_ar_token;
++	length = ar_graph_command(packet, (uint32_t)sizeof packet,
++	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_START, AR_SG_PLAY);
++	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	    "start play") != 0) {
++		goto out;
++	}
++	started = 1;
++
++	write_token = 0x10000000u | (++adsp_ar_write & 0x0fffffffu);
++	length = ar_write(packet, (uint32_t)sizeof packet, ADSP_GLINK_PORT,
++	    write_token, adsp_pcm_pa | (1ull << 32), handle, ADSP_PCM_PERIOD);
++	if (length != 0 &&
++	    adsp_apm_write(packet, length, write_token, &answer) == 0) {
++		adsp_log("apm write done address=0x%llx status=%u",
++		    (unsigned long long)answer.address, answer.status);
++	}
++
++out:
++	if (started) {
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_STOP, AR_SG_PLAY);
++		if (length != 0) {
++			(void)adsp_apm_exchange(packet, length, token, &answer,
++			    "stop play");
++		}
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_STOP, AR_SG_SPEAKER);
++		if (length != 0) {
++			(void)adsp_apm_exchange(packet, length, token, &answer,
++			    "stop speaker");
++		}
++	}
++	if (stream_open) {
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_CLOSE, AR_SG_PLAY);
++		if (length != 0) {
++			(void)adsp_apm_exchange(packet, length, token, &answer,
++			    "close play");
++		}
++	}
++	if (device_open) {
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_CLOSE, AR_SG_SPEAKER);
++		if (length != 0) {
++			(void)adsp_apm_exchange(packet, length, token, &answer,
++			    "close speaker");
++		}
++	}
++	if (mapped) {
++		token = ++adsp_ar_token;
++		length = ar_unmap(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, handle);
++		if (length != 0) {
++			(void)adsp_apm_exchange(packet, length, token, &answer,
++			    "unmap");
++		}
+ 	}
+ }
+ 
+diff --git a/bsd/dev/mondrian_audioreach.c b/bsd/dev/mondrian_audioreach.c
+index 783549d..8735958 100644
+--- a/bsd/dev/mondrian_audioreach.c
++++ b/bsd/dev/mondrian_audioreach.c
+@@ -15,9 +15,12 @@
+ #define PARAM_MODULE_PROP 0x08001003u
+ #define PARAM_MODULE_CONN 0x08001004u
+ #define PARAM_SG_LIST 0x08001005u
++#define PARAM_PCM_OUTPUT 0x08001008u
++#define PARAM_MEDIA_FORMAT 0x0800100Cu
+ #define PARAM_HW_EP_MF 0x08001017u
+ #define PARAM_FRAME_SIZE_FACTOR 0x08001018u
+ #define PARAM_I2S_INTF 0x08001019u
++#define MEDIA_PCM 0x09001000u
+ #define PROP_SG_PERF 0x0800100Eu
+ #define PROP_SG_DIRECTION 0x0800100Fu
+ #define PROP_SG_SCENARIO 0x08001010u
+@@ -29,12 +32,15 @@
+ #define CONTAINER_GC 0x0B001001u
+ #define PERF_LOW_LATENCY 2u
+ #define DIR_TX 1u
++#define DIR_RX 2u
+ #define SCENARIO_PLAYBACK 1u
+ #define POS_STREAM 1u
+ #define DOMAIN_ADSP 2u
+ #define STACK 8192u
+ #define OUT_PORT 1u
+ #define IN_PORT 2u
++#define INTERLEAVED 1u
++#define DEINTERLEAVED_UNPACKED 3u
+ 
+ typedef struct {uint8_t *p; uint32_t n, cap; int bad;} W;
+ 
+@@ -120,6 +126,19 @@ uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port,
+     return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
+ }
+ 
++/* The shared-memory endpoint and the converter end in the device graph's I2S
++ * instance: the stream graph only carries the data up to 0x6051. */
++uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
++    static const Container c = {AR_SG_PLAY, POS_STREAM};
++    static const Module m[] = {{AR_MOD_WR_SHMEM, AR_IID_PLAY_SHMEM, 0, 1}, {AR_MOD_PCM_DEC, AR_IID_PLAY_DEC, 1, 1},
++                               {AR_MOD_PCM_CNV, AR_IID_PLAY_CNV, 1, 1}};
++    static const Link l[] = {{AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC}, {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV},
++                             {AR_IID_PLAY_CNV, AR_IID_SPEAKER_I2S}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
++}
++
+ static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)
+ {
+     const uint32_t at = param_begin(w, iid, PARAM_HW_EP_MF);
+@@ -143,6 +162,47 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
+     return finish(&w);
+ }
+ 
++static void channel_map(W *w, unsigned channels) {for (unsigned i = 0; i < channels; ++i) put8(w, i + 1);}   /* FL = 1, FR = 2 */
++
++/* PCM output format of a decoder, converter or encoder. */
++static void pcm_output(W *w, uint32_t iid, const ArFormat *f, uint32_t interleaving)
++{
++    const uint32_t at = param_begin(w, iid, PARAM_PCM_OUTPUT);
++    put32(w, 1); put32(w, MEDIA_PCM); put32(w, (16u + f->channels + 3u) & ~3u);
++    put16(w, f->bits); put16(w, 1); put16(w, f->bits); put16(w, f->bits - 1u); put16(w, 1); put16(w, interleaving); put16(w, 0);
++    put16(w, f->channels);
++    channel_map(w, f->channels);
++    param_end(w, at);
++}
++
++uint32_t ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const ArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    pcm_output(&w, AR_IID_PLAY_DEC, f, INTERLEAVED);
++    pcm_output(&w, AR_IID_PLAY_CNV, f, DEINTERLEAVED_UNPACKED);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++/* The input media format of the playback shared memory endpoint, sent to the endpoint itself. */
++uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const ArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_IID_PLAY_SHMEM, token, AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, AR_IID_PLAY_SHMEM, PARAM_MEDIA_FORMAT);
++    const uint32_t body = align8(12u + 16u + f->channels);
++    put32(&w, 1); put32(&w, MEDIA_PCM); put32(&w, body + PARAM_HEADER - 12u);
++    put32(&w, f->rate); put16(&w, f->bits); put16(&w, 1); put16(&w, f->bits); put16(&w, f->bits - 1u); put16(&w, 1);
++    put16(&w, f->channels);
++    channel_map(&w, f->channels);
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
+ uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, uint32_t sg)
+ {
+     W w;
+@@ -155,6 +215,36 @@ uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32
+     return finish(&w);
+ }
+ 
++/* As the DSP's own client builds it: the region follows the GPR header directly; the command header space trails the packet. */
++uint32_t ar_map(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t bytes)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_MEM_MAP);
++    put16(&w, 3); put16(&w, 1); put32(&w, 0);                      /* shared 8-byte-aligned 4 KiB pool, one region, no flags */
++    put32(&w, (uint32_t)address); put32(&w, (uint32_t)(address >> 32)); put32(&w, (bytes + 4095u) & ~4095u);
++    pad_to(&w, w.n + CMD_HEADER);
++    return finish(&w);
++}
++
++uint32_t ar_unmap(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t handle)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_MEM_UNMAP);
++    put32(&w, handle);
++    pad_to(&w, w.n + CMD_HEADER);
++    return finish(&w);
++}
++
++uint32_t ar_write(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes)
++{
++    W w;
++    begin(&w, out, capacity, port, AR_IID_PLAY_SHMEM, token, AR_OP_WRITE);
++    put32(&w, (uint32_t)address); put32(&w, (uint32_t)(address >> 32)); put32(&w, handle); put32(&w, bytes);
++    put32(&w, 0); put32(&w, 0); put32(&w, 0);                      /* no time stamp, no flags */
++    put32(&w, 0); put32(&w, 0); put32(&w, 0); put32(&w, 0);         /* no metadata */
++    return finish(&w);
++}
++
+ int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *a)
+ {
+     GprPacket p;
+diff --git a/bsd/dev/mondrian_audioreach.h b/bsd/dev/mondrian_audioreach.h
+index 314b5cd..d82f215 100644
+--- a/bsd/dev/mondrian_audioreach.h
++++ b/bsd/dev/mondrian_audioreach.h
+@@ -80,8 +80,20 @@ uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token);
+ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token, const ArFormat *format);
++uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token);
++uint32_t ar_config_playback_stream(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token, const ArFormat *format);
++uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token, const ArFormat *format);
+ uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port,
+     uint32_t token, uint32_t opcode, uint32_t sg);
++uint32_t ar_map(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token, uint64_t address, uint32_t bytes);
++uint32_t ar_unmap(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token, uint32_t handle);
++uint32_t ar_write(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes);
+ int ar_parse(const uint8_t *in, uint32_t length, ArAnswer *answer);
+ 
+ #endif
