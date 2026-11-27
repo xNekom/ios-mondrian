@@ -1,0 +1,531 @@
+xnu 0507: drive the speaker pair through the TDM sink
+
+The live tree's active pad group is `tert_tdm_pinctrl` (`status = "ok"`): sck
+gpio121, ws gpio123 and dout **gpio124** (`mi2s2_data1`), 8 mA with a
+pull-down on dout. `tert_mi2s_pinctrl` with gpio122 (`mi2s2_data0`) is
+disabled; gpio122 is the TDM din/capture line. The two `aw882xx_smartpa`
+nodes are `sound-channel` 0 and 1 on the single dout line.
+
+The I2S sink module (0x0700100A, SD1 = 2, internal word select) and the TDM
+sink (0x0700100E) both clock the pads: SCK and WS read 50 % over the sample
+window. The dout stays at 0.3-1.2 % high, the signature of coupling on a line
+that carries digital silence, not the +1/-1 fill. Every graph command answers
+status 0. Earlier comparisons of the decoder chain and of one graph versus two
+were sampled on gpio122 before the live tree showed the pair sits on gpio124,
+so they proved nothing about those layouts.
+
+The graph now uses the AudioReach TDM sink on the tertiary interface,
+configured from the live `tert_tdm_rx` node and the public PCM TDM API:
+
+- 0x0800101B: lpaif 0, interface 2 (tertiary), internal sync, data output
+  enabled, slot mask 3 (slots 0 and 1), 2 slots of 32 bits, long sync,
+  inverted sync, one BCK of data delay.
+- 0x0800106A: lane mask 2 (lane 1, gpio124).
+
+The PCM ring is eight exact periods (480 frames of 32-bit stereo, 30720
+bytes). It is filled with the one-LSB sign square and written slot by slot,
+each write naming its own offset after the start, and every completion reports
+its own address. A 16 KiB ring is 4.27 periods, and a single write after the
+start leaves the endpoint without the lead of queued periods it renders from;
+the donor maps eight slots and queues four right after the start.
+
+The topology is the donor's: the device graph holds only the endpoint, the
+stream graph holds `WR_SHARED_MEM_EP -> PCM decoder -> PCM converter` and ends
+in the device graph's instance, and both graphs are opened before the link is
+resolved. PREPARE, START, STOP and CLOSE are sent once per subgraph. One
+command carrying both ids is accepted, so a list that only applied its first
+entry would leave exactly this symptom: the endpoint clocks while the stream
+idles.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index c3c9319..07aed4c 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -673,15 +673,18 @@ adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
+ 	return 0;
+ }
+ 
+-/* The PCM buffer: 16 KiB of physically contiguous memory, one period is 480
+- * frames of 32-bit stereo (10 ms at 48 kHz). */
+-#define ADSP_PCM_BYTES		0x4000u
++/* The PCM ring is a whole number of periods: eight slots of 480 frames of
++ * 32-bit stereo (10 ms at 48 kHz), 30720 bytes. A ring that is not a multiple
++ * of the period cannot be written slot by slot, and the endpoint needs a lead
++ * of queued periods before the sink starts rendering (the donor queues four
++ * slots right after the start and maps eight). */
+ #define ADSP_PCM_PERIOD		3840u
++#define ADSP_PCM_BYTES		(ADSP_PCM_PERIOD * 8u)
+ 
+ /*
+  * 1 kHz sign square at one LSB: (i / 2) is the frame, 48 frames per period.
+  * +1 is 0x00000001 and -1 is 0xffffffff, so the negative half sets every bit.
+- * That makes the pattern visible on DATA0 whatever width or alignment the
++ * That makes the pattern visible on DATA1 whatever width or alignment the
+  * LPAIF transmits (a -18 dBFS square only sets bit 28 and vanishes if the
+  * interface sends the low 24 bits), and one LSB is inaudible on the speaker.
+  */
+@@ -692,7 +695,7 @@ adsp_pcm_fill(void)
+ 	uint32_t i;
+ 	vm_offset_t at;
+ 
+-	for (i = 0; i < ADSP_PCM_PERIOD / 4; i++) {
++	for (i = 0; i < ADSP_PCM_BYTES / 4; i++) {
+ 		pcm[i] = (((i / 2) % 48) < 24) ? 1 : -1;
+ 	}
+ 	for (at = adsp_pcm_va; at < adsp_pcm_va + ADSP_PCM_BYTES;
+@@ -703,29 +706,41 @@ adsp_pcm_fill(void)
+ }
+ 
+ /* Run the whole playback path once: open and configure the device and stream
+- * graphs, map the PCM buffer, prepare and start both graphs, send one period
+- * and report the DSP's write completion. Cleanup releases what was taken. */
++ * graphs, map the PCM ring, prepare and start both graphs, fill every ring
++ * slot and report the DSP's write completions. Cleanup releases what was
++ * taken. */
+ static void
+ adsp_apm_probe(void)
+ {
+ 	static const ArFormat format = { 48000, 32, 2 };
++	static const uint32_t graph_sgs[] = { AR_SG_SPEAKER, AR_SG_PLAY };
++	const unsigned graph_sg_count = 2;
+ 	uint8_t packet[GPR_MAX_PACKET];
+ 	ArAnswer answer;
+ 	uint32_t length, token, handle = 0, write_token, round;
+ 	kern_return_t kr;
+ 	ppnum_t pn;
+ 	uint64_t pcm_iova = 0;
+-	int device_open = 0, stream_open = 0, mapped = 0, started = 0;
++	int opened = 0, mapped = 0, started = 0;
+ 	int amps = 0, amp_error;
+ 
++	/*
++	 * The donor's order: open the device graph and configure the
++	 * endpoint, then open the stream graph whose last connection names
++	 * that endpoint instance, and configure its modules.
++	 */
+ 	token = ++adsp_ar_token;
+ 	length = ar_open_speaker_device(packet, (uint32_t)sizeof packet,
+ 	    ADSP_GLINK_PORT, token);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+-	    "graph open") != 0) {
++	if (length == 0) {
++		adsp_log("device open packet did not fit");
+ 		goto out;
+ 	}
+-	device_open = 1;
++	if (adsp_apm_exchange(packet, length, token, &answer,
++	    "device open") != 0) {
++		goto out;
++	}
++	opened = 1;
+ 
+ 	token = ++adsp_ar_token;
+ 	length = ar_config_speaker_device(packet, (uint32_t)sizeof packet,
+@@ -738,11 +753,14 @@ adsp_apm_probe(void)
+ 	token = ++adsp_ar_token;
+ 	length = ar_open_playback_stream(packet, (uint32_t)sizeof packet,
+ 	    ADSP_GLINK_PORT, token);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
++	if (length == 0) {
++		adsp_log("stream open packet did not fit");
++		goto out;
++	}
++	if (adsp_apm_exchange(packet, length, token, &answer,
+ 	    "stream open") != 0) {
+ 		goto out;
+ 	}
+-	stream_open = 1;
+ 
+ 	token = ++adsp_ar_token;
+ 	length = ar_config_playback_stream(packet, (uint32_t)sizeof packet,
+@@ -798,36 +816,26 @@ adsp_apm_probe(void)
+ 	handle = answer.handle;
+ 	mapped = 1;
+ 
+-	token = ++adsp_ar_token;
+-	length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE, AR_SG_SPEAKER);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+-	    "prepare speaker") != 0) {
+-		goto out;
+-	}
+-
+-	token = ++adsp_ar_token;
+-	length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE, AR_SG_PLAY);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+-	    "prepare play") != 0) {
+-		goto out;
+-	}
+-
+-	token = ++adsp_ar_token;
+-	length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_START, AR_SG_SPEAKER);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+-	    "start speaker") != 0) {
+-		goto out;
++	for (unsigned i = 0; i < graph_sg_count; i++) {
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_PREPARE,
++		    &graph_sgs[i], 1);
++		if (length == 0 || adsp_apm_exchange(packet, length, token,
++		    &answer, "prepare graph") != 0) {
++			goto out;
++		}
+ 	}
+ 
+-	token = ++adsp_ar_token;
+-	length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-	    ADSP_GLINK_PORT, token, AR_OP_GRAPH_START, AR_SG_PLAY);
+-	if (length == 0 || adsp_apm_exchange(packet, length, token, &answer,
+-	    "start play") != 0) {
+-		goto out;
++	for (unsigned i = 0; i < graph_sg_count; i++) {
++		token = ++adsp_ar_token;
++		length = ar_graph_command(packet, (uint32_t)sizeof packet,
++		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_START,
++		    &graph_sgs[i], 1);
++		if (length == 0 || adsp_apm_exchange(packet, length, token,
++		    &answer, "start graph") != 0) {
++			goto out;
++		}
+ 	}
+ 	started = 1;
+ 
+@@ -846,46 +854,33 @@ adsp_apm_probe(void)
+ 	}
+ 
+ 	/*
+-	 * Eight 10 ms periods, not one: the class-D only reports SWS/BSTS
+-	 * once it has real audio to switch, and the last period is still
+-	 * playing while the report below reads the status.
++	 * Fill the whole ring, one period per slot, before listening. The
++	 * shared-memory endpoint only starts rendering once it holds a lead of
++	 * real periods; a single 10 ms write after the start is consumed and
++	 * the sink runs dry before the pads are read. Every write names its
++	 * own offset, so the completion addresses must differ per slot.
+ 	 */
+-	for (round = 0; round < 8; round++) {
++	for (round = 0; round < ADSP_PCM_BYTES / ADSP_PCM_PERIOD; round++) {
+ 		write_token = 0x10000000u |
+ 		    (++adsp_ar_write & 0x0fffffffu);
+ 		length = ar_write(packet, (uint32_t)sizeof packet,
+-		    ADSP_GLINK_PORT, write_token, pcm_iova | (1ull << 32),
+-		    handle, ADSP_PCM_PERIOD);
++		    ADSP_GLINK_PORT, write_token, (pcm_iova | (1ull << 32)) +
++		    (uint64_t)round * ADSP_PCM_PERIOD, handle,
++		    ADSP_PCM_PERIOD);
+ 		if (length == 0) {
+ 			adsp_log("apm write %u could not be built", round);
+ 			break;
+ 		}
+-		/*
+-		 * The first period is measured while it renders: the write is
+-		 * sent, the pads and SYSST are read during the period, and only
+-		 * then is the write-done answer collected.
+-		 */
+-		if (round == 0) {
+-			if (adsp_apm_send_token(packet, length, write_token,
+-			    "write") != 0) {
+-				adsp_log("apm write 0 send failed");
+-				break;
+-			}
+-			mondrian_audio_sample_pads("first period");
+-			mondrian_audio_amp_report("first period");
+-			if (adsp_apm_await(write_token, ArWriteDone, &answer,
+-			    "write") != 0) {
+-				adsp_log("apm write 0 failed");
+-				break;
+-			}
+-			adsp_log("apm write done address=0x%llx status=%u",
+-			    (unsigned long long)answer.address,
+-			    answer.status);
+-		} else if (adsp_apm_write(packet, length, write_token,
+-		    &answer) != 0) {
++		if (adsp_apm_write(packet, length, write_token, &answer) != 0) {
+ 			adsp_log("apm write %u failed", round);
+ 			break;
+ 		}
++		adsp_log("apm write %u done address=0x%llx status=%u", round,
++		    (unsigned long long)answer.address, answer.status);
++	}
++	if (round == ADSP_PCM_BYTES / ADSP_PCM_PERIOD) {
++		mondrian_audio_sample_pads("ring playing");
++		mondrian_audio_amp_report("ring playing");
+ 	}
+ 	if (amps) {
+ 		mondrian_audio_amp_report("after periods");
+@@ -899,37 +894,27 @@ out:
+ 		amps = 0;
+ 	}
+ 	if (started) {
+-		token = ++adsp_ar_token;
+-		length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_STOP, AR_SG_PLAY);
+-		if (length != 0) {
+-			(void)adsp_apm_exchange(packet, length, token, &answer,
+-			    "stop play");
+-		}
+-		token = ++adsp_ar_token;
+-		length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_STOP, AR_SG_SPEAKER);
+-		if (length != 0) {
+-			(void)adsp_apm_exchange(packet, length, token, &answer,
+-			    "stop speaker");
+-		}
+-	}
+-	if (stream_open) {
+-		token = ++adsp_ar_token;
+-		length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_CLOSE, AR_SG_PLAY);
+-		if (length != 0) {
+-			(void)adsp_apm_exchange(packet, length, token, &answer,
+-			    "close play");
++		for (unsigned i = graph_sg_count; i-- > 0;) {
++			token = ++adsp_ar_token;
++			length = ar_graph_command(packet, (uint32_t)sizeof packet,
++			    ADSP_GLINK_PORT, token, AR_OP_GRAPH_STOP,
++			    &graph_sgs[i], 1);
++			if (length != 0) {
++				(void)adsp_apm_exchange(packet, length, token,
++				    &answer, "stop graph");
++			}
+ 		}
+ 	}
+-	if (device_open) {
+-		token = ++adsp_ar_token;
+-		length = ar_graph_command(packet, (uint32_t)sizeof packet,
+-		    ADSP_GLINK_PORT, token, AR_OP_GRAPH_CLOSE, AR_SG_SPEAKER);
+-		if (length != 0) {
+-			(void)adsp_apm_exchange(packet, length, token, &answer,
+-			    "close speaker");
++	if (opened) {
++		for (unsigned i = graph_sg_count; i-- > 0;) {
++			token = ++adsp_ar_token;
++			length = ar_graph_command(packet, (uint32_t)sizeof packet,
++			    ADSP_GLINK_PORT, token, AR_OP_GRAPH_CLOSE,
++			    &graph_sgs[i], 1);
++			if (length != 0) {
++				(void)adsp_apm_exchange(packet, length, token,
++				    &answer, "close graph");
++			}
+ 		}
+ 	}
+ 	if (mapped) {
+diff --git a/bsd/dev/mondrian_audioreach.c b/bsd/dev/mondrian_audioreach.c
+index 8735958..9c60f84 100644
+--- a/bsd/dev/mondrian_audioreach.c
++++ b/bsd/dev/mondrian_audioreach.c
+@@ -20,6 +20,8 @@
+ #define PARAM_HW_EP_MF 0x08001017u
+ #define PARAM_FRAME_SIZE_FACTOR 0x08001018u
+ #define PARAM_I2S_INTF 0x08001019u
++#define PARAM_TDM_INTF 0x0800101Bu
++#define PARAM_TDM_LANE 0x0800106Au
+ #define MEDIA_PCM 0x09001000u
+ #define PROP_SG_PERF 0x0800100Eu
+ #define PROP_SG_DIRECTION 0x0800100Fu
+@@ -77,9 +79,16 @@ typedef struct {uint32_t id, position;} Container;
+ typedef struct {uint32_t module, iid, inputs, outputs;} Module;
+ typedef struct {uint32_t from, to;} Link;
+ 
+-/* One subgraph with one container (all the board topology uses). */
+-static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const Sg *sg, const Container *c,
+-                           const Module *m, unsigned modules, const Link *l, unsigned links)
++/*
++ * One GRAPH_OPEN per subgraph, as the donor does: the device graph carries
++ * only the hardware endpoint, and the stream graph's last connection names
++ * that endpoint's instance. The connection list is graph-scoped, so the
++ * stream graph can only reach a sink whose graph is already open.
++ */
++static uint32_t
++graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token,
++    const Sg *sg, const Container *c, const Module *m, unsigned modules,
++    const Link *links, unsigned link_count)
+ {
+     W w;
+     begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_GRAPH_OPEN);
+@@ -102,41 +111,60 @@ static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint3
+     at = param_begin(&w, AR_APM_IID, PARAM_MODULE_LIST);
+     put32(&w, 1);
+     put32(&w, sg->id); put32(&w, c->id); put32(&w, modules);
+-    for (unsigned i = 0; i < modules; ++i) {put32(&w, m[i].module); put32(&w, m[i].iid);}
++    for (unsigned i = 0; i < modules; ++i) {
++        put32(&w, m[i].module); put32(&w, m[i].iid);
++    }
+     param_end(&w, at);
+     at = param_begin(&w, AR_APM_IID, PARAM_MODULE_PROP);
+     put32(&w, modules);
+     for (unsigned i = 0; i < modules; ++i) {
+-        put32(&w, m[i].iid); put32(&w, 1); put32(&w, PROP_PORT_INFO); put32(&w, 8); put32(&w, m[i].inputs); put32(&w, m[i].outputs);
++        put32(&w, m[i].iid); put32(&w, 1); put32(&w, PROP_PORT_INFO); put32(&w, 8);
++        put32(&w, m[i].inputs); put32(&w, m[i].outputs);
+     }
+     param_end(&w, at);
+     at = param_begin(&w, AR_APM_IID, PARAM_MODULE_CONN);
+-    put32(&w, links);
+-    for (unsigned i = 0; i < links; ++i) {put32(&w, l[i].from); put32(&w, OUT_PORT); put32(&w, l[i].to); put32(&w, IN_PORT);}
++    put32(&w, link_count);
++    for (unsigned i = 0; i < link_count; ++i) {
++        put32(&w, links[i].from); put32(&w, OUT_PORT);
++        put32(&w, links[i].to); put32(&w, IN_PORT);
++    }
+     param_end(&w, at);
+     cmd_payload_end(&w, cmd);
+     return finish(&w);
+ }
+ 
+-uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++/* The device graph: the TDM endpoint alone, no connections. */
++uint32_t
++ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token)
+ {
+-    static const Sg sg = {AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK};
++    static const Sg sg = {
++        AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK
++    };
+     static const Container c = {AR_SG_SPEAKER, POS_STREAM};
+-    static const Module m[] = {{AR_MOD_I2S_SINK, AR_IID_SPEAKER_I2S, 1, 0}};
++    static const Module m[] = {{AR_MOD_TDM_SINK, AR_IID_SPEAKER_I2S, 1, 0}};
+     return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
+ }
+ 
+-/* The shared-memory endpoint and the converter end in the device graph's I2S
+- * instance: the stream graph only carries the data up to 0x6051. */
+-uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++/* The stream graph: shmem -> decoder -> converter, ending in the device
++ * graph's sink instance. */
++uint32_t
++ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port,
++    uint32_t token)
+ {
+     static const Sg sg = {AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
+     static const Container c = {AR_SG_PLAY, POS_STREAM};
+-    static const Module m[] = {{AR_MOD_WR_SHMEM, AR_IID_PLAY_SHMEM, 0, 1}, {AR_MOD_PCM_DEC, AR_IID_PLAY_DEC, 1, 1},
+-                               {AR_MOD_PCM_CNV, AR_IID_PLAY_CNV, 1, 1}};
+-    static const Link l[] = {{AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC}, {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV},
+-                             {AR_IID_PLAY_CNV, AR_IID_SPEAKER_I2S}};
+-    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
++    static const Module m[] = {
++        {AR_MOD_WR_SHMEM, AR_IID_PLAY_SHMEM, 0, 1},
++        {AR_MOD_PCM_DEC, AR_IID_PLAY_DEC, 1, 1},
++        {AR_MOD_PCM_CNV, AR_IID_PLAY_CNV, 1, 1},
++    };
++    static const Link links[] = {
++        {AR_IID_PLAY_SHMEM, AR_IID_PLAY_DEC},
++        {AR_IID_PLAY_DEC, AR_IID_PLAY_CNV},
++        {AR_IID_PLAY_CNV, AR_IID_SPEAKER_I2S},
++    };
++    return graph_open(out, capacity, port, token, &sg, &c, m, 3, links, 3);
+ }
+ 
+ static void hw_ep_mf(W *w, uint32_t iid, const ArFormat *f)
+@@ -151,8 +179,21 @@ uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port
+     W w;
+     begin(&w, out, capacity, port, AR_APM_IID, token, AR_OP_SET_CFG);
+     const uint32_t cmd = cmd_payload_start(&w);
+-    const uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_I2S_INTF);
+-    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY); put16(&w, AR_I2S_SD0); put16(&w, AR_WS_INTERNAL);
++    /*
++     * The live tree's tert_tdm_rx node asks for internal sync (sync-src 1),
++     * long sync (sync-mode 1), inverted sync (invert-sync 1), one BCLK of
++     * data delay and 32-bit slots. The pair is stereo on one dout line, so
++     * two slots (mask 3) and lane 1 (mask 2, gpio124) are active.
++     */
++    uint32_t at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_TDM_INTF);
++    put32(&w, AR_LPAIF); put32(&w, AR_I2S_TERTIARY);
++    put16(&w, 1); put16(&w, 1);
++    put32(&w, 3);
++    put16(&w, 2); put16(&w, 32);
++    put16(&w, 1); put16(&w, 1); put16(&w, 1); put16(&w, 0);
++    param_end(&w, at);
++    at = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_TDM_LANE);
++    put16(&w, 2); put16(&w, 0);
+     param_end(&w, at);
+     hw_ep_mf(&w, AR_IID_SPEAKER_I2S, f);
+     const uint32_t fs = param_begin(&w, AR_IID_SPEAKER_I2S, PARAM_FRAME_SIZE_FACTOR);
+@@ -203,13 +244,16 @@ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port
+     return finish(&w);
+ }
+ 
+-uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, uint32_t sg)
++/* The command takes every subgraph of the graph: prepare, start, stop and
++ * close act on the list, and both halves must move together. */
++uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, const uint32_t *sgs, unsigned count)
+ {
+     W w;
+     begin(&w, out, capacity, port, AR_APM_IID, token, opcode);
+     const uint32_t cmd = cmd_payload_start(&w);
+     const uint32_t at = param_begin(&w, AR_APM_IID, PARAM_SG_LIST);
+-    put32(&w, 1); put32(&w, sg);
++    put32(&w, count);
++    for (unsigned i = 0; i < count; ++i) put32(&w, sgs[i]);
+     param_end(&w, at);
+     cmd_payload_end(&w, cmd);
+     return finish(&w);
+diff --git a/bsd/dev/mondrian_audioreach.h b/bsd/dev/mondrian_audioreach.h
+index d82f215..10be692 100644
+--- a/bsd/dev/mondrian_audioreach.h
++++ b/bsd/dev/mondrian_audioreach.h
+@@ -35,6 +35,7 @@
+ #define AR_MOD_PCM_ENC 0x07001004u
+ #define AR_MOD_PCM_DEC 0x07001005u
+ #define AR_MOD_I2S_SINK 0x0700100Au
++#define AR_MOD_TDM_SINK 0x0700100Eu
+ #define AR_MOD_CODEC_DMA_SOURCE 0x07001024u
+ 
+ #define AR_SG_PLAY 0x4001u
+@@ -50,11 +51,11 @@
+ #define AR_IID_CAP_ENC 0x6023u
+ #define AR_IID_CAP_SHMEM 0x6024u
+ 
+-/* The hardware endpoint: mondrian drives both AW88261 amplifiers from the
+- * tertiary MI2S on SD0 (live device tree pinctrl), so the lane mask is SD0. */
++/* The hardware endpoint: the live tree's active tert_tdm_pinctrl drives the
++ * AW88261 pair from gpio124 (mi2s2_data1), so the TDM lane mask is 2. */
+ #define AR_LPAIF 0u
+ #define AR_I2S_TERTIARY 2u
+-#define AR_I2S_SD0 1u
++#define AR_I2S_SD1 2u
+ #define AR_WS_INTERNAL 1u
+ 
+ typedef struct {
+@@ -78,16 +79,16 @@ enum {
+ 
+ uint32_t ar_open_speaker_device(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token);
+-uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity,
+-    uint32_t port, uint32_t token, const ArFormat *format);
+ uint32_t ar_open_playback_stream(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token);
++uint32_t ar_config_speaker_device(uint8_t *out, uint32_t capacity,
++    uint32_t port, uint32_t token, const ArFormat *format);
+ uint32_t ar_config_playback_stream(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token, const ArFormat *format);
+ uint32_t ar_config_playback_shmem(uint8_t *out, uint32_t capacity,
+     uint32_t port, uint32_t token, const ArFormat *format);
+ uint32_t ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port,
+-    uint32_t token, uint32_t opcode, uint32_t sg);
++    uint32_t token, uint32_t opcode, const uint32_t *sgs, unsigned count);
+ uint32_t ar_map(uint8_t *out, uint32_t capacity, uint32_t port,
+     uint32_t token, uint64_t address, uint32_t bytes);
+ uint32_t ar_unmap(uint8_t *out, uint32_t capacity, uint32_t port,
+diff --git a/bsd/dev/mondrian_gpr.h b/bsd/dev/mondrian_gpr.h
+index e78d81f..cc97ca9 100644
+--- a/bsd/dev/mondrian_gpr.h
++++ b/bsd/dev/mondrian_gpr.h
+@@ -21,7 +21,12 @@ extern "C" {
+ #define GPR_OP_BASIC_RESULT 0x02001005u      /* payload {opcode, status} */
+ #define GPR_OP_APM_GET_SPF_STATE 0x01001021u
+ #define GPR_OP_APM_SPF_STATE 0x02001007u     /* payload {status}: 1 ready */
+-#define GPR_MAX_PACKET 512u
++/*
++ * The two-subgraph GRAPH_OPEN (both subgraphs, four modules, three
++ * connections) is about 560 bytes; 512 made the builder return zero and the
++ * worker left without a log (measured 2026-11-27).
++ */
++#define GPR_MAX_PACKET 1024u
+ 
+ typedef struct {
+     uint32_t version, header_bytes, size;
