@@ -249,10 +249,13 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   pre-BHI MHI context and `0495`'s idle first `WLAN_EN` cycle all leave the
   stage at `0xef0a0111` and `BHI_STATUS=0`; `PBL_WLAN_BOOT_CFG` reads `0x1`
   against stock's `0x0` before a good load and `0x200` after one, and the
-  bootstrap/OD/SVS reads hang after the stall, so they stay out. The next
-  host-side divergence from the working SM8475 driver is its MSI: it lands
-  a visible `0xa500` word inside the mapped pool, ours points at an
-  unmapped page with data `0`.
+  bootstrap/OD/SVS reads hang after the stall, so they stay out. `0496` maps
+  the whole 6 MiB buffer, so the MSI landing page at `iova + 0x5fe000` is
+  reachable, and arms the working driver's `0xa500` data word. The page is
+  still 0 after the poll and the SMMU records no read past the hash segment
+  (FSR holds only the AArch64 format bits), so the PBL neither raises the MSI
+  nor loads a segment. The remaining difference is an input the platform must
+  supply before `WLAN_EN`, not a host sequence.
 - BHI, per Linux `drivers/bus/mhi/host/boot.c`: the block is at
   `BAR0 + BHIOFF` (`BHIOFF` read from `BAR0+0x28`, `0x100` on this family), so
   doorbell `+0x18`, `EXECENV +0x28`, `STATUS +0x2c`, `ERRCODE +0x30`. BHI only
