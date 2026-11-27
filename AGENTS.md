@@ -32,9 +32,6 @@ Pro, SM8475) is the port being done here.
 | R08 | Patch numbering, hunk headers and tool syntax (`tools/validate-repo.py`) |
 | R09 | The first-party tests under `tools/tests` pass |
 
-`--only R06` runs one check; `--list`/`--verbose` add detail. CI runs the same file,
-so a local pass is the same reading as a red workflow.
-
 ## Safety: what can and cannot brick the phone
 
 This phone is a dedicated test unit: the high-level partitions may be erased
@@ -79,14 +76,12 @@ The shim takes the framebuffer and the UFS host from the device tree, and
 - **A failed boot disables RAM boots until the slot is re-activated.** After a
   boot that dies, ABL marks the active slot unbootable and then refuses *every*
   `fastboot boot` with `Failed to load/authenticate boot image: Not Found` - a
-  4 KB stub is refused the same way, and so is an image that booted an hour
-  earlier. `fastboot --set-active=<current-slot>` clears it. `cycle.sh` does
-  this before every boot; without it, the refusal reads as a kernel that
-  crashes, and the ring answering with the previous kernel's banner "confirms"
-  it. A boot after an XNU run can also die at the shim handoff; measured
-  2026-11-19, two attempts died and the third booted in the same session, so
-  `cycle.sh` retries (`ATTEMPTS=N`, three by default) instead of stopping to ask
-  for a power cycle.
+  4 KB stub or an image that booted an hour earlier get the same answer.
+  `fastboot --set-active=<current-slot>` clears it, which `cycle.sh` does before
+  every boot; without it the refusal reads as a kernel that crashes, and the
+  ring answering with the previous kernel's banner "confirms" it. A boot after
+  an XNU run can also die at the shim handoff (two of three attempts measured
+  2026-11-19), so `cycle.sh` retries (`ATTEMPTS=N`, three by default).
 - **Prove the kernel before trusting any answer.** A RAM boot that dies falls
   back to `boot_b`, so "command not found" means "old kernel" as often as
   "bug". `cycle.sh` compares the ring's `Darwin Kernel Version` with the kernel
@@ -94,16 +89,14 @@ The shim takes the framebuffer and the UFS host from the device tree, and
   `grep -c "MONDRIAN HAP" kernel` written inline in PowerShell comes back 0
   because the quotes never reach grep - put the check in a script file.
 - **Never pipe a build or flash script.** `bash mkimg.sh | head -1` dies of
-  SIGPIPE and leaves the previous image - the phone then boots the old kernel
-  and the new command "does not exist" - and `bash tools/flash-root.sh IMG |
-  tail -6` throws away the `fastboot flash` progress and its failure, so a
-  flash that never started looks like one that finished and the image gets
-  blamed. Log to a file and read the exit status. A pipe also outlives the
-  script when the script starts a daemon: `bash serve.sh | tail` never returns
-  because the daemon inherits the write end, which is what an "eternal wait"
-  looks like from the outside. Start daemons with `setsid ... </dev/null >
-  log 2>&1 &` and never pipe the script. The same goes for editing a
-  script that is still running.
+  SIGPIPE and leaves the previous image, so the phone boots the old kernel and
+  the new command "does not exist"; `bash tools/flash-root.sh IMG | tail -6`
+  throws away the `fastboot flash` progress and its failure, and a flash that
+  never started looks like one that finished. Log to a file and read the exit
+  status. A pipe also outlives the script when it starts a daemon (`bash
+  serve.sh | tail` never returns, because the daemon inherits the write end):
+  start daemons with `setsid ... </dev/null > log 2>&1 &`. The same goes for
+  editing a script that is still running.
 - **Every WSL script attaches the phone itself.** WSL shuts down between tool
   calls, so `usbipd attach --wsl` and the `192.168.7.1` address must be redone
   inside each script or the first send fails with `Errno 99`. The bus id moves
@@ -118,11 +111,10 @@ The shim takes the framebuffer and the UFS host from the device tree, and
 - **Ask the vendor before writing a driver.** The live device tree and the
   vendor source answer in minutes what a boot cannot.
   `raw.githubusercontent.com` rate-limits (429), so
-  `cdn.jsdelivr.net/gh/<owner>/<repo>@<sha>/<path>` serves the same file.
-  Vendor blobs and configs come from the stock ROM on the PC
-  (`tools/super-extract.py`), not from the phone. **A recovery is not an option
-  on this unit** (measured twice): `fastboot boot` refuses our OrangeFox images
-  with `Bad Buffer Size`.
+  `cdn.jsdelivr.net/gh/<owner>/<repo>@<sha>/<path>` serves the same file. Blobs
+  and configs come from the stock ROM (`tools/super-extract.py`), not from the
+  phone. **A recovery is not an option here** (measured twice): `fastboot boot`
+  refuses our OrangeFox images with `Bad Buffer Size`.
 - **Instrument before you poke.** One dump that answers the whole question -
   full view depth, `userInteractionEnabled`/`hidden`/`alpha` per view,
   `-[UIApplication sendEvent:]` for where a touch lands - settles in one boot
@@ -158,18 +150,16 @@ them. A fact that only mattered while debugging is not documentation.
 - **Dates only, never times.** Write `2026-10-23`; never add the hour of the
   day, never append a wall-clock time or a timezone (`UTC`, `CEST`, "local").
   Durations are fine ("about four minutes").
-- **No session ephemera.** No CI run ids, workflow job numbers, image or kernel
-  hashes, byte sizes, `/tmp` paths, `adb`/`fastboot` transcripts, "photo
-  pending", "waiting for the user", to-do notes to yourself, or narration of
-  what you tried and discarded. If a number is needed to reproduce something,
-  it belongs in `tools/` (board table, constants) and the doc points there. A
-  commit hash is allowed only when it is the sole pointer to a piece of work
-  that is not in the tree (e.g. a branch's tip).
-- **Every paragraph must answer "what do I do with this?"** Keep: measured
+- **No session ephemera.** No CI run ids, job numbers, image or kernel hashes,
+  byte sizes, `/tmp` paths, `adb`/`fastboot` transcripts, "photo pending" or
+  narration of what you tried and discarded. If a number is needed to reproduce
+  something it belongs in `tools/`, and the doc points there. A commit hash is
+  allowed only when it is the sole pointer to work outside the tree.
+- **Every paragraph must answer "what do I do with this?"** Keep measured
   hardware values, invariants that break silently, symptoms paired with their
-  cause and fix, the commands a newcomer needs, pointers to the source of a
-  number. Drop: reasoning that only justifies a decision already made, dead
-  ends without a reusable lesson, and anything duplicated from another doc.
+  cause and fix, the commands a newcomer needs and the source of a number. Drop
+  reasoning that only justifies a decision and anything duplicated from another
+  doc.
 - **One home per fact.** Hardware facts and traps in `NOTES.md`, work items and
   the hardware delta in `docs/MONDIAN_PORT.md`, procedures and layout in
   `README.md`, per-patch state in `xnu/patches-mondrian/README.md`, the
@@ -189,8 +179,7 @@ them. A fact that only mattered while debugging is not documentation.
 | `xnu/README.md` | 80 |
 | `xnu/patches-mondrian/README.md` | 80 |
 
-A budget is a ceiling: delete or merge old text in the same edit. `docs/MONDIAN_PORT.md` is
-capped at 320 until the safety section folds into this file.
+A budget is a ceiling: delete or merge old text in the same edit.
 
 ## Repository hygiene
 
@@ -209,10 +198,9 @@ capped at 320 until the safety section folds into this file.
   `Co-authored-by: Name <email>` when copying by hand.
 - **One checkout, one owner.** Work in your own clone or worktree. In a tree you
   do not own, never run `git checkout -- <path>`, `restore`, `reset --hard`,
-  `clean -f` or `stash`: `git stash` is not a backup and the work it hides is
-  not recoverable by anyone else. `git status --porcelain` before anything
-  destructive, and a snapshot (`git diff > patch`, untracked files copied out)
-  before the first delete.
+  `clean -f` or `stash`: the work it hides is not recoverable by anyone else.
+  Run `git status --porcelain` before anything destructive and snapshot
+  (`git diff > patch`, untracked files copied out) before the first delete.
 - **A tag marks a proven state.** Only `boot-proven-YYYYMMDD`, on a commit
   whose image reached SpringBoard; the message carries the ring's
   `Darwin Kernel Version` line and the console excerpt. Per-session and
@@ -222,17 +210,29 @@ capped at 320 until the safety section folds into this file.
 
 The port is at https://hackios.appaiproxy.com/device/poco-f5-pro. Read
 `node cli.mjs status-get --device poco-f5-pro` before a change, then record what
-a build, log or test shows in the same session:
-`node cli.mjs status-set poco-f5-pro <area> works|in-progress|broken --detail
-"<evidence>" --source "<commit or log>"` (`--os`, `--version`, `--photo`).
-Unproven stays `unknown`; post progress with `node cli.mjs update poco-f5-pro
-<files> --text "..."`. The token stays in `TRACKER_TOKEN` or the CLI login.
+a build, log or test shows: `node cli.mjs status-set poco-f5-pro <area>
+works|in-progress|broken --detail "<evidence>" --source "<commit or log>"`. Use
+`--os`, `--version`, `--photo` when they apply; unproven stays `unknown` and
+progress goes out with `node cli.mjs update poco-f5-pro <files> --text "..."`.
+The token stays in `TRACKER_TOKEN` or the CLI login.
 
 New code is Rust (boot/loaders, UEFI via `uefi`, host/flash tools, daemons,
 driver logic behind a thin C/C++ shim); C/C++ only for XNU, IOKit's C++
 interfaces, existing C/C++ patches and vendor ABIs. Python is dev-only. Reuse
 iOSPlus10 (MIT) before writing a tool; OneiOS has no licence file, so read it
 but do not copy it.
+
+## Models and subagents
+
+The primary model does `tools/`, patch ports, docs, log reading and the first
+diagnosis. A subagent gets exact paths, the minimal diff and the error, never
+whole files, and returns a patch applied here.
+
+- Two failures on one compile error, patch refusal or bug; bare-metal shim/MMU,
+  UFS/SPMI and pre-flash audits: `lowlevel` (`.opencode/agents/lowlevel.md`,
+  `opencode-go/glm-5.3`).
+- Opaque XNU panics and early `launchd`/`backboardd` hangs after that:
+  `kernel-expert` (`.opencode/agents/kernel-expert.md`, `opencode-go/gpt-6-luna#xhigh`).
 
 ## Skills
 
