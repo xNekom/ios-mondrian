@@ -1,0 +1,27 @@
+xnu 0492: ring the bhi doorbell with an odd session
+
+Measured 2026-11-27: the PBL reads the image and stops in `pbl_auth.c` with
+`0xef0a0111` on an even `0x2a5a5a5a` session. The working SM8475 QCA6490
+driver writes `(time & 0x3fffffff) | 1`, the 7a writes `1` and the donor
+increments the inherited value, so every proven load uses an odd session.
+Change only the session and keep the rest of the load byte for byte.
+
+diff --git a/bsd/dev/mondrian_wifi.c b/bsd/dev/mondrian_wifi.c
+--- a/bsd/dev/mondrian_wifi.c
++++ b/bsd/dev/mondrian_wifi.c
+@@ -2116,8 +2116,13 @@
+         wifi_log("W11 fsr clear rc=%d", fsr_rc);
+         mondrian_log_flush_now();
+     }
+-    /* BHI_IMGTXDB is a 30-bit sequence, not a boolean. */
+-    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5au);
++    /*
++     * BHI_IMGTXDB is a 30-bit session, not a boolean. The working
++     * SM8475 QCA6490 driver writes (time & 0x3fffffff) | 1 and the 7a
++     * writes 1, so the session is odd; 0x2a5a5a5a was the one value no
++     * working load used.
++     */
++    rc |= mondrian_mmio_try_wr32(wifi_bar + bhioff + 0x18, 0x2a5a5a5bu);
+     WIFI_STAGE(17);
+     wifi_log("W6 BHI trigger iova=0x%llx sbl=0x%x image=0x%x intvec=0x%x rc=0x%x",
+         iova, image_size, got, intvec, rc);
