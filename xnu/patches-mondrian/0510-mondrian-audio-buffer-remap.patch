@@ -1,0 +1,59 @@
+# 0510 - reuse/remap the ADSP PCM buffer for a HAL client
+#
+# The boot worker maps the PCM buffer once; a HAL client's second worker run
+# allocates a different VA and mondrian_audio_smmu_map() refuses the second
+# map ('one buffer already mapped'). That tore down the APM graph and put
+# mediaserverd into a crash loop (24 crashes, SpringBoard at 0 runloop ticks).
+# Release the old translation before installing the new one: one stream at
+# a time.
+
+--- a/bsd/dev/mondrian_adsp.c	2026-11-27 20:22:07.353091239 +0100
++++ b/bsd/dev/mondrian_adsp.c	2026-11-27 20:22:07.355985929 +0100
+@@ -1280,11 +1280,20 @@
+ 	 * (0x10000000) and the ADSP's audio DMA works in that 32-bit space.
+ 	 * No low physical page is needed.
+ 	 */
+-	kr = kmem_alloc_contig(kernel_map, &adsp_pcm_va, ADSP_PCM_BYTES,
+-	    0x3fff, 0, 3, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
+-	if (kr != KERN_SUCCESS) {
+-		adsp_log("pcm allocation failed kr=0x%x", kr);
+-		goto out;
++	/*
++	 * The boot probe already allocated and mapped a PCM buffer; the SMMU
++	 * driver allows only one buffer at a time ('one buffer already mapped').
++	 * Reuse it instead of asking for a second VA that would be refused.
++	 */
++	if (adsp_pcm_va == 0) {
++		kr = kmem_alloc_contig(kernel_map, &adsp_pcm_va, ADSP_PCM_BYTES,
++		    0x3fff, 0, 3, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
++		if (kr != KERN_SUCCESS) {
++			adsp_log("pcm allocation failed kr=0x%x", kr);
++			goto out;
++		}
++	} else {
++		adsp_log("pcm reusing the boot buffer va=0x%lx", (unsigned long)adsp_pcm_va);
+ 	}
+ 	pn = pmap_find_phys(kernel_pmap, (addr64_t)adsp_pcm_va);
+ 	if (pn == 0) {
+--- a/bsd/dev/mondrian_audio_smmu.c	2026-11-27 20:22:07.357442908 +0100
++++ b/bsd/dev/mondrian_audio_smmu.c	2026-11-27 20:22:07.359796984 +0100
+@@ -623,8 +623,17 @@
+ 			*iova_out = as.iova;
+ 			return 0;
+ 		}
+-		as_log("one buffer already mapped");
+-		return -1;
++		/*
++		 * One stream at a time: a new client re-runs the worker with a
++		 * freshly allocated buffer. Put the old translation back before
++		 * installing the new one instead of refusing the second map
++		 * (measured 2026-11-27: the refusal crash-loops mediaserverd).
++		 */
++		as_log("remapping buffer %#lx -> %#lx", (unsigned long)as.buffer_va, (unsigned long)va);
++		as_disable();
++		as.installed = 0;
++		as.buffer_va = 0;
++		as.buffer_bytes = 0;
+ 	}
+ 	if (va == 0 || (va & 0xfff) != 0 || bytes == 0 ||
+ 	    bytes > AS_MAX_BYTES) {
