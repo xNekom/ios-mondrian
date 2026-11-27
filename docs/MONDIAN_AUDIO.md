@@ -69,7 +69,10 @@ graphs are open before the link is resolved. `PREPARE`, `START`, `STOP` and
 `CLOSE` go out once per subgraph: a command carrying both ids is accepted, so
 a list that only applied its first entry would leave the endpoint clocking
 while the stream idles. The I2S module (`0x0700100A`, SD1) also clocked the
-pads but never drove data1.
+pads but never drove data1. Neither module is evidence of a working chain on
+its own: the donor's TDM code is marked unvalidated, and the only extracted
+ACDB speaker graph of this generation (a sibling platform) uses `I2S_SINK`
+with `SAL` in front and no TDM sink at all.
 
 The worker allocates eight periods (30720 bytes, a whole number of 3840-byte
 periods) with `kmem_alloc_contig()`, maps the ring into the ADSP's 32-bit
@@ -113,16 +116,18 @@ fuses gave icalk 992/1001 against vcalk 992/994, both PLLs lock to the bit
 clock (`SYSST 0x0011`), and the PCM write completes with status 0. VBAT reads
 3598 mV and PVDD tracks it.
 
-The pads answer for themselves, but the first sampler watched the wrong one.
-It read DATA0 (gpio122), the disabled `tert_mi2s` group's line, and measured
-0.05-0.45 % high with hundreds of edges while the pair sat on gpio124. The
-live tree's active `tert_tdm_pinctrl` muxes sck gpio121, ws gpio123 and dout
-gpio124 (`mi2s2_data1`); gpio122 is the TDM din/capture line. The sampler and
-the sink now use data1. Opening both subgraphs in one `GRAPH_OPEN` was
-accepted with status 0 on every command, and the direct shmem -> I2S link was
-accepted too, both still reading data0; the decoder/converter chain was not
-the silence. The one-LSB sign square (`0x00000001`/`0xffffffff`) makes the
-fill visible at any width and stays inaudible.
+The pads answer for themselves, and the instrument now proves itself too: with
+each pin temporarily muxed as a plain GPIO and driven low then high, sck, ws,
+data0 and data1 all read 0 then 1. Measured 2026-11-27 with that check in
+place: SCK and WS sit at 50 % while **both** data lines stay flat through eight
+periods (data1 1104 of 321478 samples with 60 edges, data0 0 of 321478 with no
+edge), so the sink emits no frame at all rather than a frame on the wrong
+lane. The TLMM output-enable bit, the TDM `ctrl_data_out_enable` value (1 and
+0) and `PARAM_ID_HW_INTF_CLK_CFG` (`0x0800113C`, the clock defaults the donor's
+tertiary set carries) each changed nothing. The one-LSB sign square
+(`0x00000001`/`0xffffffff`) makes the fill visible at any width and stays
+inaudible; with data on the wire it reads about 52 % high, so 0.4 % is an
+absence of data, not a bad pattern.
 
 ## Traps
 
@@ -132,17 +137,31 @@ fill visible at any width and stays inaudible.
   `tert_mi2s_pinctrl` block with gpio122 (`mi2s2_data0`) is `status =
   "disabled"`; gpio122 is the TDM din/capture line. `pinctrl-sm8450.c` maps
   register mux value 1 to `mi2s2_data1` on gpio124, so the raw TLMM write is
-  `(1 << 2) | pull | (drive << 6) | (1 << 9)`. Sampling gpio122 explains the
-  0.45 % with hundreds of edges: it is a line the pair never sees. Both
+  `(1 << 2) | pull | (drive << 6) | (1 << 9)`. Sampling gpio122 with the pair
+  on gpio124 read 0.45 % with hundreds of edges, and since then it has been
+  read 0 of 321478 with no edge, so it is not a hidden speaker line. Both
   `aw882xx_smartpa` nodes are `sound-channel` 0 and 1 on the single dout line.
+- **Tell the two data-out enables apart before blaming either.** The TDM
+  interface parameter (`0x0800101B`) is, in order, `lpaif_type`, `intf_idx`,
+  `sync_src`, `ctrl_data_out_enable`, `slot_mask`, `nslots_per_frame`,
+  `slot_width`, `sync_mode`, `ctrl_invert_sync_pulse`,
+  `ctrl_sync_data_delay`, `reserved`; the live `tdm_tert_tx` node asks for
+  `data-out 0`, internal sync, long sync, an inverted pulse and one BCLK of
+  delay, which is what 0507 sends. Value 1 means "share data-out with other
+  masters" and 0 means this block owns the line, and the pads read flat with
+  both. The TLMM `GPIO_IN_OUT` bit 1 is a GPIO-function bit: a pad muxed to
+  `mi2s2` ignores it (flat with both values), which is why the GPIO self-test,
+  not a register readback, is the only way to trust a pad measurement.
 - **The map address is `DDR tag | low 32 bits`, and the upper word must be
   exactly 1.** The low word is the address the DSP's DMA emits, not necessarily
   the physical address. A physical address above 4 GiB cannot be used directly:
   `pa=0x84a200000` was refused with status 1 (measured 2026-11-27). The vendor
   maps an IOVA from the audio-ion pool (`0x10000000`) through apps-SMMU SID
-  `0x1801`; 0505 does the same, so the buffer can stay high. The donor builds
-  the same tag (`dmaPa | (1ull << 32)`) and masks the write completion address
-  with `0xffffffff`; our map and write payloads match
+  `0x1801`; 0505 does the same, so the buffer can stay high. The upper word is
+  the stream id, as mainline builds it (`phys_addr | (pdata->sid << 32)`, with
+  `sid` the low nibble of the `iommus` phandle argument, so `0x1801` becomes
+  1). The donor builds the same tag (`dmaPa | (1ull << 32)`) and masks the write
+  completion address with `0xffffffff`; our map and write payloads match
   `APM_CMD_SHARED_MEM_MAP_REGIONS` and
   `DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2` field for field.
 - **The PCM buffer cannot be an SMEM item.** SMEM is low and contiguous, but a
