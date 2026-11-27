@@ -1,0 +1,756 @@
+xnu 0497: boot the adsp through PAS1
+
+Add bsd/dev/mondrian_adsp.c: an opt-in worker (mondrianadsp=1) that reads
+the joined /private/var/vm/adsp.mbn (tools/adsp-image.py), maps the
+0x9fd00000 carve-out and the APPS-ADSP SMEM/IPCC/mutex windows in
+mondrian_log_start premap, hands the ELF header and hash segment to PAS1
+init_image, sets up the relocatable span, copies the loadable segments,
+calls auth_and_reset and polls the ADSP slave-kernel SMP2P entry for the
+ready bit. It initializes the host outbound SMP2P item and rings the
+LPASS SMP2P doorbell before the load. No QMP load-state vote, RPMh rail
+vote, GLINK or GPR yet: those are the next milestones if PAS alone does
+not bring the ADSP up.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9b81a3f..e700277 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/mondrian_touch.c		standard
+ bsd/dev/mondrian_wifi.c		standard
+ bsd/dev/mondrian_wifi_smmu.c		standard
+ bsd/dev/mondrian_audio_probe.c		standard
++bsd/dev/mondrian_adsp.c		standard
+ bsd/dev/mondrian_usb.c			standard
+ bsd/dev/mondrian_tsens.c		standard
+ bsd/dev/mondrian_thermal.c		standard
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+new file mode 100755
+index 0000000..b5604be
+--- /dev/null
++++ b/bsd/dev/mondrian_adsp.c
+@@ -0,0 +1,697 @@
++/* SPDX-License-Identifier: APSL-2.0 */
++/*
++ * MONDRIAN ADSP: boot the phone's adsp.mdt image through PAS1 and read the
++ * ADSP's SMP2P "slave-kernel" state.
++ *
++ * The image is the joined one `tools/adsp-image.py` writes from the modem
++ * partition's adsp.mdt + adsp.bNN, pushed to /private/var/vm/adsp.mbn. The
++ * PAS calls, the carve-out and the SMEM/SMP2P item layout are protocol facts
++ * from qiumochen/UniXNU-zizhan drivers/PongPower (QcomMdt.c, QcomSmem.c,
++ * QcomSmp2p.c, PongAdsp.cpp; BSD-2-Clause-Patent) and Linux qcom_smem /
++ * qcom_smp2p. No donor code is copied.
++ *
++ * This worker stops at the ready bit: no QMP load-state vote, no RPMh rail
++ * vote and no GLINK/GPR channel. Those are the next milestones if the ADSP
++ * does not come up from PAS alone.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdarg.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++void mondrian_adsp_premap(void);
++void mondrian_adsp_start(void);
++
++#if defined(MONDRIAN)
++
++/* Not exported to the BSD layer. */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
++extern uint64_t ml_get_timebase(void);
++extern void mondrian_log_flush_now(void);
++extern int mondrian_root_read(const char *, void *, unsigned, off_t);
++extern kern_return_t thread_terminate(thread_t);
++#include "mondrian_scm.h"
++
++#define ADSP_FW_PATH		"/private/var/vm/adsp.mbn"
++#define ADSP_PAS_ID		1u
++#define ADSP_SCM_PIL_BASE	0x42000200u
++#define ADSP_SCM_INIT		1u
++#define ADSP_SCM_MEM_SETUP	2u
++#define ADSP_SCM_AUTH		5u
++
++/* dtb/mondrian-live.dtb: /reserved-memory/adsp_region@9fd00000. */
++#define ADSP_CARVEOUT_BASE	0x9fd00000ULL
++#define ADSP_CARVEOUT_SIZE	0x3100000ULL
++
++/* dtb/mondrian-live.dtb and Pong's live addresses. */
++#define ADSP_SMEM_BASE		0x80900000ULL
++#define ADSP_SMEM_SIZE		0x200000ULL
++#define ADSP_IPCC_BASE		0x0ed18000ULL
++#define ADSP_IPCC_SEND		0x0cu
++#define ADSP_IPCC_LPASS_SMP2P	((3u << 16) | 2u)
++#define ADSP_MUTEX_BASE		0x1f43000ULL
++#define ADSP_AOSS_BASE		0x0c300000ULL
++
++#define ADSP_SMEM_TOC_MAGIC	0x434f5424u	/* "$TOC" */
++#define ADSP_SMEM_PART_MAGIC	0x54525024u	/* "$PRT" */
++#define ADSP_SMP2P_MAGIC	0x504d5324u	/* "$SMP" */
++#define ADSP_SMP2P_ITEM_BYTES	(20u + 20u * 16u)
++#define ADSP_ITEM_OUT		429
++#define ADSP_ITEM_IN		443
++#define ADSP_ITEM_CRASH		423
++#define ADSP_SMP2P_READY	0x2u
++#define ADSP_SMP2P_FATAL	0x1u
++
++#define ADSP_MAX_PHDRS		32u
++#define ADSP_BOUNCE_BYTES	(64u * 1024u)
++
++struct adsp_phdr {
++	uint32_t type;
++	uint32_t offset;
++	uint32_t vaddr;
++	uint32_t paddr;
++	uint32_t filesz;
++	uint32_t memsz;
++	uint32_t flags;
++	uint32_t align;
++};
++
++static vm_offset_t adsp_carveout;
++static vm_offset_t adsp_smem;
++static vm_offset_t adsp_ipcc;
++static vm_offset_t adsp_mutex;
++static vm_offset_t adsp_aoss;
++static int adsp_mapped;
++static struct adsp_phdr adsp_phdr[ADSP_MAX_PHDRS];
++static uint8_t adsp_bounce[ADSP_BOUNCE_BYTES];
++static int adsp_last_read = -999;
++
++static void
++adsp_log(const char *fmt, ...)
++{
++	va_list ap;
++
++	printf("MONDRIAN ADSP: ");
++	va_start(ap, fmt);
++	vprintf(fmt, ap);
++	va_end(ap);
++	printf("\n");
++	mondrian_log_flush_now();
++}
++
++static uint16_t
++adsp_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (uint16_t)p[1] << 8);
++}
++
++static uint32_t
++adsp_le32(const uint8_t *p)
++{
++	return (uint32_t)adsp_le16(p) | (uint32_t)adsp_le16(p + 2) << 16;
++}
++
++static uint32_t
++adsp_rd32(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++adsp_wr32(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++adsp_fw_read(uint64_t offset, void *to, uint32_t length)
++{
++	adsp_last_read = mondrian_root_read(ADSP_FW_PATH, to, length,
++	    (off_t)offset);
++	return adsp_last_read == (int)length ? 0 : -1;
++}
++
++/*
++ * The joined image is an ELF32 whose program headers point inside the file:
++ * the first header is the ELF header plus the table, the hash segment sits at
++ * its own offset near the end, and every loadable segment names the address
++ * the secure world relocates to the carve-out.
++ */
++static int
++adsp_parse(uint32_t *lo_out, uint32_t *hi_out, uint32_t *hdr_out,
++    uint32_t *hash_out, int *reloc_out)
++{
++	uint8_t elf[0x400];
++	uint32_t phoff, phentsize, phnum, i, hash = ~0u, hdr_size;
++	uint32_t lo = ~0u, hi = 0;
++	int reloc = 1;
++
++	if (adsp_fw_read(0, elf, sizeof(elf))) {
++		return -1;
++	}
++	if (elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' ||
++	    elf[3] != 'F' || elf[4] != 1 || elf[5] != 1) {
++		return -1;
++	}
++	phoff = adsp_le32(elf + 28);
++	phentsize = adsp_le16(elf + 42);
++	phnum = adsp_le16(elf + 44);
++	if (phentsize != 32 || phnum == 0 || phnum > ADSP_MAX_PHDRS ||
++	    phoff > sizeof(elf) || phnum > (sizeof(elf) - phoff) / phentsize) {
++		return -1;
++	}
++	for (i = 0; i < phnum; i++) {
++		const uint8_t *p = elf + phoff + i * phentsize;
++		struct adsp_phdr *ph = &adsp_phdr[i];
++
++		ph->type = adsp_le32(p);
++		ph->offset = adsp_le32(p + 4);
++		ph->vaddr = adsp_le32(p + 8);
++		ph->paddr = adsp_le32(p + 12);
++		ph->filesz = adsp_le32(p + 16);
++		ph->memsz = adsp_le32(p + 20);
++		ph->flags = adsp_le32(p + 24);
++		ph->align = adsp_le32(p + 28);
++		if (((ph->flags >> 24) & 7u) == 2u) {
++			hash = i;
++		}
++		if (ph->type != 1u || ph->memsz == 0) {
++			continue;
++		}
++		if ((ph->flags & (1u << 27)) == 0) {
++			reloc = 0;
++		}
++		if (ph->paddr + ph->memsz < ph->paddr) {
++			return -1;
++		}
++		if (ph->paddr < lo) {
++			lo = ph->paddr;
++		}
++		if (ph->paddr + ph->memsz > hi) {
++			hi = ph->paddr + ph->memsz;
++		}
++	}
++	hdr_size = adsp_phdr[0].filesz;
++	if (hash == ~0u || hdr_size < phoff + phnum * phentsize ||
++	    hdr_size > 0x1000 ||
++	    adsp_phdr[hash].filesz > 0x2000 - hdr_size ||
++	    lo == ~0u || hi <= lo || hi - lo > ADSP_CARVEOUT_SIZE) {
++		return -1;
++	}
++	*lo_out = lo;
++	*hi_out = hi;
++	*hdr_out = hdr_size;
++	*hash_out = hash;
++	*reloc_out = reloc;
++	return 0;
++}
++
++static uint32_t adsp_part;
++static uint32_t adsp_part_size;
++
++/* The SMEM partition table at the end of the region, and the APPS-ADSP item
++ * partition: four bytes of magic and the host pair. */
++static int
++adsp_smem_partition(void)
++{
++	uint32_t toc = (uint32_t)ADSP_SMEM_SIZE - 0x1000;
++	uint32_t count, i;
++
++	if (adsp_rd32(adsp_smem, toc) != ADSP_SMEM_TOC_MAGIC ||
++	    adsp_rd32(adsp_smem, toc + 4) != 1) {
++		return -1;
++	}
++	count = adsp_rd32(adsp_smem, toc + 8);
++	if (count > (0x1000 - 0x20) / 0x30) {
++		return -1;
++	}
++	for (i = 0; i < count; i++) {
++		uint32_t e = toc + 0x20 + i * 0x30;
++		uint32_t off = adsp_rd32(adsp_smem, e);
++		uint32_t size = adsp_rd32(adsp_smem, e + 4);
++		uint32_t hosts = adsp_rd32(adsp_smem, e + 12);
++		uint32_t h0 = hosts & 0xffffu, h1 = hosts >> 16;
++
++		if (off == 0 || size == 0) {
++			continue;
++		}
++		if (!((h0 == 0 && h1 == 2) || (h0 == 2 && h1 == 0))) {
++			continue;
++		}
++		if ((off & 7u) != 0 || off + size > toc ||
++		    size < 0x20 + 2 * 0x10) {
++			return -1;
++		}
++		if (adsp_rd32(adsp_smem, off) != ADSP_SMEM_PART_MAGIC ||
++		    adsp_rd32(adsp_smem, off + 4) != hosts ||
++		    adsp_rd32(adsp_smem, off + 8) != size) {
++			return -1;
++		}
++		adsp_part = off;
++		adsp_part_size = size;
++		return 0;
++	}
++	return -1;
++}
++
++static int
++adsp_item(uint16_t item, uint32_t *data, uint32_t *bytes)
++{
++	uint32_t end, at;
++
++	if (adsp_part == 0) {
++		return -1;
++	}
++	end = adsp_rd32(adsp_smem, adsp_part + 12);
++	at = 0x20;
++	while (at < end) {
++		uint32_t w0 = adsp_rd32(adsp_smem, adsp_part + at);
++		uint32_t size = adsp_rd32(adsp_smem, adsp_part + at + 4);
++		uint32_t pads = adsp_rd32(adsp_smem, adsp_part + at + 8);
++		uint32_t ph = pads >> 16;
++
++		if ((w0 & 0xffffu) != 0xa5a5u) {
++			return -1;
++		}
++		if (at + 0x10 + ph + size > end) {
++			return -1;
++		}
++		if ((w0 >> 16) == item) {
++			*data = adsp_part + at + 0x10 + ph;
++			*bytes = size - (pads & 0xffffu);
++			return 0;
++		}
++		at += 0x10 + ph + size;
++	}
++	return -1;
++}
++
++static int
++adsp_smem_lock(void)
++{
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		adsp_wr32(adsp_mutex, 0, 1);
++		if (adsp_rd32(adsp_mutex, 0) == 1) {
++			return 0;
++		}
++		delay(10);
++	}
++	return -1;
++}
++
++static void
++adsp_smem_unlock(void)
++{
++	adsp_wr32(adsp_mutex, 0, 0);
++}
++
++static int
++adsp_item_alloc(uint16_t item, uint32_t bytes)
++{
++	uint32_t data, size, end, cached, aligned, need, at, i;
++
++	if (adsp_item(item, &data, &size) == 0) {
++		return 0;
++	}
++	if (adsp_smem_lock() != 0) {
++		return -1;
++	}
++	if (adsp_item(item, &data, &size) == 0) {
++		adsp_smem_unlock();
++		return 0;
++	}
++	end = adsp_rd32(adsp_smem, adsp_part + 12);
++	cached = adsp_rd32(adsp_smem, adsp_part + 16);
++	aligned = (bytes + 7u) & ~7u;
++	need = 0x10 + aligned;
++	if (end < 0x20 || end + need > cached || end + need < end) {
++		adsp_smem_unlock();
++		return -1;
++	}
++	at = end;
++	adsp_wr32(adsp_smem, adsp_part + at, 0xa5a5u | (uint32_t)item << 16);
++	adsp_wr32(adsp_smem, adsp_part + at + 4, aligned);
++	adsp_wr32(adsp_smem, adsp_part + at + 8, aligned - bytes);
++	adsp_wr32(adsp_smem, adsp_part + at + 12, 0);
++	for (i = 0; i < aligned; i += 4) {
++		adsp_wr32(adsp_smem, adsp_part + at + 0x10 + i, 0);
++	}
++	adsp_wr32(adsp_smem, adsp_part + 12, at + need);
++	adsp_smem_unlock();
++	return 0;
++}
++
++/* The outbound item must exist before the ADSP boots: it looks for the
++ * host's "master-kernel" entry. */
++static int
++adsp_smp2p_out(uint32_t data)
++{
++	volatile uint32_t *out = (volatile uint32_t *)(adsp_smem + data);
++	static const char name[] = "master-kernel";
++	uint32_t words[4] = { 0 };
++	uint32_t i;
++
++	for (i = 0; i < ADSP_SMP2P_ITEM_BYTES / 4; i++) {
++		out[i] = 0;
++	}
++	out[0] = ADSP_SMP2P_MAGIC;
++	out[2] = 0u | 2u << 16;
++	out[3] = 16;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	out[1] = 1u | 1u << 8;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	for (i = 0; i < 16 && name[i]; i++) {
++		words[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (i = 0; i < 4; i++) {
++		out[5 + i] = words[i];
++	}
++	out[9] = 0;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	out[3] = 16u | 1u << 16;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	return 0;
++}
++
++static int
++adsp_ready_value(uint32_t *value)
++{
++	uint32_t data, bytes, counts, valid, i, j;
++	volatile uint32_t *in;
++
++	if (adsp_item(ADSP_ITEM_IN, &data, &bytes) != 0 ||
++	    bytes < ADSP_SMP2P_ITEM_BYTES) {
++		return -1;
++	}
++	in = (volatile uint32_t *)(adsp_smem + data);
++	if (in[0] != ADSP_SMP2P_MAGIC || (in[1] & 0xffu) != 1 ||
++	    in[2] != 2u) {
++		return -1;
++	}
++	counts = in[3];
++	valid = counts >> 16;
++	if ((counts & 0xffffu) > 16 || valid > (counts & 0xffffu)) {
++		return -1;
++	}
++	for (i = 0; i < valid && i < 16; i++) {
++		volatile uint32_t *entry = &in[5 + 5 * i];
++		static const char name[] = "slave-kernel";
++		int match = 1;
++
++		for (j = 0; j < 16; j++) {
++			char c = (char)(entry[j / 4] >> (8 * (j % 4)));
++
++			if (c != name[j]) {
++				match = 0;
++				break;
++			}
++			if (c == 0) {
++				break;
++			}
++		}
++		if (match) {
++			*value = entry[4];
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static uint32_t
++adsp_wait_ready(void)
++{
++	uint32_t value = 0xffffffffu;
++	int i;
++
++	for (i = 0; i < 500; i++) {
++		if (adsp_ready_value(&value) == 0 &&
++		    (value & (ADSP_SMP2P_READY | ADSP_SMP2P_FATAL)) != 0) {
++			return value;
++		}
++		delay(10000);
++	}
++	if (adsp_ready_value(&value) == 0) {
++		return value;
++	}
++	return 0xffffffffu;
++}
++
++static int
++adsp_pas_call(uint32_t command, uint32_t info, uint64_t args[3],
++    const char *name)
++{
++	int32_t transport = -1;
++	int64_t result = -1;
++	int rc;
++
++	adsp_log("pas %s arg0=0x%llx arg1=0x%llx arg2=0x%llx info=0x%x",
++	    name, (unsigned long long)args[0],
++	    (unsigned long long)args[1], (unsigned long long)args[2], info);
++	rc = mondrian_scm_call(ADSP_SCM_PIL_BASE | command, info, args,
++	    &transport, &result);
++	adsp_log("pas %s -> rc=%d transport=%d result=%lld", name, rc,
++	    transport, (long long)result);
++	return (rc == 0 && transport == 0 && result == 0) ? 0 : -1;
++}
++
++static void
++adsp_run(void)
++{
++	uint32_t lo = 0, hi = 0, hdr_size = 0, hash = ~0u, span;
++	uint32_t data = 0, bytes = 0, pre = 0xffffffffu, ready;
++	uint64_t args[3], meta_pa, start, hz;
++	vm_offset_t meta_va = 0;
++	kern_return_t kr;
++	ppnum_t pn;
++	int reloc = 0, have_pre = 0;
++	uint32_t i;
++
++	adsp_log("worker start; waiting for %s (last read=%d)",
++	    ADSP_FW_PATH, adsp_last_read);
++	for (i = 0; i < 60000; i++) {
++		if (adsp_parse(&lo, &hi, &hdr_size, &hash, &reloc) == 0) {
++			break;
++		}
++		if (i != 0 && (i % 10000) == 0) {
++			adsp_log("still waiting (last read=%d)", adsp_last_read);
++		}
++		delay(1000);
++	}
++	if (i == 60000) {
++		adsp_log("firmware unavailable; no ADSP load");
++		return;
++	}
++	span = ((hi + 0xfffu) & ~0xfffu) - lo;
++	adsp_log("elf headers=%u hash=%u metadata=%u lo=0x%x hi=0x%x "
++	    "span=0x%x reloc=%d", hdr_size, hash,
++	    hdr_size + adsp_phdr[hash].filesz, lo, hi, span, reloc);
++	if (!reloc) {
++		adsp_log("image is not relocatable; refusing to place it");
++		return;
++	}
++
++	adsp_log("aoss magic=0x%x link=0x%x ack=0x%x ch=0x%x ack2=0x%x",
++	    adsp_rd32(adsp_aoss, 0), adsp_rd32(adsp_aoss, 0xc),
++	    adsp_rd32(adsp_aoss, 0x14), adsp_rd32(adsp_aoss, 0x24),
++	    adsp_rd32(adsp_aoss, 0x2c));
++
++	/* The outbound SMP2P item and the host's doorbell go in before PAS:
++	 * the ADSP looks for "master-kernel" while it starts. */
++	if (adsp_smem_partition() != 0) {
++		adsp_log("SMEM APPS-ADSP partition not found");
++	} else {
++		adsp_log("smem partition=0x%x size=0x%x",
++		    adsp_part, adsp_part_size);
++		if (adsp_item_alloc(ADSP_ITEM_OUT, ADSP_SMP2P_ITEM_BYTES) != 0 ||
++		    adsp_item(ADSP_ITEM_OUT, &data, &bytes) != 0) {
++			adsp_log("outbound item %u unavailable", ADSP_ITEM_OUT);
++		} else if (bytes < ADSP_SMP2P_ITEM_BYTES) {
++			adsp_log("outbound item %u too small (%u)", ADSP_ITEM_OUT,
++			    bytes);
++		} else {
++			(void)adsp_smp2p_out(data);
++			adsp_wr32(adsp_ipcc, ADSP_IPCC_SEND,
++			    ADSP_IPCC_LPASS_SMP2P);
++			adsp_log("outbound item %u at 0x%x; smp2p doorbell sent",
++			    ADSP_ITEM_OUT, data);
++		}
++		have_pre = adsp_ready_value(&pre) == 0;
++		adsp_log("inbound item %u pre=%s0x%x", ADSP_ITEM_IN,
++		    have_pre ? "" : "missing/", pre);
++	}
++
++	kr = kmem_alloc_contig(kernel_map, &meta_va, 0x2000, 0x1fff, 0, 3,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
++		adsp_log("metadata allocation failed kr=0x%x", kr);
++		return;
++	}
++	if (adsp_fw_read(0, (void *)meta_va, hdr_size) != 0 ||
++	    adsp_fw_read(adsp_phdr[hash].offset,
++	    (void *)(meta_va + hdr_size), adsp_phdr[hash].filesz) != 0) {
++		adsp_log("metadata read failed (last read=%d)", adsp_last_read);
++		return;
++	}
++	{
++		vm_offset_t at;
++
++		for (at = meta_va; at < meta_va + 0x2000; at += 64) {
++			__asm__ volatile("dc civac, %0" :: "r"(at) : "memory");
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	pn = pmap_find_phys(kernel_pmap, (addr64_t)meta_va);
++	if (pn == 0) {
++		adsp_log("metadata has no physical address");
++		return;
++	}
++	meta_pa = (uint64_t)pn << 12;
++	adsp_log("metadata va=0x%lx pa=0x%llx bytes=%u", (unsigned long)meta_va,
++	    (unsigned long long)meta_pa, hdr_size + adsp_phdr[hash].filesz);
++
++	args[0] = ADSP_PAS_ID;
++	args[1] = meta_pa;
++	args[2] = 0;
++	if (adsp_pas_call(ADSP_SCM_INIT, 2u | (2u << 6), args,
++	    "init_image") != 0) {
++		return;
++	}
++	args[0] = ADSP_PAS_ID;
++	args[1] = ADSP_CARVEOUT_BASE;
++	args[2] = span;
++	if (adsp_pas_call(ADSP_SCM_MEM_SETUP, 3, args, "mem_setup") != 0) {
++		return;
++	}
++
++	for (i = 0; i < ADSP_MAX_PHDRS; i++) {
++		struct adsp_phdr *p = &adsp_phdr[i];
++		vm_offset_t dest;
++		uint32_t done, zero;
++
++		if (p->type != 1u || p->memsz == 0) {
++			continue;
++		}
++		dest = adsp_carveout + (p->paddr - lo);
++		for (done = 0; done < p->filesz; ) {
++			uint32_t chunk = p->filesz - done;
++
++			if (chunk > ADSP_BOUNCE_BYTES) {
++				chunk = ADSP_BOUNCE_BYTES;
++			}
++			if (adsp_fw_read(p->offset + done, adsp_bounce,
++			    chunk) != 0) {
++				adsp_log("segment %u read failed at 0x%x", i,
++				    p->offset + done);
++				return;
++			}
++			memcpy((void *)(dest + done), adsp_bounce, chunk);
++			done += chunk;
++		}
++		for (zero = (p->filesz + 3u) & ~3u; zero < p->memsz;
++		    zero += 4) {
++			*(volatile uint32_t *)(dest + zero) = 0;
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		adsp_log("seg %u -> carveout+0x%x file=%u mem=%u", i,
++		    p->paddr - lo, p->filesz, p->memsz);
++	}
++
++	args[0] = ADSP_PAS_ID;
++	args[1] = 0;
++	args[2] = 0;
++	start = mach_absolute_time();
++	if (adsp_pas_call(ADSP_SCM_AUTH, 1, args, "auth_and_reset") != 0) {
++		return;
++	}
++	ready = adsp_wait_ready();
++	hz = ml_get_timebase();
++	adsp_log("ready=0x%x after %llu ms%s", ready,
++	    (unsigned long long)((mach_absolute_time() - start) * 1000 / hz),
++	    ready == 0xffffffffu ? " (no value)" :
++	    (ready & ADSP_SMP2P_READY) ? " (READY)" :
++	    (ready & ADSP_SMP2P_FATAL) ? " (FATAL)" : " (not ready)");
++	adsp_log("done");
++}
++
++static void
++adsp_thread(void *arg)
++{
++	(void)arg;
++	adsp_run();
++	(void)thread_terminate(current_thread());
++	(void)thread_block(THREAD_CONTINUE_NULL);
++	__builtin_unreachable();
++}
++
++void
++mondrian_adsp_premap(void)
++{
++	uint32_t enabled = 0;
++
++	if (!PE_parse_boot_argn("mondrianadsp", &enabled, sizeof(enabled)) ||
++	    enabled != 1) {
++		return;
++	}
++	adsp_carveout = ml_io_map_unmappable(ADSP_CARVEOUT_BASE,
++	    ADSP_CARVEOUT_SIZE, VM_WIMG_WCOMB);
++	adsp_smem = ml_io_map(ADSP_SMEM_BASE, ADSP_SMEM_SIZE);
++	adsp_ipcc = ml_io_map(ADSP_IPCC_BASE, 0x1000);
++	adsp_mutex = ml_io_map(ADSP_MUTEX_BASE, 0x1000);
++	adsp_aoss = ml_io_map(ADSP_AOSS_BASE, 0x1000);
++	if (adsp_carveout == 0 || adsp_smem == 0 || adsp_ipcc == 0 ||
++	    adsp_mutex == 0 || adsp_aoss == 0) {
++		printf("MONDRIAN ADSP: premap failed carveout=0x%lx smem=0x%lx "
++		    "ipcc=0x%lx mutex=0x%lx aoss=0x%lx\n",
++		    (unsigned long)adsp_carveout, (unsigned long)adsp_smem,
++		    (unsigned long)adsp_ipcc, (unsigned long)adsp_mutex,
++		    (unsigned long)adsp_aoss);
++		return;
++	}
++	adsp_mapped = 1;
++	printf("MONDRIAN ADSP: premap carveout=0x%lx smem=0x%lx\n",
++	    (unsigned long)adsp_carveout, (unsigned long)adsp_smem);
++}
++
++void
++mondrian_adsp_start(void)
++{
++	static uint32_t started;
++	thread_t thread;
++	kern_return_t kr;
++
++	if (!adsp_mapped || __atomic_exchange_n(&started, 1,
++	    __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++	kr = kernel_thread_start(adsp_thread, NULL, &thread);
++	if (kr != KERN_SUCCESS) {
++		__atomic_store_n(&started, 0, __ATOMIC_RELEASE);
++		adsp_log("worker allocation failed kr=0x%x", kr);
++		return;
++	}
++	thread_deallocate(thread);
++	adsp_log("worker started");
++}
++
++#else /* !MONDRIAN */
++
++void
++mondrian_adsp_premap(void)
++{
++}
++
++void
++mondrian_adsp_start(void)
++{
++}
++
++#endif /* MONDRIAN */
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index fe2fb0f..17ef8d0 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2396,6 +2396,8 @@ mondrian_log_start(void)
+ 		extern void mondrian_touch_probe(void);
+ 		extern void mondrian_usb_probe(void);
+ 		extern void mondrian_audio_probe_start(void);
++		extern void mondrian_adsp_premap(void);
++		extern void mondrian_adsp_start(void);
+ 		extern void mondrian_venus_start(void);
+ 		extern void mondrian_bt_tty_init(void);
+ 		extern void mondrian_bt_ctl_init(void);
+@@ -2412,12 +2414,14 @@ mondrian_log_start(void)
+ 		 */
+ 		mondrian_reset_reason_init();
+ 		mondrian_wifi_premap();
++		mondrian_adsp_premap();
+ 		mondrian_spmi_probe();
+ 		(void)mondrian_gpu_probe();
+ 		mondrian_touch_probe();
+ 		mondrian_usb_probe();
+ 		mondrian_audio_probe_start();
+ 		mondrian_venus_start();
++		mondrian_adsp_start();
+ 		mondrian_bt_tty_init();
+ 		mondrian_bt_ctl_init();
+ 	}
