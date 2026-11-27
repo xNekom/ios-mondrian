@@ -10,8 +10,8 @@ header's `p_offset`, gaps zeroed.
 
     tools/adsp-image.py OUT DIR
 
-DIR holds NAME.mdt and NAME.bNN; the name is read from the .mdt argument's
-basename. Nothing here touches a device: it reads ROM images only.
+DIR holds `adsp.mdt` and `adsp.bNN`. Nothing here touches a device: it reads
+ROM images only.
 
 The joined file is what `qcom_mdt_parse` in the donor expects, and what
 `docs/REFERENCE_PORTS.md` describes as installed on the host before boot.
