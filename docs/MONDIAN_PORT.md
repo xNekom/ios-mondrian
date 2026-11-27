@@ -266,10 +266,10 @@ PlugInKit's container check, and Phone still fails.
 and a 128x128 HEVC Main sample reports its resolution; V19 still returns raw 0
 with `LAST`/`data=0`, so the raw port's second `SETTINGS_CHANGE` is next.
 
-The ADSP runs through PAS1 (`mondrianadsp=1`): the joined `adsp.mbn` passes
-`init_image`, `mem_setup` and `auth_and_reset`, and the `slave-kernel` SMP2P
-entry reports READY | HANDOVER 2 ms after the reset. GLINK/GPR, WCD938x and
-the two AW88261 amplifiers are next (`docs/MONDIAN_AUDIO.md`).
+The ADSP runs through PAS1 (`mondrianadsp=1`): `init_image`, `mem_setup` and
+`auth_and_reset` return 0 and the `slave-kernel` SMP2P entry reports
+READY | HANDOVER 2 ms after the reset. GLINK is up and the APM answers the
+SPF probe; WCD938x and the two AW88261 amplifiers are next (`docs/MONDIAN_AUDIO.md`).
 
 ## Getting the numbers off the device
 

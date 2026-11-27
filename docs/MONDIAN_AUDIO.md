@@ -13,6 +13,17 @@ The QMP `load_state` vote and the RPMh `lcx`/`lmx` votes are **not** needed for
 this step on mondrian: the ADSP answers with the AOSS mailbox still closed.
 They stay the fallback for a service that needs the rails.
 
+## GLINK and GPR
+
+The worker then opens GLINK on the APPS-ADSP FIFOs (SMEM items 478/479, the
+DSP's receive item 480) and registers the `adsp_apps` channel as initiator
+with 16 512-byte intents. Measured 2026-11-27: the version handshake
+completes, the channel comes up, and the GPR query `APM_GET_SPF_STATE` sent
+from client port `0x2001` to APM port 1 is answered `APM_SPF_STATE` with
+status 1, so the ADSP audio framework is ready. The first three queries
+return a basic result with status 1 before the fourth succeeds; the probe
+must retry, and the worker allows eight.
+
 ## Traps
 
 - **The windows cannot come from `ml_io_map()`.** It allocates from the fixed
