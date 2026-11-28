@@ -6652,6 +6652,9 @@ mondrian_card_picture(id icon, double side, const char **used, unsigned *total,
 	return picture;
 }
 
+/* Defined further down; the App Library card uses the staged blurred still. */
+static CGImageRef mondrian_wallpaper_blur_image(void);
+
 static unsigned
 mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 {
@@ -6757,14 +6760,20 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 			 * opened.
 			 */
 			CALayer *card = [CALayer layer];
+			CGImageRef blur = mondrian_wallpaper_blur_image();
 
-			if (mondrian_fix_on("/private/var/vm/mondrian-cardmaterial")) {
+			[card setCornerRadius:side * 0.16];
+			[card setMasksToBounds:YES];
+			if (blur != NULL) {
+				/* The icon bitmap is transparent between its four tiles,
+				 * so the wallpaper's own blur reads through the card. */
+				[card setContents:(id)blur];
+				[card setContentsGravity:(NSString *)@"resize"];
+			} else if (mondrian_fix_on("/private/var/vm/mondrian-cardmaterial")) {
 				CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
 				CGFloat parts[4] = { 82.0 / 255.0, 93.0 / 255.0,
 				    107.0 / 255.0, 0.97 };
 
-				[card setCornerRadius:side * 0.16];
-				[card setMasksToBounds:YES];
 				if (rgb != NULL) {
 					CGColorRef colour = CGColorCreate(rgb, parts);
 
@@ -10257,6 +10266,32 @@ mondrian_relabel_arm(void)
  * write and needs no build.
  */
 static CGImageRef mondrian_wallpaper;
+
+/*
+ * A CPU-blurred copy of the same still, staged by the host. CoreAnimation's
+ * live backdrop blur needs a GPU path this port does not have; giving the
+ * App Library card the wallpaper's own blur keeps its material derived from
+ * what is actually on the wall instead of the flat substitute colour.
+ */
+static CGImageRef mondrian_wallpaper_blur;
+
+static CGImageRef
+mondrian_wallpaper_blur_image(void)
+{
+	CGDataProviderRef provider;
+
+	if (mondrian_wallpaper_blur != NULL) {
+		return mondrian_wallpaper_blur;
+	}
+	provider = CGDataProviderCreateWithFilename(
+	    "/private/var/vm/mondrian-wallpaper-blur.png");
+	if (provider != NULL) {
+		mondrian_wallpaper_blur = CGImageCreateWithPNGDataProvider(
+		    provider, NULL, true, kCGRenderingIntentDefault);
+		CGDataProviderRelease(provider);
+	}
+	return mondrian_wallpaper_blur;
+}
 
 static CGImageRef
 mondrian_wallpaper_image(void)
