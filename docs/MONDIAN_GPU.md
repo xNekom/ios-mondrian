@@ -1984,6 +1984,20 @@ different matter - MobileSafari's sandbox denies the shared
 kernel's line is the evidence and the value has to be judged by what WebKit
 draws.
 
+**Measured 2026-11-28: the injection has been dead since 0402, and enabling it
+crashes Safari.** `exec_extract_strings()` evaluates `mondrian_ui_hook_env()`
+before `mondrian_safari_env()`, and the UI hook claims every app that draws
+pictures (bit `MONDRIAN_HOOK_APP`), MobileSafari included. So a boot with
+`mondrianbt=1` still never logged `injected safari dom flag`, despite the
+kernel's `MONDRIAN SAFARI: candidate xpcproxy` lines proving the gate ran on
+other processes. A temporary patch that checked the Safari gate first made the
+line appear, but MobileSafari then died at startup every time with SIG 11 in
+CoreFoundation (`lr` unslid `CoreFoundation+0x7ab64`, `far` page-aligned, the
+same NULL-string site VirtualAudio hits), while Safari without the injected
+dylib launches and draws its chrome with a blank page. The patch was removed:
+moving the gate is not a fix, and the flag path is closed until the NULL
+bundle-id in CoreAudio's device manager is solved. Do not repeat it.
+
 Building it is `tools/build-mondrian-safari.sh out/mondrian-safari.dylib`, and
 the file goes to `/private/var/vm` with `wfile` like the other injected dylibs.
 
