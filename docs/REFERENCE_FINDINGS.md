@@ -172,7 +172,13 @@ six `qcom,csiphy*@ace*` blocks, `qcom,cam-isp`, `qcom,cam-cpas` and the
 `cam_sensor_mclk*` pin states — but **no camera sensor node** (`imx*`, `ov*`,
 `s5k*` are all absent). There is therefore no I2C address, CSI lane mapping or
 sensor identity to bind a driver to, and `Camera.app` returns 0 from
-`LSApplicationWorkspace openApplicationWithBundleID:`. Bringing up a real
+`LSApplicationWorkspace openApplicationWithBundleID:`. There is no generic bus probe to close that gap: `usb-ring.py` advertises
+`si`/`sr`/`sw`, but the kernel has no handler for them (the ring answers
+`no answer`), and the only I2C code in the tree is the private bit-bang in
+`mondrian_audio_probe.c` with its own hardwired pins. Scanning camera buses
+would require mapping QUP/TLMM pins for a bank no node describes.
+
+Bringing up a real
 camera means discovering the sensor on the bus first; the BW-node injection
 cannot help until a capture graph exists.
 
