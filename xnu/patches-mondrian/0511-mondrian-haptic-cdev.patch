@@ -3,8 +3,23 @@
 # MondrianAudio.driver writes S16 mono haptic frames to /dev/mondrian-haptic
 # but the kernel never created that node. Coalesce a burst into one PM8350B
 # buzz on close so the HAL writer never blocks on the boost wait.
---- a/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382183532 +0100
-+++ b/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382334932 +0100
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index dd473f4..7cbbefe 100644
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -1544,6 +1544,8 @@ mondrian_adsp_start(void)
+ 	}
+ 	thread_deallocate(thread);
+ 	mondrian_audio_dev_init();
++	extern void mondrian_haptics_dev_init(void);
++	mondrian_haptics_dev_init();
+ 	adsp_log("worker started");
+ }
+ 
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index ad30034..f4ef248 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
 @@ -24,6 +24,10 @@
   */
  #include <sys/param.h>
@@ -16,10 +31,10 @@
  #include <pexpert/arm64/board_config.h>
  
  #if defined(MONDRIAN)
-@@ -437,3 +440,95 @@
+@@ -436,4 +440,96 @@ mondrian_haptics_dump(char *out, size_t len)
+ 	used += (size_t)snprintf(line + used, sizeof(line) - used, "\n");
  	return snprintf(out, len, "%s", line);
  }
- #endif /* MONDRIAN */
 +
 +
 +/* ---- /dev/mondrian-haptic: the HAL's Actuator device ---------------------
@@ -112,15 +127,4 @@
 +	    mh_major, node != NULL ? "ok" : "FAILED");
 +}
 +
-# The haptic cdev is created with the audio node, before userland starts.
---- a/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199449776 +0100
-+++ b/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199770888 +0100
-@@ -1860,6 +1860,8 @@
- 	}
- 	thread_deallocate(thread);
-+	extern void mondrian_haptics_dev_init(void);
- 	mondrian_audio_dev_init();
-+	mondrian_haptics_dev_init();
- 	adsp_log("worker started");
- }
- 
+ #endif /* MONDRIAN */

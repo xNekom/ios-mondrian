@@ -25,41 +25,34 @@ ports that work: the device UIDs `Speaker` and `Hawking` (VirtualAudio keeps
 everything on Null_Device without the companion) and `/product/haptics` with
 `closed-loop` in the device tree for iOS's haptics later.
 diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
-index d9cffb1..0de9121 100755
+index 00cd9d7..d184dd9 100644
 --- a/bsd/dev/mondrian_adsp.c
 +++ b/bsd/dev/mondrian_adsp.c
-@@ -20,6 +20,10 @@
- #include <sys/systm.h>
- #include <sys/proc.h>
- #include <sys/sysctl.h>
+@@ -17,6 +17,10 @@
+  * rail vote: PAS alone brought the ADSP up on this unit.
+  */
+ #include <sys/param.h>
 +#include <sys/conf.h>
 +#include <sys/ioccom.h>
 +#include <sys/uio.h>
 +#include <miscfs/devfs/devfs.h>
+ #include <sys/systm.h>
  #include <stdarg.h>
  #include <kern/clock.h>
- #include <kern/locks.h>
-@@ -958,30 +962,228 @@ SYSCTL_PROC(_kern, OID_AUTO, mondrian_audio,
-     CTLTYPE_STRUCT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
-     sysctl_mondrian_audio, "S,mas_status", "mondrian speaker PCM channel");
+@@ -695,6 +699,185 @@ adsp_apm_write(uint8_t *packet, uint32_t length, uint32_t token,
+ #define ADSP_BEEP_PERIOD_FRAMES	24000u	/* 150 ms on, then 350 ms off */
+ #define ADSP_RING_FRAMES	(ADSP_PCM_BYTES / 8u)
  
--static void adsp_apm_probe(void);
--static void adsp_pcm_selftest(void);
- 
-+/*
-+ * /dev/mondrian-audio: the HAL plug-in's end of the same ring.
-+ *
-+ * MondrianAudio.driver (in mediaserverd) writes what iOS mixed for its
-+ * "Speaker" device here: S16LE, two channels, 48000 frames a second, whole
-+ * frames only. The writer is the audio server's real-time thread, so the call
-+ * never blocks: what does not fit in the ring is dropped and counted, exactly
-+ * as the other working ports do it (/dev/redwood-audio, /dev/negroni-audio).
-+ *
-+ * This is preferred over `kern.mondrian_audio` because the server is
-+ * sandboxed and a character device is what those ports open from inside it.
-+ * The sysctl stays as the diagnostic and test channel.
-+ */
 +
++/*
++ * /dev/mondrian-audio: the HAL plug-in's end of the PCM ring.
++ *
++ * MondrianAudio.driver writes S16LE stereo 48 kHz whole frames here. The
++ * writer is CoreAudio's real-time thread, so it never blocks: what does not
++ * fit in the ring is dropped and counted. The samples land in the same
++ * adsp_pcm_va ring the boot worker queues to the TDM sink, and the mute is
++ * honoured while iOS keeps the volume in software.
++ */
 +#define MONDRIAN_AUDIO_DEVICE	"mondrian-audio"
 +#define MONDRIAN_AUDIO_FRAME	4	/* bytes: S16LE left, right */
 +
@@ -74,103 +67,85 @@ index d9cffb1..0de9121 100755
 +	uint64_t frames_played;
 +	uint32_t state;
 +	uint32_t peak_in;
-+	uint32_t peak_out;
 +	uint32_t limiter_gain_q15;
 +};
 +
 +#define MONDRIAN_AUDIO_SET_VOLUME _IOW('m', 1, struct mondrian_audio_volume)
 +#define MONDRIAN_AUDIO_GET_STATS _IOR('m', 2, struct mondrian_audio_stats)
 +#define MONDRIAN_AUDIO_SET_ROUTE _IOW('m', 3, uint32_t)
-+/* A line from the plug-in: mediaserverd's stderr never reaches the ring. */
 +#define MONDRIAN_AUDIO_LOG _IOW('m', 4, char[128])
 +
-+static uint64_t mas_frames_in, mas_frames_dropped;
-+static uint32_t mas_write_calls;
-+static uint32_t mas_peak_in;
++static uint64_t mas_frames_in, mas_frames_dropped, mas_frames_played;
++static uint32_t mas_write_calls, mas_peak_in, mas_state, mas_gain = 256;
 +static int mas_major = -1;
++static lck_grp_t *mas_grp;
++static lck_mtx_t *mas_lock;
 +
 +static int
 +mas_dev_open(__unused dev_t dev, __unused int flags, __unused int devtype,
 +    __unused struct proc *p)
 +{
-+	mondrian_audio_pcm_init();
 +	lck_mtx_lock(mas_lock);
-+	mas_open = 1;
-+	mas_head = mas_tail = 0;
-+	mas_underruns = 0;
-+	mas_frames_in = mas_frames_dropped = 0;
-+	mas_peak_in = 0;
++	mas_frames_in = mas_frames_dropped = mas_frames_played = 0;
++	mas_write_calls = mas_peak_in = 0;
++	mas_state = 2;
 +	lck_mtx_unlock(mas_lock);
-+	wakeup(&mas_state);
 +	adsp_log("audio node opened");
 +	return 0;
 +}
 +
 +static int
-+mas_dev_close(__unused dev_t dev, __unused int flags,
-+    __unused int devtype, __unused struct proc *p)
++mas_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
 +{
-+	mondrian_audio_pcm_client_done();
-+	wakeup(&mas_state);
++	lck_mtx_lock(mas_lock);
++	mas_state = 1;
++	lck_mtx_unlock(mas_lock);
 +	adsp_log("audio node closed");
 +	return 0;
 +}
 +
-+/*
-+ * S16LE stereo in, S32LE stereo in the ring: the graph's converter expects
-+ * 32-bit slots, and this is the one conversion the HAL does not do.
-+ */
++/* S16LE stereo in, S32LE stereo in the ring: the PCM converter wants 32-bit
++ * slots. Copy straight into the period ring the worker already maps. */
 +static int
 +mas_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 +{
 +	int16_t in[256 * 2];
-+	int32_t out[256 * 2];
 +	int error = 0;
 +
 +	while (uio_resid(uio) >= MONDRIAN_AUDIO_FRAME) {
 +		user_ssize_t want = uio_resid(uio);
-+		uint32_t frames, i, taken, bytes;
++		uint32_t frames, i, taken;
 +
-+		if (want > (user_ssize_t)sizeof(in)) {
++		if (want > (user_ssize_t)sizeof(in))
 +			want = (user_ssize_t)sizeof(in);
-+		}
 +		want &= ~(user_ssize_t)(MONDRIAN_AUDIO_FRAME - 1);
-+		if ((error = uiomove((caddr_t)in, (int)want, uio)) != 0) {
++		if ((error = uiomove((caddr_t)in, (int)want, uio)) != 0)
 +			break;
-+		}
 +		frames = (uint32_t)want / MONDRIAN_AUDIO_FRAME;
++		lck_mtx_lock(mas_lock);
 +		for (i = 0; i < frames * 2; i++) {
++			int32_t *ring = (int32_t *)adsp_pcm_va;
++			uint32_t at = (uint32_t)((mas_frames_played + i) %
++			    (ADSP_PCM_BYTES / 4));
 +			uint32_t a = in[i] < 0 ? (uint32_t)-(int32_t)in[i] :
 +			    (uint32_t)in[i];
 +
-+			out[i] = (int32_t)in[i] << 16;
-+			if (a > mas_peak_in) {
++			ring[at] = mas_gain == 0 ? 0 : ((int32_t)in[i] << 16);
++			if (a > mas_peak_in)
 +				mas_peak_in = a;
-+			}
 +		}
-+		bytes = mondrian_audio_pcm_write((const uint8_t *)out,
-+		    frames * 8);
-+		/*
-+		 * The plug-in's own log does not reach the console ring, so the
-+		 * kernel says whether iOS is actually playing into the node: the
-+		 * first few writes and then every 500th (about every 5 s).
-+		 */
-+		if (mas_write_calls < 4 || (mas_write_calls % 500) == 0) {
-+			adsp_log("audio node: PCM %u bytes %u frames (call %u)",
-+			    (unsigned)bytes, (unsigned)(bytes / 8),
-+			    (unsigned)mas_write_calls);
-+		}
++		taken = frames;
++		mas_frames_in += taken;
++		mas_frames_played += taken;
++		if (taken < (uint32_t)want / MONDRIAN_AUDIO_FRAME)
++			mas_frames_dropped +=
++			    (uint32_t)want / MONDRIAN_AUDIO_FRAME - taken;
++		lck_mtx_unlock(mas_lock);
++		if (mas_write_calls < 4 || (mas_write_calls % 500) == 0)
++			adsp_log("audio node: PCM %u frames (call %u)",
++			    (unsigned)taken, (unsigned)mas_write_calls);
 +		mas_write_calls++;
-+		taken = (bytes / 8) * MONDRIAN_AUDIO_FRAME;
-+		mas_frames_in += bytes / 8;
-+		if (taken < (uint32_t)want) {
-+			mas_frames_dropped += ((uint32_t)want - taken) /
-+			    MONDRIAN_AUDIO_FRAME;
-+		}
-+		if (bytes == 0) {
-+			/* The ring is full: drop the rest of this call. */
-+			break;
-+		}
 +	}
 +	return error;
 +}
@@ -184,11 +159,6 @@ index d9cffb1..0de9121 100755
 +		struct mondrian_audio_volume *v =
 +		    (struct mondrian_audio_volume *)data;
 +
-+		/*
-+		 * iOS keeps its own speaker in software volume and sets this
-+		 * once to the top, so the kernel stays at unity and only the
-+		 * mute is honoured. `below` is accepted and ignored.
-+		 */
 +		lck_mtx_lock(mas_lock);
 +		mas_gain = v->muted ? 0 : 256;
 +		lck_mtx_unlock(mas_lock);
@@ -202,15 +172,14 @@ index d9cffb1..0de9121 100755
 +		lck_mtx_lock(mas_lock);
 +		st->frames_in = mas_frames_in;
 +		st->frames_dropped = mas_frames_dropped;
-+		st->frames_played = mas_bytes / 8;
-+		st->state = mas_open ? 2 : 1;
++		st->frames_played = mas_frames_played;
++		st->state = mas_state;
 +		st->peak_in = mas_peak_in;
-+		st->limiter_gain_q15 = (uint32_t)mas_gain << 7;
++		st->limiter_gain_q15 = mas_gain << 7;
 +		lck_mtx_unlock(mas_lock);
 +		return 0;
 +	}
 +	case MONDRIAN_AUDIO_SET_ROUTE:
-+		/* One route: the speaker. */
 +		return 0;
 +	case MONDRIAN_AUDIO_LOG:
 +		adsp_log("client: %s", (const char *)data);
@@ -233,13 +202,13 @@ index d9cffb1..0de9121 100755
 +{
 +	void *node;
 +
-+	if (mas_major >= 0) {
++	if (mas_major >= 0)
 +		return;
-+	}
-+	mondrian_audio_pcm_init();
++	mas_grp = lck_grp_alloc_init("mondrian_audio", LCK_GRP_ATTR_NULL);
++	mas_lock = lck_mtx_alloc_init(mas_grp, LCK_ATTR_NULL);
 +	mas_major = cdevsw_add(-1, &mas_cdevsw);
 +	if (mas_major < 0) {
-+		adsp_log("audio node: cdevsw_add failed 0x%x", mas_major);
++		adsp_log("audio node: cdevsw_add failed %d", mas_major);
 +		mas_major = -1;
 +		return;
 +	}
@@ -253,75 +222,10 @@ index d9cffb1..0de9121 100755
 +	    mas_major);
 +}
 +
-+static void adsp_apm_probe(void);
  static void
- adsp_apm_service(void)
+ adsp_pcm_fill(uint32_t first_frame, int audio)
  {
- 	struct timespec ts = { 0, 100000000 };	/* 100 ms */
--	uint32_t waited = 0;
--	int selftest_done = 0;
- 
-+	/*
-+	 * The stream runs while a client holds it open: the HAL's
-+	 * /dev/mondrian-audio or the kernel.mondrian_audio channel. With no
-+	 * client the worker sleeps and nothing is played, so a boot is silent
-+	 * unless something asks for sound.
-+	 */
- 	for (;;) {
- 		if (!mondrian_audio_pcm_client_wanted()) {
--			/*
--			 * A build with no userland client still exercises the
--			 * whole service: two seconds after the ADSP is up,
--			 * queue the boot self-test tone and play it through
--			 * the same path a client uses.
--			 */
--			if (!selftest_done && ++waited >= 20) {
--				selftest_done = 1;
--				mas_open = 1;
--				adsp_pcm_selftest();
--				continue;
--			}
- 			lck_mtx_lock(mas_lock);
- 			if (mas_open == 0) {
- 				(void)msleep(&mas_state, mas_lock, PZERO - 1,
-@@ -990,36 +1192,10 @@ adsp_apm_service(void)
- 			lck_mtx_unlock(mas_lock);
- 			continue;
- 		}
--		selftest_done = 1;
- 		adsp_apm_probe();
- 	}
- }
- 
--/*
-- * Boot self-test, for a build with no userland client: 0.7 s of 1 kHz tone
-- * (the whole ring) so the service path and the sysctl handler run in one boot
-- * even when nothing has opened the stream yet.
-- */
--static void
--adsp_pcm_selftest(void)
--{
--	uint8_t period[ADSP_PCM_PERIOD];
--	int32_t *pcm = (int32_t *)period;
--	uint32_t n, i, frame = 0, written = 0;
--
--	for (n = 0; n < MAS_RING_BYTES / ADSP_PCM_PERIOD; n++) {
--		for (i = 0; i < ADSP_PCM_PERIOD / 4; i++) {
--			uint32_t f = frame + i / 2;
--
--			pcm[i] = (f % 48) < 24 ? 0x08000000 :
--			    (int32_t)0xf8000000;
--		}
--		frame += ADSP_PCM_PERIOD / 8;
--		written += mondrian_audio_pcm_write(period, ADSP_PCM_PERIOD);
--	}
--	adsp_log("self-test: %u bytes of tone queued", written);
--}
--
- static void
- adsp_apm_probe(void)
- {
-@@ -1674,6 +1850,7 @@ mondrian_adsp_start(void)
+@@ -1362,6 +1543,7 @@ mondrian_adsp_start(void)
  		return;
  	}
  	thread_deallocate(thread);
@@ -330,10 +234,10 @@ index d9cffb1..0de9121 100755
  }
  
 diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
-index ece2eb4..00ad355 100644
+index b3c9fde..0b4b4ff 100644
 --- a/bsd/dev/mondrian_usb.c
 +++ b/bsd/dev/mondrian_usb.c
-@@ -54,6 +54,7 @@
+@@ -51,6 +51,7 @@
  #include <net/dlil.h>
  #include <sys/kern_event.h>
  #include <sys/proc.h>
@@ -341,19 +245,17 @@ index ece2eb4..00ad355 100644
  #include <sys/signalvar.h>
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-@@ -2621,6 +2622,57 @@ ud_cmd_kill(socket_t so, struct sockaddr_in *to, const char *line)
+@@ -2618,6 +2619,53 @@ ud_cmd_kill(socket_t so, struct sockaddr_in *to, const char *line)
  	printf("MONDR USB: %s", out);
  }
  
 +
 +/*
-+ * Kill every process with this name. `kill PID` is useless for a daemon
-+ * whose PID is not in the ring (`kill mediaserverd` is `kill 0`, which
-+ * answers 3 and kills nothing), and launchd starts the daemon again at once,
-+ * which is what makes a newly installed HAL plug-in load.
-+ *
-+ * proc_iterate(), not a walk of allproc under proc_list_lock: holding that
-+ * lock across psignal() wedged the command thread on the first use.
++ * Kill every process with this name. `kill PID` is useless for a daemon whose
++ * PID is not in the ring (`kill mediaserverd` is `kill 0`, which answers 3 and
++ * kills nothing), and launchd restarts it at once, which is what makes a
++ * newly installed HAL plug-in load. proc_iterate avoids holding proc_list_lock
++ * across psignal(), which wedged the command thread.
 + */
 +struct ud_killname_arg {
 +	const char *name;
@@ -382,16 +284,14 @@ index ece2eb4..00ad355 100644
 +
 +	ka.name = line + 9;
 +	ka.killed = 0;
-+	while (*ka.name == ' ') {
++	while (*ka.name == ' ')
 +		ka.name++;
-+	}
 +	if (*ka.name == '\0') {
 +		ud_cmd_send(so, to, "killname: no name\n", 19);
 +		return;
 +	}
 +	proc_iterate(PROC_ALLPROCLIST, ud_killname_one, &ka, NULL, NULL);
-+	n = snprintf(out, sizeof(out), "killname %s -> %u\n", ka.name,
-+	    ka.killed);
++	n = snprintf(out, sizeof(out), "killname %s -> %u\n", ka.name, ka.killed);
 +	ud_cmd_send(so, to, out, (size_t)n);
 +	printf("MONDR USB: %s", out);
 +}
@@ -399,7 +299,7 @@ index ece2eb4..00ad355 100644
  static void
  ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
  {
-@@ -2823,6 +2875,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2753,6 +2801,8 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
  				ud_cmd_dcs(so, peer, cmd);
  			} else if (strncmp(cmd, "wfile ", 6) == 0) {
  				ud_cmd_wfile(so, peer, cmd);

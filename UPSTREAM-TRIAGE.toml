@@ -141,3 +141,15 @@ branch = "feat/ios16-audio-graph"
 area = "audio"
 verdict = "taken"
 note = "Patch 0507 rewritten to the donor AudioReach TDM sink graph."
+
+[[local]]
+branch = "chore/ignore-generated-config"
+area = "docs"
+verdict = "taken"
+note = "Ignore the kernel config directory staged by the machine-config scripts."
+
+[[local]]
+branch = "fix/mondrian-patch-0509-0511"
+area = "audio"
+verdict = "taken"
+note = "Rebase 0509 and 0511 onto the post-0507 mondrian_adsp.c so all 506 patches apply."
