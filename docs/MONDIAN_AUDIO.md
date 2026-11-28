@@ -351,6 +351,21 @@ not depend on that plug-in - either make `Speaker` the default output from our
 own plug-in, or fix the NULL bundle-id in CoreAudio's device manager. Keep
 `mondrianadsp=1` for every audio boot.
 
+**Measured 2026-11-28: a direct write to the node used to hang, and that is why
+`audio node: PCM` stayed 0.** `0509`'s write copied samples through
+`adsp_pcm_va`, but the cdev is created when the ADSP worker starts while the PCM
+ring is allocated only in that worker's first graph cycle. Until then the
+pointer is zero and the writer faulted in the kernel without ever returning:
+both `MondrianAudio.driver` and `tools/mondrian-node-test.c` opened the node and
+then froze. `0517` drops frames while the ring is absent (the first few drops
+are logged) and copies once it exists. With `mondrianadsp=1` a direct test now
+logs `audio node: PCM ring not ready, dropping 240 frames` followed by
+`audio node: PCM 240 frames (call 0)` and exits 0; the absence of PCM lines in
+earlier boots was a kernel hang, not only a missing route. `0518` also fixed
+the haptic node: `devfs_make_node()` takes the name under `/dev`, not a path, so
+0511's `"/dev/mondrian-haptic"` created a node that could not be opened by that
+name; on close the test now logs `actuator 480 frames -> 10 ms amp 0xfd`.
+
 The WCD938x is the headphone and mic path: a SoundWire codec that needs the
 LPASS SWR master and its own probe. The donor ladder and the register
 references are in `docs/REFERENCE_PORTS.md`; the `master-kernel`/`slave-kernel`
