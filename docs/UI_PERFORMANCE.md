@@ -1747,3 +1747,17 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    reads through. Measured 2026-11-28: the ring logs `card material = blurred
    wallpaper` and a settled capture shows all four cards with the artwork's
    colour and continuous corners -- neither backdrop boot-arg did this.
+6. **The category names are drawn by the hook** (measured 2026-11-28).
+   `SBIconLegibilityLabelView` renders them black even though the backdrop is
+   dark. The glyph colour is baked in before CA sees it: hooking the settings'
+   `_configureForStyle:contentColor:`, `primaryColor`/`secondaryColor`, their
+   initialisers, `NSString -drawAtPoint:/-drawInRect:withAttributes:` and the
+   CGImage in `-setContents:` changed nothing (no hook fired). The model does
+   answer `-icon:displayNameForLocation:` with the name, so
+   `mondrian_library_cards` adds a white `UILabel` over the card's bottom edge
+   at the same frame. On unless `/private/var/vm/mondrian-whitelibrary` holds
+   `0`. Verified on a full RAM boot: all four names (`Suggestions`, `Social`,
+   `Utilities`, `Photo & Video`) read white, no crashes, and the cards keep
+   their material. **Beware the missing `alloc`**: sending `initWithFrame:` to
+   the `UILabel` class instead of an allocated instance crash-looped
+   SpringBoard on the App Library swipe; always allocate before init.
