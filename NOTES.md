@@ -23,13 +23,11 @@ implementation and is not re-described here: `xnu/patches/` is its record.
   restart reason on its own thread, then PSCI; `hardreset` is that minus the
   HFS sync. ABL reads the reason, so a BCB alone boots the active slot, and a
   reset whose reason write stalls lands on `boot_b`. Both mappings that write
-  needs -- IMEM and the PMIC SDAM window -- are taken at boot (`0466`, `0468`);
-  doing either inside the reset cost 2 s and deadlocked behind a wedged driver.
+  needs -- IMEM and PMIC SDAM -- are taken at boot (`0466`, `0468`); doing
+  either inside the reset deadlocked behind a wedged driver.
 
-  **`boot` can be refused while `Sending … OKAY` prints:** require `Booting …
-  OKAY` *and* no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
-- **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, the
-  scheduler and AMFI; the GIC and vtimer fixes (`0116`, `0173`) are in the traps.
+  **`boot` can be refused while `Sending … OKAY` prints:** require `Booting … OKAY` and no `FAILED`; `tools/wsl/flash-image.sh` checks the slot first.
+- **Kernel.** Reaches `bsd_init` through `arm_init`, VM init, IOKit, scheduler and AMFI; GIC/vtimer fixes (`0116`, `0173`) are in the traps.
 - **UFS, end to end.** Host clocked, NOP/QUERY answered, the LU woken, the GPT
   parsed, `userdata` located, HFS+ root mounted and `launchd` exec'd. `0398`
   grows the 16 GiB volume to `userdata` (223.6 GiB here); the 4 MiB ring at the
@@ -52,30 +50,32 @@ implementation and is not re-described here: `xnu/patches/` is its record.
 - **iOS userland.** `0089` handles root-auth ENOTTY; launchd reaches 150
   processes and `0112` injects the UI dylib per daemon. `0090` adds WRITE(10);
   `DKIOCISWRITABLE` must agree or HFS disables writes. Settings, Messages,
-  Photos and Safari launch; keyboard, Bluetooth pairing and the VADC battery
-  level work (`docs/MONDIAN_WIRELESS.md`, `docs/MONDIAN_POWER.md`).
+  Photos and Safari launch; the VADC battery level works (`docs/MONDIAN_POWER.md`).
 - **Display and UI.** The home screen and Settings draw on the 1440x3200 canvas
-  (the panel tick is 120 Hz); CoreAnimation composites through Mesa/freedreno
-  FD725 on the Adreno 730 (home 81-87 fps, list scroll 113-118) and presents in
-  place (`docs/UI_PERFORMANCE.md`, `docs/MONDIAN_GPU.md`).
+  (120 Hz); CoreAnimation composites through Mesa/freedreno FD725 on the Adreno
+  730 (home 81-87 fps, scroll 113-118) in place (`docs/UI_PERFORMANCE.md`).
 - **Video.** `0420` loads `vpu20_4v.mbn` through PAS 9 and accepts the iris2 data path: properties on their ports, BIN/LINE/COMV/NON_COMV before `START(1)`, DPB/raw after `START(2)` (both `flags=0x1`); firmware 2.4 marks `COMV_BUFFER_COUNT`, `OPB_ENABLE` and `PARTIAL_DATA` unsupported (info only). A 128x128 HEVC Main sample parses and answers `SETTINGS_CHANGE`; V19 (whole-batch `wait_session`) still returns raw 0 with `LAST`/`data=0`, and the raw port's `SETTINGS_CHANGE` arrives after the frame, so output reconfig is next.
 
 Current blockers, in order:
 
 1. **Wi-Fi link, SMMU, MHI and BHI proven; the firmware is next.** W1 reaches
    Gen2 x1 and QCA6490 ID; W2 programs bank 74/SID `0x1c01`; W3 assigns BAR0
-   and proves bus master; W4/W5 read MHI and BHI 1.2. Skipping the shared
-   ARC/XO/NoC votes leaves the worker up for minutes, so the BHI image load is
+   and proves bus master; W4/W5 read MHI and BHI 1.2. The BHI image load is
    the open question; QMI/ath11k and camera remain absent.
-2. **Metal is partial.** Metal2Vulkan creates a device and passes blit/clear
-   tests, but no iOS process asks for it: Safari's page stays black and the live
-   wallpaper poster has no renderer. The UI itself composites through Mesa GLES.
-3. **Haptics: direct play is silent.** `hapb 0` then `hapb 1` lifts the boost,
-   fault is 0 and `0x498` is programmed, but two 2 s tones at `0xff` moved
-   nothing (felt). `hapclick` stages the DT's PTN click; its first live run
-   wedged the ring thread on one SPMI transaction (ping still answers).
+2. **Metal is partial.** Metal2Vulkan passes blit/clear tests. WebKit's GPU
+   and WebContent hooks fire but still allocate `w30r` surfaces and paint
+   black; the Gestalt interposers are never called, so 8-bit is not the
+   selector (`docs/REFERENCE_FINDINGS.md`). The UI composites through Mesa GLES.
+3. **Haptics: kernel half is whole, iOS half is not.** `/dev/mondrian-haptic`
+   (`0511`, `major 20 node ok`) coalesces HAL frames into a PM8350B buzz, but
+   no iOS client has opened it. Direct SPMI play lifts the boost and programs
+   `0x498`, yet long tones moved nothing; `hapclick` stages the DT's click.
 4. **Brightness.** The panel takes the DCS write (`0305`); the iOS slider moves nothing (`docs/MONDIAN_POWER.md`).
-5. **Stability.** A failed boot leaves the HFS volume to repair; a warm reboot can leave the boot core unstarted (`docs/MONDIAN_GPU.md`).
+5. **Stability.** Reflashing `backup/ios-root.simg` and deleting VirtualAudio
+   removes the mediaserverd crash loop (`crash 2`, zero crash lines); large
+   `wfile` uploads damage HFS again. `bluetoothd` still dies twice per boot
+   with `sig 6` after HCI traffic; a warm reboot can leave the boot core
+   unstarted (`docs/MONDIAN_GPU.md`).
 
 ## Building and booting
 
@@ -221,7 +221,7 @@ owns that space the next read is a bus abort (`fault_code=0x10`), which is why
 The `HFS_ENABLE_JOURNALING` sysctl creates one, and then every mount hangs *before*
 the framebuffer: no ring, no userland left to undo it. `mondriannojnl=1` mounts
 ignoring it; the disable sysctl panics (`journal_close(NULL)` has no NULL check),
-and `backup/ios-root-repaired.simg` repairs a volume that will not mount.
+and a copy of `backup/ios-root.simg` expanded and repaired with `fsck.hfsplus` mounts a volume that will not.
 
 **A record whose size outruns its blocks is what marks the volume.** `ExtendFileC`
 reserves blocks without touching the disk (`kEFDeferMask`) and grows the size with
