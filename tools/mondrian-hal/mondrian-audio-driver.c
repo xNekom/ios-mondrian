@@ -890,9 +890,12 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			STRING(CFSTR("app.mondrian.audio.hal"));
 			break;
 		case kAudioPlugInPropertyResourceBundle:
-			/* The host builds a CFBundle from this URL to read the bundle
-			 * identifier. An empty CFString made that identifier NULL. */
-			URL(resource_bundle_url());
+			/*
+			 * AudioServerPlugIn.h: a CFString path relative to the
+			 * plug-in bundle. This driver has no separate resource
+			 * bundle; an empty path names the plug-in bundle itself.
+			 */
+			STRING(CFSTR(""));
 			break;
 		}
 	} else if (object == d->object) {
