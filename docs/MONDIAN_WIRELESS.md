@@ -271,6 +271,17 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   image/address/session is the gap. `wifistat` reports it once the worker has
   mapped the host windows.
 
+A reflashed `userdata` loses `/private/var/vm/amss20.bin`; `W6` then logs
+`image=... read=-2` and `wifistat` stays at `stage=14` with every BHI register
+zero, which reads exactly like a dead firmware load. Carve the file from the
+stock modem image before judging the host sequence:
+
+    mcopy -i /root/vendor-stock/modem.img '::/image/qca6490/amss20.bin' /root/amss20-stock.bin
+
+The correct file is 5,296,128 bytes, sha256 `903c378a...`, and its first
+512 KiB sums to `0x163c3337` (the boot log's `image sum`). A truncated or
+wrongly carved 286 MiB file reports `sum=0xc0628b28` instead.
+
 Arming the worker needs **both** `mondrianwifi=1` (the gate in
 `mondrian_wifi_start()`) and `mondrianwififw=1` (the auto-load at W4). With
 only the second, `wifistat` reports `stage=0` and every register stays zero,
