@@ -1,0 +1,115 @@
+# One owner per area, one branch per change.
+#
+# `mondrian` is the main line. It only takes boot-proven bases. A hardware
+# probe stays on its own branch until its build is green and its image has
+# booted on the phone; merging two probes into one tree forces a kernel
+# rebuild for every hypothesis. Never rebase a pushed branch: open a new
+# line from the current base instead.
+#
+# Each owner works in their own clone or worktree at `checkout`. Never edit
+# a tree owned by another area. A change that spans two areas is split into
+# two branches, each with its own commit, and merged in dependency order.
+
+base = "mondrian"
+platform = "POCO F5 Pro / SM8475 / mondrian"
+ios = "16.7.16"
+branch_prefixes = ["feat/", "fix/", "docs/", "chore/", "test/"]
+
+[ui]
+owner = "ui"
+branch = "feat/ios16-ui-material"
+checkout = "worktrees/ui"
+scope = ["tools/mondrian-ui-hook.m", "tools/wsl/install-stock-wallpaper.sh",
+         "docs/UI_PERFORMANCE.md"]
+note = "Wallpaper, App Library material, legibility. Probe files in /private/var/vm belong here."
+
+[gpu]
+owner = "gpu"
+branch = "feat/ios16-gpu-surface"
+checkout = "worktrees/gpu"
+scope = ["tools/gpu/", "tools/mesa/", "tools/mk-mesa-ios.sh",
+         "tools/mk-turnip-ios.sh", "docs/MONDIAN_GPU.md", "docs/COREANIMATION_GLES.md"]
+note = "EAGL/Mesa surface sharing, hashing, pitch, blur functions. Kernel GPU patches stay with power."
+
+[display]
+owner = "display"
+branch = "feat/ios16-display-blur"
+checkout = "worktrees/display"
+scope = ["xnu/patches-mondrian/0085-*", "xnu/patches-mondrian/0114-*",
+         "xnu/patches-mondrian/0305-*", "tools/boards.py"]
+note = "Framebuffer presentation, brightness, capture group. Coordinate with gpu on scanout."
+
+[input]
+owner = "input"
+branch = "feat/ios16-touch-phase"
+checkout = "worktrees/input"
+scope = ["xnu/patches-mondrian/*touch*", "xnu/patches-mondrian/*hid*",
+         "tools/usb-ring.py"]
+note = "Touch coalescing and vsync phase."
+
+[wifi]
+owner = "wifi"
+branch = "feat/mondrian-wifi-pcie"
+checkout = "worktrees/wifi"
+scope = ["xnu/patches-mondrian/*wifi*", "xnu/patches-mondrian/*ath*",
+         "drivers/", "docs/MONDIAN_WIRELESS.md"]
+note = "PCIe/MHI/BHI and ath11k. SMMU variant has its own branch."
+
+[bluetooth]
+owner = "bluetooth"
+branch = "feat/ios16-bt-hci"
+checkout = "worktrees/bluetooth"
+scope = ["xnu/patches-mondrian/*bt*", "tools/wsl/*bt*"]
+note = "BlueTool and HCI transport."
+
+[audio]
+owner = "audio"
+branch = "feat/mondrian-audio-id-probe"
+checkout = "worktrees/audio"
+scope = ["tools/mondrian-hal/", "tools/mondrian-audio-route.c",
+         "xnu/patches-mondrian/*audio*", "docs/*AUDIO*"]
+note = "AW88261 identity, WCD938x, CoreAudio HAL."
+
+[video]
+owner = "video"
+branch = "feat/mondrian-venus-bringup"
+checkout = "worktrees/video"
+scope = ["xnu/patches-mondrian/*venus*", "xnu/patches-mondrian/*video*",
+         "docs/*VIDEO*"]
+note = "Venus PAS/HFI and HEVC sessions."
+
+[haptics]
+owner = "haptics"
+branch = "feat/mondrian-haptics-hboost"
+checkout = "worktrees/haptics"
+scope = ["xnu/patches-mondrian/*haptic*", "tools/*hap*", "docs/*HAPTIC*"]
+note = "PM8350B hBoost/PBS sequence."
+
+[power]
+owner = "power"
+branch = "feat/ios16-power"
+checkout = "worktrees/power"
+scope = ["xnu/patches-mondrian/*thermal*", "xnu/patches-mondrian/*batt*",
+         "xnu/patches-mondrian/*cpufreq*", "docs/MONDIAN_POWER.md"]
+note = "CPU/GPU clocks, thermal, battery. GPU register work belongs to gpu."
+
+[shim]
+owner = "shim"
+branch = "fix/ios16-shim"
+checkout = "worktrees/shim"
+scope = ["shim/", "tools/wsl/series-stage.sh", "tools/check-patches.sh"]
+note = "Bare-metal boot, PAC and MMU. A change here rebuilds every image."
+
+[root]
+owner = "root"
+branch = "feat/ios16-root-assets"
+checkout = "worktrees/root"
+scope = ["tools/mkiosroot.sh", "tools/ios-root-tweaks.py", "tools/wallpaper-heic2png.sh"]
+note = "iOS root build, HEIC conversion, launchd jobs."
+
+[docs]
+owner = "docs"
+branch = "docs/ios16-docs"
+checkout = "worktrees/docs"
+scope = ["NOTES.md", "docs/", "README.md", "AGENTS.md"]
+note = "Documentation-only commits never carry code."

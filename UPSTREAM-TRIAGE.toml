@@ -1,0 +1,119 @@
+# Watermark and verdict per tracked branch.
+#
+# A watermark is the last commit reviewed for this port. A verdict says what
+# was decided about the commits up to that point: "taken", "read-only" or
+# "rejected". Every new branch needs an entry here before any of its code is
+# imported. Re-review from the watermark when the branch moves; do not assume
+# the old verdict still covers new commits.
+#
+# Check the real value with `git rev-parse <ref>` before relying on a
+# watermark; a fetch can move a ref without a commit in this file changing.
+
+base = "mondrian"
+last_review = "2026-11-28"
+policy = "one verdict per commit; no silent merge; no rebase of a pushed branch"
+
+[[branch]]
+ref = "origin/mondrian"
+url = "https://github.com/xNekom/ios-mondrian"
+kind = "main"
+watermark = "14ada3cc0f60c612e7777b3aa1e9c7da852d1069"
+verdict = "taken"
+note = "Boot-proven base for the iOS 16 port. CI sees this branch."
+
+[[branch]]
+ref = "upstream/main"
+url = "https://github.com/dipa-studio/ios-sweet"
+kind = "upstream"
+watermark = "45263bee51df4a0f55cdf9c649af886399488ddb"
+verdict = "taken"
+note = "Reference implementation on SM7150; patch series is the base of ours."
+
+[[branch]]
+ref = "origin/chore/spec-kit"
+kind = "working"
+watermark = "184abff"
+verdict = "in-review"
+note = "Catch-all working branch with the port commits; split future work into named topic branches."
+
+[[branch]]
+ref = "origin/feat/mondrian-audio-id-probe"
+kind = "probe"
+watermark = "3d7c266af1e073724ed73ede57357c60175198e9"
+verdict = "taken"
+note = "AW88261 identity result."
+
+[[branch]]
+ref = "origin/feat/mondrian-haptics-hboost"
+kind = "probe"
+watermark = "f71781e9e6fc82acaa73ee0739cd7c83b7f6607d"
+verdict = "taken"
+note = "PM8350B hBoost / VMAX."
+
+[[branch]]
+ref = "origin/feat/mondrian-metal-webkit-probe"
+kind = "probe"
+watermark = "251631530b630e3e716c60f053f4959168a73fcf"
+verdict = "rejected"
+note = "Gestalt interposer never fires on this build; closed path, do not repeat."
+
+[[branch]]
+ref = "origin/feat/mondrian-venus-bringup"
+kind = "probe"
+watermark = "3d2c00d"
+verdict = "taken"
+note = "Venus PAS 9 to HFI; decode sessions only, no playback route."
+
+[[branch]]
+ref = "origin/feat/mondrian-wifi-pcie"
+kind = "probe"
+watermark = "0886338697d0c100296f3cd2b9130aab0189d0b5"
+verdict = "taken"
+note = "PCIe0 and QCA6490 identification."
+
+[[branch]]
+ref = "origin/feat/mondrian-wifi-smmu-w2"
+kind = "probe"
+watermark = "02ad0adcff6aeb2a6deaa0cd8b29dc435607cfa9"
+verdict = "taken"
+note = "apps-SMMU context and SID route."
+
+[[branch]]
+ref = "origin/fix/document-migration-gate"
+kind = "fix"
+watermark = "8634ca6c3633d09916b7da7ccca0ce8924bae50d"
+verdict = "taken"
+note = "Documentation only."
+
+[[branch]]
+ref = "origin/fix/pin-fastboot-serial"
+kind = "fix"
+watermark = "75732d9cf139267cc05a7d513f21043f5e4efff1"
+verdict = "taken"
+note = "Fastboot serial pinning."
+
+[[branch]]
+ref = "origin/gpu-surface-fix"
+kind = "probe"
+watermark = "b30c4a2"
+verdict = "read-only"
+note = "Old GPU surface experiment; re-check against the current EAGL path before importing."
+
+[[donor]]
+repo = "Emilelu/UniXNU-mondrian"
+url = "https://github.com/Emilelu/UniXNU-mondrian"
+watermark = "2026-11-25"
+verdict = "read-only"
+note = "Archived. PAC gate patch taken; rest is another iOS generation."
+
+[[donor]]
+repo = "andyleenz/pixel3-ios"
+watermark = "2026-11-28"
+verdict = "taken"
+note = "sRGB gamut and phased surface hashing; attribution in commit trailers."
+
+[[donor]]
+repo = "joranv1/ios-sailfish"
+watermark = "2026-11-28"
+verdict = "read-only"
+note = "HEIC wallpaper conversion; no licence file, reimplement rather than copy."

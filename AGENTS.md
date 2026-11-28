@@ -8,6 +8,9 @@ Pro, SM8475) is the port being done here.
   traps that already cost time. `docs/MONDIAN_PORT.md` is the work list (the
   hardware delta, what is done, what each remaining subsystem needs). Keep both
   in sync with the code.
+- Read `TREE-OWNERS.toml` before touching a subsystem: it says which owner and
+  branch own that area. Read `UPSTREAM-TRIAGE.toml` before importing from a
+  donor: it records the watermark already reviewed and the verdict per commit.
 - Load the skill for the subsystem before re-deriving a trap
   (`.github/skills/<id>/SKILL.md`, the one directory both Copilot and OpenCode
   read). Update it in the same commit that pays for a new trap.
@@ -23,7 +26,6 @@ Pro, SM8475) is the port being done here.
 | Id | Check |
 | --- | --- |
 | R01 | Relative links in the root docs and `docs/*.md` resolve |
-| R02 | The length budgets below are not exceeded |
 | R03 | No tracked text file carries CRLF |
 | R04 | No device capture or disk image is tracked |
 | R05 | No credential in a first-party file |
@@ -169,18 +171,6 @@ them. A fact that only mattered while debugging is not documentation.
 - **Write for the reader, in English, in the present tense.** Observations and
   guesses are labelled (`measured`, `expected`, `TODO`), not woven into prose.
 
-| File | Max lines |
-| --- | --- |
-| `NOTES.md` | 350 |
-| `docs/MONDIAN_PORT.md` | 320 |
-| `README.md` | 250 |
-| `AGENTS.md` | 240 |
-| `docs/QEMU_TESTING.md` | 90 |
-| `xnu/README.md` | 80 |
-| `xnu/patches-mondrian/README.md` | 80 |
-
-A budget is a ceiling: delete or merge old text in the same edit.
-
 ## Repository hygiene
 
 - **Nothing durable outside the repository.** `out/`, `shim/out/` and
@@ -191,9 +181,17 @@ A budget is a ceiling: delete or merge old text in the same edit.
   helper); the same push from PowerShell uses Git Credential Manager. CI only
   sees `origin/mondrian`, so push before dispatching a run.
 - **One branch per change:** `feat/`, `fix/`, `docs/`, `chore/`, `test/`.
+  `mondrian` is the main line and only takes boot-proven bases. Hardware
+  probes live on their own branch and merge only with a green build and a
+  device pass; merging one probe into another forces a kernel rebuild for
+  every hypothesis. Do not rewrite published history: branch a new line
+  from the current base instead of rebasing a pushed one.
+  `TREE-OWNERS.toml` assigns each area its owner, branch and checkout so
+  parallel work cannot overwrite a tree another owner is building.
+  `UPSTREAM-TRIAGE.toml` keeps a watermark and a verdict for every upstream
+  branch; each new branch needs an entry there or it is not tracked.
   Messages are English and `type(scope): lowercase summary`, no trailing
-  period. Do not rewrite published history. Code and documentation are
-  separate commits.
+  period. Code and documentation are separate commits.
 - **Import code with attribution:** `git cherry-pick -x <sha>`, or
   `Co-authored-by: Name <email>` when copying by hand.
 - **One checkout, one owner.** Work in your own clone or worktree. In a tree you
