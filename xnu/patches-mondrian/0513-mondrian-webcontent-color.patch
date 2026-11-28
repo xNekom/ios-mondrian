@@ -1,0 +1,75 @@
+# 0513 - force WebKit's 8-bit colour path in WebContent
+#
+# The GPU process interpose loaded but WebKit still allocated w30r surfaces,
+# so the extended-colour decision is made in WebContent. Give that process
+# the same MobileGestalt hook, gated on the probe switch and the dylib in
+# /private/var/vm like the other injections.
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5666,6 +5666,7 @@
+  * it makes stay zero without it (0379/0380).
+  */
+ #define MONDRIAN_HOOK_METAL             0x200
++#define MONDRIAN_HOOK_COLOR             0x1000
+ 
+ /*
+  * Every app in /Applications (0x400): the one thing an app needs is the
+@@ -6121,6 +6122,9 @@
+ 	 */
+ 	const char bridge[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-layer-bridge.dylib";
+ 	const char bridge_path[] = "/private/var/vm/mondrian-layer-bridge.dylib";
++	/* vphone #756: WebContent, not only the GPU process, asks MobileGestalt. */
++	const char color_only[] = "DYLD_INSERT_LIBRARIES=/private/var/vm/mondrian-webkit-color.dylib";
++	const char color_only_path[] = "/private/var/vm/mondrian-webkit-color.dylib";
+ 
+ 	/*
+ 	 * A bitmask: 1 containermanagerd, 2 backboardd, 4 SpringBoard, 8 the poster
+@@ -6196,11 +6200,15 @@
+ 		wanted = MONDRIAN_HOOK_METAL;
+ 	} else if (wanted == 0 && mondrian_exec_draws_pictures(imgp)) {
+ 		wanted = MONDRIAN_HOOK_APP;
++	} else if (wanted == 0 &&
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "com.apple.WebKit.WebContent")) {
++		wanted = MONDRIAN_HOOK_COLOR;
+ 	}
+ 	/* The probe names its own processes; everything else needs its mask bit. */
+ 	if (wanted == 0 ||
+ 	    (wanted != MONDRIAN_HOOK_PROBE && wanted != MONDRIAN_HOOK_METAL &&
+-	    (targets & wanted) == 0)) {
++	    wanted != MONDRIAN_HOOK_COLOR && (targets & wanted) == 0)) {
+ 		return false;
+ 	}
+ 	/*
+@@ -6228,6 +6236,15 @@
+ 		    "8-bit colour hook\n");
+ 		strlcpy(env, metal, size);
+ 		strlcat(env, color_append, size);
++		return true;
++	}
++	if (wanted == MONDRIAN_HOOK_COLOR) {
++		if (!mondrian_probe_switch() ||
++		    !mondrian_dylib_in_vm(color_only_path)) {
++			return false;
++		}
++		printf("MONDRIAN HOOK: WebContent gets the 8-bit colour hook\n");
++		strlcpy(env, color_only, size);
+ 		return true;
+ 	}
+ 	if (wanted == MONDRIAN_HOOK_BACKBOARDD) {
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6136,6 +6136,13 @@
+ 		return false;
+ 	}
+ 	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	/* 0402 claims every WebKit path for the picture bridge; claim this one
++	 * first so the 8-bit MobileGestalt hook reaches WebContent. */
++	if (wanted == 0 && name != NULL &&
++	    mondrian_name_is(name, (size_t)imgp->ip_ndp->ni_cnd.cn_namelen,
++	    "com.apple.WebKit.WebContent")) {
++		wanted = MONDRIAN_HOOK_COLOR;
++	}
+ 	if (name == NULL || sizeof(library) > size || sizeof(injector) > size) {
+ 		return false;
+ 	}

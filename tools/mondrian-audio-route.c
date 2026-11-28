@@ -12,11 +12,31 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
+#include <stdio.h>
 #include <unistd.h>
+
+#define ROUTE_LOG "/var/mobile/audio-route.log"
+
+static void
+route_log(const char *fmt, ...)
+{
+	char line[256];
+	va_list ap;
+	FILE *f;
+
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	f = fopen(ROUTE_LOG, "a");
+	if (f == NULL)
+		return;
+	fprintf(f, "%s\n", line);
+	fclose(f);
+}
 
 typedef uint32_t AudioObjectID;
 typedef int32_t OSStatus;
@@ -68,14 +88,17 @@ mondrian_route_thread(void *unused)
 	OSStatus err;
 
 	(void)unused;
+	route_log("route thread start");
 	if (AudioObjectGetPropertyDataSize == NULL ||
 	    AudioObjectGetPropertyData == NULL ||
-	    AudioObjectSetPropertyData == NULL)
+	    AudioObjectSetPropertyData == NULL) {
+		route_log("AudioObject symbols missing");
 		return NULL;
+	}
 	sleep(12); /* the HAL scan and the ADSP graph start after mediaserverd */
 	err = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devs,
 	    0, NULL, &size);
-	syslog(5, "MONDRIAN ROUTE: device list size %u err %d", size, (int)err);
+	route_log("MONDRIAN ROUTE: device list size %u err %d", size, (int)err);
 	if (err != 0 || size == 0)
 		return NULL;
 	ids = malloc(size);
@@ -102,14 +125,13 @@ mondrian_route_thread(void *unused)
 			    kCFStringEncodingUTF8);
 			wanted = strcmp(buf, "Speaker") == 0 ||
 			    strcmp(buf, "PuffinOutput") == 0;
-			syslog(5, "MONDRIAN ROUTE: device %u uid %s%s",
+			route_log("MONDRIAN ROUTE: device %u uid %s%s",
 			    (unsigned)ids[i], buf, wanted ? " WANTED" : "");
 			if (wanted) {
 				err = AudioObjectSetPropertyData(
 				    kAudioObjectSystemObject, &def, 0, NULL,
 				    sizeof(ids[i]), ids + i);
-				syslog(5, "MONDRIAN ROUTE: set default -> %d",
-				    (int)err);
+				route_log("MONDRIAN ROUTE: set default -> %d", (int)err);
 				break;
 			}
 		}
