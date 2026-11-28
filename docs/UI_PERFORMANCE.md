@@ -1739,3 +1739,11 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    `MONDRIAN WALLPAPER: stock PNG loaded ...` and a screen capture shows the
    real WWDC 2022 artwork behind the icons and dock. The HEIC asset is never
    committed; only the converter is.
+   The cards no longer need a GPU blur either: `install-stock-wallpaper.sh`
+   also stages a 36 px Gaussian blur at `mondrian-wallpaper-blur.png`, and
+   `mondrian_wallpaper_blur_image()` sets it as the `contents` of each App
+   Library card in place of the old slate square (82/93/107 at 0.97). The icon
+   bitmap is transparent between its four tiles, so the wallpaper's colour
+   reads through. Measured 2026-11-28: the ring logs `card material = blurred
+   wallpaper` and a settled capture shows all four cards with the artwork's
+   colour and continuous corners -- neither backdrop boot-arg did this.
