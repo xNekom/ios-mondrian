@@ -58,6 +58,7 @@ static int boot_arg_set(const char *name);
 static int boot_arg_int(const char *name, int fallback);
 static void mondrian_probe_fmt(const char *fmt, ...);
 static int mondrian_file_on(const char *path);
+static CGImageRef mondrian_wallpaper_image(void);
 static void mondrian_touch(const char *path);
 static void *mondrian_surface_owner(void *unused);
 
@@ -9338,13 +9339,28 @@ mondrian_wallpaint(void)
 		double now = (double)CFAbsoluteTimeGetCurrent();
 
 		if (!mondrian_library_open() && now - last_picture > 5.0) {
-			CGImageRef picture = mondrian_display_picture();
+			CGImageRef stock = mondrian_wallpaper_image();
 
 			last_picture = now;
-			if (picture != NULL) {
+			/*
+			 * The display render used to feed this layer from the screen it
+			 * was itself painting, so a gradient stayed a gradient forever.
+			 * The staged stock still, when it decoded, never reached it.
+			 */
+			if (stock != NULL) {
 				((void (*)(id, SEL, id))objc_msgSend)(mondrian_wall_layer,
-				    sel_registerName("setContents:"), (id)picture);
-				CGImageRelease(picture);
+				    sel_registerName("setContents:"), (id)stock);
+				if (said++ < 6) {
+					say("MONDRIAN WALL: stock still on the home screen\n");
+				}
+			} else {
+				CGImageRef picture = mondrian_display_picture();
+
+				if (picture != NULL) {
+					((void (*)(id, SEL, id))objc_msgSend)(mondrian_wall_layer,
+					    sel_registerName("setContents:"), (id)picture);
+					CGImageRelease(picture);
+				}
 			}
 		}
 		return;
@@ -10403,6 +10419,9 @@ mondrian_wallpaper_image(void)
 				say(line);
 				return mondrian_wallpaper;
 			}
+			say("MONDRIAN WALLPAPER: stock PNG decode failed\n");
+		} else {
+			say("MONDRIAN WALLPAPER: stock PNG cannot be opened\n");
 		}
 	}
 	pixels = calloc(1, row * height);
