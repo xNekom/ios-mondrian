@@ -312,7 +312,14 @@ explicit `dlopen` of CoreAudio, `dlsym` finds all three AudioObject calls
 `MONDRIAN ROUTE: set default`, and `audio node: PCM` stays 0 while
 `audio node opened 1`. So a userland default-output request from a pthread does
 not reach a usable CoreAudio object graph in this process; do not repeat the
-same injection. A future attempt has to call AudioObject from mediaserverd's
+same injection. A 2026-11-28 follow-up tried dispatching the same work onto
+`mediaserverd`'s main queue (`dispatch_after_f`, 15 s). The constructor logs a
+valid queue pointer but the block never runs (no `dlsym` line), and
+`audio node: PCM` stays 0. The injected dylib therefore cannot reach a running
+CoreAudio object graph by either a pthread or the main queue; stop retrying
+this path.
+
+A future attempt has to call AudioObject from mediaserverd's
 own run loop (or route at the HAL plug-in level) and log before/after each call
 to see where it stops.
 
