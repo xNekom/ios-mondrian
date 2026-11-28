@@ -11083,6 +11083,13 @@ mondrian_library_step(void)
 	id app, windows;
 	unsigned count, i;
 	int on = mondrian_fix_on("/private/var/vm/mondrian-nolibrary");
+	/*
+	 * iOS uses the library's live CABackdropLayer for its background. On this
+	 * port it works while the Library slides in, but the settled view used to
+	 * be covered by a painted substitute. With this switch set, leave the
+	 * backdrop alone and paint no background at all.
+	 */
+	int live = mondrian_file_on("/private/var/vm/mondrian-library-live");
 
 	if (app_cls == Nil || (method = class_getClassMethod(app_cls,
 	    sel_registerName("sharedApplication"))) == NULL) {
@@ -11102,11 +11109,11 @@ mondrian_library_step(void)
 		if (name == NULL || strstr(name, "HomeScreenWindow") == NULL) {
 			continue;
 		}
-		if (mondrian_library_image() != NULL) {
+		if (!live && mondrian_library_image() != NULL) {
 			painted += mondrian_library_paint(window, 0, "LibraryPodFolderView",
 			    mondrian_library_image());
 		}
-		if (mondrian_wallpaper_image() != NULL) {
+		if (!live && mondrian_wallpaper_image() != NULL) {
 			painted += mondrian_library_paint(window, 0, "SBRootFolderView",
 			    mondrian_wallpaper_image());
 		}
