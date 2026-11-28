@@ -159,3 +159,9 @@ branch = "fix/ui-stock-wallpaper"
 area = "ui"
 verdict = "taken"
 note = "Home wallpaper layer prefers the staged stock still over a render of the screen it paints."
+
+[[local]]
+branch = "fix/mondrian-audio-hal-registration"
+area = "audio"
+verdict = "taken"
+note = "Register MondrianAudio.driver with CoreAudio using the piid bundle selector and a real CFURL resource bundle."
