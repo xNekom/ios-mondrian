@@ -10277,6 +10277,29 @@ mondrian_wallpaper_image(void)
 	if (mondrian_wallpaper != NULL) {
 		return mondrian_wallpaper;
 	}
+	/*
+	 * The stock iOS 16 wallpaper is staged at this path by the host (its HEIC
+	 * layers cannot be decoded here without the A11's HEVC block). Prefer it
+	 * over the generated gradient; the fallback stays for a root without it.
+	 */
+	{
+		const char *path = "/private/var/vm/mondrian-wallpaper.png";
+		CGDataProviderRef provider = CGDataProviderCreateWithFilename(path);
+
+		if (provider != NULL) {
+			mondrian_wallpaper = CGImageCreateWithPNGDataProvider(
+			    provider, NULL, true, kCGRenderingIntentDefault);
+			CGDataProviderRelease(provider);
+			if (mondrian_wallpaper != NULL) {
+				char line[160];
+
+				snprintf(line, sizeof(line),
+				    "MONDRIAN WALLPAPER: stock PNG loaded from %s\n", path);
+				say(line);
+				return mondrian_wallpaper;
+			}
+		}
+	}
 	pixels = calloc(1, row * height);
 	rgb = CGColorSpaceCreateDeviceRGB();
 	ctx = pixels != NULL ? CGBitmapContextCreate(pixels, width, height, 8, row, rgb,
