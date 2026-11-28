@@ -36,47 +36,7 @@ color_log(const char *what)
 }
 
 static const struct mondrian_interpose color_bool_interpose;
-static const struct mondrian_interpose color_copy_interpose;
 
-static int
-is_key(CFStringRef key, const char *want)
-{
-	char buf[128];
-
-	if (key == NULL ||
-	    !CFStringGetCString(key, buf, sizeof(buf), kCFStringEncodingUTF8))
-		return 0;
-	return strcmp(buf, want) == 0;
-}
-
-static Boolean
-mondrian_color_bool(CFStringRef key)
-{
-	Boolean (*real)(CFStringRef) =
-	    (Boolean (*)(CFStringRef))color_bool_interpose.replacee;
-
-	if (is_key(key, "HasExtendedColorDisplay")) {
-		color_log("bool HasExtendedColorDisplay -> false");
-		return false;
-	}
-	return real != NULL ? real(key) : false;
-}
-
-static CFTypeRef
-mondrian_color_copy(CFStringRef key)
-{
-	CFTypeRef (*real)(CFStringRef) =
-	    (CFTypeRef (*)(CFStringRef))color_copy_interpose.replacee;
-
-	if (is_key(key, "HasExtendedColorDisplay") ||
-	    is_key(key, "artwork-display-gamut")) {
-		color_log("copy extended gamut -> false");
-		return kCFBooleanFalse;
-	}
-	return real != NULL ? real(key) : NULL;
-}
-
-__attribute__((used, section("__DATA,__interpose")))
 static const struct mondrian_interpose color_bool_interpose = {
 	(const void *)mondrian_color_bool,
 	(const void *)MGGetBoolAnswer,

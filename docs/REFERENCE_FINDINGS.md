@@ -145,7 +145,15 @@ The Gestalt interposer in `tools/mondrian-webkit-color.c` is injected by patch
 `com.apple.WebKit.WebContent` (before 0402's picture-bridge branch claims the
 process). Measured: the kernel logs both injections and AMFI logs the dylib,
 but WebKit still creates `0x77333072` (`w30r`) surfaces and the page remains
-black. The interposer then logged to both a file and stderr (2026-11-28): neither
+black. A further probe interposed `CVPixelBufferCreate` and
+`CVPixelBufferCreateWithIOSurface` and logged format plus stack to file,
+stderr and `syslog(LOG_ALERT)`. With `MobileSafari` and two `WebContent`
+processes running (confirmed in the ring), **no interposer fired at all** —
+not even the Gestalt ones — so `DYLD_INSERT_LIBRARIES` interposing is not
+reaching these symbols in WebKit on this build. Identifying the `w30r`
+selector needs a different injection mechanism, not another interposer.
+
+The interposer then logged to both a file and stderr (2026-11-28): neither
 `MGGetBoolAnswer` nor `MGCopyAnswer` is ever called in WebContent or the GPU
 process, so WebKit does not get the extended-colour answer from MobileGestalt
 on this port. Do not repeat the Gestalt hook. The next step would be to find
