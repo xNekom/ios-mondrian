@@ -161,9 +161,30 @@ mondrian_route_thread(void *unused)
 	    handle != NULL, get_size != NULL, get_data != NULL, set_data != NULL);
 	if (get_size == NULL || get_data == NULL || set_data == NULL)
 		return NULL;
-	/* The HAL scan starts after mediaserverd; give it a few seconds. */
-	sleep(6);
-	speaker = find_speaker();
+	/*
+	 * The HAL scan starts well after mediaserverd: a probe run a minute
+	 * into the boot sees the plug-in, while a 6 s delay does not. Retry
+	 * until the plug-in object shows up, logging the list size so a
+	 * failure names which step is empty.
+	 */
+	for (unsigned try = 0; try < 12; try++) {
+		sleep(5);
+		{
+			struct audio_property_address owned = {
+				kAudioObjectPropertyOwnedObjects,
+				kAudioObjectPropertyScopeGlobal, 0
+			};
+			uint32_t n = 0;
+
+			if (get_size(kAudioObjectSystemObject, &owned, 0, NULL,
+			    &n) != 0)
+				n = 0;
+			printf("MONDRIAN ROUTE: try %u owned=%u\n", try, n);
+		}
+		speaker = find_speaker();
+		if (speaker != 0)
+			break;
+	}
 	printf("MONDRIAN ROUTE: speaker id=%u\n", (unsigned)speaker);
 	if (speaker == 0)
 		return NULL;
