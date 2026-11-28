@@ -11084,13 +11084,20 @@ mondrian_library_step(void)
 	unsigned count, i;
 	int on = mondrian_fix_on("/private/var/vm/mondrian-nolibrary");
 	/*
-	 * iOS uses the library's live CABackdropLayer for its background. On this
-	 * port it works while the Library slides in, but the settled view used to
-	 * be covered by a painted substitute. With this switch set, leave the
-	 * backdrop alone and paint no background at all.
+	 * iOS uses the library's live CABackdropLayer for its background, and on
+	 * this port it does blur the settled view once the wallpaper is real. Paint
+	 * no substitute by default. The old painted background is kept behind a
+	 * switch for an A/B: create /private/var/vm/mondrian-library-substitute.
 	 */
-	int live = mondrian_file_on("/private/var/vm/mondrian-library-live");
+	int substitute = mondrian_file_on("/private/var/vm/mondrian-library-substitute");
 
+	if (!substitute) {
+		static unsigned said;
+
+		if (said++ < 2) {
+			say("MONDRIAN LIBRARY: live backdrop, no painted substitute\n");
+		}
+	}
 	if (app_cls == Nil || (method = class_getClassMethod(app_cls,
 	    sel_registerName("sharedApplication"))) == NULL) {
 		return;
@@ -11109,11 +11116,11 @@ mondrian_library_step(void)
 		if (name == NULL || strstr(name, "HomeScreenWindow") == NULL) {
 			continue;
 		}
-		if (!live && mondrian_library_image() != NULL) {
+		if (substitute && mondrian_library_image() != NULL) {
 			painted += mondrian_library_paint(window, 0, "LibraryPodFolderView",
 			    mondrian_library_image());
 		}
-		if (!live && mondrian_wallpaper_image() != NULL) {
+		if (substitute && mondrian_wallpaper_image() != NULL) {
 			painted += mondrian_library_paint(window, 0, "SBRootFolderView",
 			    mondrian_wallpaper_image());
 		}
