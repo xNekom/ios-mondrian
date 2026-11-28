@@ -304,6 +304,19 @@ what the phone's amplifier actually runs.
 
 ## What is next
 
+`tools/mondrian-audio-route.c` was injected into mediaserverd through patch
+0512 to set our HAL device as CoreAudio's default output. Measured 2026-11-28:
+the dylib loads (`MONDRIAN AMFI: mondrian-msg-guard.dylib`) and, after an
+explicit `dlopen` of CoreAudio, `dlsym` finds all three AudioObject calls
+(`dlopen 1`, `dlsym 1 1 1`). The thread still never logs a device list or a
+`MONDRIAN ROUTE: set default`, and `audio node: PCM` stays 0 while
+`audio node opened 1`. So a userland default-output request from a pthread does
+not reach a usable CoreAudio object graph in this process; do not repeat the
+same injection. A future attempt has to call AudioObject from mediaserverd's
+own run loop (or route at the HAL plug-in level) and log before/after each call
+to see where it stops.
+
+
 After a userdata reflash the stock root brings VirtualAudio back. Delete
 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (and the
 `/System/Library/...` copy) over the ring before the boot that loads the HAL:
