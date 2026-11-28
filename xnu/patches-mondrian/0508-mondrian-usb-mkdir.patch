@@ -1,0 +1,60 @@
+xnu 0508: create a directory over the USB command channel
+
+`wfile` can replace or create a file, but not a directory, and installing a
+driver bundle needs one: `/Library/Audio/Plug-Ins/HAL` exists in the image and
+is writable at runtime, while the bundle below it is not. The hook runs as the
+user and cannot create a root-owned directory, so the kernel does it.
+
+The command is `mkdir PATH`, answered with `mkdir <errno>`. It reuses the
+`mondrian_root_mkdir()` helper the HFS bring-up already had (namei with
+OP_MKDIR and LOCKPARENT, VATTR type VDIR, vn_authorize_mkdir then VNOP_MKDIR),
+which until now was static and only created `/private/var/vm` at boot; it is
+now exported. The mode is 0755, the owner root, and an existing directory
+answers EEXIST, so a repeated install is harmless.
+
+The host side is `tools/usb-ring.py mkdir PATH`. Together with `wfile` it
+installs the speaker HAL bundle without reflashing the root image:
+
+  python tools/usb-ring.py mkdir /Library/Audio/Plug-Ins/HAL/MondrianAudio.driver
+  python tools/usb-ring.py wfile /Library/Audio/Plug-Ins/HAL/MondrianAudio.driver/Info.plist Info.plist
+  python tools/usb-ring.py wfile /Library/Audio/Plug-Ins/HAL/MondrianAudio.driver/MondrianAudio MondrianAudio
+
+which is what `tools/install-mondrian-hal.sh` runs.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 17ef8d0..86b904f 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -2435,7 +2435,7 @@ mondrian_log_start(void)
+  * what makes Jetsam kill launchd. Create the directory once the root vnode is
+  * installed, before load_init_program().
+  */
+-static int
++int
+ mondrian_root_mkdir(const char *path, int mode)
+ {
+ 	struct nameidata nd;
+diff --git a/bsd/dev/mondrian_usb.c b/bsd/dev/mondrian_usb.c
+index 702775b..ece2eb4 100644
+--- a/bsd/dev/mondrian_usb.c
++++ b/bsd/dev/mondrian_usb.c
+@@ -2737,6 +2737,20 @@ ud_cmd_thread(void *arg __unused, wait_result_t wr __unused)
+ 				printf("MONDRIAN DEL: %s -> %d\n", cmd + 4, err);
+ 				len = snprintf(ans, sizeof(ans), "del %d\n", err);
+ 				ud_cmd_send(so, peer, ans, (size_t)len);
++			} else if (strncmp(cmd, "mkdir ", 6) == 0) {
++				/*
++				 * One root-side mkdir, so a bundle can be installed over
++				 * the command channel: the hook runs as the user and
++				 * cannot create a root-owned directory.
++				 */
++				extern int mondrian_root_mkdir(const char *, int);
++				char ans[192];
++				int err, len;
++
++				err = mondrian_root_mkdir(cmd + 6, 0755);
++				printf("MONDRIAN MKDIR: %s -> %d\n", cmd + 6, err);
++				len = snprintf(ans, sizeof(ans), "mkdir %d\n", err);
++				ud_cmd_send(so, peer, ans, (size_t)len);
+ 			} else if (strncmp(cmd, "ls ", 3) == 0) {
+ 				extern int mondrian_hfs_list(const char *, int);
+ 				char ans[96];
