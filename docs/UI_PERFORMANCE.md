@@ -1734,8 +1734,12 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    fix stays. The stock wallpaper now works without the GPU path:
    `tools/wsl/install-stock-wallpaper.sh` converts the iPhone X iOS 16 still
    (`7400.WWDC_2022`) to PNG off the phone and stages it at
-   `/private/var/vm/mondrian-wallpaper.png`; `mondrian_wallpaper_image()`
-   prefers it over the generated gradient. Measured 2026-11-28: the ring logs
+   `/private/var/vm/mondrian-wallpaper.png`. A RAM boot that dies and falls back
+   to `boot_b` loses these staged files: the next good boot shows the old
+   gradient and slate cards even though the kernel is current. Re-run the
+   installer and respring before judging the UI after any failed boot.
+   `mondrian_wallpaper_image()` prefers the staged still over the generated
+   gradient. Measured 2026-11-28: the ring logs
    `MONDRIAN WALLPAPER: stock PNG loaded ...` and a screen capture shows the
    real WWDC 2022 artwork behind the icons and dock. The HEIC asset is never
    committed; only the converter is.
