@@ -47,7 +47,10 @@ XNU=$WORK/xnu
 FAKEROOT=$WORK/fakeroot
 OBJROOT=$WORK/build/xnu.obj
 SYMROOT=$WORK/build/xnu.sym
-LOG=${LOG:-xnu/out/kernel-linux.log}
+# cycle.sh exports LOG as a *directory* for its own artifacts. Never inherit
+# it: tee would try to write to a directory and a successful build would be
+# reported as failed (measured 2026-11-28). The build log is this script's own.
+LOG=xnu/out/kernel-linux.log
 JOBS=${JOBS:-$(nproc)}
 ADDITIONAL_SYMBOLS=${ADDITIONAL_SYMBOLS:-}
 
