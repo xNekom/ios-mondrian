@@ -354,6 +354,16 @@ CoreAudio instantiate the plug-in's devices into the global list, probably by
 answering `kAudioObjectPropertyOwnedObjects` with the device class qualifier
 the host uses. Do not retry the route/dispatch work above until that is fixed.
 
+A follow-up probe (`probe5`) asked the registered plug-in object (ID 40) for
+`kAudioPlugInPropertyDeviceList`: it returns all four devices with their real
+UIDs (`Speaker` 41, `Hawking` 47, `Actuator` 50, `Codec` 54), all
+`DeviceIsAlive=1`. So CoreAudio sees the devices **through the plug-in**, but
+still excludes them from `kAudioHardwarePropertyDevices`. Publishing the
+change to the system object as well (`PropertiesChanged` with `dev#` on
+object 1) returns 0 and does not change that: the host needs something else
+before it publishes them globally. Inspecting the host's decision is the next
+step; the plug-in side is as complete as it can be made from the public API.
+
 
 After a userdata reflash the stock root brings VirtualAudio back. Delete
 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (and the
