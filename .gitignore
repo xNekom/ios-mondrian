@@ -9,6 +9,8 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 /out/
+# kernel config staged by the machine-config patch scripts
+/config/
 
 # the console ring is one boot's capture, not source
 /ring.bin
