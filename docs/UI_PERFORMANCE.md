@@ -1756,6 +1756,13 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    reads through. Measured 2026-11-28: the ring logs `card material = blurred
    wallpaper` and a settled capture shows all four cards with the artwork's
    colour and continuous corners -- neither backdrop boot-arg did this.
+   The home wallpaper layer used to be painted from `CARenderServerRenderDisplay`,
+   a picture of the screen it was itself painting: a staged stock still decoded
+   (`MONDRIAN WALLPAPER: stock PNG loaded`) but never reached the glass, so the
+   fallback gradient stayed on screen forever. `mondrian_wallpaint()` now prefers
+   the staged still and only renders the display when no still decoded. A boot
+   that fails and falls back to `boot_b` loses both staged PNGs, so re-run
+   `tools/wsl/install-stock-wallpaper.sh` before judging the wallpaper again.
 6. **The category names are drawn by the hook** (measured 2026-11-28).
    `SBIconLegibilityLabelView` renders them black even though the backdrop is
    dark. The glyph colour is baked in before CA sees it: hooking the settings'
