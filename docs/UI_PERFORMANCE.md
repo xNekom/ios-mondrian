@@ -1515,10 +1515,10 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
   compositor that hung, and a reboot does not clear it -- the forced `fsck`
   still leaves 1357 marks in the next boot. Check `hfs_mark_inconsistent` first
   in any boot that stops presenting, and restore
-  `backup/ios-root-repaired.simg` when it is there.
+  `backup/ios-root.simg` when it is there.
 - **A verified-clean root degrades because a catalog record can claim more bytes
   than the blocks it owns.** Measured 2026-11-18:
-  `backup/ios-root-repaired.simg` expanded and checked with `fsck.hfsplus`
+  `backup/ios-root.simg` expanded and checked with `fsck.hfsplus`
   ("appears to be OK"), written to `userdata`, and the first boot on it already
   produces them: `knowledgeC.db-shm` at 32768 bytes with **one** block, and a
   fresh 37-byte file with **none** every boot (a new cnid each time, so they are
@@ -1721,3 +1721,12 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    `mondrian-gl: frame` line), so the open question is how many frames the
    submission path can hold in flight: a third one would let the CPU run a frame
    ahead without skipping the wait. TODO, not measured.
+5. **App Library transparency is a Metal result, not a backdrop-key result**
+   (measured 2026-11-28). Two boots of the same image, one with the hook's
+   backdrop fix and one with `mondrianbackdrop=0`, both show grey category cards
+   with the wallpaper gradient behind them; disabling the fix only adds a black
+   wedge at the panel's top-right corner. Keep the fix. `AdyaGMD/ios-spes` and
+   `andyleenz/pixel3-ios` get the Library's blur by giving CoreAnimation a
+   GPU/Metal device; the 600-repo survey in `REFERENCE_FINDINGS.md` has the
+   donor list. The stock wallpaper needs the same GPU path plus the HEIC layers
+   converted to PNG at root-build time (`joranv1/ios-sailfish`).
