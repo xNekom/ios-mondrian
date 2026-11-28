@@ -252,3 +252,54 @@ nearby Snapdragon:
 Consequence: stop re-testing CoreAudio discovery, Gestalt interposers and the
 BHI doorbell. Port the implementations above; files and licences are in
 `REFERENCE_PORTS.md`.
+
+## The sibling mondrian port (audited 2026-11-28)
+
+[Emilelu/UniXNU-mondrian](https://github.com/Emilelu/UniXNU-mondrian) targets
+the same phone. Its repo is archived; its current `main` is an iOS 27 stage-0
+defconfig with no storage, display or GPU enabled, and its last
+device-verified UI is SpringBoard on a **software renderer** (0.9-7.8 fps
+against our 81-118 fps). It is not a source of UI or performance fixes. These
+are the concrete deltas:
+
+- **PAC gate (import first).** `patches/ios-mondrian/pac-probe-arm64e-gate.patch`
+  (commits `f67aee8703`, `ec0863fe63`, `8cc3855376`) applies to our
+  `shim/pac.c` and `shim/start.S`: `APA=5` is FEAT_PAuth (with EPAC and PAuth2),
+  `API=0` only means no generic keys, and the exception frame restores
+  `x29/x30` from `#272` with `add sp,#34*8`. Our note that pointer auth is
+  "none" describes a compile choice, not the hardware. READ-ONLY on the donor
+  side (offline objdump); one boot is still needed after import.
+- **Layered transparency.** `patches/xnu/0600-k60-display-composition.patch`
+  keeps unmentioned layers, composes old and new footprints with
+  premultiplied-BGRA `sourceOver()` and writes only damaged rects. It is the
+  only donor code aimed at transparency rather than one full-screen surface,
+  but its own header says verification was not run. Treat as a candidate to
+  diff against our `0085`, not as a proven fix.
+- **Wallpaper selection.** `patches/xnu/0618-k60-wallpaper-seed.patch`,
+  `userland/ui_compat.c:628-741` and
+  `docs/research/springboard/WALLPAPER-CHAIN.md`: a staged still is not a
+  selected wallpaper. The donor needed a native `WKSystemShellWallpaperManager`
+  call and the correct `logicalScreenClass`; pixels were never confirmed.
+- **Touch-driven responsiveness.** `patches/xnu/0626-k60-touch-activity.patch`
+  and `drivers/PongPower/K60CpuFreqProbe.cpp` raise the P-domain to 1.8048 GHz
+  in a ~1 s window from touch reports. This is the donor's only
+  device-verified latency work and is the closest near-term lever for the
+  app switcher. GPU DCVS in the same series is build-only.
+- **Metal traps.** `drivers/PongMetal/PongMetalPlugin.mm`,
+  `PongQuartzCorePolicy.h`, `seeds/PongAdrenoMetal.clients` and
+  `docs/engineering/GPU-IOSURFACE-ROOT-CAUSE.md` §6: the plugin was deployed
+  to `/private/var/ngpu/addons/` while the injector read `/private/var/pong/`,
+  so no process ever loaded it and `MTLCreateSystemDefaultDevice()` stayed nil.
+  A CA allow-list covers `backboardd`, `SpringBoard`, `CollectionsPoster`,
+  `WidgetRenderer_Default`, `PosterBoard` and the poster extensions.
+- **4 KiB pages are not excluded by the SoC.** The donor boots iOS 16.6.1 to
+  SpringBoard at 4 KiB with `native-4k-*.patch`; our failure was deriving 4 KiB
+  code-sign hashes from the 16 KiB cache, not a hardware limit.
+- IOSurface renaming is a dead end (patches `0622`/`0623` retired); the donor's
+  thermal status contradicts itself, so check a log before treating it as a
+  result. Its sealed-root `bindfs` trap does not apply to our single HFS+
+  volume, and its committed Bluetooth firmware blobs are not license-clean
+  for this tree.
+
+No adaptive text colour, text legibility fix, Safari rendering, HEIC wallpaper
+converter or HFS+ work exists there; do not look for a UI fix in this donor.
