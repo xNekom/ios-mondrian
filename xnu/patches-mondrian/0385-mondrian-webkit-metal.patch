@@ -60,17 +60,25 @@ mondrian_probe_switch(), so a default boot injects nothing new.
  		return false;
  	}
  	/*
-@@ -5917,6 +5938,15 @@
+@@ -5917,6 +5938,23 @@
  	 * /private/var/vm, and when it is not there yet backboardd is left alone
  	 * rather than handed the hook.
  	 */
 +	if (wanted == MONDRIAN_HOOK_METAL) {
-+		if (!mondrian_probe_switch() || !mondrian_dylib_in_vm(metal_path)) {
++		/* vphone #756: WebKit's GPU process needs 8-bit backing stores. */
++		const char color_append[] =
++		    ":/private/var/vm/mondrian-webkit-color.dylib";
++		const char color_path[] =
++		    "/private/var/vm/mondrian-webkit-color.dylib";
++
++		if (!mondrian_probe_switch() || !mondrian_dylib_in_vm(metal_path) ||
++		    !mondrian_dylib_in_vm(color_path)) {
 +			return false;
 +		}
-+		printf("MONDRIAN HOOK: WebKit's GPU process gets the Metal "
-+		    "provider\n");
++		printf("MONDRIAN HOOK: WebKit's GPU process gets Metal and the "
++		    "8-bit colour hook\n");
 +		strlcpy(env, metal, size);
++		strlcat(env, color_append, size);
 +		return true;
 +	}
  	if (wanted == MONDRIAN_HOOK_BACKBOARDD) {

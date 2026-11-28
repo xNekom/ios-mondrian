@@ -304,6 +304,15 @@ what the phone's amplifier actually runs.
 
 ## What is next
 
+After a userdata reflash the stock root brings VirtualAudio back. Delete
+`/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (and the
+`/System/Library/...` copy) over the ring before the boot that loads the HAL:
+`usb-ring.py rf <path> 0 4` must answer `-2`. Measured 2026-11-28 on the freshly
+flashed root: `MONDRIAN PROC: ... crash 2`, zero `CRASH mediaserverd` lines and
+`audio node opened 1`. The old crash-log loop is gone; `audio node: PCM` is
+still 0, so the missing piece remains a userland route into this device.
+
+
 The kernel side is complete: the ADSP graph starts with `status=0`, the HAL
 loads and opens `/dev/mondrian-audio` (`opened=1`), and the SMMU map no longer
 fails. The remaining gap is userland routing: **iOS never writes samples**
