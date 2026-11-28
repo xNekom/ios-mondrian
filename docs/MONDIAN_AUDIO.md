@@ -364,6 +364,21 @@ object 1) returns 0 and does not change that: the host needs something else
 before it publishes them globally. Inspecting the host's decision is the next
 step; the plug-in side is as complete as it can be made from the public API.
 
+**Measured 2026-11-28: the default output can be set by object ID without the
+global device list.** `probe11` called
+`AudioObjectSetPropertyData(kAudioHardwarePropertyDefaultOutputDevice, 41)`
+and got `0`; reading it back showed `50 -> 41`. So the userland route does not
+need `kAudioHardwarePropertyDevices` at all. `tools/mondrian-audio-route.c`
+now discovers the plug-in's `Speaker` ID through
+`kAudioObjectPropertyOwnedObjects` and sets it as default from a detached
+thread in mediaserverd. A boot with `mondrianadsp=1 mondrianmsguard=1` proved
+the dylib is injected (`MONDRIAN ROUTE: thread start`), but the discovery ran
+too early (6 s) and returned `speaker id=0`; the retries added in `3c4c797`
+have not yet been observed to load because replacing a mapped dylib in
+`/private/var/vm` in place keeps the old copy. Delete the file before writing
+a new dylib, as `install-mondrian-hal.sh` does for the HAL binary. No
+`audio node: PCM` line from an iOS client has appeared yet.
+
 
 After a userdata reflash the stock root brings VirtualAudio back. Delete
 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (and the
