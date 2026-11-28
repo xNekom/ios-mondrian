@@ -701,9 +701,17 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 			kAudioObjectPropertyScopeGlobal,
 			0  /* kAudioObjectPropertyElementMaster */
 		};
+		AudioObjectPropertyAddress sysaddr = {
+			kAudioHardwarePropertyDevices,
+			kAudioObjectPropertyScopeGlobal,
+			0
+		};
 		OSStatus e = host->PropertiesChanged(host, OBJECT_PLUGIN, 1, &addr);
+		OSStatus se = host->PropertiesChanged(host, kAudioObjectSystemObject,
+		    1, &sysaddr);
 
-		say("published device list -> %d", (int)e);
+		say("published device list -> %d, system devices -> %d", (int)e,
+		    (int)se);
 	}
 	return 0;
 }

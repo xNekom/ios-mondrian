@@ -20,6 +20,8 @@ typedef void *LPVOID;
 #include <CoreAudioTypes/CoreAudioTypes.h>
 
 typedef UInt32 AudioObjectID;
+#define kAudioObjectSystemObject             ((AudioObjectID)1)
+#define kAudioHardwarePropertyDevices        ('d' << 24 | 'e' << 16 | 'v' << 8 | '#')
 typedef struct {
 	UInt32 mSelector, mScope, mElement;
 } AudioObjectPropertyAddress;
