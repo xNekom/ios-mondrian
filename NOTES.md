@@ -273,9 +273,9 @@ powers it down in fastboot; the kernel brings the host up itself either way
 (`0074`-`0076`). Wait loops are spin counts, not `delay()`: a wait that never
 completes has to be non-fatal and dump `hcs/is/dbr` plus the UTRD. The write
 path is `0090` (WRITE(10), read-modify-write, SYNCHRONIZE CACHE).
-**Known debt:** `ufs_find_partition()` bounds the entry table with
-`nent * esz > BOUNCE_SIZE`, a 32-bit product a corrupt table can wrap; guard
-with `nent > BOUNCE_SIZE / esz`.
+`0516` bounds the GPT entry table with `nent > BOUNCE_SIZE / esz`: the earlier
+`nent * esz > BOUNCE_SIZE` was a 32-bit product that a corrupt header could wrap,
+passing the check and asking `ufs_read_blocks()` for a bogus count.
 
 ## Display
 

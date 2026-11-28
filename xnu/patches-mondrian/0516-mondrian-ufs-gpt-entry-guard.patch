@@ -1,0 +1,22 @@
+xnu 0516: bound the GPT entry table before multiplying
+
+ufs_find_partition() read the GPT header's entry count and size from the disk
+and rejected a table whose byte count did not fit BOUNCE_SIZE. The product was
+computed in 32 bits, so a corrupt header with a large enough entry count wrapped
+and passed the check; ufs_read_blocks() was then asked for a bogus block count
+and the read walked off the bounce buffer. Compare the count against
+BOUNCE_SIZE / esz instead, which cannot wrap. esz is checked to be 128 first,
+so the division is safe.
+diff --git a/bsd/dev/mondrian_ufs.c b/bsd/dev/mondrian_ufs.c
+index 86b904f..e85c25f 100644
+--- a/bsd/dev/mondrian_ufs.c
++++ b/bsd/dev/mondrian_ufs.c
+@@ -548,7 +548,7 @@ ufs_find_partition(const char *want)
+ 	memcpy(&entry_lba, b + 72, 8);
+ 	memcpy(&nent, b + 80, 4);
+ 	memcpy(&esz, b + 84, 4);
+-	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++	if (esz != 128 || nent == 0 || nent > BOUNCE_SIZE / esz) {
+ 		printf("MONDRIAN UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		UFS_WHY("unsupported GPT entries %u x %u", nent, esz);
+ 		return ENXIO;
