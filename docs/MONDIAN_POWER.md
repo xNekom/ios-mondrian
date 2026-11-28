@@ -257,7 +257,13 @@ settled (`MONDRIAN UI: sample …` lines). In order of contribution:
    launching app, and a lone housekeeping frame does not wake it. So a
    sleeping AMOLED no longer shows the last frame. The DCS write exists
    (`0305`, `usb-ring.py bl LEVEL`: DCS `0x51`, max `0xfff`, inverted DBV),
-   but iOS does not drive it: the Display & Brightness slider moves nothing.
+   iOS now drives it: the UI hook catches
+   `-[SBDisplayBrightnessController _setBrightnessLevel:animated:]` after a
+   deferred retry (the class is loaded later than the dylib) and sends the
+   level to the driver's user client. Measured 2026-11-28: a synthetic
+   brightness key makes SpringBoard log `_setBrightnessLevel:animated: 0.606
+   -> 2480` and the kernel log `MONDRIAN BL: level 2480 fmt 8 cmd 0x51 dbv
+   0x9b0 path dma`; `0515` supplies the two HID brightness keys for the ring.
    The MDSS/DSI driver would also stop the 120 Hz timer and the full-canvas
    rescale (`docs/MONDIAN_PORT.md` §3).
 3. **The EPSS rows are no longer pinned** (`0299`): `cpufreq=2` runs a

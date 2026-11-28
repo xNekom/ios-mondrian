@@ -12525,6 +12525,15 @@ mondrian_bl_scan(const char *class_name, int dump)
 	free(methods);
 }
 
+static void install_brightness_hooks(void);
+
+static void
+mondrian_bl_retry(void *unused)
+{
+	(void)unused;
+	install_brightness_hooks();
+}
+
 static void
 install_brightness_hooks(void)
 {
@@ -15164,13 +15173,61 @@ mondrian_launch_sampler(void *unused)
  * (the path the icon uses), backboardd (a plain user-501 daemon) and
  * containermanagerd (root). The three answers say where the request dies.
  */
+/*
+ * The launch answer outlives the console ring: a probing boot writes several
+ * MiB in a minute, so the result goes to a file mobile owns. The probe runs in
+ * SpringBoard (uid 501) and /private/var/vm is root's.
+ */
+static void
+mondrian_launch_answer(const char *fmt, ...)
+{
+	FILE *answer;
+	va_list ap;
+
+	answer = fopen("/private/var/mobile/Library/Caches/mondrian-launch.log",
+	    "a");
+	if (answer == NULL) {
+		return;
+	}
+	va_start(ap, fmt);
+	vfprintf(answer, fmt, ap);
+	va_end(ap);
+	fclose(answer);
+}
+
 static void
 mondrian_probe_app(const char *tag)
 {
 	static const char path[] = "/Applications/Preferences.app/Preferences";
 	struct stat st;
 	void *handle;
+	char wanted[128] = "com.apple.Preferences";
+	FILE *lf;
 
+	/*
+	 * A file names the bundle to launch, so a staged app can be asked about
+	 * without another kernel build: /private/var/vm/mondrian-launch holds the
+	 * identifier, one line.
+	 */
+	lf = fopen("/private/var/vm/mondrian-launch", "r");
+	if (lf != NULL) {
+		size_t n;
+
+		if (fgets(wanted, sizeof(wanted), lf) == NULL) {
+			wanted[0] = '\0';
+		}
+		fclose(lf);
+		for (n = strlen(wanted); n > 0; n--) {
+			if (wanted[n - 1] == '\n' || wanted[n - 1] == '\r') {
+				wanted[n - 1] = '\0';
+			} else {
+				break;
+			}
+		}
+		if (wanted[0] == '\0') {
+			strlcpy(wanted, "com.apple.Preferences", sizeof(wanted));
+		}
+	}
 	if (stat(path, &st) == 0) {
 		mondrian_probe_fmt("MONDRIAN APP[%s]: %lld bytes mode %o\n", tag,
 		    (long long)st.st_size, (unsigned)(st.st_mode & 07777));
@@ -15184,6 +15241,7 @@ mondrian_probe_app(const char *tag)
 		CFStringRef (*errtxt)(int) = (CFStringRef (*)(int))
 		    dlsym(handle, "SBSApplicationLaunchingErrorString");
 		struct timeval before, after;
+		CFStringRef bid;
 
 		/*
 		 * The two services a launch waits on, asked in this process
@@ -15325,7 +15383,13 @@ mondrian_probe_app(const char *tag)
 			}
 			(void)gettimeofday(&before, NULL);
 			errno = 0;
-			lrc = launch(CFSTR("com.apple.Preferences"), false);
+			bid = CFStringCreateWithCString(NULL, wanted,
+			    kCFStringEncodingUTF8);
+			lrc = launch(bid != NULL ? bid : CFSTR("com.apple.Preferences"),
+			    false);
+			if (bid != NULL) {
+				CFRelease(bid);
+			}
 			(void)gettimeofday(&after, NULL);
 			message[0] = '\0';
 			if (errtxt != NULL && lrc != 0) {
@@ -15341,6 +15405,14 @@ mondrian_probe_app(const char *tag)
 			    tag, lrc, errno,
 			    (long)((after.tv_sec - before.tv_sec) * 1000 +
 			    (after.tv_usec - before.tv_usec) / 1000),
+			    message[0] != '\0' ? message : "-");
+			/*
+			 * The ring only holds the last few MiB, and a probing boot
+			 * writes more than that in a minute: the answer also goes to
+			 * a file the host can read with rf after the boot.
+			 */
+			mondrian_launch_answer("%s rc %d errno %d %s\n",
+			    wanted, lrc, errno,
 			    message[0] != '\0' ? message : "-");
 		} else {
 			mondrian_probe_fmt("MONDRIAN APP[%s]: no symbol\n", tag);
@@ -15782,6 +15854,8 @@ mondrian_probe_launch(void)
 		}
 		mondrian_probe_fmt("MONDRIAN LAUNCH: workspace %s open -> %d\n",
 		    workspace != nil ? "yes" : "nil", opened_app ? 1 : 0);
+		mondrian_launch_answer("workspace %s open %d\n",
+		    workspace != nil ? "yes" : "nil", opened_app ? 1 : 0);
 	} @catch (id exception) {
 		mondrian_probe_fmt("MONDRIAN LAUNCH: workspace raised\n");
 	}
@@ -15889,6 +15963,22 @@ mondrian_launch_thread(void *unused)
 		}
 		sleep(15);
 	}
+	return NULL;
+}
+
+/*
+ * One cold launch ask, and nothing else. The full launch probe creates the
+ * lock-screen manager before UIApplication exists and SpringBoard aborts
+ * (measured 2026-11-21), which makes it useless as an install test: this asks
+ * SpringBoardServices once, after the home screen has settled, and records the
+ * answer. Switch: /private/var/vm/mondrian-launch (the bundle id, one line).
+ */
+static void *
+mondrian_launch_only_thread(void *unused)
+{
+	(void)unused;
+	sleep(45);
+	mondrian_probe_app("one");
 	return NULL;
 }
 
@@ -20139,6 +20229,9 @@ mondrian_install_ui_hooks(void)
 		install_idle_hooks();
 		install_display_link_rate_hooks();
 		install_brightness_hooks();
+		/* SpringBoard loads these classes later than this dylib. */
+		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+		    dispatch_get_main_queue(), NULL, mondrian_bl_retry);
 		install_screen_size_hooks();
 		install_touch_probe();
 	} else {
@@ -20199,6 +20292,14 @@ mondrian_install_ui_hooks(void)
 			if (pthread_create(&xpc, NULL, mondrian_xpc_probe_thread,
 			    NULL) == 0) {
 				pthread_detach(xpc);
+			}
+		}
+		if (mondrian_file_on("/private/var/vm/mondrian-launch")) {
+			pthread_t one;
+
+			if (pthread_create(&one, NULL, mondrian_launch_only_thread,
+			    NULL) == 0) {
+				pthread_detach(one);
 			}
 		}
 		if (boot_arg_set("mondrianrbsx=1")) {

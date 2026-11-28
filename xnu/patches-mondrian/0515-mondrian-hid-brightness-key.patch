@@ -1,0 +1,23 @@
+# 0515 - send display brightness keys through the HID ring command
+#
+# The UI hook now catches SBDisplayBrightnessController's level setter after
+# a deferred retry; synthetic brightness keys let us drive and verify it.
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -779,13 +779,15 @@
+ extern "C" void mondrian_fb_power_key(void);
+ extern "C" void mondrian_fb_touch_activity(void);
+ 
+-/* key: 0 power (side button), 1 volume up, 2 volume down, 3 home */
++/* key: 0 power, 1 volume up, 2 volume down, 3 home, 4/5 display brightness */
+ extern "C" void
+ mondrian_hid_key(int key, int down)
+ {
+ 	static const UInt32 usages[] = {
+ 		kHIDUsage_Csmr_Power, kHIDUsage_Csmr_VolumeIncrement,
+ 		kHIDUsage_Csmr_VolumeDecrement, kHIDUsage_Csmr_Menu,
++		kHIDUsage_Csmr_DisplayBrightnessIncrement,
++		kHIDUsage_Csmr_DisplayBrightnessDecrement,
+ 	};
+ 
+ 	/*
