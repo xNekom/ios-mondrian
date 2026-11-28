@@ -53,7 +53,7 @@ struct audio_property_address {
 #define kAudioHardwarePropertyDevices        FOURCC('d', 'e', 'v', '#')
 #define kAudioHardwarePropertyDefaultOutputDevice FOURCC('d', 'O', 'u', 't')
 #define kAudioObjectPropertyScopeGlobal      FOURCC('g', 'l', 'o', 'b')
-#define kAudioObjectPropertyElementMain      FOURCC('m', 'a', 'i', 'n')
+#define kAudioObjectPropertyElementMain      0  /* kAudioObjectPropertyElementMaster */
 #define kAudioDevicePropertyDeviceUID        FOURCC('u', 'i', 'd', ' ')
 
 typedef OSStatus (*get_size_fn)(AudioObjectID,
