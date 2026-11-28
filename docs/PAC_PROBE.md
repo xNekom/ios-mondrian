@@ -29,7 +29,7 @@ that killed it.
 | `FEAT APA=.. API=.. GPA=.. GPI=..` | nonzero on all four means FEAT_PAuth with address and generic keys |
 | `FEAT APA3=.. GPA3=..` | the ISAR2 fallback; either set is enough |
 | `RESULT no FEAT_PAuth` | no PAC: the ceiling is iOS 18 (arm64), stop the arm64e plan |
-| `PAC: writing the five key pairs at EL1 ...` then a reset | the hypervisor traps the key registers (`HCR_EL2.APK/API`); arm64e is not usable here |
+| `PAC: writing the address key pairs at EL1 ...` then a reset | the hypervisor traps the key registers (`HCR_EL2.APK/API`); arm64e is not usable here |
 | `KEY RB ok` | the keys read back; the hypervisor left them alone |
 | `RESULT PACIA is a NOP` | the core claims PAuth but does not sign: unusable |
 | `RESULT AUTIA did not restore` | signing happened but authentication does not round-trip |
@@ -37,9 +37,29 @@ that killed it.
 
 ## What it does to the machine
 
-Writes `SCTLR_EL1` EnIA/EnIB/EnDA/EnDB, the five key pairs and one `PACIA` /
-`AUTIA` pair, then halts. It runs before the loader, so nothing of the iOS 16
-boot is touched, and it writes no storage.
+Writes `SCTLR_EL1` EnIA/EnIB/EnDA/EnDB, the address key pairs (and `APGA` only
+when `ISAR1.API` says the generic keys exist) and one `PACIA` / `AUTIA` pair,
+then halts. It runs before the loader, so nothing of the iOS 16 boot is touched,
+and it writes no storage.
+
+## First run, 2026-11-18
+
+```
+ISAR1 0x0010011101211052   ISAR2 0x0000000000000000
+FEAT APA 5  API 0          GPA 1  GPI 0
+RESULT no FEAT_PAuth -> arm64 only (max IOS 18)
+```
+
+The result was wrong twice over. `APA = 0b0101` is FEAT_PAuth with EPAC and
+PAuth2, so the core does implement pointer authentication; `API = 0` only means
+the *generic* keys are absent, and arm64e uses the address keys. The gate tested
+`apa && api && gpa && gpi`, which can never be true on this SoC, and the print
+read GPA/GPI from `[15:12]`/`[19:16]` — JSCVT and FCMA — instead of
+`[27:24]`/`[31:28]`.
+
+The probe now gates on `APA` (or `APA3`), labels the fields it actually reads,
+and skips `APGA` unless `API` says the generic keys exist. The key-register and
+`PACIA`/`AUTIA` steps never ran in this capture, so those remain unmeasured.
 
 ## Limits
 
