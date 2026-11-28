@@ -1763,6 +1763,11 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    the staged still and only renders the display when no still decoded. A boot
    that fails and falls back to `boot_b` loses both staged PNGs, so re-run
    `tools/wsl/install-stock-wallpaper.sh` before judging the wallpaper again.
+   During an App Library swipe the live backdrop blurs the wallpaper, but the
+   settled view used to be covered by `mondrian_library_image()`, a fixed dark
+   gradient, so the blur vanished as soon as the gesture ended. It now uses the
+   staged wallpaper blur (the same one the cards use) and keeps the gradient
+   only as a fallback; `mondrian-nolibrary` still disables the substitution.
 6. **The category names are drawn by the hook** (measured 2026-11-28).
    `SBIconLegibilityLabelView` renders them black even though the backdrop is
    dark. The glyph colour is baked in before CA sees it: hooking the settings'
