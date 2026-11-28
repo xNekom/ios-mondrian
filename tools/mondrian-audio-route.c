@@ -87,15 +87,23 @@ mondrian_route_thread(void *unused)
 		kAudioObjectPropertyElementMain
 	};
 	uint32_t size = 0, n = 0, i;
+	void *handle;
 	AudioObjectID *ids;
 	OSStatus err;
 
 	(void)unused;
 	route_log("route thread start");
-	get_size = (get_size_fn)dlsym(RTLD_DEFAULT,
+	handle = dlopen("/System/Library/Frameworks/CoreAudio.framework/CoreAudio",
+	    RTLD_LAZY);
+	if (handle == NULL)
+		handle = dlopen("/usr/lib/libAudioObject.dylib", RTLD_LAZY);
+	route_log("dlopen %d", handle != NULL);
+	get_size = (get_size_fn)dlsym(handle != NULL ? handle : RTLD_DEFAULT,
 	    "AudioObjectGetPropertyDataSize");
-	get_data = (get_data_fn)dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyData");
-	set_data = (set_data_fn)dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
+	get_data = (get_data_fn)dlsym(handle != NULL ? handle : RTLD_DEFAULT,
+	    "AudioObjectGetPropertyData");
+	set_data = (set_data_fn)dlsym(handle != NULL ? handle : RTLD_DEFAULT,
+	    "AudioObjectSetPropertyData");
 	route_log("dlsym %d %d %d", get_size != NULL, get_data != NULL,
 	    set_data != NULL);
 	if (get_size == NULL || get_data == NULL || set_data == NULL)
