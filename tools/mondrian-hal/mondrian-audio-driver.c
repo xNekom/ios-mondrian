@@ -689,6 +689,22 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	sink_open();
 	hal_note("init: sink %d (%s)", sink, sink >= 0 ? "open" : strerror(errno));
 	say("initialized: Speaker, Hawking, Actuator, Codec (timebase %u/%u)", timebase.numer, timebase.denom);
+	/*
+	 * The host builds its device list from the plug-in object. Publishing the
+	 * objects at init is not enough: tell it the device list changed so it
+	 * re-queries us. Without this the plug-in scans but the client's
+	 * kAudioHardwarePropertyDevices stays empty.
+	 */
+	if (host != NULL && host->PropertiesChanged != NULL) {
+		AudioObjectPropertyAddress addr = {
+			kAudioPlugInPropertyDeviceList,
+			kAudioObjectPropertyScopeGlobal,
+			0  /* kAudioObjectPropertyElementMaster */
+		};
+		OSStatus e = host->PropertiesChanged(host, OBJECT_PLUGIN, 1, &addr);
+
+		say("published device list -> %d", (int)e);
+	}
 	return 0;
 }
 
@@ -724,11 +740,13 @@ struct value {
 	UInt32 size;
 	bool empty;
 	bool string;                    /* a CFString: the caller gets its own reference */
+	bool url;                       /* a CFURL: likewise */
 	union {
 		UInt32 words[4];
 		Float64 number;
 		Float32 decimal;
 		CFStringRef string;
+		CFURLRef url;
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
 		AudioStreamRangedDescription ranged;
@@ -822,6 +840,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 #define WORD(x)         (v.u.words[0] = (x), v.size = sizeof(UInt32))
 #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
 #define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
+#define URL(x)          (v.u.url = (x), v.url = true, v.size = sizeof(CFURLRef))
 	switch (selector) {
 	case kAudioObjectPropertyBaseClass:
 		WORD(kAudioObjectClassID);
@@ -863,7 +882,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			STRING(CFSTR("app.mondrian.audio.hal"));
 			break;
 		case kAudioPlugInPropertyResourceBundle:
-			STRING(CFSTR(""));
+			/* The host builds a CFBundle from this URL to read the bundle
+			 * identifier. An empty CFString made that identifier NULL. */
+			URL(resource_bundle_url());
 			break;
 		}
 	} else if (object == d->object) {
@@ -1094,6 +1115,9 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	memcpy(data, &v.u, v.size);
 	if (v.string && v.size == sizeof(CFStringRef)) {
 		CFRetain(v.u.string);
+	}
+	if (v.url && v.size == sizeof(CFURLRef) && v.u.url != NULL) {
+		CFRetain(v.u.url);
 	}
 	*size = v.size;
 	return 0;
