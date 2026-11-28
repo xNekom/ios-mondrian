@@ -279,6 +279,16 @@ wake source. It needs a platform sleep driver, PSCI `SYSTEM_SUSPEND`, GIC
 save/restore with wake masks, `CNTVOFF`/`CVAL` save, PMIC wake and an RPMh
 DDR self-refresh vote.
 
+## Sensors
+
+`0514` registers `MondrianHIDSensors`, an IOHID temperature service backed by
+the SoC's own TSENS (`mondrian_tsens_hottest_mc()`). It dispatches a HID
+temperature event every 5 s. Measured 2026-11-28: `MONDRIAN HID: temperature
+sensor registered` followed by `temperature 39300 mC`, `43200 mC`, `49000 mC`
+on the `01:51:24` kernel, with a healthy UI (`loop 20`). This is a real sensor
+reading, not a synthetic placeholder; accelerometer/gyro hardware is still
+absent.
+
 ## Haptics
 
 ### The iOS Actuator node

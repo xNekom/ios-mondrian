@@ -1,0 +1,85 @@
+# 0514 - publish TSENS as an IOHID temperature sensor
+#
+# The SoC's own thermal sensors are already read for throttling; expose the
+# hottest reading as a real HID temperature event so iOS's sensor stack sees
+# hardware-backed data.
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -52,6 +52,11 @@
+     "     'IOMatchCategory' = MondrianHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = MondrianHIDSensors;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = MondrianHIDSensors;"
++    "   },"
++    "   {"
+     "     'IOClass'         = MondrianCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+     "     'IONameMatch'     = 'qcom,kryo';"
+--- a/iokit/Kernel/arm/hid/MondrianHID.cpp
++++ b/iokit/Kernel/arm/hid/MondrianHID.cpp
+@@ -401,6 +401,63 @@
+ };
+ OSDefineMetaClassAndStructors(MondrianHIDTouch, IOHIDEventService);
+ 
++
++extern "C" int mondrian_tsens_hottest_mc(void);
++
++/* Hardware-backed sensor: the SoC's own TSENS, published as a temperature
++ * event so sensd/UIKit see a real sensor instead of a fabricated value. */
++class MondrianHIDSensors : public IOHIDEventService {
++	OSDeclareDefaultStructors(MondrianHIDSensors);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++private:
++	static void sampleFired(OSObject *owner, IOTimerEventSource *sender);
++	IOTimerEventSource *fSample;
++	UInt32 fSamples;
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Sensor; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Snsr_Environmental_Temperature; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++};
++OSDefineMetaClassAndStructors(MondrianHIDSensors, IOHIDEventService);
++
++bool
++MondrianHIDSensors::start(IOService *provider)
++{
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	fSample = IOTimerEventSource::timerEventSource(this,
++	    &MondrianHIDSensors::sampleFired);
++	if (fSample != NULL &&
++	    _hidWorkLoop->addEventSource(fSample) == kIOReturnSuccess) {
++		fSample->setTimeoutMS(5000);
++	}
++	registerService();
++	IOLog("MONDRIAN HID: temperature sensor registered\n");
++	return true;
++}
++
++void
++MondrianHIDSensors::sampleFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	MondrianHIDSensors *self = (MondrianHIDSensors *)owner;
++	int mc = mondrian_tsens_hottest_mc();
++	IOFixed level = (IOFixed)(((int64_t)mc * 65536) / 1000);
++	IOHIDEvent *event = IOHIDEvent::temperatureEvent(
++	    mach_absolute_time(), level);
++
++	(void)sender;
++	if (event != NULL) {
++		self->dispatchEvent(event);
++		event->release();
++	}
++	if (self->fSamples++ < 3 || (self->fSamples % 60) == 0) {
++		IOLog("MONDRIAN HID: temperature %d mC (%u samples)\n", mc,
++		    self->fSamples);
++	}
++	self->fSample->setTimeoutMS(5000);
++}
+ static MondrianHIDButtons *gSweetButtons;
+ static MondrianHIDTouch *gSweetTouch;
+ /* Every touch gets a new identity: a repeated one is the same finger. */
