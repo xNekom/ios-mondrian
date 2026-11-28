@@ -331,6 +331,29 @@ A future attempt has to call AudioObject from mediaserverd's
 own run loop (or route at the HAL plug-in level) and log before/after each call
 to see where it stops.
 
+**Measured 2026-11-28: the plug-in now registers, but its devices still do not
+appear in the client device list.** `tools/mondrian-audio-probe.c` runs from a
+process whose stdout is the kernel ring and calls the same AudioObject API.
+Before the fix, CoreAudio's owned-object list held 12 plug-ins and none was
+ours. Two bugs in the driver were found against Apple's `AudioServerPlugIn.h`:
+- `mondrian-asp.h` defined `kAudioPlugInPropertyBundleID` as `'bund'`; the real
+  selector is `'piid'`. CoreAudio asked for `piid`, got `who?`, and could not
+  identify the plug-in. The log now shows `app.mondrian.audio.hal` as one of
+  CoreAudio's plug-in objects.
+- `kAudioPlugInPropertyResourceBundle` returned an empty CFString instead of a
+  CFURL, so the host could not build a CFBundle to read that identifier;
+  `resource_bundle_url()` now supplies the URL and `PropertiesChanged()` is
+  called at initialize to publish the device list.
+
+After all three fixes the plugin is visible, CoreAudio scans its Speaker,
+Hawking, Actuator and Codec objects, and `PropertiesChanged` returns 0, yet
+`AudioObjectGetPropertyDataSize(kAudioHardwarePropertyDevices)` still answers
+`size=0 err=0` while `kAudioHardwarePropertyDefaultOutputDevice` is a different
+object (ID 50). So registration is solved; the remaining step is making
+CoreAudio instantiate the plug-in's devices into the global list, probably by
+answering `kAudioObjectPropertyOwnedObjects` with the device class qualifier
+the host uses. Do not retry the route/dispatch work above until that is fixed.
+
 
 After a userdata reflash the stock root brings VirtualAudio back. Delete
 `/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio` (and the
