@@ -271,6 +271,14 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   image/address/session is the gap. `wifistat` reports it once the worker has
   mapped the host windows.
 
+Arming the worker needs **both** `mondrianwifi=1` (the gate in
+`mondrian_wifi_start()`) and `mondrianwififw=1` (the auto-load at W4). With
+only the second, `wifistat` reports `stage=0` and every register stays zero,
+which looks exactly like a failed firmware load. The two arguments plus the
+default command line are 585 bytes; adding `mondrianwifidelay=5000` reaches
+608 and `mkpayload.py` refuses it (iOS reads `kern.bootargs` into a 608-byte
+buffer, so an overlong line fails with ENOMEM).
+
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
 `wifibhi`/`wifistat` commands.
