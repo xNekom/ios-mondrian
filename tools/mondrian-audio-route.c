@@ -11,6 +11,7 @@
  * framework leaves the tuple nil).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -55,15 +56,17 @@ struct audio_property_address {
 #define kAudioObjectPropertyElementMain      FOURCC('m', 'a', 'i', 'n')
 #define kAudioDevicePropertyDeviceUID        FOURCC('u', 'i', 'd', ' ')
 
-extern OSStatus AudioObjectGetPropertyDataSize(AudioObjectID,
-    const struct audio_property_address *, uint32_t, const void *, uint32_t *)
-    __attribute__((weak_import));
-extern OSStatus AudioObjectGetPropertyData(AudioObjectID,
+typedef OSStatus (*get_size_fn)(AudioObjectID,
+    const struct audio_property_address *, uint32_t, const void *, uint32_t *);
+typedef OSStatus (*get_data_fn)(AudioObjectID,
     const struct audio_property_address *, uint32_t, const void *, uint32_t *,
-    void *) __attribute__((weak_import));
-extern OSStatus AudioObjectSetPropertyData(AudioObjectID,
+    void *);
+typedef OSStatus (*set_data_fn)(AudioObjectID,
     const struct audio_property_address *, uint32_t, const void *, uint32_t,
-    const void *) __attribute__((weak_import));
+    const void *);
+static get_size_fn get_size;
+static get_data_fn get_data;
+static set_data_fn set_data;
 
 static void *
 mondrian_route_thread(void *unused)
@@ -89,14 +92,16 @@ mondrian_route_thread(void *unused)
 
 	(void)unused;
 	route_log("route thread start");
-	if (AudioObjectGetPropertyDataSize == NULL ||
-	    AudioObjectGetPropertyData == NULL ||
-	    AudioObjectSetPropertyData == NULL) {
-		route_log("AudioObject symbols missing");
+	get_size = (get_size_fn)dlsym(RTLD_DEFAULT,
+	    "AudioObjectGetPropertyDataSize");
+	get_data = (get_data_fn)dlsym(RTLD_DEFAULT, "AudioObjectGetPropertyData");
+	set_data = (set_data_fn)dlsym(RTLD_DEFAULT, "AudioObjectSetPropertyData");
+	route_log("dlsym %d %d %d", get_size != NULL, get_data != NULL,
+	    set_data != NULL);
+	if (get_size == NULL || get_data == NULL || set_data == NULL)
 		return NULL;
-	}
 	sleep(12); /* the HAL scan and the ADSP graph start after mediaserverd */
-	err = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devs,
+	err = get_size(kAudioObjectSystemObject, &devs,
 	    0, NULL, &size);
 	route_log("MONDRIAN ROUTE: device list size %u err %d", size, (int)err);
 	if (err != 0 || size == 0)
@@ -104,7 +109,7 @@ mondrian_route_thread(void *unused)
 	ids = malloc(size);
 	if (ids == NULL)
 		return NULL;
-	err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &devs,
+	err = get_data(kAudioObjectSystemObject, &devs,
 	    0, NULL, &size, ids);
 	if (err != 0) {
 		free(ids);
@@ -115,7 +120,7 @@ mondrian_route_thread(void *unused)
 		CFStringRef uid = NULL;
 		uint32_t us = sizeof(uid);
 
-		err = AudioObjectGetPropertyData(ids[i], &uidaddr, 0, NULL,
+		err = get_data(ids[i], &uidaddr, 0, NULL,
 		    &us, &uid);
 		if (err == 0 && uid != NULL) {
 			char buf[128];
@@ -128,7 +133,7 @@ mondrian_route_thread(void *unused)
 			route_log("MONDRIAN ROUTE: device %u uid %s%s",
 			    (unsigned)ids[i], buf, wanted ? " WANTED" : "");
 			if (wanted) {
-				err = AudioObjectSetPropertyData(
+				err = set_data(
 				    kAudioObjectSystemObject, &def, 0, NULL,
 				    sizeof(ids[i]), ids + i);
 				route_log("MONDRIAN ROUTE: set default -> %d", (int)err);
