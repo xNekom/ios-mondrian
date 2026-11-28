@@ -159,6 +159,13 @@ focus and flash from the kernel. `vcam-ios` establishes that `mediaserverd`
 connects to the camera hardware and forwards frames to clients, and hooks
 there to replace the image — the same interception point a port needs. Our
 Photos path already works; Camera is the missing client.
+`yiffysec/Wam-Bam-A-Free-Cam-VCam` (MIT, iOS 15-18) is the clearest map of
+that point: `BWNodeOutput -emitSampleBuffer:`, `BWImageQueueSinkNode
+-renderSampleBuffer:forInput:`, `BWRemoteQueueSinkNode`, `BWPhotoEncoderNode`
+and `BWStillImageSampleBufferSinkNode` in mediaserverd (cameracaptured from
+iOS 18); video sinks need `420v` and still sinks BGRA. It registers no new
+AVCaptureDevice, so it still depends on a real capture graph existing — do
+not assume it makes Camera.app work on a board with no camera device.
 
 ## Sensors and thermals — `DenialOfGravity/ios-redfin`, `ResistanceTo/MiniWatts`
 
