@@ -1715,9 +1715,14 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    cost (median 19.9 ms against 20.0 ms), so the governor is not the limit: the
    frame waits 13-15 ms for the GPU to finish drawing. Measure from a touch to
    the first `present` before optimizing draws.
-4. A/B the frame path (`glflushdraws`, `glcopy`, `mondrianfb_fps=0`) on a
-   screen something is actually animating. `glwait=0` is off the table (see the
-   traps). The wait itself is 2.4-6.2 ms of a frame (`waiting` on the
+4. A/B the frame path (`glcopy`, `mondrianfb_fps=0`) on a
+   screen something is actually animating. `glwait=0` and `glflushdraws=0` are
+   off the table: the first loses half-drawn frames, and `0` was measured on
+   2026-11-21 to shear the Control Center backdrop into the wallpaper and turn
+   the media glyph into a blue blob; `2` is the default for that reason. The
+   cost left is a 9.8 ms full-canvas `glReadPixels` on every App Library swipe
+   (measured 2026-11-28) and 17 submits per switcher frame: both live in the
+   GPU path (`tools/gpu/eagl.c`), not in the UI hook. The wait itself is 2.4-6.2 ms of a frame (`waiting` on the
    `mondrian-gl: frame` line), so the open question is how many frames the
    submission path can hold in flight: a third one would let the CPU run a frame
    ahead without skipping the wait. TODO, not measured.
