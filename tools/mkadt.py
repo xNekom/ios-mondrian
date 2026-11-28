@@ -327,6 +327,18 @@ def build(board, seed=None, qemu=False, altmem=False):
     ])
 
     product_props = d22ap_product()
+    if product_props is not None:
+        # The panel is sRGB, but the D22AP product node says P3. MobileGestalt
+        # then asks CoreAnimation for 'b3a8' (10-bit wide-gamut) blur surfaces,
+        # which this GL path cannot draw: the App Library and Control Center
+        # materials come out black. ios-sweet/pixel3-ios measured that forcing
+        # sRGB here -- and clearing the cached Gestalt answer once -- makes
+        # both blurs draw. Do not repeat the WebKit MGGetBoolAnswer hook: it
+        # never fires on this build.
+        product_props = [(k, b'sRGB\0') if k == 'artwork-display-gamut' else (k, v)
+                         for k, v in product_props]
+        if not any(k == 'artwork-display-gamut' for k, _ in product_props):
+            product_props.append(('artwork-display-gamut', b'sRGB\0'))
     if product_props is None and not qemu and os.environ.get('ADT_ALLOW_NO_PRODUCT') != '1':
         raise SystemExit('mkadt.py: research/ipsw-x/d22ap.adt missing; /product would be '
                          'absent (set ADT_ALLOW_NO_PRODUCT=1 to override)')
