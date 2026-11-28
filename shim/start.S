@@ -202,7 +202,7 @@ exc_common:
 	stp	x24, x25, [sp, #192]
 	stp	x26, x27, [sp, #208]
 	str	x28, [sp, #224]
-	ldp	x2, x3, [sp, #256]		/* the stashed x29/x30 */
+	ldp	x2, x3, [sp, #272]		/* the stashed x29/x30 */
 	stp	x2, x3, [sp, #232]		/* the frame's slots 29 and 30 */
 	mov	x0, x29
 	mov	x1, sp
@@ -222,6 +222,6 @@ exc_common:
 	ldp	x24, x25, [sp, #192]
 	ldp	x26, x27, [sp, #208]
 	ldr	x28, [sp, #224]
-	add	sp, sp, #(30 * 8)
+	add	sp, sp, #(34 * 8)
 	ldp	x29, x30, [sp], #16
 	eret

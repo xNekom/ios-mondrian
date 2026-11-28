@@ -164,6 +164,11 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("ELR", rsr("elr_el1"));
 	con_hex("FAR", rsr("far_el1"));
 	con_hex("SPSR", rsr("spsr_el1"));
+	/* A translation fault means the MMU was on: say which map it used. */
+	con_hex64("SCTLR", rsr("sctlr_el1"));
+	con_hex64("VBAR", rsr("vbar_el1"));
+	con_hex64("TTBR0", rsr("ttbr0_el1"));
+	con_hex64("TCR", rsr("tcr_el1"));
 	con_hex("X0", regs[0]);
 	con_hex("X1", regs[1]);
 	con_hex("X2", regs[2]);
