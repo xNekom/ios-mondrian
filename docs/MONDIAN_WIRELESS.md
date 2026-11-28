@@ -271,6 +271,14 @@ the first 512 KiB (ath11k's `sbl_size`) to BHI. Measured 2026-11-26:
   image/address/session is the gap. `wifistat` reports it once the worker has
   mapped the host windows.
 
+Measured 2026-11-28 on a clean boot with both arming arguments and the
+correctly carved firmware: `W6 image sum=0x163c3337`, SMMU map at
+`0xa1000000`, reset and doorbell `0x2a5a5a5b`, then 10,000 polls with
+`BHI_STATUS=0x0`, `ERRCODE=0x0` and `MHISTATUS=0x0`; `EXECENV` stays 0 and the
+cookie/warm-entry reads stay zero. The host sequence is therefore complete
+and the PBL never hands over to the SBL, as recorded above (authentication
+stage in the PBL log). Do not spend another boot on the BHI doorbell.
+
 A reflashed `userdata` loses `/private/var/vm/amss20.bin`; `W6` then logs
 `image=... read=-2` and `wifistat` stays at `stage=14` with every BHI register
 zero, which reads exactly like a dead firmware load. Carve the file from the
