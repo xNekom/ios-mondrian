@@ -24,6 +24,14 @@ separates a device-verified result from code that was only read.
 | [cotunjr/hakios-xnu-kernel](https://github.com/cotunjr/hakios-xnu-kernel) (`mayfly-port`) | the `minisandbox` container path, the `miniamfi` policy and entitlement grants | `0354` and `0108` in this series | APSL 2.0 kernel, MIT userland |
 | [rui12366B/UniXNU-gts7xlwifi](https://github.com/rui12366B/UniXNU-gts7xlwifi) | GPU-fault recovery on the Adreno 650 | device-verified on the Tab S7+ | BSD-2-Clause-Patent |
 
+| [akshaynexus/slop](https://github.com/akshaynexus/slop) (also [MellysInformejtik/slop](https://github.com/MellysInformejtik/slop)) | 128 xnu-8796 patches, shim, `mkadt` and root tools for SM8450; the substrate under `iOSPlus10` | device-verified on negroni with iOS 16 | MIT/APSL per file |
+| [UniXNU/QcaBluetooth](https://github.com/UniXNU/QcaBluetooth) | Qualcomm BT controller over GENI UART, H4/IBS, UART.SK pipe, `BlueTool` and `Type0` | pairing, reconnect, A2DP and AirPods device-verified on sheng | GPL-2.0 kernel parts, APSL/BSD userland; check each SPDX |
+| [aTechGeekDev/ios-apollo](https://github.com/aTechGeekDev/ios-apollo) | ath11k Wi-Fi, A2DP at 921600 baud, CS35L41 audio, AW8697 haptics, brightness, runaway-daemon CPU limit | iOS 16.7.16 on apollo | check its README/NOTICE |
+| [andyleenz/pixel3-ios](https://github.com/andyleenz/pixel3-ios) | Safari over Wi-Fi, stock wallpaper, App Library and Control Center blurs, GPU UI, zero-copy flips and hitch measurements | device-verified on Pixel 3 | MIT/APSL per file |
+| [joranv1/ios-sailfish](https://github.com/joranv1/ios-sailfish) | App Library, layered stock wallpaper, HEIC→PNG at root build, EAGL over Mesa | device-verified on Pixel 1 | check its README/NOTICE |
+| [coreycusick/ios-guacamole](https://github.com/coreycusick/ios-guacamole) | mobile camera via `/dev/hakios-camera` + `ISP.mediacapture`, 24 MHz timebase audio fix, haptics, A2DP | device-verified on guacamole | check its README/NOTICE |
+| [ry-diffusion/Crimson](https://github.com/ry-diffusion/Crimson) | maintained AIR→NIR→ir3 Metal frontend over Turnip, successor of `Chlorophyll` | code and host evidence in its `chlorophyll` branch | MIT |
+
 ## What to take for the open areas
 
 - **Wi-Fi.** Start with `qiumochen/UniXNU-zizhan`: `drivers/PongWifi/`
@@ -98,6 +106,26 @@ separates a device-verified result from code that was only read.
   are different hardware; the auto-brightness path only applies if our ALS is
   the same chip. Our sensors are behind SSC/ADSP, so treat these as
   architecture references, not drop-in drivers.
+
+- **Bluetooth.** Start from `UniXNU/QcaBluetooth`: `src/qbt_core.c`,
+  `qbt_geni.c`, `qbt_transport.c` and `userland/BlueTool.c`/`Type0.c`, plus the
+  `bt_quirks` table in HackiOS `Documentation/bluetooth.md`. `ios-apollo`
+  shows 921600 baud when A2DP is needed. Do not keep extending the
+  environment-only shim.
+- **Audio and haptics together.** `DenialOfGravity/ios-redfin`'s
+  `phone/RedwoodAudio.driver` serves speaker, microphone, Actuator and camera
+  from one AudioServerPlugIn; `open-mapple/mapple_userland/audio` shows the
+  install beside `VirtualAudio.plugin`. `ios-guacamole` fixes cut-outs by
+  presenting a 24 MHz timebase on a 19.2 MHz timer.
+- **WebKit, text, App Library and wallpaper.** `ios-spes`, `pixel3-ios`,
+  `ios-flame` and `ios-sailfish` get Safari, text and blur with an EAGL/Mesa or
+  Metal device and an allow-list containing `backboardd`; `ios-sailfish`
+  converts HEIC wallpaper layers to PNG at root build and `UniXNU-alioth`
+  proves `WALLPAPER stage=5`. Our Gestalt interposers are a closed path.
+- **Performance.** `ios-apollo`'s 10 % cap on runaway daemons and
+  `pixel3-ios`'s shader cache plus row-aligned images are the concrete fixes
+  for slow multitasking; `ios-guacamole` shows `locationd` and `wland` polling
+  as two avoidable full-core loops.
 
 ## Licence rules
 

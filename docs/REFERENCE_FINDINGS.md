@@ -150,15 +150,15 @@ black. A further probe interposed `CVPixelBufferCreate` and
 stderr and `syslog(LOG_ALERT)`. With `MobileSafari` and two `WebContent`
 processes running (confirmed in the ring), **no interposer fired at all** —
 not even the Gestalt ones — so `DYLD_INSERT_LIBRARIES` interposing is not
-reaching these symbols in WebKit on this build. Identifying the `w30r`
-selector needs a different injection mechanism, not another interposer.
+reaching these symbols in WebKit on this build. Neither `MGGetBoolAnswer` nor
+`MGCopyAnswer` is ever called, so WebKit does not get the extended-colour
+answer from MobileGestalt on this port. Do not repeat the Gestalt hook.
 
-The interposer then logged to both a file and stderr (2026-11-28): neither
-`MGGetBoolAnswer` nor `MGCopyAnswer` is ever called in WebContent or the GPU
-process, so WebKit does not get the extended-colour answer from MobileGestalt
-on this port. Do not repeat the Gestalt hook. The next step would be to find
-the UIScreen trait or WebCore preference that selects `w30r` and interpose
-that instead.
+The wider reference directory (below) shows the real fix is rendering, not
+colour negotiation: `AdyaGMD/ios-spes`, `andyleenz/pixel3-ios` and
+`NWylynko/ios-flame` render Safari pages when CoreAnimation has an EAGL/Mesa
+or Metal device, and `ios-spes` attributes working blur to a Metal allow-list
+for `backboardd`. The next step is that GPU path, not another interposer.
 
 ## Camera — `DenialOfGravity/ios-redfin`, `EthanArbuckle/vcam-ios`
 
@@ -181,6 +181,12 @@ would require mapping QUP/TLMM pins for a bank no node describes.
 Bringing up a real
 camera means discovering the sensor on the bus first; the BW-node injection
 cannot help until a capture graph exists.
+
+`coreycusick/ios-guacamole` gets a real preview and photos in Camera.app by
+publishing `/dev/hakios-camera` from the kernel and handing raw frames to
+`ISP.mediacapture`; `DenialOfGravity/ios-redfin` serves camera frames through
+its `RedwoodAudio.driver`. Those are the implementation references once a
+sensor is discovered; the tracker's BW-node map below is only the userland end.
 
 `yiffysec/Wam-Bam-A-Free-Cam-VCam` (MIT, iOS 15-18) is the clearest map of
 that point: `BWNodeOutput -emitSampleBuffer:`, `BWImageQueueSinkNode
@@ -212,3 +218,37 @@ to work without a similar workaround.
 `bangprovn/ios-fuxi` keep their negative results explicitly; read those before
 re-testing a discarded approach. Both are iOS 16 generation and close to our
 hardware.
+
+## The wider reference directory (2026-11-28)
+
+The six base projects are not the full picture: `GET /api/forks` on the tracker
+lists **600 repos** with per-area evidence. Filtering them by subsystem found a
+device-verified reference for every open area, often on iOS 16.7.16 and a
+nearby Snapdragon:
+
+- `DenialOfGravity/ios-redfin` runs iOS 16.7.16 with `RedwoodAudio.driver`
+  serving speaker, microphone, haptics **and camera**, plus `wland`, `btd`,
+  `fastrpcd`/`sensd`, Venus video, native Metal, auto-brightness, Night Shift
+  and True Tone.
+- `akshaynexus/iOSPlus10` with `akshaynexus/slop` (also
+  `MellysInformejtik/slop`) carries 128 xnu-8796 patches for SM8450 and
+  Metal2Vulkan, Wi-Fi, Bluetooth, audio, haptics, brightness and battery.
+- `aTechGeekDev/ios-apollo` proves ath11k Wi-Fi, Bluetooth A2DP at 921600
+  baud, AW8697 vibration, CS35L41 audio, brightness and a runaway-daemon
+  limit of 10 % of a core on iOS 16.7.16.
+- `andyleenz/pixel3-ios`, `joranv1/ios-sailfish` and `AdyaGMD/ios-spes` show
+  Safari, text, App Library blur and stock wallpaper are GPU/EAGL/Metal
+  results, not MobileGestalt results. `ios-sailfish` converts HEIC wallpaper
+  layers to PNG at root-build time (`tools/wallpaper-heic2png.sh`).
+- `UniXNU/QcaBluetooth` is the working Qualcomm Bluetooth driver with
+  `BlueTool` and `Type0`; `coreycusick/ios-guacamole` publishes camera frames
+  from `/dev/hakios-camera` to `ISP.mediacapture` and fixes audio cut-outs
+  with a 24 MHz timebase on a 19.2 MHz timer.
+- `FFT-infra/UniXNU-alioth` reaches `WALLPAPER stage=5` with a staged Metal
+  device; `ry-diffusion/Crimson` is the maintained AIR→NIR→ir3 Metal frontend.
+- `qiumochen/UniXNU-zizhan` and `Chengdong-Yu/pong-wifi` remain the same-SoC
+  Wi-Fi authority already recorded in `REFERENCE_PORTS.md`.
+
+Consequence: stop re-testing CoreAudio discovery, Gestalt interposers and the
+BHI doorbell. Port the implementations above; files and licences are in
+`REFERENCE_PORTS.md`.
