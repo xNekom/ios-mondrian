@@ -6683,6 +6683,7 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 		    sel_registerName("bounds"));
 		CGRect box = mondrian_card_box(view, bounds);
 		id icon, layer;
+		id category_model = nil;
 		CGImageRef art;
 		double side = box.size.width;
 		char line[224];
@@ -6731,6 +6732,7 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 					model = category;
 				}
 			}
+			category_model = model;
 			art = mondrian_card_picture(model, side, &used, &total, &drew);
 			snprintf(line, sizeof(line),
 			    "MONDRIAN LIBRARY: card %s icon %s model %s via %s:"
@@ -6795,6 +6797,74 @@ mondrian_library_cards(id view, unsigned depth, unsigned *painted)
 			}
 			[(CALayer *)layer setValue:card forKey:@"mondrianCardArt"];
 			[(CALayer *)layer addSublayer:card];
+		}
+		/*
+		 * SBUILegibilityLabelView draws the category name black (measured
+		 * 2026-11-28). The model exposes -icon:displayNameForLocation: -- the
+		 * only display-name accessor it has -- so paint the name as a white
+		 * UILabel under the card. On unless /private/var/vm/mondrian-white-
+		 * library holds 0. The name is logged before anything is created,
+		 * so a bad accessor cannot masquerade as a drawing failure.
+		 */
+		if (mondrian_fix_on("/private/var/vm/mondrian-whitelibrary")) {
+			Class str_cls = objc_getClass("NSString");
+			Class label_cls = objc_getClass("UILabel");
+			Class colour_cls = objc_getClass("UIColor");
+			SEL sel = sel_registerName("icon:displayNameForLocation:");
+			id caption = nil;
+			char line[224];
+
+			if (category_model != nil &&
+			    [category_model respondsToSelector:sel]) {
+				caption = ((id (*)(id, SEL, id, id))objc_msgSend)(
+				    category_model, sel, icon, nil);
+			}
+			snprintf(line, sizeof(line),
+			    "MONDRIAN LIBRARY: caption %s from %s\n",
+			    caption != nil && str_cls != Nil &&
+			    [caption isKindOfClass:str_cls] ? [caption UTF8String]
+			    : "(none)",
+			    category_model != NULL ?
+			    object_getClassName(category_model) : "none");
+			say(line);
+			if (caption != nil && str_cls != Nil &&
+			    [caption isKindOfClass:str_cls] &&
+			    label_cls != Nil && colour_cls != Nil) {
+				id white = ((id (*)(id, SEL))objc_msgSend)(
+				    (id)colour_cls, sel_registerName("whiteColor"));
+				CGRect frame = CGRectMake(0,
+				    box.size.height - 1, box.size.width, 20);
+				id label = ((id (*)(id, SEL))objc_msgSend)(
+				    (id)label_cls, sel_registerName("alloc"));
+
+				if (label != nil) {
+					label = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+					    label, sel_registerName("initWithFrame:"),
+					    frame);
+				}
+				if (label != nil && white != nil) {
+					Class font_cls = objc_getClass("UIFont");
+					id font = font_cls != Nil ?
+					    ((id (*)(id, SEL, double))objc_msgSend)(
+					        (id)font_cls,
+					        sel_registerName("systemFontOfSize:"),
+					        13.0) : nil;
+
+					((void (*)(id, SEL, id))objc_msgSend)(label,
+					    sel_registerName("setText:"), caption);
+					((void (*)(id, SEL, id))objc_msgSend)(label,
+					    sel_registerName("setTextColor:"), white);
+					if (font != nil) {
+						((void (*)(id, SEL, id))objc_msgSend)(
+						    label, sel_registerName("setFont:"),
+						    font);
+					}
+					((void (*)(id, SEL, long))objc_msgSend)(label,
+					    sel_registerName("setTextAlignment:"), 1L);
+					[view addSubview:label];
+					say("MONDRIAN LIBRARY: white caption placed\n");
+				}
+			}
 		}
 		CGImageRelease(art);
 		snprintf(line, sizeof(line),
