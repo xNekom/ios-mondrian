@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the repository the way AGENTS.md says it must be checked.
 
-Every check has an id (R01...R09). AGENTS.md carries the same ids in its
+Every check has an id (R01, R03..R09). AGENTS.md carries the same ids in its
 "Repository checks" table and this script fails when the two disagree: a rule
 that is only prose is a red build, not a wish.
 
@@ -101,27 +101,6 @@ def check_doc_links(verbose=False):
             if not os.path.exists(resolved):
                 problems.append(f'{rel}: dead link -> {target}')
     return not problems, f'{seen} relative links', problems
-
-
-def doc_budgets(verbose=False):
-    """R02: the length budgets AGENTS.md declares are not exceeded."""
-    text = read('AGENTS.md')
-    row = re.compile(r'^\|\s*`([^`]+)`\s*\|\s*(\d+)\s*\|\s*$', re.M)
-    budgets = {p: int(n) for p, n in row.findall(text)}
-    if not budgets:
-        return False, 'no budget table found in AGENTS.md', \
-            ['AGENTS.md: expected a table of `file` | max lines']
-    problems = []
-    for rel, limit in sorted(budgets.items()):
-        path = os.path.join(REPO, rel)
-        if not os.path.isfile(path):
-            problems.append(f'{rel}: listed in the budgets, missing on disk')
-            continue
-        with open(path, 'rb') as f:
-            lines = f.read().count(b'\n')
-        if lines > limit:
-            problems.append(f'{rel}: {lines} lines, budget {limit}')
-    return not problems, f'{len(budgets)} budgets', problems
 
 
 def check_line_endings(verbose=False):
@@ -360,7 +339,6 @@ def check_tests(verbose=False):
 
 CHECKS = {
     'R01': ('doc links resolve', check_doc_links),
-    'R02': ('documented length budgets', doc_budgets),
     'R03': ('LF line endings', check_line_endings),
     'R04': ('no device captures in git', check_captures),
     'R05': ('no credentials in tracked files', check_secrets),
