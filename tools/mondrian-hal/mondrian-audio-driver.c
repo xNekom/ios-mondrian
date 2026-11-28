@@ -108,6 +108,15 @@ struct device {
 };
 
 static struct device devices[] = {
+	/*
+	 * VirtualAudio's device factory routes only UIDs it knows. `PuffinOutput`
+	 * is the Apple-silicon speaker family: it publishes the `pspk` port and
+	 * becomes the master of the default VAD, so CoreAudio writes our stream.
+	 * `Speaker` alone is reported Unhandled by the factory and leaves the
+	 * route on Null_Device (measured in vphone's iOS guest and on mondrian).
+	 * Keep the classic UID as a second device for clients that still ask for
+	 * it; both feed the same ring and the same /dev node.
+	 */
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
 	  .output_channels = MONDRIAN_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
@@ -854,7 +863,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			STRING(CFSTR("app.mondrian.audio.hal"));
 			break;
 		case kAudioPlugInPropertyResourceBundle:
-			STRING((CFStringRef)resource_bundle_url());
+			STRING(CFSTR(""));
 			break;
 		}
 	} else if (object == d->object) {
@@ -1321,6 +1330,7 @@ static AudioServerPlugInDriverInterface interface = {
 static AudioServerPlugInDriverInterface *driver = &interface;
 
 /* The factory named in Info.plist (CFPlugInFactories). */
+
 __attribute__((visibility("default"))) void *MondrianAudio_Create(CFAllocatorRef allocator, CFUUIDRef type);
 
 void *

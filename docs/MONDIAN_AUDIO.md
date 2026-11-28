@@ -312,7 +312,15 @@ explicit `dlopen` of CoreAudio, `dlsym` finds all three AudioObject calls
 `MONDRIAN ROUTE: set default`, and `audio node: PCM` stays 0 while
 `audio node opened 1`. So a userland default-output request from a pthread does
 not reach a usable CoreAudio object graph in this process; do not repeat the
-same injection. A 2026-11-28 follow-up tried dispatching the same work onto
+same injection. The route attempt was then moved inside `MondrianAudio.driver` itself, where
+CoreAudio is already loaded (2026-11-28): `dlopen` and all three AudioObject
+symbols resolve (`dlopen=1 syms=111`), but
+`AudioObjectGetPropertyDataSize(kAudioHardwarePropertyDevices)` answers
+`size=0 err=0`. CoreAudio's device list is empty on this port, so there is no
+device to make default and no route can be created from either inside or
+outside the HAL. This is the concrete reason `audio node: PCM` stays 0.
+
+A 2026-11-28 follow-up tried dispatching the same work onto
 `mediaserverd`'s main queue (`dispatch_after_f`, 15 s). The constructor logs a
 valid queue pointer but the block never runs (no `dlsym` line), and
 `audio node: PCM` stays 0. The injected dylib therefore cannot reach a running
