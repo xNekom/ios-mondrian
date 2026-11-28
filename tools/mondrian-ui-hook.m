@@ -10992,6 +10992,20 @@ mondrian_library_image(void)
 	if (mondrian_library_picture != NULL) {
 		return mondrian_library_picture;
 	}
+	/*
+	 * The live backdrop really does blur while the Library is sliding in, but
+	 * the settled view was being covered by this fixed dark gradient. Use the
+	 * host-staged blur of the same still the cards already use, so the calm
+	 * state matches the gesture; keep the gradient for a root without it.
+	 */
+	{
+		CGImageRef blur = mondrian_wallpaper_blur_image();
+
+		if (blur != NULL) {
+			say("MONDRIAN LIBRARY: the background is the wallpaper blur\n");
+			return blur;
+		}
+	}
 	pixels = calloc(1, row * height);
 	rgb = CGColorSpaceCreateDeviceRGB();
 	ctx = pixels != NULL ? CGBitmapContextCreate(pixels, width, height, 8, row, rgb,
