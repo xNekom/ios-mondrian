@@ -298,6 +298,17 @@ default command line are 585 bytes; adding `mondrianwifidelay=5000` reaches
 608 and `mkpayload.py` refuses it (iOS reads `kern.bootargs` into a 608-byte
 buffer, so an overlong line fails with ENOMEM).
 
+The `bluetoothd` `sig 6` crash is still unexplained (2026-11-28): its
+backtraces were symbolicated with REA/Rizin against the stock
+`/usr/sbin/bluetoothd` (offset `0xc0d90` and neighbours) and with
+`dsc-sym.py`, but the nearest shared-cache symbols had deltas in the MB range,
+so they do not name a frame. Instrumenting the injected shim with interposers
+for `objc_exception_throw`, `abort()` and `pthread_kill(SIGABRT)` logged no
+exception reason and no abort stack, so the signal is raised by a path that
+does not go through those symbols. Do not keep adding interposers without a
+new lead; the HCI control channel itself works (`MONDRIAN BTCTL` answers and
+LE scans run).
+
 The load thread runs that reset, the 6 MiB AMSS read, the SMMU map and the BHI
 writes in sequence; `0430`/`0431` carry the BHIE stage and the live
 `wifibhi`/`wifistat` commands.
