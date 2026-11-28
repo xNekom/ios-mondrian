@@ -593,45 +593,6 @@ format_of(AudioObjectID stream)
 
 extern void *MondrianAudio_Create(CFAllocatorRef allocator, CFUUIDRef type);
 
-/*
- * kAudioPlugInPropertyResourceBundle is a CFURL of the bundle directory: the host builds a
- * CFBundle from it and asks that bundle for its identifier. An empty CFString is not a URL,
- * so the bundle cannot be made and the identifier is NULL. The reference port ships the empty
- * string, but Apple's own plug-ins all answer their real directory, so do the same: derive it
- * from this image's own path, which keeps the /System and the /Library install working.
- */
-static CFURLRef
-resource_bundle_url(void)
-{
-	static CFURLRef url;
-	static bool tried;
-
-	if (!tried) {
-		Dl_info info;
-		char dir[PATH_MAX];
-
-		tried = true;
-		if (dladdr((const void *)MondrianAudio_Create, &info) != 0 && info.dli_fname != NULL &&
-		    strlen(info.dli_fname) < sizeof(dir)) {
-			char *slash;
-
-			strcpy(dir, info.dli_fname);
-			slash = strrchr(dir, '/');
-			if (slash != NULL && slash != dir) {
-				CFStringRef path;
-
-				*slash = '\0';
-				path = CFStringCreateWithCString(kCFAllocatorDefault, dir, kCFStringEncodingUTF8);
-				if (path != NULL) {
-					url = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, path, kCFURLPOSIXPathStyle, true);
-					CFRelease(path);
-				}
-			}
-		}
-	}
-	return url;
-}
-
 static HRESULT
 query_interface(void *driver, REFIID uuid, LPVOID *interface)
 {
@@ -888,6 +849,18 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioPlugInPropertyBundleID:
 			STRING(CFSTR("app.mondrian.audio.hal"));
+			break;
+		case kAudioPlugInPropertyClockDeviceList:
+			/*
+			 * AudioServerPlugIn.h requires this on every plug-in.
+			 * The host asked for it on object 1 and got "unknown"
+			 * (measured in the console ring); the devices use the
+			 * system clock, so the list is empty.
+			 */
+			v.empty = true;
+			break;
+		case kAudioPlugInPropertyTranslateUIDToClockDevice:
+			WORD(0);
 			break;
 		case kAudioPlugInPropertyResourceBundle:
 			/*

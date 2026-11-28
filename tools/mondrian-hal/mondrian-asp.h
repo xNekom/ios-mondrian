@@ -107,6 +107,7 @@ enum {
 	kAudioPlugInPropertyBoxList = 'box#', kAudioPlugInPropertyTranslateUIDToBox = 'uidb',
 	kAudioPlugInPropertyDeviceList = 'dev#', kAudioPlugInPropertyTranslateUIDToDevice = 'uidd',
 	kAudioPlugInPropertyResourceBundle = 'rsrc', kAudioPlugInPropertyBundleID = 'piid',
+	kAudioPlugInPropertyClockDeviceList = 'clk#', kAudioPlugInPropertyTranslateUIDToClockDevice = 'uidc',
 
 	kAudioDevicePropertyDeviceUID = 'uid ', kAudioDevicePropertyModelUID = 'muid', kAudioDevicePropertyTransportType = 'tran',
 	kAudioDevicePropertyRelatedDevices = 'akin', kAudioDevicePropertyClockDomain = 'clkd',

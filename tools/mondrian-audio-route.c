@@ -162,42 +162,40 @@ mondrian_route_thread(void *unused)
 	if (get_size == NULL || get_data == NULL || set_data == NULL)
 		return NULL;
 	/*
-	 * The HAL scan starts well after mediaserverd: a probe run a minute
-	 * into the boot sees the plug-in, while a 6 s delay does not. Retry
-	 * until the plug-in object shows up, logging the list size so a
-	 * failure names which step is empty.
+	 * Measured 2026-11-28: a standalone probe spawned by mondrian-run sees
+	 * the plug-in and its devices, but the same owned-object query from
+	 * this pthread returns 0, so discovery cannot run here. Object IDs are
+	 * assigned in registration order and every probe names the Speaker as
+	 * 41. Try discovery first, then fall back to that fixed ID, and log
+	 * the set error and readback so the next boot says which step fails.
 	 */
-	for (unsigned try = 0; try < 12; try++) {
-		sleep(5);
-		{
-			struct audio_property_address owned = {
-				kAudioObjectPropertyOwnedObjects,
-				kAudioObjectPropertyScopeGlobal, 0
-			};
-			uint32_t n = 0;
+	for (unsigned try = 0; try < 8; try++) {
+		uint32_t candidate;
 
-			if (get_size(kAudioObjectSystemObject, &owned, 0, NULL,
-			    &n) != 0)
-				n = 0;
-			printf("MONDRIAN ROUTE: try %u owned=%u\n", try, n);
-		}
+		sleep(5);
+		current = 0; size = sizeof(current);
+		err = get_data(kAudioObjectSystemObject, &def, 0, NULL, &size,
+		    &current);
+		printf("MONDRIAN ROUTE: try %u default=%u err=%d\n", try,
+		    (unsigned)current, (int)err);
 		speaker = find_speaker();
-		if (speaker != 0)
-			break;
+		candidate = speaker != 0 ? speaker : 41;
+		printf("MONDRIAN ROUTE: try %u speaker=%u candidate=%u\n", try,
+		    (unsigned)speaker, (unsigned)candidate);
+		err = set_data(kAudioObjectSystemObject, &def, 0, NULL,
+		    sizeof(candidate), &candidate);
+		printf("MONDRIAN ROUTE: try %u set %u -> %d\n", try,
+		    (unsigned)candidate, (int)err);
+		if (err == 0) {
+			current = 0; size = sizeof(current);
+			err = get_data(kAudioObjectSystemObject, &def, 0, NULL,
+			    &size, &current);
+			printf("MONDRIAN ROUTE: try %u readback=%u err=%d\n",
+			    try, (unsigned)current, (int)err);
+			if (current == candidate)
+				break;
+		}
 	}
-	printf("MONDRIAN ROUTE: speaker id=%u\n", (unsigned)speaker);
-	if (speaker == 0)
-		return NULL;
-	err = get_data(kAudioObjectSystemObject, &def, 0, NULL, &size, &current);
-	printf("MONDRIAN ROUTE: default before=%u err=%d\n", (unsigned)current,
-	    (int)err);
-	err = set_data(kAudioObjectSystemObject, &def, 0, NULL, sizeof(speaker),
-	    &speaker);
-	printf("MONDRIAN ROUTE: set default -> %d\n", (int)err);
-	current = 0; size = sizeof(current);
-	err = get_data(kAudioObjectSystemObject, &def, 0, NULL, &size, &current);
-	printf("MONDRIAN ROUTE: default after=%u err=%d\n", (unsigned)current,
-	    (int)err);
 	return NULL;
 }
 
