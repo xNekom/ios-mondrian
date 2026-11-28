@@ -138,6 +138,17 @@ the cheapest fix for our "Safari content is black; w30r surfaces stay zero"
 (`docs/MONDIAN_PORT.md` §7), and it does not need GPU work. `ios-spes` reset
 the MobileGestalt cache (`sweetmgreset=1`) for the same reason.
 
+## The 8-bit colour hook on our port (2026-11-28)
+
+The Gestalt interposer in `tools/mondrian-webkit-color.c` is injected by patch
+0385 into `com.apple.WebKit.GPU` and by 0513 into
+`com.apple.WebKit.WebContent` (before 0402's picture-bridge branch claims the
+process). Measured: the kernel logs both injections and AMFI logs the dylib,
+but WebKit still creates `0x77333072` (`w30r`) surfaces and the page remains
+black. Matching vphone's fix needs more than this one answer; do not repeat
+the injection experiment until a log from inside WebKit says which property
+actually selects the 10-bit backing store.
+
 ## Camera — `DenialOfGravity/ios-redfin`, `EthanArbuckle/vcam-ios`
 
 `ios-redfin` runs Camera.app with live preview and photos on IMX363/IMX355,
