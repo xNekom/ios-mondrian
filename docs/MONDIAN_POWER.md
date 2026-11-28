@@ -281,6 +281,16 @@ DDR self-refresh vote.
 
 ## Haptics
 
+### The iOS Actuator node
+
+`0511` creates `/dev/mondrian-haptic` (major assigned dynamically) next to the
+audio node. `MondrianAudio.driver` publishes an `Actuator` output and writes S16
+mono frames there; the cdev records the peak and the frame count, then calls
+`mondrian_haptics_buzz()` once on close so the HAL's writer thread never blocks
+on the boost wait. Measured 2026-11-28 on the `01:05:39` kernel:
+`MONDRIAN HAPTIC: /dev/mondrian-haptic major 20 node ok`. No iOS client has been
+seen opening it yet: the kernel half is proven, the userland route is not.
+
 The vibrator is not an I²C part. SM8475 drives an LRA from the PMIC's HV
 haptics block on `pm8350b@3`, three SPMI pages (`reg = <0xf000 0xf100 0xf200>`):
 CFG at 0xf000 (enable 0x46 bit 7, VMAX 0x48 = mV/50, play 0x4c = source | 0x80,

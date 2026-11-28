@@ -5,13 +5,14 @@
 # buzz on close so the HAL writer never blocks on the boost wait.
 --- a/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382183532 +0100
 +++ b/bsd/dev/mondrian_haptics.c	2026-11-28 00:38:07.382334932 +0100
-@@ -24,6 +24,9 @@
+@@ -24,6 +24,10 @@
   */
  #include <sys/param.h>
  #include <sys/systm.h>
 +#include <sys/conf.h>
 +#include <sys/uio.h>
-+#include <sys/devfs.h>
++#include <sys/uio_internal.h>
++#include <miscfs/devfs/devfs.h>
  #include <pexpert/arm64/board_config.h>
  
  #if defined(MONDRIAN)
@@ -69,9 +70,9 @@
 +	size_t n;
 +	int error = 0;
 +
-+	while (uio->uio_resid > 0) {
-+		n = min(sizeof(buf), (size_t)uio->uio_resid);
-+		error = uiomove(buf, n, uio);
++	while (uio_resid(uio) > 0) {
++		n = min(sizeof(buf), (size_t)uio_resid(uio));
++		error = uiomove(buf, (int)n, uio);
 +		if (error != 0) break;
 +		for (size_t i = 0; i + 1 < n; i += 2) {
 +			int16_t s;
@@ -114,9 +115,10 @@
 # The haptic cdev is created with the audio node, before userland starts.
 --- a/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199449776 +0100
 +++ b/bsd/dev/mondrian_adsp.c	2026-11-28 00:41:40.199770888 +0100
-@@ -1860,6 +1860,7 @@
+@@ -1860,6 +1860,8 @@
  	}
  	thread_deallocate(thread);
++	extern void mondrian_haptics_dev_init(void);
  	mondrian_audio_dev_init();
 +	mondrian_haptics_dev_init();
  	adsp_log("worker started");
