@@ -59,7 +59,10 @@ if [ "$BUILD" = 1 ]; then
 	echo "== build"
 	bash tools/wsl/build-kernel.sh > "$LOG/build.log" 2>&1
 	if [ $? -ne 0 ]; then
-		grep -a -n 'error:' "$LOG/build.log" | tail -6
+		# A bare 'error:' also matches identifiers such as __pagein_error:638,
+		# so a successful build was reported as failed. Require the compiler's
+		# "error: " prefix with a space after the colon.
+		grep -a -n 'error: ' "$LOG/build.log" | tail -6
 		echo "== build failed: $LOG/build.log"
 		exit 1
 	fi
