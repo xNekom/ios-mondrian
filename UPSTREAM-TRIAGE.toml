@@ -117,3 +117,27 @@ repo = "joranv1/ios-sailfish"
 watermark = "2026-11-28"
 verdict = "read-only"
 note = "HEIC wallpaper conversion; no licence file, reimplement rather than copy."
+
+[[local]]
+branch = "fix/ios16-ring-tools"
+area = "input"
+verdict = "taken"
+note = "USB ring gains killname and mkdir commands; pre-session work."
+
+[[local]]
+branch = "fix/ios16-root-audit"
+area = "root"
+verdict = "taken"
+note = "HFS audit points at the current root image."
+
+[[local]]
+branch = "feat/ios16-audio-nullguard"
+area = "audio"
+verdict = "taken"
+note = "objc_msgSend guard and vm_protect rewrite in the audio HAL."
+
+[[local]]
+branch = "feat/ios16-audio-graph"
+area = "audio"
+verdict = "taken"
+note = "Patch 0507 rewritten to the donor AudioReach TDM sink graph."
