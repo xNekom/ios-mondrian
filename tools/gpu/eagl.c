@@ -1023,6 +1023,20 @@ surface_shared(struct eagl *e, struct image *image)
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
  */
+/*
+ * A still picture is looked at only every eighth frame, phased by its surface
+ * id, once it has been unchanged for a while. Big pictures settle sooner:
+ * hashing the wallpaper's 11 MB every frame cost 3-4 ms in glBindTexture and
+ * a fifth of the drawing thread while browsing (andyleenz/pixel3-ios,
+ * eagl.c:805-861, commits a5434091 and 1d0c6239). A change is still noticed
+ * within eight frames. `glstill=0` restores the old every-frame comparison.
+ */
+#define STILL_LOOKS       120
+#define STILL_LOOKS_BIG    12
+#define STILL_EVERY         8
+#define STILL_BIG_BYTES (2u << 20)
+static int still_seldom = 1;
+
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
@@ -1030,16 +1044,24 @@ surface_changed(struct eagl *e, struct image *image)
 	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
 	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
-	uint64_t sum = size, word;
+	uint64_t sum, word;
+	unsigned still;
 
+	/*
+	 * A texture can be described bigger than its surface (more rows, or more
+	 * bytes a pixel than it holds); reading to the described end killed
+	 * backboardd with SIGSEGV in pixel3-ios on 2026-11-20.
+	 */
+	if (size > IOSurfaceGetAllocSize(surface)) {
+		size = IOSurfaceGetAllocSize(surface);
+	}
+	sum = size;
 	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
 		return false;
 	}
-	/*
-	 * Adding up 11 MB was 3-4 ms a frame (glBindTexture). A memory whose sum has stayed the
-	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made app launches lag).
-	 */
-	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
+	still = size > STILL_BIG_BYTES ? STILL_LOOKS_BIG : STILL_LOOKS;
+	if (still_seldom && image->quiet >= still &&
+	    (e->frames + IOSurfaceGetID(surface)) % STILL_EVERY != 0) {
 		return false;
 	}
 	image->looked = e->frames + 1;
@@ -1049,7 +1071,7 @@ surface_changed(struct eagl *e, struct image *image)
 		sum ^= sum >> 29;
 	}
 	if (sum == image->sum) {
-		image->quiet++;
+		image->quiet += image->quiet < still;
 		return false;
 	}
 	image->sum = sum;
@@ -5959,6 +5981,7 @@ install(void)
 		}
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
+		still_seldom = strstr(arguments, "glstill=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;
 		}
