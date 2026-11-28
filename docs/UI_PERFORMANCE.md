@@ -1728,5 +1728,8 @@ image) and back on with `0x29` from the tick, so the wake needs no frame.
    wedge at the panel's top-right corner. Keep the fix. `AdyaGMD/ios-spes` and
    `andyleenz/pixel3-ios` get the Library's blur by giving CoreAnimation a
    GPU/Metal device; the 600-repo survey in `REFERENCE_FINDINGS.md` has the
-   donor list. The stock wallpaper needs the same GPU path plus the HEIC layers
+   donor list. A third A/B with only `allowsInPlaceFiltering` disabled
+   (`mondrianbackdrop=1`) left the substitute colour and occlusion keys alone
+   and drew horizontal line artefacts over the lock screen, so the three-key
+   fix stays. The stock wallpaper needs the GPU path plus the HEIC layers
    converted to PNG at root-build time (`joranv1/ios-sailfish`).
