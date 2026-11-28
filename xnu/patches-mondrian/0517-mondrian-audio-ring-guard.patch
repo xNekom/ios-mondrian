@@ -1,0 +1,54 @@
+xnu 0517: drop audio writes until the PCM ring exists
+
+The audio cdev is created when the ADSP worker starts, but the PCM ring is
+allocated only in that worker's first graph cycle. A write before then copied
+samples through adsp_pcm_va == 0 and hung the caller in a kernel fault; that is
+why neither the HAL writer nor a direct test ever produced an 'audio node: PCM'
+line. Drop frames while the ring is absent and log the first few drops.
+diff --git a/bsd/dev/mondrian_adsp.c b/bsd/dev/mondrian_adsp.c
+index ff07d9e..7bd54ca 100755
+--- a/bsd/dev/mondrian_adsp.c
++++ b/bsd/dev/mondrian_adsp.c
+@@ -780,16 +780,32 @@ mas_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 			break;
+ 		frames = (uint32_t)want / MONDRIAN_AUDIO_FRAME;
+ 		lck_mtx_lock(mas_lock);
+-		for (i = 0; i < frames * 2; i++) {
+-			int32_t *ring = (int32_t *)adsp_pcm_va;
+-			uint32_t at = (uint32_t)((mas_frames_played + i) %
+-			    (ADSP_PCM_BYTES / 4));
+-			uint32_t a = in[i] < 0 ? (uint32_t)-(int32_t)in[i] :
+-			    (uint32_t)in[i];
+-
+-			ring[at] = mas_gain == 0 ? 0 : ((int32_t)in[i] << 16);
+-			if (a > mas_peak_in)
+-				mas_peak_in = a;
++		/*
++		 * The node is created when the ADSP worker starts, but the PCM ring is
++		 * allocated later in that worker's first graph cycle. Until then
++		 * adsp_pcm_va is zero: writing through it hangs the caller in a kernel
++		 * fault, which is what froze both the HAL writer and a direct test.
++		 * Drop the frames instead and say so a few times.
++		 */
++		if (adsp_pcm_va != 0) {
++			for (i = 0; i < frames * 2; i++) {
++				int32_t *ring = (int32_t *)adsp_pcm_va;
++				uint32_t at = (uint32_t)((mas_frames_played + i) %
++				    (ADSP_PCM_BYTES / 4));
++				uint32_t a = in[i] < 0 ? (uint32_t)-(int32_t)in[i] :
++				    (uint32_t)in[i];
++
++				ring[at] = mas_gain == 0 ? 0 : ((int32_t)in[i] << 16);
++				if (a > mas_peak_in)
++					mas_peak_in = a;
++			}
++		} else {
++			static unsigned warned;
++
++			if (warned++ < 4) {
++				adsp_log("audio node: PCM ring not ready, "
++				    "dropping %u frames", (unsigned)frames);
++			}
+ 		}
+ 		taken = frames;
+ 		mas_frames_in += taken;

@@ -1,0 +1,20 @@
+xnu 0518: create the haptic node with a devfs name, not a path
+
+0511 passed "/dev/mondrian-haptic" to devfs_make_node, which takes the name
+under /dev. The node was reported as created but /dev/mondrian-haptic could not
+be opened by a caller. Use "mondrian-haptic" like the audio node does.
+diff --git a/bsd/dev/mondrian_haptics.c b/bsd/dev/mondrian_haptics.c
+index f4ef248..3deff98 100644
+--- a/bsd/dev/mondrian_haptics.c
++++ b/bsd/dev/mondrian_haptics.c
+@@ -526,8 +526,9 @@ mondrian_haptics_dev_init(void)
+ 		mh_major = -1;
+ 		return;
+ 	}
++	/* devfs_make_node takes the name under /dev, not the full path. */
+ 	node = devfs_make_node(makedev(mh_major, 0), DEVFS_CHAR, UID_ROOT,
+-	    GID_WHEEL, 0666, "/dev/mondrian-haptic");
++	    GID_WHEEL, 0666, "mondrian-haptic");
+ 	printf("MONDRIAN HAPTIC: /dev/mondrian-haptic major %d node %s\n",
+ 	    mh_major, node != NULL ? "ok" : "FAILED");
+ }
