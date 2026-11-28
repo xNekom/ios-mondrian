@@ -153,3 +153,9 @@ branch = "fix/mondrian-patch-0509-0511"
 area = "audio"
 verdict = "taken"
 note = "Rebase 0509 and 0511 onto the post-0507 mondrian_adsp.c so all 506 patches apply."
+
+[[local]]
+branch = "fix/ui-stock-wallpaper"
+area = "ui"
+verdict = "taken"
+note = "Home wallpaper layer prefers the staged stock still over a render of the screen it paints."
