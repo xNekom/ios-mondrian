@@ -12,8 +12,8 @@
  * already been measured to abort a WebKit client on this port.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
 #include <string.h>
-#include <syslog.h>
 
 extern Boolean MGGetBoolAnswer(CFStringRef) __attribute__((weak_import));
 extern CFTypeRef MGCopyAnswer(CFStringRef) __attribute__((weak_import));
@@ -22,6 +22,18 @@ struct mondrian_interpose {
 	const void *replacement;
 	const void *replacee;
 };
+
+static void
+color_log(const char *what)
+{
+	FILE *f = fopen("/var/mobile/webkit-color.log", "a");
+
+	if (f == NULL)
+		return;
+	fprintf(f, "MONDRIAN COLOR: %s\n", what);
+	fclose(f);
+	fprintf(stderr, "MONDRIAN COLOR: %s\n", what);
+}
 
 static const struct mondrian_interpose color_bool_interpose;
 static const struct mondrian_interpose color_copy_interpose;
@@ -44,7 +56,7 @@ mondrian_color_bool(CFStringRef key)
 	    (Boolean (*)(CFStringRef))color_bool_interpose.replacee;
 
 	if (is_key(key, "HasExtendedColorDisplay")) {
-		syslog(5, "MONDRIAN COLOR: HasExtendedColorDisplay -> false");
+		color_log("bool HasExtendedColorDisplay -> false");
 		return false;
 	}
 	return real != NULL ? real(key) : false;
@@ -58,7 +70,7 @@ mondrian_color_copy(CFStringRef key)
 
 	if (is_key(key, "HasExtendedColorDisplay") ||
 	    is_key(key, "artwork-display-gamut")) {
-		syslog(5, "MONDRIAN COLOR: extended gamut query -> false");
+		color_log("copy extended gamut -> false");
 		return kCFBooleanFalse;
 	}
 	return real != NULL ? real(key) : NULL;
