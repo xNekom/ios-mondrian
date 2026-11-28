@@ -159,6 +159,15 @@ focus and flash from the kernel. `vcam-ios` establishes that `mediaserverd`
 connects to the camera hardware and forwards frames to clients, and hooks
 there to replace the image — the same interception point a port needs. Our
 Photos path already works; Camera is the missing client.
+The live device tree has camera plumbing — `reserved-memory/camera_region`,
+six `qcom,csiphy*@ace*` blocks, `qcom,cam-isp`, `qcom,cam-cpas` and the
+`cam_sensor_mclk*` pin states — but **no camera sensor node** (`imx*`, `ov*`,
+`s5k*` are all absent). There is therefore no I2C address, CSI lane mapping or
+sensor identity to bind a driver to, and `Camera.app` returns 0 from
+`LSApplicationWorkspace openApplicationWithBundleID:`. Bringing up a real
+camera means discovering the sensor on the bus first; the BW-node injection
+cannot help until a capture graph exists.
+
 `yiffysec/Wam-Bam-A-Free-Cam-VCam` (MIT, iOS 15-18) is the clearest map of
 that point: `BWNodeOutput -emitSampleBuffer:`, `BWImageQueueSinkNode
 -renderSampleBuffer:forInput:`, `BWRemoteQueueSinkNode`, `BWPhotoEncoderNode`
